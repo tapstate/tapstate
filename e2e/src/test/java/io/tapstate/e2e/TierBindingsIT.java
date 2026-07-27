@@ -66,7 +66,7 @@ class TierBindingsIT {
             // with a constant, or from its own record rather than the database, cannot satisfy both
             // assertions. This last read confirms the rows are really there, through a driver the
             // binding does not own.
-            assertThat(endpoints.count(endpointUri, "orders")).isEqualTo(5L);
+            assertThat(endpoints.count(EndpointAddress.uri(endpointUri), "orders")).isEqualTo(5L);
             assertThat(control.artifactIds()).contains("tgt_mongo", "e2e_pipeline");
         }
     }

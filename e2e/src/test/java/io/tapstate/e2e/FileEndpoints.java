@@ -30,23 +30,27 @@ final class FileEndpoints implements Endpoints {
     private static final String HEADER = "id,seq";
     private static final String SUFFIX = ".csv";
 
+    /** The setting this store is addressed by: the directory holding one file per table. */
+    private static final String DIRECTORY = "uri";
+
     /** Lays {@code rows} rows down, numbered from one, replacing whatever the table held. */
     @Override
-    public void seed(String uri, String table, long rows) {
+    public void seed(EndpointAddress address, String table, long rows) {
         List<Row> seeded = new ArrayList<>();
         for (long id = 1; id <= rows; id++) {
             seeded.add(new Row(id, id));
         }
-        write(file(uri, table), seeded);
+        write(file(address, table), seeded);
     }
 
     /** Produces {@code rows} changes of one kind against a table that is already seeded. */
     @Override
-    public void cdc(String uri, String table, CdcOp op, long rows) {
-        Path file = file(uri, table);
+    public void cdc(EndpointAddress address, String table, CdcOp op, long rows) {
+        Path file = file(address, table);
         if (!Files.exists(file)) {
             throw new EnvelopeException(
-                    "the table " + table + " at " + uri + " has not been seeded, so there is nothing to change");
+                    "the table " + table + " at " + address.text(DIRECTORY)
+                            + " has not been seeded, so there is nothing to change");
         }
         List<Row> current = read(file);
         write(file, switch (op) {
@@ -62,8 +66,8 @@ final class FileEndpoints implements Endpoints {
      * waits for a first write is waiting for exactly this reading to move.
      */
     @Override
-    public long count(String uri, String table) {
-        Path file = file(uri, table);
+    public long count(EndpointAddress address, String table) {
+        Path file = file(address, table);
         return Files.exists(file) ? read(file).size() : 0L;
     }
 
@@ -100,7 +104,8 @@ final class FileEndpoints implements Endpoints {
         return rows.stream().sorted(Comparator.comparingLong(Row::id)).toList();
     }
 
-    private static Path file(String uri, String table) {
+    private static Path file(EndpointAddress address, String table) {
+        String uri = address.text(DIRECTORY);
         Path directory = Path.of(uri);
         if (!Files.isDirectory(directory)) {
             throw new EnvelopeException("the endpoint at " + uri + " is not a directory, so it holds no tables");

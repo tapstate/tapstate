@@ -108,7 +108,7 @@ class PublishedExamplesIT {
 
             new E2eExecutor(binding, new FilePipelineLoader(workspace), TIMEOUT, POLL).execute(envelope);
 
-            settled.forEach((alias, rows) -> assertThat(files.count(targetDirectory.toString(), alias.table()))
+            settled.forEach((alias, rows) -> assertThat(files.count(EndpointAddress.uri(targetDirectory.toString()), alias.table()))
                     .as("%s settles on %s rows in %s, read there by the address it named; this reads the "
                             + "target this run handed out, which it cannot name", specification, rows, alias)
                     .isEqualTo(rows));

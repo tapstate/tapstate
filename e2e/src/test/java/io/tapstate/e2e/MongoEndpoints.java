@@ -27,18 +27,21 @@ final class MongoEndpoints implements Endpoints {
     private static final String SEQUENCE_FIELD = "seq";
     private static final String TOUCHED_FIELD = "touched";
 
+    /** The setting this store is addressed by: one connection string naming host, port and database. */
+    private static final String CONNECTION_STRING = "uri";
+
     private final Map<String, MongoClient> clientsByUri = new LinkedHashMap<>();
 
     @Override
-    public void seed(String uri, String table, long rows) {
-        MongoCollection<Document> collection = collection(uri, table);
+    public void seed(EndpointAddress address, String table, long rows) {
+        MongoCollection<Document> collection = collection(address, table);
         collection.drop();
         insertRange(collection, 1, rows);
     }
 
     @Override
-    public void cdc(String uri, String table, CdcOp op, long rows) {
-        MongoCollection<Document> collection = collection(uri, table);
+    public void cdc(EndpointAddress address, String table, CdcOp op, long rows) {
+        MongoCollection<Document> collection = collection(address, table);
         switch (op) {
             case INSERT -> insertRange(collection, highestId(collection) + 1, rows);
             case UPDATE -> collection.updateMany(
@@ -48,8 +51,8 @@ final class MongoEndpoints implements Endpoints {
     }
 
     @Override
-    public long count(String uri, String table) {
-        return collection(uri, table).countDocuments();
+    public long count(EndpointAddress address, String table) {
+        return collection(address, table).countDocuments();
     }
 
     @Override
@@ -73,7 +76,8 @@ final class MongoEndpoints implements Endpoints {
         return highest == null ? 0L : highest.getLong("_id");
     }
 
-    private MongoCollection<Document> collection(String uri, String table) {
+    private MongoCollection<Document> collection(EndpointAddress address, String table) {
+        String uri = address.text(CONNECTION_STRING);
         ConnectionString connectionString = new ConnectionString(uri);
         String database = connectionString.getDatabase();
         if (database == null) {
