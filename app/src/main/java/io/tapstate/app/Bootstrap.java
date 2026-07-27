@@ -68,3 +68,5 @@ public class Bootstrap {
         return List.of(PdkAdapter.class, MongoStorePort.class);
     }
 }
+
+// Witness for the end-to-end admission gate; this branch is thrown away.
