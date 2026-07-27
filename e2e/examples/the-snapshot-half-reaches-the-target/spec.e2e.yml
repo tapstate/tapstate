@@ -28,4 +28,3 @@ seed:
 steps:
   - start
   - await: { count: { tgt_file.orders: 3 } }
-# Witness line: this specification was touched so the admission gate can be seen to pass.
