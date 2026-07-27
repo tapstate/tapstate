@@ -1,14 +1,11 @@
 package io.tapstate.e2e;
 
-import org.junit.jupiter.api.AfterAll;
+import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.utility.DockerImageName;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -40,22 +37,15 @@ class MySqlEndpointsIT {
 
     private static final String TABLE = "orders";
 
-    private static MySQLContainer<?> mysql;
+    /** A database of this class's own on the shared server; nothing else writes in it. */
+    private static Map<String, Object> settings;
 
     private final MySqlEndpoints endpoints = new MySqlEndpoints();
 
     @BeforeAll
-    static void startMySql() {
+    static void takeADatabase() {
         DockerGate.require();
-        mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
-        mysql.start();
-    }
-
-    @AfterAll
-    static void stopMySql() {
-        if (mysql != null) {
-            mysql.stop();
-        }
+        settings = SharedMySql.settings("e2e_mysql_endpoints");
     }
 
     @AfterEach
@@ -181,13 +171,35 @@ class MySqlEndpointsIT {
     }
 
     /**
+     * Two databases taken separately share nothing, which is the whole basis for one server serving every
+     * specification in the JVM.
+     *
+     * <p>It is pinned here because this is the lane that always runs. The property is also exercised by the
+     * two tiers of the real-connector witnesses - they would collide on the same table - but those need
+     * connector jars and stay out of the default build, so on their own they would leave this unguarded
+     * exactly where it is cheapest to break.
+     */
+    @Test
+    void databasesTakenSeparatelyShareNoTables() {
+        EndpointAddress mine = at();
+        EndpointAddress theirs =
+                new EndpointAddress("src_other", SharedMySql.settings("e2e_mysql_endpoints_other"));
+
+        endpoints.seed(mine, TABLE, 3);
+        endpoints.seed(theirs, TABLE, 5);
+
+        assertThat(endpoints.count(mine, TABLE)).isEqualTo(3L);
+        assertThat(endpoints.count(theirs, TABLE)).isEqualTo(5L);
+    }
+
+    /**
      * A JDBC store is addressed by several settings, so an absent one has to name itself: "cannot connect"
      * sends an author to their database, and the fault is in their resource.
      */
     @Test
     void anAddressMissingASettingRefusesAndNamesWhatItLacks() {
         EndpointAddress withoutPort = new EndpointAddress(
-                "src_mysql", Map.of("host", mysql.getHost(), "database", mysql.getDatabaseName()));
+                "src_mysql", Map.of("host", settings.get("host"), "database", settings.get("database")));
 
         assertThatThrownBy(() -> endpoints.count(withoutPort, TABLE))
                 .isInstanceOf(EnvelopeException.class)
@@ -197,14 +209,7 @@ class MySqlEndpointsIT {
 
     /** The address as a resource would carry it: five settings, no one of which is the whole address. */
     private static EndpointAddress at() {
-        return new EndpointAddress(
-                "src_mysql",
-                Map.of(
-                        "host", mysql.getHost(),
-                        "port", mysql.getMappedPort(MySQLContainer.MYSQL_PORT),
-                        "database", mysql.getDatabaseName(),
-                        "username", mysql.getUsername(),
-                        "password", mysql.getPassword()));
+        return new EndpointAddress("src_mysql", settings);
     }
 
     /**
@@ -237,6 +242,6 @@ class MySqlEndpointsIT {
     }
 
     private static Connection open() throws SQLException {
-        return DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword());
+        return SharedMySql.connect(settings);
     }
 }

@@ -6,11 +6,8 @@ import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.utility.DockerImageName;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
@@ -68,39 +65,38 @@ class RealMysqlToMongoSnapshotIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void realMysqlSnapshotRowsReachRealMongo(Tiers tier) throws Exception {
-        try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
-            mysql.start();
-            seedMysqlOrders(mysql, SEEDED_ROWS);
+        // A source database, a store and a target per tier, all on the shared servers: sharing any of
+        // them would let a later tier read the rows an earlier one already landed and pass on the first
+        // poll without the connector writing a thing.
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        Map<String, Object> mysql = SharedMySql.settings("real_mysql_src_" + suffix);
+        seedMysqlOrders(mysql, SEEDED_ROWS);
 
-            // One store and one target per tier: sharing them would let a later tier read the rows an
-            // earlier one already landed and pass on the first poll without the connector writing a thing.
-            String suffix = tier.name().toLowerCase(Locale.ROOT);
-            String storeUri = SharedMongo.replicaSetUrl("real_mysql_store_" + suffix);
-            String targetUri = SharedMongo.replicaSetUrl("real_mysql_target_" + suffix);
+        String storeUri = SharedMongo.replicaSetUrl("real_mysql_store_" + suffix);
+        String targetUri = SharedMongo.replicaSetUrl("real_mysql_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
-                    MongoEndpoints mongo = new MongoEndpoints()) {
-                ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+        try (ServerHandle server = tier.launch(storeUri);
+                MongoEndpoints mongo = new MongoEndpoints()) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
 
-                control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
-                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
-                Map<String, Object> mysqlConfig = mysqlConfig(mysql);
-                Map<String, String> resources = new LinkedHashMap<>();
-                resources.put("src_mysql.tap.yml", sourceYaml(mysqlConfig));
-                resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
-                resources.put("pipeline.tap.yml", pipelineYaml());
-                control.apply(resources);
+            Map<String, Object> mysqlConfig = mysql;
+            Map<String, String> resources = new LinkedHashMap<>();
+            resources.put("src_mysql.tap.yml", sourceYaml(mysqlConfig));
+            resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
+            resources.put("pipeline.tap.yml", pipelineYaml());
+            control.apply(resources);
 
-                // The target model and its key are read out of the source's own schema, so discovery has
-                // to run before the sink is asked to create a collection and upsert into it.
-                control.discoverSchema("src_mysql", "mysql", mysqlConfig);
+            // The target model and its key are read out of the source's own schema, so discovery has
+            // to run before the sink is asked to create a collection and upsert into it.
+            control.discoverSchema("src_mysql", "mysql", mysqlConfig);
 
-                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-                awaitCount(mongo, targetUri, SEEDED_ROWS);
-            }
+            awaitCount(mongo, targetUri, SEEDED_ROWS);
         }
     }
 
@@ -120,9 +116,9 @@ class RealMysqlToMongoSnapshotIT {
                 .isEqualTo(expected);
     }
 
-    private static void seedMysqlOrders(MySQLContainer<?> mysql, long rows) throws Exception {
+    private static void seedMysqlOrders(Map<String, Object> mysql, long rows) throws Exception {
         try (Connection connection =
-                DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword())) {
+                SharedMySql.connect(mysql)) {
             try (Statement statement = connection.createStatement()) {
                 statement.execute("CREATE TABLE " + TABLE + " (id INT PRIMARY KEY, name VARCHAR(64))");
             }
@@ -143,16 +139,6 @@ class RealMysqlToMongoSnapshotIT {
      * is a number, not a string: the connector's config bean holds it as a numeric field, and handing it a
      * string is a cast failure inside the connector's config load.
      */
-    private static Map<String, Object> mysqlConfig(MySQLContainer<?> mysql) {
-        Map<String, Object> config = new LinkedHashMap<>();
-        config.put("host", mysql.getHost());
-        config.put("port", mysql.getMappedPort(MySQLContainer.MYSQL_PORT));
-        config.put("database", mysql.getDatabaseName());
-        config.put("username", mysql.getUsername());
-        config.put("password", mysql.getPassword());
-        return config;
-    }
-
     private static String sourceYaml(Map<String, Object> config) {
         return """
                 version: tapstate/v1

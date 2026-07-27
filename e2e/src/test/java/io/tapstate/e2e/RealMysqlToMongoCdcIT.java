@@ -6,11 +6,8 @@ import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.utility.DockerImageName;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
@@ -57,46 +54,46 @@ class RealMysqlToMongoCdcIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void realMysqlCdcRowsReachRealMongo(Tiers tier) throws Exception {
-        try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
-            mysql.start();
-            seedMysqlOrders(mysql, SEEDED_ROWS);
-            grantReplication(mysql);
+        // A source database, a store and a target per tier, all on the shared servers: sharing any of
+        // them would let a later tier read the rows an earlier one already landed and pass on the first
+        // poll without the connector writing a thing. The binary log underneath is one log for the whole
+        // server, so this run's rows are told apart from the other tier's by the database they are in -
+        // which is what the connector is configured to read.
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        Map<String, Object> mysql = SharedMySql.settings("real_cdc_src_" + suffix);
+        seedMysqlOrders(mysql, SEEDED_ROWS);
 
-            // One store and one target per tier: sharing them would let a later tier read the rows an
-            // earlier one already landed and pass on the first poll without the connector writing a thing.
-            String suffix = tier.name().toLowerCase(Locale.ROOT);
-            String storeUri = SharedMongo.replicaSetUrl("real_cdc_store_" + suffix);
-            String targetUri = SharedMongo.replicaSetUrl("real_cdc_target_" + suffix);
+        String storeUri = SharedMongo.replicaSetUrl("real_cdc_store_" + suffix);
+        String targetUri = SharedMongo.replicaSetUrl("real_cdc_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
-                    MongoEndpoints mongo = new MongoEndpoints()) {
-                ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+        try (ServerHandle server = tier.launch(storeUri);
+                MongoEndpoints mongo = new MongoEndpoints()) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
 
-                control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
-                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
-                Map<String, Object> mysqlConfig = mysqlConfig(mysql);
-                Map<String, String> resources = new LinkedHashMap<>();
-                resources.put("src_mysql.tap.yml", sourceYaml(mysqlConfig));
-                resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
-                resources.put("pipeline.tap.yml", pipelineYaml());
-                control.apply(resources);
+            Map<String, Object> mysqlConfig = mysql;
+            Map<String, String> resources = new LinkedHashMap<>();
+            resources.put("src_mysql.tap.yml", sourceYaml(mysqlConfig));
+            resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
+            resources.put("pipeline.tap.yml", pipelineYaml());
+            control.apply(resources);
 
-                control.discoverSchema("src_mysql", "mysql", mysqlConfig);
-                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            control.discoverSchema("src_mysql", "mysql", mysqlConfig);
+            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-                // Snapshot half: the seeded rows must arrive before any change is made.
-                awaitCount(mongo, targetUri, SEEDED_ROWS);
+            // Snapshot half: the seeded rows must arrive before any change is made.
+            awaitCount(mongo, targetUri, SEEDED_ROWS);
 
-                // Let the binlog tail position at the current end before changing anything - a null resume
-                // offset starts the stream from now, so an insert that races the tail bring-up is missed.
-                Thread.sleep(TAIL_SETTLE.toMillis());
+            // Let the binlog tail position at the current end before changing anything - a null resume
+            // offset starts the stream from now, so an insert that races the tail bring-up is missed.
+            Thread.sleep(TAIL_SETTLE.toMillis());
 
-                // CDC half: real inserts made AFTER start must reach Mongo through the binlog tail.
-                insertMoreOrders(mysql, SEEDED_ROWS + 1, CDC_ROWS);
-                awaitCount(mongo, targetUri, SEEDED_ROWS + CDC_ROWS);
-            }
+            // CDC half: real inserts made AFTER start must reach Mongo through the binlog tail.
+            insertMoreOrders(mysql, SEEDED_ROWS + 1, CDC_ROWS);
+            awaitCount(mongo, targetUri, SEEDED_ROWS + CDC_ROWS);
         }
     }
 
@@ -115,9 +112,9 @@ class RealMysqlToMongoCdcIT {
                 .isEqualTo(expected);
     }
 
-    private static void seedMysqlOrders(MySQLContainer<?> mysql, long rows) throws Exception {
+    private static void seedMysqlOrders(Map<String, Object> mysql, long rows) throws Exception {
         try (Connection connection =
-                DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword())) {
+                SharedMySql.connect(mysql)) {
             try (Statement statement = connection.createStatement()) {
                 statement.execute("CREATE TABLE " + TABLE + " (id INT PRIMARY KEY, name VARCHAR(64))");
             }
@@ -126,9 +123,9 @@ class RealMysqlToMongoCdcIT {
     }
 
     /** Inserts {@code rows} more orders starting at {@code firstId}, on a fresh connection, no CREATE. */
-    private static void insertMoreOrders(MySQLContainer<?> mysql, long firstId, long rows) throws Exception {
+    private static void insertMoreOrders(Map<String, Object> mysql, long firstId, long rows) throws Exception {
         try (Connection connection =
-                DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword())) {
+                SharedMySql.connect(mysql)) {
             insertOrders(connection, firstId, rows);
         }
     }
@@ -143,26 +140,6 @@ class RealMysqlToMongoCdcIT {
             }
             insert.executeBatch();
         }
-    }
-
-    /** Binlog CDC needs replication privileges the default test user lacks; grant them as root. */
-    private static void grantReplication(MySQLContainer<?> mysql) throws Exception {
-        try (Connection root = DriverManager.getConnection(mysql.getJdbcUrl(), "root", mysql.getPassword());
-                Statement statement = root.createStatement()) {
-            statement.execute("GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD, SELECT ON *.* TO '"
-                    + mysql.getUsername() + "'@'%'");
-            statement.execute("FLUSH PRIVILEGES");
-        }
-    }
-
-    private static Map<String, Object> mysqlConfig(MySQLContainer<?> mysql) {
-        Map<String, Object> config = new LinkedHashMap<>();
-        config.put("host", mysql.getHost());
-        config.put("port", mysql.getMappedPort(MySQLContainer.MYSQL_PORT));
-        config.put("database", mysql.getDatabaseName());
-        config.put("username", mysql.getUsername());
-        config.put("password", mysql.getPassword());
-        return config;
     }
 
     private static String sourceYaml(Map<String, Object> config) {
