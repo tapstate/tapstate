@@ -1,0 +1,94 @@
+package io.tapstate.e2e;
+
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.function.UnaryOperator;
+
+/**
+ * The stores a specification asked for, brought up and reported back in the three shapes a run needs
+ * them: an address to interpolate, a driver to read them back with, and a handle to release them.
+ *
+ * <p>This is the seam the specification never sees. It says {@code src: { kind: mysql }} and gets a real
+ * MySQL; it does not name a container, a port, or a driver class. Which is the point - the same
+ * specification has to keep working when the store comes from somewhere else entirely (a pooled remote
+ * instance rather than a local container), and it can only do that if it never said where from.
+ *
+ * <p>Addresses are published as environment references named after the store: a request named
+ * {@code src} publishes {@code SRC_HOST}, {@code SRC_PORT}, … and the resource writes
+ * {@code host: ${SRC_HOST}}. The shape differs by kind because stores differ - a JDBC endpoint has no
+ * single string that is its address, a Mongo one does - and that difference is the store's, not the
+ * specification's, so it lives here.
+ */
+final class ProvisionedStores implements AutoCloseable {
+
+    private final Map<String, String> environment = new LinkedHashMap<>();
+    private final Map<String, Endpoints> driversByConnector = new LinkedHashMap<>();
+
+    private ProvisionedStores() {
+    }
+
+    /**
+     * Brings up every store the specification asked for.
+     *
+     * <p>{@code runId} keeps concurrent runs off each other's data: it is folded into the database name,
+     * so two runs of the same specification share a server and nothing else. Sharing the server is
+     * deliberate - a database per run costs a name, a server per run costs a start-up.
+     */
+    static ProvisionedStores provision(Map<String, DatabaseRequest> requests, String runId) {
+        ProvisionedStores stores = new ProvisionedStores();
+        try {
+            requests.forEach((name, request) -> stores.bring(name, request, runId));
+        } catch (RuntimeException bringingUpFailed) {
+            // Whatever came up before the failure still has to come down; a half-provisioned run must not
+            // leak the half that succeeded.
+            stores.close();
+            throw bringingUpFailed;
+        }
+        return stores;
+    }
+
+    /** What a specification's {@code ${...}} references resolve to for these stores. */
+    Map<String, String> environment() {
+        return Map.copyOf(environment);
+    }
+
+    /** The independent reader per connector, for the stores this run brought up. */
+    Map<String, Endpoints> driversByConnector() {
+        return Map.copyOf(driversByConnector);
+    }
+
+    @Override
+    public void close() {
+        driversByConnector.values().forEach(Endpoints::close);
+        driversByConnector.clear();
+        environment.clear();
+    }
+
+    private void bring(String name, DatabaseRequest request, String runId) {
+        String database = database(name, runId);
+        String prefix = name.toUpperCase(Locale.ROOT);
+        switch (request.kind()) {
+            case MYSQL -> {
+                Map<String, Object> settings = SharedMySql.settings(database);
+                settings.forEach((setting, value) ->
+                        environment.put(prefix + "_" + setting.toUpperCase(Locale.ROOT), String.valueOf(value)));
+                driversByConnector.put(request.kind().connectorId(), new MySqlEndpoints());
+            }
+            case MONGO -> {
+                environment.put(prefix + "_URI", SharedMongo.replicaSetUrl(database));
+                driversByConnector.put(request.kind().connectorId(), new MongoEndpoints());
+            }
+        }
+    }
+
+    /**
+     * A database name of this store's own. Mongo refuses names past 63 characters and only says so once a
+     * run is under way, so the run id is trimmed rather than allowed to overflow - a truncated name still
+     * separates runs, an unusable one fails them.
+     */
+    private static String database(String name, String runId) {
+        String candidate = ("e2e_" + name + "_" + runId).toLowerCase(Locale.ROOT).replace('-', '_');
+        return candidate.length() <= 63 ? candidate : candidate.substring(0, 63);
+    }
+}

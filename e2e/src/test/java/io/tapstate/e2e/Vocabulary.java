@@ -51,6 +51,12 @@ final class Vocabulary {
     /** The provisioning facet's keys, in dependency order - which is the order they are declared. */
     static final List<String> SETUP_KEYS = componentsOf(Setup.class);
 
+    /** Store kinds the harness can provide, as a specification spells them. */
+    static final SortedSet<String> DATABASE_KINDS = sorted(DatabaseKind.values(), DatabaseKind::word);
+
+    /** The one key a store request carries. */
+    static final Set<String> DATABASE_KEYS = Set.of("kind");
+
     /** The one key a seed entry carries. */
     static final Set<String> SEED_KEYS = Set.of("rows");
 

@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -45,6 +46,52 @@ class EnvelopeParserTest {
         assertThat(envelope.setup().apply()).containsExactly("src_mongo.tap.yml", "tgt_mongo.tap.yml");
         assertThat(envelope.setup().discover()).containsExactly("src_mongo");
         assertThat(envelope.seed()).containsExactly(new Seed(new TableAlias("src_mongo", "orders"), 100L));
+    }
+
+    /**
+     * A specification can ask for the stores it needs, so a real-database case is data like any other.
+     *
+     * <p>Without this a case can only name endpoints that already exist, which is why every published
+     * example runs on a synthetic connector and every real-database witness is hand-written Java. The
+     * name is the case's handle: {@code src} is what its resources interpolate an address out of.
+     */
+    @Test
+    void parsesTheStoresASpecificationAsksFor() {
+        Envelope envelope = EnvelopeParser.parse("""
+                name: a-case-that-needs-real-stores
+                setup:
+                  databases:
+                    src: { kind: mysql }
+                    tgt: { kind: mongo }
+                  connectors: [mysql, mongodb]
+                  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+                  discover: [src_mysql]
+                pipeline: pipeline.tap.yml
+                steps:
+                  - start
+                """);
+
+        assertThat(envelope.setup().databases())
+                .containsExactly(
+                        entry("src", new DatabaseRequest(DatabaseKind.MYSQL)),
+                        entry("tgt", new DatabaseRequest(DatabaseKind.MONGO)));
+    }
+
+    /** A store kind nobody can provide is an authoring mistake, and it is cheapest to say so here. */
+    @Test
+    void refusesAStoreKindTheHarnessCannotProvide() {
+        assertThatThrownBy(() -> EnvelopeParser.parse("""
+                name: a-case-asking-for-something-unprovidable
+                setup:
+                  databases:
+                    src: { kind: cassandra }
+                pipeline: pipeline.tap.yml
+                steps:
+                  - start
+                """))
+                .isInstanceOf(EnvelopeException.class)
+                .hasMessageContaining("cassandra")
+                .hasMessageContaining("mongo");
     }
 
     @Test

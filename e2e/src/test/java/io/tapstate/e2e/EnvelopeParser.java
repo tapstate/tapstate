@@ -59,9 +59,39 @@ public final class EnvelopeParser {
         Map<String, Object> mapping = mapping(node, "setup");
         rejectUnknownKeys(mapping.keySet(), Set.copyOf(Vocabulary.SETUP_KEYS), "setup");
         return new Setup(
+                databases(mapping.get("databases")),
                 stringList(mapping.get("connectors"), "setup.connectors"),
                 stringList(mapping.get("apply"), "setup.apply"),
                 stringList(mapping.get("discover"), "setup.discover"));
+    }
+
+    /**
+     * The stores a specification asks the harness to provide, keyed by the name its resources
+     * interpolate an address out of. Nothing here names a driver or a container: the kind settles both,
+     * so a specification stays a description of what it needs rather than of how to get it.
+     */
+    private static Map<String, DatabaseRequest> databases(Object node) {
+        if (node == null) {
+            return Map.of();
+        }
+        Map<String, DatabaseRequest> requests = new LinkedHashMap<>();
+        mapping(node, "setup.databases")
+                .forEach(
+                        (name, request) -> {
+                            String where = "setup.databases." + name;
+                            Map<String, Object> fields = mapping(request, where);
+                            rejectUnknownKeys(fields.keySet(), Vocabulary.DATABASE_KEYS, where);
+                            requests.put(
+                                    name,
+                                    new DatabaseRequest(
+                                            databaseKind(string(fields.get("kind"), where + ".kind"))));
+                        });
+        return requests;
+    }
+
+    private static DatabaseKind databaseKind(String word) {
+        return word(DatabaseKind.values(), DatabaseKind::word, word,
+                "unknown store kind: " + word + "; the harness can provide " + Vocabulary.DATABASE_KINDS);
     }
 
     private static List<Seed> seed(Object node) {

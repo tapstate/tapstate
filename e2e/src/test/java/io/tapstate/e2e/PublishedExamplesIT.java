@@ -11,6 +11,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.UnaryOperator;
@@ -99,20 +100,38 @@ class PublishedExamplesIT {
                         specification)
                 .isNotEmpty();
 
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(store(workspace, tier)));
+        String run = store(workspace, tier);
+        // The stores the example asked for come up before anything else: a resource cannot be applied
+        // before the endpoint whose address it interpolates exists.
+        try (ProvisionedStores stores = ProvisionedStores.provision(envelope.setup().databases(), run);
+                ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(run));
                 Endpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");
             HttpTierBinding binding = new HttpTierBinding(
-                    control, workspace, Map.of(E2eConnectorJar.CONNECTOR_ID, files), env());
+                    control, workspace, drivers(files, stores), env(stores));
 
             new E2eExecutor(binding, new FilePipelineLoader(workspace), TIMEOUT, POLL).execute(envelope);
 
-            settled.forEach((alias, rows) -> assertThat(files.count(EndpointAddress.uri(targetDirectory.toString()), alias.table()))
-                    .as("%s settles on %s rows in %s, read there by the address it named; this reads the "
-                            + "target this run handed out, which it cannot name", specification, rows, alias)
-                    .isEqualTo(rows));
+            if (envelope.setup().databases().isEmpty()) {
+                settled.forEach((alias, rows) -> assertThat(
+                                files.count(EndpointAddress.uri(targetDirectory.toString()), alias.table()))
+                        .as("%s settles on %s rows in %s, read there by the address it named; this reads the "
+                                + "target this run handed out, which it cannot name", specification, rows, alias)
+                        .isEqualTo(rows));
+            }
         }
+    }
+
+    /**
+     * The file driver plus one per store the example asked for. The file driver is always present because
+     * the synthetic connector needs no provisioning - it reads a directory this run made.
+     */
+    private static Map<String, Endpoints> drivers(Endpoints files, ProvisionedStores stores) {
+        Map<String, Endpoints> drivers = new LinkedHashMap<>();
+        drivers.put(E2eConnectorJar.CONNECTOR_ID, files);
+        drivers.putAll(stores.driversByConnector());
+        return drivers;
     }
 
     /**
@@ -163,9 +182,10 @@ class PublishedExamplesIT {
      * so one directory would have a pipeline write back over the file the harness seeded, and a count would
      * then read the harness's own rows without a single row having crossed the product.
      */
-    private UnaryOperator<String> env() {
-        return Map.of(
-                "SRC_DIR", sourceDirectory.toString(),
-                "TGT_DIR", targetDirectory.toString())::get;
+    private UnaryOperator<String> env(ProvisionedStores stores) {
+        Map<String, String> environment = new LinkedHashMap<>(stores.environment());
+        environment.put("SRC_DIR", sourceDirectory.toString());
+        environment.put("TGT_DIR", targetDirectory.toString());
+        return environment::get;
     }
 }

@@ -60,6 +60,7 @@ final class SpecGenerator {
         root.put("pipelineStates", List.copyOf(Vocabulary.PIPELINE_STATES));
         root.put("topLevelKeys", List.copyOf(Vocabulary.TOP_LEVEL_KEYS));
         root.put("setupKeys", List.copyOf(Vocabulary.SETUP_KEYS));
+        root.put("databaseKinds", listing(Vocabulary.DATABASE_KINDS, kind -> "Provides a " + kind + " store."));
         return SpecJson.write(root);
     }
 
@@ -93,11 +94,13 @@ final class SpecGenerator {
     private static Map<String, Object> setupDef() {
         Map<String, Object> properties = new LinkedHashMap<>();
         for (String key : Vocabulary.SETUP_KEYS) {
-            properties.put(key, stringArray(setupDescription(key)));
+            // Every setup key but one is a list of names; databases is a mapping, because each store
+            // carries a kind and is referenced by the name its author gave it.
+            properties.put(key, "databases".equals(key) ? databasesDef() : stringArray(setupDescription(key)));
         }
         Map<String, Object> setup = new LinkedHashMap<>();
         setup.put("type", "object");
-        setup.put("description", "Three real product verbs, in dependency order.");
+        setup.put("description", "What the harness brings up, then the three product verbs run against it, in dependency order.");
         setup.put("additionalProperties", false);
         setup.put("properties", properties);
         return setup;
@@ -284,8 +287,30 @@ final class SpecGenerator {
         };
     }
 
+    /** A named store per entry, each saying only what kind it is; the harness settles the rest. */
+    private static Map<String, Object> databasesDef() {
+        Map<String, Object> kind = new LinkedHashMap<>();
+        kind.put("type", "string");
+        kind.put("description", "What sort of store, which settles provisioning, address shape and driver.");
+        kind.put("enum", List.copyOf(Vocabulary.DATABASE_KINDS));
+
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("type", "object");
+        request.put("additionalProperties", false);
+        request.put("required", List.of("kind"));
+        request.put("properties", Map.of("kind", kind));
+
+        Map<String, Object> databases = new LinkedHashMap<>();
+        databases.put("type", "object");
+        databases.put("description", setupDescription("databases"));
+        databases.put("additionalProperties", request);
+        return databases;
+    }
+
     private static String setupDescription(String key) {
         return switch (key) {
+            case "databases" -> "Stores the harness provisions first, keyed by the name whose address the "
+                    + "resources interpolate.";
             case "connectors" -> "Connector ids whose runtime jars are registered; idempotent by content hash.";
             case "apply" -> "Product resource files, applied as one batch: the product resolves references "
                     + "within the submitted set.";
