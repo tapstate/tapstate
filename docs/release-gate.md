@@ -26,6 +26,11 @@ The honesty of the gate extends to what the release says about itself. The Alpha
 
 - **must disclose** the insert-only blind spot: on an insert-only (non-upsert) target, overlapping
   snapshot and CDC reads can produce duplicate rows, and no shipped scenario covers that case;
+- **must disclose** the change-stream positioning window: on real connectors, changes written to the
+  source between the snapshot read and the change stream becoming positioned may be lost — the
+  position recorded before the snapshot is not yet handed to the connector's stream read, and no
+  shipped scenario covers the window (the e2e executor's redelivery exists to keep tests stable
+  across it, not to close it);
 - **must not claim production readiness**;
 - **must not claim exactly-once delivery**.
 
