@@ -6,8 +6,12 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * The {@link Endpoints} driver for a MySQL store, addressed by the host, port, database and credentials
@@ -42,13 +46,93 @@ final class MySqlEndpoints implements Endpoints {
     private final Map<String, Connection> connectionsByUrl = new LinkedHashMap<>();
 
     @Override
-    public void seed(EndpointAddress address, String table, long rows) {
+    public void seed(EndpointAddress address, String table, List<Map<String, Object>> rows) {
         Connection connection = connection(address);
         // Dropped rather than truncated: a seed replaces whatever the table held, including a shape some
         // earlier run left behind, and a truncate would keep the old columns.
         execute(connection, "DROP TABLE IF EXISTS " + quoted(table));
-        execute(connection, "CREATE TABLE " + quoted(table) + " (id BIGINT PRIMARY KEY, seq BIGINT)");
-        insertRange(connection, table, 1, rows);
+        execute(connection, createTable(table, rows.getFirst()));
+        insertRows(connection, table, rows);
+    }
+
+    /**
+     * The table the first row describes: {@code id} is the primary key, integers become BIGINT and
+     * strings VARCHAR. The parser has already held every row to one shape and to these two scalar
+     * types, so the first row speaks for all of them.
+     */
+    private static String createTable(String table, Map<String, Object> shape) {
+        StringBuilder columns = new StringBuilder();
+        shape.forEach((column, value) -> {
+            if (!columns.isEmpty()) {
+                columns.append(", ");
+            }
+            columns.append(quoted(column))
+                    .append(value instanceof String ? " VARCHAR(255)" : " BIGINT")
+                    .append(SeedRows.ID.equals(column) ? " PRIMARY KEY" : "");
+        });
+        return "CREATE TABLE " + quoted(table) + " (" + columns + ")";
+    }
+
+    private void insertRows(Connection connection, String table, List<Map<String, Object>> rows) {
+        List<String> columns = List.copyOf(rows.getFirst().keySet());
+        String sql = "INSERT INTO " + quoted(table) + " ("
+                + String.join(", ", columns.stream().map(MySqlEndpoints::quoted).toList())
+                + ") VALUES (" + String.join(", ", Collections.nCopies(columns.size(), "?")) + ")";
+        try (PreparedStatement insert = connection.prepareStatement(sql)) {
+            for (Map<String, Object> row : rows) {
+                for (int i = 0; i < columns.size(); i++) {
+                    insert.setObject(i + 1, row.get(columns.get(i)));
+                }
+                insert.addBatch();
+            }
+            insert.executeBatch();
+        } catch (SQLException e) {
+            throw new EnvelopeException("cannot write rows into " + table, e);
+        }
+    }
+
+    /**
+     * Reads the whole matching row back as the columns the table carries. Equality only, and exactly
+     * one match allowed: a specification locating a document ambiguously should hear that, not get
+     * whichever row sorted first.
+     */
+    @Override
+    public Optional<Map<String, Object>> fetch(EndpointAddress address, String table, Map<String, Object> where) {
+        Connection connection = connection(address);
+        if (!exists(connection, address, table)) {
+            return Optional.empty();
+        }
+        List<String> settings = List.copyOf(where.keySet());
+        String sql = "SELECT * FROM " + quoted(table) + " WHERE "
+                + String.join(" AND ", settings.stream().map(s -> quoted(s) + " = ?").toList());
+        try (PreparedStatement select = connection.prepareStatement(sql)) {
+            for (int i = 0; i < settings.size(); i++) {
+                select.setObject(i + 1, where.get(settings.get(i)));
+            }
+            try (ResultSet results = select.executeQuery()) {
+                if (!results.next()) {
+                    return Optional.empty();
+                }
+                Map<String, Object> row = rowOf(results);
+                if (results.next()) {
+                    throw new EnvelopeException(
+                            "more than one row in " + table + " matches " + where
+                                    + "; a document read must locate exactly one");
+                }
+                return Optional.of(row);
+            }
+        } catch (SQLException e) {
+            throw new EnvelopeException("cannot read the row of " + table + " matching " + where, e);
+        }
+    }
+
+    private static Map<String, Object> rowOf(ResultSet results) throws SQLException {
+        Map<String, Object> row = new LinkedHashMap<>();
+        var metadata = results.getMetaData();
+        for (int column = 1; column <= metadata.getColumnCount(); column++) {
+            row.put(metadata.getColumnLabel(column), results.getObject(column));
+        }
+        return row;
     }
 
     @Override
@@ -86,28 +170,32 @@ final class MySqlEndpoints implements Endpoints {
         }
         try {
             connection.setAutoCommit(false);
+            List<Map<String, Object>> rows = new ArrayList<>();
             try (Statement statement = connection.createStatement();
-                    ResultSet rows = statement.executeQuery(
-                            "SELECT id, seq FROM " + quoted(table) + " ORDER BY id")) {
-                try (PreparedStatement reemit = connection.prepareStatement(
-                        "DELETE FROM " + quoted(table) + " WHERE id = ?");
-                        PreparedStatement insert = connection.prepareStatement(
-                                "INSERT INTO " + quoted(table) + " (id, seq) VALUES (?, ?)")) {
-                    while (rows.next()) {
-                        long id = rows.getLong(1);
-                        long seq = rows.getLong(2);
-                        reemit.setLong(1, id);
-                        reemit.executeUpdate();
-                        insert.setLong(1, id);
-                        insert.setLong(2, seq);
-                        insert.executeUpdate();
+                    ResultSet current = statement.executeQuery(
+                            "SELECT * FROM " + quoted(table) + " ORDER BY " + quoted(SeedRows.ID))) {
+                while (current.next()) {
+                    rows.add(rowOf(current));
+                }
+            }
+            if (!rows.isEmpty()) {
+                try (PreparedStatement delete = connection.prepareStatement(
+                        "DELETE FROM " + quoted(table) + " WHERE " + quoted(SeedRows.ID) + " = ?")) {
+                    for (Map<String, Object> row : rows) {
+                        delete.setObject(1, row.get(SeedRows.ID));
+                        delete.executeUpdate();
                     }
                 }
+                insertRows(connection, table, rows);
             }
             connection.commit();
         } catch (SQLException e) {
             rollback(connection);
             throw new EnvelopeException("cannot re-emit the rows of " + table, e);
+        } catch (RuntimeException e) {
+            // The insert helper throws its own diagnosis; the transaction must still come back.
+            rollback(connection);
+            throw e;
         } finally {
             restoreAutoCommit(connection);
         }

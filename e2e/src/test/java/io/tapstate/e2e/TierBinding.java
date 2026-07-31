@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -33,8 +34,15 @@ public interface TierBinding {
     /** Discovers and persists a source model, feeding target-table creation. */
     void discoverSchema(String resourceId);
 
-    /** Lays down initial rows on a table before the run begins. */
-    void seed(TableAlias table, long rows);
+    /** Lays down initial rows on a table before the run begins, one mapping per row. */
+    void seed(TableAlias table, List<Map<String, Object>> rows);
+
+    /**
+     * Reads the one document the equality settings locate at the endpoint that owns the table, or
+     * empty when none matches. Read from outside the product like {@link #count}, and in the
+     * specification's own spelling - identity is {@code id} whatever the store calls it.
+     */
+    Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where);
 
     /** Records a lifecycle intent. Returns once the intent is recorded, not once it converges. */
     void drive(String pipelineId, LifecycleVerb verb);

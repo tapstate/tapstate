@@ -13,6 +13,12 @@
 # is the snapshot half working, not the tail replaying. The change-stream half is the sibling
 # example, a-real-change-stream-carries-rows-written-after-start.
 #
+# The rows are spelled out rather than generated, and the closing read is a document, not a count:
+# a real connector's type mapping is exactly what a synthetic connector cannot witness, so this is
+# where "the string in MySQL is the string in Mongo" is actually read - located by id, field by
+# field, through a driver that is not the product. The table's columns come from these rows; the
+# product discovers that model, derives the target from it, and must land the values intact.
+#
 # Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
 # this example, naming a directory whose jars do not resolve fails it. The default build therefore
 # stays green without it; the real-connector lane is where it always runs.
@@ -26,7 +32,12 @@ setup:
   discover: [src_mysql]
 pipeline: pipeline.tap.yml
 seed:
-  src_mysql.orders: { rows: 5 }
+  src_mysql.orders:
+    values:
+      - { id: 1, name: widget }
+      - { id: 2, name: gadget }
+      - { id: 3, name: sprocket }
 steps:
   - start
-  - await: { count: { tgt_mongo.orders: 5 } }
+  - await: { count: { tgt_mongo.orders: 3 } }
+  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, expect: { name: widget } } } }

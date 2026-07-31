@@ -66,8 +66,8 @@ class EndpointResolutionIT {
                     control, workspace, Map.of(E2eConnectorJar.CONNECTOR_ID, files), env());
             binding.applyResources(List.of("src_file.tap.yml", "tgt_file.tap.yml"));
 
-            binding.seed(new TableAlias("src_file", "orders"), INTO_THE_SOURCE);
-            binding.seed(new TableAlias("tgt_file", "orders"), INTO_THE_TARGET);
+            binding.seed(new TableAlias("src_file", "orders"), SeedRows.generated(INTO_THE_SOURCE));
+            binding.seed(new TableAlias("tgt_file", "orders"), SeedRows.generated(INTO_THE_TARGET));
 
             // Read back by the paths this test handed out, so the harness cannot agree with itself: a
             // lookup that resolved both aliases to one directory would have the second seed overwrite the
@@ -122,7 +122,7 @@ class EndpointResolutionIT {
                     env());
             binding.applyResources(List.of("src_jdbc.tap.yml"));
 
-            binding.seed(new TableAlias("src_jdbc", "orders"), 2);
+            binding.seed(new TableAlias("src_jdbc", "orders"), SeedRows.generated(2));
 
             EndpointAddress dialled = jdbc.addressDialled();
             assertThat(dialled)
@@ -149,8 +149,15 @@ class EndpointResolutionIT {
         }
 
         @Override
-        public void seed(EndpointAddress address, String table, long rows) {
+        public void seed(EndpointAddress address, String table, java.util.List<Map<String, Object>> rows) {
             dialled = address;
+        }
+
+        @Override
+        public java.util.Optional<Map<String, Object>> fetch(
+                EndpointAddress address, String table, Map<String, Object> where) {
+            dialled = address;
+            return java.util.Optional.empty();
         }
 
         @Override

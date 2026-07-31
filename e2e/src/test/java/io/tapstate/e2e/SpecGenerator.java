@@ -107,20 +107,51 @@ final class SpecGenerator {
     }
 
     private static Map<String, Object> seedDef() {
-        Map<String, Object> rows = new LinkedHashMap<>();
-        rows.put("type", "object");
-        rows.put("additionalProperties", false);
-        rows.put("required", List.of("rows"));
-        Map<String, Object> rowCount = scalar("integer", "How many rows to lay down.");
+        Map<String, Object> generated = new LinkedHashMap<>();
+        generated.put("type", "object");
+        generated.put("additionalProperties", false);
+        generated.put("required", List.of("rows"));
+        Map<String, Object> rowCount = scalar(
+                "integer", "How many generated rows to lay down: ids 1..N, each with seq equal to its id.");
         rowCount.put("minimum", 0);
-        rows.put("properties", Map.of("rows", rowCount));
+        generated.put("properties", Map.of("rows", rowCount));
+
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("type", "object");
+        row.put("description", "One row: columns and values. Every row of a table carries the same columns.");
+        row.put("required", List.of("id"));
+        row.put("properties", Map.of("id", scalar("integer", "The key rows are seeded and upserted by.")));
+        row.put("additionalProperties", scalarValue());
+
+        Map<String, Object> values = new LinkedHashMap<>();
+        values.put("type", "array");
+        values.put("description", "The rows themselves, when what they hold is the point.");
+        values.put("minItems", 1);
+        values.put("items", row);
+        Map<String, Object> explicit = new LinkedHashMap<>();
+        explicit.put("type", "object");
+        explicit.put("additionalProperties", false);
+        explicit.put("required", List.of("values"));
+        explicit.put("properties", Map.of("values", values));
+
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("description", "A generated count, or the rows themselves - one of the two.");
+        entry.put("oneOf", List.of(generated, explicit));
 
         Map<String, Object> seed = new LinkedHashMap<>();
         seed.put("type", "object");
         seed.put("description", "Rows per table, addressed as <resourceId>.<table>.");
         seed.put("propertyNames", Map.of("pattern", ALIAS_PATTERN));
-        seed.put("additionalProperties", rows);
+        seed.put("additionalProperties", entry);
         return seed;
+    }
+
+    /** The two scalars every store in this vocabulary spells the same way. */
+    private static Map<String, Object> scalarValue() {
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("type", List.of("integer", "string"));
+        value.put("description", "An integer or a string; wider value types are a widening of the vocabulary.");
+        return value;
     }
 
     private static Map<String, Object> stepDef() {
@@ -155,6 +186,7 @@ final class SpecGenerator {
             forms.add(
                     switch (word) {
                         case COUNT -> keyed(word.word(), countBody());
+                        case DOC -> keyed(word.word(), docBody());
                         case ERROR_COUNT -> keyed(word.word(), errorCountBody());
                         case STATE -> keyed(word.word(), stateBody());
                     });
@@ -195,6 +227,51 @@ final class SpecGenerator {
         body.put("propertyNames", Map.of("pattern", ALIAS_PATTERN));
         body.put("additionalProperties", rows);
         return body;
+    }
+
+    private static Map<String, Object> docBody() {
+        Map<String, Object> where = new LinkedHashMap<>();
+        where.put("type", "object");
+        where.put("description", "Equality settings locating exactly one document. Identity is spelled id "
+                + "whatever the store calls it.");
+        where.put("minProperties", 1);
+        where.put("additionalProperties", scalarValue());
+
+        Map<String, Object> expect = new LinkedHashMap<>();
+        expect.put("type", "object");
+        expect.put("description", "Scalar values by path: a.b for a field of a field, items[0].sku for a "
+                + "field of a list element.");
+        expect.put("additionalProperties", scalarValue());
+
+        Map<String, Object> length = scalar("integer", "How many elements the list at this path holds.");
+        length.put("minimum", 0);
+        Map<String, Object> size = new LinkedHashMap<>();
+        size.put("type", "object");
+        size.put("description", "List lengths by path.");
+        size.put("additionalProperties", length);
+
+        // LinkedHashMap on purpose: Map.of iterates in a per-JVM salted order, and a generated
+        // artifact whose key order changes between runs can never match its checked-in copy.
+        Map<String, Object> docProperties = new LinkedHashMap<>();
+        docProperties.put("where", where);
+        docProperties.put("expect", expect);
+        docProperties.put("size", size);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("type", "object");
+        body.put("additionalProperties", false);
+        body.put("required", List.of("where"));
+        body.put("description", "One document, located and read at the endpoint itself. Carry expect or "
+                + "size - a doc that expects nothing checks nothing.");
+        body.put("properties", docProperties);
+
+        Map<String, Object> keyedByTable = new LinkedHashMap<>();
+        keyedByTable.put("type", "object");
+        keyedByTable.put("description", "Exactly one table, addressed as <resourceId>.<table>.");
+        keyedByTable.put("minProperties", 1);
+        keyedByTable.put("maxProperties", 1);
+        keyedByTable.put("propertyNames", Map.of("pattern", ALIAS_PATTERN));
+        keyedByTable.put("additionalProperties", body);
+        return keyedByTable;
     }
 
     private static Map<String, Object> errorCountBody() {
@@ -273,6 +350,9 @@ final class SpecGenerator {
         return switch (MatcherWord.valueOf(word.toUpperCase(java.util.Locale.ROOT))) {
             case COUNT -> "Rows present at an endpoint, read from the endpoint itself rather than from "
                     + "the product's record of what it wrote.";
+            case DOC -> "One document at an endpoint, located by equality settings and held to scalar "
+                    + "values by path and list lengths by path - what makes 'the right rows crossed' "
+                    + "assertable rather than only 'rows crossed'.";
             case ERROR_COUNT -> "The pipeline's published error count, read from the metrics face: one "
                     + "while it is FAILED, zero otherwise.";
             case STATE -> "The pipeline's published lifecycle state, read from the observation face.";

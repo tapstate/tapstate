@@ -30,8 +30,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * 3" against any store: an author choosing a store should not have to learn a different row shape.
  *
  * <p>Needs Docker for the database, and nothing else - no connector jar. What a real PDK connector does
- * with this data is a different witness ({@link RealMysqlToMongoSnapshotIT}); this one is about whether
- * the harness can lay down and read back rows in MySQL at all.
+ * with this data is a different witness (the real-connector examples under {@code examples/}); this one
+ * is about whether the harness can lay down and read back rows in MySQL at all.
  */
 class MySqlEndpointsIT {
 
@@ -53,24 +53,57 @@ class MySqlEndpointsIT {
         endpoints.close();
     }
 
+    /** The table is the shape of the rows: columns from the row, id the key, strings as strings. */
+    @Test
+    void seedsTheRowsThemselvesAndReadsOneBack() {
+        endpoints.seed(at(), TABLE, List.of(
+                Map.of("id", 1L, "name", "widget"),
+                Map.of("id", 2L, "name", "gadget")));
+
+        assertThat(endpoints.count(at(), TABLE)).isEqualTo(2L);
+        assertThat(endpoints.fetch(at(), TABLE, Map.of("id", 1L)))
+                .hasValueSatisfying(row -> assertThat(row)
+                        .containsEntry("name", "widget")
+                        .containsEntry("id", 1L));
+    }
+
+    /** Empty is a reading; ambiguity is an error. A matcher polling absence must not poll ambiguity. */
+    @Test
+    void fetchAnswersEmptyForNoMatchAndRefusesMoreThanOne() {
+        endpoints.seed(at(), TABLE, List.of(
+                Map.of("id", 1L, "name", "twin"),
+                Map.of("id", 2L, "name", "twin")));
+
+        assertThat(endpoints.fetch(at(), TABLE, Map.of("id", 9L))).isEmpty();
+        assertThat(endpoints.fetch(at(), TABLE, Map.of("name", "no-such-row"))).isEmpty();
+        assertThatThrownBy(() -> endpoints.fetch(at(), TABLE, Map.of("name", "twin")))
+                .hasMessageContaining("more than one");
+    }
+
+    /** An absent table answers empty like an absent row: both read as "nothing there yet". */
+    @Test
+    void fetchAnswersEmptyForATableNoOneHasCreatedYet() {
+        assertThat(endpoints.fetch(at(), "never_created", Map.of("id", 1L))).isEmpty();
+    }
+
     @Test
     void seedingWritesTheRowsNumberedFromOne() {
-        endpoints.seed(at(), TABLE, 3);
+        endpoints.seed(at(), TABLE, SeedRows.generated(3));
 
         assertThat(rowsReadBackIndependently()).containsExactly("1,1", "2,2", "3,3");
     }
 
     @Test
     void seedingReplacesWhateverTheTableHeld() {
-        endpoints.seed(at(), TABLE, 5);
-        endpoints.seed(at(), TABLE, 2);
+        endpoints.seed(at(), TABLE, SeedRows.generated(5));
+        endpoints.seed(at(), TABLE, SeedRows.generated(2));
 
         assertThat(rowsReadBackIndependently()).containsExactly("1,1", "2,2");
     }
 
     @Test
     void countingReadsTheRowsBack() {
-        endpoints.seed(at(), TABLE, 3);
+        endpoints.seed(at(), TABLE, SeedRows.generated(3));
 
         assertThat(endpoints.count(at(), TABLE)).isEqualTo(3L);
     }
@@ -97,7 +130,7 @@ class MySqlEndpointsIT {
 
     @Test
     void insertingAppendsRowsAfterTheHighestIdTheTableHolds() {
-        endpoints.seed(at(), TABLE, 3);
+        endpoints.seed(at(), TABLE, SeedRows.generated(3));
 
         endpoints.cdc(at(), TABLE, CdcOp.INSERT, 2);
 
@@ -106,7 +139,7 @@ class MySqlEndpointsIT {
 
     @Test
     void deletingRemovesTheLowestIdsAndLowersTheCount() {
-        endpoints.seed(at(), TABLE, 4);
+        endpoints.seed(at(), TABLE, SeedRows.generated(4));
 
         endpoints.cdc(at(), TABLE, CdcOp.DELETE, 2);
 
@@ -117,7 +150,7 @@ class MySqlEndpointsIT {
     /** An update changes rows without adding or removing any, so a count cannot witness it. */
     @Test
     void updatingRewritesTheSequenceOfTheLowestIdsAndLeavesTheCountAlone() {
-        endpoints.seed(at(), TABLE, 3);
+        endpoints.seed(at(), TABLE, SeedRows.generated(3));
 
         endpoints.cdc(at(), TABLE, CdcOp.UPDATE, 2);
 
@@ -135,7 +168,7 @@ class MySqlEndpointsIT {
      */
     @Test
     void changesReachTheRowsThatAreActuallyLowestNotTheLowNumbers() {
-        endpoints.seed(at(), TABLE, 4);
+        endpoints.seed(at(), TABLE, SeedRows.generated(4));
         endpoints.cdc(at(), TABLE, CdcOp.DELETE, 2);
 
         endpoints.cdc(at(), TABLE, CdcOp.UPDATE, 2);
@@ -149,7 +182,7 @@ class MySqlEndpointsIT {
      */
     @Test
     void insertingAfterADeleteContinuesFromTheHighestIdNotTheCount() {
-        endpoints.seed(at(), TABLE, 4);
+        endpoints.seed(at(), TABLE, SeedRows.generated(4));
         endpoints.cdc(at(), TABLE, CdcOp.DELETE, 2);
 
         endpoints.cdc(at(), TABLE, CdcOp.INSERT, 1);
@@ -185,8 +218,8 @@ class MySqlEndpointsIT {
         EndpointAddress theirs =
                 new EndpointAddress("src_other", SharedMySql.settings("e2e_mysql_endpoints_other"));
 
-        endpoints.seed(mine, TABLE, 3);
-        endpoints.seed(theirs, TABLE, 5);
+        endpoints.seed(mine, TABLE, SeedRows.generated(3));
+        endpoints.seed(theirs, TABLE, SeedRows.generated(5));
 
         assertThat(endpoints.count(mine, TABLE)).isEqualTo(3L);
         assertThat(endpoints.count(theirs, TABLE)).isEqualTo(5L);

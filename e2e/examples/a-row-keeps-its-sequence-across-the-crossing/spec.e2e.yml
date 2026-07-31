@@ -1,0 +1,23 @@
+# The witness that a row's values survive the crossing, not only the row itself.
+#
+# Every count in every sibling example proves that rows crossed; none of them proves that what
+# crossed was the rows. A product that carried the keys and dropped or rewrote everything else -
+# a sink writing zeroes into every column it does not need for identity - passes every count in
+# this suite at full marks. This example is the one that fails it: after the crossing, the row
+# with id 1 must still carry its own sequence, read back field by field from the target.
+#
+# The doc read is value-level on purpose and minimal on purpose: one document, located by its id,
+# held to the one non-identity column the generated shape has. When the vocabulary gains richer
+# rows, this example is where a richer expectation lands first.
+name: a-row-keeps-its-sequence-across-the-crossing
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  discover: [src_file]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 3 }
+steps:
+  - start
+  - await: { count: { tgt_file.orders: 3 } }
+  - assert: { doc: { tgt_file.orders: { where: { id: 1 }, expect: { seq: 1 } } } }

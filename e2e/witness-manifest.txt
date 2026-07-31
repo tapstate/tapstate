@@ -12,6 +12,8 @@ a-cdc-failure-is-observable on IN_PROCESS
 a-cdc-failure-is-observable on REAL_PROCESS
 a-real-change-stream-carries-rows-written-after-start on IN_PROCESS
 a-real-change-stream-carries-rows-written-after-start on REAL_PROCESS
+a-row-keeps-its-sequence-across-the-crossing on IN_PROCESS
+a-row-keeps-its-sequence-across-the-crossing on REAL_PROCESS
 a-sink-write-failure-is-observable on IN_PROCESS
 a-sink-write-failure-is-observable on REAL_PROCESS
 real-mysql-rows-cross-to-a-real-mongo-target on IN_PROCESS

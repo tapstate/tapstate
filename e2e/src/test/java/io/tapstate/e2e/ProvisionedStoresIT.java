@@ -44,7 +44,7 @@ class ProvisionedStoresIT {
 
             // Dial exactly what a resource would have interpolated, and nothing the harness kept back.
             EndpointAddress asAResourceWouldWriteIt = addressFrom(environment, "SRC", "src_mysql");
-            driver.seed(asAResourceWouldWriteIt, "orders", 3);
+            driver.seed(asAResourceWouldWriteIt, "orders", SeedRows.generated(3));
 
             assertThat(driver.count(asAResourceWouldWriteIt, "orders")).isEqualTo(3L);
         }
@@ -61,7 +61,7 @@ class ProvisionedStoresIT {
 
             Endpoints driver = stores.driversByConnector().get("mongodb");
             EndpointAddress address = EndpointAddress.uri(stores.environment().get("TGT_URI"));
-            driver.seed(address, "orders", 2);
+            driver.seed(address, "orders", SeedRows.generated(2));
 
             assertThat(driver.count(address, "orders")).isEqualTo(2L);
         }
@@ -88,7 +88,7 @@ class ProvisionedStoresIT {
             EndpointAddress source = addressFrom(environment, "SRC", "src_mysql");
             EndpointAddress target = addressFrom(environment, "TGT", "tgt_mysql");
 
-            driver.seed(source, "orders", 4);
+            driver.seed(source, "orders", SeedRows.generated(4));
 
             assertThat(driver.count(source, "orders")).isEqualTo(4L);
             assertThat(driver.count(target, "orders"))
@@ -134,7 +134,7 @@ class ProvisionedStoresIT {
 
         try (ProvisionedStores stores = ProvisionedStores.provision(asked, "counted_by_own_handle")) {
             EndpointAddress published = addressFrom(stores.environment(), "SRC", "src_mysql");
-            stores.driversByConnector().get("mysql").seed(published, "orders", 3);
+            stores.driversByConnector().get("mysql").seed(published, "orders", SeedRows.generated(3));
 
             assertThat(stores.count("src", "orders")).isEqualTo(3L);
         }

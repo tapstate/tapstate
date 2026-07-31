@@ -102,11 +102,65 @@ public final class EnvelopeParser {
         mapping(node, "seed")
                 .forEach(
                         (alias, spec) -> {
-                            Map<String, Object> rows = mapping(spec, "seed." + alias);
-                            rejectUnknownKeys(rows.keySet(), Vocabulary.SEED_KEYS, "seed." + alias);
-                            seeds.add(new Seed(alias(alias), rowCount(rows.get("rows"), "seed." + alias + ".rows")));
+                            Map<String, Object> entry = mapping(spec, "seed." + alias);
+                            rejectUnknownKeys(entry.keySet(), Vocabulary.SEED_KEYS, "seed." + alias);
+                            seeds.add(new Seed(alias(alias), seedRows(entry, "seed." + alias)));
                         });
         return seeds;
+    }
+
+    /**
+     * The rows one seed entry lays down. {@code rows: N} is sugar for the generated shape - ids 1..N,
+     * each with a sequence equal to its id - expanded here so no driver ever decides what a row looks
+     * like. {@code values} is the general form: the rows themselves, columns and all.
+     */
+    private static List<Map<String, Object>> seedRows(Map<String, Object> entry, String at) {
+        Object rows = entry.get("rows");
+        Object values = entry.get("values");
+        if ((rows == null) == (values == null)) {
+            throw new EnvelopeException(at + " carries exactly one of rows or values");
+        }
+        if (rows != null) {
+            return SeedRows.generated(rowCount(rows, at + ".rows"));
+        }
+        return valueRows(values, at + ".values");
+    }
+
+    /**
+     * Explicit rows: each carries {@code id} (the key everything seeds and upserts by), every row
+     * carries the same columns (one table, one shape), and every value is an integer or a string -
+     * the two scalars whose crossing every store in this vocabulary spells the same way. Wider value
+     * types are a widening of this word, not a loosening of this check.
+     */
+    private static List<Map<String, Object>> valueRows(Object node, String at) {
+        if (!(node instanceof List<?> sequence) || sequence.isEmpty()) {
+            throw new EnvelopeException(at + " must be a non-empty sequence of rows, found: " + describe(node));
+        }
+        List<Map<String, Object>> rows = new ArrayList<>();
+        Set<String> shape = null;
+        for (int i = 0; i < sequence.size(); i++) {
+            String rowAt = at + "[" + i + "]";
+            Map<String, Object> row = mapping(sequence.get(i), rowAt);
+            if (!row.containsKey(SeedRows.ID)) {
+                throw new EnvelopeException(rowAt + " carries no id, the key rows are seeded and upserted by");
+            }
+            row.forEach((column, value) -> requireScalar(value, rowAt + "." + column));
+            if (shape == null) {
+                shape = row.keySet();
+            } else if (!shape.equals(row.keySet())) {
+                throw new EnvelopeException(
+                        rowAt + " does not carry the same columns as the rows before it: one table, one shape");
+            }
+            rows.add(new LinkedHashMap<>(row));
+        }
+        return rows;
+    }
+
+    private static void requireScalar(Object value, String at) {
+        if (!(value instanceof Integer || value instanceof Long || value instanceof String)) {
+            throw new EnvelopeException(
+                    at + " must be an integer or a string, found: " + describe(value));
+        }
     }
 
     private static List<Step> steps(Object node) {
@@ -218,9 +272,43 @@ public final class EnvelopeParser {
         Map.Entry<String, Object> only = mapping.entrySet().iterator().next();
         return switch (matcherWord(only.getKey())) {
             case COUNT -> count(only.getValue());
+            case DOC -> doc(only.getValue());
             case ERROR_COUNT -> new Matcher.ErrorCount(rowCount(only.getValue(), "error_count"));
             case STATE -> new Matcher.State(pipelineState(only.getValue()));
         };
+    }
+
+    /** One table, one document: located by {@code where}, held to {@code expect} and {@code size}. */
+    private static Matcher doc(Object node) {
+        Map<String, Object> mapping = mapping(node, "doc");
+        if (mapping.size() != 1) {
+            throw new EnvelopeException("doc names exactly one table, found: " + mapping.keySet());
+        }
+        Map.Entry<String, Object> only = mapping.entrySet().iterator().next();
+        String at = "doc." + only.getKey();
+        Map<String, Object> body = mapping(only.getValue(), at);
+        rejectUnknownKeys(body.keySet(), Vocabulary.DOC_KEYS, at);
+
+        Map<String, Object> where = mapping(body.get("where"), at + ".where");
+        if (where.isEmpty()) {
+            throw new EnvelopeException(at + ".where must name at least one setting to locate the document by");
+        }
+        where.forEach((setting, value) -> requireScalar(value, at + ".where." + setting));
+
+        Map<String, Object> expect = body.get("expect") == null
+                ? Map.of()
+                : mapping(body.get("expect"), at + ".expect");
+        expect.forEach((path, value) -> requireScalar(value, at + ".expect." + path));
+
+        Map<String, Long> size = new LinkedHashMap<>();
+        if (body.get("size") != null) {
+            mapping(body.get("size"), at + ".size")
+                    .forEach((path, length) -> size.put(path, rowCount(length, at + ".size." + path)));
+        }
+        if (expect.isEmpty() && size.isEmpty()) {
+            throw new EnvelopeException(at + " holds the document to nothing: carry expect or size");
+        }
+        return new Matcher.Doc(alias(only.getKey()), where, expect, size);
     }
 
     private static Matcher count(Object node) {

@@ -95,9 +95,15 @@ final class HttpTierBinding implements TierBinding {
     }
 
     @Override
-    public void seed(TableAlias table, long rows) {
+    public void seed(TableAlias table, List<Map<String, Object>> rows) {
         Endpoint endpoint = endpoint(table);
         endpoint.driver().seed(endpoint.address(), table.table(), rows);
+    }
+
+    @Override
+    public Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where) {
+        Endpoint endpoint = endpoint(table);
+        return endpoint.driver().fetch(endpoint.address(), table.table(), where);
     }
 
     @Override

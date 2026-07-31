@@ -7,6 +7,10 @@
       "description": "Rows present at an endpoint, read from the endpoint itself rather than from the product's record of what it wrote."
     },
     {
+      "word": "doc",
+      "description": "One document at an endpoint, located by equality settings and held to scalar values by path and list lengths by path - what makes 'the right rows crossed' assertable rather than only 'rows crossed'."
+    },
+    {
       "word": "error_count",
       "description": "The pipeline's published error count, read from the metrics face: one while it is FAILED, zero otherwise."
     },

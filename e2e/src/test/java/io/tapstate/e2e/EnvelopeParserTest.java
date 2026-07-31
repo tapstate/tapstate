@@ -45,7 +45,7 @@ class EnvelopeParserTest {
         assertThat(envelope.setup().connectors()).containsExactly("mongodb");
         assertThat(envelope.setup().apply()).containsExactly("src_mongo.tap.yml", "tgt_mongo.tap.yml");
         assertThat(envelope.setup().discover()).containsExactly("src_mongo");
-        assertThat(envelope.seed()).containsExactly(new Seed(new TableAlias("src_mongo", "orders"), 100L));
+        assertThat(envelope.seed()).containsExactly(new Seed(new TableAlias("src_mongo", "orders"), SeedRows.generated(100)));
     }
 
     /**
@@ -247,7 +247,7 @@ class EnvelopeParserTest {
                 EnvelopeParser.parse(minimal("seed:\n  a.t1: { rows: 1 }\n  b.t2: { rows: 2 }\nsteps:\n  - start\n"));
 
         assertThat(envelope.seed())
-                .containsExactly(new Seed(new TableAlias("a", "t1"), 1L), new Seed(new TableAlias("b", "t2"), 2L));
+                .containsExactly(new Seed(new TableAlias("a", "t1"), SeedRows.generated(1)), new Seed(new TableAlias("b", "t2"), SeedRows.generated(2)));
     }
 
     @Test
@@ -344,6 +344,82 @@ class EnvelopeParserTest {
 
         assertThat(envelope.steps()).isUnmodifiable();
         assertThat(envelope.seed()).isUnmodifiable();
+    }
+
+    @Test
+    void seedValuesAreTheRowsThemselves() {
+        Envelope envelope = EnvelopeParser.parse(minimal(
+                "seed:\n  src_mongo.orders:\n    values:\n      - { id: 1, name: widget }\n"
+                        + "      - { id: 2, name: gadget }\nsteps:\n  - start\n"));
+
+        assertThat(envelope.seed()).hasSize(1);
+        assertThat(envelope.seed().getFirst().rows())
+                .containsExactly(
+                        java.util.Map.of("id", 1, "name", "widget"),
+                        java.util.Map.of("id", 2, "name", "gadget"));
+    }
+
+    /** rows: N is sugar for the generated shape, so the two forms cannot disagree about one table. */
+    @Test
+    void aSeedEntryCarriesExactlyOneOfRowsOrValues() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    rows: 2\n    values: [ { id: 1 } ]\nsteps:\n  - start\n")))
+                .hasMessageContaining("exactly one of rows or values");
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal("seed:\n  a.t: {}\nsteps:\n  - start\n")))
+                .hasMessageContaining("exactly one of rows or values");
+    }
+
+    @Test
+    void aSeedValueRowWithoutAnIdIsRefused() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    values: [ { name: widget } ]\nsteps:\n  - start\n")))
+                .hasMessageContaining("carries no id");
+    }
+
+    /** The two scalars every store spells the same way; anything wider is a vocabulary widening. */
+    @Test
+    void aSeedValueBeyondIntegerOrStringIsRefused() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    values: [ { id: 1, price: 1.5 } ]\nsteps:\n  - start\n")))
+                .hasMessageContaining("must be an integer or a string");
+    }
+
+    @Test
+    void seedValueRowsCarryOneShape() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    values:\n      - { id: 1, name: widget }\n      - { id: 2 }\n"
+                        + "steps:\n  - start\n")))
+                .hasMessageContaining("same columns");
+    }
+
+    @Test
+    void aDocMatcherReadsWhereExpectAndSize() {
+        Envelope envelope = EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                        + "expect: { name: widget, \"items[0].sku\": x }, size: { items: 2 } } } }\n"));
+
+        Step.Assertion assertion = (Step.Assertion) envelope.steps().getFirst();
+        Matcher.Doc doc = (Matcher.Doc) assertion.matcher();
+        assertThat(doc.table()).isEqualTo(new TableAlias("tgt_mongo", "orders"));
+        assertThat(doc.where()).containsExactly(java.util.Map.entry("id", 1));
+        assertThat(doc.expect()).containsKeys("name", "items[0].sku");
+        assertThat(doc.size()).containsExactly(java.util.Map.entry("items", 2L));
+    }
+
+    /** A doc that expects nothing would hold for any document at all, including the wrong one. */
+    @Test
+    void aDocMatcherWithoutExpectationsIsRefused() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 } } } }\n")))
+                .hasMessageContaining("carry expect or size");
+    }
+
+    @Test
+    void aDocMatcherNamesExactlyOneTable() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { x: 1 } }, "
+                        + "b.t: { where: { id: 1 }, expect: { x: 1 } } } }\n")))
+                .hasMessageContaining("exactly one table");
     }
 
     private static String minimal(String body) {

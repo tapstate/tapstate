@@ -35,22 +35,22 @@ class FileEndpointsTest {
 
     @Test
     void seedingWritesAHeaderAndTheRowsNumberedFromOne() throws IOException {
-        endpoints.seed(at(), "orders", 3);
+        endpoints.seed(at(), "orders", SeedRows.generated(3));
 
         assertThat(lines("orders")).containsExactly("id,seq", "1,1", "2,2", "3,3");
     }
 
     @Test
     void seedingReplacesWhateverTheTableHeld() throws IOException {
-        endpoints.seed(at(), "orders", 5);
-        endpoints.seed(at(), "orders", 2);
+        endpoints.seed(at(), "orders", SeedRows.generated(5));
+        endpoints.seed(at(), "orders", SeedRows.generated(2));
 
         assertThat(lines("orders")).containsExactly("id,seq", "1,1", "2,2");
     }
 
     @Test
     void countingReadsTheRowsBackWithoutTheHeader() {
-        endpoints.seed(at(), "orders", 3);
+        endpoints.seed(at(), "orders", SeedRows.generated(3));
 
         assertThat(endpoints.count(at(), "orders")).isEqualTo(3L);
     }
@@ -74,7 +74,7 @@ class FileEndpointsTest {
 
     @Test
     void insertingAppendsRowsAfterTheHighestIdTheTableHolds() throws IOException {
-        endpoints.seed(at(), "orders", 3);
+        endpoints.seed(at(), "orders", SeedRows.generated(3));
 
         endpoints.cdc(at(), "orders", CdcOp.INSERT, 2);
 
@@ -83,7 +83,7 @@ class FileEndpointsTest {
 
     @Test
     void deletingRemovesTheLowestIdsAndLowersTheCount() throws IOException {
-        endpoints.seed(at(), "orders", 4);
+        endpoints.seed(at(), "orders", SeedRows.generated(4));
 
         endpoints.cdc(at(), "orders", CdcOp.DELETE, 2);
 
@@ -94,7 +94,7 @@ class FileEndpointsTest {
     /** An update changes rows without adding or removing any, so a count cannot witness it. */
     @Test
     void updatingRewritesTheSequenceOfTheLowestIdsAndLeavesTheCountAlone() throws IOException {
-        endpoints.seed(at(), "orders", 3);
+        endpoints.seed(at(), "orders", SeedRows.generated(3));
 
         endpoints.cdc(at(), "orders", CdcOp.UPDATE, 2);
 

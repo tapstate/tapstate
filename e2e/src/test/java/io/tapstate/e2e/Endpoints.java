@@ -1,5 +1,9 @@
 package io.tapstate.e2e;
 
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
 /**
  * The endpoints a specification lays data on and reads data from, reached with a driver of the
  * harness's own rather than through the product.
@@ -20,11 +24,27 @@ package io.tapstate.e2e;
  */
 interface Endpoints extends AutoCloseable {
 
-    /** Lays {@code rows} rows down, numbered from one, replacing whatever the table held. */
-    void seed(EndpointAddress address, String table, long rows);
+    /**
+     * Lays the given rows down, replacing whatever the table held. Rows arrive explicit - columns and
+     * values, every row carrying {@code id} - and the driver spells them its store's way; no driver
+     * decides what a row looks like.
+     */
+    void seed(EndpointAddress address, String table, List<Map<String, Object>> rows);
 
-    /** Produces {@code rows} changes of one kind against a table that is already seeded. */
+    /**
+     * Produces {@code rows} changes of one kind against a table that is already seeded. The change
+     * generators assume the generated row shape (an id and a sequence); driving them against a table
+     * seeded with other columns fails loudly rather than inventing a change.
+     */
     void cdc(EndpointAddress address, String table, CdcOp op, long rows);
+
+    /**
+     * The one document the equality settings locate, or empty when none matches. Identity is spelled
+     * {@code id} in the settings and in the returned document whatever the store calls it; the
+     * translation is the driver's. More than one match is an error - a matcher that silently read the
+     * first of many would hold or fail by insertion order.
+     */
+    Optional<Map<String, Object>> fetch(EndpointAddress address, String table, Map<String, Object> where);
 
     /**
      * Re-emits the table's current rows as fresh change events under their existing keys, for a change

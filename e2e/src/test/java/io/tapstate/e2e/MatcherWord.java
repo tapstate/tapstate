@@ -21,6 +21,15 @@ enum MatcherWord {
     COUNT,
 
     /**
+     * One document at an endpoint, located by equality settings and held to scalar values by path and
+     * to list lengths by path. This is the word that makes "the right rows crossed" assertable rather
+     * than only "rows crossed": a count is satisfied by any rows at all, and every value-level claim -
+     * a field surviving the crossing, an embedded array holding exactly its children - needs to read
+     * inside one document. Reads through the same independent driver a count does.
+     */
+    DOC,
+
+    /**
      * The count of observable errors the pipeline has published. Its source is the metrics read face,
      * which the runtime derives from the pipeline's actual state - one while it is FAILED, zero otherwise -
      * so a dead data-plane job is an assertable statistic and not only a log line. The other run

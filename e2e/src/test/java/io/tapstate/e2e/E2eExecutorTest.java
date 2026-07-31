@@ -302,6 +302,49 @@ class E2eExecutorTest {
         assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
     }
 
+    @Test
+    void holdsADocumentToValuesByPathAndListSizesByPath() {
+        binding.holdsDocument(TARGET, Map.of(
+                "id", 1L,
+                "name", "widget",
+                "items", List.of(Map.of("sku", "a"), Map.of("sku", "b"))));
+
+        execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                + "expect: { name: widget, \"items[1].sku\": b }, size: { items: 2 } } } }\n"));
+    }
+
+    /** Absence and disagreement send an author to different places, so they read differently. */
+    @Test
+    void reportsAnAbsentDocumentAsItsOwnMismatch() {
+        assertThatThrownBy(() -> execute(minimal(
+                "steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, expect: { name: widget } } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("holds no document where {id=1}");
+    }
+
+    /** All the disagreeing paths, not the first: one read, one full account. */
+    @Test
+    void reportsEveryDisagreeingPathInOneReading() {
+        binding.holdsDocument(TARGET, Map.of("id", 1L, "name", "gadget", "items", List.of()));
+
+        assertThatThrownBy(() -> execute(minimal(
+                "steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                        + "expect: { name: widget, missing: x }, size: { items: 2 } } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("at name expected widget, found gadget")
+                .hasMessageContaining("has nothing at missing")
+                .hasMessageContaining("at items expected 2 elements, found 0");
+    }
+
+    /** Whole numbers agree across representations: a store answering Int32 for a long is the same value. */
+    @Test
+    void holdsWholeNumbersAcrossTheirRepresentations() {
+        binding.holdsDocument(TARGET, Map.of("id", 1, "seq", 7));
+
+        execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                + "expect: { seq: 7 } } } }\n"));
+    }
+
     private void execute(String yaml) {
         binding.calls.clear();
         new E2eExecutor(binding, path -> PIPELINE_ID, Duration.ofMillis(200), Duration.ofMillis(1))
@@ -385,8 +428,20 @@ class E2eExecutorTest {
         }
 
         @Override
-        public void seed(TableAlias table, long rows) {
-            calls.add("seed:" + table + "=" + rows);
+        public void seed(TableAlias table, List<Map<String, Object>> rows) {
+            calls.add("seed:" + table + "=" + rows.size());
+        }
+
+        private final Map<TableAlias, Map<String, Object>> fetchable = new HashMap<>();
+
+        void holdsDocument(TableAlias table, Map<String, Object> document) {
+            fetchable.put(table, document);
+        }
+
+        @Override
+        public Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where) {
+            calls.add("fetch:" + table + "=" + where);
+            return Optional.ofNullable(fetchable.get(table));
         }
 
         @Override

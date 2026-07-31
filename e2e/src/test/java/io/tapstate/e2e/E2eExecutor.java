@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+
 /**
  * Runs a specification against one tier binding.
  *
@@ -143,9 +144,83 @@ public final class E2eExecutor {
     private Optional<String> mismatch(Matcher matcher, String pipelineId) {
         return switch (matcher) {
             case Matcher.Count count -> countMismatch(count.expected());
+            case Matcher.Doc doc -> docMismatch(doc);
             case Matcher.State state -> stateMismatch(state.expected(), pipelineId);
             case Matcher.ErrorCount errorCount -> errorCountMismatch(errorCount.expected(), pipelineId);
         };
+    }
+
+    /**
+     * Holds one document to the matcher's expectations, all of them, so a failure names every path
+     * that disagrees rather than the first. An absent document is its own mismatch - the ordinary
+     * reading while an await sits out a crossing - and never conflated with a present document that
+     * disagrees, which sends an author to a different place.
+     */
+    private Optional<String> docMismatch(Matcher.Doc doc) {
+        Optional<Map<String, Object>> fetched = binding.fetch(doc.table(), doc.where());
+        if (fetched.isEmpty()) {
+            return Optional.of(doc.table() + " holds no document where " + doc.where());
+        }
+        Map<String, Object> document = fetched.get();
+        List<String> mismatches = new ArrayList<>();
+        doc.expect().forEach((path, expected) -> {
+            Optional<Object> actual = valueAt(document, path);
+            if (actual.isEmpty()) {
+                mismatches.add(doc.table() + " has nothing at " + path);
+            } else if (!scalarsAgree(expected, actual.get())) {
+                mismatches.add(doc.table() + " at " + path + " expected " + expected + ", found " + actual.get());
+            }
+        });
+        doc.size().forEach((path, expected) -> {
+            Optional<Object> actual = valueAt(document, path);
+            if (actual.isEmpty()) {
+                mismatches.add(doc.table() + " has nothing at " + path);
+            } else if (!(actual.get() instanceof List<?> list)) {
+                mismatches.add(doc.table() + " at " + path + " is not a list, so it has no size: " + actual.get());
+            } else if (list.size() != expected) {
+                mismatches.add(doc.table() + " at " + path + " expected " + expected + " elements, found " + list.size());
+            }
+        });
+        return mismatches.isEmpty() ? Optional.empty() : Optional.of(String.join("; ", mismatches));
+    }
+
+    /**
+     * Walks a path of the shape {@code a.b} and {@code items[0].sku} into nested mappings and lists.
+     * Empty when anything along the way is absent, out of range, or not the shape the next segment
+     * needs - all of which read as "nothing there", which is what a polling await must see while a
+     * document is still being assembled.
+     */
+    private static Optional<Object> valueAt(Map<String, Object> document, String path) {
+        Object current = document;
+        for (String segment : path.split("\\.")) {
+            int bracket = segment.indexOf('[');
+            String field = bracket < 0 ? segment : segment.substring(0, bracket);
+            if (!(current instanceof Map<?, ?> mapping) || !mapping.containsKey(field)) {
+                return Optional.empty();
+            }
+            current = mapping.get(field);
+            while (bracket >= 0) {
+                int close = segment.indexOf(']', bracket);
+                int index = Integer.parseInt(segment.substring(bracket + 1, close));
+                if (!(current instanceof List<?> list) || index >= list.size()) {
+                    return Optional.empty();
+                }
+                current = list.get(index);
+                bracket = segment.indexOf('[', close);
+            }
+        }
+        return Optional.ofNullable(current);
+    }
+
+    /**
+     * Whole numbers agree across their representations - a store answering Int32 for a value written
+     * as a long is the same value - and everything else agrees the ordinary way.
+     */
+    private static boolean scalarsAgree(Object expected, Object actual) {
+        if (expected instanceof Number left && actual instanceof Number right) {
+            return left.longValue() == right.longValue();
+        }
+        return expected.equals(actual);
     }
 
     private Optional<String> countMismatch(Map<TableAlias, Long> expected) {
