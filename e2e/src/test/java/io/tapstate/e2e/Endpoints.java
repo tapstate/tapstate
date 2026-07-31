@@ -26,6 +26,15 @@ interface Endpoints extends AutoCloseable {
     /** Produces {@code rows} changes of one kind against a table that is already seeded. */
     void cdc(EndpointAddress address, String table, CdcOp op, long rows);
 
+    /**
+     * Re-emits the table's current rows as fresh change events under their existing keys, for a change
+     * stream that was not yet positioned when the rows were first written. The default does nothing:
+     * a store whose stream replays from the origin cannot lose an early change, so there is nothing to
+     * re-emit. A store with a positional stream overrides this with a real re-emission.
+     */
+    default void redeliver(EndpointAddress address, String table) {
+    }
+
     /** The rows the table holds now; zero when the product has not created it yet. */
     long count(EndpointAddress address, String table);
 

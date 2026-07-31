@@ -19,10 +19,23 @@ import java.util.Optional;
  */
 public final class E2eExecutor {
 
+    /**
+     * Consecutive identical readings before a stalled await redelivers the last changed table. A real
+     * change stream positions itself some time after it is asked for, and a change written into that
+     * window is never delivered; nothing observable announces readiness, so the executor watches for
+     * its opposite - a reading that has stopped moving - and re-asserts the change. Redelivery is
+     * idempotent under existing keys, so reading a slow delivery as a lost one costs a duplicate the
+     * target absorbs, while the reverse misreading would be a timeout.
+     */
+    private static final int STALLED_POLLS = 15;
+
     private final TierBinding binding;
     private final PipelineLoader pipelineLoader;
     private final Duration timeout;
     private final Duration pollInterval;
+
+    /** The table the last cdc step changed, until an await confirms the change arrived. */
+    private TableAlias lastChanged;
 
     public E2eExecutor(
             TierBinding binding, PipelineLoader pipelineLoader, Duration timeout, Duration pollInterval) {
@@ -33,6 +46,7 @@ public final class E2eExecutor {
     }
 
     public void execute(Envelope envelope) {
+        lastChanged = null;
         String pipelineId = pipelineLoader.resolvePipelineId(envelope.pipeline());
         provision(envelope.setup());
         for (Seed seed : envelope.seed()) {
@@ -71,9 +85,17 @@ public final class E2eExecutor {
     private void execute(Step step, String pipelineId) {
         switch (step) {
             case Step.Lifecycle lifecycle -> binding.drive(pipelineId, lifecycle.verb());
-            case Step.Cdc cdc -> binding.cdc(cdc.table(), cdc.op(), cdc.rows());
+            case Step.Cdc cdc -> {
+                binding.cdc(cdc.table(), cdc.op(), cdc.rows());
+                lastChanged = cdc.table();
+            }
             case Step.Assertion assertion -> check(assertion.matcher(), pipelineId);
-            case Step.Await await -> await(await.matcher(), pipelineId);
+            case Step.Await await -> {
+                await(await.matcher(), pipelineId);
+                // The await held, so the change it was waiting on arrived; a later stall is not this
+                // change's loss, and redelivering it there would be noise against a different problem.
+                lastChanged = null;
+            }
         }
     }
 
@@ -88,6 +110,8 @@ public final class E2eExecutor {
     private void await(Matcher matcher, String pipelineId) {
         long start = System.nanoTime();
         long deadline = start + timeout.toNanos();
+        String previousMismatch = null;
+        int identicalReadings = 0;
         while (true) {
             Optional<String> mismatch = mismatch(matcher, pipelineId);
             if (mismatch.isEmpty()) {
@@ -101,6 +125,15 @@ public final class E2eExecutor {
                                 + timeout
                                 + "); "
                                 + mismatch.get());
+            }
+            // The mismatch text carries the reading, so identical text is a reading that has stopped
+            // moving. Stalled long enough with an undelivered change on record, the change is
+            // re-asserted; the counter restarts so the redelivery gets its own full window to arrive.
+            identicalReadings = mismatch.get().equals(previousMismatch) ? identicalReadings + 1 : 1;
+            previousMismatch = mismatch.get();
+            if (identicalReadings >= STALLED_POLLS && lastChanged != null) {
+                binding.redeliver(lastChanged);
+                identicalReadings = 0;
             }
             sleep(pollInterval);
         }

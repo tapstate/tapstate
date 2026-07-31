@@ -247,6 +247,61 @@ class E2eExecutorTest {
         assertThat(binding.countReads).isEqualTo(1);
     }
 
+    /**
+     * A change written right after a real change stream comes up can land in the source before the
+     * stream is positioned, and is then never delivered: the await that follows stalls at a reading
+     * that never moves. The executor closes that window without a fixed sleep: an await that reads the
+     * same mismatch enough consecutive polls, when the last step was a change, asks the binding to
+     * redeliver the changed table's current rows. Redelivery re-asserts state row-wise, so a batch that
+     * was merely slow is absorbed by the same keys rather than doubled.
+     */
+    @Test
+    void aStalledAwaitAfterAChangeRedeliversTheChangedTable() {
+        binding.countsOverTime(TARGET, 5L);
+        binding.onRedeliverCountBecomes(TARGET, 8L);
+
+        execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { count: { tgt_mongo.orders: 8 } }\n"));
+
+        assertThat(binding.calls).contains("redeliver:src_mongo.orders");
+    }
+
+    /** Redelivery exists for lost changes; an await with no change before it has nothing to redeliver. */
+    @Test
+    void aStalledAwaitWithNoPrecedingChangeNeverRedelivers() {
+        binding.countsOverTime(TARGET, 5L);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - await: { count: { tgt_mongo.orders: 8 } }\n")))
+                .isInstanceOf(AssertionError.class);
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
+    /** A reading that keeps moving is a delivery in progress, not a loss; redelivering it would double it. */
+    @Test
+    void anAwaitStillMakingProgressIsNotRedelivered() {
+        binding.countsOverTime(TARGET, 5L, 5L, 6L, 6L, 7L, 7L, 8L);
+
+        execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { count: { tgt_mongo.orders: 8 } }\n"));
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
+    /** Once an await has held, its change was delivered; a later stall is not that change's fault. */
+    @Test
+    void aDeliveredChangeIsNotRedeliveredByALaterAwait() {
+        binding.countsOverTime(TARGET, 8L);
+        binding.countsOverTime(SOURCE, 0L);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { count: { tgt_mongo.orders: 8 } }\n"
+                + "  - await: { count: { src_mongo.orders: 9 } }\n")))
+                .isInstanceOf(AssertionError.class);
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
     private void execute(String yaml) {
         binding.calls.clear();
         new E2eExecutor(binding, path -> PIPELINE_ID, Duration.ofMillis(200), Duration.ofMillis(1))
@@ -343,6 +398,23 @@ class E2eExecutorTest {
         @Override
         public void cdc(TableAlias table, CdcOp op, long rows) {
             calls.add("cdc:" + table + "=" + op + " x" + rows);
+        }
+
+        private TableAlias redeliverMovesTable;
+        private long redeliverMovesTo;
+
+        /** Arranges for a redelivery to unblock a count, the way a re-emitted batch reaches a target. */
+        void onRedeliverCountBecomes(TableAlias table, long value) {
+            redeliverMovesTable = table;
+            redeliverMovesTo = value;
+        }
+
+        @Override
+        public void redeliver(TableAlias table) {
+            calls.add("redeliver:" + table);
+            if (redeliverMovesTable != null) {
+                countsOverTime(redeliverMovesTable, redeliverMovesTo);
+            }
         }
 
         @Override

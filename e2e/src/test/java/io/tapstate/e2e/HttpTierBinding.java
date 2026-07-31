@@ -112,6 +112,21 @@ final class HttpTierBinding implements TierBinding {
     }
 
     @Override
+    public void redeliver(TableAlias table) {
+        Endpoint endpoint = endpoint(table);
+        endpoint.driver().redeliver(endpoint.address(), table.table());
+    }
+
+    /**
+     * The address a table's resource carries, as the harness resolved it. This is the bridge a guard
+     * outside this class needs: which provisioned store a resource actually landed on can only be told
+     * from the address, and the address lives here.
+     */
+    EndpointAddress addressOf(TableAlias table) {
+        return endpoint(table).address();
+    }
+
+    @Override
     public long count(TableAlias table) {
         Endpoint endpoint = endpoint(table);
         return endpoint.driver().count(endpoint.address(), table.table());

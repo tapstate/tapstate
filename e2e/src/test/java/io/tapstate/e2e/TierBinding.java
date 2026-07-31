@@ -42,6 +42,19 @@ public interface TierBinding {
     /** Produces changes against a table while the pipeline runs. */
     void cdc(TableAlias table, CdcOp op, long rows);
 
+    /**
+     * Re-emits a table's current rows as fresh change events, row keys unchanged.
+     *
+     * <p>This exists for one seam: a change written to a real source right after its change stream is
+     * asked for can land before the stream is positioned, and is then never delivered - nothing the
+     * product publishes says when the stream is ready, so no await can be written against readiness
+     * itself. Redelivery re-asserts the table's current state row-wise instead; a batch that was lost
+     * is re-emitted and one that was merely slow arrives twice under the same keys, which an upserting
+     * target absorbs. Deletions already delivered are not compensated: redelivery only re-emits rows
+     * that still exist.
+     */
+    void redeliver(TableAlias table);
+
     /** Reads the current row count from the endpoint that owns the table. */
     long count(TableAlias table);
 

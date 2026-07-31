@@ -72,6 +72,64 @@ final class MySqlEndpoints implements Endpoints {
     }
 
     /**
+     * Re-emits every current row as a delete followed by an insert of the same values, in one
+     * transaction. The binlog is positional: a row written before the product's tail is positioned is
+     * never delivered, and nothing observable says when positioning is done. Re-emitting the whole
+     * table under existing ids is idempotent at any upserting target - rows that already crossed are
+     * overwritten with themselves - so it is safe to do on nothing more than suspicion of a stall.
+     */
+    @Override
+    public void redeliver(EndpointAddress address, String table) {
+        Connection connection = connection(address);
+        if (!exists(connection, address, table)) {
+            return;
+        }
+        try {
+            connection.setAutoCommit(false);
+            try (Statement statement = connection.createStatement();
+                    ResultSet rows = statement.executeQuery(
+                            "SELECT id, seq FROM " + quoted(table) + " ORDER BY id")) {
+                try (PreparedStatement reemit = connection.prepareStatement(
+                        "DELETE FROM " + quoted(table) + " WHERE id = ?");
+                        PreparedStatement insert = connection.prepareStatement(
+                                "INSERT INTO " + quoted(table) + " (id, seq) VALUES (?, ?)")) {
+                    while (rows.next()) {
+                        long id = rows.getLong(1);
+                        long seq = rows.getLong(2);
+                        reemit.setLong(1, id);
+                        reemit.executeUpdate();
+                        insert.setLong(1, id);
+                        insert.setLong(2, seq);
+                        insert.executeUpdate();
+                    }
+                }
+            }
+            connection.commit();
+        } catch (SQLException e) {
+            rollback(connection);
+            throw new EnvelopeException("cannot re-emit the rows of " + table, e);
+        } finally {
+            restoreAutoCommit(connection);
+        }
+    }
+
+    private static void rollback(Connection connection) {
+        try {
+            connection.rollback();
+        } catch (SQLException rollbackIsBestEffort) {
+            // The re-emission already failed; the original failure is the one worth reporting.
+        }
+    }
+
+    private static void restoreAutoCommit(Connection connection) {
+        try {
+            connection.setAutoCommit(true);
+        } catch (SQLException e) {
+            throw new EnvelopeException("cannot restore auto-commit after a re-emission", e);
+        }
+    }
+
+    /**
      * The rows the table holds now, or none when the table is not there. A table the product has not
      * created yet is absent rather than empty, and the honest count of it is zero: a specification that
      * waits for a first write is waiting for exactly this reading to move. Letting the database's "no
