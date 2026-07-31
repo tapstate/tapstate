@@ -3,18 +3,24 @@ package io.tapstate.e2e;
 import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.function.UnaryOperator;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,16 +41,25 @@ import static org.assertj.core.api.Assertions.assertThat;
  * otherwise. What each example is for, and why its numbers are what they are, is written in the example
  * itself - it is the file an author opens.
  *
- * <p>The count it settles on is then read again, by the path this class handed out rather than by the
- * alias the example named. Every await resolves its address out of the example's own resource, so an
- * example whose target names the source's address counts the rows the harness seeded itself: it settles
- * on the first poll, before the product has emitted anything, and is green with the connector deleted.
- * Resolving faithfully is not enough when the resource is what is wrong - a faithful lookup returns the
- * wrong directory just as faithfully - so the last word belongs to an address the example cannot name.
+ * <p>The count it settles on is then read again, from outside the example's own addressing. Every await
+ * resolves its address out of the example's own resource, so an example whose target names the source's
+ * address counts the rows the harness seeded itself: it settles on the first poll, before the product has
+ * emitted anything, and is green with the connector deleted. Resolving faithfully is not enough when the
+ * resource is what is wrong - a faithful lookup returns the wrong directory just as faithfully - so the
+ * last word belongs to a reading the example cannot influence. For a file example that is a count over
+ * the target directory this run handed out. For an example that asked for stores, it is two facts read
+ * over the run's own handles: the store its settled table actually landed on is not one the seed went
+ * into, and that store's own count agrees - together they refuse the seeded rows counted back, however
+ * the resource came to point there.
  *
  * <p>That read is what obliges an example to settle on a count, and to mean the target by it. The
  * obligation is small and it is checked: an example that never settles fails before it runs, rather than
  * quietly skipping the one assertion that does not take its word for anything.
+ *
+ * <p>An example naming real connectors is gated the way any real-connector witness is: naming no
+ * connectors directory skips it, a directory whose jars do not resolve fails it. The gate reads the
+ * directory named from outside before this class points the registration path at its own staging
+ * directory, so the decision is about the operator's intent, not about the staging.
  */
 class PublishedExamplesIT {
 
@@ -61,20 +76,45 @@ class PublishedExamplesIT {
     private Path targetDirectory;
 
     private String previousConnectorsDir;
+    private boolean connectorsDirOverridden;
 
     @BeforeAll
     static void requireDocker() {
         DockerGate.require();
     }
 
-    @BeforeEach
-    void publishTheConnectorJar() {
+    /**
+     * Stages every jar the example registers into a directory of this run's own, then points the
+     * registration path there. The synthetic connector is built fresh; real connectors are copied from
+     * the directory named from outside, gated first - so a developer machine skips a real-connector
+     * example the way it skips any real-connector witness, and a named-but-broken directory fails it.
+     * The gate must run before the property is overridden: it is asking about the outside directory.
+     */
+    private void stageConnectorJars(List<String> connectorIds) {
+        List<String> real = connectorIds.stream()
+                .filter(connectorId -> !E2eConnectorJar.CONNECTOR_ID.equals(connectorId))
+                .toList();
+        if (!real.isEmpty()) {
+            RealConnectorGate.require(real.toArray(String[]::new));
+            try {
+                for (String connectorId : real) {
+                    Files.write(connectorJars.resolve(connectorId + "-connector.jar"),
+                            ConnectorJars.bytesFor(connectorId));
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException("cannot stage real connector jars for this run", e);
+            }
+        }
         E2eConnectorJar.buildInto(connectorJars);
         previousConnectorsDir = System.setProperty("tapstate.e2e.connectors-dir", connectorJars.toString());
+        connectorsDirOverridden = true;
     }
 
     @AfterEach
     void restoreTheConnectorsDirectory() {
+        if (!connectorsDirOverridden) {
+            return;
+        }
         if (previousConnectorsDir == null) {
             System.clearProperty("tapstate.e2e.connectors-dir");
         } else {
@@ -100,6 +140,8 @@ class PublishedExamplesIT {
                         specification)
                 .isNotEmpty();
 
+        stageConnectorJars(envelope.setup().connectors());
+
         String run = store(workspace, tier);
         // The stores the example asked for come up before anything else: a resource cannot be applied
         // before the endpoint whose address it interpolates exists.
@@ -119,8 +161,45 @@ class PublishedExamplesIT {
                         .as("%s settles on %s rows in %s, read there by the address it named; this reads the "
                                 + "target this run handed out, which it cannot name", specification, rows, alias)
                         .isEqualTo(rows));
+            } else {
+                theSettledCountIsInAStoreTheSeedNeverTouched(specification, envelope, settled, binding, stores);
             }
         }
+    }
+
+    /**
+     * The independent read for an example that asked for stores. The example's own awaits already read
+     * through its resources; what remains unproven is that those resources point where they claim. The
+     * bridge from a resource to a store is the interpolation under test, so it is not consulted: the
+     * store an address lands on is told by the database name this run minted, and the closing count is
+     * taken over the run's own handle. An example whose target interpolated the source's references
+     * settles its count in the very store the seed went into - the first assertion refuses exactly that.
+     */
+    private static void theSettledCountIsInAStoreTheSeedNeverTouched(
+            Path specification,
+            Envelope envelope,
+            Map<TableAlias, Long> settled,
+            HttpTierBinding binding,
+            ProvisionedStores stores) {
+        Set<String> seeded = envelope.seed().stream()
+                .map(seed -> stores.storeHolding(binding.addressOf(seed.table())))
+                .flatMap(Optional::stream)
+                .collect(Collectors.toSet());
+        settled.forEach((alias, rows) -> {
+            Optional<String> holder = stores.storeHolding(binding.addressOf(alias));
+            assertThat(holder)
+                    .as("%s settles on %s, whose resource names none of the stores this run brought up",
+                            specification, alias)
+                    .isPresent();
+            assertThat(holder.get())
+                    .as("%s settles its count in the store its seed went into: the rows it counted are "
+                            + "the harness's own, not rows the product moved", specification)
+                    .isNotIn(seeded);
+            assertThat(stores.count(holder.get(), alias.table()))
+                    .as("%s settles on %s rows in %s; this reads the same store by the handle this run "
+                            + "kept for itself, which the example cannot name", specification, rows, alias)
+                    .isEqualTo(rows);
+        });
     }
 
     /**

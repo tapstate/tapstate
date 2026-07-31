@@ -1,0 +1,32 @@
+# The witness that a real PDK connector moves real rows across two databases through the product.
+#
+# Every other example moves rows through a synthetic connector the harness builds; that proves the
+# product's chain but never a real connector's own behaviour - its schema discovery, its key, its type
+# mapping. This one drives the shipped path with two real connectors instead: a real MySQL is seeded
+# over JDBC, the product discovers its model, derives the target model and key, creates the Mongo
+# collection and upserts into it, and the rows are counted back out of Mongo by a reader that is not
+# the product.
+#
+# Snapshot only on purpose: this is the smallest real crossing, batch-read to sink with no change
+# stream, so it rests on nothing but the connector reading a table and the sink writing one. The
+# filter admits only rows marked op=r - the mark only a snapshot read carries - so a count that moves
+# is the snapshot half working, not the tail replaying. The change-stream half is the sibling
+# example, a-real-change-stream-carries-rows-written-after-start.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it. The default build therefore
+# stays green without it; the real-connector lane is where it always runs.
+name: real-mysql-rows-cross-to-a-real-mongo-target
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mysql]
+pipeline: pipeline.tap.yml
+seed:
+  src_mysql.orders: { rows: 5 }
+steps:
+  - start
+  - await: { count: { tgt_mongo.orders: 5 } }

@@ -3,7 +3,7 @@ package io.tapstate.e2e;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.function.UnaryOperator;
+import java.util.Optional;
 
 /**
  * The stores a specification asked for, brought up and reported back in the three shapes a run needs
@@ -24,6 +24,10 @@ final class ProvisionedStores implements AutoCloseable {
 
     private final Map<String, String> environment = new LinkedHashMap<>();
     private final Map<String, Endpoints> driversByConnector = new LinkedHashMap<>();
+    private final Map<String, Store> storesByName = new LinkedHashMap<>();
+
+    /** One store as this run brought it up: the database that is its identity, and a handle of our own. */
+    private record Store(String database, Endpoints driver, EndpointAddress address) {}
 
     private ProvisionedStores() {
     }
@@ -58,6 +62,39 @@ final class ProvisionedStores implements AutoCloseable {
         return Map.copyOf(driversByConnector);
     }
 
+    /**
+     * The store an address actually lands on, told by the one thing that is a store's identity here:
+     * its database name. Every database this run makes carries the run id, so the name appears in a
+     * resource's settings if and only if the resource interpolated that store's published address -
+     * whether as a {@code database} setting or inside a uri. This is how a guard learns where a
+     * resource really points without trusting the interpolation it is there to check.
+     */
+    Optional<String> storeHolding(EndpointAddress address) {
+        for (Map.Entry<String, Store> named : storesByName.entrySet()) {
+            String database = named.getValue().database();
+            boolean holds = address.settings().values().stream()
+                    .anyMatch(value -> value != null && value.toString().contains(database));
+            if (holds) {
+                return Optional.of(named.getKey());
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Counts a table in a named store by the handle this run kept for itself when it brought the store
+     * up - an address no resource supplies and no example can name. The last word on where rows ended
+     * up has to be read over an address the specification could not have influenced.
+     */
+    long count(String store, String table) {
+        Store named = storesByName.get(store);
+        if (named == null) {
+            throw new EnvelopeException(
+                    "no store named " + store + " was provisioned; this run brought up " + storesByName.keySet());
+        }
+        return named.driver().count(named.address(), table);
+    }
+
     @Override
     public void close() {
         driversByConnector.values().forEach(Endpoints::close);
@@ -68,18 +105,30 @@ final class ProvisionedStores implements AutoCloseable {
     private void bring(String name, DatabaseRequest request, String runId) {
         String database = database(name, runId);
         String prefix = name.toUpperCase(Locale.ROOT);
+        // One driver per connector however many stores share it: the driver holds connections, and a
+        // second instance for a second store of the same kind would leave the first unclosed.
+        Endpoints driver = driversByConnector.computeIfAbsent(
+                request.kind().connectorId(), connectorId -> newDriver(request.kind()));
         switch (request.kind()) {
             case MYSQL -> {
                 Map<String, Object> settings = SharedMySql.settings(database);
                 settings.forEach((setting, value) ->
                         environment.put(prefix + "_" + setting.toUpperCase(Locale.ROOT), String.valueOf(value)));
-                driversByConnector.put(request.kind().connectorId(), new MySqlEndpoints());
+                storesByName.put(name, new Store(database, driver, new EndpointAddress(name, settings)));
             }
             case MONGO -> {
-                environment.put(prefix + "_URI", SharedMongo.replicaSetUrl(database));
-                driversByConnector.put(request.kind().connectorId(), new MongoEndpoints());
+                String url = SharedMongo.replicaSetUrl(database);
+                environment.put(prefix + "_URI", url);
+                storesByName.put(name, new Store(database, driver, new EndpointAddress(name, Map.of("uri", url))));
             }
         }
+    }
+
+    private static Endpoints newDriver(DatabaseKind kind) {
+        return switch (kind) {
+            case MYSQL -> new MySqlEndpoints();
+            case MONGO -> new MongoEndpoints();
+        };
     }
 
     /**

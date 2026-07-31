@@ -1,0 +1,36 @@
+# The witness that a real connector's change stream carries rows written after the pipeline started.
+#
+# The sibling example, real-mysql-rows-cross-to-a-real-mongo-target, proves only the snapshot half: it
+# seeds before start and admits only op=r. This one drives the transition: seed a snapshot, start,
+# watch the seeded rows arrive, then write more rows on the MySQL side and watch the binlog tail carry
+# them to Mongo. The filter admits a snapshot read (op=r) and a change insert (op=i), so the count
+# crosses from the seeded five to eight only if the tail delivers.
+#
+# The first await is load-bearing twice over. It proves the snapshot half before any change is made,
+# and it anchors what the second await witnesses: rows six to eight can only have crossed as changes,
+# because the snapshot was already complete and counted when they were written.
+#
+# A change written this early races the stream's own positioning, and a change written before the
+# stream is positioned is never delivered - nothing the product publishes says when positioning is
+# done. The executor closes that window without a fixed wait: an await whose reading has stopped
+# moving re-emits the changed table's current rows under their existing ids, which the upserting
+# target absorbs, so a lost first batch converges and a slow one is not doubled.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: a-real-change-stream-carries-rows-written-after-start
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mysql]
+pipeline: pipeline.tap.yml
+seed:
+  src_mysql.orders: { rows: 5 }
+steps:
+  - start
+  - await: { count: { tgt_mongo.orders: 5 } }
+  - cdc: { src_mysql.orders: insert 3 }
+  - await: { count: { tgt_mongo.orders: 8 } }

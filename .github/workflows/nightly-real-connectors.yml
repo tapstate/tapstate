@@ -1,10 +1,11 @@
 # Real-connector witness lane.
 #
-# Runs the real-connector end-to-end witnesses - RealMysqlToMongoSnapshotIT and RealMysqlToMongoCdcIT -
-# across both fidelity tiers: the product embedded in the test JVM, and the shipped boot jar in its own
-# process. They drive two real Tapdata connectors (MySQL, MongoDB), so they need a Docker daemon for
-# the databases and the connectors' runtime jars. The default CI build skips them (no jars); this lane
-# is where they are meant to run.
+# Runs the published-example sweep with real connector jars available, across both fidelity tiers:
+# the product embedded in the test JVM, and the shipped boot jar in its own process. The real-connector
+# witnesses are declarative examples like every other one; what sets them apart is that they register
+# real Tapdata connectors (MySQL, MongoDB), so they need a Docker daemon for the databases and the
+# connectors' runtime jars. The default CI build skips exactly those examples (no jars); this lane is
+# where they always run.
 #
 # The jars are built here from the connectors' own source. They used to be named as a directory somebody
 # had staged on the runner by hand, which is what kept this lane unscheduled: a nightly cannot depend on
@@ -46,11 +47,12 @@ jobs:
         run: e2e/build-real-connectors.sh "${{ runner.temp }}/connectors"
       - name: Real-connector witnesses on both tiers
         # Docker 29 rejects the API version testcontainers negotiates by default, so pin it. The surefire
-        # selector matches nothing, so only the two failsafe witnesses run.
+        # selector matches nothing, so only the example sweep runs - with the connectors directory named,
+        # the sweep's gate turns the real-connector examples from skipped to mandatory.
         run: >
           mvn -B -pl e2e -am verify
           -Dapi.version=1.44
           -Dtapstate.e2e.connectors-dir="${{ runner.temp }}/connectors"
           -Dtest=ZzzNoSuchSurefireSelector -Dsurefire.failIfNoSpecifiedTests=false
-          -Dit.test=RealMysqlToMongoSnapshotIT,RealMysqlToMongoCdcIT
+          -Dit.test=PublishedExamplesIT
           -Dfailsafe.failIfNoSpecifiedTests=false

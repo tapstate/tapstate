@@ -97,6 +97,49 @@ class ProvisionedStoresIT {
         }
     }
 
+    /**
+     * A guard that must not trust interpolation still has to learn where a resource points; the only
+     * honest witness is the database name, which this run minted and which appears in an address if and
+     * only if that store's published references were interpolated into it. An address naming no store of
+     * this run answers empty rather than guessing.
+     */
+    @Test
+    void theStoreHoldingAnAddressIsToldByTheDatabaseTheAddressNames() {
+        Map<String, DatabaseRequest> asked = new LinkedHashMap<>();
+        asked.put("src", new DatabaseRequest(DatabaseKind.MYSQL));
+        asked.put("tgt", new DatabaseRequest(DatabaseKind.MONGO));
+
+        try (ProvisionedStores stores = ProvisionedStores.provision(asked, "who_holds_what")) {
+            Map<String, String> environment = stores.environment();
+            EndpointAddress source = addressFrom(environment, "SRC", "src_mysql");
+            EndpointAddress target = new EndpointAddress(
+                    "tgt_mongo", Map.of("uri", environment.get("TGT_URI")));
+
+            assertThat(stores.storeHolding(source)).contains("src");
+            assertThat(stores.storeHolding(target)).contains("tgt");
+            assertThat(stores.storeHolding(EndpointAddress.uri("mongodb://elsewhere/e2e_no_such_db")))
+                    .as("an address naming none of this run's databases belongs to none of its stores")
+                    .isEmpty();
+        }
+    }
+
+    /**
+     * The count taken by store name reads over the handle this run kept for itself, so it agrees with
+     * the published address when both point at the same store - and it is the reading a guard falls back
+     * on precisely because no example could have named it.
+     */
+    @Test
+    void aStoreIsCountedByTheHandleTheRunKeptForItself() {
+        Map<String, DatabaseRequest> asked = Map.of("src", new DatabaseRequest(DatabaseKind.MYSQL));
+
+        try (ProvisionedStores stores = ProvisionedStores.provision(asked, "counted_by_own_handle")) {
+            EndpointAddress published = addressFrom(stores.environment(), "SRC", "src_mysql");
+            stores.driversByConnector().get("mysql").seed(published, "orders", 3);
+
+            assertThat(stores.count("src", "orders")).isEqualTo(3L);
+        }
+    }
+
     /** The address a resource writes, assembled from the published references exactly as it would. */
     private static EndpointAddress addressFrom(Map<String, String> environment, String prefix, String id) {
         Map<String, Object> settings = new LinkedHashMap<>();
