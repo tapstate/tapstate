@@ -56,3 +56,7 @@ jobs:
           -Dtest=ZzzNoSuchSurefireSelector -Dsurefire.failIfNoSpecifiedTests=false
           -Dit.test=PublishedExamplesIT
           -Dfailsafe.failIfNoSpecifiedTests=false
+      - name: Witness gate
+        # Aggregate counts cannot see a witness that never ran; this reads the manifest name by name
+        # against the ledger the sweep wrote, and fails on absence.
+        run: .github/scripts/witness-gate.sh

@@ -1,0 +1,22 @@
+# The witness manifest: every scenario the release gate verifies ran and passed, by name.
+#
+# One line per witness, "<example> on <tier>". The gate holds this file to the published examples in
+# both directions - a published example missing from here fails it, and a line naming no published
+# example fails it - so the manifest cannot be quietly narrowed to make a release easier, and a new
+# example cannot ship unlisted. It then requires every line to appear in the run's witness ledger,
+# which a witness only reaches by executing and holding every assertion: skipped, aborted, and
+# never-discovered all read as absence, and absence fails the gate.
+#
+# Editing this file is editing the release contract. Removing a line must say why in the commit.
+a-cdc-failure-is-observable on IN_PROCESS
+a-cdc-failure-is-observable on REAL_PROCESS
+a-real-change-stream-carries-rows-written-after-start on IN_PROCESS
+a-real-change-stream-carries-rows-written-after-start on REAL_PROCESS
+a-sink-write-failure-is-observable on IN_PROCESS
+a-sink-write-failure-is-observable on REAL_PROCESS
+real-mysql-rows-cross-to-a-real-mongo-target on IN_PROCESS
+real-mysql-rows-cross-to-a-real-mongo-target on REAL_PROCESS
+rows-cross-from-a-source-file-to-a-target-file on IN_PROCESS
+rows-cross-from-a-source-file-to-a-target-file on REAL_PROCESS
+the-snapshot-half-reaches-the-target on IN_PROCESS
+the-snapshot-half-reaches-the-target on REAL_PROCESS

@@ -165,6 +165,10 @@ class PublishedExamplesIT {
                 theSettledCountIsInAStoreTheSeedNeverTouched(specification, envelope, settled, binding, stores);
             }
         }
+        // Last line on purpose: the ledger vouches only for a run that held every assertion above,
+        // including the independent read. The release gate reads absence from it, so nothing may be
+        // recorded on a path that can be reached without the assertions.
+        WitnessLedger.record(workspace.getFileName().toString(), tier);
     }
 
     /**
