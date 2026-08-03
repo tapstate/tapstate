@@ -51,8 +51,13 @@ final class MySqlEndpoints implements Endpoints {
         // Dropped rather than truncated: a seed replaces whatever the table held, including a shape some
         // earlier run left behind, and a truncate would keep the old columns.
         execute(connection, "DROP TABLE IF EXISTS " + quoted(table));
-        execute(connection, createTable(table, rows.getFirst()));
-        insertRows(connection, table, rows);
+        // A seed of no rows still lays the table down: seeding nothing is how a specification says the
+        // table exists and holds nothing, and a wait for the first write is a wait on a table that is
+        // already there. Explicit values can never be empty, so an empty seed is the generated shape.
+        execute(connection, createTable(table, rows.isEmpty() ? SeedRows.generatedShape() : rows.getFirst()));
+        if (!rows.isEmpty()) {
+            insertRows(connection, table, rows);
+        }
     }
 
     /**
@@ -269,9 +274,24 @@ final class MySqlEndpoints implements Endpoints {
         }
     }
 
+    /**
+     * Appends rows of the generated shape, and refuses any other shape by name.
+     *
+     * <p>A table seeded with explicit values carries whatever columns those rows carried, and there is
+     * no honest value this can put in them - inventing one would make a document assertion pass against
+     * data no specification described. Left to the database the refusal arrives as "unknown column",
+     * which reads as a fault in the store rather than as a combination the vocabulary does not yet say.
+     */
     private void insertRange(Connection connection, String table, long firstId, long rows) {
         if (rows <= 0) {
             return;
+        }
+        List<String> columns = columnsOf(connection, table);
+        if (!columns.equals(SeedRows.generatedColumns())) {
+            throw new EnvelopeException(
+                    "cannot insert into " + table + ": an inserted row is the generated shape "
+                            + SeedRows.generatedColumns() + ", and this table carries " + columns
+                            + "; seed it with a row count, or make the change with update or delete");
         }
         String sql = "INSERT INTO " + quoted(table) + " (id, seq) VALUES (?, ?)";
         try (PreparedStatement insert = connection.prepareStatement(sql)) {
@@ -283,6 +303,21 @@ final class MySqlEndpoints implements Endpoints {
             insert.executeBatch();
         } catch (SQLException e) {
             throw new EnvelopeException("cannot write rows into " + table, e);
+        }
+    }
+
+    /** The columns the table carries now, in the order it declares them. */
+    private List<String> columnsOf(Connection connection, String table) {
+        try (Statement statement = connection.createStatement();
+                ResultSet empty = statement.executeQuery("SELECT * FROM " + quoted(table) + " LIMIT 0")) {
+            var metadata = empty.getMetaData();
+            List<String> columns = new ArrayList<>();
+            for (int column = 1; column <= metadata.getColumnCount(); column++) {
+                columns.add(metadata.getColumnLabel(column));
+            }
+            return columns;
+        } catch (SQLException e) {
+            throw new EnvelopeException("cannot read the columns of " + table, e);
         }
     }
 

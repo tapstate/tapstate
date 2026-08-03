@@ -113,6 +113,12 @@ public final class E2eExecutor {
         long deadline = start + timeout.toNanos();
         String previousMismatch = null;
         int identicalReadings = 0;
+        // Redelivery answers one suspicion only - that a change never crossed - so it belongs to a wait
+        // that reads what crossed. A wait on a lifecycle state or an error count reads the product's own
+        // observation, whose reading holds still for the ordinary reason that the product has not
+        // converged yet; rewriting the source there would not move it, and would mutate the very fixture
+        // a specification about failure is asserting on.
+        boolean readsDeliveredData = matcher instanceof Matcher.Count || matcher instanceof Matcher.Doc;
         while (true) {
             Optional<String> mismatch = mismatch(matcher, pipelineId);
             if (mismatch.isEmpty()) {
@@ -132,7 +138,7 @@ public final class E2eExecutor {
             // re-asserted; the counter restarts so the redelivery gets its own full window to arrive.
             identicalReadings = mismatch.get().equals(previousMismatch) ? identicalReadings + 1 : 1;
             previousMismatch = mismatch.get();
-            if (identicalReadings >= STALLED_POLLS && lastChanged != null) {
+            if (readsDeliveredData && identicalReadings >= STALLED_POLLS && lastChanged != null) {
                 binding.redeliver(lastChanged);
                 identicalReadings = 0;
             }
@@ -201,6 +207,12 @@ public final class E2eExecutor {
             current = mapping.get(field);
             while (bracket >= 0) {
                 int close = segment.indexOf(']', bracket);
+                // The parser holds every path an author writes to this shape, so reaching here with a
+                // malformed one is the harness disagreeing with itself; it is named rather than left to
+                // surface as a substring or number fault with no path in it.
+                if (close < 0) {
+                    throw new EnvelopeException("the path " + path + " leaves an index unclosed");
+                }
                 int index = Integer.parseInt(segment.substring(bracket + 1, close));
                 if (!(current instanceof List<?> list) || index >= list.size()) {
                     return Optional.empty();

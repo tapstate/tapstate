@@ -10,6 +10,7 @@ import org.yaml.snakeyaml.error.YAMLException;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -127,10 +128,16 @@ public final class EnvelopeParser {
     }
 
     /**
-     * Explicit rows: each carries {@code id} (the key everything seeds and upserts by), every row
-     * carries the same columns (one table, one shape), and every value is an integer or a string -
-     * the two scalars whose crossing every store in this vocabulary spells the same way. Wider value
-     * types are a widening of this word, not a loosening of this check.
+     * Explicit rows: each carries {@code id} (the key everything seeds and upserts by), no two rows
+     * carry the same one, every row carries the same columns (one table, one shape), and every value is
+     * an integer or a string - the two scalars whose crossing every store in this vocabulary spells the
+     * same way. Wider value types are a widening of this word, not a loosening of this check.
+     *
+     * <p>Uniqueness is held here rather than left to the store, because the stores disagree about it: a
+     * relational table refuses the second row outright, and a document store accepts it, so the same
+     * specification would be an authoring error against one and a silently doubled seed against
+     * another - surfacing far away as an ambiguous document read, or as a count that agrees by
+     * accident.
      */
     private static List<Map<String, Object>> valueRows(Object node, String at) {
         if (!(node instanceof List<?> sequence) || sequence.isEmpty()) {
@@ -138,11 +145,17 @@ public final class EnvelopeParser {
         }
         List<Map<String, Object>> rows = new ArrayList<>();
         Set<String> shape = null;
+        Set<Object> ids = new LinkedHashSet<>();
         for (int i = 0; i < sequence.size(); i++) {
             String rowAt = at + "[" + i + "]";
             Map<String, Object> row = mapping(sequence.get(i), rowAt);
             if (!row.containsKey(SeedRows.ID)) {
                 throw new EnvelopeException(rowAt + " carries no id, the key rows are seeded and upserted by");
+            }
+            if (!ids.add(normalizedId(row.get(SeedRows.ID)))) {
+                throw new EnvelopeException(
+                        rowAt + " carries the id " + row.get(SeedRows.ID)
+                                + " a row before it already carries; one row, one id");
             }
             row.forEach((column, value) -> requireScalar(value, rowAt + "." + column));
             if (shape == null) {
@@ -154,6 +167,55 @@ public final class EnvelopeParser {
             rows.add(new LinkedHashMap<>(row));
         }
         return rows;
+    }
+
+    /**
+     * The id as identity rather than as written: a YAML parser hands back 1 as an Integer and 1 as a
+     * Long depending on nothing an author controls, and two rows keyed the same way are the same row
+     * whichever width each arrived as.
+     */
+    private static Object normalizedId(Object id) {
+        return id instanceof Number number ? number.longValue() : id;
+    }
+
+    /**
+     * A path into a document: dotted field names, each optionally followed by list indices, as in
+     * {@code items[0].sku}. Held here rather than where it is walked, because a path is written by an
+     * author and a mistake in one is an authoring mistake: unchecked, a missing bracket or a negative
+     * index reaches a polling wait as a raw index or substring fault, naming neither the specification
+     * nor the path, and a wait that dies that way records no witness at all.
+     */
+    private static void requirePath(String path, String at) {
+        String where = at + "." + path;
+        if (path.isBlank()) {
+            throw new EnvelopeException(where + " must name a field");
+        }
+        for (String segment : path.split("\\.", -1)) {
+            int bracket = segment.indexOf('[');
+            String field = bracket < 0 ? segment : segment.substring(0, bracket);
+            if (field.isBlank()) {
+                throw new EnvelopeException(where + " must name a field before each index");
+            }
+            while (bracket >= 0) {
+                int close = segment.indexOf(']', bracket);
+                if (close < 0) {
+                    throw new EnvelopeException(where + " leaves an index unclosed: expected a ] after " + segment);
+                }
+                String index = segment.substring(bracket + 1, close);
+                if (!index.matches("\\d+")) {
+                    throw new EnvelopeException(
+                            where + " indexes a list with '" + index
+                                    + "'; an index is a whole number counting from zero");
+                }
+                bracket = segment.indexOf('[', close);
+                if (bracket > close + 1) {
+                    throw new EnvelopeException(where + " carries text between indices: " + segment);
+                }
+                if (bracket < 0 && close != segment.length() - 1) {
+                    throw new EnvelopeException(where + " carries text after an index: " + segment);
+                }
+            }
+        }
     }
 
     private static void requireScalar(Object value, String at) {
@@ -298,12 +360,20 @@ public final class EnvelopeParser {
         Map<String, Object> expect = body.get("expect") == null
                 ? Map.of()
                 : mapping(body.get("expect"), at + ".expect");
-        expect.forEach((path, value) -> requireScalar(value, at + ".expect." + path));
+        expect.forEach(
+                (path, value) -> {
+                    requirePath(path, at + ".expect");
+                    requireScalar(value, at + ".expect." + path);
+                });
 
         Map<String, Long> size = new LinkedHashMap<>();
         if (body.get("size") != null) {
             mapping(body.get("size"), at + ".size")
-                    .forEach((path, length) -> size.put(path, rowCount(length, at + ".size." + path)));
+                    .forEach(
+                            (path, length) -> {
+                                requirePath(path, at + ".size");
+                                size.put(path, rowCount(length, at + ".size." + path));
+                            });
         }
         if (expect.isEmpty() && size.isEmpty()) {
             throw new EnvelopeException(at + " holds the document to nothing: carry expect or size");

@@ -204,6 +204,100 @@ class MySqlEndpointsIT {
     }
 
     /**
+     * Seeding nothing lays the table down anyway: it is how a specification says a table exists and holds
+     * nothing, and an await for the first write is waiting on a table that must already be there. A driver
+     * reading the shape off the first row has none to read, and the row count is the only form that can be
+     * empty at all.
+     */
+    @Test
+    void seedingNoRowsStillLaysTheTableDown() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(0));
+
+        assertThat(endpoints.count(at(), TABLE)).isZero();
+        assertThat(rowsReadBackIndependently()).isEmpty();
+    }
+
+    /** The table an empty seed lays down is the one a later change appends to. */
+    @Test
+    void insertingIntoAnEmptySeededTableStartsAtOne() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(0));
+
+        endpoints.cdc(at(), TABLE, CdcOp.INSERT, 2);
+
+        assertThat(rowsReadBackIndependently()).containsExactly("1,1", "2,2");
+    }
+
+    /**
+     * Re-emission is what an await falls back on when a change may never have crossed. Every row is
+     * deleted and written again under the same id, so a target that upserts absorbs the repetition - which
+     * is what makes it safe to do on suspicion alone. The rows have to survive it exactly.
+     */
+    @Test
+    void reEmittingWritesEveryRowAgainUnchanged() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(3));
+
+        endpoints.redeliver(at(), TABLE);
+
+        assertThat(rowsReadBackIndependently()).containsExactly("1,1", "2,2", "3,3");
+        assertThat(endpoints.count(at(), TABLE)).isEqualTo(3L);
+    }
+
+    /** Re-emission carries the columns the table has, not the columns a generated row would have. */
+    @Test
+    void reEmittingKeepsTheColumnsTheTableWasSeededWith() {
+        endpoints.seed(at(), TABLE, List.of(
+                Map.of("id", 1L, "name", "widget"),
+                Map.of("id", 2L, "name", "gadget")));
+
+        endpoints.redeliver(at(), TABLE);
+
+        assertThat(endpoints.count(at(), TABLE)).isEqualTo(2L);
+        assertThat(endpoints.fetch(at(), TABLE, Map.of("id", 2L)))
+                .hasValueSatisfying(row -> assertThat(row).containsEntry("name", "gadget"));
+    }
+
+    /**
+     * The transaction has to be given back. The driver holds one connection per address and re-uses it for
+     * every later read and write, so a re-emission that left auto-commit off would leave every subsequent
+     * write in an open transaction - invisible to this driver's own reads, and never seen by a connector
+     * tailing the log. The following seed is what would go missing.
+     */
+    @Test
+    void reEmittingLeavesTheConnectionCommittingAgain() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(2));
+        endpoints.redeliver(at(), TABLE);
+
+        endpoints.seed(at(), TABLE, SeedRows.generated(4));
+
+        assertThat(rowsReadBackIndependently()).containsExactly("1,1", "2,2", "3,3", "4,4");
+    }
+
+    /** Nothing to re-emit is not a failure: a target may be awaited before its table exists. */
+    @Test
+    void reEmittingATableNoOneSeededDoesNothing() {
+        endpoints.redeliver(at(), "never_created");
+
+        assertThat(endpoints.count(at(), "never_created")).isZero();
+    }
+
+    /**
+     * An inserted row is the generated shape, and a table seeded with explicit columns has no honest value
+     * for it to carry - inventing one would make a document assertion pass against data no specification
+     * described. Left to the database the refusal arrives as "unknown column", which reads as a fault in
+     * the store rather than as a combination the vocabulary does not say.
+     */
+    @Test
+    void insertingIntoATableOfAnotherShapeRefusesAndNamesTheShapes() {
+        endpoints.seed(at(), TABLE, List.of(Map.of("id", 1L, "name", "widget")));
+
+        assertThatThrownBy(() -> endpoints.cdc(at(), TABLE, CdcOp.INSERT, 1))
+                .isInstanceOf(EnvelopeException.class)
+                .hasMessageContaining(TABLE)
+                .hasMessageContaining("name")
+                .hasMessageContaining("seed it with a row count");
+    }
+
+    /**
      * Two databases taken separately share nothing, which is the whole basis for one server serving every
      * specification in the JVM.
      *

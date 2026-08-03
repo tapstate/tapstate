@@ -384,6 +384,31 @@ class EnvelopeParserTest {
                 .hasMessageContaining("must be an integer or a string");
     }
 
+    /**
+     * The stores disagree about a repeated id - a relational table refuses the second row, a document
+     * store keeps both - so a specification carrying one would be an authoring error against one store
+     * and a silently doubled seed against another. Held here, it is one answer for every store, and it
+     * arrives at the row that repeats rather than as an ambiguous read a hundred lines later.
+     */
+    @Test
+    void seedValueRowsCarryOneIdEach() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    values:\n      - { id: 1, name: widget }\n      - { id: 1, name: gadget }\n"
+                        + "steps:\n  - start\n")))
+                .hasMessageContaining("values[1]")
+                .hasMessageContaining("one row, one id");
+    }
+
+    /** A table that exists and holds nothing is a thing a specification says, and a store must lay down. */
+    @Test
+    void aSeedOfNoRowsIsTheEmptyTable() {
+        Envelope envelope =
+                EnvelopeParser.parse(minimal("seed:\n  a.t: { rows: 0 }\nsteps:\n  - start\n"));
+
+        assertThat(envelope.seed()).hasSize(1);
+        assertThat(envelope.seed().getFirst().rows()).isEmpty();
+    }
+
     @Test
     void seedValueRowsCarryOneShape() {
         assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
@@ -412,6 +437,40 @@ class EnvelopeParserTest {
         assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
                 "steps:\n  - assert: { doc: { a.t: { where: { id: 1 } } } }\n")))
                 .hasMessageContaining("carry expect or size");
+    }
+
+    /**
+     * A path is written by an author, so a mistake in one is an authoring mistake and belongs here.
+     * Unchecked it reaches the wait that walks it as a raw index or substring fault naming neither the
+     * specification nor the path - and a wait that dies that way records no witness at all, so the
+     * release gate reports the example as never run rather than as mis-written.
+     */
+    @Test
+    void aDocPathThatIsNotAPathIsRefusedWhereItIsWritten() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { \"items[0.sku\": 1 } } } }\n")))
+                .hasMessageContaining("doc.a.t.expect.items[0.sku")
+                .hasMessageContaining("unclosed");
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { \"items[-1].sku\": 1 } } } }\n")))
+                .hasMessageContaining("whole number counting from zero");
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, size: { \"items[x]\": 1 } } } }\n")))
+                .hasMessageContaining("whole number counting from zero");
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { \"[0].sku\": 1 } } } }\n")))
+                .hasMessageContaining("must name a field");
+    }
+
+    /** The shapes an author does write: plain fields, nested fields, indices, indices in a row. */
+    @Test
+    void aDocPathReadsFieldsAndIndices() {
+        Envelope envelope = EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { name: x, \"a.b\": y, "
+                        + "\"items[0].sku\": z, \"grid[0][1]\": w } } } }\n"));
+
+        Matcher.Doc doc = (Matcher.Doc) ((Step.Assertion) envelope.steps().getFirst()).matcher();
+        assertThat(doc.expect()).containsKeys("name", "a.b", "items[0].sku", "grid[0][1]");
     }
 
     @Test

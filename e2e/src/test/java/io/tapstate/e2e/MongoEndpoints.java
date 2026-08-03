@@ -47,7 +47,11 @@ final class MongoEndpoints implements Endpoints {
             row.forEach((column, value) -> document.append(column, normalized(value)));
             documents.add(document);
         }
-        collection.insertMany(documents);
+        // Seeding nothing is how a specification says the collection holds nothing, and the driver
+        // rejects a write of no documents outright; the drop above has already made it so.
+        if (!documents.isEmpty()) {
+            collection.insertMany(documents);
+        }
     }
 
     /**
@@ -91,9 +95,24 @@ final class MongoEndpoints implements Endpoints {
         switch (op) {
             case INSERT -> insertRange(collection, highestId(collection) + 1, rows);
             case UPDATE -> collection.updateMany(
-                    Filters.lte(IDENTITY_FIELD, rows), Updates.set(TOUCHED_FIELD, true));
-            case DELETE -> collection.deleteMany(Filters.lte(IDENTITY_FIELD, rows));
+                    Filters.in(IDENTITY_FIELD, lowestIds(collection, rows)),
+                    Updates.set(TOUCHED_FIELD, true));
+            case DELETE -> collection.deleteMany(Filters.in(IDENTITY_FIELD, lowestIds(collection, rows)));
         }
+    }
+
+    /**
+     * The lowest ids by order rather than by id &lt;= rows: after a delete the ids no longer start at
+     * one, and a change meant to touch two documents would touch none. The SQL driver selects the same
+     * way, so one specification means the same change against either store.
+     */
+    private static List<Object> lowestIds(MongoCollection<Document> collection, long rows) {
+        List<Object> ids = new ArrayList<>();
+        collection.find()
+                .sort(new Document(IDENTITY_FIELD, 1))
+                .limit((int) Math.min(rows, Integer.MAX_VALUE))
+                .forEach(document -> ids.add(document.get(IDENTITY_FIELD)));
+        return ids;
     }
 
     @Override
@@ -117,9 +136,26 @@ final class MongoEndpoints implements Endpoints {
         }
     }
 
+    /**
+     * The greatest id present, or zero for an empty collection. Identity is a plain field here, so
+     * unlike the store's own key nothing guarantees a document carries it or carries it as a whole
+     * number - a document the product landed may spell it any width, or not at all. A missing or
+     * non-numeric id is named rather than let out as a cast or an unboxing of null, which would reach a
+     * specification as a fault with no place in it.
+     */
     private long highestId(MongoCollection<Document> collection) {
         Document highest = collection.find().sort(new Document(IDENTITY_FIELD, -1)).limit(1).first();
-        return highest == null ? 0L : highest.getLong(IDENTITY_FIELD);
+        if (highest == null) {
+            return 0L;
+        }
+        Object id = highest.get(IDENTITY_FIELD);
+        if (!(id instanceof Number number)) {
+            throw new EnvelopeException(
+                    "the highest document in " + collection.getNamespace().getCollectionName()
+                            + " carries no numeric " + IDENTITY_FIELD + " (found " + id
+                            + "), so an inserted row has nothing to continue from");
+        }
+        return number.longValue();
     }
 
     private MongoCollection<Document> collection(EndpointAddress address, String table) {

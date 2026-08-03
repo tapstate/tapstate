@@ -19,6 +19,24 @@ final class SeedRows {
     private SeedRows() {
     }
 
+    /**
+     * The columns a generated row carries, as a row of its own. {@code rows: 0} is a legal seed - the
+     * way a specification says a table exists and holds nothing - and it leaves a driver no row to read
+     * the shape from, while explicit values can never be empty. So the shape lives here too, and the
+     * values in it stand only for their types.
+     */
+    static Map<String, Object> generatedShape() {
+        Map<String, Object> shape = new LinkedHashMap<>();
+        shape.put(ID, 0L);
+        shape.put(SEQ, 0L);
+        return shape;
+    }
+
+    /** The columns a generated row carries, in order. */
+    static List<String> generatedColumns() {
+        return List.of(ID, SEQ);
+    }
+
     /** The rows {@code rows: N} stands for. */
     static List<Map<String, Object>> generated(long rows) {
         List<Map<String, Object>> generated = new ArrayList<>();

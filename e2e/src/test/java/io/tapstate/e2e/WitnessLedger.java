@@ -15,8 +15,11 @@ import java.nio.file.StandardOpenOption;
  * is written only at the end of a run that held every assertion, so a witness that was skipped,
  * aborted, or never discovered simply is not there, and the release gate reads the absence.
  *
- * <p>The ledger is truncated once per JVM, before the first line is written, so a stale file from an
- * earlier build cannot vouch for a run that never happened.
+ * <p>The ledger is truncated once per JVM, before the first line is written. That alone does not make
+ * a stale file impossible: a build whose witnesses were never discovered, or all of which aborted,
+ * never reaches this class at all and would leave an earlier run's file standing. So the build deletes
+ * the file before the phase that writes it, and this truncation covers the run started outside the
+ * build - from a development environment - by hand.
  */
 final class WitnessLedger {
 

@@ -302,6 +302,36 @@ class E2eExecutorTest {
         assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
     }
 
+    /**
+     * A wait on the product's own observation is not a wait on delivered data. Its reading holds still
+     * for the ordinary reason that the product has not converged yet - so on a long enough wait the
+     * stall is the normal case, not the exceptional one - and no rewrite of the source would move it.
+     * A specification that waits for a failure is usually asserting about the very rows a redelivery
+     * would rewrite, so the harness would be mutating the fixture whose failure is the subject.
+     */
+    @Test
+    void aStalledAwaitOnAPublishedStateNeverRedeliversTheSource() {
+        binding.states(PipelineState.RUNNING);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { state: FAILED }\n")))
+                .isInstanceOf(AssertionError.class);
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
+    /** An error count is read the same way, and stalls the same way, so it redelivers no more than a state. */
+    @Test
+    void aStalledAwaitOnAnErrorCountNeverRedeliversTheSource() {
+        binding.errorCounts(0L);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { error_count: 1 }\n")))
+                .isInstanceOf(AssertionError.class);
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
     @Test
     void holdsADocumentToValuesByPathAndListSizesByPath() {
         binding.holdsDocument(TARGET, Map.of(

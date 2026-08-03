@@ -17,16 +17,35 @@
 #      reads as absence, and absence fails the gate. An environment that could not run a witness is a
 #      gate failure, not an exemption.
 #
+# Checks 1 and 2 compare two files in the checkout and need no database, no connector and no run, so
+# they are also run per pull request (--manifest-only). Left to the nightly alone, an example added
+# without its manifest lines merges green and the contract breach surfaces the next night, against
+# main, attributed to no pull request.
+#
 # Run it after the verify that produced the ledger, from the repository root:
 #   .github/scripts/witness-gate.sh
+#   .github/scripts/witness-gate.sh --manifest-only   # checks 1 and 2, no run required
 set -euo pipefail
+
+manifest_only=false
+case "${1:-}" in
+  --manifest-only) manifest_only=true ;;
+  "") ;;
+  *) echo "witness-gate: unknown argument '$1'; expected --manifest-only or nothing"; exit 2 ;;
+esac
 
 manifest="e2e/witness-manifest.txt"
 ledger="e2e/target/witness-ledger.txt"
 tiers="IN_PROCESS REAL_PROCESS"
 
+# Every line of a listing, set in from the message above it.
+indent() { echo "  ${1//$'\n'/$'\n'  }"; }
+
 [ -f "$manifest" ] || { echo "witness-gate: $manifest is missing - the release contract itself is gone"; exit 1; }
-[ -f "$ledger" ] || { echo "witness-gate: $ledger is missing - no witness recorded anything; was the sweep run?"; exit 1; }
+if [ "$manifest_only" = false ] && [ ! -f "$ledger" ]; then
+  echo "witness-gate: $ledger is missing - no witness recorded anything; was the sweep run?"
+  exit 1
+fi
 
 expected=$(for d in e2e/examples/*/; do
   name=$(basename "$d")
@@ -38,23 +57,29 @@ listed=$(grep -v '^#' "$manifest" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort)
 missing_from_manifest=$(LC_ALL=C comm -23 <(echo "$expected") <(echo "$listed"))
 if [ -n "$missing_from_manifest" ]; then
   echo "witness-gate: published examples missing from $manifest:"
-  echo "$missing_from_manifest" | sed 's/^/  /'
+  indent "$missing_from_manifest"
   exit 1
 fi
 
 ghosts=$(LC_ALL=C comm -13 <(echo "$expected") <(echo "$listed"))
 if [ -n "$ghosts" ]; then
   echo "witness-gate: manifest lines naming no published example:"
-  echo "$ghosts" | sed 's/^/  /'
+  indent "$ghosts"
   exit 1
+fi
+
+count=$(echo "$listed" | wc -l | tr -d ' ')
+
+if [ "$manifest_only" = true ]; then
+  echo "witness-gate: the manifest and the published examples agree on all $count witnesses"
+  exit 0
 fi
 
 never_ran=$(LC_ALL=C comm -23 <(echo "$listed") <(LC_ALL=C sort "$ledger"))
 if [ -n "$never_ran" ]; then
   echo "witness-gate: manifest witnesses that never ran to a pass (skipped, aborted, or absent):"
-  echo "$never_ran" | sed 's/^/  /'
+  indent "$never_ran"
   exit 1
 fi
 
-count=$(echo "$listed" | wc -l | tr -d ' ')
 echo "witness-gate: all $count witnesses executed and passed"
