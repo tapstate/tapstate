@@ -23,7 +23,14 @@ import java.nio.file.StandardOpenOption;
  */
 final class WitnessLedger {
 
-    private static final Path LEDGER = Path.of("target", "witness-ledger.txt");
+    /**
+     * Where the build puts this module's output, named by the build. Falling back to a path relative to
+     * the working directory would make the file's location depend on where the JVM was started, while
+     * the gate reads one fixed place - so a run started from elsewhere would write a ledger nothing
+     * reads, and the gate would fail for absence with the evidence sitting in another directory.
+     */
+    private static final Path LEDGER =
+            Path.of(System.getProperty("tapstate.e2e.build-directory", "target"), "witness-ledger.txt");
     private static boolean truncated;
 
     private WitnessLedger() {

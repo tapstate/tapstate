@@ -155,6 +155,14 @@ class SpecSchemaAgreesWithParserTest {
                 steps:
                   - await: { synced: true }
                 """,
+                // A document located but held to nothing: it would hold for any document at all,
+                // including the wrong one, so locating it proves nothing.
+                """
+                name: n
+                pipeline: p.tap.yml
+                steps:
+                  - assert: { doc: { t.o: { where: { id: 1 } } } }
+                """,
                 // A verb the product does not have.
                 """
                 name: n

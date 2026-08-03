@@ -22,6 +22,9 @@ import java.util.Optional;
  */
 final class ProvisionedStores implements AutoCloseable {
 
+    /** Mongo refuses a database name past this many characters, and only says so once a run is under way. */
+    private static final int NAME_LIMIT = 63;
+
     private final Map<String, String> environment = new LinkedHashMap<>();
     private final Map<String, Endpoints> driversByConnector = new LinkedHashMap<>();
     private final Map<String, Store> storesByName = new LinkedHashMap<>();
@@ -133,11 +136,20 @@ final class ProvisionedStores implements AutoCloseable {
 
     /**
      * A database name of this store's own. Mongo refuses names past 63 characters and only says so once a
-     * run is under way, so the run id is trimmed rather than allowed to overflow - a truncated name still
-     * separates runs, an unusable one fails them.
+     * run is under way, so the name is brought under the limit rather than allowed to overflow - but it
+     * has to stay a name of this run's own while doing it, which a plain cut does not.
      */
-    private static String database(String name, String runId) {
+    static String database(String name, String runId) {
         String candidate = ("e2e_" + name + "_" + runId).toLowerCase(Locale.ROOT).replace('-', '_');
-        return candidate.length() <= 63 ? candidate : candidate.substring(0, 63);
+        if (candidate.length() <= NAME_LIMIT) {
+            return candidate;
+        }
+        // What distinguishes two runs sits at the end of the run id, so a plain cut takes exactly the
+        // part that separates them - two tiers of one example are told apart by a suffix that is the
+        // first thing to go. A digest of the whole name put back on the end keeps them apart, and it
+        // fails visibly rather than silently: two runs sharing a database would drop and rewrite each
+        // other's tables in turn, which no assertion here would report as anything but a wrong count.
+        String digest = Integer.toHexString(candidate.hashCode());
+        return candidate.substring(0, NAME_LIMIT - digest.length() - 1) + "_" + digest;
     }
 }

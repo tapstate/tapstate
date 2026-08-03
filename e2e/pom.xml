@@ -246,6 +246,9 @@
                  rather than the value itself: it is long enough that some shells and process tables
                  truncate it, and reading it back is a fact the build produced rather than a guess. -->
             <tapstate.e2e.cli-classpath>${project.build.directory}/cli-classpath.txt</tapstate.e2e.cli-classpath>
+            <!-- Where this module's output goes, so the witness ledger is written where the release
+                 gate reads it rather than wherever the JVM happened to be started. -->
+            <tapstate.e2e.build-directory>${project.build.directory}</tapstate.e2e.build-directory>
           </systemPropertyVariables>
         </configuration>
         <executions>

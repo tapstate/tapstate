@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -45,23 +46,52 @@ class FixedSleepGateTest {
 
     @Test
     void everyFixedSleepInThisModuleIsANamedPollPrimitive() {
-        Map<String, Long> found = new TreeMap<>();
-        try (Stream<Path> sources = Files.walk(Path.of("src"))) {
-            sources.filter(path -> path.getFileName().toString().endsWith(".java"))
-                    .forEach(source -> {
-                        long sleeps = countSleeps(source);
-                        if (sleeps > 0) {
-                            found.put(source.getFileName().toString(), sleeps);
-                        }
-                    });
-        } catch (IOException e) {
-            throw new UncheckedIOException("cannot walk this module's sources", e);
-        }
-        assertThat(found)
+        assertThat(sleepsUnder(Path.of("src")))
                 .as("every Thread.sleep in the e2e module must be a named poll primitive inside a "
                         + "bounded condition loop; a new one is a settle - wait on an observable "
                         + "condition instead")
                 .containsExactlyInAnyOrderEntriesOf(POLL_PRIMITIVES);
+    }
+
+    /**
+     * Two files of the same name in different packages are two files. Counting them under one key is
+     * what the allowlist's shape asks for; letting the second replace the first would hide however many
+     * sleeps the first held, and this gate exists to make sleeps impossible to hide.
+     */
+    @Test
+    void sleepsInSameNamedFilesAreAddedRatherThanOneReplacingTheOther(@TempDir Path root) throws IOException {
+        Files.createDirectories(root.resolve("one"));
+        Files.createDirectories(root.resolve("two"));
+        // Spelled in pieces on purpose: written whole, these fixtures would be counted by the very walk
+        // they are here to exercise, and this file would fail its own gate.
+        String sleep = "Thread." + "sleep(";
+        Files.writeString(root.resolve("one/Twin.java"), "class Twin { void a() { " + sleep + "1); } }");
+        Files.writeString(root.resolve("two/Twin.java"), "class Twin { void b() { " + sleep + "2); } }");
+
+        assertThat(sleepsUnder(root)).containsExactly(java.util.Map.entry("Twin.java", 2L));
+    }
+
+    /**
+     * Every source under the root that holds a sleep, by file name, with the counts of same-named files
+     * added together rather than one replacing the other. The allowlist is written in file names because
+     * that is what a reader of a failure recognises, and names are not unique across packages - so a
+     * second {@code Foo.java} used to overwrite the first, and its sleeps left the reckoning entirely.
+     * Added, they cannot: the total stops matching the allowlist and the gate says so.
+     */
+    static Map<String, Long> sleepsUnder(Path root) {
+        Map<String, Long> found = new TreeMap<>();
+        try (Stream<Path> sources = Files.walk(root)) {
+            sources.filter(path -> path.getFileName().toString().endsWith(".java"))
+                    .forEach(source -> {
+                        long sleeps = countSleeps(source);
+                        if (sleeps > 0) {
+                            found.merge(source.getFileName().toString(), sleeps, Long::sum);
+                        }
+                    });
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot walk the sources under " + root, e);
+        }
+        return found;
     }
 
     private static long countSleeps(Path source) {

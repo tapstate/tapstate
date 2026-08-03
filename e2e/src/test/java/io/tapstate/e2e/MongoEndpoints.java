@@ -115,6 +115,21 @@ final class MongoEndpoints implements Endpoints {
         return ids;
     }
 
+    /**
+     * Deliberately does nothing, and is written out rather than inherited so that it reads as a decision.
+     *
+     * <p>Re-emission answers a positional log: a row written before the reader's tail is positioned is
+     * never delivered, and nothing observable says when positioning is done. A change stream is resumed
+     * by a token the store itself issues, so the same window is not known to exist here - and rewriting
+     * every document of a collection under test to chase a window that may not be there would cost more
+     * than it could buy. A stalled await against a Mongo source therefore runs its bound out and fails
+     * with its reading, which is the honest outcome for a stall nothing here can explain.
+     */
+    @Override
+    public void redeliver(EndpointAddress address, String table) {
+        // Intentionally empty; see above.
+    }
+
     @Override
     public long count(EndpointAddress address, String table) {
         return collection(address, table).countDocuments();

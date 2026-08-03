@@ -288,7 +288,19 @@
                       "minimum": 0
                     }
                   }
-                }
+                },
+                "anyOf": [
+                  {
+                    "required": [
+                      "expect"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "size"
+                    ]
+                  }
+                ]
               }
             }
           }

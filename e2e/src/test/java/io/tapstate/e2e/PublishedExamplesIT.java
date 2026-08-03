@@ -14,13 +14,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.UnaryOperator;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -179,16 +179,28 @@ class PublishedExamplesIT {
      * taken over the run's own handle. An example whose target interpolated the source's references
      * settles its count in the very store the seed went into - the first assertion refuses exactly that.
      */
-    private static void theSettledCountIsInAStoreTheSeedNeverTouched(
+    private void theSettledCountIsInAStoreTheSeedNeverTouched(
             Path specification,
             Envelope envelope,
             Map<TableAlias, Long> settled,
             HttpTierBinding binding,
             ProvisionedStores stores) {
-        Set<String> seeded = envelope.seed().stream()
-                .map(seed -> stores.storeHolding(binding.addressOf(seed.table())))
-                .flatMap(Optional::stream)
-                .collect(Collectors.toSet());
+        Set<String> seeded = new LinkedHashSet<>();
+        for (Seed seed : envelope.seed()) {
+            EndpointAddress address = binding.addressOf(seed.table());
+            Optional<String> holder = stores.storeHolding(address);
+            // A seed that landed on nothing this run handed out is not one to skip over. Its resource is
+            // pointing at an endpoint the run did not provision, which is the same failure of
+            // interpolation this guard exists to catch - and skipping it would quietly shrink the set
+            // below, so a target sharing the source's store would then pass unremarked. The reading is
+            // taken here rather than from the resource text, which is the thing under test.
+            assertThat(holder.isPresent() || namesSomethingThisRunHandedOut(address))
+                    .as("%s seeds %s at %s, which is neither a store this run provisioned nor a directory "
+                            + "it handed out: the resource is not pointing where the run put its endpoint",
+                            specification, seed.table(), address.settings())
+                    .isTrue();
+            holder.ifPresent(seeded::add);
+        }
         settled.forEach((alias, rows) -> {
             Optional<String> holder = stores.storeHolding(binding.addressOf(alias));
             assertThat(holder)
@@ -265,6 +277,22 @@ class PublishedExamplesIT {
      * so one directory would have a pipeline write back over the file the harness seeded, and a count would
      * then read the harness's own rows without a single row having crossed the product.
      */
+    /** Whether an address names one of the two directories this run handed out for the file store. */
+    private boolean namesSomethingThisRunHandedOut(EndpointAddress address) {
+        return namesOneOf(address, List.of(sourceDirectory.toString(), targetDirectory.toString()));
+    }
+
+    /**
+     * The same reading {@code storeHolding} takes of a provisioned database, applied to the run's own
+     * directories: an address is one of them when a setting carries the path. Held apart from the
+     * caller so it can be checked without a run.
+     */
+    static boolean namesOneOf(EndpointAddress address, List<String> handedOut) {
+        return address.settings().values().stream()
+                .filter(java.util.Objects::nonNull)
+                .anyMatch(value -> handedOut.stream().anyMatch(value.toString()::contains));
+    }
+
     private UnaryOperator<String> env(ProvisionedStores stores) {
         Map<String, String> environment = new LinkedHashMap<>(stores.environment());
         environment.put("SRC_DIR", sourceDirectory.toString());

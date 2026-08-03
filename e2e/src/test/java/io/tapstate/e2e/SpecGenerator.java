@@ -263,6 +263,13 @@ final class SpecGenerator {
         body.put("description", "One document, located and read at the endpoint itself. Carry expect or "
                 + "size - a doc that expects nothing checks nothing.");
         body.put("properties", docProperties);
+        // Said in the description above and enforced here too, because the two are read by different
+        // readers: an author reads the description, and everything that completes or validates a
+        // specification before it runs reads only the constraint. A rule the parser refuses but the
+        // schema admits is the schema telling that reader the document is fine right up until the run.
+        body.put(
+                "anyOf",
+                List.of(Map.of("required", List.of("expect")), Map.of("required", List.of("size"))));
 
         Map<String, Object> keyedByTable = new LinkedHashMap<>();
         keyedByTable.put("type", "object");

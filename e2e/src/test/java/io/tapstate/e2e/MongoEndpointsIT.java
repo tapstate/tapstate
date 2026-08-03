@@ -150,6 +150,22 @@ class MongoEndpointsIT {
                 .hasMessageContaining("nothing to continue from");
     }
 
+    /**
+     * Re-emission is a no-op here, and that is a decision rather than an omission - so it is pinned.
+     * The executor calls it on any stalled await, and a driver that quietly rewrote the collection
+     * instead would be mutating the data under an assertion that is still being made. What this test
+     * refuses is the silent middle ground: a redelivery that does something partial.
+     */
+    @Test
+    void reEmittingLeavesTheCollectionExactlyAsItWas() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(3));
+        endpoints.cdc(at(), TABLE, CdcOp.DELETE, 1);
+
+        endpoints.redeliver(at(), TABLE);
+
+        assertThat(rowsReadBackIndependently()).containsExactly("2,2", "3,3");
+    }
+
     @Test
     void fetchAnswersEmptyForNoMatchAndRefusesMoreThanOne() {
         endpoints.seed(at(), TABLE, List.of(
