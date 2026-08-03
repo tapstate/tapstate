@@ -265,7 +265,11 @@ class PublishedExamplesIT {
         String name = workspace.getFileName().toString().toLowerCase(Locale.ROOT).replace('-', '_');
         int room = NAME_LIMIT - head.length() - tail.length();
         if (name.length() > room) {
-            String digest = Integer.toHexString(name.hashCode());
+            // The same digest the database naming uses, and for the same reason: this id is what keeps
+            // two runs off each other's data, so what shortens it has to keep it unique. A 32-bit
+            // hashCode does not - pairs that agree on it can be constructed - and a collision here
+            // would be inherited by every database name built from this id.
+            String digest = ProvisionedStores.digest(name);
             name = name.substring(0, room - digest.length() - 1) + "_" + digest;
         }
         return head + name + tail;

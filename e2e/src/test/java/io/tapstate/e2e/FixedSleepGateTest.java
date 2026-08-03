@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
@@ -35,11 +36,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class FixedSleepGateTest {
 
-    /** Sanctioned poll primitives: file name to the exact number of sleep calls it may hold. */
+    /**
+     * Keyed by the path under {@code src}, not by file name. A name is not an identity: two files may
+     * share one, and then the allowlist stops saying which file is sanctioned - an unsanctioned
+     * {@code other/E2eExecutor.java} would satisfy the entry the moment the sanctioned one stopped
+     * needing it, and the gate would be green over a sleep nobody allowed.
+     */
     private static final Map<String, Long> POLL_PRIMITIVES = Map.of(
-            "E2eExecutor.java", 1L,
-            "RealProcessServer.java", 1L,
-            "CsvConnector.java", 1L);
+            "test/java/io/tapstate/e2e/E2eExecutor.java", 1L,
+            "test/java/io/tapstate/e2e/RealProcessServer.java", 1L,
+            "test/java/io/tapstate/e2e/connector/CsvConnector.java", 1L);
 
     private static final Pattern SLEEP = Pattern.compile(
             "Thread\\.sleep\\(|TimeUnit\\.[A-Z_]+\\.sleep\\(");
@@ -54,12 +60,13 @@ class FixedSleepGateTest {
     }
 
     /**
-     * Two files of the same name in different packages are two files. Counting them under one key is
-     * what the allowlist's shape asks for; letting the second replace the first would hide however many
-     * sleeps the first held, and this gate exists to make sleeps impossible to hide.
+     * Two files of the same name in different packages are two files, and the gate has to be able to
+     * say which of them is allowed a sleep. Under one key it cannot: an unsanctioned namesake spends
+     * the sanctioned file's allowance the moment that file stops needing it, and the gate stays green
+     * over a sleep nobody allowed - which is the one thing it exists to prevent.
      */
     @Test
-    void sleepsInSameNamedFilesAreAddedRatherThanOneReplacingTheOther(@TempDir Path root) throws IOException {
+    void sameNamedFilesInDifferentPackagesAreToldApart(@TempDir Path root) throws IOException {
         Files.createDirectories(root.resolve("one"));
         Files.createDirectories(root.resolve("two"));
         // Spelled in pieces on purpose: written whole, these fixtures would be counted by the very walk
@@ -68,15 +75,19 @@ class FixedSleepGateTest {
         Files.writeString(root.resolve("one/Twin.java"), "class Twin { void a() { " + sleep + "1); } }");
         Files.writeString(root.resolve("two/Twin.java"), "class Twin { void b() { " + sleep + "2); } }");
 
-        assertThat(sleepsUnder(root)).containsExactly(java.util.Map.entry("Twin.java", 2L));
+        assertThat(sleepsUnder(root)).containsExactlyInAnyOrderEntriesOf(java.util.Map.of(
+                "one/Twin.java", 1L,
+                "two/Twin.java", 1L));
     }
 
     /**
-     * Every source under the root that holds a sleep, by file name, with the counts of same-named files
-     * added together rather than one replacing the other. The allowlist is written in file names because
-     * that is what a reader of a failure recognises, and names are not unique across packages - so a
-     * second {@code Foo.java} used to overwrite the first, and its sleeps left the reckoning entirely.
-     * Added, they cannot: the total stops matching the allowlist and the gate says so.
+     * Every source under the root that holds a sleep, keyed by its path under that root.
+     *
+     * <p>The path is the identity because a file name is not one. Two packages may hold a
+     * {@code Foo.java} each, and keyed by name they are one entry: whichever is walked second used to
+     * replace the first, taking its sleeps out of the reckoning, and adding them instead only fixes
+     * half of it - a sanctioned file that stops needing its sleep leaves its allowance behind for an
+     * unsanctioned namesake to spend. A path says which file is allowed what.
      */
     static Map<String, Long> sleepsUnder(Path root) {
         Map<String, Long> found = new TreeMap<>();
@@ -85,7 +96,8 @@ class FixedSleepGateTest {
                     .forEach(source -> {
                         long sleeps = countSleeps(source);
                         if (sleeps > 0) {
-                            found.merge(source.getFileName().toString(), sleeps, Long::sum);
+                            // Separator normalised so the allowlist reads the same on every platform.
+                            found.put(root.relativize(source).toString().replace(File.separatorChar, '/'), sleeps);
                         }
                     });
         } catch (IOException e) {

@@ -1,5 +1,9 @@
 package io.tapstate.e2e;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -24,6 +28,9 @@ final class ProvisionedStores implements AutoCloseable {
 
     /** Mongo refuses a database name past this many characters, and only says so once a run is under way. */
     private static final int NAME_LIMIT = 63;
+
+    /** Digest width in bytes: 48 bits of hex, enough that a collision is not something one arranges. */
+    private static final int DIGEST_BYTES = 6;
 
     private final Map<String, String> environment = new LinkedHashMap<>();
     private final Map<String, Endpoints> driversByConnector = new LinkedHashMap<>();
@@ -149,7 +156,24 @@ final class ProvisionedStores implements AutoCloseable {
         // first thing to go. A digest of the whole name put back on the end keeps them apart, and it
         // fails visibly rather than silently: two runs sharing a database would drop and rewrite each
         // other's tables in turn, which no assertion here would report as anything but a wrong count.
-        String digest = Integer.toHexString(candidate.hashCode());
+        String digest = digest(candidate);
         return candidate.substring(0, NAME_LIMIT - digest.length() - 1) + "_" + digest;
+    }
+
+    /**
+     * A short digest of the whole text, from a hash built to make collisions hard to produce.
+     *
+     * <p>{@code String.hashCode} is not one: it is 32 bits, and pairs that agree on it are easy to
+     * construct rather than merely unlikely - {@code aan} and {@code ac0} already do. Used to keep
+     * truncated names apart, it would let two runs share a database, and sharing one is silent here
+     * because the runs go in turn and every seed drops its table before writing.
+     */
+    static String digest(String text) {
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(hash, 0, DIGEST_BYTES);
+        } catch (NoSuchAlgorithmException everyJvmHasIt) {
+            throw new IllegalStateException("SHA-256 is required of every Java runtime", everyJvmHasIt);
+        }
     }
 }

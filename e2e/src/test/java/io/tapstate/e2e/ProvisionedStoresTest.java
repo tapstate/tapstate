@@ -42,6 +42,30 @@ class ProvisionedStoresTest {
                 .isNotEqualTo(ProvisionedStores.database("tgt", runId));
     }
 
+    /**
+     * Two run ids that a 32-bit hash cannot tell apart still get different databases.
+     *
+     * <p>The pair is constructed, not stumbled on: {@code aan} and {@code ac0} have the same
+     * {@code String.hashCode}, so two ids sharing everything before them and differing only there
+     * agree on that hash exactly - and they also share the truncated prefix, because what differs sits
+     * past the cut. Under a hashCode digest both halves of the name would therefore be identical and
+     * the two runs would share one database, dropping and reseeding each other's tables with nothing
+     * reporting it. This is what a digest has to survive to be worth having.
+     */
+    @Test
+    void twoRunsAHashCodeCannotTellApartStillGetDifferentNames() {
+        String shared = "e2e_a_specification_named_long_enough_to_be_trimmed_at_the_limit_";
+
+        String first = ProvisionedStores.database("src", shared + "aan");
+        String second = ProvisionedStores.database("src", shared + "ac0");
+
+        assertThat(("e2e_src_" + shared + "aan").hashCode())
+                .as("the pair has to actually collide, or this test proves nothing")
+                .isEqualTo(("e2e_src_" + shared + "ac0").hashCode());
+        assertThat(first).isNotEqualTo(second);
+        assertThat(first).hasSizeLessThanOrEqualTo(NAME_LIMIT);
+    }
+
     /** Same inputs, same name: a run has to be able to find the database it made. */
     @Test
     void theNameIsTheSameEveryTimeItIsAskedFor() {
