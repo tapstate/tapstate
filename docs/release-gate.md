@@ -34,4 +34,4 @@ The honesty of the gate extends to what the release says about itself. The Alpha
 - **must not claim production readiness**;
 - **must not claim exactly-once delivery**.
 
-Wording changes to these three go through review together with this file.
+Wording changes to these four requirements go through review together with this file.

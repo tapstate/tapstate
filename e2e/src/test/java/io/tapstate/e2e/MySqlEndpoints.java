@@ -152,9 +152,12 @@ final class MySqlEndpoints implements Endpoints {
             case INSERT -> insertRange(connection, table, highestId(connection, table) + 1, rows);
             // Lowest ids by order rather than by id <= rows: after a delete the ids no longer start at
             // one, and a change meant to touch two rows would touch none.
-            case UPDATE -> execute(
-                    connection,
-                    "UPDATE " + quoted(table) + " SET seq = -id ORDER BY id LIMIT " + rows);
+            case UPDATE -> {
+                requireSequence(connection, table);
+                execute(
+                        connection,
+                        "UPDATE " + quoted(table) + " SET seq = -id ORDER BY id LIMIT " + rows);
+            }
             case DELETE -> execute(
                     connection, "DELETE FROM " + quoted(table) + " ORDER BY id LIMIT " + rows);
         }
@@ -196,14 +199,33 @@ final class MySqlEndpoints implements Endpoints {
             connection.commit();
         } catch (SQLException e) {
             rollback(connection);
-            throw new EnvelopeException("cannot re-emit the rows of " + table, e);
+            throw withAutoCommitRestored(
+                    connection, new EnvelopeException("cannot re-emit the rows of " + table, e));
         } catch (RuntimeException e) {
             // The insert helper throws its own diagnosis; the transaction must still come back.
             rollback(connection);
-            throw e;
-        } finally {
-            restoreAutoCommit(connection);
+            throw withAutoCommitRestored(connection, e);
         }
+        // Only on the way out without a failure: here a connection that will not commit again is the
+        // whole of what went wrong, so it is the diagnosis rather than a footnote to another one.
+        restoreAutoCommit(connection);
+    }
+
+    /**
+     * Gives the transaction back and returns the failure that is already on its way out.
+     *
+     * <p>Restoring auto-commit in a {@code finally} would have replaced that failure with its own: a
+     * connection broken enough to fail the re-emission is exactly the connection whose
+     * {@code setAutoCommit} then fails too, so the reading an author needs - what the re-emission hit -
+     * would be the one discarded. Attached as suppressed, both survive, and neither is invented.
+     */
+    static <T extends RuntimeException> T withAutoCommitRestored(Connection connection, T failure) {
+        try {
+            connection.setAutoCommit(true);
+        } catch (SQLException e) {
+            failure.addSuppressed(e);
+        }
+        return failure;
     }
 
     private static void rollback(Connection connection) {
@@ -303,6 +325,24 @@ final class MySqlEndpoints implements Endpoints {
             insert.executeBatch();
         } catch (SQLException e) {
             throw new EnvelopeException("cannot write rows into " + table, e);
+        }
+    }
+
+    /**
+     * Refuses an update of a table that has no sequence to rewrite, by name.
+     *
+     * <p>An update is spelled as a rewrite of {@code seq}, which is the generated shape's second column
+     * and need not exist in a table seeded with explicit values. Left to the database the refusal
+     * arrives as "unknown column", which reads as a fault in the store rather than as a word this
+     * table cannot be asked. A delete needs only the id every row carries, so it is not held to this.
+     */
+    private void requireSequence(Connection connection, String table) {
+        List<String> columns = columnsOf(connection, table);
+        if (!columns.contains(SeedRows.SEQ)) {
+            throw new EnvelopeException(
+                    "cannot update " + table + ": an update rewrites the column " + SeedRows.SEQ
+                            + ", and this table carries " + columns
+                            + "; seed it with a row count, or make the change with delete");
         }
     }
 

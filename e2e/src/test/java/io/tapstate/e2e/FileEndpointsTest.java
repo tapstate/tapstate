@@ -40,6 +40,21 @@ class FileEndpointsTest {
         assertThat(lines("orders")).containsExactly("id,seq", "1,1", "2,2", "3,3");
     }
 
+    /**
+     * The shape check holds a row to id and seq but says nothing about what is in them, and the
+     * vocabulary admits a string wherever it admits a number. So this is reachable from a specification
+     * an author can write, and the reading it gets has to name the column and the value - the cast it
+     * would otherwise reach names neither, and arrives as a bare fault with no example in it.
+     */
+    @Test
+    void seedingANonNumberInACountedColumnRefusesAndNamesIt() {
+        assertThatThrownBy(() -> endpoints.seed(at(), "orders", List.of(Map.of("id", 1L, "seq", "two"))))
+                .isInstanceOf(EnvelopeException.class)
+                .hasMessageContaining("seq")
+                .hasMessageContaining("two")
+                .hasMessageContaining("whole numbers");
+    }
+
     @Test
     void seedingReplacesWhateverTheTableHeld() throws IOException {
         endpoints.seed(at(), "orders", SeedRows.generated(5));

@@ -51,13 +51,26 @@ final class FileEndpoints implements Endpoints {
                         "a file store holds rows of exactly id and seq; seeding columns " + row.keySet()
                                 + " means widening the file format and both of its readers first");
             }
-            seeded.add(new Row(longOf(row.get(SeedRows.ID)), longOf(row.get(SeedRows.SEQ))));
+            seeded.add(new Row(longOf(row, SeedRows.ID), longOf(row, SeedRows.SEQ)));
         }
         write(file(address, table), seeded);
     }
 
-    private static long longOf(Object value) {
-        return ((Number) value).longValue();
+    /**
+     * The column as the whole number this format holds. The shape check above holds the row to these
+     * two columns but says nothing about what is in them, and the vocabulary admits a string wherever
+     * it admits a number - so a seed writing {@code seq: two} passes every earlier check and would
+     * reach the cast, which fails with no example, no column and no value in what it says.
+     */
+    private static long longOf(Map<String, Object> row, String column) {
+        Object value = row.get(column);
+        if (!(value instanceof Number number)) {
+            throw new EnvelopeException(
+                    "a file store holds " + SeedRows.ID + " and " + SeedRows.SEQ
+                            + " as whole numbers; seeding " + column + " as '" + value
+                            + "' means widening the file format and both of its readers first");
+        }
+        return number.longValue();
     }
 
     /** The one row the settings locate, in the two columns this format has. */

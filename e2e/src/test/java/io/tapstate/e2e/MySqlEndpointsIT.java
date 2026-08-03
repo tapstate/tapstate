@@ -298,6 +298,27 @@ class MySqlEndpointsIT {
     }
 
     /**
+     * An update is spelled as a rewrite of {@code seq}, so a table seeded with other columns has nothing
+     * for it to rewrite - the same shape mismatch an insert hits, one case along. A delete is not held to
+     * this, because it needs only the id every row carries.
+     */
+    @Test
+    void updatingATableWithNoSequenceRefusesAndNamesTheShape() {
+        endpoints.seed(at(), TABLE, List.of(
+                Map.of("id", 1L, "name", "widget"),
+                Map.of("id", 2L, "name", "gadget")));
+
+        assertThatThrownBy(() -> endpoints.cdc(at(), TABLE, CdcOp.UPDATE, 1))
+                .isInstanceOf(EnvelopeException.class)
+                .hasMessageContaining(TABLE)
+                .hasMessageContaining("name")
+                .hasMessageContaining("make the change with delete");
+
+        endpoints.cdc(at(), TABLE, CdcOp.DELETE, 1);
+        assertThat(endpoints.count(at(), TABLE)).isEqualTo(1L);
+    }
+
+    /**
      * Two databases taken separately share nothing, which is the whole basis for one server serving every
      * specification in the JVM.
      *
