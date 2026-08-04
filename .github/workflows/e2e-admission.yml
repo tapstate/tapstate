@@ -42,8 +42,16 @@ jobs:
 
       - name: The gate still decides the way it is supposed to
         run: |
-          shellcheck .github/scripts/e2e-admission.sh .github/scripts/e2e-admission-smoke.sh
+          shellcheck .github/scripts/e2e-admission.sh .github/scripts/e2e-admission-smoke.sh \
+            .github/scripts/witness-gate.sh
           bash .github/scripts/e2e-admission-smoke.sh
+
+      # The release contract's two file-level halves, which need no database and therefore no nightly:
+      # every published example is listed, and every listed one exists. Checked here so an example that
+      # ships unlisted is caught on the pull request that adds it, rather than the next night against
+      # main, where it belongs to nobody. Whether each witness actually ran is the nightly's half.
+      - name: Every published example is in the release manifest
+        run: bash .github/scripts/witness-gate.sh --manifest-only
 
       - name: An end-to-end case accompanies the product change
         env:

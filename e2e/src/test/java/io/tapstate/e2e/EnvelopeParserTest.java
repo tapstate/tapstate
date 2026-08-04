@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -44,7 +45,53 @@ class EnvelopeParserTest {
         assertThat(envelope.setup().connectors()).containsExactly("mongodb");
         assertThat(envelope.setup().apply()).containsExactly("src_mongo.tap.yml", "tgt_mongo.tap.yml");
         assertThat(envelope.setup().discover()).containsExactly("src_mongo");
-        assertThat(envelope.seed()).containsExactly(new Seed(new TableAlias("src_mongo", "orders"), 100L));
+        assertThat(envelope.seed()).containsExactly(new Seed(new TableAlias("src_mongo", "orders"), SeedRows.generated(100)));
+    }
+
+    /**
+     * A specification can ask for the stores it needs, so a real-database case is data like any other.
+     *
+     * <p>Without this a case can only name endpoints that already exist, which is why every published
+     * example runs on a synthetic connector and every real-database witness is hand-written Java. The
+     * name is the case's handle: {@code src} is what its resources interpolate an address out of.
+     */
+    @Test
+    void parsesTheStoresASpecificationAsksFor() {
+        Envelope envelope = EnvelopeParser.parse("""
+                name: a-case-that-needs-real-stores
+                setup:
+                  databases:
+                    src: { kind: mysql }
+                    tgt: { kind: mongo }
+                  connectors: [mysql, mongodb]
+                  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+                  discover: [src_mysql]
+                pipeline: pipeline.tap.yml
+                steps:
+                  - start
+                """);
+
+        assertThat(envelope.setup().databases())
+                .containsExactly(
+                        entry("src", new DatabaseRequest(DatabaseKind.MYSQL)),
+                        entry("tgt", new DatabaseRequest(DatabaseKind.MONGO)));
+    }
+
+    /** A store kind nobody can provide is an authoring mistake, and it is cheapest to say so here. */
+    @Test
+    void refusesAStoreKindTheHarnessCannotProvide() {
+        assertThatThrownBy(() -> EnvelopeParser.parse("""
+                name: a-case-asking-for-something-unprovidable
+                setup:
+                  databases:
+                    src: { kind: cassandra }
+                pipeline: pipeline.tap.yml
+                steps:
+                  - start
+                """))
+                .isInstanceOf(EnvelopeException.class)
+                .hasMessageContaining("cassandra")
+                .hasMessageContaining("mongo");
     }
 
     @Test
@@ -200,7 +247,7 @@ class EnvelopeParserTest {
                 EnvelopeParser.parse(minimal("seed:\n  a.t1: { rows: 1 }\n  b.t2: { rows: 2 }\nsteps:\n  - start\n"));
 
         assertThat(envelope.seed())
-                .containsExactly(new Seed(new TableAlias("a", "t1"), 1L), new Seed(new TableAlias("b", "t2"), 2L));
+                .containsExactly(new Seed(new TableAlias("a", "t1"), SeedRows.generated(1)), new Seed(new TableAlias("b", "t2"), SeedRows.generated(2)));
     }
 
     @Test
@@ -297,6 +344,141 @@ class EnvelopeParserTest {
 
         assertThat(envelope.steps()).isUnmodifiable();
         assertThat(envelope.seed()).isUnmodifiable();
+    }
+
+    @Test
+    void seedValuesAreTheRowsThemselves() {
+        Envelope envelope = EnvelopeParser.parse(minimal(
+                "seed:\n  src_mongo.orders:\n    values:\n      - { id: 1, name: widget }\n"
+                        + "      - { id: 2, name: gadget }\nsteps:\n  - start\n"));
+
+        assertThat(envelope.seed()).hasSize(1);
+        assertThat(envelope.seed().getFirst().rows())
+                .containsExactly(
+                        java.util.Map.of("id", 1, "name", "widget"),
+                        java.util.Map.of("id", 2, "name", "gadget"));
+    }
+
+    /** rows: N is sugar for the generated shape, so the two forms cannot disagree about one table. */
+    @Test
+    void aSeedEntryCarriesExactlyOneOfRowsOrValues() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    rows: 2\n    values: [ { id: 1 } ]\nsteps:\n  - start\n")))
+                .hasMessageContaining("exactly one of rows or values");
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal("seed:\n  a.t: {}\nsteps:\n  - start\n")))
+                .hasMessageContaining("exactly one of rows or values");
+    }
+
+    @Test
+    void aSeedValueRowWithoutAnIdIsRefused() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    values: [ { name: widget } ]\nsteps:\n  - start\n")))
+                .hasMessageContaining("carries no id");
+    }
+
+    /** The two scalars every store spells the same way; anything wider is a vocabulary widening. */
+    @Test
+    void aSeedValueBeyondIntegerOrStringIsRefused() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    values: [ { id: 1, price: 1.5 } ]\nsteps:\n  - start\n")))
+                .hasMessageContaining("must be an integer or a string");
+    }
+
+    /**
+     * The stores disagree about a repeated id - a relational table refuses the second row, a document
+     * store keeps both - so a specification carrying one would be an authoring error against one store
+     * and a silently doubled seed against another. Held here, it is one answer for every store, and it
+     * arrives at the row that repeats rather than as an ambiguous read a hundred lines later.
+     */
+    @Test
+    void seedValueRowsCarryOneIdEach() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    values:\n      - { id: 1, name: widget }\n      - { id: 1, name: gadget }\n"
+                        + "steps:\n  - start\n")))
+                .hasMessageContaining("values[1]")
+                .hasMessageContaining("one row, one id");
+    }
+
+    /** A table that exists and holds nothing is a thing a specification says, and a store must lay down. */
+    @Test
+    void aSeedOfNoRowsIsTheEmptyTable() {
+        Envelope envelope =
+                EnvelopeParser.parse(minimal("seed:\n  a.t: { rows: 0 }\nsteps:\n  - start\n"));
+
+        assertThat(envelope.seed()).hasSize(1);
+        assertThat(envelope.seed().getFirst().rows()).isEmpty();
+    }
+
+    @Test
+    void seedValueRowsCarryOneShape() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "seed:\n  a.t:\n    values:\n      - { id: 1, name: widget }\n      - { id: 2 }\n"
+                        + "steps:\n  - start\n")))
+                .hasMessageContaining("same columns");
+    }
+
+    @Test
+    void aDocMatcherReadsWhereExpectAndSize() {
+        Envelope envelope = EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                        + "expect: { name: widget, \"items[0].sku\": x }, size: { items: 2 } } } }\n"));
+
+        Step.Assertion assertion = (Step.Assertion) envelope.steps().getFirst();
+        Matcher.Doc doc = (Matcher.Doc) assertion.matcher();
+        assertThat(doc.table()).isEqualTo(new TableAlias("tgt_mongo", "orders"));
+        assertThat(doc.where()).containsExactly(java.util.Map.entry("id", 1));
+        assertThat(doc.expect()).containsKeys("name", "items[0].sku");
+        assertThat(doc.size()).containsExactly(java.util.Map.entry("items", 2L));
+    }
+
+    /** A doc that expects nothing would hold for any document at all, including the wrong one. */
+    @Test
+    void aDocMatcherWithoutExpectationsIsRefused() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 } } } }\n")))
+                .hasMessageContaining("carry expect or size");
+    }
+
+    /**
+     * A path is written by an author, so a mistake in one is an authoring mistake and belongs here.
+     * Unchecked it reaches the wait that walks it as a raw index or substring fault naming neither the
+     * specification nor the path - and a wait that dies that way records no witness at all, so the
+     * release gate reports the example as never run rather than as mis-written.
+     */
+    @Test
+    void aDocPathThatIsNotAPathIsRefusedWhereItIsWritten() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { \"items[0.sku\": 1 } } } }\n")))
+                .hasMessageContaining("doc.a.t.expect.items[0.sku")
+                .hasMessageContaining("unclosed");
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { \"items[-1].sku\": 1 } } } }\n")))
+                .hasMessageContaining("whole number counting from zero");
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, size: { \"items[x]\": 1 } } } }\n")))
+                .hasMessageContaining("whole number counting from zero");
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { \"[0].sku\": 1 } } } }\n")))
+                .hasMessageContaining("must name a field");
+    }
+
+    /** The shapes an author does write: plain fields, nested fields, indices, indices in a row. */
+    @Test
+    void aDocPathReadsFieldsAndIndices() {
+        Envelope envelope = EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { name: x, \"a.b\": y, "
+                        + "\"items[0].sku\": z, \"grid[0][1]\": w } } } }\n"));
+
+        Matcher.Doc doc = (Matcher.Doc) ((Step.Assertion) envelope.steps().getFirst()).matcher();
+        assertThat(doc.expect()).containsKeys("name", "a.b", "items[0].sku", "grid[0][1]");
+    }
+
+    @Test
+    void aDocMatcherNamesExactlyOneTable() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { x: 1 } }, "
+                        + "b.t: { where: { id: 1 }, expect: { x: 1 } } } }\n")))
+                .hasMessageContaining("exactly one table");
     }
 
     private static String minimal(String body) {

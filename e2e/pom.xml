@@ -207,6 +207,36 @@
           </execution>
         </executions>
       </plugin>
+      <!-- The witness ledger is the run's own record, so it must not outlive the run.
+           Truncating it from inside the harness covers only a run that got as far as one passing
+           witness: a build where the witnesses were never discovered, or where every one of them
+           aborted, leaves an earlier run's file in place, and the release gate then reads it as this
+           run's evidence and vouches for witnesses that did not execute. Deleting the file before the
+           phase that writes it is what makes its absence mean absence. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-clean-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>witness-ledger-belongs-to-this-run</id>
+            <phase>pre-integration-test</phase>
+            <goals>
+              <goal>clean</goal>
+            </goals>
+            <configuration>
+              <excludeDefaultDirectories>true</excludeDefaultDirectories>
+              <filesets>
+                <fileset>
+                  <directory>${project.build.directory}</directory>
+                  <includes>
+                    <include>witness-ledger.txt</include>
+                  </includes>
+                </fileset>
+              </filesets>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
       <!-- Specification runs (*IT) are Docker-backed and live in the integration-test phase, so `mvn
            test` stays fast and `mvn verify` exercises them. Without this binding failsafe is not
            active in this module and every *IT here would be silently collected by nobody - a tier that
@@ -237,6 +267,9 @@
                  rather than the value itself: it is long enough that some shells and process tables
                  truncate it, and reading it back is a fact the build produced rather than a guess. -->
             <tapstate.e2e.cli-classpath>${project.build.directory}/cli-classpath.txt</tapstate.e2e.cli-classpath>
+            <!-- Where this module's output goes, so the witness ledger is written where the release
+                 gate reads it rather than wherever the JVM happened to be started. -->
+            <tapstate.e2e.build-directory>${project.build.directory}</tapstate.e2e.build-directory>
           </systemPropertyVariables>
         </configuration>
         <executions>

@@ -22,7 +22,7 @@
 #
 #   e2e/build-real-connectors.sh /tmp/connectors
 #   mvn -pl e2e -am verify -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=/tmp/connectors \
-#     -Dit.test=RealMysqlToMongoSnapshotIT,RealMysqlToMongoCdcIT
+#     -Dit.test=PublishedExamplesIT
 #
 # A second argument names the directory to clone into, which has to be empty; it defaults to a fresh
 # temporary directory.

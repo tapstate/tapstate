@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -27,26 +28,46 @@ class FileEndpointsTest {
 
     private final FileEndpoints endpoints = new FileEndpoints();
 
+    /** The temporary directory this test drives, in the shape a driver is handed it. */
+    private EndpointAddress at() {
+        return EndpointAddress.uri(directory.toString());
+    }
+
     @Test
     void seedingWritesAHeaderAndTheRowsNumberedFromOne() throws IOException {
-        endpoints.seed(directory.toString(), "orders", 3);
+        endpoints.seed(at(), "orders", SeedRows.generated(3));
 
         assertThat(lines("orders")).containsExactly("id,seq", "1,1", "2,2", "3,3");
     }
 
+    /**
+     * The shape check holds a row to id and seq but says nothing about what is in them, and the
+     * vocabulary admits a string wherever it admits a number. So this is reachable from a specification
+     * an author can write, and the reading it gets has to name the column and the value - the cast it
+     * would otherwise reach names neither, and arrives as a bare fault with no example in it.
+     */
+    @Test
+    void seedingANonNumberInACountedColumnRefusesAndNamesIt() {
+        assertThatThrownBy(() -> endpoints.seed(at(), "orders", List.of(Map.of("id", 1L, "seq", "two"))))
+                .isInstanceOf(EnvelopeException.class)
+                .hasMessageContaining("seq")
+                .hasMessageContaining("two")
+                .hasMessageContaining("whole numbers");
+    }
+
     @Test
     void seedingReplacesWhateverTheTableHeld() throws IOException {
-        endpoints.seed(directory.toString(), "orders", 5);
-        endpoints.seed(directory.toString(), "orders", 2);
+        endpoints.seed(at(), "orders", SeedRows.generated(5));
+        endpoints.seed(at(), "orders", SeedRows.generated(2));
 
         assertThat(lines("orders")).containsExactly("id,seq", "1,1", "2,2");
     }
 
     @Test
     void countingReadsTheRowsBackWithoutTheHeader() {
-        endpoints.seed(directory.toString(), "orders", 3);
+        endpoints.seed(at(), "orders", SeedRows.generated(3));
 
-        assertThat(endpoints.count(directory.toString(), "orders")).isEqualTo(3L);
+        assertThat(endpoints.count(at(), "orders")).isEqualTo(3L);
     }
 
     /**
@@ -56,44 +77,44 @@ class FileEndpointsTest {
      */
     @Test
     void aTableNoOneHasWrittenYetCountsZero() {
-        assertThat(endpoints.count(directory.toString(), "never_written")).isZero();
+        assertThat(endpoints.count(at(), "never_written")).isZero();
     }
 
     @Test
     void countingReadsRowsThisDriverDidNotWrite() throws IOException {
         Files.writeString(directory.resolve("orders.csv"), "id,seq\n7,7\n8,8\n");
 
-        assertThat(endpoints.count(directory.toString(), "orders")).isEqualTo(2L);
+        assertThat(endpoints.count(at(), "orders")).isEqualTo(2L);
     }
 
     @Test
     void insertingAppendsRowsAfterTheHighestIdTheTableHolds() throws IOException {
-        endpoints.seed(directory.toString(), "orders", 3);
+        endpoints.seed(at(), "orders", SeedRows.generated(3));
 
-        endpoints.cdc(directory.toString(), "orders", CdcOp.INSERT, 2);
+        endpoints.cdc(at(), "orders", CdcOp.INSERT, 2);
 
         assertThat(lines("orders")).containsExactly("id,seq", "1,1", "2,2", "3,3", "4,4", "5,5");
     }
 
     @Test
     void deletingRemovesTheLowestIdsAndLowersTheCount() throws IOException {
-        endpoints.seed(directory.toString(), "orders", 4);
+        endpoints.seed(at(), "orders", SeedRows.generated(4));
 
-        endpoints.cdc(directory.toString(), "orders", CdcOp.DELETE, 2);
+        endpoints.cdc(at(), "orders", CdcOp.DELETE, 2);
 
         assertThat(lines("orders")).containsExactly("id,seq", "3,3", "4,4");
-        assertThat(endpoints.count(directory.toString(), "orders")).isEqualTo(2L);
+        assertThat(endpoints.count(at(), "orders")).isEqualTo(2L);
     }
 
     /** An update changes rows without adding or removing any, so a count cannot witness it. */
     @Test
     void updatingRewritesTheSequenceOfTheLowestIdsAndLeavesTheCountAlone() throws IOException {
-        endpoints.seed(directory.toString(), "orders", 3);
+        endpoints.seed(at(), "orders", SeedRows.generated(3));
 
-        endpoints.cdc(directory.toString(), "orders", CdcOp.UPDATE, 2);
+        endpoints.cdc(at(), "orders", CdcOp.UPDATE, 2);
 
         assertThat(lines("orders")).containsExactly("id,seq", "1,-1", "2,-2", "3,3");
-        assertThat(endpoints.count(directory.toString(), "orders")).isEqualTo(3L);
+        assertThat(endpoints.count(at(), "orders")).isEqualTo(3L);
     }
 
     /**
@@ -103,15 +124,34 @@ class FileEndpointsTest {
      */
     @Test
     void changingATableNoOneSeededRefusesRatherThanCreatingIt() {
-        assertThatThrownBy(() -> endpoints.cdc(directory.toString(), "orders", CdcOp.INSERT, 1))
+        assertThatThrownBy(() -> endpoints.cdc(at(), "orders", CdcOp.INSERT, 1))
                 .isInstanceOf(EnvelopeException.class)
                 .hasMessageContaining("orders")
                 .hasMessageContaining("not been seeded");
     }
 
+    /**
+     * The refusal that used to live in the binding, which read one setting and rejected a resource without
+     * it. Now that the whole mapping is handed over, only the driver knows which setting it needed - so the
+     * refusal belongs here, and has to keep naming both the resource at fault and the setting it lacked.
+     * Left untested it would decay into a bare NullPointerException, and an author would learn that
+     * something was null rather than that their resource carries no address.
+     */
+    @Test
+    void anAddressCarryingNoUriRefusesAndNamesWhatItLacks() {
+        EndpointAddress addressless = new EndpointAddress("src_jdbc", Map.of("host", "localhost"));
+
+        assertThatThrownBy(() -> endpoints.count(addressless, "orders"))
+                .isInstanceOf(EnvelopeException.class)
+                .hasMessageContaining("src_jdbc")
+                .hasMessageContaining("uri")
+                .hasMessageContaining("host");
+    }
+
     @Test
     void anEndpointNamingSomethingThatIsNotADirectoryRefuses() {
-        assertThatThrownBy(() -> endpoints.count(directory.resolve("absent").toString(), "orders"))
+        EndpointAddress absent = EndpointAddress.uri(directory.resolve("absent").toString());
+        assertThatThrownBy(() -> endpoints.count(absent, "orders"))
                 .isInstanceOf(EnvelopeException.class)
                 .hasMessageContaining("is not a directory");
     }

@@ -10,6 +10,7 @@ import org.yaml.snakeyaml.error.YAMLException;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -59,9 +60,39 @@ public final class EnvelopeParser {
         Map<String, Object> mapping = mapping(node, "setup");
         rejectUnknownKeys(mapping.keySet(), Set.copyOf(Vocabulary.SETUP_KEYS), "setup");
         return new Setup(
+                databases(mapping.get("databases")),
                 stringList(mapping.get("connectors"), "setup.connectors"),
                 stringList(mapping.get("apply"), "setup.apply"),
                 stringList(mapping.get("discover"), "setup.discover"));
+    }
+
+    /**
+     * The stores a specification asks the harness to provide, keyed by the name its resources
+     * interpolate an address out of. Nothing here names a driver or a container: the kind settles both,
+     * so a specification stays a description of what it needs rather than of how to get it.
+     */
+    private static Map<String, DatabaseRequest> databases(Object node) {
+        if (node == null) {
+            return Map.of();
+        }
+        Map<String, DatabaseRequest> requests = new LinkedHashMap<>();
+        mapping(node, "setup.databases")
+                .forEach(
+                        (name, request) -> {
+                            String where = "setup.databases." + name;
+                            Map<String, Object> fields = mapping(request, where);
+                            rejectUnknownKeys(fields.keySet(), Vocabulary.DATABASE_KEYS, where);
+                            requests.put(
+                                    name,
+                                    new DatabaseRequest(
+                                            databaseKind(string(fields.get("kind"), where + ".kind"))));
+                        });
+        return requests;
+    }
+
+    private static DatabaseKind databaseKind(String word) {
+        return word(DatabaseKind.values(), DatabaseKind::word, word,
+                "unknown store kind: " + word + "; the harness can provide " + Vocabulary.DATABASE_KINDS);
     }
 
     private static List<Seed> seed(Object node) {
@@ -72,11 +103,126 @@ public final class EnvelopeParser {
         mapping(node, "seed")
                 .forEach(
                         (alias, spec) -> {
-                            Map<String, Object> rows = mapping(spec, "seed." + alias);
-                            rejectUnknownKeys(rows.keySet(), Vocabulary.SEED_KEYS, "seed." + alias);
-                            seeds.add(new Seed(alias(alias), rowCount(rows.get("rows"), "seed." + alias + ".rows")));
+                            Map<String, Object> entry = mapping(spec, "seed." + alias);
+                            rejectUnknownKeys(entry.keySet(), Vocabulary.SEED_KEYS, "seed." + alias);
+                            seeds.add(new Seed(alias(alias), seedRows(entry, "seed." + alias)));
                         });
         return seeds;
+    }
+
+    /**
+     * The rows one seed entry lays down. {@code rows: N} is sugar for the generated shape - ids 1..N,
+     * each with a sequence equal to its id - expanded here so no driver ever decides what a row looks
+     * like. {@code values} is the general form: the rows themselves, columns and all.
+     */
+    private static List<Map<String, Object>> seedRows(Map<String, Object> entry, String at) {
+        Object rows = entry.get("rows");
+        Object values = entry.get("values");
+        if ((rows == null) == (values == null)) {
+            throw new EnvelopeException(at + " carries exactly one of rows or values");
+        }
+        if (rows != null) {
+            return SeedRows.generated(rowCount(rows, at + ".rows"));
+        }
+        return valueRows(values, at + ".values");
+    }
+
+    /**
+     * Explicit rows: each carries {@code id} (the key everything seeds and upserts by), no two rows
+     * carry the same one, every row carries the same columns (one table, one shape), and every value is
+     * an integer or a string - the two scalars whose crossing every store in this vocabulary spells the
+     * same way. Wider value types are a widening of this word, not a loosening of this check.
+     *
+     * <p>Uniqueness is held here rather than left to the store, because the stores disagree about it: a
+     * relational table refuses the second row outright, and a document store accepts it, so the same
+     * specification would be an authoring error against one and a silently doubled seed against
+     * another - surfacing far away as an ambiguous document read, or as a count that agrees by
+     * accident.
+     */
+    private static List<Map<String, Object>> valueRows(Object node, String at) {
+        if (!(node instanceof List<?> sequence) || sequence.isEmpty()) {
+            throw new EnvelopeException(at + " must be a non-empty sequence of rows, found: " + describe(node));
+        }
+        List<Map<String, Object>> rows = new ArrayList<>();
+        Set<String> shape = null;
+        Set<Object> ids = new LinkedHashSet<>();
+        for (int i = 0; i < sequence.size(); i++) {
+            String rowAt = at + "[" + i + "]";
+            Map<String, Object> row = mapping(sequence.get(i), rowAt);
+            if (!row.containsKey(SeedRows.ID)) {
+                throw new EnvelopeException(rowAt + " carries no id, the key rows are seeded and upserted by");
+            }
+            if (!ids.add(normalizedId(row.get(SeedRows.ID)))) {
+                throw new EnvelopeException(
+                        rowAt + " carries the id " + row.get(SeedRows.ID)
+                                + " a row before it already carries; one row, one id");
+            }
+            row.forEach((column, value) -> requireScalar(value, rowAt + "." + column));
+            if (shape == null) {
+                shape = row.keySet();
+            } else if (!shape.equals(row.keySet())) {
+                throw new EnvelopeException(
+                        rowAt + " does not carry the same columns as the rows before it: one table, one shape");
+            }
+            rows.add(new LinkedHashMap<>(row));
+        }
+        return rows;
+    }
+
+    /**
+     * The id as identity rather than as written: a YAML parser hands back 1 as an Integer and 1 as a
+     * Long depending on nothing an author controls, and two rows keyed the same way are the same row
+     * whichever width each arrived as.
+     */
+    private static Object normalizedId(Object id) {
+        return id instanceof Number number ? number.longValue() : id;
+    }
+
+    /**
+     * A path into a document: dotted field names, each optionally followed by list indices, as in
+     * {@code items[0].sku}. Held here rather than where it is walked, because a path is written by an
+     * author and a mistake in one is an authoring mistake: unchecked, a missing bracket or a negative
+     * index reaches a polling wait as a raw index or substring fault, naming neither the specification
+     * nor the path, and a wait that dies that way records no witness at all.
+     */
+    private static void requirePath(String path, String at) {
+        String where = at + "." + path;
+        if (path.isBlank()) {
+            throw new EnvelopeException(where + " must name a field");
+        }
+        for (String segment : path.split("\\.", -1)) {
+            int bracket = segment.indexOf('[');
+            String field = bracket < 0 ? segment : segment.substring(0, bracket);
+            if (field.isBlank()) {
+                throw new EnvelopeException(where + " must name a field before each index");
+            }
+            while (bracket >= 0) {
+                int close = segment.indexOf(']', bracket);
+                if (close < 0) {
+                    throw new EnvelopeException(where + " leaves an index unclosed: expected a ] after " + segment);
+                }
+                String index = segment.substring(bracket + 1, close);
+                if (!index.matches("\\d+")) {
+                    throw new EnvelopeException(
+                            where + " indexes a list with '" + index
+                                    + "'; an index is a whole number counting from zero");
+                }
+                bracket = segment.indexOf('[', close);
+                if (bracket > close + 1) {
+                    throw new EnvelopeException(where + " carries text between indices: " + segment);
+                }
+                if (bracket < 0 && close != segment.length() - 1) {
+                    throw new EnvelopeException(where + " carries text after an index: " + segment);
+                }
+            }
+        }
+    }
+
+    private static void requireScalar(Object value, String at) {
+        if (!(value instanceof Integer || value instanceof Long || value instanceof String)) {
+            throw new EnvelopeException(
+                    at + " must be an integer or a string, found: " + describe(value));
+        }
     }
 
     private static List<Step> steps(Object node) {
@@ -188,9 +334,51 @@ public final class EnvelopeParser {
         Map.Entry<String, Object> only = mapping.entrySet().iterator().next();
         return switch (matcherWord(only.getKey())) {
             case COUNT -> count(only.getValue());
+            case DOC -> doc(only.getValue());
             case ERROR_COUNT -> new Matcher.ErrorCount(rowCount(only.getValue(), "error_count"));
             case STATE -> new Matcher.State(pipelineState(only.getValue()));
         };
+    }
+
+    /** One table, one document: located by {@code where}, held to {@code expect} and {@code size}. */
+    private static Matcher doc(Object node) {
+        Map<String, Object> mapping = mapping(node, "doc");
+        if (mapping.size() != 1) {
+            throw new EnvelopeException("doc names exactly one table, found: " + mapping.keySet());
+        }
+        Map.Entry<String, Object> only = mapping.entrySet().iterator().next();
+        String at = "doc." + only.getKey();
+        Map<String, Object> body = mapping(only.getValue(), at);
+        rejectUnknownKeys(body.keySet(), Vocabulary.DOC_KEYS, at);
+
+        Map<String, Object> where = mapping(body.get("where"), at + ".where");
+        if (where.isEmpty()) {
+            throw new EnvelopeException(at + ".where must name at least one setting to locate the document by");
+        }
+        where.forEach((setting, value) -> requireScalar(value, at + ".where." + setting));
+
+        Map<String, Object> expect = body.get("expect") == null
+                ? Map.of()
+                : mapping(body.get("expect"), at + ".expect");
+        expect.forEach(
+                (path, value) -> {
+                    requirePath(path, at + ".expect");
+                    requireScalar(value, at + ".expect." + path);
+                });
+
+        Map<String, Long> size = new LinkedHashMap<>();
+        if (body.get("size") != null) {
+            mapping(body.get("size"), at + ".size")
+                    .forEach(
+                            (path, length) -> {
+                                requirePath(path, at + ".size");
+                                size.put(path, rowCount(length, at + ".size." + path));
+                            });
+        }
+        if (expect.isEmpty() && size.isEmpty()) {
+            throw new EnvelopeException(at + " holds the document to nothing: carry expect or size");
+        }
+        return new Matcher.Doc(alias(only.getKey()), where, expect, size);
     }
 
     private static Matcher count(Object node) {

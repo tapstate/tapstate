@@ -29,3 +29,6 @@ docs owner, with a link back to this PR.
 
 - [ ] `mvn verify` is green locally
 - [ ] An end-to-end case covers this change, and is named above
+- [ ] New or changed e2e assertions carry mutation evidence: the mutation applied,
+      the red observed, and that only it went red (see CONTRIBUTING.md,
+      "Mutation evidence")

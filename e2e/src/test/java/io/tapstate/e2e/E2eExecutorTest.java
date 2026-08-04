@@ -247,6 +247,134 @@ class E2eExecutorTest {
         assertThat(binding.countReads).isEqualTo(1);
     }
 
+    /**
+     * A change written right after a real change stream comes up can land in the source before the
+     * stream is positioned, and is then never delivered: the await that follows stalls at a reading
+     * that never moves. The executor closes that window without a fixed sleep: an await that reads the
+     * same mismatch enough consecutive polls, when the last step was a change, asks the binding to
+     * redeliver the changed table's current rows. Redelivery re-asserts state row-wise, so a batch that
+     * was merely slow is absorbed by the same keys rather than doubled.
+     */
+    @Test
+    void aStalledAwaitAfterAChangeRedeliversTheChangedTable() {
+        binding.countsOverTime(TARGET, 5L);
+        binding.onRedeliverCountBecomes(TARGET, 8L);
+
+        execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { count: { tgt_mongo.orders: 8 } }\n"));
+
+        assertThat(binding.calls).contains("redeliver:src_mongo.orders");
+    }
+
+    /** Redelivery exists for lost changes; an await with no change before it has nothing to redeliver. */
+    @Test
+    void aStalledAwaitWithNoPrecedingChangeNeverRedelivers() {
+        binding.countsOverTime(TARGET, 5L);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - await: { count: { tgt_mongo.orders: 8 } }\n")))
+                .isInstanceOf(AssertionError.class);
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
+    /** A reading that keeps moving is a delivery in progress, not a loss; redelivering it would double it. */
+    @Test
+    void anAwaitStillMakingProgressIsNotRedelivered() {
+        binding.countsOverTime(TARGET, 5L, 5L, 6L, 6L, 7L, 7L, 8L);
+
+        execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { count: { tgt_mongo.orders: 8 } }\n"));
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
+    /** Once an await has held, its change was delivered; a later stall is not that change's fault. */
+    @Test
+    void aDeliveredChangeIsNotRedeliveredByALaterAwait() {
+        binding.countsOverTime(TARGET, 8L);
+        binding.countsOverTime(SOURCE, 0L);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { count: { tgt_mongo.orders: 8 } }\n"
+                + "  - await: { count: { src_mongo.orders: 9 } }\n")))
+                .isInstanceOf(AssertionError.class);
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
+    /**
+     * A wait on the product's own observation is not a wait on delivered data. Its reading holds still
+     * for the ordinary reason that the product has not converged yet - so on a long enough wait the
+     * stall is the normal case, not the exceptional one - and no rewrite of the source would move it.
+     * A specification that waits for a failure is usually asserting about the very rows a redelivery
+     * would rewrite, so the harness would be mutating the fixture whose failure is the subject.
+     */
+    @Test
+    void aStalledAwaitOnAPublishedStateNeverRedeliversTheSource() {
+        binding.states(PipelineState.RUNNING);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { state: FAILED }\n")))
+                .isInstanceOf(AssertionError.class);
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
+    /** An error count is read the same way, and stalls the same way, so it redelivers no more than a state. */
+    @Test
+    void aStalledAwaitOnAnErrorCountNeverRedeliversTheSource() {
+        binding.errorCounts(0L);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - cdc: { src_mongo.orders: insert 3 }\n"
+                + "  - await: { error_count: 1 }\n")))
+                .isInstanceOf(AssertionError.class);
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
+    @Test
+    void holdsADocumentToValuesByPathAndListSizesByPath() {
+        binding.holdsDocument(TARGET, Map.of(
+                "id", 1L,
+                "name", "widget",
+                "items", List.of(Map.of("sku", "a"), Map.of("sku", "b"))));
+
+        execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                + "expect: { name: widget, \"items[1].sku\": b }, size: { items: 2 } } } }\n"));
+    }
+
+    /** Absence and disagreement send an author to different places, so they read differently. */
+    @Test
+    void reportsAnAbsentDocumentAsItsOwnMismatch() {
+        assertThatThrownBy(() -> execute(minimal(
+                "steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, expect: { name: widget } } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("holds no document where {id=1}");
+    }
+
+    /** All the disagreeing paths, not the first: one read, one full account. */
+    @Test
+    void reportsEveryDisagreeingPathInOneReading() {
+        binding.holdsDocument(TARGET, Map.of("id", 1L, "name", "gadget", "items", List.of()));
+
+        assertThatThrownBy(() -> execute(minimal(
+                "steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                        + "expect: { name: widget, missing: x }, size: { items: 2 } } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("at name expected widget, found gadget")
+                .hasMessageContaining("has nothing at missing")
+                .hasMessageContaining("at items expected 2 elements, found 0");
+    }
+
+    /** Whole numbers agree across representations: a store answering Int32 for a long is the same value. */
+    @Test
+    void holdsWholeNumbersAcrossTheirRepresentations() {
+        binding.holdsDocument(TARGET, Map.of("id", 1, "seq", 7));
+
+        execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                + "expect: { seq: 7 } } } }\n"));
+    }
+
     private void execute(String yaml) {
         binding.calls.clear();
         new E2eExecutor(binding, path -> PIPELINE_ID, Duration.ofMillis(200), Duration.ofMillis(1))
@@ -330,8 +458,20 @@ class E2eExecutorTest {
         }
 
         @Override
-        public void seed(TableAlias table, long rows) {
-            calls.add("seed:" + table + "=" + rows);
+        public void seed(TableAlias table, List<Map<String, Object>> rows) {
+            calls.add("seed:" + table + "=" + rows.size());
+        }
+
+        private final Map<TableAlias, Map<String, Object>> fetchable = new HashMap<>();
+
+        void holdsDocument(TableAlias table, Map<String, Object> document) {
+            fetchable.put(table, document);
+        }
+
+        @Override
+        public Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where) {
+            calls.add("fetch:" + table + "=" + where);
+            return Optional.ofNullable(fetchable.get(table));
         }
 
         @Override
@@ -343,6 +483,23 @@ class E2eExecutorTest {
         @Override
         public void cdc(TableAlias table, CdcOp op, long rows) {
             calls.add("cdc:" + table + "=" + op + " x" + rows);
+        }
+
+        private TableAlias redeliverMovesTable;
+        private long redeliverMovesTo;
+
+        /** Arranges for a redelivery to unblock a count, the way a re-emitted batch reaches a target. */
+        void onRedeliverCountBecomes(TableAlias table, long value) {
+            redeliverMovesTable = table;
+            redeliverMovesTo = value;
+        }
+
+        @Override
+        public void redeliver(TableAlias table) {
+            calls.add("redeliver:" + table);
+            if (redeliverMovesTable != null) {
+                countsOverTime(redeliverMovesTable, redeliverMovesTo);
+            }
         }
 
         @Override

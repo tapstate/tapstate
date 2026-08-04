@@ -6,7 +6,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 /**
  * The file endpoints a specification lays data on and reads data from: one comma-separated file per
@@ -30,23 +34,90 @@ final class FileEndpoints implements Endpoints {
     private static final String HEADER = "id,seq";
     private static final String SUFFIX = ".csv";
 
-    /** Lays {@code rows} rows down, numbered from one, replacing whatever the table held. */
+    /** The setting this store is addressed by: the directory holding one file per table. */
+    private static final String DIRECTORY = "uri";
+
+    /**
+     * Lays the given rows down, replacing whatever the table held. This store's format is a contract
+     * with a second, independent reader, so it carries exactly the generated shape - an id and a
+     * sequence; rows with other columns name a widening of the format, not of this method.
+     */
     @Override
-    public void seed(String uri, String table, long rows) {
+    public void seed(EndpointAddress address, String table, List<Map<String, Object>> rows) {
         List<Row> seeded = new ArrayList<>();
-        for (long id = 1; id <= rows; id++) {
-            seeded.add(new Row(id, id));
+        for (Map<String, Object> row : rows) {
+            if (!row.keySet().equals(Set.of(SeedRows.ID, SeedRows.SEQ))) {
+                throw new EnvelopeException(
+                        "a file store holds rows of exactly id and seq; seeding columns " + row.keySet()
+                                + " means widening the file format and both of its readers first");
+            }
+            seeded.add(new Row(longOf(row, SeedRows.ID), longOf(row, SeedRows.SEQ)));
         }
-        write(file(uri, table), seeded);
+        write(file(address, table), seeded);
+    }
+
+    /**
+     * The column as the whole number this format holds. The shape check above holds the row to these
+     * two columns but says nothing about what is in them, and the vocabulary admits a string wherever
+     * it admits a number - so a seed writing {@code seq: two} passes every earlier check and would
+     * reach the cast, which fails with no example, no column and no value in what it says.
+     */
+    private static long longOf(Map<String, Object> row, String column) {
+        Object value = row.get(column);
+        if (!(value instanceof Number number)) {
+            throw new EnvelopeException(
+                    "a file store holds " + SeedRows.ID + " and " + SeedRows.SEQ
+                            + " as whole numbers; seeding " + column + " as '" + value
+                            + "' means widening the file format and both of its readers first");
+        }
+        return number.longValue();
+    }
+
+    /** The one row the settings locate, in the two columns this format has. */
+    @Override
+    public Optional<Map<String, Object>> fetch(EndpointAddress address, String table, Map<String, Object> where) {
+        Path file = file(address, table);
+        if (!Files.exists(file)) {
+            return Optional.empty();
+        }
+        List<Row> matches = read(file).stream().filter(row -> matches(row, where)).toList();
+        if (matches.isEmpty()) {
+            return Optional.empty();
+        }
+        if (matches.size() > 1) {
+            throw new EnvelopeException(
+                    "more than one row in " + table + " matches " + where
+                            + "; a document read must locate exactly one");
+        }
+        Map<String, Object> document = new LinkedHashMap<>();
+        document.put(SeedRows.ID, matches.getFirst().id());
+        document.put(SeedRows.SEQ, matches.getFirst().seq());
+        return Optional.of(document);
+    }
+
+    private static boolean matches(Row row, Map<String, Object> where) {
+        for (Map.Entry<String, Object> setting : where.entrySet()) {
+            Long actual = switch (setting.getKey()) {
+                case SeedRows.ID -> row.id();
+                case SeedRows.SEQ -> row.seq();
+                default -> null;
+            };
+            if (actual == null || !(setting.getValue() instanceof Number expected)
+                    || actual != expected.longValue()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Produces {@code rows} changes of one kind against a table that is already seeded. */
     @Override
-    public void cdc(String uri, String table, CdcOp op, long rows) {
-        Path file = file(uri, table);
+    public void cdc(EndpointAddress address, String table, CdcOp op, long rows) {
+        Path file = file(address, table);
         if (!Files.exists(file)) {
             throw new EnvelopeException(
-                    "the table " + table + " at " + uri + " has not been seeded, so there is nothing to change");
+                    "the table " + table + " at " + address.text(DIRECTORY)
+                            + " has not been seeded, so there is nothing to change");
         }
         List<Row> current = read(file);
         write(file, switch (op) {
@@ -62,8 +133,8 @@ final class FileEndpoints implements Endpoints {
      * waits for a first write is waiting for exactly this reading to move.
      */
     @Override
-    public long count(String uri, String table) {
-        Path file = file(uri, table);
+    public long count(EndpointAddress address, String table) {
+        Path file = file(address, table);
         return Files.exists(file) ? read(file).size() : 0L;
     }
 
@@ -100,7 +171,8 @@ final class FileEndpoints implements Endpoints {
         return rows.stream().sorted(Comparator.comparingLong(Row::id)).toList();
     }
 
-    private static Path file(String uri, String table) {
+    private static Path file(EndpointAddress address, String table) {
+        String uri = address.text(DIRECTORY);
         Path directory = Path.of(uri);
         if (!Files.isDirectory(directory)) {
             throw new EnvelopeException("the endpoint at " + uri + " is not a directory, so it holds no tables");

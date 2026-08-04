@@ -51,6 +51,35 @@ the review — it is a reviewed exception, not something you assert about your o
 change. The check verifies a case is *present*; whether it is *adequate* is the
 reviewer's call.
 
+### Mutation evidence
+
+**An assertion is only as good as the red it has been seen to produce.** A case
+that has never failed proves it can run, not that it can catch anything — this
+repository has shipped more than one green that was checked by nothing. So when
+you introduce or change an end-to-end assertion, record three things in the
+commit or pull request that carries it:
+
+1. **The mutation you applied** — which product code you changed to make the
+   assertion's claim false.
+2. **The red you observed** — which assertion failed, and what it reported.
+3. **That only it went red** — the failure did not take unrelated cases with it.
+
+The evidence rides with the code; there is no separate ledger to keep in sync.
+It expires: if the product path an assertion verifies changes, or the assertion
+itself does, the recorded evidence no longer describes anything and the
+assertion needs new evidence before the next release review. A release review
+confirms, case by case for the witness manifest, that the evidence on record has
+not expired; evidence that cannot be confirmed counts as absent.
+
+### The witness manifest
+
+`e2e/witness-manifest.txt` names every scenario a release must have seen execute
+and pass. It is held to the published examples in both directions and to the
+run's witness ledger by `.github/scripts/witness-gate.sh` — a scenario that was
+skipped, aborted, or never discovered fails the gate by its absence. Editing the
+manifest is editing the release contract: removing a line must say why in the
+commit.
+
 ## Guidelines
 
 - **Java 21.** The build targets JDK 21; the native CLI requires GraalVM for JDK 21.

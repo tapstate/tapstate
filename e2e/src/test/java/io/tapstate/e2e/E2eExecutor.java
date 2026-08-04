@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+
 /**
  * Runs a specification against one tier binding.
  *
@@ -19,10 +20,23 @@ import java.util.Optional;
  */
 public final class E2eExecutor {
 
+    /**
+     * Consecutive identical readings before a stalled await redelivers the last changed table. A real
+     * change stream positions itself some time after it is asked for, and a change written into that
+     * window is never delivered; nothing observable announces readiness, so the executor watches for
+     * its opposite - a reading that has stopped moving - and re-asserts the change. Redelivery is
+     * idempotent under existing keys, so reading a slow delivery as a lost one costs a duplicate the
+     * target absorbs, while the reverse misreading would be a timeout.
+     */
+    private static final int STALLED_POLLS = 15;
+
     private final TierBinding binding;
     private final PipelineLoader pipelineLoader;
     private final Duration timeout;
     private final Duration pollInterval;
+
+    /** The table the last cdc step changed, until an await confirms the change arrived. */
+    private TableAlias lastChanged;
 
     public E2eExecutor(
             TierBinding binding, PipelineLoader pipelineLoader, Duration timeout, Duration pollInterval) {
@@ -33,6 +47,7 @@ public final class E2eExecutor {
     }
 
     public void execute(Envelope envelope) {
+        lastChanged = null;
         String pipelineId = pipelineLoader.resolvePipelineId(envelope.pipeline());
         provision(envelope.setup());
         for (Seed seed : envelope.seed()) {
@@ -71,9 +86,17 @@ public final class E2eExecutor {
     private void execute(Step step, String pipelineId) {
         switch (step) {
             case Step.Lifecycle lifecycle -> binding.drive(pipelineId, lifecycle.verb());
-            case Step.Cdc cdc -> binding.cdc(cdc.table(), cdc.op(), cdc.rows());
+            case Step.Cdc cdc -> {
+                binding.cdc(cdc.table(), cdc.op(), cdc.rows());
+                lastChanged = cdc.table();
+            }
             case Step.Assertion assertion -> check(assertion.matcher(), pipelineId);
-            case Step.Await await -> await(await.matcher(), pipelineId);
+            case Step.Await await -> {
+                await(await.matcher(), pipelineId);
+                // The await held, so the change it was waiting on arrived; a later stall is not this
+                // change's loss, and redelivering it there would be noise against a different problem.
+                lastChanged = null;
+            }
         }
     }
 
@@ -88,6 +111,14 @@ public final class E2eExecutor {
     private void await(Matcher matcher, String pipelineId) {
         long start = System.nanoTime();
         long deadline = start + timeout.toNanos();
+        String previousMismatch = null;
+        int identicalReadings = 0;
+        // Redelivery answers one suspicion only - that a change never crossed - so it belongs to a wait
+        // that reads what crossed. A wait on a lifecycle state or an error count reads the product's own
+        // observation, whose reading holds still for the ordinary reason that the product has not
+        // converged yet; rewriting the source there would not move it, and would mutate the very fixture
+        // a specification about failure is asserting on.
+        boolean readsDeliveredData = matcher instanceof Matcher.Count || matcher instanceof Matcher.Doc;
         while (true) {
             Optional<String> mismatch = mismatch(matcher, pipelineId);
             if (mismatch.isEmpty()) {
@@ -102,6 +133,15 @@ public final class E2eExecutor {
                                 + "); "
                                 + mismatch.get());
             }
+            // The mismatch text carries the reading, so identical text is a reading that has stopped
+            // moving. Stalled long enough with an undelivered change on record, the change is
+            // re-asserted; the counter restarts so the redelivery gets its own full window to arrive.
+            identicalReadings = mismatch.get().equals(previousMismatch) ? identicalReadings + 1 : 1;
+            previousMismatch = mismatch.get();
+            if (readsDeliveredData && identicalReadings >= STALLED_POLLS && lastChanged != null) {
+                binding.redeliver(lastChanged);
+                identicalReadings = 0;
+            }
             sleep(pollInterval);
         }
     }
@@ -110,9 +150,89 @@ public final class E2eExecutor {
     private Optional<String> mismatch(Matcher matcher, String pipelineId) {
         return switch (matcher) {
             case Matcher.Count count -> countMismatch(count.expected());
+            case Matcher.Doc doc -> docMismatch(doc);
             case Matcher.State state -> stateMismatch(state.expected(), pipelineId);
             case Matcher.ErrorCount errorCount -> errorCountMismatch(errorCount.expected(), pipelineId);
         };
+    }
+
+    /**
+     * Holds one document to the matcher's expectations, all of them, so a failure names every path
+     * that disagrees rather than the first. An absent document is its own mismatch - the ordinary
+     * reading while an await sits out a crossing - and never conflated with a present document that
+     * disagrees, which sends an author to a different place.
+     */
+    private Optional<String> docMismatch(Matcher.Doc doc) {
+        Optional<Map<String, Object>> fetched = binding.fetch(doc.table(), doc.where());
+        if (fetched.isEmpty()) {
+            return Optional.of(doc.table() + " holds no document where " + doc.where());
+        }
+        Map<String, Object> document = fetched.get();
+        List<String> mismatches = new ArrayList<>();
+        doc.expect().forEach((path, expected) -> {
+            Optional<Object> actual = valueAt(document, path);
+            if (actual.isEmpty()) {
+                mismatches.add(doc.table() + " has nothing at " + path);
+            } else if (!scalarsAgree(expected, actual.get())) {
+                mismatches.add(doc.table() + " at " + path + " expected " + expected + ", found " + actual.get());
+            }
+        });
+        doc.size().forEach((path, expected) -> {
+            Optional<Object> actual = valueAt(document, path);
+            if (actual.isEmpty()) {
+                mismatches.add(doc.table() + " has nothing at " + path);
+            } else if (!(actual.get() instanceof List<?> list)) {
+                mismatches.add(doc.table() + " at " + path + " is not a list, so it has no size: " + actual.get());
+            } else if (list.size() != expected) {
+                mismatches.add(doc.table() + " at " + path + " expected " + expected + " elements, found " + list.size());
+            }
+        });
+        return mismatches.isEmpty() ? Optional.empty() : Optional.of(String.join("; ", mismatches));
+    }
+
+    /**
+     * Walks a path of the shape {@code a.b} and {@code items[0].sku} into nested mappings and lists.
+     * Empty when anything along the way is absent, out of range, or not the shape the next segment
+     * needs - all of which read as "nothing there", which is what a polling await must see while a
+     * document is still being assembled.
+     */
+    private static Optional<Object> valueAt(Map<String, Object> document, String path) {
+        Object current = document;
+        for (String segment : path.split("\\.")) {
+            int bracket = segment.indexOf('[');
+            String field = bracket < 0 ? segment : segment.substring(0, bracket);
+            if (!(current instanceof Map<?, ?> mapping) || !mapping.containsKey(field)) {
+                return Optional.empty();
+            }
+            current = mapping.get(field);
+            while (bracket >= 0) {
+                int close = segment.indexOf(']', bracket);
+                // The parser holds every path an author writes to this shape, so reaching here with a
+                // malformed one is the harness disagreeing with itself; it is named rather than left to
+                // surface as a substring or number fault with no path in it.
+                if (close < 0) {
+                    throw new EnvelopeException("the path " + path + " leaves an index unclosed");
+                }
+                int index = Integer.parseInt(segment.substring(bracket + 1, close));
+                if (!(current instanceof List<?> list) || index >= list.size()) {
+                    return Optional.empty();
+                }
+                current = list.get(index);
+                bracket = segment.indexOf('[', close);
+            }
+        }
+        return Optional.ofNullable(current);
+    }
+
+    /**
+     * Whole numbers agree across their representations - a store answering Int32 for a value written
+     * as a long is the same value - and everything else agrees the ordinary way.
+     */
+    private static boolean scalarsAgree(Object expected, Object actual) {
+        if (expected instanceof Number left && actual instanceof Number right) {
+            return left.longValue() == right.longValue();
+        }
+        return expected.equals(actual);
     }
 
     private Optional<String> countMismatch(Map<TableAlias, Long> expected) {

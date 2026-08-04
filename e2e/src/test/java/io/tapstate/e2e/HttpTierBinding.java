@@ -31,8 +31,6 @@ import java.util.function.UnaryOperator;
  */
 final class HttpTierBinding implements TierBinding {
 
-    private static final String URI_SETTING = "uri";
-
     private final ControlPlane control;
     private final Path workspace;
     private final DslParser parser = new DslParser();
@@ -97,9 +95,15 @@ final class HttpTierBinding implements TierBinding {
     }
 
     @Override
-    public void seed(TableAlias table, long rows) {
+    public void seed(TableAlias table, List<Map<String, Object>> rows) {
         Endpoint endpoint = endpoint(table);
-        endpoint.driver().seed(endpoint.uri(), table.table(), rows);
+        endpoint.driver().seed(endpoint.address(), table.table(), rows);
+    }
+
+    @Override
+    public Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where) {
+        Endpoint endpoint = endpoint(table);
+        return endpoint.driver().fetch(endpoint.address(), table.table(), where);
     }
 
     @Override
@@ -110,13 +114,28 @@ final class HttpTierBinding implements TierBinding {
     @Override
     public void cdc(TableAlias table, CdcOp op, long rows) {
         Endpoint endpoint = endpoint(table);
-        endpoint.driver().cdc(endpoint.uri(), table.table(), op, rows);
+        endpoint.driver().cdc(endpoint.address(), table.table(), op, rows);
+    }
+
+    @Override
+    public void redeliver(TableAlias table) {
+        Endpoint endpoint = endpoint(table);
+        endpoint.driver().redeliver(endpoint.address(), table.table());
+    }
+
+    /**
+     * The address a table's resource carries, as the harness resolved it. This is the bridge a guard
+     * outside this class needs: which provisioned store a resource actually landed on can only be told
+     * from the address, and the address lives here.
+     */
+    EndpointAddress addressOf(TableAlias table) {
+        return endpoint(table).address();
     }
 
     @Override
     public long count(TableAlias table) {
         Endpoint endpoint = endpoint(table);
-        return endpoint.driver().count(endpoint.uri(), table.table());
+        return endpoint.driver().count(endpoint.address(), table.table());
     }
 
     @Override
@@ -151,9 +170,14 @@ final class HttpTierBinding implements TierBinding {
 
     /**
      * Where a table lives and what reads it, both taken from the resource that declares it: the
-     * connector chooses the driver, the {@code uri} setting is the address handed to it. Resolving both
-     * from the one applied resource is what keeps the address the harness dials identical to the one the
-     * product was given.
+     * connector chooses the driver, and the settings the resource carries are the address handed to it.
+     * Resolving both from the one applied resource is what keeps the address the harness dials identical
+     * to the one the product was given.
+     *
+     * <p>Which of those settings is the address is deliberately not decided here. This method is the one
+     * piece of the harness every store shares, and a store answering on a host and a port rather than a
+     * uri is not an exception to be special-cased but the ordinary case for anything reached over JDBC.
+     * The whole mapping goes to the driver, which is the only party that knows its own store.
      */
     private Endpoint endpoint(TableAlias table) {
         SourceResource source = requireSource(table.resourceId());
@@ -164,16 +188,11 @@ final class HttpTierBinding implements TierBinding {
                             + " connector, which this run has no independent driver for; it knows "
                             + endpointsByConnector.keySet());
         }
-        if (!(source.config().get(URI_SETTING) instanceof String uri)) {
-            throw new EnvelopeException(
-                    table.resourceId() + " carries no " + URI_SETTING + " setting, so " + table
-                            + " cannot be read from outside the product");
-        }
-        return new Endpoint(driver, uri);
+        return new Endpoint(driver, new EndpointAddress(table.resourceId(), source.config()));
     }
 
     /** One addressable endpoint: the driver that reads it and the address it answers on. */
-    private record Endpoint(Endpoints driver, String uri) {}
+    private record Endpoint(Endpoints driver, EndpointAddress address) {}
 
     /**
      * Reads a resource and resolves its references, exactly as the CLI does before an apply — so what the

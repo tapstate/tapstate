@@ -1,0 +1,53 @@
+package io.tapstate.e2e;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+/**
+ * The run's own record of which witnesses actually executed and passed, one line per witness.
+ *
+ * <p>This exists because the build's aggregate counts cannot be trusted with absence: a witness that
+ * aborts before its first test reports {@code Tests run: 0, Skipped: 0}, and a parameterized case is
+ * reported under an index that shifts when a sibling is added. The ledger inverts the burden - a line
+ * is written only at the end of a run that held every assertion, so a witness that was skipped,
+ * aborted, or never discovered simply is not there, and the release gate reads the absence.
+ *
+ * <p>The ledger is truncated once per JVM, before the first line is written. That alone does not make
+ * a stale file impossible: a build whose witnesses were never discovered, or all of which aborted,
+ * never reaches this class at all and would leave an earlier run's file standing. So the build deletes
+ * the file before the phase that writes it, and this truncation covers the run started outside the
+ * build - from a development environment - by hand.
+ */
+final class WitnessLedger {
+
+    /**
+     * Where the build puts this module's output, named by the build. Falling back to a path relative to
+     * the working directory would make the file's location depend on where the JVM was started, while
+     * the gate reads one fixed place - so a run started from elsewhere would write a ledger nothing
+     * reads, and the gate would fail for absence with the evidence sitting in another directory.
+     */
+    private static final Path LEDGER =
+            Path.of(System.getProperty("tapstate.e2e.build-directory", "target"), "witness-ledger.txt");
+    private static boolean truncated;
+
+    private WitnessLedger() {
+    }
+
+    /** Records one witness as executed and passed, in the form the manifest names it. */
+    static synchronized void record(String example, Tiers tier) {
+        try {
+            Files.createDirectories(LEDGER.getParent());
+            if (!truncated) {
+                Files.deleteIfExists(LEDGER);
+                truncated = true;
+            }
+            Files.writeString(LEDGER, example + " on " + tier.name() + System.lineSeparator(),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot record a witness in " + LEDGER, e);
+        }
+    }
+}

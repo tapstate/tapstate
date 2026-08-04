@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -33,14 +34,34 @@ public interface TierBinding {
     /** Discovers and persists a source model, feeding target-table creation. */
     void discoverSchema(String resourceId);
 
-    /** Lays down initial rows on a table before the run begins. */
-    void seed(TableAlias table, long rows);
+    /** Lays down initial rows on a table before the run begins, one mapping per row. */
+    void seed(TableAlias table, List<Map<String, Object>> rows);
+
+    /**
+     * Reads the one document the equality settings locate at the endpoint that owns the table, or
+     * empty when none matches. Read from outside the product like {@link #count}, and in the
+     * specification's own spelling - identity is {@code id} whatever the store calls it.
+     */
+    Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where);
 
     /** Records a lifecycle intent. Returns once the intent is recorded, not once it converges. */
     void drive(String pipelineId, LifecycleVerb verb);
 
     /** Produces changes against a table while the pipeline runs. */
     void cdc(TableAlias table, CdcOp op, long rows);
+
+    /**
+     * Re-emits a table's current rows as fresh change events, row keys unchanged.
+     *
+     * <p>This exists for one seam: a change written to a real source right after its change stream is
+     * asked for can land before the stream is positioned, and is then never delivered - nothing the
+     * product publishes says when the stream is ready, so no await can be written against readiness
+     * itself. Redelivery re-asserts the table's current state row-wise instead; a batch that was lost
+     * is re-emitted and one that was merely slow arrives twice under the same keys, which an upserting
+     * target absorbs. Deletions already delivered are not compensated: redelivery only re-emits rows
+     * that still exist.
+     */
+    void redeliver(TableAlias table);
 
     /** Reads the current row count from the endpoint that owns the table. */
     long count(TableAlias table);

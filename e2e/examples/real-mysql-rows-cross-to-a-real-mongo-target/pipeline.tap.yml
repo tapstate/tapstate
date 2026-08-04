@@ -1,0 +1,11 @@
+version: tapstate/v1
+kind: pipeline
+id: mysql2mongo
+source: src_mysql
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - { id: snapshot_rows, from: [orders], type: filter, expr: "op == 'r'" }
+serve:
+  from: snapshot_rows
+  sync:
+    - source: tgt_mongo

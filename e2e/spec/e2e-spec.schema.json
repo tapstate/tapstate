@@ -39,9 +39,30 @@
   "$defs": {
     "setup": {
       "type": "object",
-      "description": "Three real product verbs, in dependency order.",
+      "description": "What the harness brings up, then the three product verbs run against it, in dependency order.",
       "additionalProperties": false,
       "properties": {
+        "databases": {
+          "type": "object",
+          "description": "Stores the harness provisions first, keyed by the name whose address the resources interpolate.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "description": "What sort of store, which settles provisioning, address shape and driver.",
+                "enum": [
+                  "mongo",
+                  "mysql"
+                ]
+              }
+            }
+          }
+        },
         "connectors": {
           "type": "array",
           "description": "Connector ids whose runtime jars are registered; idempotent by content hash.",
@@ -72,18 +93,57 @@
         "pattern": "^[^.]+\\..+$"
       },
       "additionalProperties": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "rows"
-        ],
-        "properties": {
-          "rows": {
-            "type": "integer",
-            "description": "How many rows to lay down.",
-            "minimum": 0
+        "description": "A generated count, or the rows themselves - one of the two.",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "rows"
+            ],
+            "properties": {
+              "rows": {
+                "type": "integer",
+                "description": "How many generated rows to lay down: ids 1..N, each with seq equal to its id.",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "values"
+            ],
+            "properties": {
+              "values": {
+                "type": "array",
+                "description": "The rows themselves, when what they hold is the point.",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "description": "One row: columns and values. Every row of a table carries the same columns.",
+                  "required": [
+                    "id"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "integer",
+                      "description": "The key rows are seeded and upserted by."
+                    }
+                  },
+                  "additionalProperties": {
+                    "type": [
+                      "integer",
+                      "string"
+                    ],
+                    "description": "An integer or a string; wider value types are a widening of the vocabulary."
+                  }
+                }
+              }
+            }
           }
-        }
+        ]
       }
     },
     "step": {
@@ -169,6 +229,78 @@
                 "type": "integer",
                 "description": "Rows the table is expected to hold.",
                 "minimum": 0
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "doc"
+          ],
+          "properties": {
+            "doc": {
+              "type": "object",
+              "description": "Exactly one table, addressed as <resourceId>.<table>.",
+              "minProperties": 1,
+              "maxProperties": 1,
+              "propertyNames": {
+                "pattern": "^[^.]+\\..+$"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "where"
+                ],
+                "description": "One document, located and read at the endpoint itself. Carry expect or size - a doc that expects nothing checks nothing.",
+                "properties": {
+                  "where": {
+                    "type": "object",
+                    "description": "Equality settings locating exactly one document. Identity is spelled id whatever the store calls it.",
+                    "minProperties": 1,
+                    "additionalProperties": {
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "description": "An integer or a string; wider value types are a widening of the vocabulary."
+                    }
+                  },
+                  "expect": {
+                    "type": "object",
+                    "description": "Scalar values by path: a.b for a field of a field, items[0].sku for a field of a list element.",
+                    "additionalProperties": {
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "description": "An integer or a string; wider value types are a widening of the vocabulary."
+                    }
+                  },
+                  "size": {
+                    "type": "object",
+                    "description": "List lengths by path.",
+                    "additionalProperties": {
+                      "type": "integer",
+                      "description": "How many elements the list at this path holds.",
+                      "minimum": 0
+                    }
+                  }
+                },
+                "anyOf": [
+                  {
+                    "required": [
+                      "expect"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "size"
+                    ]
+                  }
+                ]
               }
             }
           }
