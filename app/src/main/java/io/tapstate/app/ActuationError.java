@@ -24,7 +24,21 @@ enum ActuationError implements TapstateErrorCode {
      * A start named an id that resolves to a resource of another kind: {@code pipeline} is the id given and
      * {@code kind} is the kind actually stored under it.
      */
-    NOT_A_PIPELINE("actuation.not-a-pipeline", Set.of("pipeline", "kind"));
+    NOT_A_PIPELINE("actuation.not-a-pipeline", Set.of("pipeline", "kind")),
+
+    SOURCE_SCHEMA_NOT_DISCOVERED("actuation.source-schema-not-discovered", Set.of("source")),
+
+    SOURCE_TABLE_NOT_DISCOVERED("actuation.source-table-not-discovered", Set.of("source", "table")),
+
+    SOURCE_TABLE_SELECTION_EMPTY("actuation.source-table-selection-empty", Set.of("source")),
+
+    SOURCE_TABLE_REGEX_INVALID("actuation.source-table-regex-invalid", Set.of("source", "regex")),
+
+    SOURCE_TABLE_AMBIGUOUS("actuation.source-table-ambiguous", Set.of("table", "sources")),
+
+    FROM_REGEX_INVALID("actuation.from-regex-invalid", Set.of("regex")),
+
+    FROM_REGEX_EMPTY("actuation.from-regex-empty", Set.of("regex"));
 
     private final String code;
     private final Set<String> placeholders;

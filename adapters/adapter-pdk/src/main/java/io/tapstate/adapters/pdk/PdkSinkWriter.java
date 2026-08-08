@@ -14,6 +14,7 @@ import io.tapdata.pdk.apis.entity.WriteListResult;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -42,15 +43,21 @@ final class PdkSinkWriter implements SinkWriter {
     private final WriteRecordFunction write;
     private final WriteMode mode;
     private final DdlPolicy ddl;
-    private final TargetTable target;
+    private final Map<String, TargetTable> targets;
     private boolean closed;
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl, TargetTable target) {
+        this(connector, write, mode, ddl, target == null ? Map.of() : Map.of(target.name(), target));
+    }
+
+    PdkSinkWriter(
+            PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
+            Map<String, TargetTable> targets) {
         this.connector = connector;
         this.write = write;
         this.mode = mode;
         this.ddl = ddl;
-        this.target = target;
+        this.targets = targets == null ? Map.of() : Map.copyOf(new LinkedHashMap<>(targets));
     }
 
     @Override
@@ -59,7 +66,7 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private WriteResult deliver(List<Envelope> records) {
-        List<TapRecordEvent> rows = new ArrayList<>(records.size());
+        Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
         for (Envelope env : records) {
             if (env.op() == Op.DDL) {
                 if (ddl == DdlPolicy.FAIL) {
@@ -69,18 +76,23 @@ final class PdkSinkWriter implements SinkWriter {
                 // ignore: drop the schema change. apply: applying it to the target is a later slice, so drop it too.
                 continue;
             }
-            rows.add(encode(mode == WriteMode.APPEND ? asInsert(env) : env));
+            rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>())
+                    .add(encode(mode == WriteMode.APPEND ? asInsert(env) : env));
         }
-        if (rows.isEmpty()) {
+        if (rowsByTable.isEmpty()) {
             return new WriteResult(0);
         }
-        TapTable table = target != null ? TargetTapTable.build(target) : new TapTable(rows.get(0).getTableId());
         try {
             return connector.underLoader(() -> {
                 long[] accepted = {0};
-                // A connector may report the batch in several flushes, one callback each; accumulate.
-                write.writeRecord(connector.context(), rows, table,
-                        result -> accepted[0] += accepted(result));
+                for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
+                    List<TapRecordEvent> rows = entry.getValue();
+                    TargetTable target = targets.get(entry.getKey());
+                    TapTable table = target != null ? TargetTapTable.build(target) : new TapTable(rows.get(0).getTableId());
+                    // A connector may report the batch in several flushes, one callback each; accumulate.
+                    write.writeRecord(connector.context(), rows, table,
+                            result -> accepted[0] += accepted(result));
+                }
                 return new WriteResult(accepted[0]);
             });
         } catch (TapstateException e) {

@@ -10,6 +10,7 @@ import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 
@@ -40,7 +41,7 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     private final Map<String, Object> settings;
     private final WriteMode writeMode;
     private final DdlPolicy ddl;
-    private final TargetTable target;
+    private final Map<String, TargetTable> targets;
 
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl, TargetTable target) {
@@ -48,13 +49,23 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
         this.settings = settings;
         this.writeMode = writeMode;
         this.ddl = ddl;
-        this.target = target;
+        this.targets = target == null ? Map.of() : Map.of(target.name(), target);
+    }
+
+    PdkSinkWriterFactory(
+            String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+            Map<String, TargetTable> targets) {
+        this.connectorId = connectorId;
+        this.settings = settings;
+        this.writeMode = writeMode;
+        this.ddl = ddl;
+        this.targets = targets == null ? Map.of() : Map.copyOf(new LinkedHashMap<>(targets));
     }
 
     @Override
     public SinkWriter getEx() {
         ConnectorProvisioner provisioner = provisioner(localMember());
-        return new PdkSinkPort(provisioner).open(new SinkConfig(connectorId, settings, writeMode, ddl, target));
+        return new PdkSinkPort(provisioner).open(new SinkConfig(connectorId, settings, writeMode, ddl), targets);
     }
 
     /** The connector provisioner bound onto the local member, or a bare failure when the member has none. */

@@ -25,8 +25,11 @@ import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
@@ -65,6 +68,83 @@ class StoreBackedDagSourceTest {
         assertThat(edges(dag)).containsExactlyInAnyOrder(
                 edge("orders_src", "keep_even"),
                 edge("keep_even", "serve.sync_1"));
+    }
+
+    @Test
+    void expands_a_multi_table_source_into_one_source_vertex_per_table() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "multi", null, List.of("multi_src"), null, null,
+                serve(FromRef.literal("multi_src"), sync("sync_1", "orders_dest")), null, null));
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("multi");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "multi_src.orders", "multi_src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("multi_src.orders", "serve.sync_1"),
+                "multi_src.customers->serve.sync_1#0,1");
+    }
+
+    @Test
+    void omitted_tables_expand_to_the_latest_discovered_source_schema() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("all_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, null, null, null, null));
+        store.schemas.save(new DiscoveredSourceModel("all_src", "mysql", 1L, new SourceModel(List.of(
+                new SourceTable("orders", List.of(), List.of(), List.of()),
+                new SourceTable("customers", List.of(), List.of(), List.of())))));
+        store.artifacts().save(connectionSupplier("all_dest"));
+        store.artifacts().save(new PipelineResource(
+                "all", null, List.of("all_src"), null, null,
+                serve(FromRef.literal("all_src"), sync("sync_1", "all_dest")), null, null));
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("all");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("all_src.orders", "all_src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("all_src.orders", "serve.sync_1"),
+                "all_src.customers->serve.sync_1#0,1");
+    }
+
+    @Test
+    void from_regex_expands_selected_source_tables_instead_of_failing_the_dag_build() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("players_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC,
+                List.of(TableRef.literal("Player"), TableRef.literal("PlayerCard"), TableRef.literal("Orders")),
+                null, null, null));
+        store.artifacts().save(connectionSupplier("players_dest"));
+        store.artifacts().save(new PipelineResource(
+                "players", null, List.of("players_src"), null, null,
+                serve(FromRef.regex("Player.*"), sync("sync_1", "players_dest")), null, null));
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("players");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "players_src.Player", "players_src.PlayerCard", "players_src.Orders", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("players_src.Player", "serve.sync_1"),
+                "players_src.PlayerCard->serve.sync_1#0,1");
+    }
+
+    @Test
+    void rejects_an_unqualified_table_selected_by_two_sources() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("src_a", "orders"));
+        store.artifacts().save(cdcSource("src_b", "orders"));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource(
+                "ambiguous", null, List.of("src_a", "src_b"), null, null,
+                serve(FromRef.literal("orders"), sync("sync_1", "dest")), null, null));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
+                        .isEqualTo("actuation.source-table-ambiguous"));
     }
 
     @Test

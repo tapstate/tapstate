@@ -39,10 +39,11 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
         }
         Map<String, String> positions = new LinkedHashMap<>();
         for (String sourceId : pipeline.get().sources()) {
-            SourceCaptureResolution resolution =
-                    SourceCaptureResolution.of(StoredArtifacts.requireSource(storePort.artifacts(), sourceId));
+            SourceCaptureResolution resolution = SourceCaptureResolution.of(
+                    StoredArtifacts.requireSource(storePort.artifacts(), sourceId),
+                    storePort.schemas().get(sourceId).map(io.tapstate.spi.store.DiscoveredSourceModel::model).orElse(null));
             ackedSrcpos(resolution.chainId().value(), pipelineId)
-                    .ifPresent(srcpos -> positions.put(resolution.table(), srcpos));
+                    .ifPresent(srcpos -> resolution.tables().forEach(table -> positions.put(table, srcpos)));
         }
         return positions;
     }

@@ -59,7 +59,9 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
 
         for (String sourceId : pipeline.sources()) {
-            byKey.put(sourceId, dag.newVertex(sourceId, bindings.sourceVertices().apply(sourceId)));
+            for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {
+                byKey.put(sourceKey, dag.newVertex(sourceKey, bindings.sourceVertices().apply(sourceKey)));
+            }
         }
 
         if (pipeline.transforms() != null) {

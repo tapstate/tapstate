@@ -7,6 +7,7 @@ import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.ringbuffer.Ringbuffer;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.CaptureBatch;
@@ -256,6 +257,17 @@ class CdcPhaseTest {
         // The stream reported a failure rather than a change; the phase records it on the health so the run
         // can surface a dead tail that the change ring merely going quiet would otherwise hide.
         assertThat(health.failure()).contains(boom);
+    }
+
+    @Test
+    void rejectsCdcEventsForTablesOutsideTheConfiguredSelection() {
+        FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(1, "customers", Map.of("id", 1), Map.of())));
+
+        assertThatThrownBy(() -> CdcPhase.run(port, config(), Map.of(), new CaptureHealth()))
+                .isInstanceOfSatisfying(TapstateException.class, exception -> {
+                    assertThat(exception.code()).isEqualTo(CaptureError.EVENT_TABLE_NOT_SELECTED);
+                    assertThat(exception.args()).containsEntry("table", "customers");
+                });
     }
 
     /** A cdc port that drives a fixed list of change events into the listener when the stream starts. */

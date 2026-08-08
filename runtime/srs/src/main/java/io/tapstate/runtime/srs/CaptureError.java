@@ -20,7 +20,9 @@ public enum CaptureError implements TapstateErrorCode {
 
     /** A {@code start_from} value that is neither the {@code earliest} / {@code latest} keyword nor a
      *  parseable ISO-8601 instant; {@code value} carries the offending token. */
-    START_FROM_UNPARSABLE("capture.start-from-unparsable", Set.of("value"));
+    START_FROM_UNPARSABLE("capture.start-from-unparsable", Set.of("value")),
+
+    EVENT_TABLE_NOT_SELECTED("capture.event-table-not-selected", Set.of("table"));
 
     private final String code;
     private final Set<String> placeholders;

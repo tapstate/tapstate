@@ -5,6 +5,8 @@ import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkPort;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
+import io.tapstate.spi.sink.TargetTable;
+import java.util.Map;
 
 /**
  * The PDK implementation of the write-side sink port: it provisions a connector, refuses it with a
@@ -23,6 +25,11 @@ public final class PdkSinkPort implements SinkPort {
 
     @Override
     public SinkWriter open(SinkConfig config) {
+        Map<String, TargetTable> targets = config.target() == null ? Map.of() : Map.of(config.target().name(), config.target());
+        return open(config, targets);
+    }
+
+    public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
         WriteRecordFunction write;
@@ -46,7 +53,7 @@ public final class PdkSinkPort implements SinkPort {
             connector.close();
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }
-        return new PdkSinkWriter(connector, write, config.writeMode(), config.ddl(), config.target());
+        return new PdkSinkWriter(connector, write, config.writeMode(), config.ddl(), targets);
     }
 
     private static WriteRecordFunction requireWriteFunction(WriteRecordFunction function) {

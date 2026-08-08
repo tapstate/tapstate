@@ -9,7 +9,10 @@ import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -19,9 +22,8 @@ import java.util.Optional;
  * model, not from the events flowing through - so a target table is built by reading the persisted model for
  * the pipeline's source and mapping the discovered {@link SourceTable} onto a {@link TargetTable}.
  *
- * <p>L1 shape: a pipeline reads a single source of a single table, so the resolved target is that table. When
- * the source's schema has never been discovered the target is absent, and the sink falls back to a bare table
- * id and lets the connector infer structure and keying.
+ * <p>A pipeline may select several source tables. When the source's schema has never been discovered, each
+ * selected table is absent from the resolved map and the sink falls back to a bare table id for that stream.
  */
 final class TargetModelResolver {
 
@@ -33,20 +35,26 @@ final class TargetModelResolver {
 
     /**
      * Resolves the write-side target table for a pipeline's sink from the discovered model of the source it
-     * reads: the source's single L1 table looked up in its persisted model and mapped to a target table.
+     * reads: each selected source table looked up in its persisted model and mapped to a target table.
      * Empty when the source's schema was never discovered, or when the discovered model does not carry that
      * table.
      */
     Optional<TargetTable> resolve(PipelineResource pipeline) {
+        return resolveAll(pipeline).values().stream().findFirst();
+    }
+
+    /** Resolves one target model per selected source table, preserving source and discovery order. */
+    Map<String, TargetTable> resolveAll(PipelineResource pipeline) {
+        Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (String sourceId : pipeline.sources()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-            String table = SourceCaptureResolution.of(source).table();
-            Optional<SourceTable> discovered = discoveredTable(sourceId, table);
-            if (discovered.isPresent()) {
-                return Optional.of(toTargetTable(discovered.get()));
+            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discoveredModel(sourceId));
+            for (String table : resolution.tables()) {
+                discoveredTable(sourceId, table).map(TargetModelResolver::toTargetTable)
+                        .ifPresent(target -> targets.putIfAbsent(table, target));
             }
         }
-        return Optional.empty();
+        return Collections.unmodifiableMap(new LinkedHashMap<>(targets));
     }
 
     /** The named table in the source's persisted discovery model, or empty when neither is present. */
@@ -54,6 +62,10 @@ final class TargetModelResolver {
         return storePort.schemas().get(connectionId)
                 .map(DiscoveredSourceModel::model)
                 .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(table)).findFirst());
+    }
+
+    private io.tapstate.spi.store.SourceModel discoveredModel(String sourceId) {
+        return storePort.schemas().get(sourceId).map(DiscoveredSourceModel::model).orElse(null);
     }
 
     /**

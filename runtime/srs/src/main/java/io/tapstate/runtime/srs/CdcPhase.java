@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.SourcePosition;
@@ -8,6 +9,7 @@ import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 
 import java.util.Collection;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.LongSupplier;
@@ -58,6 +60,35 @@ public final class CdcPhase {
         Objects.requireNonNull(consumers, "consumers");
         Objects.requireNonNull(health, "health");
         return port.cdc(config, health.recording(event -> writeChange(chain, event, minConsumerReadSeq, consumers)));
+    }
+
+    /** Starts one connector subscription and routes each event to the ring for its source table. */
+    public static Subscription run(
+            CapturePort port,
+            CaptureConfig config,
+            Map<String, TableRoute> routes,
+            CaptureHealth health) {
+        Objects.requireNonNull(routes, "routes");
+        return port.cdc(config, health.recording(event -> {
+            TableRoute route = routes.get(event.src());
+            if (route == null) {
+                throw new TapstateException(
+                        CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
+            }
+            writeChange(route.chain(), event, route.minConsumerReadSeq(), route.consumers());
+        }));
+    }
+
+    public record TableRoute(
+            CdcChain chain,
+            LongSupplier minConsumerReadSeq,
+            Supplier<Collection<ConsumerOffset>> consumers) {
+
+        public TableRoute {
+            Objects.requireNonNull(chain, "chain");
+            Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
+            Objects.requireNonNull(consumers, "consumers");
+        }
     }
 
     /**

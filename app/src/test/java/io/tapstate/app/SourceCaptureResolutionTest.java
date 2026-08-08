@@ -10,6 +10,8 @@ import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -69,13 +71,83 @@ class SourceCaptureResolutionTest {
     }
 
     @Test
-    void rejectsASourceThatDoesNotReadExactlyOneTable() {
+    void expandsAnOmittedTableListToTheDiscoveryOrder() {
+        SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, null, null, null, null);
+
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered("players", "cards"));
+
+        assertThat(resolution.tables()).containsExactly("players", "cards");
+        assertThat(resolution.config().streams()).containsExactly("players", "cards");
+    }
+
+    @Test
+    void expandsRegexWithFullMatchAndKeepsSelectorOrder() {
+        SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.regex("Player.*"), TableRef.literal("Orders")), null, null, null);
+
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(
+                source, discovered("Player", "PlayerCard", "XPlayer", "Orders"));
+
+        assertThat(resolution.tables()).containsExactly("Player", "PlayerCard", "Orders");
+    }
+
+    @Test
+    void deDuplicatesOverlappingSelectorsOnFirstOccurrence() {
+        SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("Player"), TableRef.regex("Player.*")), null, null, null);
+
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(
+                source, discovered("Player", "PlayerCard"));
+
+        assertThat(resolution.tables()).containsExactly("Player", "PlayerCard");
+    }
+
+    @Test
+    void requiresDiscoveryForAnOmittedOrRegexTableList() {
+        SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, null, null, null, null);
+
+        assertThatThrownBy(() -> SourceCaptureResolution.of(source))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-schema-not-discovered");
+    }
+
+    @Test
+    void rejectsAnOmittedTableListWhenDiscoveryContainsNoTables() {
+        SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, null, null, null, null);
+
+        assertThatThrownBy(() -> SourceCaptureResolution.of(source, discovered()))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-table-selection-empty");
+    }
+
+    @Test
+    void rejectsASelectorThatMatchesNoDiscoveredTable() {
+        SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.regex("Missing.*")), null, null, null);
+
+        assertThatThrownBy(() -> SourceCaptureResolution.of(source, discovered("orders")))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-table-selection-empty");
+    }
+
+    @Test
+    void supportsMultipleConcreteStreams() {
         SourceResource multiTable = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("items")), null, null, null);
 
-        assertThatThrownBy(() -> SourceCaptureResolution.of(multiTable))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("exactly one table");
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(multiTable);
+
+        assertThat(resolution.tables()).containsExactly("orders", "items");
+        assertThat(resolution.table()).isEqualTo("orders");
+    }
+
+    private static SourceModel discovered(String... names) {
+        return new SourceModel(List.of(names).stream()
+                .map(name -> new SourceTable(name, List.of(), List.of(), List.of()))
+                .toList());
     }
 
     private static SourceResource cdcSource(String id, String table, String srsKey) {

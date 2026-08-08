@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
 
 import io.tapstate.core.model.PipelineResource;
@@ -176,6 +177,32 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
+    void multiTableSnapshotProgressAndBufferRoutingStayPerTable() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null);
+        artifacts.save(source);
+        artifacts.save(pipelineWithReadMode("p", "multi_src", ReadMode.SNAPSHOT_AND_CDC));
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        CaptureStarter starter = (spec, passthrough) -> {
+            passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 1L), Map.of()));
+            passthrough.accept(Envelope.read(2L, "customers", Map.of("id", 2L), Map.of()));
+            return new CaptureRun(Optional.empty(), false, 2L, Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()), buffer);
+
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.snapshotProgress("p")).containsOnly(
+                entry("orders", new TableSnapshot(1L, null, null)),
+                entry("customers", new TableSnapshot(1L, null, null)));
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(source);
+        assertThat(buffer.drain(resolution.ringName("orders"))).extracting(e -> e.src()).containsExactly("orders");
+        assertThat(buffer.drain(resolution.ringName("customers"))).extracting(e -> e.src()).containsExactly("customers");
+    }
+
+    @Test
     void snapshotProgressReportsTheRowsEachTableLoaded() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("orders_src", "orders", null));
@@ -347,6 +374,38 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(coordinator.captureFailure("p"))
                 .as("surfaces the failed run past the healthy earlier one")
                 .contains(boom);
+    }
+
+    @Test
+    void startFailureClosesRunsStartedForEarlierSources() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource first = cdcSource("src_a", "orders", null);
+        SourceResource second = new SourceResource("src_b", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, null, null, null, null);
+        artifacts.save(first);
+        artifacts.save(second);
+        artifacts.save(twoSourcePipeline("p", "src_a", "src_b"));
+        SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
+        AtomicBoolean firstSubscriptionClosed = new AtomicBoolean(false);
+        AtomicReference<CaptureRunSpec> firstSpec = new AtomicReference<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            firstSpec.set(spec);
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(),
+                    Optional.of(() -> firstSubscriptionClosed.set(true)), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, srsCoordinator, new SnapshotBuffer());
+
+        assertThatThrownBy(() -> coordinator.startCapture("p"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+
+        MiningChainId firstChain = MiningChainId.resolve(firstSpec.get().config(), firstSpec.get().srsKey());
+        assertThat(firstSubscriptionClosed).isTrue();
+        assertThat(srsCoordinator.isProvisioned(firstChain)).isFalse();
+        assertThat(coordinator.isActive("p")).isFalse();
     }
 
     // ---- fixtures --------------------------------------------------------------------------------

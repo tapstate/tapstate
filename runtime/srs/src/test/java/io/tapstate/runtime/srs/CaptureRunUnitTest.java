@@ -37,7 +37,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The capture run unit assembles the snapshot phase, cdc phase, the self-built Jet ring source and the
@@ -130,6 +129,7 @@ class CaptureRunUnitTest {
         // so nothing is provisioned, no cdc-start is recorded, and no tail is attached.
         assertThat(passthrough).extracting(e -> e.after().get("id")).containsExactly(1, 2, 3);
         assertThat(run.snapshotCount()).isEqualTo(3);
+        assertThat(run.snapshotCounts()).containsEntry("orders", 3L);
         assertThat(run.chainId()).isEmpty();
         assertThat(run.ringSource()).isEmpty();
         assertThat(run.cdcSubscription()).isEmpty();
@@ -236,16 +236,28 @@ class CaptureRunUnitTest {
     }
 
     @Test
-    void rejectsAMultiTableSharedRingRunAsBeyondSingleTableScope() {
+    void routesAMultiTableSharedRingRunToOneSubscriptionAndTwoRings() throws Exception {
         InMemoryMeta meta = new InMemoryMeta();
         CaptureConfig multi = new CaptureConfig("mysql", Map.of(), List.of("orders", "customers"));
-        CaptureRunSpec spec = new CaptureRunSpec(multi, ReadMode.CDC_ONLY, "k-multi", true, "src-1", "pipe-1",
+        CaptureRunSpec spec = new CaptureRunSpec(multi, ReadMode.SNAPSHOT_AND_CDC, "k-multi", true, "src-1", "pipe-1",
                 StartFrom.earliest(), new SourcePosition("cdc-start-0"), null, 0L, monotonicWatermark(), NUMERIC_ORDER);
+        List<Envelope> snapshots = List.of(
+                Envelope.read(1, "orders", Map.of("id", 1), Map.of()),
+                Envelope.read(2, "customers", Map.of("id", 2), Map.of()));
+        List<Envelope> changes = List.of(
+                Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
+                Envelope.insert(2, "customers", Map.of("id", 2), Map.of()));
+        List<Envelope> passthrough = new ArrayList<>();
 
-        // L1 capture is single-table: a multi-table shared-ring run is rejected before any chain is opened.
-        assertThatThrownBy(() -> runUnit(new FakeSource(List.of(), List.of()), meta).start(spec, e -> { }))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThat(meta.created).isEmpty();
+        CaptureRun run = runUnit(new FakeSource(snapshots, changes), meta).start(spec, passthrough::add);
+
+        assertThat(run.chainId()).isPresent();
+        assertThat(run.cdcSubscription()).isPresent();
+        assertThat(run.snapshotCounts()).containsExactlyInAnyOrderEntriesOf(Map.of("orders", 1L, "customers", 1L));
+        assertThat(passthrough).extracting(Envelope::src).containsExactly("orders", "customers");
+        String chainId = run.chainId().orElseThrow().value();
+        assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders")).tailSequence()).isEqualTo(0L);
+        assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "customers")).tailSequence()).isEqualTo(0L);
     }
 
     @Test

@@ -35,5 +35,14 @@ public record DagBindings(
         Function<String, ProcessorMetaSupplier> sourceVertices,
         Function<Step, SupplierEx<? extends TransformPort>> transformPorts,
         Function<SyncElement, SupplierEx<? extends SinkWriter>> sinkWriters,
-        Function<FromRef, List<String>> upstreams) {
+        Function<FromRef, List<String>> upstreams,
+        Function<String, List<String>> sourceKeys) {
+
+    public DagBindings(
+            Function<String, ProcessorMetaSupplier> sourceVertices,
+            Function<Step, SupplierEx<? extends TransformPort>> transformPorts,
+            Function<SyncElement, SupplierEx<? extends SinkWriter>> sinkWriters,
+            Function<FromRef, List<String>> upstreams) {
+        this(sourceVertices, transformPorts, sinkWriters, upstreams, sourceId -> List.of(sourceId));
+    }
 }

@@ -14,12 +14,36 @@ actuation.pipeline-not-found:
 actuation.not-a-pipeline:
   message: "Resource `{pipeline}` is a `{kind}`, not a pipeline, so it cannot be run."
   solution: "Start a pipeline resource; check the id names a pipeline and not another kind of resource."
+actuation.source-schema-not-discovered:
+  message: "Source `{source}` needs a discovered schema before its tables can be selected."
+  solution: "Run schema discovery for the source, then apply or start the pipeline again."
+actuation.source-table-not-discovered:
+  message: "Source `{source}` does not declare discovered table `{table}`."
+  solution: "Discover the source again or change the pipeline table selector to a discovered table."
+actuation.source-table-selection-empty:
+  message: "Source `{source}` selects no tables."
+  solution: "Use a table name or regex that matches at least one discovered table."
+actuation.source-table-regex-invalid:
+  message: "Source `{source}` has an invalid table regex `{regex}`."
+  solution: "Fix the regex syntax and apply the pipeline again."
+actuation.source-table-ambiguous:
+  message: "Table `{table}` is selected by more than one source: {sources}."
+  solution: "Use a qualified source.table reference to choose the intended source."
+actuation.from-regex-invalid:
+  message: "The pipeline from regex `{regex}` is invalid."
+  solution: "Fix the regex syntax and apply the pipeline again."
+actuation.from-regex-empty:
+  message: "The pipeline from regex `{regex}` matches no upstream vertex."
+  solution: "Use a regex matching a selected source table or an earlier transform step."
 boot.hazelcast-unavailable:
   message: "The embedded Hazelcast member could not start."
   solution: "Another process may already be using the member port on loopback; stop it or set a different port, then restart."
 capture.start-from-unparsable:
   message: "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp."
   solution: "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."
+capture.event-table-not-selected:
+  message: "The capture stream emitted table `{table}`, which this pipeline did not select."
+  solution: "Update the source table selection or verify the connector emits the configured table names."
 cli.artifact-exists:
   message: "An artifact already exists at {path}."
   solution: "Choose a different id or --out, or pass --force to overwrite."

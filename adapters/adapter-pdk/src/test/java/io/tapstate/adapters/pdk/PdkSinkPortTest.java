@@ -162,6 +162,21 @@ class PdkSinkPortTest {
     }
 
     @Test
+    void oneConnectorSessionRoutesEachSourceTableBatchToItsOwnTargetModel(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.keyCountingSink(dir);
+        PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.KeyCounting"));
+        TargetTable second = new TargetTable("t2", List.of(
+                new TargetField("tenant", "int", true), new TargetField("id", "int", true)));
+        try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.FAIL),
+                Map.of("t1", target(), "t2", second))) {
+            assertThat(await(writer, List.of(
+                    Envelope.insert(1L, "t1", Map.of("id", 1), null),
+                    Envelope.insert(2L, "t2", Map.of("tenant", 7, "id", 2), null))).written())
+                    .isEqualTo(3);
+        }
+    }
+
+    @Test
     void withoutAResolvedTargetTheConnectorGetsABareTableWithNoColumns(@TempDir Path dir) throws Exception {
         // No resolved target model: the connector is handed a bare table id with no columns, as before.
         Path jar = Synthetic.fieldCountingSink(dir);

@@ -5,6 +5,7 @@ import io.tapstate.spi.capture.Subscription;
 
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Map;
 
 /**
  * The handle a {@link CaptureRunUnit#start started} source run hands back — what the assembly did and the
@@ -17,6 +18,8 @@ import java.util.Optional;
  *       with a running capture) rather than opening a fresh one; false when no chain was provisioned.</li>
  *   <li>{@code snapshotCount} — how many snapshot rows were drained straight to the pass-through sink; zero
  *       when the read mode runs no snapshot.</li>
+ *   <li>{@code snapshotCounts} — the same count split by source stream; empty when the read mode runs no
+ *       snapshot. This carries the table dimension needed by a multi-table source.</li>
  *   <li>{@code ringSource} — the self-built Jet source over the change ring, present only on the shared-ring
  *       path; the downstream reads the cdc tail from it.</li>
  *   <li>{@code cdcSubscription} — the handle that stops the cdc stream, present whenever a tail runs (the
@@ -32,15 +35,28 @@ public record CaptureRun(
         Optional<MiningChainId> chainId,
         boolean merged,
         long snapshotCount,
+        Map<String, Long> snapshotCounts,
         Optional<StreamSource<SrsItem>> ringSource,
         Optional<Subscription> cdcSubscription,
         CaptureHealth health) implements AutoCloseable {
 
+    public CaptureRun(
+            Optional<MiningChainId> chainId,
+            boolean merged,
+            long snapshotCount,
+            Optional<StreamSource<SrsItem>> ringSource,
+            Optional<Subscription> cdcSubscription,
+            CaptureHealth health) {
+        this(chainId, merged, snapshotCount, Map.of(), ringSource, cdcSubscription, health);
+    }
+
     public CaptureRun {
         Objects.requireNonNull(chainId, "chainId");
+        Objects.requireNonNull(snapshotCounts, "snapshotCounts");
         Objects.requireNonNull(ringSource, "ringSource");
         Objects.requireNonNull(cdcSubscription, "cdcSubscription");
         Objects.requireNonNull(health, "health");
+        snapshotCounts = Map.copyOf(snapshotCounts);
     }
 
     /**
