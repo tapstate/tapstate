@@ -57,6 +57,7 @@ class RealMysqlToMongoSnapshotIT {
     private static final Duration POLL = Duration.ofMillis(250);
     private static final long SEEDED_ROWS = 5;
     private static final String TABLE = "orders";
+    private static final String TARGET_COLLECTION = "player_address";
     private static final String PIPELINE_ID = "mysql2mongo";
 
     @BeforeAll
@@ -99,24 +100,24 @@ class RealMysqlToMongoSnapshotIT {
 
                 control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-                awaitCount(mongo, targetUri, SEEDED_ROWS);
+                awaitCount(mongo, targetUri, TARGET_COLLECTION, SEEDED_ROWS);
             }
         }
     }
 
     /** Reads the target the way a user would, from outside the product, until the rows are all there. */
-    private static void awaitCount(MongoEndpoints mongo, String targetUri, long expected) {
+    private static void awaitCount(MongoEndpoints mongo, String targetUri, String collection, long expected) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();
         long last = -1;
         while (System.nanoTime() - deadline < 0) {
-            last = mongo.count(targetUri, TABLE);
+            last = mongo.count(targetUri, collection);
             if (last == expected) {
                 return;
             }
             sleep();
         }
         assertThat(last)
-                .as("rows in the Mongo target %s after a snapshot of %d real MySQL rows", TABLE, expected)
+                .as("rows in the Mongo target %s after a snapshot of %d real MySQL rows", collection, expected)
                 .isEqualTo(expected);
     }
 
@@ -195,6 +196,8 @@ class RealMysqlToMongoSnapshotIT {
                   from: snapshot_rows
                   sync:
                     - source: tgt_mongo
+                      rename:
+                        map: { orders: player_address }
                 """;
     }
 

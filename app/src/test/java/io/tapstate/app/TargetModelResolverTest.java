@@ -3,6 +3,8 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.RenameCase;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
@@ -69,6 +71,61 @@ class TargetModelResolverTest {
     }
 
     @Test
+    void explicit_table_map_takes_precedence_over_bulk_rename_rules() {
+        SourceTable address = new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of());
+
+        TargetTable target = TargetModelResolver.toTargetTable(address,
+                new RenameSpec(Map.of("PlayerAddress", "player_address"), RenameCase.UPPER, "ods_", "_v1"));
+
+        assertThat(target.name()).isEqualTo("player_address");
+    }
+
+    @Test
+    void bulk_table_rename_applies_case_before_prefix_and_suffix() {
+        SourceTable address = new SourceTable(
+                "PLAYER_ADDRESS", List.of(new SourceField("id", "INT")), List.of("id"), List.of());
+
+        TargetTable target = TargetModelResolver.toTargetTable(address,
+                new RenameSpec(null, RenameCase.CAMEL, "ods_", "_v1"));
+
+        assertThat(target.name()).isEqualTo("ods_playerAddress_v1");
+    }
+
+    @Test
+    void bulk_table_rename_supports_pascal_case() {
+        SourceTable address = new SourceTable(
+                "player_address", List.of(new SourceField("id", "INT")), List.of("id"), List.of());
+
+        TargetTable target = TargetModelResolver.toTargetTable(address,
+                new RenameSpec(null, RenameCase.PASCAL, null, null));
+
+        assertThat(target.name()).isEqualTo("PlayerAddress");
+    }
+
+    @Test
+    void bulk_table_rename_preserves_acronym_and_digit_boundaries() {
+        SourceTable server = new SourceTable(
+                "HTTP2ServerV1", List.of(new SourceField("id", "INT")), List.of("id"), List.of());
+
+        TargetTable target = TargetModelResolver.toTargetTable(server,
+                new RenameSpec(null, RenameCase.PASCAL, null, null));
+
+        assertThat(target.name()).isEqualTo("Http2ServerV1");
+    }
+
+    @Test
+    void bulk_table_rename_supports_upper_case() {
+        SourceTable address = new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of());
+
+        TargetTable target = TargetModelResolver.toTargetTable(address,
+                new RenameSpec(null, RenameCase.UPPER, null, null));
+
+        assertThat(target.name()).isEqualTo("PLAYERADDRESS");
+    }
+
+    @Test
     void resolves_the_target_from_the_discovered_model_of_the_pipelines_source() {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(cdcSource("src_mysql", "orders"));
@@ -79,11 +136,12 @@ class TargetModelResolverTest {
                 List.of("id"),
                 List.of())));
 
-        Optional<TargetTable> target = new TargetModelResolver(store).resolve(pipelineArtifact(store, "p"));
+        Optional<TargetModelResolver.ResolvedTarget> target =
+                new TargetModelResolver(store).resolve(pipelineArtifact(store, "p"));
 
-        assertThat(target).contains(new TargetTable("orders", List.of(
+        assertThat(target).contains(new TargetModelResolver.ResolvedTarget("orders", new TargetTable("orders", List.of(
                 new TargetField("id", "INT", true),
-                new TargetField("amount", "DECIMAL", false))));
+                new TargetField("amount", "DECIMAL", false)))));
     }
 
     @Test
@@ -92,7 +150,8 @@ class TargetModelResolverTest {
         store.artifacts().save(cdcSource("src_mysql", "orders"));
         store.artifacts().save(pipeline("p", "src_mysql"));
 
-        Optional<TargetTable> target = new TargetModelResolver(store).resolve(pipelineArtifact(store, "p"));
+        Optional<TargetModelResolver.ResolvedTarget> target =
+                new TargetModelResolver(store).resolve(pipelineArtifact(store, "p"));
 
         assertThat(target).isEmpty();
     }

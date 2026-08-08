@@ -67,9 +67,17 @@ final class StoreBackedDagSource implements DagSource {
     @Override
     public DAG dagFor(String pipelineId) {
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
-        TargetTable target = targetModelResolver.resolve(pipeline).orElse(null);
+        TargetModelResolver.ResolvedTarget resolved = targetModelResolver.resolve(pipeline)
+                .orElseGet(() -> new TargetModelResolver.ResolvedTarget(sourceTable(pipeline), null));
         return PipelineDagBuilder.build(
-                pipeline, bindings(sourceIdByTable(pipeline), target), sinkAckBinding(pipeline, pipelineId));
+                pipeline,
+                bindings(sourceIdByTable(pipeline), resolved.target(), resolved.sourceTable()),
+                sinkAckBinding(pipeline, pipelineId));
+    }
+
+    private String sourceTable(PipelineResource pipeline) {
+        String sourceId = pipeline.sources().getFirst();
+        return SourceCaptureResolution.of(StoredArtifacts.requireSource(artifacts(), sourceId)).table();
     }
 
     /**
@@ -111,11 +119,11 @@ final class StoreBackedDagSource implements DagSource {
      * builder walks the topology; only the vertex suppliers they return travel onto the DAG, so they may
      * reach the store freely while what they produce stays serializable.
      */
-    private DagBindings bindings(Map<String, String> sourceIdByTable, TargetTable target) {
+    private DagBindings bindings(Map<String, String> sourceIdByTable, TargetTable target, String sourceTable) {
         return new DagBindings(
                 this::sourceVertex,
                 StoreBackedDagSource::transformPort,
-                element -> sinkWriter(element, target),
+                element -> sinkWriter(element, TargetModelResolver.rename(target, sourceTable, element.rename())),
                 ref -> upstreams(ref, sourceIdByTable));
     }
 

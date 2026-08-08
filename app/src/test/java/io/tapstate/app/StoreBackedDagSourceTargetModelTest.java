@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.RenameCase;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
@@ -57,9 +59,56 @@ class StoreBackedDagSourceTargetModelTest {
         assertThat(bound).containsExactly((TargetTable) null);
     }
 
+    @Test
+    void applies_explicit_rename_without_a_discovered_model() {
+        InMemoryStorePort store = seededPipeline(new SyncElement(
+                "sync_1", "orders_dest", null,
+                new RenameSpec(Map.of("orders", "player_address"), null, null, null), null, null));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).containsExactly(new TargetTable("player_address", List.of()));
+    }
+
+    @Test
+    void gives_each_sync_its_own_renamed_target_model() {
+        InMemoryStorePort store = seededPipeline(
+                new SyncElement("mongo", "orders_dest", null,
+                        new RenameSpec(Map.of("orders", "player_address"), null, null, null), null, null),
+                new SyncElement("warehouse", "orders_dest", null,
+                        new RenameSpec(null, RenameCase.LOWER, "ods_", null), null, null));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable(
+                "orders", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).containsExactly(
+                new TargetTable("player_address", List.of(new TargetField("id", "INT", true))),
+                new TargetTable("ods_orders", List.of(new TargetField("id", "INT", true))));
+    }
+
+    @Test
+    void renames_with_the_table_whose_discovered_model_binds_the_sink() {
+        InMemoryStorePort store = seededMultiSourcePipeline();
+        store.schemas().save(discovered("address_src", "mysql", new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).containsExactly(new TargetTable(
+                "player_address", List.of(new TargetField("id", "INT", true))));
+    }
+
     // ---- fixtures ----------------------------------------------------------------------
 
     private static InMemoryStorePort seededPipeline() {
+        return seededPipeline(new SyncElement("sync_1", "orders_dest", null, null, null, null));
+    }
+
+    private static InMemoryStorePort seededPipeline(SyncElement... syncElements) {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
@@ -67,7 +116,24 @@ class StoreBackedDagSourceTargetModelTest {
                 null, null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of("orders_src"), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("orders_src"),
-                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)), null, null),
+                        List.of(syncElements), null, null),
+                null, null));
+        return store;
+    }
+
+    private static InMemoryStorePort seededMultiSourcePipeline() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+        store.artifacts().save(new SourceResource("address_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("PlayerAddress")), null, null, null));
+        store.artifacts().save(new SourceResource("orders_dest", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null, null));
+        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src", "address_src"), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"), List.of(new SyncElement(
+                        "sync_1", "orders_dest", null,
+                        new RenameSpec(Map.of("PlayerAddress", "player_address"), null, null, null), null, null)),
+                        null, null),
                 null, null));
         return store;
     }

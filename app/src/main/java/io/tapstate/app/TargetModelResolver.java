@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.RenameCase;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
@@ -10,6 +12,8 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -33,20 +37,23 @@ final class TargetModelResolver {
 
     /**
      * Resolves the write-side target table for a pipeline's sink from the discovered model of the source it
-     * reads: the source's single L1 table looked up in its persisted model and mapped to a target table.
-     * Empty when the source's schema was never discovered, or when the discovered model does not carry that
-     * table.
+     * reads: the selected source table looked up in its persisted model and mapped to a target table. The
+     * source table travels with the target model so sink-side rename rules use the same source that supplied
+     * the fields. Empty when no pipeline source has a matching discovered table.
      */
-    Optional<TargetTable> resolve(PipelineResource pipeline) {
+    Optional<ResolvedTarget> resolve(PipelineResource pipeline) {
         for (String sourceId : pipeline.sources()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
             String table = SourceCaptureResolution.of(source).table();
             Optional<SourceTable> discovered = discoveredTable(sourceId, table);
             if (discovered.isPresent()) {
-                return Optional.of(toTargetTable(discovered.get()));
+                return Optional.of(new ResolvedTarget(table, toTargetTable(discovered.get())));
             }
         }
         return Optional.empty();
+    }
+
+    record ResolvedTarget(String sourceTable, TargetTable target) {
     }
 
     /** The named table in the source's persisted discovery model, or empty when neither is present. */
@@ -75,6 +82,90 @@ final class TargetModelResolver {
             }
         }
         return new TargetTable(source.name(), fields);
+    }
+
+    static TargetTable toTargetTable(SourceTable source, RenameSpec rename) {
+        return rename(toTargetTable(source), source.name(), rename);
+    }
+
+    static TargetTable rename(TargetTable target, String sourceName, RenameSpec rename) {
+        if (rename == null) {
+            return target;
+        }
+        List<TargetField> fields = target == null ? List.of() : target.fields();
+        return new TargetTable(renamedName(sourceName, rename), fields);
+    }
+
+    private static String renamedName(String sourceName, RenameSpec rename) {
+        Map<String, String> explicit = rename.map();
+        if (explicit != null && explicit.containsKey(sourceName)) {
+            return explicit.get(sourceName);
+        }
+        RenameCase caseMode = rename.caseMode();
+        String transformed = caseMode == null ? sourceName : switch (caseMode) {
+            case UPPER -> sourceName.toUpperCase(Locale.ROOT);
+            case LOWER -> sourceName.toLowerCase(Locale.ROOT);
+            case CAMEL -> compoundCase(sourceName, false);
+            case PASCAL -> compoundCase(sourceName, true);
+        };
+        return (rename.prefix() == null ? "" : rename.prefix())
+                + transformed
+                + (rename.suffix() == null ? "" : rename.suffix());
+    }
+
+    private static String compoundCase(String name, boolean capitalizeFirst) {
+        StringBuilder result = new StringBuilder();
+        StringBuilder word = new StringBuilder();
+        for (int index = 0; index < name.length(); index++) {
+            char current = name.charAt(index);
+            if (!isAsciiAlphaNumeric(current)) {
+                appendWord(result, word, capitalizeFirst);
+                continue;
+            }
+            boolean lowerOrDigitFollowedByUpper = index > 0
+                    && isAsciiLowerOrDigit(name.charAt(index - 1))
+                    && isAsciiUpper(current);
+            boolean acronymFollowedByWord = isAsciiUpper(current)
+                    && index + 2 < name.length()
+                    && isAsciiUpper(name.charAt(index + 1))
+                    && isAsciiLower(name.charAt(index + 2));
+            if (lowerOrDigitFollowedByUpper || acronymFollowedByWord) {
+                appendWord(result, word, capitalizeFirst);
+            }
+            word.append(current);
+        }
+        appendWord(result, word, capitalizeFirst);
+        return result.toString();
+    }
+
+    private static void appendWord(StringBuilder result, StringBuilder word, boolean capitalizeFirst) {
+        if (word.isEmpty()) {
+            return;
+        }
+        String lower = word.toString().toLowerCase(Locale.ROOT);
+        if (result.length() > 0 || capitalizeFirst) {
+            result.append(Character.toUpperCase(lower.charAt(0)));
+            result.append(lower.substring(1));
+        } else {
+            result.append(lower);
+        }
+        word.setLength(0);
+    }
+
+    private static boolean isAsciiAlphaNumeric(char value) {
+        return isAsciiUpper(value) || isAsciiLower(value) || value >= '0' && value <= '9';
+    }
+
+    private static boolean isAsciiUpper(char value) {
+        return value >= 'A' && value <= 'Z';
+    }
+
+    private static boolean isAsciiLower(char value) {
+        return value >= 'a' && value <= 'z';
+    }
+
+    private static boolean isAsciiLowerOrDigit(char value) {
+        return isAsciiLower(value) || value >= '0' && value <= '9';
     }
 
     /** The discovered field a key column names; a key naming no discovered field is a broken source model. */
