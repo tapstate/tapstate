@@ -91,10 +91,35 @@ class SrsRingReaderTest {
         SrsRingReader reader = new SrsRingReader(filled("srs.chain.all", 3), 0);
         List<SrsItem> out = new ArrayList<>();
 
-        int n = reader.fill(out::add, 10);
+        int n = reader.fill((item, seq) -> out.add(item), 10);
 
         assertThat(n).isEqualTo(3);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(0, 1, 2);
+    }
+
+    @Test
+    void handsEachChangeTheSequenceTheRingAssignedIt() {
+        SrsRingReader reader = new SrsRingReader(filled("srs.chain.seq", 3), 0);
+        List<Long> sequences = new ArrayList<>();
+
+        reader.fill((item, seq) -> sequences.add(seq), 10);
+
+        // The ring assigns the sequence on append and keeps it: it is not a field of the item, so a reader
+        // that handed over the item alone would leave the only monotonic order the engine has behind.
+        assertThat(sequences).containsExactly(0L, 1L, 2L);
+    }
+
+    @Test
+    void theSequenceItHandsOverIsTheOneItStartedFromNotACountOfThisFill() {
+        SrsRingReader reader = new SrsRingReader(filled("srs.chain.seq-offset", 4), 2);
+        List<Long> sequences = new ArrayList<>();
+
+        reader.fill((item, seq) -> sequences.add(seq), 10);
+
+        // A reader that begins part way through the ring must report the ring's sequence, not how many
+        // changes this fill has emitted. Counting per fill would restart the order at every batch and at
+        // every reader, and two changes of one chain would come out claiming the same place in it.
+        assertThat(sequences).containsExactly(2L, 3L);
     }
 
     @Test
@@ -104,8 +129,8 @@ class SrsRingReaderTest {
 
         // A fill drains at most max, so the reader yields to the downstream between batches (backpressure);
         // the next fill picks up exactly where the last stopped — no change re-read, none skipped.
-        assertThat(reader.fill(out::add, 2)).isEqualTo(2);
-        assertThat(reader.fill(out::add, 2)).isEqualTo(1);
+        assertThat(reader.fill((item, seq) -> out.add(item), 2)).isEqualTo(2);
+        assertThat(reader.fill((item, seq) -> out.add(item), 2)).isEqualTo(1);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(0, 1, 2);
     }
 
@@ -116,7 +141,7 @@ class SrsRingReaderTest {
 
         // max exceeds what the ring holds: the reader returns what is present rather than blocking for a
         // change past the tail that has not been written yet.
-        int n = reader.fill(out::add, 10);
+        int n = reader.fill((item, seq) -> out.add(item), 10);
 
         assertThat(n).isEqualTo(2);
         assertThat(out).hasSize(2);
@@ -127,7 +152,7 @@ class SrsRingReaderTest {
         SrsRingReader reader = new SrsRingReader(filled("srs.chain.start", 4), 2);
         List<SrsItem> out = new ArrayList<>();
 
-        int n = reader.fill(out::add, 10);
+        int n = reader.fill((item, seq) -> out.add(item), 10);
 
         assertThat(n).isEqualTo(2);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(2, 3);
@@ -139,7 +164,7 @@ class SrsRingReaderTest {
         SrsRingReader reader = new SrsRingReader(filled("srs.chain.drained", 2), 2);
         List<SrsItem> out = new ArrayList<>();
 
-        assertThat(reader.fill(out::add, 10)).isEqualTo(0);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(0);
         assertThat(out).isEmpty();
     }
 
@@ -149,11 +174,11 @@ class SrsRingReaderTest {
         SrsRingReader reader = new SrsRingReader(ring, 0);
         List<SrsItem> out = new ArrayList<>();
 
-        assertThat(reader.fill(out::add, 10)).isEqualTo(2);
-        assertThat(reader.fill(out::add, 10)).isEqualTo(0);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(2);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(0);
         // A change appended after an exhausted fill is picked up by the next fill — the reader tails the ring.
         ring.append(insert(2));
-        assertThat(reader.fill(out::add, 10)).isEqualTo(1);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(1);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(0, 1, 2);
     }
 
@@ -169,7 +194,7 @@ class SrsRingReaderTest {
 
         // The reader reports its read cursor as it advances: after draining a batch it publishes the last
         // sequence it read, the progress signal the write-side headroom gate reads back as this consumer's.
-        int n = reader.fill(i -> {}, 10);
+        int n = reader.fill((item, seq) -> { }, 10);
 
         assertThat(n).isEqualTo(3);
         assertThat(published).containsExactly(2L);
@@ -182,8 +207,8 @@ class SrsRingReaderTest {
 
         // One publish per non-empty fill carrying that batch's last sequence — not one per change — so the
         // durable cursor write is amortized over the batch a bounded fill already draws.
-        assertThat(reader.fill(i -> {}, 2)).isEqualTo(2);
-        assertThat(reader.fill(i -> {}, 2)).isEqualTo(1);
+        assertThat(reader.fill((item, seq) -> { }, 2)).isEqualTo(2);
+        assertThat(reader.fill((item, seq) -> { }, 2)).isEqualTo(1);
         assertThat(published).containsExactly(1L, 2L);
     }
 
@@ -193,7 +218,7 @@ class SrsRingReaderTest {
         // Start past the tail: nothing to read, the cursor does not move, so nothing is published.
         SrsRingReader reader = new SrsRingReader(filled("srs.pub.empty", 2), 2, published::add);
 
-        assertThat(reader.fill(i -> {}, 10)).isEqualTo(0);
+        assertThat(reader.fill((item, seq) -> { }, 10)).isEqualTo(0);
         assertThat(published).isEmpty();
     }
 
@@ -204,7 +229,7 @@ class SrsRingReaderTest {
         // last sequence it read there.
         SrsRingReader reader = SrsRingReader.from(filled("srs.pub.from", 3), StartFrom.earliest(), published::add);
 
-        assertThat(reader.fill(i -> {}, 10)).isEqualTo(3);
+        assertThat(reader.fill((item, seq) -> { }, 10)).isEqualTo(3);
         assertThat(published).containsExactly(2L);
     }
 
@@ -213,7 +238,7 @@ class SrsRingReaderTest {
         SrsRingReader reader = SrsRingReader.from(filled("srs.start.earliest", 3), StartFrom.earliest());
         List<SrsItem> out = new ArrayList<>();
 
-        assertThat(reader.fill(out::add, 10)).isEqualTo(3);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(3);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(0, 1, 2);
     }
 
@@ -224,10 +249,10 @@ class SrsRingReaderTest {
         List<SrsItem> out = new ArrayList<>();
 
         // latest starts past the newest buffered change: nothing already there is replayed...
-        assertThat(reader.fill(out::add, 10)).isEqualTo(0);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(0);
         // ...but a change appended after the start point is tailed.
         ring.append(insert(3));
-        assertThat(reader.fill(out::add, 10)).isEqualTo(1);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(1);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(3);
     }
 
@@ -237,7 +262,7 @@ class SrsRingReaderTest {
                 filledWith("srs.start.at", 10, 20, 30, 40), StartFrom.at(Instant.ofEpochMilli(25)));
         List<SrsItem> out = new ArrayList<>();
 
-        assertThat(reader.fill(out::add, 10)).isEqualTo(2);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(2);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(2, 3);
     }
 
@@ -249,7 +274,7 @@ class SrsRingReaderTest {
                 filledWith("srs.start.at-old", 100, 200), StartFrom.at(Instant.ofEpochMilli(50)));
         List<SrsItem> out = new ArrayList<>();
 
-        assertThat(reader.fill(out::add, 10)).isEqualTo(2);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(2);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(0, 1);
     }
 
@@ -259,9 +284,9 @@ class SrsRingReaderTest {
         SrsRingReader reader = SrsRingReader.from(ring, StartFrom.at(Instant.ofEpochMilli(999)));
         List<SrsItem> out = new ArrayList<>();
 
-        assertThat(reader.fill(out::add, 10)).isEqualTo(0);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(0);
         ring.append(insertAt(2, 1000));
-        assertThat(reader.fill(out::add, 10)).isEqualTo(1);
+        assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(1);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(2);
     }
 }

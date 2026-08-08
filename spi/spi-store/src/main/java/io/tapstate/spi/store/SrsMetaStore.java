@@ -1,5 +1,6 @@
 package io.tapstate.spi.store;
 
+import io.tapstate.core.event.ChainPosition;
 import java.util.Optional;
 
 /**
@@ -61,21 +62,57 @@ public interface SrsMetaStore {
      * never clobbers the {@code perTableSeq} read cursor the pipeline's reader writes to the same consumer
      * record: the sink-ack and the read cursor are independent writers of one consumer, of different
      * lifetime. It creates the consumer entry when the pipeline has none yet, so a sink may ack before the
-     * reader first publishes a cursor. The caller advances a monotonically non-decreasing position (the
-     * sink's contiguous acked prefix); this store persists the value the caller resolved. A mutate on an
-     * unseeded chain is a caller ordering error.
+     * reader first publishes a cursor. The caller only ever advances, never lowers; this store persists the
+     * position the caller resolved. A mutate on an unseeded chain is a caller ordering error.
+     *
+     * <p>Both halves of the position are persisted. The token is what a read resumes from; the order is
+     * what the next comparison runs on, and a stored token without it can no longer be ranked against the
+     * reader's own position — which is the comparison that keeps a source read from passing the slowest
+     * sink.
      */
-    void advanceSinkAckedSrcpos(String miningChainId, String pipelineId, String srcpos);
+    void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position);
 
     /**
-     * Sets the chain's cdc start position — the opaque position the cdc tail starts from, recorded at
-     * the snapshot-to-cdc seam. A mutate on an unseeded chain is a caller ordering error.
+     * Records the chain's snapshot-to-cdc seam: the opaque position the cdc tail starts from, together
+     * with the ring generation the snapshot that reached this seam began in. A mutate on an unseeded chain
+     * is a caller ordering error.
+     *
+     * <p>The two are one call because they are only ever read together. The seam position is the sole
+     * record that a snapshot began at all, so a snapshot resuming after a restart looks here to learn
+     * both where the tail picks up and which generation to pin its rows to. A store that could write the
+     * position without its generation would leave a resumed snapshot with nothing to pin to, and a rerun
+     * that then took the current generation would overwrite changes the earlier one had already applied.
      */
-    void setCdcStartPosition(String miningChainId, String cdcStartPosition);
+    void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch);
+
+    /**
+     * Opens the chain's next ring generation and returns it — the monotonic counter every order on this
+     * chain compares first. Generations begin at one, so a chain whose stored generation is still zero has
+     * never had a ring opened.
+     *
+     * <p>Called once per ring establishment: a restart or a re-mine rebuilds the ring and takes a new
+     * generation, while a second source force-merging onto an already-open chain joins the generation
+     * already running rather than opening one. Generations are per chain, because an order is only ever
+     * compared against another order of the same chain. It leaves the recorded snapshot generation alone —
+     * that is the whole point of keeping the two apart. A mutate on an unseeded chain is a caller ordering
+     * error.
+     */
+    long openEpoch(String miningChainId);
 
     /**
      * Appends a version to the chain's append-only schema history. A mutate on an unseeded chain is a
      * caller ordering error.
      */
     void appendSchemaVersion(String miningChainId, SchemaVersion version);
+
+    /**
+     * Marks one table's bounded snapshot read as drained to completion on the chain. The caller marks a
+     * table only once that table's snapshot has finished, so a reader may take the mark as "every row of
+     * this table has been through" — a distinct question from the one {@link #setCdcStart}
+     * answers, which is where the tail resumes and is written before the snapshot begins. Completion is
+     * per table because one chain carries many, each snapshotted by its own capture run. Marking is
+     * idempotent (set membership): a table already marked stays marked once, so a re-run or replay of a
+     * table's snapshot is safe. A mutate on an unseeded chain is a caller ordering error.
+     */
+    void markSnapshotComplete(String miningChainId, String table);
 }

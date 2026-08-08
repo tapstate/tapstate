@@ -194,7 +194,12 @@ class SchemaGeneratorTest {
         assertThat(embed.get("arrayKey")).isNotNull();
         assertThat(embed.get("array_key")).isNull();
         assertThat(embed.get("ignoreUpdates")).isNotNull();
-        assertThat(embed.get("trackJoinKeyChanges")).isNotNull();
+        assertThat(embed.get("trackKeyChanges")).isNotNull();
+
+        // the root carries its own key-tracking switch, in camelCase like the embed's
+        Json.Obj nestRoot = (Json.Obj) ((Json.Obj) defs.get("NestRoot")).get("properties");
+        assertThat(nestRoot.get("trackKeyChanges")).isNotNull();
+        assertThat(nestRoot.get("track_key_changes")).isNull();
     }
 
     @Test

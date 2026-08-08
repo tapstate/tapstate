@@ -4,7 +4,6 @@ import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.core.model.ReadMode;
 
-import java.util.Comparator;
 import java.util.Objects;
 import java.util.function.Supplier;
 
@@ -23,9 +22,9 @@ import java.util.function.Supplier;
  *       pass-through retention config seeded on a new chain (may be null).</li>
  *   <li>{@code cdcStart} — the source position sampled at snapshot start (an L1 mock for the
  *       snapshot-to-cdc seam); {@code schemaVer} — the schema version stamped on ring items.</li>
- *   <li>{@code watermark} — the per-change source position generator (an L1 mock monotonic stand-in);
- *       {@code positionOrder} — the connector-defined order over opaque positions, never lexicographic
- *       (an L1 mock).</li>
+ *   <li>{@code watermark} — the per-change source position generator (an L1 mock monotonic stand-in).
+ *       What ranks the positions it hands out is not here: the order is the ring's own, assigned on
+ *       append, so a run has nothing to be told about it.</li>
  * </ul>
  */
 public record CaptureRunSpec(
@@ -39,8 +38,7 @@ public record CaptureRunSpec(
         SourcePosition cdcStart,
         String retention,
         long schemaVer,
-        Supplier<SourcePosition> watermark,
-        Comparator<String> positionOrder) {
+        Supplier<SourcePosition> watermark) {
 
     public CaptureRunSpec {
         Objects.requireNonNull(config, "config");
@@ -50,6 +48,5 @@ public record CaptureRunSpec(
         Objects.requireNonNull(startFrom, "startFrom");
         Objects.requireNonNull(cdcStart, "cdcStart");
         Objects.requireNonNull(watermark, "watermark");
-        Objects.requireNonNull(positionOrder, "positionOrder");
     }
 }

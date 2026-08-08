@@ -57,6 +57,7 @@ class StoreBackedDagSourceTest {
                 null,
                 serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
                 null, null));
+        OpenRingGenerations.forSources(store, "orders_src");
 
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
@@ -65,6 +66,28 @@ class StoreBackedDagSourceTest {
         assertThat(edges(dag)).containsExactlyInAnyOrder(
                 edge("orders_src", "keep_even"),
                 edge("keep_even", "serve.sync_1"));
+    }
+
+    @Test
+    void builds_a_job_for_a_source_that_reads_no_chain_of_its_own() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of("orders_src"),
+                null,
+                null,
+                serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")),
+                null, null));
+
+        // No chain record: only a read with an incremental tail through the shared ring opens one, so a
+        // snapshot-only or srs-disabled read reaches here with none. Its rows come from the snapshot buffer
+        // and no capture fills its ring, so demanding a generation of it would refuse to build a job that
+        // is perfectly well formed.
+        DAG dag = new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(vertexNames(dag)).contains("orders_src");
     }
 
     @Test
@@ -221,9 +244,17 @@ class StoreBackedDagSourceTest {
             throw new UnsupportedOperationException();
         }
 
+        private final SrsMetaStore meta = new InMemorySrsMetaStore();
+        private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
+
         @Override
         public SrsMetaStore meta() {
-            throw new UnsupportedOperationException();
+            return meta;
+        }
+
+        @Override
+        public io.tapstate.spi.store.KeyedStateStore keyedState() {
+            return keyedState;
         }
     }
 }

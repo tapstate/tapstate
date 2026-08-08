@@ -156,7 +156,8 @@ class CaptureToSinkDataFlowTest {
                 (connectorId, settings, writeMode, ddl, target) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
         DagSource dagSource = new StoreBackedDagSource(store, capturingSink);
 
-        LifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member), dagSource, coordinator);
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState()));
 
         actuator.start(PIPELINE);
         try {
@@ -300,7 +301,7 @@ class CaptureToSinkDataFlowTest {
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             for (Envelope record : records) {
-                COLLECTED.add(record.src() + "|" + record.srcPos() + "|" + record.after().get("id"));
+                COLLECTED.add(record.src() + "|" + (record.position() == null ? null : record.position().token()) + "|" + record.after().get("id"));
             }
             return CompletableFuture.completedFuture(new WriteResult(records.size()));
         }

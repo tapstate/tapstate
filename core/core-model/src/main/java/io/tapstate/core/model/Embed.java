@@ -7,8 +7,8 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * One embedded child of a nest tree (ADR-0016 §5.1). {@code from} names an alias of the
- * step's {@code from:} map; {@code on} maps child join fields to parent fields.
+ * One embedded child of a nest tree. {@code from} names an alias of the step's {@code from:}
+ * map; {@code on} maps child join fields to parent fields.
  */
 @Doc("One embedded child of a nest tree, joined onto its parent and placed at a target path.")
 public record Embed(
@@ -26,9 +26,12 @@ public record Embed(
         @Doc(value = "When true, updates to the child rows are not propagated into the parent.",
                 key = "ignoreUpdates")
         Boolean ignoreUpdates,
-        @Doc(value = "When true, changes to the join key are tracked so embedded data is moved accordingly.",
-                key = "trackJoinKeyChanges")
-        Boolean trackJoinKeyChanges,
+        @Doc(value = "When true, changes to this child's structural keys are tracked so embedded data "
+                + "is moved accordingly: the key identifying an element within its array, the key "
+                + "saying which parent it hangs under, and the key its own children point at. "
+                + "Requires the source to supply a before image.",
+                key = "trackKeyChanges")
+        Boolean trackKeyChanges,
         @Doc("Further children embedded beneath this one, forming a nested tree.")
         List<Embed> embed) {
 

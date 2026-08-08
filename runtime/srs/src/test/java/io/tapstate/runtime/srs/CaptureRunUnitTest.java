@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.event.ChainPosition;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
@@ -111,7 +112,7 @@ class CaptureRunUnitTest {
     private static CaptureRunSpec spec(ReadMode mode, boolean srsEnabled, String srsKey) {
         return new CaptureRunSpec(
                 config(), mode, srsKey, srsEnabled, "src-1", "pipe-1", StartFrom.earliest(),
-                new SourcePosition("cdc-start-0"), null, 0L, monotonicWatermark(), NUMERIC_ORDER);
+                new SourcePosition("cdc-start-0"), null, 0L, monotonicWatermark());
     }
 
     private CaptureRunUnit runUnit(CapturePort port, SrsMetaStore meta) {
@@ -240,7 +241,7 @@ class CaptureRunUnitTest {
         InMemoryMeta meta = new InMemoryMeta();
         CaptureConfig multi = new CaptureConfig("mysql", Map.of(), List.of("orders", "customers"));
         CaptureRunSpec spec = new CaptureRunSpec(multi, ReadMode.CDC_ONLY, "k-multi", true, "src-1", "pipe-1",
-                StartFrom.earliest(), new SourcePosition("cdc-start-0"), null, 0L, monotonicWatermark(), NUMERIC_ORDER);
+                StartFrom.earliest(), new SourcePosition("cdc-start-0"), null, 0L, monotonicWatermark());
 
         // L1 capture is single-table: a multi-table shared-ring run is rejected before any chain is opened.
         assertThatThrownBy(() -> runUnit(new FakeSource(List.of(), List.of()), meta).start(spec, e -> { }))
@@ -410,7 +411,7 @@ class CaptureRunUnitTest {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), sourceReadOffset, m.consumerOffsets(), m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention()));
+                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
@@ -421,7 +422,7 @@ class CaptureRunUnitTest {
             next.add(offset);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention()));
+                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
@@ -438,15 +439,15 @@ class CaptureRunUnitTest {
             }
             Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
             perTable.put(table, lastReadSeq);
-            String ack = existing == null ? null : existing.sinkAckedSrcpos();
+            ChainPosition ack = existing == null ? null : existing.sinkAcked();
             next.add(new ConsumerOffset(pipelineId, perTable, ack));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention()));
+                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
-        public void advanceSinkAckedSrcpos(String miningChainId, String pipelineId, String srcpos) {
+        public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
             SrsMeta m = require(miningChainId);
             List<ConsumerOffset> next = new ArrayList<>();
             ConsumerOffset existing = null;
@@ -458,18 +459,28 @@ class CaptureRunUnitTest {
                 }
             }
             Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
-            next.add(new ConsumerOffset(pipelineId, perTable, srcpos));
+            next.add(new ConsumerOffset(pipelineId, perTable, position));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention()));
+                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
-        public void setCdcStartPosition(String miningChainId, String cdcStartPosition) {
+        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), cdcStartPosition,
-                    m.schemaHistory(), m.retention()));
+                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), snapshotEpoch));
+        }
+
+        @Override
+        public long openEpoch(String miningChainId) {
+            SrsMeta m = require(miningChainId);
+            long opened = m.epoch() + 1;
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
+                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), opened, m.snapshotEpoch()));
+            return opened;
         }
 
         @Override
@@ -479,7 +490,20 @@ class CaptureRunUnitTest {
             next.add(version);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
-                    next, m.retention()));
+                    next, m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+        }
+
+        @Override
+        public void markSnapshotComplete(String miningChainId, String table) {
+            SrsMeta m = require(miningChainId);
+            if (m.snapshotCompletedTables().contains(table)) {
+                return;
+            }
+            List<String> next = new ArrayList<>(m.snapshotCompletedTables());
+            next.add(table);
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
+                    m.schemaHistory(), m.retention(), next, m.epoch(), m.snapshotEpoch()));
         }
 
         private SrsMeta require(String miningChainId) {

@@ -3,12 +3,15 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 
 import java.util.Collection;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -72,17 +75,26 @@ public final class CdcPhase {
         SourcePosition pos = chain.watermark().get();
         SrsItem item = new SrsItem(
                 pos, event.op(), event.ts(), event.before(), event.after(), chain.schemaVer());
+        long seq;
         // Admit the change through the headroom gate. A refused write is backpressure, not a drop: park
         // off-CPU and re-check against the live consumer cursor so this call -- and with it the source read --
         // pauses until a consumer frees a slot, rather than overwriting a change no consumer has read or
         // burning a core spinning while it waits.
-        while (chain.gate().append(item, minConsumerReadSeq.getAsLong()).isEmpty()) {
+        while (true) {
+            OptionalLong appended = chain.gate().append(item, minConsumerReadSeq.getAsLong());
+            if (appended.isPresent()) {
+                seq = appended.getAsLong();
+                break;
+            }
             LockSupport.parkNanos(BACKPRESSURE_PARK_NANOS);
         }
         // The change is in the ring; advance the durable read offset to its position, clamped so it never
         // passes the slowest consumer's sink-acked position -- a change only ever in the volatile ring must
         // stay re-minable from the source until a sink has durably landed it.
-        SrsDurableFrontier.safeAdvance(pos.token(), consumers.get(), chain.positionOrder())
+        // The sequence the ring just assigned, paired with the generation it is running under, is what
+        // ranks this position against the consumers' acked ones: a token says nothing about order.
+        ChainPosition read = new ChainPosition(new SourceOrder(chain.epoch(), seq), pos.token());
+        SrsDurableFrontier.safeAdvance(read, consumers.get())
                 .ifPresent(safe -> chain.meta().advanceSourceReadOffset(chain.miningChainId(), safe));
     }
 }

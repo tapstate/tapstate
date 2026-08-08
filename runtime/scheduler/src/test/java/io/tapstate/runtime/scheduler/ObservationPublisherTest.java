@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
@@ -75,6 +76,108 @@ class ObservationPublisherTest {
 
         // A missing metric means the source is not wired (here: no live job), expressed by its absence
         // rather than a zero sentinel, so only the errorCount gauge is carried.
+        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 0L));
+    }
+
+    @Test
+    void publishWiresHowFarEachChainsFrontierTrailsIntoTheMetrics() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(),
+                id -> Map.of("orders", 0L, "order_items", 480L));
+
+        wired.publish("orders");
+
+        // One entry per chain, named by it. A frontier standing still is one symptom of two causes, and the
+        // distance is what tells them apart: order_items is running ahead of positions it was ever given,
+        // while orders is exactly where its bound lets it be. A zero and a large number are both readings.
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("errorCount", 0L),
+                        entry("frontierGap.orders", 0L), entry("frontierGap.order_items", 480L));
+    }
+
+    @Test
+    void theFrontierGapIsAbsentFromTheMetricsWhenNoSinkReportsOne() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(
+                state, observations, id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of());
+
+        wired.publish("orders");
+
+        // Absent means unmeasured, and a zero would read as a frontier keeping up with its bound - the
+        // opposite reading, and the one an alarm over this number would stay quiet on.
+        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 0L));
+    }
+
+    @Test
+    void publishWiresWhatEachNestNamespaceHoldsAndWhatItCostsIntoTheMetrics() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)));
+
+        wired.publish("orders");
+
+        // Four numbers per namespace rather than the one ratio they imply: a ratio published here would be
+        // an average over the whole run, and a state layer that fell off its cliff a minute ago still reads
+        // as healthy in it. Two scrapes of counts give any window a reader wants.
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("errorCount", 0L),
+                        entry("nestStateEntries.nest.orders.doc.$root", 4_000L),
+                        entry("nestStateAccesses.nest.orders.doc.$root", 900L),
+                        entry("nestStateBackfills.nest.orders.doc.$root", 30L),
+                        entry("nestStateBackfillMillis.nest.orders.doc.$root", 210L));
+    }
+
+    /**
+     * What is in memory and how much there is are two numbers, and publishing only the first would say a
+     * namespace holds four thousand when it holds a hundred times that with the rest on the layer behind
+     * it. Once what stays in memory is a budget, the entries reading is what the budget costs rather than
+     * what the pipeline has.
+     */
+    @Test
+    void publishWiresHowMuchANamespaceHoldsAltogetherBesideWhatIsInMemory() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> Map.of("nest.orders.doc.$root",
+                        new NestStateReading(4_000L, 900L, 30L, 210L, OptionalLong.of(400_000L))));
+
+        wired.publish("orders");
+
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .contains(entry("nestStateEntries.nest.orders.doc.$root", 4_000L),
+                        entry("nestStateStored.nest.orders.doc.$root", 400_000L));
+    }
+
+    /**
+     * A run keeping its state in memory alone has no second number, and one published anyway would be the
+     * first wearing the name of the second - a namespace reading as though its cold layer held exactly what
+     * memory did, which is the one shape that says nothing is being evicted when nothing can be.
+     */
+    @Test
+    void howMuchANamespaceHoldsAltogetherIsAbsentWhereThereIsNoColdLayerToAsk() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)));
+
+        wired.publish("orders");
+
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .doesNotContainKey("nestStateStored.nest.orders.doc.$root");
+    }
+
+    @Test
+    void theNestStateReadingsAreAbsentFromTheMetricsWhenNoNamespaceReportsAny() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of());
+
+        wired.publish("orders");
+
+        // Absent means unmeasured. Zeroes would read as a state layer holding nothing and serving every
+        // read from memory - the healthy end of both scales, and the reading an alarm stays quiet on.
         assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 0L));
     }
 

@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
@@ -60,6 +61,48 @@ class SrsCoordinatorTest {
         assertThat(coord.tablesOf(CHAIN)).containsExactlyInAnyOrder("orders", "customers");
         // Both sources are recorded on the one chain -- the force-merge, observable.
         assertThat(coord.sourcesOf(CHAIN)).containsExactlyInAnyOrder("src-a", "src-b");
+    }
+
+    @Test
+    void openingTheChainOpensARingGeneration() {
+        FakeMeta meta = new FakeMeta();
+        SrsCoordinator coord = new SrsCoordinator(meta);
+
+        ProvisionOutcome out = coord.provisionSource("src-a", CHAIN, List.of("orders"), "7d");
+
+        // Opening the chain is what establishes the ring, so it is where a generation is taken. Every
+        // order on this chain compares generation first, and a restart arrives here with no chain state.
+        assertThat(out.epoch()).isEqualTo(1L);
+        assertThat(meta.mutations).contains("openEpoch:" + CHAIN.value());
+    }
+
+    @Test
+    void aSourceMergingOntoAnOpenChainReadsUnderTheGenerationAlreadyRunning() {
+        FakeMeta meta = new FakeMeta();
+        SrsCoordinator coord = new SrsCoordinator(meta);
+        long opened = coord.provisionSource("src-a", CHAIN, List.of("orders"), "7d").epoch();
+
+        ProvisionOutcome merged = coord.provisionSource("src-b", CHAIN, List.of("customers"), "30d");
+
+        // One ring, one generation. A source that took its own would make two sources of the same chain
+        // order their changes against each other by which of them happened to be provisioned first.
+        assertThat(merged.epoch()).isEqualTo(opened);
+        assertThat(meta.mutations).filteredOn(m -> m.startsWith("openEpoch:")).hasSize(1);
+    }
+
+    @Test
+    void reopeningAChainAfterARestartTakesTheNextGenerationWithoutReseeding() {
+        FakeMeta meta = new FakeMeta();
+        long first = new SrsCoordinator(meta).provisionSource("src-a", CHAIN, List.of("orders"), "7d").epoch();
+
+        // A restart loses the in-process chain state but not the durable record, so the rebuilt ring is a
+        // new generation -- which is what lets its changes win against state the previous one left behind.
+        // Seeding is insert-only, so a chain that already has a record must be opened without being seeded
+        // again: re-seeding it would either fail the restart outright or discard the offsets it accumulated.
+        long second = new SrsCoordinator(meta).provisionSource("src-a", CHAIN, List.of("orders"), "7d").epoch();
+
+        assertThat(second).isGreaterThan(first);
+        assertThat(meta.mutations).filteredOn("create:%s".formatted(CHAIN.value())::equals).hasSize(1);
     }
 
     @Test
@@ -194,6 +237,7 @@ class SrsCoordinatorTest {
         final Map<String, String> created = new LinkedHashMap<>();
         final Map<String, SrsMeta> records = new LinkedHashMap<>();
         final List<String> mutations = new ArrayList<>();
+        long epoch;
 
         @Override
         public Optional<SrsMeta> read(String miningChainId) {
@@ -226,13 +270,24 @@ class SrsCoordinatorTest {
         }
 
         @Override
-        public void advanceSinkAckedSrcpos(String miningChainId, String pipelineId, String srcpos) {
+        public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
             mutations.add("sinkAck:" + miningChainId + ":" + pipelineId);
         }
 
         @Override
-        public void setCdcStartPosition(String miningChainId, String cdcStartPosition) {
+        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
             mutations.add("cdcStart:" + miningChainId);
+        }
+
+        @Override
+        public long openEpoch(String miningChainId) {
+            mutations.add("openEpoch:" + miningChainId);
+            return ++epoch;
+        }
+
+        @Override
+        public void markSnapshotComplete(String miningChainId, String table) {
+            mutations.add("snapshotComplete:" + miningChainId + "/" + table);
         }
 
         @Override

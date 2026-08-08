@@ -9,6 +9,7 @@ import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -52,6 +53,8 @@ public final class MongoStorePort implements StorePort {
     public static final String CONNECTION_TEST_RESULTS = "connection_test_results";
     /** The collection holding one SRS coordination record per mining chain. */
     public static final String SRS_META = "srs_meta";
+    /** The collection holding one stateful-operator state document per key, per namespace. */
+    public static final String OPERATOR_STATE = "operator_state";
 
     private final ArtifactStore artifacts;
     private final StateStore state;
@@ -64,6 +67,7 @@ public final class MongoStorePort implements StorePort {
     private final ConnectionTestResultStore connectionTestResults;
     private final ObservationStore observations;
     private final SrsMetaStore meta;
+    private final KeyedStateStore keyedState;
 
     /**
      * Binds the ten sub-stores to their own collections on the verified connection's database. The
@@ -85,6 +89,7 @@ public final class MongoStorePort implements StorePort {
                 new MongoConnectionTestResultStore(database.getCollection(CONNECTION_TEST_RESULTS));
         this.observations = new MongoObservationStore(database.getCollection(PIPELINE_OBSERVATION));
         this.meta = new MongoSrsMetaStore(database.getCollection(SRS_META));
+        this.keyedState = new MongoKeyedStateStore(database.getCollection(OPERATOR_STATE));
     }
 
     @Override
@@ -140,5 +145,10 @@ public final class MongoStorePort implements StorePort {
     @Override
     public SrsMetaStore meta() {
         return meta;
+    }
+
+    @Override
+    public KeyedStateStore keyedState() {
+        return keyedState;
     }
 }

@@ -69,26 +69,12 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
                 "pipe-1", settings, source, SourceCaptureResolution.of(source));
 
-        // The mock watermark is a monotonic source-position generator; the position order and the token format
-        // are a matched pair, ranking by numeric suffix -- never lexically (where w10 would sort before w2).
+        // The mock watermark is a monotonic source-position generator. What ranks the tokens it hands out
+        // is not carried here at all: the order is the ring's own, assigned on append, so the spec has
+        // nothing to say about it - and nothing that could disagree with what the sink ranks by.
         assertThat(spec.watermark().get()).isEqualTo(new SourcePosition("w1"));
         assertThat(spec.watermark().get()).isEqualTo(new SourcePosition("w2"));
         assertThat(spec.cdcStart()).isNotNull();
-        assertThat(spec.positionOrder().compare("w2", "w10")).isNegative();
-        assertThat("w2".compareTo("w10")).as("plain lexical order would rank w10 before w2").isPositive();
-    }
-
-    @Test
-    void theCaptureSpecOrdersByTheOneSharedPositionOrderSoTheSinkCannotDrift() {
-        SourceResource source = cdcSource("orders_src", "orders", null);
-        Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest");
-
-        CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                "pipe-1", settings, source, SourceCaptureResolution.of(source));
-
-        // The capture side and the sink-ack side must rank positions through one and the same order; the
-        // spec carries the shared instance so a change to the order cannot leave the two disagreeing.
-        assertThat(spec.positionOrder()).isSameAs(MockPositionOrder.INSTANCE);
     }
 
     @Test

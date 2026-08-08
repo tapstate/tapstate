@@ -4,8 +4,12 @@ import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.FindOneAndUpdateOptions;
+import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
@@ -85,8 +89,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public void advanceSinkAckedSrcpos(String miningChainId, String pipelineId, String srcpos) {
-        update(miningChainId, sinkAckedSrcposUpdate(pipelineId, srcpos));
+    public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
+        update(miningChainId, sinkAckedUpdate(pipelineId, position));
     }
 
     /**
@@ -106,28 +110,78 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /**
      * The path-scoped update that advances one consumer's durable sink-acked position: a {@code $set} on
-     * {@code consumerOffsets.<pipelineId>.sinkAckedSrcpos}, so the reader's per-table cursor is left
-     * untouched by a sink-ack advance. The pipeline id is a resource id the grammar forbids a dot in, so
-     * the dotted path addresses exactly one field. A deep {@code $set} creates the intermediate objects, so
-     * a sink may ack before the consumer has any other cursor state.
+     * {@code consumerOffsets.<pipelineId>.sinkAckedSrcpos} and the two fields carrying the order it sat
+     * at, so the reader's per-table cursor is left untouched by a sink-ack advance. The pipeline id is a
+     * resource id the grammar forbids a dot in, so each dotted path addresses exactly one field. A deep
+     * {@code $set} creates the intermediate objects, so a sink may ack before the consumer has any other
+     * cursor state.
+     *
+     * <p>The three fields move together in one update. A token stored without its order can no longer be
+     * ranked against anything, and an order stored without its token is nothing a read can resume from;
+     * either alone would be a record no later comparison can use.
      */
-    static Document sinkAckedSrcposUpdate(String pipelineId, String srcpos) {
+    static Document sinkAckedUpdate(String pipelineId, ChainPosition position) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        Objects.requireNonNull(srcpos, "srcpos");
-        return new Document("$set",
-                new Document("consumerOffsets." + pipelineId + ".sinkAckedSrcpos", srcpos));
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        String path = "consumerOffsets." + pipelineId + ".";
+        Document fields = new Document(path + "sinkAckedEpoch", position.order().epoch())
+                .append(path + "sinkAckedSeq", position.order().seq());
+        if (position.token() != null) {
+            fields.append(path + "sinkAckedSrcpos", position.token());
+        }
+        return new Document("$set", fields);
     }
 
     @Override
-    public void setCdcStartPosition(String miningChainId, String cdcStartPosition) {
+    public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
         Objects.requireNonNull(cdcStartPosition, "cdcStartPosition");
-        update(miningChainId, new Document("$set", new Document("cdcStartPosition", cdcStartPosition)));
+        if (snapshotEpoch < 0) {
+            throw new IllegalArgumentException("snapshotEpoch must not be negative, got " + snapshotEpoch);
+        }
+        // One update, both fields: a resumed snapshot reads them together, so a state where the seam
+        // position is stored without the generation it belongs to must not be reachable.
+        update(miningChainId, new Document("$set", new Document("cdcStartPosition", cdcStartPosition)
+                .append("snapshotEpoch", snapshotEpoch)));
+    }
+
+    @Override
+    public long openEpoch(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        // An atomic increment read back after the write: two members opening the same chain must take two
+        // different generations, so the counter is advanced by the store rather than read, added to and
+        // written back. It touches only epoch, leaving any pinned snapshot generation where it is.
+        Document updated = StoreIo.call(() -> collection.findOneAndUpdate(
+                new Document("_id", miningChainId),
+                new Document("$inc", new Document("epoch", 1L)),
+                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)));
+        if (updated == null) {
+            throw new IllegalStateException("srs meta mutate on an unseeded mining chain: " + miningChainId
+                    + " (create must seed it first)");
+        }
+        return readEpoch(updated, "epoch");
     }
 
     @Override
     public void appendSchemaVersion(String miningChainId, SchemaVersion version) {
         Objects.requireNonNull(version, "version");
         update(miningChainId, new Document("$push", new Document("schemaHistory", schemaToDocument(version))));
+    }
+
+    @Override
+    public void markSnapshotComplete(String miningChainId, String table) {
+        update(miningChainId, snapshotCompleteUpdate(table));
+    }
+
+    /**
+     * The update that marks one table's snapshot drained: an {@code $addToSet} on
+     * {@code snapshotCompletedTables}. A set add, not a push — the mark answers "has this table drained?",
+     * so re-marking a table (a replay, a re-run of the snapshot) must be a no-op rather than a duplicate
+     * entry.
+     */
+    static Document snapshotCompleteUpdate(String table) {
+        Objects.requireNonNull(table, "table");
+        return new Document("$addToSet", new Document("snapshotCompletedTables", table));
     }
 
     /**
@@ -170,7 +224,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // appended only when set, so a seed reads back as a seed rather than as corruption.
         Document document = new Document("_id", meta.miningChainId())
                 .append("consumerOffsets", consumers)
-                .append("schemaHistory", schemaHistory);
+                .append("schemaHistory", schemaHistory)
+                .append("snapshotCompletedTables", List.copyOf(meta.snapshotCompletedTables()));
         if (meta.sourceReadOffset() != null) {
             document.append("sourceReadOffset", meta.sourceReadOffset());
         }
@@ -180,7 +235,33 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         if (meta.retention() != null) {
             document.append("retention", meta.retention());
         }
+        // Zero means "no generation opened" and "no snapshot pinned", which is also what an absent field
+        // reads back as, so a seed stays a seed rather than carrying two fields that say nothing.
+        if (meta.epoch() != 0L) {
+            document.append("epoch", meta.epoch());
+        }
+        if (meta.snapshotEpoch() != 0L) {
+            document.append("snapshotEpoch", meta.snapshotEpoch());
+        }
         return document;
+    }
+
+    /**
+     * Reads one generation counter out of a stored document. Absent is zero rather than corruption: the
+     * meta field set is append-only and these fields are newer than the collection, so a document an older
+     * build wrote has no generation opened. A stored value of another type is corruption, surfaced as a
+     * coded io diagnostic rather than a bare cast failure.
+     */
+    private static long readEpoch(Document document, String field) {
+        Object raw = document.get(field);
+        if (raw == null) {
+            return 0L;
+        }
+        if (raw instanceof Number number) {
+            return number.longValue();
+        }
+        throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", String.valueOf(document.get("_id"))), null);
     }
 
     /** Reconstructs a meta record from its stored document. */
@@ -201,8 +282,19 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         for (Object entry : entries) {
             schemaHistory.add(schemaFromDocument(asDocument(entry, id), id));
         }
+        // Absent snapshotCompletedTables is not corruption, unlike the two structural fields above: the
+        // meta field set is append-only and this field is newer than the collection, so a document written
+        // by an older build simply has no table marked.
+        Object completedRaw = document.get("snapshotCompletedTables");
+        List<String> snapshotCompletedTables = new ArrayList<>();
+        if (completedRaw instanceof List<?> completedEntries) {
+            for (Object entry : completedEntries) {
+                snapshotCompletedTables.add(String.valueOf(entry));
+            }
+        }
         return new SrsMeta(id, document.getString("sourceReadOffset"), consumers,
-                document.getString("cdcStartPosition"), schemaHistory, document.getString("retention"));
+                document.getString("cdcStartPosition"), schemaHistory, document.getString("retention"),
+                snapshotCompletedTables, readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"));
     }
 
     /** Reconstructs one consumer cursor from its stored sub-document, keyed by the pipeline id. */
@@ -220,7 +312,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             // empty cursor rather than as corruption.
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId), null);
         }
-        return new ConsumerOffset(pipelineId, perTableSeq, document.getString("sinkAckedSrcpos"));
+        return new ConsumerOffset(pipelineId, perTableSeq, sinkAckedFrom(document));
     }
 
     /** Reconstructs one schema version from its stored sub-document. */
@@ -242,6 +334,23 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", miningChainId), null);
     }
 
+    /**
+     * The acked position a consumer document carries, or null when it has none. A record whose token was
+     * written without the order it sat at cannot be ranked against the reader's position, and reads back as
+     * nothing acked: that pins a source-read advance where it stands, which only ever costs re-mining
+     * changes already read - the direction that keeps them re-minable at all.
+     */
+    private static ChainPosition sinkAckedFrom(Document document) {
+        Object epoch = document.get("sinkAckedEpoch");
+        Object seq = document.get("sinkAckedSeq");
+        if (!(epoch instanceof Number) || !(seq instanceof Number)) {
+            return null;
+        }
+        return new ChainPosition(
+                new SourceOrder(((Number) epoch).longValue(), ((Number) seq).longValue()),
+                document.getString("sinkAckedSrcpos"));
+    }
+
     /** Maps one consumer cursor to its stored sub-document (the per-table read cursor plus the acked position). */
     private static Document consumerToDocument(ConsumerOffset offset) {
         Document perTable = new Document();
@@ -249,8 +358,12 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             perTable.append(entry.getKey(), entry.getValue());
         }
         Document document = new Document("perTableSeq", perTable);
-        if (offset.sinkAckedSrcpos() != null) {
-            document.append("sinkAckedSrcpos", offset.sinkAckedSrcpos());
+        if (offset.sinkAcked() != null) {
+            document.append("sinkAckedEpoch", offset.sinkAcked().order().epoch())
+                    .append("sinkAckedSeq", offset.sinkAcked().order().seq());
+            if (offset.sinkAcked().token() != null) {
+                document.append("sinkAckedSrcpos", offset.sinkAcked().token());
+            }
         }
         return document;
     }

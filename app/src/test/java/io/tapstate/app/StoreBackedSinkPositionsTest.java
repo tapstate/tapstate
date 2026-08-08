@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.entry;
 
@@ -32,7 +34,7 @@ class StoreBackedSinkPositionsTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         String chain = chainOf(source);
         store.meta().create(chain, null);
-        store.meta().advanceSinkAckedSrcpos(chain, PIPELINE, "w6");
+        store.meta().advanceSinkAcked(chain, PIPELINE, new ChainPosition(new SourceOrder(1, 6), "w6"));
 
         assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE))
                 .containsExactly(entry("orders", "w6"));
@@ -80,8 +82,8 @@ class StoreBackedSinkPositionsTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         String chain = chainOf(source);
         store.meta().create(chain, null);
-        store.meta().advanceSinkAckedSrcpos(chain, "other-pipe", "w9");
-        store.meta().advanceSinkAckedSrcpos(chain, PIPELINE, "w6");
+        store.meta().advanceSinkAcked(chain, "other-pipe", new ChainPosition(new SourceOrder(1, 9), "w9"));
+        store.meta().advanceSinkAcked(chain, PIPELINE, new ChainPosition(new SourceOrder(1, 6), "w6"));
 
         assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE))
                 .containsExactly(entry("orders", "w6"));
@@ -97,7 +99,7 @@ class StoreBackedSinkPositionsTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         String chain = chainOf(source);
         store.meta().create(chain, null);
-        store.meta().advanceSinkAckedSrcpos(chain, "other-pipe", "w9");
+        store.meta().advanceSinkAcked(chain, "other-pipe", new ChainPosition(new SourceOrder(1, 9), "w9"));
 
         assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE)).isEmpty();
     }
@@ -122,7 +124,7 @@ class StoreBackedSinkPositionsTest {
     private static void seedAck(InMemoryStorePort store, SourceResource source, String srcpos) {
         String chain = chainOf(source);
         store.meta().create(chain, null);
-        store.meta().advanceSinkAckedSrcpos(chain, PIPELINE, srcpos);
+        store.meta().advanceSinkAcked(chain, PIPELINE, new ChainPosition(new SourceOrder(1, 1), srcpos));
     }
 
     private static String chainOf(SourceResource source) {

@@ -60,7 +60,8 @@ public final class CaptureRunUnit {
      *   <li>a shared-ring tail provisions the mining chain first, seeding its meta — the precondition for
      *       recording the cdc-start position;</li>
      *   <li>the snapshot phase drains to the pass-through sink: on a shared-ring run it records the cdc-start
-     *       position at the seam, otherwise it is a pure drain with no chain to position;</li>
+     *       position at the seam and marks the table's snapshot complete once drained, otherwise it is a
+     *       pure drain with no chain to position or mark;</li>
      *   <li>a shared-ring tail then attaches the consumer, runs the cdc phase into the change ring, and
      *       exposes the Jet source; an srs-disabled tail instead streams straight to the pass-through sink.</li>
      * </ol>
@@ -73,20 +74,25 @@ public final class CaptureRunUnit {
         MiningChainId chainId = null;
         boolean merged = false;
         String table = null;
+        long epoch = 0;
         if (plan.sharedRing()) {
             // Fail fast before provisioning: a shared-ring run is single-table at L1, so a multi-table
             // config is rejected before any chain state is opened, not part way through.
             table = singleTable(spec.config());
             chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
-            merged = coordinator
-                    .provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention())
-                    .merged();
+            ProvisionOutcome provisioned = coordinator
+                    .provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            merged = provisioned.merged();
+            epoch = provisioned.epoch();
         }
 
         long snapshotCount = 0;
         if (plan.snapshot()) {
+            // A chainless read has no ring and so no generation to order its rows against: they carry no
+            // order at all, which a stateful node downstream rejects rather than guesses at.
             snapshotCount = chainId != null
-                    ? SnapshotPhase.run(port, spec.config(), chainId.value(), spec.cdcStart(), meta, passthrough)
+                    ? SnapshotPhase.run(port, spec.config(), chainId.value(), table, spec.cdcStart(), epoch,
+                            meta, passthrough)
                     : SnapshotPhase.drain(port, spec.config(), passthrough);
         }
 
@@ -99,8 +105,7 @@ public final class CaptureRunUnit {
             coordinator.attachConsumer(chainId, spec.pipelineId());
             String ringName = SrsRingbuffer.ringName(cid, tbl);
             SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ringName)));
-            CdcChain chain = new CdcChain(
-                    gate, meta, cid, spec.watermark(), spec.positionOrder(), spec.schemaVer());
+            CdcChain chain = new CdcChain(gate, meta, cid, spec.watermark(), epoch, spec.schemaVer());
             LongSupplier minConsumerReadSeq = () -> minConsumerReadSeq(meta, cid, tbl);
             Supplier<Collection<ConsumerOffset>> consumers =
                     () -> meta.read(cid).map(SrsMeta::consumerOffsets).orElse(List.of());

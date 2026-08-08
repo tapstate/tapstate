@@ -236,6 +236,9 @@ engine.job-failed:
 engine.no-such-job:
   message: "Pipeline {pipeline} has no running job to act on."
   solution: "Start the pipeline before pausing or resuming it, and check the id for typos."
+engine.frontier-order-not-encodable:
+  message: "Chain {chain} reached generation {epoch} position {seq}, past what the engine encodes an ordering value in."
+  solution: "Report this with the pipeline: the range is a build-time width, and no configuration widens it."
 monitor.no-observation:
   message: "No observation is available for pipeline {pipeline}."
   solution: "Check the pipeline id for typos; a freshly started pipeline may take a moment to publish its first observation."
@@ -272,3 +275,48 @@ transform.script-no-process:
 transform.script-output-invalid:
   message: "The js transform script produced output that is not a valid record: {detail}."
   solution: "Ensure process returns a record (or emits one) whose before, after and schema are objects or null."
+nest.sibling-embeds-target-different-parent-keys:
+  message: "The embeds under {embedPath} join on different parent fields: {fields}."
+  solution: "Have every embed under one parent join on the same parent field; that field is the parent's identity."
+nest.embed-path-conflict:
+  message: "Embeds {embedPathA} and {embedPathB} both target the path {path}."
+  solution: "Give each embed a path of its own, or one silently overwrites the other in the document."
+nest.root-key-required:
+  message: "The nest rooted at {rootAlias} declares no key."
+  solution: "Declare root.key: it is the identity children are grouped under, and the assembled document has none without it."
+nest.array-key-unresolvable:
+  message: "Embed {embedPath} declares no array key, and table {table} has no primary key to take one from."
+  solution: "Declare arrayKey on that embed; without an element identity, updates pile up as duplicates."
+nest.resolver-vertex-limit-exceeded:
+  message: "This nest compiles to {vertices} resolver vertices, past the limit of {limit}."
+  solution: "Flatten the tree or split the pipeline: every vertex takes a thread of its own."
+nest.chain-axis-limit-exceeded:
+  message: "This pipeline draws from {chains} chains, past the limit of {limit}."
+  solution: "Split the pipeline: each table it reads spends one of the axes a bound can travel on."
+nest.append-mode-conflicts-with-key-tracking:
+  message: "Root {rootAlias} is append-only, and embed {embedPath} tracks structural key changes."
+  solution: "Use an upsert root, or turn key tracking off: moving a subtree holds emissions back until it lands, which append-only forbids."
+nest.snapshot-passthrough-forbidden:
+  message: "A nest writing {rootCollection} cannot pass its snapshot reads straight to the sink."
+  solution: "Let the nest assemble snapshot reads like any other change; passing them through writes unassembled rows."
+nest.memory-budget-below-partition-count:
+  message: "A nest was asked to hold {entries} entries in memory, spread across {partitions} partitions."
+  solution: "Ask for at least as many entries as there are partitions: the budget is spent per partition, so anything smaller is rounded up to one entry each and holds the partition count whatever it was set to."
+nest.memory-budget-changed-while-running:
+  message: "Nest state {namespace} is already configured to hold {configured} entries in memory on this process, and this pipeline asks for {requested}."
+  solution: "Restart the process to pick up the new budget: what a state map holds is settled the first time that map is configured and cannot be changed while the process runs, so restarting the pipeline alone would leave it on the earlier number."
+nest.state-paths-changed:
+  message: "Nest {stepId} stored its state under {recorded}, and now compiles to {compiled}."
+  solution: "Stop the pipeline and start it again rather than resuming: renaming an embed path or inserting a level leaves the stored state where nothing reads it, and the new paths start empty beside documents that are not."
+nest.root-fanout-limit-exceeded:
+  message: "Document {rootKey} holds {elements} elements, past the per-document limit of {limit}."
+  solution: "Raise the limit if the data really is this wide, or narrow what the nest embeds."
+nest.migration-parking-limit-exceeded:
+  message: "Moving a subtree to document {newRootKey} parked {bytes} bytes, past the limit of {limit}."
+  solution: "Raise the parking limit, or make the structural change in smaller steps."
+nest.pending-protection-expired:
+  message: "An event of chain {chain} waiting in {bucket} since {order} was released after {maxAge}: {verdict}."
+  solution: "parent-absent is a dangling reference in the source and is normal; wall-clock-backstop means a slow parent may have been given up on, and is worth investigating."
+nest.key-change-tracking-requires-before-image:
+  message: "Stream {alias} tracks structural key changes, but source table {table} provides no before image."
+  solution: "Configure the source to emit full row images, or turn key tracking off for that stream."

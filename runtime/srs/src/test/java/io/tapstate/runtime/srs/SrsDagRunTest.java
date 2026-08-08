@@ -10,6 +10,7 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Job;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.model.FromClause;
@@ -178,7 +179,7 @@ class SrsDagRunTest {
         SupplierEx<SinkWriter> intoSink = () -> new CapturingSinkWriter(sinkName);
         return new DagBindings(
                 sourceId -> SrsSourceProcessor.metaSupplier(
-                        ringName, src, StartFrom.earliest(), SrsReadCursorPublisherFactory.NONE),
+                        ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE),
                 step -> transformPort,
                 syncElement -> intoSink,
                 ref -> Map.of(
@@ -233,9 +234,15 @@ class SrsDagRunTest {
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             Queue<String> queue = collected(name);
             for (Envelope record : records) {
-                queue.add(record.src() + "|" + record.srcPos() + "|" + record.after().get("id"));
+                queue.add(record.src() + "|" + token(record) + "|" + record.after().get("id"));
             }
             return CompletableFuture.completedFuture(new WriteResult(records.size()));
+        }
+
+        /** The connector token of the spot this record sits at on its own stream, or null where it sits nowhere. */
+        private static String token(Envelope record) {
+            ChainPosition at = record.position();
+            return at == null ? null : at.token();
         }
 
         @Override

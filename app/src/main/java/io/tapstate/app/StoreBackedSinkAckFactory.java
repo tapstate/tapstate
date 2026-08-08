@@ -1,9 +1,11 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.util.Map;
 
@@ -20,6 +22,11 @@ import java.util.Map;
  * {@code (miningChainId, pipelineId, srcpos)}. A member with no store bound resolves to a no-op ack, so a
  * sink still runs before the assembly layer makes the member SRS-capable. A stream the map does not carry
  * is a builder-side wiring defect (the sink saw a chain the pipeline never sourced) and crashes bare.
+ *
+ * <p>A position that carries no token is a snapshot row, and what is persisted for it is the chain's cdc
+ * start position: the read has confirmed rows of a snapshot but no change at all, so a resume belongs
+ * where changes begin. Resolving it here rather than at the sink is what keeps the durable store out of
+ * the engine — the sink says which position it reached, this says what that spells on disk.
  */
 final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
@@ -37,15 +44,29 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     public SinkAck resolve(HazelcastInstance member) {
         Object bound = member.getUserContext().get(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY);
         if (!(bound instanceof SrsMetaStore meta)) {
-            return (chain, srcpos) -> { };
+            return (chain, position) -> { };
         }
-        return (chain, srcpos) -> {
+        return (chain, position) -> {
             String miningChainId = chainIdByTable.get(chain);
             if (miningChainId == null) {
                 throw new IllegalStateException(
                         "sink acked a chain the pipeline never sourced: '" + chain + "'");
             }
-            meta.advanceSinkAckedSrcpos(miningChainId, pipelineId, srcpos);
+            String token = position.token() != null ? position.token() : cdcStart(meta, miningChainId);
+            meta.advanceSinkAcked(miningChainId, pipelineId, new ChainPosition(position.order(), token));
         };
+    }
+
+    /**
+     * Where changes begin on {@code miningChainId}, for a frontier that has only reached snapshot rows. The
+     * capture writes it before it drains a snapshot, so a snapshot row reaching a sink without one means the
+     * chain was never seeded — the same caller-ordering defect as acking an unseeded chain, and it crashes
+     * bare rather than writing an absent position over a real one.
+     */
+    private static String cdcStart(SrsMetaStore meta, String miningChainId) {
+        return meta.read(miningChainId)
+                .map(SrsMeta::cdcStartPosition)
+                .orElseThrow(() -> new IllegalStateException("sink acked snapshot rows of mining chain '"
+                        + miningChainId + "', which has no meta record to resume from"));
     }
 }

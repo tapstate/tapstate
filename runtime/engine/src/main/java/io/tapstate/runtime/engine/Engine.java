@@ -6,16 +6,28 @@ import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.config.ProcessingGuarantee;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
+import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.NestStateReading;
+import io.tapstate.runtime.engine.nest.NestMemoryBudget;
+import io.tapstate.runtime.engine.nest.NestSettings;
+import io.tapstate.runtime.engine.nest.NestStateMetricNames;
+import io.tapstate.spi.store.KeyedStateStore;
+import java.time.Duration;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * The data-plane execution engine: the lifecycle actuator that maps a pipeline's lifecycle to Jet
@@ -32,8 +44,20 @@ public final class Engine {
 
     private final HazelcastInstance member;
 
+    /**
+     * The layer behind the nest state maps, asked how much a namespace holds altogether. Absent on a run
+     * that keeps its state in memory alone, where what is in memory is all there is.
+     */
+    private final KeyedStateStore nestState;
+
     public Engine(HazelcastInstance member) {
+        this(member, null);
+    }
+
+    /** An engine that can also say how much of a nest's state is on the layer behind its memory. */
+    public Engine(HazelcastInstance member, KeyedStateStore nestState) {
         this.member = Objects.requireNonNull(member, "member");
+        this.nestState = nestState;
     }
 
     /**
@@ -48,6 +72,22 @@ public final class Engine {
      * never set, which is a no-op.
      */
     public void submit(String pipelineId, DAG dag) {
+        submit(pipelineId, dag, Set.of(), NestSettings.defaults());
+    }
+
+    /**
+     * As above, first holding {@code stateNamespaces} to what {@code settings} asks them to keep in memory.
+     *
+     * <p>Before the job and not after: a state map is created the first moment a vertex asks for it, and
+     * what a map holds is fixed as it is created. Applied afterwards the numbers would be accepted, change
+     * nothing, and report nothing - the run would sit on the process-wide figure while its own artifact
+     * named another.
+     *
+     * <p>A submission naming no namespaces configures none, which is what a pipeline with no nest in it
+     * does.
+     */
+    public void submit(String pipelineId, DAG dag, Set<String> stateNamespaces, NestSettings settings) {
+        NestMemoryBudget.applyTo(member, stateNamespaces, settings);
         JobFailureRegistry.of(member).clear(pipelineId);
         JobConfig config = new JobConfig()
                 .setName(pipelineId)
@@ -87,6 +127,38 @@ public final class Engine {
             job.cancel();
         }
         JobFailureRegistry.of(member).clear(pipelineId);
+    }
+
+    /**
+     * Waits for the pipeline's job to be over, up to {@code budget}: true once it is, false if the budget
+     * ran out with the job still running. A pipeline with no job has nothing to wait for and is over by
+     * definition.
+     *
+     * <p>A cancel only asks. The job goes on running while it winds down, and a processor writing state
+     * as it closes writes it after the cancel has returned - so anything that lets go of what the job was
+     * writing to has to wait here first, or it lets go of it while the job is still filling it back in.
+     * How the job ended does not matter to the caller: cancelled, failed and completed are equally over.
+     *
+     * <p>The budget is what keeps a stuck job from holding up the caller indefinitely, and a false answer
+     * is a real answer rather than a failure - the caller is expected to have a way of finishing later
+     * what it could not safely do now.
+     */
+    public boolean awaitTerminal(String pipelineId, Duration budget) {
+        Job job = member.getJet().getJob(pipelineId);
+        if (job == null) {
+            return true;
+        }
+        try {
+            job.getFuture().toCompletableFuture().get(budget.toMillis(), TimeUnit.MILLISECONDS);
+            return true;
+        } catch (CancellationException | ExecutionException over) {
+            return true;
+        } catch (TimeoutException stillRunning) {
+            return false;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     /**
@@ -141,6 +213,88 @@ public final class Engine {
                 .mapToLong(Measurement::value)
                 .sum();
         return OptionalLong.of(reached);
+    }
+
+    /**
+     * How far each chain of the pipeline's live job trails the bound combined for it, keyed by chain;
+     * empty when it has no live job and for a job whose sinks have no such distance to report.
+     *
+     * <p>A chain reported by more than one sink is kept at its widest reading. Two sinks fed the same
+     * chain are two frontiers over it, and the pipeline has only got as far as whichever is furthest
+     * behind; combining them any other way reports a pipeline healthier than any sink in it really is.
+     *
+     * <p>Like the record count this reads the job's last collected statistics, so a freshly submitted job
+     * reports nothing until the first collection. Absence here is "not measured", never "measured at
+     * zero" - the two call for opposite responses, and a zero standing in for an unwired reading is the
+     * frontier-lag alarm's blind spot rather than its quiet state.
+     */
+    public Map<String, Long> frontierGaps(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            return Map.of();
+        }
+        JobMetrics collected = job.getMetrics();
+        Map<String, Long> widest = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            String chain = JetFrontierGauge.chainOf(metric);
+            if (chain == null) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                widest.merge(chain, measurement.value(), Math::max);
+            }
+        }
+        return widest;
+    }
+
+    /**
+     * What each namespace of the pipeline's nest state looks like right now, keyed by namespace; empty
+     * when it has no live job and for a job whose nests report nothing.
+     *
+     * <p>Every processor instance of one vertex reads the same shared counters and the same map, so they
+     * all report the same numbers and a namespace is kept at its highest reading rather than summed - a sum
+     * would multiply every count by however many instances the vertex happened to run as.
+     *
+     * <p>Like the record count this reads the job's last collected statistics, so a freshly submitted job
+     * reports nothing until the first collection. A namespace that reports nothing is absent rather than
+     * present at zero: "not measured" and "measured empty" call for opposite responses, and a state layer
+     * that stopped reporting would otherwise read as one that had emptied.
+     */
+    public Map<String, NestStateReading> nestStateReadings(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            return Map.of();
+        }
+        JobMetrics collected = job.getMetrics();
+        Map<String, Map<String, Long>> byNamespace = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            NestStateMetricNames.Reading reading = NestStateMetricNames.readingOf(metric);
+            if (reading == null) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                byNamespace.computeIfAbsent(reading.namespace(), ignored -> new HashMap<>())
+                        .merge(reading.kind(), measurement.value(), Math::max);
+            }
+        }
+        Map<String, NestStateReading> readings = new HashMap<>();
+        byNamespace.forEach((namespace, kinds) -> readings.put(namespace, new NestStateReading(
+                kinds.getOrDefault(NestStateMetricNames.ENTRIES, 0L),
+                kinds.getOrDefault(NestStateMetricNames.ACCESSES, 0L),
+                kinds.getOrDefault(NestStateMetricNames.BACKFILLS, 0L),
+                kinds.getOrDefault(NestStateMetricNames.BACKFILL_MILLIS, 0L),
+                stored(namespace))));
+        return readings;
+    }
+
+    /**
+     * How much the layer behind the memory holds for {@code namespace}, asked here rather than published
+     * from the run: it is a question about a namespace as a whole, so its cost is what the namespace holds
+     * rather than what an event touched, and asking it as state is written would put that cost on every
+     * write. Here it is paid once per namespace by whoever is reporting.
+     */
+    private OptionalLong stored(String namespace) {
+        return nestState == null ? OptionalLong.empty() : OptionalLong.of(nestState.count(namespace));
     }
 
     /** Whether a measurement belongs to a serve-sink vertex, which the builder names by that prefix. */

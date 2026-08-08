@@ -368,7 +368,7 @@ class CanonicalWriterTest {
                                             "policy", FromRef.literal("POLICIES"),
                                             "claim", FromRef.literal("CLAIMS"))),
                                     new TransformBody.Nest(null, null,
-                                            new NestRoot("customer", List.of("customer_id"), null,
+                                            new NestRoot("customer", List.of("customer_id"), null, null,
                                                     List.of(new Embed("policy",
                                                             Map.of("CUST_ID", "customer_id"),
                                                             EmbedAs.ARRAY, "policies",

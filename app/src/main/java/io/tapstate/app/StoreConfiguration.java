@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -55,5 +56,17 @@ class StoreConfiguration {
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
     SrsMetaStore srsMetaStore(StorePort storePort) {
         return storePort.meta();
+    }
+
+    /**
+     * The cold layer the embedded member puts behind every nest state map: written through as a key is
+     * handled, read back per key when a key that is no longer in memory is asked for. Gated with the
+     * store, and the gate is what it means: a run without one keeps nest state in the member alone, so a
+     * restart rebuilds it by re-reading the sources rather than resuming.
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    KeyedStateStore nestStateStore(StorePort storePort) {
+        return storePort.keyedState();
     }
 }

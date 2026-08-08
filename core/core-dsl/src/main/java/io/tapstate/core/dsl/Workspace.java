@@ -27,7 +27,8 @@ public final class Workspace {
     /**
      * Builds a workspace from already-parsed resources: rejects duplicate top-level ids
      * (F8: kind resources and pipelines share one namespace and must be unique), then validates
-     * batch reference closure ({@link ReferenceClosure}). Returns only fully-valid batches; the
+     * batch reference closure ({@link ReferenceClosure}) and the alias references a nest body makes
+     * back into its step's wiring ({@link NestAliasRules}). Returns only fully-valid batches; the
      * first violation throws a {@link DslException}.
      */
     public static Workspace of(List<Resource> resources) {
@@ -39,6 +40,8 @@ public final class Workspace {
             }
         }
         ReferenceClosure.validate(byId.values());
+        NestAliasRules.validate(byId.values());
+        NestCapacityRules.validate(byId.values());
         ModeRules.validate(byId.values());
         return new Workspace(byId);
     }

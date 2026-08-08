@@ -1,8 +1,8 @@
 package io.tapstate.runtime.srs;
 
 import java.util.Objects;
-import java.util.function.Consumer;
 import java.util.function.LongConsumer;
+import java.util.function.ObjLongConsumer;
 
 /**
  * One consumer's reader over a per-table change ring. It tails the ring from a run-local cursor,
@@ -86,18 +86,22 @@ public final class SrsRingReader {
     }
 
     /**
-     * Drains up to {@code max} changes from the cursor to the ring tail, passing each to {@code out} and
-     * advancing the cursor past it, and returns how many were emitted. Bounded by {@code max} and by the
-     * tail, so it respects the downstream's pull and returns promptly when the ring holds nothing new.
-     * When it emits at least one change it reports the last sequence it read to the progress sink; an
-     * empty fill advanced nothing and reports nothing.
+     * Drains up to {@code max} changes from the cursor to the ring tail, passing each to {@code out} with
+     * the sequence the ring assigned it and advancing the cursor past it, and returns how many were
+     * emitted. Bounded by {@code max} and by the tail, so it respects the downstream's pull and returns
+     * promptly when the ring holds nothing new. When it emits at least one change it reports the last
+     * sequence it read to the progress sink; an empty fill advanced nothing and reports nothing.
+     *
+     * <p>The sequence is handed over rather than left behind because the ring keeps it and the item does
+     * not carry it, and it is the only monotonic order over a chain the engine has. A caller projecting
+     * into the event currency needs it there; one that does not simply ignores it.
      */
-    public int fill(Consumer<SrsItem> out, int max) {
+    public int fill(ObjLongConsumer<SrsItem> out, int max) {
         Objects.requireNonNull(out, "out");
         long tail = ring.tailSequence();
         int emitted = 0;
         while (cursor <= tail && emitted < max) {
-            out.accept(ring.readOne(cursor));
+            out.accept(ring.readOne(cursor), cursor);
             cursor++;
             emitted++;
         }

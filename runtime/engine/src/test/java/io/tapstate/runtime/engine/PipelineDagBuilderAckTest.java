@@ -7,7 +7,6 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
-import com.hazelcast.function.ComparatorEx;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
@@ -20,7 +19,9 @@ import com.hazelcast.jet.core.test.TestProcessorMetaSupplierContext;
 import com.hazelcast.jet.core.test.TestProcessorSupplierContext;
 import com.hazelcast.jet.core.processor.Processors;
 import com.hazelcast.function.FunctionEx;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
@@ -40,7 +41,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * Proves the builder wires the ack-bearing sink when a {@link SinkAckBinding} is given: the serve sink
+ * Proves the builder wires the ack-bearing sink when a {@link SinkAckFactory} is given: the serve sink
  * vertex it builds carries the ack factory, so once resolved on a member it advances the watermark. The
  * ack path itself (the lag-by-one prefix) is covered by SinkProcessorTest; this proves the seam from the
  * builder through to a firing ack, which the no-ack overload does not wire.
@@ -48,10 +49,6 @@ import org.junit.jupiter.api.Test;
 class PipelineDagBuilderAckTest {
 
     private static final String ACK_KEY = "test.sink.ack";
-
-    /** The connector position order, faked here as the integer suffix of a token. */
-    private static final ComparatorEx<String> BY_SUFFIX =
-            (a, b) -> Integer.compare(suffix(a), suffix(b));
 
     private static int suffix(String token) {
         return Integer.parseInt(token.replaceAll("\\D+", ""));
@@ -83,8 +80,7 @@ class PipelineDagBuilderAckTest {
     void builds_an_ack_bearing_serve_sink_that_advances_the_watermark() throws Exception {
         RecordingAck ack = new RecordingAck();
         member.getUserContext().put(ACK_KEY, ack);
-        SinkAckBinding sinkAck =
-                new SinkAckBinding(m -> (SinkAck) m.getUserContext().get(ACK_KEY), BY_SUFFIX);
+        SinkAckFactory sinkAck = m -> (SinkAck) m.getUserContext().get(ACK_KEY);
 
         PipelineResource pipeline = new PipelineResource(
                 "p", null, List.of("orders_src"), null, null,
@@ -145,15 +141,17 @@ class PipelineDagBuilderAckTest {
     }
 
     private static Envelope at(String src, String pos) {
-        return Envelope.insert(1L, src, Map.of("id", pos), null).withSrcPos(pos);
+        return Envelope.insert(1L, src, Map.of("id", pos), null)
+                .withSrcPos(pos)
+                .withOrder(new SourceOrder(1, Integer.parseInt(pos.replaceAll("\\D+", ""))));
     }
 
     private static final class RecordingAck implements SinkAck {
         private final List<String> calls = new ArrayList<>();
 
         @Override
-        public void advance(String chain, String srcpos) {
-            calls.add(chain + "=" + srcpos);
+        public void advance(String chain, ChainPosition position) {
+            calls.add(chain + "=" + position.token());
         }
     }
 

@@ -59,7 +59,7 @@ public final class SrsRingSource {
                     return SrsRingReader.from(ring, start, publisherFactory.resolve(ctx.hazelcastInstance()));
                 })
                 .fillBufferFn((SrsRingReader reader, SourceBuilder.SourceBuffer<SrsItem> buffer) ->
-                        reader.fill(buffer::add, FILL_BATCH))
+                        reader.fill((item, seq) -> buffer.add(item), FILL_BATCH))
                 .build();
     }
 }

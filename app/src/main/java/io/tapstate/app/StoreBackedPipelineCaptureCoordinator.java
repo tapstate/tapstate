@@ -7,6 +7,7 @@ import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
@@ -18,10 +19,12 @@ import io.tapstate.core.lifecycle.TableSnapshot;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -146,15 +149,20 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (runs == null) {
             return;
         }
+        // Close first: stops every capture daemon so no thread leaks. Then release this pipeline's consumer
+        // membership and tear the source chain down -- a shared-ring run only; a run that opened no chain has
+        // nothing to release.
+        Set<MiningChainId> chains = new LinkedHashSet<>();
         for (CaptureRun run : runs) {
-            // Close first: stops the capture daemon so no thread leaks. Then release this pipeline's consumer
-            // membership and tear the source chain down -- a shared-ring run only; a run that opened no chain
-            // has nothing to release.
             run.close();
-            run.chainId().ifPresent(chainId -> {
-                srsCoordinator.detachConsumer(chainId, pipelineId);
-                srsCoordinator.teardownSource(chainId);
-            });
+            run.chainId().ifPresent(chains::add);
+        }
+        // Once per chain, never once per run. Two sources reading one connection are one chain with a ring
+        // per table, which is what a pipeline over a parent and a child table is; releasing it per run would
+        // have the second source release a chain the first already closed, and the release refuses that.
+        for (MiningChainId chainId : chains) {
+            srsCoordinator.detachConsumer(chainId, pipelineId);
+            srsCoordinator.teardownSource(chainId);
         }
     }
 
@@ -181,8 +189,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 MOCK_CDC_START,
                 retention,
                 MOCK_SCHEMA_VER,
-                monotonicWatermark(),
-                MockPositionOrder.INSTANCE);
+                monotonicWatermark());
     }
 
     @Override

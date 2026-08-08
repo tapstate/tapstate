@@ -86,13 +86,13 @@ final class TransformBodyPrompter {
     /**
      * A nest tree: the root parent alias and upsert key, then a (possibly nested) list of embedded
      * children. Aliases name the use-site {@code from:} map and stay abstract in a definition (X19);
-     * the second tier (root.mode / order / ignoreUpdates / trackJoinKeyChanges) is authored by hand.
+     * the second tier (root.mode / order / ignoreUpdates / trackKeyChanges) is authored by hand.
      */
     private TransformBody askNest() {
         String from = prompter.ask("Nest root: parent stream alias", null);
         List<String> key = askKeyList("Root upsert key (comma-separated, blank for none)");
         List<Embed> embed = askEmbeds();
-        return new TransformBody.Nest(null, null, new NestRoot(from, key, null, embed));
+        return new TransformBody.Nest(null, null, new NestRoot(from, key, null, null, embed));
     }
 
     /** Zero or more embedded children, each of which may carry its own nested children (recursive). */

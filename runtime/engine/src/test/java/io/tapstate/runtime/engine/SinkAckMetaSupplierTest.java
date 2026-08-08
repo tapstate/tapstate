@@ -8,7 +8,6 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
-import com.hazelcast.function.ComparatorEx;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
@@ -18,7 +17,9 @@ import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import com.hazelcast.jet.core.test.TestProcessorMetaSupplierContext;
 import com.hazelcast.jet.core.test.TestProcessorSupplierContext;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
@@ -41,13 +42,6 @@ class SinkAckMetaSupplierTest {
 
     private static final String ACK_KEY = "test.sink.ack";
 
-    /** The connector position order, faked here as the integer suffix of a token. */
-    private static final ComparatorEx<String> BY_SUFFIX =
-            (a, b) -> Integer.compare(suffix(a), suffix(b));
-
-    private static int suffix(String token) {
-        return Integer.parseInt(token.replaceAll("\\D+", ""));
-    }
 
     private HazelcastInstance member;
 
@@ -80,7 +74,7 @@ class SinkAckMetaSupplierTest {
         SinkAckFactory factory = m -> (SinkAck) m.getUserContext().get(ACK_KEY);
 
         ProcessorMetaSupplier meta =
-                SinkProcessor.metaSupplier(() -> new RecordingWriter(), factory, BY_SUFFIX);
+                SinkProcessor.metaSupplier(() -> new RecordingWriter(), factory, ContiguousPrefix::new);
         SinkProcessor sink = resolveOnMember(meta);
         sink.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext());
 
@@ -95,18 +89,18 @@ class SinkAckMetaSupplierTest {
     @Test
     void pins_the_ack_sink_vertex_to_a_single_instance_across_the_cluster() throws Exception {
         ProcessorMetaSupplier meta = SinkProcessor.metaSupplier(
-                () -> new RecordingWriter(), member -> (chain, srcpos) -> { }, BY_SUFFIX);
+                () -> new RecordingWriter(), member -> (chain, position) -> { }, ContiguousPrefix::new);
 
         assertThat(TotalParallelismOne.pins(meta, 3)).isTrue();
     }
 
     @Test
-    void rejects_a_null_factory_or_position_order() {
+    void rejects_a_null_factory_or_frontier() {
         assertThatThrownBy(() -> SinkProcessor.metaSupplier(
-                () -> new RecordingWriter(), null, BY_SUFFIX))
+                () -> new RecordingWriter(), null, ContiguousPrefix::new))
                 .isInstanceOf(NullPointerException.class);
         assertThatThrownBy(() -> SinkProcessor.metaSupplier(
-                () -> new RecordingWriter(), member -> (chain, srcpos) -> { }, null))
+                () -> new RecordingWriter(), member -> (chain, position) -> { }, null))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -139,18 +133,20 @@ class SinkAckMetaSupplierTest {
         throw new AssertionError("sink did not complete");
     }
 
-    /** An event on chain {@code src} carrying source position {@code pos}. */
+    /** An event on chain {@code src} at source position {@code pos}, ordered by that token's suffix. */
     private static Envelope at(String src, String pos) {
-        return Envelope.insert(1L, src, Map.of("id", pos), null).withSrcPos(pos);
+        return Envelope.insert(1L, src, Map.of("id", pos), null)
+                .withSrcPos(pos)
+                .withOrder(new SourceOrder(1, Integer.parseInt(pos.replaceAll("\\D+", ""))));
     }
 
-    /** Records every {@code advance(chain, srcpos)} call as {@code "chain=srcpos"}, in order. */
+    /** Records every {@code advance(chain, position)} call as {@code "chain=token"}, in order. */
     private static final class RecordingAck implements SinkAck {
         private final List<String> calls = new ArrayList<>();
 
         @Override
-        public void advance(String chain, String srcpos) {
-            calls.add(chain + "=" + srcpos);
+        public void advance(String chain, ChainPosition position) {
+            calls.add(chain + "=" + position.token());
         }
     }
 

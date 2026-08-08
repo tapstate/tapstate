@@ -45,4 +45,10 @@ public interface StorePort {
 
     /** The SRS meta store: one durable offset / consumer-cursor / schema record per mining chain. */
     SrsMetaStore meta();
+
+    /**
+     * The cold layer under a stateful operator: one opaque state document per key, within a namespace.
+     * Read and written on the data path as keys are handled, never enumerated.
+     */
+    KeyedStateStore keyedState();
 }

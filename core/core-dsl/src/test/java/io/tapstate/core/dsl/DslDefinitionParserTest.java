@@ -201,6 +201,44 @@ class DslDefinitionParserTest {
     }
 
     @Test
+    void nestTracksStructuralKeyChangesAtTheRootAndAtEachEmbed() {
+        // One switch per declaring level covers every structural key that level owns — the column
+        // giving an element its identity in the array, the column saying which parent it hangs
+        // under, and the column its own children point at. The root carries its own switch because
+        // the root key is the identity the whole document is filed under and nothing above the root
+        // declares it.
+        String yaml = """
+                version: tapstate/v1
+                kind: transform
+                id: c360_shape
+                type: nest
+                root:
+                  from: customer
+                  key: [customer_id]
+                  trackKeyChanges: true
+                  embed:
+                    - from: policy
+                      on:
+                        CUST_ID: customer_id
+                      as: array
+                      path: policies
+                      arrayKey: [POLICY_ID]
+                      trackKeyChanges: true
+                """;
+
+        TransformResource t = (TransformResource) parser.parse(yaml);
+
+        TransformBody.Nest nest = (TransformBody.Nest) t.body();
+        assertThat(nest.root().trackKeyChanges()).isTrue();
+        assertThat(nest.root().embed().get(0).trackKeyChanges()).isTrue();
+        // Re-parsing the canonical output is what discriminates the writer: a writer that drops
+        // either switch still yields a stable fixed point, so comparing text to text would pass.
+        TransformBody.Nest again = (TransformBody.Nest) ((TransformResource) parser.parse(writer.write(t))).body();
+        assertThat(again.root().trackKeyChanges()).isTrue();
+        assertThat(again.root().embed().get(0).trackKeyChanges()).isTrue();
+    }
+
+    @Test
     void parsesJoinDefinition_multilineSqlAndAbstractTables() {
         // A standalone join body's SQL names table aliases (c / o) bound at the use site; the definition
         // is pure logic with no from: wiring (X19).

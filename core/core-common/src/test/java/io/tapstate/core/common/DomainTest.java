@@ -18,7 +18,7 @@ class DomainTest {
                 .containsExactlyInAnyOrder(
                         "dsl", "cli", "core", "catalog", "schema", "lifecycle", "role", "boot",
                         "actuation", "store", "connector", "transform", "io", "control",
-                        "engine", "monitor", "source", "mcp", "capture");
+                        "engine", "monitor", "source", "mcp", "capture", "nest");
     }
 
     @Test

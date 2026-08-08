@@ -222,6 +222,24 @@ final class ControlPlane {
     }
 
     /**
+     * The pipeline's node-local log as the product serves it, or the refusal body when there is none.
+     *
+     * <p>A diagnostic read, never an assertion: it is what a pipeline that reports itself healthy while
+     * moving nothing has left to say. Every answer is handed back verbatim, refusals included, because a
+     * diagnosis that throws while diagnosing tells the reader less than the refusal would have.
+     */
+    String logs(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/logs"));
+        return response.statusCode() + " " + response.body();
+    }
+
+    /** The published metrics body verbatim, for the same diagnostic use and on the same terms as {@link #logs}. */
+    String metrics(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        return response.statusCode() + " " + response.body();
+    }
+
+    /**
      * The canonical code of the published failure, or empty when the pipeline has published none — it is
      * healthy, or no convergence pass has reached it yet.
      *

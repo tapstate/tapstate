@@ -7,8 +7,10 @@ import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.ringbuffer.Ringbuffer;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -28,7 +30,6 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -57,7 +58,8 @@ class CdcPhaseTest {
     private static HazelcastInstance hz;
 
     /** Orders the mock positions {@code w1 < w2 < w3 < ...} by their numeric suffix; a source position is never ordered lexically. */
-    private static final Comparator<String> NUMERIC_ORDER = Comparator.comparingInt(p -> Integer.parseInt(p.substring(1)));
+    /** The generation the ring under test is running under; every order on it carries this first. */
+    private static final long RING_GENERATION = 1L;
 
     @BeforeAll
     static void startMember() {
@@ -118,7 +120,7 @@ class CdcPhaseTest {
     void projectsEachCdcChangeToTheRingInOrder() throws Exception {
         Ringbuffer<SrsItem> ring = hz.getRingbuffer("srs.chain.order");
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(ring));
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), NUMERIC_ORDER, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(
                 Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
                 Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 1, "n", 9), Map.of()),
@@ -146,8 +148,8 @@ class CdcPhaseTest {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.offset")));
         RecordingMeta meta = new RecordingMeta();
         // One consumer has durably acked its sink up to w2; the persisted read offset must never pass it.
-        List<ConsumerOffset> consumers = List.of(new ConsumerOffset("p1", Map.of("orders", 9L), "w2"));
-        CdcChain chain = new CdcChain(gate, meta, "chain", monotonicWatermark(), NUMERIC_ORDER, 0L);
+        List<ConsumerOffset> consumers = List.of(new ConsumerOffset("p1", Map.of("orders", 9L), new ChainPosition(new SourceOrder(RING_GENERATION, 1), "w2")));
+        CdcChain chain = new CdcChain(gate, meta, "chain", monotonicWatermark(), RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(
                 Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
                 Envelope.insert(2, "orders", Map.of("id", 2), Map.of()),
@@ -172,7 +174,7 @@ class CdcPhaseTest {
         // seq 0 on the next -- modeling the source read pausing until a consumer frees a slot.
         AtomicLong polls = new AtomicLong();
         LongSupplier minRead = () -> polls.getAndIncrement() == 0 ? -1L : 0L;
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), NUMERIC_ORDER, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
         CdcPhase.run(port, config(), chain, minRead, List::of, new CaptureHealth());
@@ -195,7 +197,7 @@ class CdcPhaseTest {
         // The slowest consumer reads nothing until the test frees a slot: the write stays backpressured.
         AtomicBoolean freed = new AtomicBoolean(false);
         LongSupplier minRead = () -> freed.get() ? 0L : -1L;
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), NUMERIC_ORDER, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
         Thread writer = new Thread(() -> CdcPhase.run(port, config(), chain, minRead, List::of, new CaptureHealth()), "cdc-writer");
@@ -221,7 +223,7 @@ class CdcPhaseTest {
     @Test
     void stopsTheStreamThroughTheReturnedSubscription() {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.sub")));
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), NUMERIC_ORDER, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of());
 
         Subscription sub = CdcPhase.run(port, config(), chain, () -> Long.MAX_VALUE, List::of, new CaptureHealth());
@@ -234,7 +236,7 @@ class CdcPhaseTest {
     @Test
     void rejectsIncompleteWiringBeforeStartingTheStream() {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.guard")));
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), NUMERIC_ORDER, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
 
         assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, null, List::of, new CaptureHealth()))
@@ -249,7 +251,7 @@ class CdcPhaseTest {
         CaptureHealth health = new CaptureHealth();
         RuntimeException boom = new RuntimeException("stream boom");
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.fail")));
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), NUMERIC_ORDER, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
 
         CdcPhase.run(FakeCdcPort.failing(boom), config(), chain, () -> Long.MAX_VALUE, List::of, health);
 
@@ -338,12 +340,22 @@ class CdcPhaseTest {
         }
 
         @Override
-        public void advanceSinkAckedSrcpos(String miningChainId, String pipelineId, String srcpos) {
+        public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public void setCdcStartPosition(String miningChainId, String cdcStartPosition) {
+        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public long openEpoch(String miningChainId) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void markSnapshotComplete(String miningChainId, String table) {
             throw new UnsupportedOperationException();
         }
 

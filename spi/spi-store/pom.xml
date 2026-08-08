@@ -35,6 +35,12 @@
       <artifactId>core-catalog</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The position pair a durable frontier persists and ranks by (rule R2: core only). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-event</artifactId>
+      <version>${revision}</version>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>

@@ -1,5 +1,7 @@
 package io.tapstate.spi.store;
 
+import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.event.ChainPosition;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
@@ -12,7 +14,7 @@ class ConsumerOffsetTest {
 
     @Test
     void holdsThePipelineCursorAndAckedPosition() {
-        ConsumerOffset offset = new ConsumerOffset("orders-pipeline", Map.of("orders", 42L, "items", 7L), "gtid:aaa-1:100");
+        ConsumerOffset offset = new ConsumerOffset("orders-pipeline", Map.of("orders", 42L, "items", 7L), new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100"));
         assertThat(offset.pipelineId()).isEqualTo("orders-pipeline");
         assertThat(offset.perTableSeq()).containsEntry("orders", 42L).containsEntry("items", 7L);
         assertThat(offset.sinkAckedSrcpos()).isEqualTo("gtid:aaa-1:100");

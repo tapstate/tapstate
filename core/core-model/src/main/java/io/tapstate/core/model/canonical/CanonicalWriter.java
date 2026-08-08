@@ -223,6 +223,8 @@ public final class CanonicalWriter {
                 if (n.order() != null) {
                     b.scalar("order", n.order().yaml());
                 }
+                b.scalar("entries_in_memory", n.entriesInMemory());
+                b.scalar("max_elements_per_document", n.maxElementsPerDocument());
                 b.put("root", nestRoot(n.root()));
             }
             case TransformBody.Join j -> {
@@ -250,6 +252,7 @@ public final class CanonicalWriter {
         b.scalar("from", root.from());
         b.scalarSeq("key", root.key());
         b.scalar("mode", root.mode());
+        b.scalar("trackKeyChanges", root.trackKeyChanges());
         b.put("embed", embeds(root.embed()));
         return b.build();
     }
@@ -267,7 +270,7 @@ public final class CanonicalWriter {
             b.scalar("path", e.path());
             b.scalarSeq("arrayKey", e.arrayKey());
             b.scalar("ignoreUpdates", e.ignoreUpdates());
-            b.scalar("trackJoinKeyChanges", e.trackJoinKeyChanges());
+            b.scalar("trackKeyChanges", e.trackKeyChanges());
             if (e.embed() != null) {
                 b.put("embed", embeds(e.embed()));
             }

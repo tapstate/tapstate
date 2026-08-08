@@ -44,6 +44,15 @@
       <version>${revision}</version>
     </dependency>
 
+    <!-- The cold layer under a stateful operator's state maps: an entry per key within a namespace,
+         with no way to enumerate one. A pure spi contract; which database stands behind it is the
+         assembly root's choice and no driver type reaches the engine (rule R4: core + spi only). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>spi-store</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
     <!-- The execution substrate: the member and the Jet engine ship in this one artifact (rule R4:
          Hazelcast is the one allowed substrate for the runtime ring); the actuator submits / suspends /
          resumes / cancels Jet jobs on it. Version managed by the bom. -->

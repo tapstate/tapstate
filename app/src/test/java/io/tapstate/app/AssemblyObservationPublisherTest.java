@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.entry;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -46,7 +48,7 @@ class AssemblyObservationPublisherTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         String chain = SourceCaptureResolution.of(source).chainId().value();
         store.meta().create(chain, null);
-        store.meta().advanceSinkAckedSrcpos(chain, PIPELINE, "w7");
+        store.meta().advanceSinkAcked(chain, PIPELINE, new ChainPosition(new SourceOrder(1, 7), "w7"));
         store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
 
         // An engine whose member reports no live job, so recordCount resolves absent.
@@ -68,5 +70,26 @@ class AssemblyObservationPublisherTest {
                 .as("recordCount is absent with no live job (present-only); errorCount stays present at 0")
                 .containsEntry("errorCount", 0L)
                 .doesNotContainKey("recordCount");
+    }
+
+    @Test
+    void projectsTheFrontierReadingsTheEnginePortReports() {
+        InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
+        store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
+
+        // The engine stands in for a live run here; that a real run publishes these is witnessed against a
+        // real nest job. What is pinned is that the factory binds the port at all - a publisher built
+        // without it goes on projecting every other statistic, and the one reading that tells a stalled
+        // frontier's two causes apart is simply never there to be missed.
+        Engine engine = mock(Engine.class);
+        when(engine.frontierGaps(PIPELINE)).thenReturn(Map.of(TABLE, 480L));
+        ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
+                .observationPublisher(store, engine, new NoOpCaptureCoordinator());
+
+        publisher.publish(PIPELINE);
+
+        assertThat(store.observations().read(PIPELINE).orElseThrow().metrics())
+                .as("the factory binds the frontier port and the publisher names each reading by its chain")
+                .containsEntry("frontierGap." + TABLE, 480L);
     }
 }

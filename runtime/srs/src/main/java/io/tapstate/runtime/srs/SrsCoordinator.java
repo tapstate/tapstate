@@ -48,9 +48,15 @@ public final class SrsCoordinator {
 
     /**
      * Opens the chain for a cdc source, bound to the source run-unit. The first source to reach a chain
-     * seeds its durable meta (carrying the pass-through retention); a later same-chain source is force-merged
-     * — no reseed, it just joins and unions its {@code streams}. Returns whether the chain was already open
-     * (a merge) and the chain's table set after this source.
+     * seeds its durable meta (carrying the pass-through retention) and opens a ring generation; a later
+     * same-chain source is force-merged — no reseed, no new generation, it just joins and unions its
+     * {@code streams}. Returns whether the chain was already open (a merge), the chain's table set after
+     * this source, and the generation it now reads under.
+     *
+     * <p>Opening the chain is what establishes the ring, so it is where a generation is taken: a restart
+     * or a re-mine arrives here with no chain state and takes a new one, while a source merging onto a
+     * running chain reads under the generation already in flight. Taking one per source instead would make
+     * two sources of one chain order their changes against each other by which arrived first.
      */
     public synchronized ProvisionOutcome provisionSource(
             String sourceId, MiningChainId chainId, List<String> streams, String retention) {
@@ -60,13 +66,19 @@ public final class SrsCoordinator {
         ChainState state = chains.get(chainId.value());
         boolean merged = state != null;
         if (state == null) {
-            meta.create(chainId.value(), retention);
-            state = new ChainState(chainId);
+            // Seed only a chain that has none. The durable record outlives this process, so after a restart
+            // the chain is opened again with its record already there; seeding is insert-only precisely so
+            // an accumulated offset / cursor / schema truth is never discarded, and skipping the seed is how
+            // that is honoured. Opening still happens either way -- a rebuilt ring is a new generation.
+            if (meta.read(chainId.value()).isEmpty()) {
+                meta.create(chainId.value(), retention);
+            }
+            state = new ChainState(chainId, meta.openEpoch(chainId.value()));
             chains.put(chainId.value(), state);
         }
         state.sources.add(sourceId);
         state.tables.addAll(streams);
-        return new ProvisionOutcome(chainId, merged, List.copyOf(state.tables));
+        return new ProvisionOutcome(chainId, merged, List.copyOf(state.tables), state.epoch);
     }
 
     /** Whether the chain has been opened by a source. */
@@ -145,15 +157,21 @@ public final class SrsCoordinator {
         return state;
     }
 
-    /** One mining chain's single-node coordination state: its member sources, unioned tables, and consumers. */
+    /**
+     * One mining chain's single-node coordination state: its member sources, unioned tables, consumers, and
+     * the ring generation opened when the chain was. The generation is held here so every source that
+     * merges onto the chain reads under the one already running rather than taking its own.
+     */
     private static final class ChainState {
         private final MiningChainId chainId;
+        private final long epoch;
         private final Set<String> sources = new LinkedHashSet<>();
         private final Set<String> tables = new LinkedHashSet<>();
         private final Set<String> consumers = new LinkedHashSet<>();
 
-        ChainState(MiningChainId chainId) {
+        ChainState(MiningChainId chainId, long epoch) {
             this.chainId = chainId;
+            this.epoch = epoch;
         }
     }
 }

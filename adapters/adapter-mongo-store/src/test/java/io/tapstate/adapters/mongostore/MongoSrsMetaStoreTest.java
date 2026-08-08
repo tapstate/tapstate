@@ -1,5 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
 import com.mongodb.ServerAddress;
@@ -37,13 +39,14 @@ class MongoSrsMetaStoreTest {
                 "orders@mysql-1",
                 "gtid:aaa-1:900",
                 List.of(
-                        new ConsumerOffset("p1", Map.of("orders", 42L), "gtid:aaa-1:100"),
+                        new ConsumerOffset("p1", Map.of("orders", 42L), new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100")),
                         new ConsumerOffset("p2", new LinkedHashMap<>(Map.of("orders", 7L, "items", 3L)), null)),
                 "binlog.000042:1024",
                 List.of(
                         new SchemaVersion(0, Map.of("id", "int"), 0),
                         new SchemaVersion(1, new LinkedHashMap<>(Map.of("id", "int", "name", "string")), 12)),
-                "7d");
+                "7d",
+                List.of("orders"));
 
         Document document = MongoSrsMetaStore.toDocument(meta);
 
@@ -53,7 +56,33 @@ class MongoSrsMetaStoreTest {
         assertThat(document.getString("retention")).isEqualTo("7d");
         // consumer cursors keyed by pipeline id, so a per-consumer set targets one path
         assertThat(document.get("consumerOffsets", Document.class)).containsOnlyKeys("p1", "p2");
+        // snapshot completion is per table: this chain has drained orders but not items
+        assertThat(document.getList("snapshotCompletedTables", String.class)).containsExactly("orders");
         assertThat(MongoSrsMetaStore.toMeta(document)).isEqualTo(meta);
+    }
+
+    @Test
+    void snapshotCompleteAddsToSetSoARepeatedMarkDoesNotDuplicateTheTable() {
+        Document update = MongoSrsMetaStore.snapshotCompleteUpdate("orders");
+
+        // $addToSet, not $push: a re-run of a table's snapshot (a restart mid-backfill, a replay) marks the
+        // same table again, and the mark is a set membership question -- "has this table drained?" -- so a
+        // second mark must be a no-op rather than a second entry.
+        assertThat(update).isEqualTo(new Document("$addToSet", new Document("snapshotCompletedTables", "orders")));
+    }
+
+    @Test
+    void toMetaOnADocumentWrittenBeforeSnapshotCompletionExistedReadsBackAsNoTableCompleted() {
+        // The meta field set is append-only and a newer reader must stay compatible with a document written
+        // before the field existed. Absence is not corruption here: it reads as "no table has been marked",
+        // which is exactly what a chain snapshotted by an older build had recorded.
+        Document old = new Document("_id", "chain")
+                .append("consumerOffsets", new Document())
+                .append("schemaHistory", List.of());
+
+        SrsMeta meta = MongoSrsMetaStore.toMeta(old);
+
+        assertThat(meta.snapshotCompletedTables()).isEmpty();
     }
 
     @Test
@@ -116,25 +145,30 @@ class MongoSrsMetaStoreTest {
     }
 
     @Test
-    void sinkAckedSrcposUpdateTargetsOnlyThatConsumersAckPathNotThePerTableCursor() {
-        // The sink's ack advance is a path-scoped $set: it touches only
-        // consumerOffsets.<pipelineId>.sinkAckedSrcpos, so a sink advancing its acked position never clobbers
-        // the per-table read cursor the reader writes to the same consumer document -- the two are
-        // independent writers on one consumer record.
-        Document update = MongoSrsMetaStore.sinkAckedSrcposUpdate("p1", "gtid:aaa-1:99");
+    void sinkAckedUpdateTargetsOnlyThatConsumersAckPathNotThePerTableCursor() {
+        // The sink's ack advance is a path-scoped $set: it touches only that consumer's acked position, so a
+        // sink advancing it never clobbers the per-table read cursor the reader writes to the same consumer
+        // document -- the two are independent writers on one consumer record. Both halves of the position
+        // move in the one update: a stored token whose order was left behind can no longer be ranked, and an
+        // order with no token is nothing a read resumes from.
+        Document update = MongoSrsMetaStore.sinkAckedUpdate("p1", new ChainPosition(new SourceOrder(1, 99), "gtid:aaa-1:99"));
 
-        assertThat(update.get("$set", Document.class))
-                .containsExactly(Map.entry("consumerOffsets.p1.sinkAckedSrcpos", "gtid:aaa-1:99"));
+        assertThat(update.get("$set", Document.class)).containsOnly(
+                Map.entry("consumerOffsets.p1.sinkAckedEpoch", 1L),
+                Map.entry("consumerOffsets.p1.sinkAckedSeq", 99L),
+                Map.entry("consumerOffsets.p1.sinkAckedSrcpos", "gtid:aaa-1:99"));
     }
 
     @Test
     void aConsumerWithOnlyASinkAckedPositionAndNoReadCursorReadsBackWithAnEmptyCursor() {
         // The sink and the reader are independent writers of one consumer; the sink may create the consumer
         // entry (a sink-ack-only $set) before the reader publishes any per-table cursor. Such a consumer
-        // carries a sinkAckedSrcpos and no perTableSeq sub-document, and must read back as an empty cursor --
-        // not as corruption -- mirroring how an absent sinkAckedSrcpos reads back as null.
+        // carries the acked position and no perTableSeq sub-document, and must read back as an empty cursor
+        // -- not as corruption -- mirroring how an absent acked position reads back as null.
         Document doc = new Document("_id", "chain")
-                .append("consumerOffsets", new Document("p1", new Document("sinkAckedSrcpos", "gtid:aaa-1:99")))
+                .append("consumerOffsets", new Document("p1", new Document("sinkAckedSrcpos", "gtid:aaa-1:99")
+                        .append("sinkAckedEpoch", 1L)
+                        .append("sinkAckedSeq", 99L)))
                 .append("schemaHistory", List.of());
 
         SrsMeta meta = MongoSrsMetaStore.toMeta(doc);
@@ -143,6 +177,21 @@ class MongoSrsMetaStoreTest {
         ConsumerOffset p1 = meta.consumerOffsets().get(0);
         assertThat(p1.pipelineId()).isEqualTo("p1");
         assertThat(p1.perTableSeq()).isEmpty();
-        assertThat(p1.sinkAckedSrcpos()).isEqualTo("gtid:aaa-1:99");
+        assertThat(p1.sinkAcked()).isEqualTo(new ChainPosition(new SourceOrder(1, 99), "gtid:aaa-1:99"));
+    }
+
+    @Test
+    void aStoredTokenWithNoOrderBesideItReadsBackAsNothingAcked() {
+        // A token on its own cannot be ranked against the reader's position, and ranking is the whole use a
+        // source-read advance has for it. Reading it as an ack would put an unrankable value into that
+        // comparison; reading it as nothing acked pins the advance where it stands, which costs re-mining
+        // changes already read and keeps every unacked one re-minable.
+        Document doc = new Document("_id", "chain")
+                .append("consumerOffsets", new Document("p1", new Document("sinkAckedSrcpos", "gtid:aaa-1:99")))
+                .append("schemaHistory", List.of());
+
+        SrsMeta meta = MongoSrsMetaStore.toMeta(doc);
+
+        assertThat(meta.consumerOffsets().get(0).sinkAcked()).isNull();
     }
 }

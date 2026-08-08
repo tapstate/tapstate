@@ -4,8 +4,8 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Root of a nest tree (ADR-0016 §5.1): parent stream alias, upsert key, optional
- * append-only mode, and the embedded children.
+ * Root of a nest tree: parent stream alias, upsert key, optional append-only mode, and the
+ * embedded children.
  */
 @Doc("Root of a nest tree: the parent stream, its upsert key, write mode, and the embedded child streams.")
 public record NestRoot(
@@ -15,6 +15,11 @@ public record NestRoot(
         List<String> key,
         @Doc("Write mode for the parent stream, such as append-only or upsert.")
         String mode,
+        @Doc(value = "When true, changes to the root key are tracked so the whole document is moved "
+                + "to its new identity. The root declares its own because nothing above it does. "
+                + "Requires the source to supply a before image.",
+                key = "trackKeyChanges")
+        Boolean trackKeyChanges,
         @Doc("Child streams embedded under each parent document.")
         List<Embed> embed) {
 

@@ -69,6 +69,7 @@ class StoreBackedDagSourceTargetModelTest {
                 new ServeBlock.Inline(null, FromRef.literal("orders_src"),
                         List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)), null, null),
                 null, null));
+        OpenRingGenerations.forSources(store, "orders_src");
         return store;
     }
 

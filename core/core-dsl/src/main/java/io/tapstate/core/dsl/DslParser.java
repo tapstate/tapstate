@@ -83,9 +83,10 @@ public final class DslParser {
     private static final Set<String> TABLE_SPEC_KEYS = Set.of("name", "filter", "pk", "options");
     private static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", "options", "experimental");
     private static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", "options");
-    private static final Set<String> NEST_ROOT_KEYS = Set.of("from", "key", "mode", "embed");
+    private static final Set<String> NEST_ROOT_KEYS =
+            Set.of("from", "key", "mode", "trackKeyChanges", "embed");
     private static final Set<String> EMBED_KEYS = Set.of(
-            "from", "on", "as", "path", "arrayKey", "ignoreUpdates", "trackJoinKeyChanges", "embed");
+            "from", "on", "as", "path", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
     private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", "primary_key", "storage", "schema");
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> STORAGE_KEYS = Set.of("hot", "warm", "cold");
@@ -275,7 +276,8 @@ public final class DslParser {
             case "map" -> Set.of("fields");
             case "filter" -> Set.of("expr");
             case "union" -> Set.of();
-            case "nest" -> Set.of("primary_key", "order", "root");
+            case "nest" -> Set.of(
+                    "primary_key", "order", "entries_in_memory", "max_elements_per_document", "root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
         };
@@ -294,6 +296,8 @@ public final class DslParser {
             case "nest" -> new TransformBody.Nest(
                     s.string("primary_key"),
                     enumByYaml(NestOrder.values(), NestOrder::yaml, s, "order"),
+                    positiveIntValue(s, "entries_in_memory"),
+                    positiveIntValue(s, "max_elements_per_document"),
                     nestRoot(s.mapping("root")));
             case "join" -> new TransformBody.Join(s.string("engine"), s.string("sql"));
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
@@ -330,7 +334,12 @@ public final class DslParser {
 
     private NestRoot nestRoot(YamlMap r) {
         r.requireOnly(NEST_ROOT_KEYS);
-        return new NestRoot(r.string("from"), scalarList(r.seq("key"), "key"), r.string("mode"), embeds(r.seq("embed")));
+        return new NestRoot(
+                r.string("from"),
+                scalarList(r.seq("key"), "key"),
+                r.string("mode"),
+                boolValue(r, "trackKeyChanges"),
+                embeds(r.seq("embed")));
     }
 
     private List<Embed> embeds(List<Node> items) {
@@ -348,7 +357,7 @@ public final class DslParser {
                     e.string("path"),
                     scalarList(e.seq("arrayKey"), "arrayKey"),
                     boolValue(e, "ignoreUpdates"),
-                    boolValue(e, "trackJoinKeyChanges"),
+                    boolValue(e, "trackKeyChanges"),
                     embeds(e.seq("embed"))));
         }
         return out;
@@ -710,6 +719,20 @@ public final class DslParser {
             throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", l, "expected", "a 32-bit integer"));
         }
         return num.intValue();
+    }
+
+    /**
+     * As {@link #intValue}, and refused at zero and below. A capacity of none is not a small capacity:
+     * it admits nothing at all, so it fails every run rather than some, and the author is told where the
+     * number was written rather than where it is later enforced.
+     */
+    private static Integer positiveIntValue(YamlMap m, String key) {
+        Integer value = intValue(m, key);
+        if (value != null && value <= 0) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE,
+                    Map.of("value", value, "expected", "a count above zero"));
+        }
+        return value;
     }
 
     private static Boolean boolValue(YamlMap m, String key) {

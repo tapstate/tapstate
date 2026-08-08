@@ -83,10 +83,26 @@ public sealed interface TransformBody {
             String primaryKey,
             @Doc("Ordering applied to nested child records.")
             NestOrder order,
+            @Doc(value = "How many entries each of this nest's levels keeps in memory; what is beyond it "
+                    + "is kept on the layer behind them and read back as it is asked for. A count of "
+                    + "entries, not of bytes. Absent leaves the number the deployment was started with.",
+                    key = "entries_in_memory")
+            Integer entriesInMemory,
+            @Doc(value = "How many embedded elements one document of this nest may hold before the run "
+                    + "is failed. Per document rather than per nest: a document is assembled whole, so "
+                    + "no layer behind the memory can absorb one that outgrows it. Absent leaves the "
+                    + "number the deployment was started with.",
+                    key = "max_elements_per_document")
+            Integer maxElementsPerDocument,
             @Doc(value = "The root stream whose documents receive the nested children.", required = true)
             NestRoot root) implements TransformBody {
         public Nest {
             Objects.requireNonNull(root, "root");
+        }
+
+        /** A nest that writes down no capacity of its own, and so runs on whatever the deployment set. */
+        public Nest(String primaryKey, NestOrder order, NestRoot root) {
+            this(primaryKey, order, null, null, root);
         }
 
         @Override

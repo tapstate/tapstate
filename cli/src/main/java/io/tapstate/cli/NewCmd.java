@@ -267,7 +267,7 @@ final class NewCmd implements Callable<Integer> {
             case "filter" -> new TransformBody.Filter("op != 'd'");
             case "js" -> new TransformBody.Js("emit(after)\n");
             case "map" -> new TransformBody.MapProjection(Map.of("id", FieldRule.rename("id")));
-            case "nest" -> new TransformBody.Nest(null, null, new NestRoot("main", null, null, null));
+            case "nest" -> new TransformBody.Nest(null, null, new NestRoot("main", null, null, null, null));
             case "join" -> new TransformBody.Join("duckdb", "SELECT * FROM a\n");
             default -> throw new IllegalStateException("unhandled transform type: " + type);
         };
