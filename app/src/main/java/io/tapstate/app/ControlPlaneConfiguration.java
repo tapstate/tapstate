@@ -18,7 +18,6 @@ import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.AuditGate;
-import io.tapstate.control.core.AuditedSourceService;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
@@ -40,8 +39,8 @@ import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
-import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.SessionService;
+import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -508,20 +507,13 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SourceService sourceService(
-            ConnectorCatalogView connectorCatalogView, ArtifactStore artifactStore,
-            SourceRepresentation representation, ObjectProvider<DataBrowserFollows> follows) {
-        // Resolved through a provider rather than injected directly: the streaming face is
-        // servlet-only, and a control plane assembled without one still deletes sources -- it
-        // simply has no follows to stop. Asked for at call time so it cannot depend on which
-        // configuration Spring happens to process first.
-        return new SourceService(connectorCatalogView::merged, artifactStore, representation,
-                follows.getIfAvailable(() -> DataBrowserFollows.NONE));
-    }
-
-    @Bean
-    AuditedSourceService auditedSourceService(SourceService sourceService, AuditGate auditGate) {
-        return new AuditedSourceService(sourceService, auditGate);
+    SourceProjectionService sourceProjectionService(
+            ApplyService applyService,
+            ArtifactQueryService artifactQueryService,
+            ArtifactMutationService artifactMutationService,
+            SourceRepresentation representation) {
+        return new SourceProjectionService(
+                applyService, artifactQueryService, artifactMutationService, representation);
     }
 
     /**

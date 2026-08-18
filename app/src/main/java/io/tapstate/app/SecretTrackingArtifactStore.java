@@ -8,8 +8,10 @@ import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StoredArtifactRecord;
+import io.tapstate.spi.store.ArtifactWrite;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -75,6 +77,15 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         ArtifactMutation result = delegate.delete(id, expectedContentHash);
         if (result == ArtifactMutation.DELETED) {
             redactor.remove(id);
+        }
+        return result;
+    }
+
+    @Override
+    public synchronized ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
+        ArtifactBatchWrite result = delegate.writeAll(writes);
+        if (result.appliedSuccessfully()) {
+            writes.forEach(write -> track(write.resource()));
         }
         return result;
     }

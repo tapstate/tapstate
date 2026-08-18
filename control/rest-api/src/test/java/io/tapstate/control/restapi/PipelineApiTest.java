@@ -32,7 +32,6 @@ import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.Scope;
-import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -372,8 +371,7 @@ class PipelineApiTest {
      */
     @SpringBootConfiguration
     @EnableAutoConfiguration
-    @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
-            AuditedSourceServiceTestConfiguration.class})
+    @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class})
     static class TestApp {
 
         @Bean

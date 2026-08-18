@@ -41,6 +41,17 @@ public final class ArtifactQueryService {
         return store.listStored().stream().map(this::view).toList();
     }
 
+    /** Returns one typed stored resource and its canonical hash without parsing canonical text. */
+    public Optional<StoredResource> getResource(String id) {
+        Objects.requireNonNull(id, "id");
+        return store.get(id).map(this::typedView);
+    }
+
+    /** Lists typed stored resources and their canonical hashes without exposing canonical text. */
+    public List<StoredResource> listResources() {
+        return store.list().stream().map(this::typedView).toList();
+    }
+
     /**
      * Lists stored artifacts of the given {@code kind} as their canonical form; a null or blank kind is
      * "no filter" and returns every artifact, the same as {@link #list()}. Read-by-kind lives here in
@@ -67,5 +78,10 @@ public final class ArtifactQueryService {
     private ArtifactListEntry view(StoredArtifactRecord row) {
         return new ArtifactListEntry(
                 row.id(), row.kind(), row.canonicalForm(), row.contentHash(), row.readable());
+    }
+
+    private StoredResource typedView(Resource resource) {
+        String canonicalForm = writer.write(resource);
+        return new StoredResource(resource, CanonicalHash.of(canonicalForm));
     }
 }

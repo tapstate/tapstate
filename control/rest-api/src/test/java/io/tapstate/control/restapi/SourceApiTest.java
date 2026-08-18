@@ -3,13 +3,15 @@ package io.tapstate.control.restapi;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import io.tapstate.control.core.AuditGate;
-import io.tapstate.control.core.AuditedSourceService;
+import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.ArtifactMutationService;
+import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.Scope;
-import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -25,6 +27,7 @@ import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
+import io.tapstate.spi.store.SchemaStore;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -201,6 +204,34 @@ class SourceApiTest {
     }
 
     @Test
+    void concurrentCreatesOfTheSameIdAllowExactlyOneWinner() throws Exception {
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try (ExecutorService callers = Executors.newFixedThreadPool(2)) {
+            Future<RaceResult> alpha = callers.submit(
+                    () -> createAtBarrier("alpha", ready, start));
+            Future<RaceResult> beta = callers.submit(
+                    () -> createAtBarrier("beta", ready, start));
+            ready.await();
+            start.countDown();
+
+            List<RaceResult> outcomes = List.of(alpha.get(), beta.get());
+            assertThat(outcomes).extracting(RaceResult::status)
+                    .containsExactlyInAnyOrder(HttpStatus.CREATED, HttpStatus.CONFLICT);
+            assertThat(outcomes).filteredOn(result -> result.status() == HttpStatus.CONFLICT)
+                    .singleElement().extracting(RaceResult::code).isEqualTo("source.already-exists");
+            String winner = outcomes.stream()
+                    .filter(result -> result.status() == HttpStatus.CREATED)
+                    .findFirst().orElseThrow().description();
+            String stored = request("reader").get().uri("/api/sources/orders")
+                    .retrieve().body(String.class);
+            assertThat(JSON.readTree(stored).path("metadata").path("description").asText())
+                    .isEqualTo(winner);
+        }
+    }
+
+    @Test
     void mapsDomainConflictsAndRejectsResponseOnlyOrUnknownRequestFields() {
         ResponseEntity<String> created = create("orders", "before");
         assertError(request("writer").post().uri("/api/sources")
@@ -324,6 +355,26 @@ class SourceApiTest {
                 });
     }
 
+    private RaceResult createAtBarrier(
+            String description, CountDownLatch ready, CountDownLatch start) throws Exception {
+        ready.countDown();
+        start.await();
+        return request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(sourceJson("orders", description))
+                .exchange((req, res) -> {
+                    HttpStatus status = HttpStatus.valueOf(res.getStatusCode().value());
+                    if (status == HttpStatus.CREATED) {
+                        String body = res.bodyTo(String.class);
+                        String storedDescription = JSON.readTree(body)
+                                .path("metadata").path("description").asText();
+                        return new RaceResult(status, null, storedDescription);
+                    }
+                    ApiError error = res.bodyTo(ApiError.class);
+                    return new RaceResult(status, error.code(), null);
+                });
+    }
+
     private ResponseEntity<String> create(String id, String description) {
         return request("writer").post().uri("/api/sources")
                 .contentType(MediaType.APPLICATION_JSON).body(sourceJson(id, description))
@@ -375,7 +426,7 @@ class SourceApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class,
-            SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
+            SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             SourceController.class,
             SourceDraftController.class,
             ApiExceptionHandler.class})
@@ -383,8 +434,20 @@ class SourceApiTest {
         @Bean InMemoryArtifactStore artifactStore() { return new InMemoryArtifactStore(); }
         @Bean RecordingAuditStore auditStore() { return new RecordingAuditStore(); }
         @Bean Clock clock() { return Clock.fixed(Instant.parse("2026-07-13T00:00:00Z"), ZoneOffset.UTC); }
-        @Bean AuditedSourceService auditedSourceService(SourceService source, AuditStore audits, Clock clock) {
-            return new AuditedSourceService(source, new AuditGate(audits, clock));
+        @Bean AuditGate auditGate(AuditStore auditStore, Clock clock) {
+            return new AuditGate(auditStore, clock);
+        }
+        @Bean ApplyService applyService(ArtifactStore store, AuditGate auditGate) {
+            return new ApplyService(TapstateCatalog::load, store, auditGate, new EmptySchemaStore(),
+                    PlanAdvisories.none());
+        }
+        @Bean ArtifactQueryService artifactQueryService(ArtifactStore store) {
+            return new ArtifactQueryService(store);
+        }
+        @Bean ArtifactMutationService artifactMutationService(ArtifactStore store, AuditGate auditGate) {
+            return new ArtifactMutationService(
+                    store, NoReclaimStores.desired(), NoReclaimStores.state(),
+                    NoReclaimStores.observations(), NoReclaimStores.srsMeta(), auditGate);
         }
         @Bean OperationRegistry operationRegistry() { return ControlOperations.registry(); }
         @Bean TokenStore tokenStore() { return new EmptyTokenStore(); }
