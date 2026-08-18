@@ -10,6 +10,8 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
@@ -21,6 +23,10 @@ import org.testcontainers.utility.DockerImageName;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -164,6 +170,102 @@ class MongoArtifactStoreIT {
 
             assertThat(store.delete("orders", newHash)).isEqualTo(ArtifactMutation.DELETED);
             assertThat(store.delete("orders", newHash)).isEqualTo(ArtifactMutation.NOT_FOUND);
+        });
+    }
+
+    @Test
+    void conditionalBatchWritesKeepCreateAndReplaceConditionsAtomic() {
+        withStore((store, collection) -> {
+            Resource source = PARSER.parse(ORDERS);
+            Resource changed = PARSER.parse(ORDERS.replace("localhost", "replica"));
+            Resource stale = PARSER.parse(ORDERS.replace("localhost", "stale-writer"));
+            CountDownLatch ready = new CountDownLatch(2);
+            CountDownLatch start = new CountDownLatch(1);
+
+            try (ExecutorService callers = Executors.newFixedThreadPool(2)) {
+                Future<ArtifactBatchWrite> alpha = callers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return store.writeAll(List.of(ArtifactWrite.createOnly(source)));
+                });
+                Future<ArtifactBatchWrite> beta = callers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return store.writeAll(List.of(ArtifactWrite.createOnly(source)));
+                });
+                ready.await();
+                start.countDown();
+
+                List<ArtifactBatchWrite> outcomes = List.of(alpha.get(), beta.get());
+                assertThat(outcomes).filteredOn(ArtifactBatchWrite::appliedSuccessfully).hasSize(1);
+                assertThat(outcomes).filteredOn(outcome -> !outcome.appliedSuccessfully())
+                        .singleElement().extracting(ArtifactBatchWrite::refusal)
+                        .isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            } catch (Exception error) {
+                throw new AssertionError("concurrent create test failed", error);
+            }
+
+            String hash = collection.find(new Document("_id", "orders")).first().getString("contentHash");
+            assertThat(store.writeAll(List.of(ArtifactWrite.replaceOnly(changed, hash))))
+                    .isEqualTo(ArtifactBatchWrite.applied());
+            String canonicalAfterReplace = collection.find(new Document("_id", "orders"))
+                    .first().getString("canonical");
+
+            ArtifactBatchWrite staleOutcome = store.writeAll(List.of(ArtifactWrite.replaceOnly(stale, hash)));
+            assertThat(staleOutcome.refusedId()).isEqualTo("orders");
+            assertThat(staleOutcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
+                    .isEqualTo(canonicalAfterReplace);
+        });
+    }
+
+    @Test
+    void concurrentReplacementWithTheSameVersionHasOneWinnerAndLeavesItsCanonicalBytesStored() {
+        withStore((store, collection) -> {
+            Resource original = PARSER.parse(ORDERS);
+            Resource alphaReplacement = PARSER.parse(ORDERS.replace("localhost", "alpha"));
+            Resource betaReplacement = PARSER.parse(ORDERS.replace("localhost", "beta"));
+            assertThat(store.writeAll(List.of(ArtifactWrite.createOnly(original))))
+                    .isEqualTo(ArtifactBatchWrite.applied());
+            String declared = collection.find(new Document("_id", "orders")).first().getString("contentHash");
+
+            CountDownLatch ready = new CountDownLatch(2);
+            CountDownLatch start = new CountDownLatch(1);
+            try (ExecutorService callers = Executors.newFixedThreadPool(2)) {
+                Future<ArtifactBatchWrite> alpha = callers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return store.writeAll(List.of(ArtifactWrite.replaceOnly(alphaReplacement, declared)));
+                });
+                Future<ArtifactBatchWrite> beta = callers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return store.writeAll(List.of(ArtifactWrite.replaceOnly(betaReplacement, declared)));
+                });
+                ready.await();
+                start.countDown();
+
+                ArtifactBatchWrite alphaOutcome = alpha.get();
+                ArtifactBatchWrite betaOutcome = beta.get();
+                assertThat(List.of(alphaOutcome, betaOutcome))
+                        .filteredOn(ArtifactBatchWrite::appliedSuccessfully)
+                        .hasSize(1);
+                assertThat(List.of(alphaOutcome, betaOutcome))
+                        .filteredOn(outcome -> !outcome.appliedSuccessfully())
+                        .singleElement()
+                        .satisfies(outcome -> {
+                            assertThat(outcome.refusedId()).isEqualTo("orders");
+                            assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+                        });
+
+                String expectedCanonical = alphaOutcome.appliedSuccessfully()
+                        ? WRITER.write(alphaReplacement)
+                        : WRITER.write(betaReplacement);
+                assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
+                        .isEqualTo(expectedCanonical);
+            } catch (Exception error) {
+                throw new AssertionError("concurrent replace test failed", error);
+            }
         });
     }
 

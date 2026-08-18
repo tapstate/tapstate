@@ -35,9 +35,20 @@ public final class ArtifactQueryService {
         return store.get(id).map(this::view);
     }
 
+    /** Returns one typed stored resource and its canonical hash without parsing canonical text. */
+    public Optional<StoredResource> getResource(String id) {
+        Objects.requireNonNull(id, "id");
+        return store.get(id).map(this::typedView);
+    }
+
     /** Lists every stored artifact as its canonical form. */
     public List<StoredArtifact> list() {
         return store.list().stream().map(this::view).toList();
+    }
+
+    /** Lists typed stored resources and their canonical hashes without exposing canonical text. */
+    public List<StoredResource> listResources() {
+        return store.list().stream().map(this::typedView).toList();
     }
 
     /**
@@ -58,5 +69,10 @@ public final class ArtifactQueryService {
         String canonicalForm = writer.write(resource);
         return new StoredArtifact(
                 resource.id(), resource.kind(), canonicalForm, CanonicalHash.of(canonicalForm));
+    }
+
+    private StoredResource typedView(Resource resource) {
+        String canonicalForm = writer.write(resource);
+        return new StoredResource(resource, CanonicalHash.of(canonicalForm));
     }
 }

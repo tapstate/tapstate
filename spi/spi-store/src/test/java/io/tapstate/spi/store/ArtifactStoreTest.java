@@ -104,6 +104,29 @@ class ArtifactStoreTest {
         assertThat(store.saveAll(List.of(source("localhost")), Map.of())).isEmpty();
     }
 
+    @Test
+    void defaultWriteAllPreservesLegacyUpsertAndSingleReplaceSemantics() {
+        LegacySingleWriteStore store = new LegacySingleWriteStore();
+        Resource original = source("localhost");
+        Resource replacement = source("replica");
+        store.seed(original);
+
+        assertThat(store.writeAll(List.of(ArtifactWrite.upsert(replacement))))
+                .isEqualTo(ArtifactBatchWrite.applied());
+        assertThat(store.saveAllCalls).isEqualTo(1);
+        assertThat(store.storedCanonical("orders")).isEqualTo(WRITER.write(replacement));
+
+        ArtifactBatchWrite stale = store.writeAll(List.of(ArtifactWrite.replaceOnly(
+                original, hash(original))));
+        assertThat(stale.refusedId()).isEqualTo("orders");
+        assertThat(stale.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+
+        ArtifactBatchWrite missing = store.writeAll(List.of(ArtifactWrite.replaceOnly(
+                source("missing", "replica"), hash(original))));
+        assertThat(missing.refusedId()).isEqualTo("missing");
+        assertThat(missing.refusal()).isEqualTo(ArtifactMutation.NOT_FOUND);
+    }
+
     private static Resource source(String host) {
         return source("orders", host);
     }
@@ -140,6 +163,53 @@ class ArtifactStoreTest {
         @Override
         public List<Resource> list() {
             return new ArrayList<>(resources.values());
+        }
+    }
+
+    /**
+     * An adapter that predates conditional batches but implements the original single-replace
+     * contract. The default command adapter must preserve these exact outcomes.
+     */
+    private static final class LegacySingleWriteStore implements ArtifactStore {
+
+        private final Map<String, Resource> resources = new LinkedHashMap<>();
+        private int saveAllCalls;
+
+        void seed(Resource resource) {
+            resources.put(resource.id(), resource);
+        }
+
+        @Override
+        public void saveAll(List<Resource> artifacts) {
+            saveAllCalls++;
+            artifacts.forEach(artifact -> resources.put(artifact.id(), artifact));
+        }
+
+        @Override
+        public ArtifactMutation replace(String id, String expectedContentHash, Resource replacement) {
+            Resource current = resources.get(id);
+            if (current == null) {
+                return ArtifactMutation.NOT_FOUND;
+            }
+            if (!hash(current).equals(expectedContentHash)) {
+                return ArtifactMutation.VERSION_CONFLICT;
+            }
+            resources.put(id, replacement);
+            return ArtifactMutation.REPLACED;
+        }
+
+        @Override
+        public Optional<Resource> get(String id) {
+            return Optional.ofNullable(resources.get(id));
+        }
+
+        @Override
+        public List<Resource> list() {
+            return new ArrayList<>(resources.values());
+        }
+
+        private String storedCanonical(String id) {
+            return WRITER.write(resources.get(id));
         }
     }
 

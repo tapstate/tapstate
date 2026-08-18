@@ -16,7 +16,6 @@ import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.AuditGate;
-import io.tapstate.control.core.AuditedSourceService;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
@@ -34,7 +33,7 @@ import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.SourceDraftService;
 import io.tapstate.control.core.SourceRepresentation;
-import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -410,15 +409,13 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SourceService sourceService(
-            ConnectorCatalogView connectorCatalogView, ArtifactStore artifactStore,
+    SourceProjectionService sourceProjectionService(
+            ApplyService applyService,
+            ArtifactQueryService artifactQueryService,
+            ArtifactMutationService artifactMutationService,
             SourceRepresentation representation) {
-        return new SourceService(connectorCatalogView::merged, artifactStore, representation);
-    }
-
-    @Bean
-    AuditedSourceService auditedSourceService(SourceService sourceService, AuditGate auditGate) {
-        return new AuditedSourceService(sourceService, auditGate);
+        return new SourceProjectionService(
+                applyService, artifactQueryService, artifactMutationService, representation);
     }
 
     /**
