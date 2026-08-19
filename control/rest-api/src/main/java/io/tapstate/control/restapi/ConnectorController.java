@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ConnectorDetail;
+import io.tapstate.control.core.ConnectorIcon;
 import io.tapstate.control.core.ConnectorRegisterService;
 import io.tapstate.control.core.ConnectorRegistrationReport;
 import io.tapstate.core.common.TapstateException;
@@ -10,6 +11,8 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 
 import java.util.Base64;
 
@@ -74,6 +77,20 @@ class ConnectorController {
     @GetMapping("/connectors/{id}")
     ConnectorDetail get(@PathVariable("id") String id) {
         return catalogView.detail(id);
+    }
+
+    @Verb("connector.icon")
+    @GetMapping("/connectors/{id}/icon")
+    ResponseEntity<byte[]> icon(@PathVariable("id") String id) {
+        return catalogView.icon(id)
+                .map(ConnectorController::iconResponse)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    private static ResponseEntity<byte[]> iconResponse(ConnectorIcon icon) {
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType(icon.mediaType()))
+                .body(icon.bytes());
     }
 
     /** Decodes the base64 artifact, refusing a non-base64 body field at the boundary as a coded 400. */

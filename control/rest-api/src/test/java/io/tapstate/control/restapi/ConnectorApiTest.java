@@ -46,8 +46,11 @@ import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestClient;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
@@ -59,6 +62,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -177,7 +182,7 @@ class ConnectorApiTest {
 
     private static final String ORDERS_ROW = """
             {
-              "id": "orders", "name": "Orders", "displayName": "Orders", "icon": null,
+              "id": "orders", "name": "Orders", "displayName": "Orders", "icon": "icons/orders.png",
               "group": "database", "modes": ["snapshot"], "discovery": "catalog",
               "sink": {"capable": false, "writeSemantics": []}, "pushOut": false,
               "config": [
@@ -207,6 +212,91 @@ class ConnectorApiTest {
                 .filter(c -> c.id().equals("orders")).findFirst().orElseThrow();
         assertThat(orders.origin()).isEqualTo("registered");
         assertThat(orders.modes()).contains("snapshot");
+        assertThat(orders.icon()).isEqualTo("icons/orders.png");
+    }
+
+    @Test
+    void servesAnIconFromTheRegisteredConnectorArtifact() {
+        context.getBean(SeedableConnectorCatalogStore.class).upsert(CatalogEntryReader.read(ORDERS_ROW));
+        SeedableConnectorRegistry registry = context.getBean(SeedableConnectorRegistry.class);
+        registry.register("orders", "artifact-hash");
+        registry.withArtifact("artifact-hash", jarWith("icons/orders.png", new byte[] {1, 2, 3}));
+
+        ResponseEntity<byte[]> response = client().get().uri("/api/connectors/orders/icon")
+                .header("Authorization", "Bearer " + token(Scope.READ))
+                .retrieve().toEntity(byte[].class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getHeaders().getContentType()).isEqualTo(MediaType.IMAGE_PNG);
+        assertThat(response.getBody()).containsExactly(1, 2, 3);
+    }
+
+    @Test
+    void refusesAnIconForAnUnregisteredConnector() {
+        HttpStatusCode status = client().get().uri("/api/connectors/mysql/icon")
+                .header("Authorization", "Bearer " + token(Scope.READ))
+                .exchange((request, response) -> response.getStatusCode());
+
+        assertThat(status).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void iconRequiresAnAuthenticatedCaller() {
+        HttpStatusCode status = client().get().uri("/api/connectors/orders/icon")
+                .exchange((request, response) -> response.getStatusCode());
+
+        assertThat(status).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    void servesARegisteredIconThroughTheAnonymousImageRoute() {
+        context.getBean(SeedableConnectorCatalogStore.class).upsert(CatalogEntryReader.read(ORDERS_ROW));
+        SeedableConnectorRegistry registry = context.getBean(SeedableConnectorRegistry.class);
+        registry.register("orders", "artifact-hash");
+        registry.withArtifact("artifact-hash", jarWith("icons/orders.png", new byte[] {7, 8, 9}));
+
+        ResponseEntity<byte[]> response = client().get().uri("/connector-icons/orders")
+                .retrieve().toEntity(byte[].class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getHeaders().getContentType()).isEqualTo(MediaType.IMAGE_PNG);
+        assertThat(response.getBody()).containsExactly(7, 8, 9);
+    }
+
+    @Test
+    void anonymousImageRouteDoesNotExposeAnUnregisteredIcon() {
+        HttpStatusCode status = client().get().uri("/connector-icons/mysql")
+                .exchange((request, response) -> response.getStatusCode());
+
+        assertThat(status).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void returnsNotFoundWhenTheRegisteredArtifactDoesNotContainTheDeclaredIcon() {
+        context.getBean(SeedableConnectorCatalogStore.class).upsert(CatalogEntryReader.read(ORDERS_ROW));
+        SeedableConnectorRegistry registry = context.getBean(SeedableConnectorRegistry.class);
+        registry.register("orders", "artifact-hash");
+        registry.withArtifact("artifact-hash", jarWith("icons/other.png", new byte[] {1, 2, 3}));
+
+        HttpStatusCode status = client().get().uri("/api/connectors/orders/icon")
+                .header("Authorization", "Bearer " + token(Scope.READ))
+                .exchange((request, response) -> response.getStatusCode());
+
+        assertThat(status).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    private static byte[] jarWith(String path, byte[] bytes) {
+        try {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (JarOutputStream jar = new JarOutputStream(output)) {
+                jar.putNextEntry(new JarEntry(path));
+                jar.write(bytes);
+                jar.closeEntry();
+            }
+            return output.toByteArray();
+        } catch (IOException error) {
+            throw new AssertionError("test jar could not be created", error);
+        }
     }
 
     @Test
@@ -475,7 +565,7 @@ class ConnectorApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class,
-            ConnectorController.class, ApiExceptionHandler.class})
+            ConnectorController.class, ConnectorIconController.class, ApiExceptionHandler.class})
     static class TestApp {
 
         @Bean
@@ -747,10 +837,12 @@ class ConnectorApiTest {
 
         private final List<ConnectorRegistration> registrations = new ArrayList<>();
         private final Set<String> present = new java.util.LinkedHashSet<>();
+        private final Map<String, byte[]> artifacts = new java.util.LinkedHashMap<>();
 
         void clear() {
             registrations.clear();
             present.clear();
+            artifacts.clear();
         }
 
         /** Files a registration for {@code connectorId} under {@code contentHash}, bytes not implied. */
@@ -762,6 +854,12 @@ class ConnectorApiTest {
         /** Declares that the bytes under {@code contentHash} are present. */
         void withArtifactBytes(String contentHash) {
             present.add(contentHash);
+        }
+
+        /** Stores artifact bytes for a read that explicitly requests the connector's icon resource. */
+        void withArtifact(String contentHash, byte[] artifact) {
+            present.add(contentHash);
+            artifacts.put(contentHash, artifact.clone());
         }
 
         @Override
@@ -777,6 +875,9 @@ class ConnectorApiTest {
 
         @Override
         public java.util.Optional<byte[]> artifact(String contentHash) {
+            if (artifacts.containsKey(contentHash)) {
+                return java.util.Optional.of(artifacts.get(contentHash).clone());
+            }
             throw new UnsupportedOperationException("the read face must answer without fetching artifact bytes");
         }
 
