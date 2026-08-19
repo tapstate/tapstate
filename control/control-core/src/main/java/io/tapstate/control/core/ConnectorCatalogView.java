@@ -1,11 +1,15 @@
 package io.tapstate.control.core;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.jar.JarEntry;
+import java.util.jar.JarInputStream;
 
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.TapstateCatalog;
@@ -61,6 +65,53 @@ public final class ConnectorCatalogView {
             summaries.add(ConnectorSummary.of(entry, REGISTERED));
         }
         return summaries;
+    }
+
+    /** The declared catalog icon stored inside the one artifact registered under this connector id. */
+    public Optional<ConnectorIcon> icon(String id) {
+        Objects.requireNonNull(id, "id");
+        Optional<ConnectorCatalogEntry> stored = store.get(id);
+        if (stored.isEmpty()) {
+            return Optional.empty();
+        }
+        String icon = stored.get().icon();
+        if (icon == null || icon.isBlank()) {
+            return Optional.empty();
+        }
+        List<ConnectorRegistration> registrations = registry.findAll(id);
+        if (registrations.size() != 1) {
+            return Optional.empty();
+        }
+        return registry.artifact(registrations.get(0).contentHash())
+                .flatMap(artifact -> iconFrom(artifact, icon));
+    }
+
+    private static Optional<ConnectorIcon> iconFrom(byte[] artifact, String declaredPath) {
+        String path = declaredPath.startsWith("/") ? declaredPath.substring(1) : declaredPath;
+        try (JarInputStream jar = new JarInputStream(new ByteArrayInputStream(artifact))) {
+            JarEntry entry;
+            while ((entry = jar.getNextJarEntry()) != null) {
+                if (!entry.isDirectory() && entry.getName().equals(path)) {
+                    return Optional.of(new ConnectorIcon(jar.readAllBytes(), mediaType(path)));
+                }
+            }
+            return Optional.empty();
+        } catch (IOException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    private static String mediaType(String path) {
+        int dot = path.lastIndexOf('.');
+        String extension = dot < 0 ? "" : path.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
+        return switch (extension) {
+            case "png" -> "image/png";
+            case "jpg", "jpeg" -> "image/jpeg";
+            case "gif" -> "image/gif";
+            case "webp" -> "image/webp";
+            case "svg" -> "image/svg+xml";
+            default -> "application/octet-stream";
+        };
     }
 
     /**

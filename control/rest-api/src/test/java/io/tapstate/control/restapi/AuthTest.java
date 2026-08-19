@@ -660,8 +660,16 @@ class AuthTest {
         // current request's error, no application data). A future plain @Controller added at the root would
         // escape both the verb-derivation gate and the interceptor — this pins the anonymous surface to
         // exactly that set.
-        Set<String> allowedRootPaths = Set.of("/healthz", "/version", AuthWire.DISCOVERY_PATH, "/auth/login",
-                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, "/auth/bootstrap", "/error");
+        Set<String> allowedRootPaths = Set.of(
+                "/healthz",
+                "/version",
+                AuthWire.DISCOVERY_PATH,
+                "/auth/login",
+                AuthWire.SESSION_PATH,
+                AuthWire.LOGOUT_PATH,
+                "/auth/bootstrap",
+                "/connector-icons/{id}",
+                "/error");
 
         RequestMappingHandlerMapping mapping =
                 context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
@@ -683,8 +691,9 @@ class AuthTest {
         });
 
         assertThat(unexpectedRootEndpoints)
-                .as("only the liveness probe, issuer discovery, and the pre-auth entry points may live outside /api; every "
-                        + "other endpoint is a registry verb under the authenticated /api prefix")
+                .as("only the liveness probe, pre-auth entry points, and the anonymous connector icon asset "
+                        + "surface may live outside /api; every other endpoint is a registry verb under the "
+                        + "authenticated /api prefix")
                 .isEmpty();
     }
 

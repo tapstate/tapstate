@@ -119,6 +119,11 @@ public final class ControlOperations {
     public static final Operation CONNECTOR_GET =
             mcp("connector.get", Scope.READ, false,
                     "Get a connector's complete live config spec, content hash, origin, and runtime availability.");
+    // Connector icons are authenticated assets. The web picker uses the anonymous projection, while this
+    // authenticated peer remains available to any CLI or REST client that needs the protected asset.
+    public static final Operation CONNECTOR_ICON = new Operation(
+            "connector.icon", Scope.READ, false, null,
+            "Read the registered connector icon asset.", CLI_ONLY);
 
     // data-browser domain: the read face over a declared source's own database — list its collections,
     // read one collection's rows, report one collection's size. All three read through to the connector
@@ -213,6 +218,7 @@ public final class ControlOperations {
             CONNECTOR_REGISTER,
             CONNECTOR_LIST,
             CONNECTOR_GET,
+            CONNECTOR_ICON,
             DATA_BROWSER_COLLECTIONS,
             DATA_BROWSER_FIND,
             DATA_BROWSER_STATS,

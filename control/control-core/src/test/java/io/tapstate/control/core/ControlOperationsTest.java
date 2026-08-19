@@ -33,6 +33,7 @@ class ControlOperationsTest {
                         "connector.register",
                         "connector.list",
                         "connector.get",
+                        "connector.icon",
                         "data-browser.collections",
                         "data-browser.find",
                         "data-browser.stats",
@@ -84,6 +85,7 @@ class ControlOperationsTest {
         // nothing, so it is read.
         assertThat(registry.resolve("connector.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.get").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("connector.icon").scope()).isEqualTo(Scope.READ);
         // the three data-browser verbs look at what a declared source's own database holds. They read
         // through to the connector and persist nothing at all — not even the result, unlike the two
         // connection probes — so they are read-scoped.
@@ -141,6 +143,7 @@ class ControlOperationsTest {
                 "connection.schema",
                 "connector.list",
                 "connector.get",
+                "connector.icon",
                 "data-browser.collections",
                 "data-browser.find",
                 "data-browser.stats",
