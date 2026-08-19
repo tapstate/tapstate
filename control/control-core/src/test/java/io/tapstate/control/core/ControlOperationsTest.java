@@ -76,8 +76,8 @@ class ControlOperationsTest {
         // connector.register ingests a connector artifact into the distribution store, so it is a
         // state-mutating write.
         assertThat(registry.resolve("connector.register").scope()).isEqualTo(Scope.WRITE);
-        // connector.list reads the online catalog view (bundled snapshot union registered rows); it
-        // mutates nothing, so it is read.
+        // connector.list reads registered authoring candidates from the online catalog view; it mutates
+        // nothing, so it is read.
         assertThat(registry.resolve("connector.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.get").scope()).isEqualTo(Scope.READ);
         // cluster.members reads live topology; it is authenticated like every registry operation, but

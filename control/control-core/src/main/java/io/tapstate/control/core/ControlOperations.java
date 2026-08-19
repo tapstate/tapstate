@@ -97,10 +97,10 @@ public final class ControlOperations {
     // dispatching to the runtime, so it adds no member to the synchronous control-to-runtime whitelist.
     public static final Operation CONNECTOR_REGISTER =
             new Operation("connector.register", Scope.WRITE, true, null, CLI_POC);
-    // connector.list reads the online catalog view — the bundled snapshot union the rows derived for
-    // registered connectors — so a registered connector becomes visible without a restart. It reads
-    // derived catalog state, mutates nothing, and needs no member on the synchronous control-to-runtime
-    // whitelist; it is read-scoped and unaudited.
+    // connector.list reads registered authoring candidates from the online catalog view, so a newly
+    // registered connector becomes visible without a restart. It reads derived catalog state, mutates
+    // nothing, and needs no member on the synchronous control-to-runtime whitelist; it is read-scoped and
+    // unaudited.
     public static final Operation CONNECTOR_LIST =
             mcp("connector.list", Scope.READ, false,
                     "List connectors currently visible to the online Tapstate Server.");
