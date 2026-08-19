@@ -22,10 +22,9 @@ import io.tapstate.core.catalog.CatalogEntryReader;
 import io.tapstate.core.catalog.TapstateCatalog;
 
 /**
- * The online catalog view unions the bundled snapshot with the rows derived for registered connectors:
- * a registered connector becomes visible without a restart (the view re-reads the store per call), and
- * every listed connector is tagged bundled or registered so a face can tell an authored-in connector
- * from a user-uploaded one.
+ * The online catalog view keeps the bundled snapshot for capability validation and detail fallback, while
+ * the authoring list exposes only rows derived for registered connectors. A registration becomes visible
+ * without a restart because the view re-reads the store per call.
  */
 class ConnectorCatalogViewTest {
 
@@ -162,7 +161,7 @@ class ConnectorCatalogViewTest {
     }
 
     @Test
-    void summariesTagRegisteredRowsRegisteredAndBundledRowsBundled() {
+    void summariesExposeOnlyRegisteredConnectorsAsAuthoringCandidates() {
         InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
         store.upsert(CatalogEntryReader.read(ACME_ROW));
         ConnectorCatalogView view = new ConnectorCatalogView(
@@ -170,12 +169,22 @@ class ConnectorCatalogViewTest {
 
         List<ConnectorSummary> summaries = view.summaries();
 
-        ConnectorSummary acme = summaries.stream().filter(s -> s.id().equals("acme")).findFirst().orElseThrow();
-        assertThat(acme.origin()).isEqualTo("registered");
-        assertThat(acme.modes()).contains("snapshot");
-        String bundledId = BUNDLED.ids().get(0);
-        ConnectorSummary bundled = summaries.stream().filter(s -> s.id().equals(bundledId)).findFirst().orElseThrow();
-        assertThat(bundled.origin()).isEqualTo("bundled");
+        assertThat(summaries).extracting(ConnectorSummary::id).containsExactly("acme");
+        assertThat(summaries.get(0).origin()).isEqualTo("registered");
+        assertThat(summaries.get(0).modes()).contains("snapshot");
+    }
+
+    @Test
+    void summariesReflectRegistrationsAddedAfterTheViewWasConstructed() {
+        InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, store, new InMemoryConnectorSpecStore(), emptyRegistry());
+
+        assertThat(view.summaries()).isEmpty();
+
+        store.upsert(CatalogEntryReader.read(ACME_ROW));
+
+        assertThat(view.summaries()).extracting(ConnectorSummary::id).containsExactly("acme");
     }
 
     @Test

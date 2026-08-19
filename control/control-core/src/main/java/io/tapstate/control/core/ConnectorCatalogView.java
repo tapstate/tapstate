@@ -2,12 +2,10 @@ package io.tapstate.control.core;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.TapstateCatalog;
@@ -19,10 +17,11 @@ import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.IoError;
 
 /**
- * The online catalog view: the bundled snapshot overlaid with the rows derived for registered
- * connectors, read live from the store so a runtime registration is visible without a restart. It
- * backs the connector.list read verb and feeds the online apply path its capability matrix, while the
- * offline CLI keeps reading only the bundled snapshot (its honest boundary).
+ * The online catalog view: the bundled snapshot remains the capability and detail baseline, while rows
+ * derived for registered connectors are read live from the store so a runtime registration is visible
+ * without a restart. The connector.list read verb exposes only those registered rows as authoring
+ * candidates; merged() remains the capability matrix for online validation, while the offline CLI keeps
+ * reading only the bundled snapshot (its honest boundary).
  */
 public final class ConnectorCatalogView {
 
@@ -43,21 +42,23 @@ public final class ConnectorCatalogView {
         this.registry = Objects.requireNonNull(registry, "registry");
     }
 
-    /** The live online catalog = the bundled snapshot with registered rows overlaid (registered shadows). */
+    /** The live capability catalog = the bundled snapshot with registered rows overlaid (registered shadows). */
     public TapstateCatalog merged() {
         return TapstateCatalog.merged(bundled, store.list());
     }
 
-    /** Every connector visible online, tagged {@code bundled} or {@code registered}. */
+    /**
+     * Every registered connector available as an authoring candidate.
+     *
+     * <p>The bundled snapshot remains available through {@link #merged()} and {@link #detail(String)}
+     * for capability validation and explicit detail reads, but an unregistered bundled row is not a
+     * connector the control plane can author against because its spec source is not stored here.
+     */
     public List<ConnectorSummary> summaries() {
         List<ConnectorCatalogEntry> registered = store.list();
-        Set<String> registeredIds = new HashSet<>();
-        for (ConnectorCatalogEntry entry : registered) {
-            registeredIds.add(entry.id());
-        }
         List<ConnectorSummary> summaries = new ArrayList<>();
-        for (ConnectorCatalogEntry entry : TapstateCatalog.merged(bundled, registered).all()) {
-            summaries.add(ConnectorSummary.of(entry, registeredIds.contains(entry.id()) ? REGISTERED : BUNDLED));
+        for (ConnectorCatalogEntry entry : registered) {
+            summaries.add(ConnectorSummary.of(entry, REGISTERED));
         }
         return summaries;
     }

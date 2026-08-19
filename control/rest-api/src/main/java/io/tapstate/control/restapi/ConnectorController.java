@@ -26,9 +26,9 @@ import java.util.Base64;
  * artifact that decodes but does not load, declares no connector or identity, or collides with a
  * registered id surfaces the register service's coded connector-domain refusal.
  *
- * <p>The read peer lists the online catalog view — the bundled snapshot union the rows derived for
- * registered connectors — so a registered connector is visible without a restart; each row is tagged
- * bundled or registered. It reads nothing but derived catalog state, so it is a plain read.
+ * <p>The read peer lists only connectors registered in this deployment, so every authoring candidate has
+ * a stored normalized row and spec source. Registration becomes visible without a restart because the
+ * catalog view re-reads derived catalog state for each call.
  */
 @RestController
 class ConnectorController {
