@@ -27,7 +27,6 @@ import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
-import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -430,7 +429,12 @@ class AuthTest {
         // entry points, and the framework's own error endpoint (which renders only the current request's
         // error, no application data). A future plain @Controller added at the root would escape both the
         // verb-derivation gate and the interceptor — this pins the anonymous surface to exactly that set.
-        Set<String> allowedRootPaths = Set.of("/healthz", "/auth/login", "/auth/bootstrap", "/error");
+        Set<String> allowedRootPaths = Set.of(
+                "/healthz",
+                "/auth/login",
+                "/auth/bootstrap",
+                "/connector-icons/{id}",
+                "/error");
 
         RequestMappingHandlerMapping mapping =
                 context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
@@ -452,8 +456,9 @@ class AuthTest {
         });
 
         assertThat(unexpectedRootEndpoints)
-                .as("only the liveness probe and the pre-auth entry points may live outside /api; every "
-                        + "other endpoint is a registry verb under the authenticated /api prefix")
+                .as("only the liveness probe, pre-auth entry points, and the anonymous connector icon asset "
+                        + "surface may live outside /api; every other endpoint is a registry verb under the "
+                        + "authenticated /api prefix")
                 .isEmpty();
     }
 
@@ -520,8 +525,7 @@ class AuthTest {
      */
     @SpringBootConfiguration
     @EnableAutoConfiguration
-    @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
-            AuditedSourceServiceTestConfiguration.class})
+    @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class})
     static class TestApp {
 
         @Bean

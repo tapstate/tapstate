@@ -97,16 +97,21 @@ public final class ControlOperations {
     // dispatching to the runtime, so it adds no member to the synchronous control-to-runtime whitelist.
     public static final Operation CONNECTOR_REGISTER =
             new Operation("connector.register", Scope.WRITE, true, null, CLI_POC);
-    // connector.list reads the online catalog view — the bundled snapshot union the rows derived for
-    // registered connectors — so a registered connector becomes visible without a restart. It reads
-    // derived catalog state, mutates nothing, and needs no member on the synchronous control-to-runtime
-    // whitelist; it is read-scoped and unaudited.
+    // connector.list reads registered authoring candidates from the online catalog view, so a newly
+    // registered connector becomes visible without a restart. It reads derived catalog state, mutates
+    // nothing, and needs no member on the synchronous control-to-runtime whitelist; it is read-scoped and
+    // unaudited.
     public static final Operation CONNECTOR_LIST =
             mcp("connector.list", Scope.READ, false,
                     "List connectors currently visible to the online Tapstate Server.");
     public static final Operation CONNECTOR_GET =
             mcp("connector.get", Scope.READ, false,
                     "Get a connector's complete live config spec, content hash, origin, and runtime availability.");
+    // Connector icons are authenticated assets. The web picker uses the anonymous projection, while this
+    // authenticated peer remains available to any CLI or REST client that needs the protected asset.
+    public static final Operation CONNECTOR_ICON = new Operation(
+            "connector.icon", Scope.READ, false, null,
+            "Read the registered connector icon asset.", CLI_POC);
 
     // cluster domain: topology is sensitive, so listing members is a registry operation (authenticated
     // like every other verb) rather than an anonymous endpoint — only the process-liveness probe stays
@@ -169,6 +174,7 @@ public final class ControlOperations {
             CONNECTOR_REGISTER,
             CONNECTOR_LIST,
             CONNECTOR_GET,
+            CONNECTOR_ICON,
             CLUSTER_MEMBERS,
             PIPELINE_START,
             PIPELINE_STOP,

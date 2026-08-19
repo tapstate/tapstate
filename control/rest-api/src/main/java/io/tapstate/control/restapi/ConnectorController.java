@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ConnectorDetail;
+import io.tapstate.control.core.ConnectorIcon;
 import io.tapstate.control.core.ConnectorRegisterService;
 import io.tapstate.control.core.ConnectorRegistrationReport;
 import io.tapstate.core.common.TapstateException;
@@ -11,6 +12,8 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 
 import java.util.Base64;
 
@@ -27,9 +30,9 @@ import java.util.Base64;
  * artifact that decodes but does not load, declares no connector or identity, or collides with a
  * registered id surfaces the register service's coded connector-domain refusal.
  *
- * <p>The read peer lists the online catalog view — the bundled snapshot union the rows derived for
- * registered connectors — so a registered connector is visible without a restart; each row is tagged
- * bundled or registered. It reads nothing but derived catalog state, so it is a plain read.
+ * <p>The read peer lists only connectors registered in this deployment, so every authoring candidate has
+ * a stored normalized row and spec source. Registration becomes visible without a restart because the
+ * catalog view re-reads derived catalog state for each call.
  */
 @RestController
 class ConnectorController {
@@ -76,6 +79,20 @@ class ConnectorController {
     @GetMapping("/connectors/{id}")
     ConnectorDetail get(@PathVariable("id") String id) {
         return catalogView.detail(id);
+    }
+
+    @Verb("connector.icon")
+    @GetMapping("/connectors/{id}/icon")
+    ResponseEntity<byte[]> icon(@PathVariable("id") String id) {
+        return catalogView.icon(id)
+                .map(ConnectorController::iconResponse)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    private static ResponseEntity<byte[]> iconResponse(ConnectorIcon icon) {
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType(icon.mediaType()))
+                .body(icon.bytes());
     }
 
     /** Decodes the base64 artifact, refusing a non-base64 body field at the boundary as a coded 400. */

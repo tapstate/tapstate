@@ -32,6 +32,7 @@ class ControlOperationsTest {
                         "connector.register",
                         "connector.list",
                         "connector.get",
+                        "connector.icon",
                         "cluster.members",
                         "pipeline.start",
                         "pipeline.stop",
@@ -76,10 +77,11 @@ class ControlOperationsTest {
         // connector.register ingests a connector artifact into the distribution store, so it is a
         // state-mutating write.
         assertThat(registry.resolve("connector.register").scope()).isEqualTo(Scope.WRITE);
-        // connector.list reads the online catalog view (bundled snapshot union registered rows); it
-        // mutates nothing, so it is read.
+        // connector.list reads registered authoring candidates from the online catalog view; it mutates
+        // nothing, so it is read.
         assertThat(registry.resolve("connector.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.get").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("connector.icon").scope()).isEqualTo(Scope.READ);
         // cluster.members reads live topology; it is authenticated like every registry operation, but
         // needs no write or admin privilege.
         assertThat(registry.resolve("cluster.members").scope()).isEqualTo(Scope.READ);
@@ -130,6 +132,7 @@ class ControlOperationsTest {
                 "connection.schema",
                 "connector.list",
                 "connector.get",
+                "connector.icon",
                 "cluster.members",
                 "user.list",
                 "token.list",
@@ -146,7 +149,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them below POC. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI, Maturity.POC)).hasSize(33);
+        assertThat(registry.exposedOn(Frontend.CLI, Maturity.POC)).hasSize(34);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.POC));
     }

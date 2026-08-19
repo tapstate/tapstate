@@ -13,7 +13,9 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.IoError;
 import org.bson.Document;
 
@@ -98,6 +100,94 @@ public final class MongoArtifactStore implements ArtifactStore {
                     ? ArtifactMutation.NOT_FOUND
                     : ArtifactMutation.VERSION_CONFLICT;
         });
+    }
+
+    @Override
+    public ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
+        Objects.requireNonNull(writes, "writes");
+        if (writes.isEmpty()) {
+            return ArtifactBatchWrite.applied();
+        }
+        if (writes.size() == 1) {
+            return singleWrite(writes.getFirst());
+        }
+        return StoreIo.call(() -> writeTransactionally(writes));
+    }
+
+    private ArtifactBatchWrite singleWrite(ArtifactWrite write) {
+        ArtifactMutation outcome = switch (write.intent()) {
+            case CREATE_ONLY -> create(write.resource());
+            case REPLACE_ONLY -> replace(write.resource().id(), write.expectedContentHash(), write.resource());
+            case UPSERT -> {
+                save(write.resource());
+                yield ArtifactMutation.REPLACED;
+            }
+        };
+        return switch (outcome) {
+            case CREATED, REPLACED -> ArtifactBatchWrite.applied();
+            case NOT_FOUND, ALREADY_EXISTS, VERSION_CONFLICT ->
+                    ArtifactBatchWrite.refused(write.resource().id(), outcome);
+            case DELETED -> throw new IllegalStateException("artifact write cannot report deletion");
+        };
+    }
+
+    private ArtifactBatchWrite writeTransactionally(List<ArtifactWrite> writes) {
+        try (ClientSession session = client.startSession()) {
+            session.startTransaction();
+            try {
+                for (ArtifactWrite write : writes) {
+                    ArtifactBatchWrite refusal = writeOne(session, write);
+                    if (!refusal.appliedSuccessfully()) {
+                        session.abortTransaction();
+                        return refusal;
+                    }
+                }
+                session.commitTransaction();
+                return ArtifactBatchWrite.applied();
+            } catch (RuntimeException error) {
+                try {
+                    session.abortTransaction();
+                } catch (RuntimeException abortFailure) {
+                    error.addSuppressed(abortFailure);
+                }
+                throw error;
+            }
+        }
+    }
+
+    private ArtifactBatchWrite writeOne(ClientSession session, ArtifactWrite write) {
+        return switch (write.intent()) {
+            case CREATE_ONLY -> insertOnly(session, write);
+            case REPLACE_ONLY -> replaceOnly(session, write);
+            case UPSERT -> {
+                collection.replaceOne(session, new Document("_id", write.resource().id()), toDocument(write.resource()),
+                        new ReplaceOptions().upsert(true));
+                yield ArtifactBatchWrite.applied();
+            }
+        };
+    }
+
+    private ArtifactBatchWrite insertOnly(ClientSession session, ArtifactWrite write) {
+        try {
+            collection.insertOne(session, toDocument(write.resource()));
+            return ArtifactBatchWrite.applied();
+        } catch (MongoException error) {
+            if (ErrorCategory.fromErrorCode(error.getCode()) == ErrorCategory.DUPLICATE_KEY) {
+                return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
+            }
+            throw error;
+        }
+    }
+
+    private ArtifactBatchWrite replaceOnly(ClientSession session, ArtifactWrite write) {
+        Document filter = new Document("_id", write.resource().id())
+                .append("contentHash", write.expectedContentHash());
+        if (collection.replaceOne(session, filter, toDocument(write.resource())).getMatchedCount() == 1) {
+            return ArtifactBatchWrite.applied();
+        }
+        return collection.find(session, new Document("_id", write.resource().id())).first() == null
+                ? ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.NOT_FOUND)
+                : ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.VERSION_CONFLICT);
     }
 
     @Override

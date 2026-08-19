@@ -1,9 +1,8 @@
 package io.tapstate.app;
 
-import io.tapstate.control.core.AuditedSourceService;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.SourceRepresentation;
-import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -76,8 +75,7 @@ class ControlPlaneAssemblyIT {
 
         assertThat(context.getBeansOfType(ConnectorCatalogView.class)).hasSize(1);
         assertThat(context.getBeansOfType(SourceRepresentation.class)).hasSize(1);
-        assertThat(context.getBeansOfType(SourceService.class)).hasSize(1);
-        assertThat(context.getBeansOfType(AuditedSourceService.class)).hasSize(1);
+        assertThat(context.getBeansOfType(SourceProjectionService.class)).hasSize(1);
         assertThat(context.getBeansOfType(StorePort.class)).hasSize(1);
         assertThat(context.getBeansOfType(ArtifactStore.class)).hasSize(1);
 
