@@ -3,9 +3,13 @@ package io.tapstate.control.core;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 
 import org.junit.jupiter.api.Test;
 
@@ -32,7 +36,7 @@ class ConnectorCatalogViewTest {
 
     private static final String ACME_ROW = """
             {
-              "id": "acme", "name": "Acme", "displayName": "Acme", "icon": null,
+              "id": "acme", "name": "Acme", "displayName": "Acme", "icon": "icons/acme.png",
               "group": "database", "modes": ["snapshot"], "discovery": "catalog",
               "sink": {"capable": false, "writeSemantics": []}, "pushOut": false, "config": [],
               "provenance": {"connectorRepoSha": null, "specPath": "spec.json", "specContentHash": "h",
@@ -185,6 +189,39 @@ class ConnectorCatalogViewTest {
         store.upsert(CatalogEntryReader.read(ACME_ROW));
 
         assertThat(view.summaries()).extracting(ConnectorSummary::id).containsExactly("acme");
+    }
+
+    @Test
+    void iconReadsTheDeclaredEntryFromTheRegisteredArtifact() {
+        InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
+        store.upsert(CatalogEntryReader.read(ACME_ROW));
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, store, new InMemoryConnectorSpecStore(),
+                registryHoldingArtifact("acme", "jar-hash", jarWith("icons/acme.png", new byte[] {4, 5, 6})));
+
+        ConnectorIcon icon = view.icon("acme").orElseThrow();
+
+        assertThat(icon.mediaType()).isEqualTo("image/png");
+        assertThat(icon.bytes()).containsExactly(4, 5, 6);
+    }
+
+    @Test
+    void iconIsAbsentWhenTheConnectorIsNotRegisteredInTheCatalogStore() {
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, new InMemoryConnectorCatalogStore(), new InMemoryConnectorSpecStore(), emptyRegistry());
+
+        assertThat(view.icon("mysql")).isEmpty();
+    }
+
+    @Test
+    void iconIsAbsentWhenTheArtifactDoesNotContainTheDeclaredEntry() {
+        InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
+        store.upsert(CatalogEntryReader.read(ACME_ROW));
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, store, new InMemoryConnectorSpecStore(),
+                registryHoldingArtifact("acme", "jar-hash", jarWith("icons/other.png", new byte[] {4})));
+
+        assertThat(view.icon("acme")).isEmpty();
     }
 
     @Test
@@ -454,5 +491,45 @@ class ConnectorCatalogViewTest {
                 return bytesPresent && hash.equals(contentHash);
             }
         };
+    }
+
+    private static ConnectorRegistry registryHoldingArtifact(String connectorId, String contentHash, byte[] artifact) {
+        List<ConnectorRegistration> registrations = List.of(
+                new ConnectorRegistration(connectorId, contentHash, "1.0.0", RegistrationSource.REGISTER));
+        return new ConnectorRegistry() {
+            @Override
+            public RegistrationOutcome register(String id, String pdkApiVersion, RegistrationSource source, byte[] bytes) {
+                throw new UnsupportedOperationException("the icon read never registers");
+            }
+
+            @Override
+            public List<ConnectorRegistration> list() {
+                return registrations;
+            }
+
+            @Override
+            public Optional<byte[]> artifact(String hash) {
+                return hash.equals(contentHash) ? Optional.of(artifact.clone()) : Optional.empty();
+            }
+
+            @Override
+            public boolean hasArtifact(String hash) {
+                return hash.equals(contentHash);
+            }
+        };
+    }
+
+    private static byte[] jarWith(String path, byte[] bytes) {
+        try {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (JarOutputStream jar = new JarOutputStream(output)) {
+                jar.putNextEntry(new JarEntry(path));
+                jar.write(bytes);
+                jar.closeEntry();
+            }
+            return output.toByteArray();
+        } catch (IOException error) {
+            throw new AssertionError("test jar could not be created", error);
+        }
     }
 }

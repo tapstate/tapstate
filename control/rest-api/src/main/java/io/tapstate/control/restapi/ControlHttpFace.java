@@ -31,7 +31,7 @@ import tools.jackson.databind.DeserializationFeature;
  */
 @Configuration
 @Import({RestApiConfiguration.class, ArtifactController.class, ConnectionController.class,
-        ConnectorController.class, PipelineController.class, PipelineObservationController.class,
+        ConnectorController.class, ConnectorIconController.class, PipelineController.class, PipelineObservationController.class,
         PipelineLogsController.class, PipelineStreamConfiguration.class, ClusterController.class,
         HealthController.class, AuthController.class, TokenController.class, SourceController.class,
         SourceDraftController.class,

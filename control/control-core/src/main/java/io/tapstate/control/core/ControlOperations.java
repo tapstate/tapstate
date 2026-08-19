@@ -107,6 +107,11 @@ public final class ControlOperations {
     public static final Operation CONNECTOR_GET =
             mcp("connector.get", Scope.READ, false,
                     "Get a connector's complete live config spec, content hash, origin, and runtime availability.");
+    // Connector icons are authenticated assets. The web picker uses the anonymous projection, while this
+    // authenticated peer remains available to any CLI or REST client that needs the protected asset.
+    public static final Operation CONNECTOR_ICON = new Operation(
+            "connector.icon", Scope.READ, false, null,
+            "Read the registered connector icon asset.", CLI_POC);
 
     // cluster domain: topology is sensitive, so listing members is a registry operation (authenticated
     // like every other verb) rather than an anonymous endpoint — only the process-liveness probe stays
@@ -169,6 +174,7 @@ public final class ControlOperations {
             CONNECTOR_REGISTER,
             CONNECTOR_LIST,
             CONNECTOR_GET,
+            CONNECTOR_ICON,
             CLUSTER_MEMBERS,
             PIPELINE_START,
             PIPELINE_STOP,
