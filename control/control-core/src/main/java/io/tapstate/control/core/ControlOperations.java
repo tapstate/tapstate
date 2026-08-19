@@ -108,7 +108,7 @@ public final class ControlOperations {
     // over the artifact bytes; the operation classloads and stores in the control process rather than
     // dispatching to the runtime, so it adds no member to the synchronous control-to-runtime whitelist.
     public static final Operation CONNECTOR_REGISTER =
-            new Operation("connector.register", Scope.WRITE, true, null, CLI_ONLY);
+    new Operation("connector.register", Scope.WRITE, true, null, CLI_ONLY);
     // connector.list reads the online catalog view — the bundled snapshot union the rows derived for
     // registered connectors — so a registered connector becomes visible without a restart. It reads
     // derived catalog state, mutates nothing, and needs no member on the synchronous control-to-runtime

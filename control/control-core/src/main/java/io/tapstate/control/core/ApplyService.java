@@ -59,8 +59,8 @@ import java.util.regex.PatternSyntaxException;
  * references resolve against the state that would exist after the write.
  *
  * <p>The catalog is supplied per plan rather than fixed, so the online path validates against the live
- * catalog view — the bundled snapshot union the connectors registered so far — and a connector
- * registered at runtime is honoured without a restart.
+ * capability view — the bundled snapshot with registered rows overlaid — and a connector registered at
+ * runtime is honoured without a restart.
  *
  * <p>The no-op is keyed by the content hash over the canonical form, so re-applying identical content
  * — even with different raw key order — writes nothing. Apply writes the changed set — the created and

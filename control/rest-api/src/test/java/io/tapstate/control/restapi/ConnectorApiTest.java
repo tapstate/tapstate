@@ -173,7 +173,7 @@ class ConnectorApiTest {
         });
     }
 
-    // ---- the read peer lists the online catalog, registered rows included and tagged ----
+    // ---- the read peer lists registered authoring candidates and tags their origin ----
 
     private static final String ORDERS_ROW = """
             {
@@ -202,10 +202,20 @@ class ConnectorApiTest {
                 .header("Authorization", "Bearer " + token(Scope.READ))
                 .retrieve().toEntity(ConnectorCatalogList.class).getBody();
 
+        assertThat(listed.connectors()).extracting(ConnectorSummary::id).containsExactly("orders");
         ConnectorSummary orders = listed.connectors().stream()
                 .filter(c -> c.id().equals("orders")).findFirst().orElseThrow();
         assertThat(orders.origin()).isEqualTo("registered");
         assertThat(orders.modes()).contains("snapshot");
+    }
+
+    @Test
+    void doesNotListBundledConnectorsThatWereNotRegistered() {
+        ConnectorCatalogList listed = client().get().uri("/api/connectors")
+                .header("Authorization", "Bearer " + token(Scope.READ))
+                .retrieve().toEntity(ConnectorCatalogList.class).getBody();
+
+        assertThat(listed.connectors()).isEmpty();
     }
 
     @Test
