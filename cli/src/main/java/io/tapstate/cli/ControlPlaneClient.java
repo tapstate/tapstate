@@ -15,6 +15,11 @@ import java.util.function.BooleanSupplier;
  */
 interface ControlPlaneClient extends AutoCloseable {
 
+    /** Reads anonymous stable cluster identity from the well-known endpoint. */
+    default DiscoveryOutcome discover(URI baseUrl) {
+        return new DiscoveryOutcome.Unreachable();
+    }
+
     /** Whether {@code GET {baseUrl}/healthz} answers 200; any I/O failure counts as not healthy. */
     boolean isHealthy(URI baseUrl);
 

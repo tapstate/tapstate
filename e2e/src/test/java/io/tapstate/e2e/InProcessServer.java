@@ -29,9 +29,6 @@ final class InProcessServer implements ServerHandle {
     static InProcessServer start(String storeUri) {
         ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
                 .properties(
-                        // Port zero, then read back what was granted: a hard-coded port turns a busy
-                        // machine into a flaky suite.
-                        "server.port=0",
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
                         // The container speaks plaintext; store TLS is opt-in, so no flag is needed.
@@ -40,7 +37,10 @@ final class InProcessServer implements ServerHandle {
                         // default is relative to it.
                         ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + ServerHandle.privateStagingDirectory(),
                         ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID)
-                .run();
+                // Port zero, then read back what was granted: a hard-coded port turns a busy machine
+                // into a flaky suite. This is a command-line argument rather than a default property
+                // because the product's application configuration publishes 8080 as its default.
+                .run("--server.port=0");
         int port = ((WebServerApplicationContext) context).getWebServer().getPort();
         return new InProcessServer(context, URI.create("http://localhost:" + port));
     }

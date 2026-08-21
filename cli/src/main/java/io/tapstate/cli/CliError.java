@@ -131,7 +131,19 @@ enum CliError implements TapstateErrorCode {
     CONTEXT_SOURCE_CONFLICT("cli.context-source-conflict", Set.of()),
 
     /** An online verb has no explicit, environment, or exact workspace target. */
-    CONTEXT_REQUIRED("cli.context-required", Set.of("verb"));
+    CONTEXT_REQUIRED("cli.context-required", Set.of("verb")),
+
+    /** A non-loopback seed would expose authentication traffic over plaintext HTTP. */
+    REMOTE_PLAINTEXT("cli.remote-plaintext", Set.of("seed")),
+
+    /** A configured seed did not answer anonymous issuer discovery. */
+    ISSUER_DISCOVERY_FAILED("cli.issuer-discovery-failed", Set.of("seed")),
+
+    /** A seed answered discovery with fields that cannot identify a Tapstate cluster. */
+    ISSUER_DISCOVERY_INVALID("cli.issuer-discovery-invalid", Set.of("seed", "reason")),
+
+    /** A cached issuer or another seed differs from the anonymously discovered issuer. */
+    AUTH_ISSUER_MISMATCH("cli.auth-issuer-mismatch", Set.of("expected", "actual", "seed"));
 
     private final String code;
     private final Set<String> placeholders;
