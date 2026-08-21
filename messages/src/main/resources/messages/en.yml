@@ -552,3 +552,15 @@ pdk.testitem.time.consistent.fail:
   message: "The clock comparison did not pass."
 pdk.testitem.stream.read.fail:
   message: "The change stream could not be started."
+cli.remote-plaintext:
+  message: "Server seed {seed} uses plaintext HTTP outside loopback."
+  solution: "Use HTTPS for remote servers; HTTP is allowed only for a loopback development server."
+cli.issuer-discovery-failed:
+  message: "Server seed {seed} did not return its anonymous cluster identity."
+  solution: "Check that the seed is reachable and serves /.well-known/tapstate, then try again."
+cli.issuer-discovery-invalid:
+  message: "Server seed {seed} returned an invalid cluster identity ({reason})."
+  solution: "Check that the URL targets a compatible Tapstate server and has not been replaced by another service."
+cli.auth-issuer-mismatch:
+  message: "Server seed {seed} reports issuer {actual}, but {expected} was required."
+  solution: "Check the context seeds and sign in again only after confirming that this is the intended cluster."

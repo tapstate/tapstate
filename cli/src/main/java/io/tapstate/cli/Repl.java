@@ -189,7 +189,7 @@ final class Repl {
 
     /** Whether this verb can be routed to the control plane when a context resolves. */
     static boolean isOnlineVerb(String verb) {
-        return ONLINE_VERBS.contains(verb);
+        return ONLINE_VERBS.contains(verb) || Cli.LIVE_VIEW_VERBS.contains(verb);
     }
 
     /** The live-view verb this line opens with, or null when it opens with something else. */
@@ -275,7 +275,7 @@ final class Repl {
             if (connected != Cli.EXIT_OK || username == null || username.isBlank()) {
                 return connected;
             }
-            return login(username, password.get());
+            return login(username, password);
         } finally {
             this.quiet = false;
         }
@@ -767,6 +767,12 @@ final class Repl {
             err.println(verb + ": " + malformed.reason());
             err.flush();
             return Cli.EXIT_USAGE;
+        }
+        if (!session.isConnected() && contextResolver != null) {
+            int resolved = resolveTarget(List.of(verb));
+            if (resolved != Cli.EXIT_OK) {
+                return resolved;
+            }
         }
         if (!session.isConnected()) {
             Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", verb));
@@ -3056,27 +3062,33 @@ final class Repl {
             err.flush();
             return Cli.EXIT_USAGE;
         }
-        return login(words.get(1), prompter.secret("Password"));
+        return login(words.get(1), () -> prompter.secret("Password"));
     }
 
     /**
-     * Signs in with a password already in hand. Split from the typed {@code login} so the password can
-     * come from somewhere other than the prompt — a one-line launch supplies its own — without either
-     * path having to know where the other got it.
+     * Signs in only after the connected seeds pass anonymous issuer discovery. The password supplier
+     * keeps an interactive prompt behind that preflight while allowing one-line launches to provide it.
      */
-    private int login(String username, String password) {
-        PrintWriter out = commandLine.getOut();
+    private int login(String username, Supplier<String> password) {
         PrintWriter err = commandLine.getErr();
-        URI node = session.landingNode();
-        return switch (controlPlane.login(node, username, password)) {
+        IssuerBinding.Verified verified;
+        try {
+            verified = new IssuerBinding(controlPlane).verify(session.seeds(), null);
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(err, failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+        return switch (verified.withCredential(password.get(),
+                (node, credential) -> controlPlane.login(node, username, credential))) {
             case LoginOutcome.Success success -> {
+                session.reland(verified.seed());
                 session.authenticate(success.token(), username, null, session.seeds());
                 confirm("logged in as " + username);
                 yield Cli.EXIT_OK;
             }
             case LoginOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case LoginOutcome.Unreachable ignored -> {
-                err.println("login: cannot reach " + hostPort(node));
+                err.println("login: cannot reach " + hostPort(verified.seed()));
                 err.flush();
                 yield Cli.EXIT_DIAGNOSTIC;
             }

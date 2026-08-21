@@ -81,6 +81,77 @@ class HttpControlPlaneClientTest {
         assertThat(new HttpControlPlaneClient().isHealthy(URI.create("http://foo:bar"))).isFalse();
     }
 
+    @Test
+    void issuerDiscoveryUsesTheWellKnownGetWithoutAnyAuthorizationHeader() throws Exception {
+        AtomicReference<String> authorization = new AtomicReference<>("not-called");
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/.well-known/tapstate", exchange -> {
+            authorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            byte[] body = ("{\"issuer\":\"urn:tapstate:cluster:01J5FIXTURE\","
+                    + "\"clusterId\":\"01J5FIXTURE\",\"apiVersion\":\"tapstate/v1\","
+                    + "\"authModes\":[\"password\",\"machine_token\"]}")
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream output = exchange.getResponseBody()) {
+                output.write(body);
+            }
+            exchange.close();
+        });
+        server.start();
+        try {
+            assertThat(new HttpControlPlaneClient().discover(baseOf(server)))
+                    .isEqualTo(new DiscoveryOutcome.Discovered(
+                            "urn:tapstate:cluster:01J5FIXTURE", "01J5FIXTURE", "tapstate/v1",
+                            List.of("password", "machine_token")));
+            assertThat(authorization.get()).isNull();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void malformedIssuerDiscoveryResponseIsReportedAsInvalidRatherThanUnreachable() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/.well-known/tapstate", exchange -> {
+            byte[] body = "not-json".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream output = exchange.getResponseBody()) {
+                output.write(body);
+            }
+            exchange.close();
+        });
+        server.start();
+        try {
+            assertThat(new HttpControlPlaneClient().discover(baseOf(server)))
+                    .isEqualTo(new DiscoveryOutcome.Invalid("response-body"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void issuerDiscoveryRejectsANonStringAuthMode() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/.well-known/tapstate", exchange -> {
+            byte[] body = ("{\"issuer\":\"urn:tapstate:cluster:01J5FIXTURE\","
+                    + "\"clusterId\":\"01J5FIXTURE\",\"apiVersion\":\"tapstate/v1\","
+                    + "\"authModes\":[\"password\",12,\"machine_token\"]}")
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream output = exchange.getResponseBody()) {
+                output.write(body);
+            }
+            exchange.close();
+        });
+        server.start();
+        try {
+            assertThat(new HttpControlPlaneClient().discover(baseOf(server)))
+                    .isEqualTo(new DiscoveryOutcome.Invalid("response-contract"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
     // --- stream endpoint URI: http(s) base -> ws(s) with the path appended ------------------------
 
     @Test
@@ -435,8 +506,11 @@ class HttpControlPlaneClientTest {
                         + "{\"name\":\"customers\",\"kind\":\"view\"}]}",
                 seen);
         try {
-            DataBrowserOutcome.Collections outcome =
-                    new HttpControlPlaneClient().collections(baseOf(server), "tok-abc", "views");
+            // This test exercises wire decoding, while timeout behavior has dedicated coverage. Give the
+            // in-JVM server a little scheduling headroom so a cold JDK HTTP client cannot hide that contract.
+            DataBrowserOutcome.Collections outcome = new HttpControlPlaneClient(
+                    Duration.ofSeconds(5), HttpControlPlaneClient.HEAVY_TIMEOUT)
+                    .collections(baseOf(server), "tok-abc", "views");
 
             assertThat(outcome).isInstanceOf(DataBrowserOutcome.Collections.Listed.class);
             assertThat(((DataBrowserOutcome.Collections.Listed) outcome).collections())
@@ -836,7 +910,9 @@ class HttpControlPlaneClientTest {
                 "{\"code\":\"control.forbidden\",\"params\":{},\"message\":\"You lack the grade.\"}",
                 new AtomicReference<>());
         try {
-            GetOutcome outcome = new HttpControlPlaneClient().get(baseOf(server), "tok", "src_kfk");
+            GetOutcome outcome = new HttpControlPlaneClient(
+                    Duration.ofSeconds(5), HttpControlPlaneClient.HEAVY_TIMEOUT)
+                    .get(baseOf(server), "tok", "src_kfk");
             assertThat(outcome).isEqualTo(new GetOutcome.Rejected("control.forbidden", "You lack the grade."));
         } finally {
             server.stop(0);

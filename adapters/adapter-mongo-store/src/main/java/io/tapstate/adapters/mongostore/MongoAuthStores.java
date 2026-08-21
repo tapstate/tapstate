@@ -2,6 +2,7 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.spi.store.AuditStore;
+import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.TokenStore;
 import io.tapstate.spi.store.UserStore;
 
@@ -23,13 +24,16 @@ public final class MongoAuthStores {
     public static final String TOKENS = "tokens";
     /** The append-only collection holding one document per audited operation. */
     public static final String AUDIT = "audit";
+    /** The singleton document holding the stable server issuer input. */
+    public static final String CLUSTER_IDENTITY = "cluster_identity";
 
     private final UserStore users;
     private final TokenStore tokens;
     private final AuditStore audit;
+    private final ClusterIdentityStore clusterIdentity;
 
     /**
-     * Binds the three auth stores to their own collections on the verified connection's database. The
+     * Binds the four auth stores to their own collections on the verified connection's database. The
      * connection must have been verified first (its client opened); the stores share that one client and
      * are closed with it when the connection closes.
      */
@@ -39,6 +43,7 @@ public final class MongoAuthStores {
         this.users = new MongoUserStore(database.getCollection(USERS));
         this.tokens = new MongoTokenStore(database.getCollection(TOKENS));
         this.audit = new MongoAuditStore(database.getCollection(AUDIT));
+        this.clusterIdentity = new MongoClusterIdentityStore(database.getCollection(CLUSTER_IDENTITY));
     }
 
     public UserStore users() {
@@ -51,5 +56,9 @@ public final class MongoAuthStores {
 
     public AuditStore audit() {
         return audit;
+    }
+
+    public ClusterIdentityStore clusterIdentity() {
+        return clusterIdentity;
     }
 }

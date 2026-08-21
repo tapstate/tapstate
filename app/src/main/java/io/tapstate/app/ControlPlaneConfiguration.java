@@ -21,6 +21,7 @@ import io.tapstate.control.core.AuditedSourceService;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
+import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ConnectorConfigValidator;
 import io.tapstate.control.core.ConnectorRegisterService;
 import io.tapstate.control.core.ControlOperations;
@@ -66,6 +67,7 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.CapabilityDeriver;
+import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
@@ -135,6 +137,16 @@ class ControlPlaneConfiguration {
     @Bean
     AuditStore auditStore(MongoAuthStores authStores) {
         return authStores.audit();
+    }
+
+    @Bean
+    ClusterIdentityStore clusterIdentityStore(MongoAuthStores authStores) {
+        return authStores.clusterIdentity();
+    }
+
+    @Bean
+    ClusterIdentityService clusterIdentityService(ClusterIdentityStore store) {
+        return new ClusterIdentityService(store);
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----

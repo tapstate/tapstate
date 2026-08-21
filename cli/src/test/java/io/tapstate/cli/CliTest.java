@@ -78,6 +78,12 @@ class CliTest {
     }
 
     @Test
+    void liveViewVerbsAreOnlineLaunchesEvenThoughTheyProjectNoOperation() {
+        assertThat(Cli.LIVE_VIEW_VERBS).allSatisfy(verb ->
+                assertThat(Repl.isOnlineVerb(verb)).as(verb).isTrue());
+    }
+
+    @Test
     void mcpLauncherIsAOneShotMetaCommand() {
         Run help = run("mcp", "--help");
 

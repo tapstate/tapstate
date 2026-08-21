@@ -8,6 +8,7 @@ import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
+import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.ConnectorSpecStore;
@@ -49,6 +50,8 @@ import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResultStore;
+import io.tapstate.spi.store.ClusterIdentity;
+import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
@@ -470,12 +473,27 @@ class AuthTest {
         assertThat(body.params()).containsKey("reason");
     }
 
-    // ---- the liveness probe stays anonymous; topology does not ----
+    // ---- the liveness probe and discovery stay anonymous; topology does not ----
 
     @Test
     void theLivenessProbeStaysAnonymous() {
         String probe = client().get().uri("/healthz").retrieve().body(String.class);
         assertThat(probe).isEqualTo("ok");
+    }
+
+    @Test
+    void issuerDiscoveryStaysAnonymous() {
+        IssuerDiscoveryResponse discovery = client().get().uri(AuthWire.DISCOVERY_PATH)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    return response.bodyTo(IssuerDiscoveryResponse.class);
+                });
+
+        assertThat(discovery).isEqualTo(new IssuerDiscoveryResponse(
+                "urn:tapstate:cluster:01J5AUTHFIXTURE",
+                "01J5AUTHFIXTURE",
+                "tapstate/v1",
+                List.of("password", "machine_token")));
     }
 
     @Test
@@ -497,11 +515,13 @@ class AuthTest {
     @Test
     void theOnlyEndpointsOutsideTheApiPrefixAreTheProbeAndThePreAuthEntryPoints() {
         // /api is the authenticated boundary (the API security chain guards /api/**). Everything reachable
-        // anonymously must therefore be an intentional carve-out: the liveness probe, the two pre-auth
-        // entry points, and the framework's own error endpoint (which renders only the current request's
-        // error, no application data). A future plain @Controller added at the root would escape both the
-        // verb-derivation gate and the interceptor — this pins the anonymous surface to exactly that set.
-        Set<String> allowedRootPaths = Set.of("/healthz", "/auth/login", "/auth/bootstrap", "/error");
+        // anonymously must therefore be an intentional carve-out: the liveness probe, issuer discovery,
+        // the two pre-auth entry points, and the framework's own error endpoint (which renders only the
+        // current request's error, no application data). A future plain @Controller added at the root would
+        // escape both the verb-derivation gate and the interceptor — this pins the anonymous surface to
+        // exactly that set.
+        Set<String> allowedRootPaths = Set.of("/healthz", AuthWire.DISCOVERY_PATH, "/auth/login",
+                "/auth/bootstrap", "/error");
 
         RequestMappingHandlerMapping mapping =
                 context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
@@ -523,7 +543,7 @@ class AuthTest {
         });
 
         assertThat(unexpectedRootEndpoints)
-                .as("only the liveness probe and the pre-auth entry points may live outside /api; every "
+                .as("only the liveness probe, issuer discovery, and the pre-auth entry points may live outside /api; every "
                         + "other endpoint is a registry verb under the authenticated /api prefix")
                 .isEmpty();
     }
@@ -599,6 +619,23 @@ class AuthTest {
         @Bean
         TokenSigner tokenSigner() {
             return new FakeSigner();
+        }
+
+        @Bean
+        ClusterIdentityService clusterIdentityService() {
+            ClusterIdentity identity = new ClusterIdentity("01J5AUTHFIXTURE");
+            ClusterIdentityStore store = new ClusterIdentityStore() {
+                @Override
+                public Optional<ClusterIdentity> find() {
+                    return Optional.of(identity);
+                }
+
+                @Override
+                public ClusterIdentity createIfAbsent(ClusterIdentity proposed) {
+                    return identity;
+                }
+            };
+            return new ClusterIdentityService(store, () -> "unused");
         }
 
         @Bean

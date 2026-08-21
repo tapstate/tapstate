@@ -84,6 +84,7 @@ class ReplTest {
     private static final class FakeControlPlane implements ControlPlaneClient {
         private final Set<URI> healthy;
         final List<URI> probed = new ArrayList<>();
+        final List<URI> discovered = new ArrayList<>();
         /** The canned login outcome and a log of the login calls made ({@code user:pass@base}). */
         LoginOutcome loginOutcome = new LoginOutcome.Unreachable();
         final List<String> loginCalls = new ArrayList<>();
@@ -170,6 +171,15 @@ class ReplTest {
         public boolean isHealthy(URI baseUrl) {
             probed.add(baseUrl);
             return healthy.contains(baseUrl);
+        }
+
+        @Override
+        public DiscoveryOutcome discover(URI baseUrl) {
+            discovered.add(baseUrl);
+            return healthy.contains(baseUrl)
+                    ? new DiscoveryOutcome.Discovered("urn:tapstate:cluster:test-cluster", "test-cluster",
+                            "tapstate/v1", List.of("password", "machine_token"))
+                    : new DiscoveryOutcome.Unreachable();
         }
 
         /** Replaces the reachable set, so a test can knock a landing node down mid-session. */
@@ -786,66 +796,66 @@ class ReplTest {
 
     @Test
     void loginReadsAMaskedPasswordAndAuthenticatesOnSuccess() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-abc");
         ScriptedPrompter prompter = new ScriptedPrompter("s3cret");
         Harness h = harness(Path.of("tap-work"), client, prompter);
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         assertThat(h.repl().dispatch("login alice")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isTrue();
         assertThat(h.repl().session().principal()).isEqualTo("alice");
         assertThat(h.repl().session().credential()).isEqualTo("jwt-abc");
         assertThat(prompter.secretQuestions).isNotEmpty();   // the password was read masked, never echoed
-        assertThat(client.loginCalls).containsExactly("alice:s3cret@http://node1:7900");
+        assertThat(client.loginCalls).containsExactly("alice:s3cret@http://localhost:7900");
         assertThat(h.sink().toString()).contains("logged in as alice");
     }
 
     @Test
     void authenticatedPromptShowsThePrincipalAtTheNode() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-abc");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("s3cret"));
-        h.repl().dispatch("connect node1:7900");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(node1:7900)> ");   // connected, unauthenticated
+        h.repl().dispatch("connect localhost:7900");
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(localhost:7900)> ");   // connected, unauthenticated
         h.repl().dispatch("login alice");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(alice@node1:7900)> ");
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(alice@localhost:7900)> ");
     }
 
     @Test
     void loginRejectedRendersTheServerErrorAndStaysUnauthenticated() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Rejected("control.auth-failed", "Login failed.");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("wrong"));
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         assertThat(h.repl().dispatch("login alice")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isFalse();
         assertThat(h.sink().toString()).contains("control.auth-failed").contains("Login failed.");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(node1:7900)> ");   // stays connected-unauthenticated
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(localhost:7900)> ");   // stays connected-unauthenticated
     }
 
     @Test
     void loginUnreachableReportsAndStaysUnauthenticated() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Unreachable();
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         assertThat(h.repl().dispatch("login alice")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isFalse();
-        assertThat(h.sink().toString()).contains("login:").contains("node1:7900");
+        assertThat(h.sink().toString()).contains("login:").contains("localhost:7900");
     }
 
     @Test
     void logoutClearsAuthenticationButKeepsTheConnection() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
         assertThat(h.repl().dispatch("logout")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isFalse();
         assertThat(h.repl().session().isConnected()).isTrue();
         assertThat(h.sink().toString()).contains("logged out");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(node1:7900)> ");
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(localhost:7900)> ");
     }
 
     @Test
@@ -861,17 +871,18 @@ class ReplTest {
 
     @Test
     void failoverRelandsOnAnotherHealthyMemberKeepingTheCredential() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");      // both healthy -> lands n1, members = [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));   // n1 goes down
+        client.setHealthy(URI.create("http://localhost:7901"));   // the first seed goes down
         assertThat(h.repl().failover()).isTrue();
-        assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://n2:7900"));
+        assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://localhost:7901"));
         assertThat(h.repl().session().isAuthenticated()).isTrue();   // cluster-wide credential survives
         assertThat(h.repl().session().credential()).isEqualTo("jwt");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(alice@n2:7900)> ");
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(alice@localhost:7901)> ");
     }
 
     @Test
@@ -887,10 +898,10 @@ class ReplTest {
 
     @Test
     void failoverWithNoReachableMemberLosesTheConnection() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900");
+        h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
         client.setHealthy();   // nothing reachable
         assertThat(h.repl().failover()).isFalse();
@@ -926,20 +937,22 @@ class ReplTest {
 
     /** An authenticated session with stdout and stderr kept apart. */
     private static SplitHarness onlineSplitStreamSession(Path workdir, FakeControlPlane client) {
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         SplitHarness h = splitStreamHarness(workdir, client);
-        h.repl().dispatch("connect node1:7900");
-        h.repl().dispatch("login alice");
+        authenticateOnNode1(h.repl());
         return h;
     }
 
     /** Connects to a single healthy node and logs in, so a test starts from an authenticated session. */
     private static Harness onlineSession(Path workdir, FakeControlPlane client) {
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         Harness h = harness(workdir, client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect node1:7900");
-        h.repl().dispatch("login alice");
+        authenticateOnNode1(h.repl());
         return h;
+    }
+
+    private static void authenticateOnNode1(Repl repl) {
+        URI seed = URI.create("http://node1:7900");
+        repl.session().connect(List.of(seed), seed);
+        repl.session().authenticate("jwt-tok", "alice", null, List.of(seed));
     }
 
     // ---- the read shell ----
@@ -1288,10 +1301,8 @@ class ReplTest {
 
     /** An authenticated session whose interpolation reads {@code env} instead of the process environment. */
     private static Harness onlineSession(Path workdir, FakeControlPlane client, Map<String, String> env) {
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         Harness h = harness(workdir, client, new ScriptedPrompter("pw"), env);
-        h.repl().dispatch("connect node1:7900");
-        h.repl().dispatch("login alice");
+        authenticateOnNode1(h.repl());
         return h;
     }
 
@@ -1411,19 +1422,19 @@ class ReplTest {
     @Test
     void aRemovalThatGetsNoAnswerIsSentOnceAndNeverReplayedElsewhere() {
         FakeControlPlane client = new FakeControlPlane(
-                URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");       // lands n1, members = [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));    // n1 takes the removal, then goes quiet
+        client.setHealthy(URI.create("http://localhost:7901"));    // the first seed takes the removal, then goes quiet
         int mark = h.sink().toString().length();
 
         assertThat(h.repl().dispatch("delete src_kfk --if-match " + "a".repeat(64))).isTrue();
 
-        // One call, to the node that went quiet — n2 is reachable and would have taken a replay.
+        // One call, to the node that went quiet — the second seed is reachable and would have taken a replay.
         assertThat(client.deleteCalls).hasSize(1);
-        assertThat(client.deleteCalls.get(0)).contains("http://n1:7900");
+        assertThat(client.deleteCalls.get(0)).contains("http://localhost:7900");
         // And the report says which it is: neither "deleted" nor "not found", both of which would be
         // asserting something nobody here knows.
         assertThat(h.sink().toString().substring(mark)).contains("may or may not have been applied");
@@ -3007,7 +3018,7 @@ class ReplTest {
     @Test
     void onlineLsSourcesTheServerAndNeverTheLocalWorkspace(@TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);   // a real local workspace: source/src_kfk + pipeline/kfk2my
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of());
         Harness h = harness(base, client, new ScriptedPrompter("pw"));
         // precondition: offline, ls really does read these local artifacts (so the guard below is load-bearing)
@@ -3015,7 +3026,7 @@ class ReplTest {
         assertThat(h.sink().toString()).contains("src_kfk").contains("kfk2my");
         // once online, the same session's ls sources the (empty) server, not that local workspace
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
         int mark = h.sink().toString().length();
         h.repl().dispatch("ls");
@@ -3370,17 +3381,18 @@ class ReplTest {
 
     @Test
     void aLifecycleVerbFailsOverToAHealthyMemberAndRetriesOnceOnTheNewNode() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");   // land n1, members [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));   // n1 goes down before the request
+        client.setHealthy(URI.create("http://localhost:7901"));   // the first seed goes down before the request
         int mark = h.sink().toString().length();
         h.repl().dispatch("start pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("reconnected to n2:7900");
+        assertThat(out).contains("reconnected to localhost:7901");
         assertThat(out).contains("pl1").contains("running");
     }
 
@@ -3747,17 +3759,18 @@ class ReplTest {
 
     @Test
     void aReadVerbFailsOverToAHealthyMemberAndRetriesOnceOnTheNewNode() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");   // land n1, members [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));   // n1 goes down before the request
+        client.setHealthy(URI.create("http://localhost:7901"));   // the first seed goes down before the request
         int mark = h.sink().toString().length();
         h.repl().dispatch("status pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("reconnected to n2:7900");
+        assertThat(out).contains("reconnected to localhost:7901");
         assertThat(out).contains("pl1").contains("running");
     }
 
@@ -3778,31 +3791,32 @@ class ReplTest {
 
     @Test
     void anOnlineVerbFailsOverToAHealthyMemberAndRetriesOnceOnTheNewNode() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", "kind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");   // land n1, members [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));   // n1 goes down before the request
+        client.setHealthy(URI.create("http://localhost:7901"));   // the first seed goes down before the request
 
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("reconnected to n2:7900").contains("kind: source");
-        assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://n2:7900"));
-        // the verb was attempted on n1 (unreachable) then retried on n2 after failover, credential intact
+        assertThat(out).contains("reconnected to localhost:7901").contains("kind: source");
+        assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://localhost:7901"));
+        // the verb was attempted on the first seed (unreachable) then retried after failover, credential intact
         assertThat(client.getCalls).containsExactly(
-                "jwt-tok@http://n1:7900/src_kfk", "jwt-tok@http://n2:7900/src_kfk");
+                "jwt-tok@http://localhost:7900/src_kfk", "jwt-tok@http://localhost:7901/src_kfk");
     }
 
     @Test
     void anOnlineVerbWithNoReachableMemberLosesTheConnectionAndReportsItOnce() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact("x", "source", "kind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900");
+        h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
         client.setHealthy();   // every member is down
 
@@ -3883,16 +3897,49 @@ class ReplTest {
 
     @Test
     void aOneLineLaunchConnectsSignsInAndRunsTheCommand() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.listOutcome = new ListOutcome.Listed(List.of(
                 new RemoteArtifact("src_kfk", "source", "")));
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "ls");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "-p", "pw", "ls");
         int code = Cli.runSession(launch, client, () -> new ScriptedPrompter());
         assertThat(code).isZero();
         // the whole chain ran off one line: probe, credential exchange, then the verb against the server
-        assertThat(client.loginCalls).containsExactly("admin:pw@http://node1:7900");
+        assertThat(client.discovered).containsExactly(URI.create("http://localhost:7900"));
+        assertThat(client.loginCalls).containsExactly("admin:pw@http://localhost:7900");
         assertThat(client.listCalls).hasSize(1);
+    }
+
+    @Test
+    void aRemotePlaintextLaunchStopsBeforeReadingOrSendingThePassword() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        ScriptedPrompter prompter = new ScriptedPrompter("should-not-be-read");
+        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "ls")
+                .withEnv(name -> null);
+
+        int code = Cli.runSession(launch, client, () -> prompter);
+
+        assertThat(code).isNotZero();
+        assertThat(prompter.secretQuestions).isEmpty();
+        assertThat(client.discovered).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(client.listCalls).isEmpty();
+    }
+
+    @Test
+    void aRemotePlaintextReplLoginStopsBeforePromptingOrSendingThePassword() {
+        URI seed = URI.create("http://node1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        ScriptedPrompter prompter = new ScriptedPrompter("should-not-be-read");
+        Harness harness = harness(Path.of("tap-work"), client, prompter);
+
+        harness.repl().dispatch("connect node1:7900");
+        harness.repl().dispatch("login admin");
+
+        assertThat(prompter.secretQuestions).isEmpty();
+        assertThat(client.discovered).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(harness.sink().toString()).contains("cli.remote-plaintext");
     }
 
     @Test
@@ -3923,6 +3970,33 @@ class ReplTest {
     }
 
     @Test
+    void liveViewDispatcherLazilyConnectsTheExactWorkspaceContext(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://dev:7900");
+        ContextDefinition definition = new ContextDefinition(
+                java.util.UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"), List.of(seed),
+                new ContextTls(true),
+                java.util.UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed"));
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        PrintWriter writer = new PrintWriter(sink);
+        commandLine.setOut(writer);
+        commandLine.setErr(writer);
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null);
+
+        repl.dispatch(List.of("tail", "src.orders"));
+
+        assertThat(client.probed).containsExactly(seed);
+        assertThat(repl.session().isConnected()).isTrue();
+        assertThat(sink.toString()).contains("cli.not-authenticated").doesNotContain("cli.not-connected");
+    }
+
+    @Test
     void onlineDispatcherReportsContextRequiredWithoutGuessingATarget(@TempDir Path home) {
         ContextResolver resolver = new ContextResolver(ContextConfig::empty, name -> null);
         FakeControlPlane client = new FakeControlPlane();
@@ -3945,23 +4019,23 @@ class ReplTest {
     void aOneShotLaunchKeepsItsConnectionNoiseOffTheCommandsOutput() {
         // the point of the one-line form is piping the command's output somewhere; two lines about
         // having connected, ahead of it, land in whatever is reading the result
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.listOutcome = new ListOutcome.Listed(List.of(new RemoteArtifact("src", "source", "")));
         StringWriter sink = new StringWriter();
         Repl repl = replWritingTo(sink, client);
-        repl.signIn("node1:7900", "admin", () -> "pw", true);
+        repl.signIn("localhost:7900", "admin", () -> "pw", true);
         assertThat(sink.toString()).doesNotContain("connected to").doesNotContain("logged in as");
     }
 
     @Test
     void aSessionLaunchStillConfirmsThatItConnected() {
         // in a session those lines are the answer to what was just typed, so they stay
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         StringWriter sink = new StringWriter();
         Repl repl = replWritingTo(sink, client);
-        repl.signIn("node1:7900", "admin", () -> "pw", false);
+        repl.signIn("localhost:7900", "admin", () -> "pw", false);
         assertThat(sink.toString()).contains("connected to").contains("logged in as");
     }
 
@@ -3975,10 +4049,10 @@ class ReplTest {
 
     @Test
     void aOneLineLaunchYieldsTheCommandsOwnStatus() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.getOutcome = new GetOutcome.Absent();
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "get", "nope");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "-p", "pw", "get", "nope");
         assertThat(Cli.runSession(launch, client, () -> new ScriptedPrompter())).isNotZero();
     }
 
@@ -3995,9 +4069,9 @@ class ReplTest {
 
     @Test
     void aLaunchThatCannotSignInStopsBeforeRunningTheCommand() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Rejected("auth.bad-credentials", "Wrong password.");
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "nope", "ls");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "-p", "nope", "ls");
         assertThat(Cli.runSession(launch, client, () -> new ScriptedPrompter())).isNotZero();
         assertThat(client.listCalls).isEmpty();
     }
@@ -4024,12 +4098,12 @@ class ReplTest {
 
     @Test
     void anOmittedPasswordIsAskedForWhenTheEnvironmentHasNone() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "ls")
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "ls")
                 .withEnv(name -> null);
         Cli.runSession(launch, client, () -> new ScriptedPrompter("asked"));
-        assertThat(client.loginCalls).containsExactly("admin:asked@http://node1:7900");
+        assertThat(client.loginCalls).containsExactly("admin:asked@http://localhost:7900");
     }
 
     @Test
@@ -4044,12 +4118,12 @@ class ReplTest {
     void anOmittedPasswordFallsBackToTheEnvironmentBeforeAsking() {
         // the point of the fallback is that a script need not put the password in argv, where the
         // process list and the shell history can both read it
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "ls")
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "ls")
                 .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "from-env" : null);
         Cli.runSession(launch, client, () -> new ScriptedPrompter("asked"));
-        assertThat(client.loginCalls).containsExactly("admin:from-env@http://node1:7900");
+        assertThat(client.loginCalls).containsExactly("admin:from-env@http://localhost:7900");
     }
 
     // ---- the in-place view ----
