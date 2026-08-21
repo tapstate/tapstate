@@ -135,6 +135,12 @@ cli.context-not-found:
 cli.context-already-exists:
   message: "A context named `{name}` already exists."
   solution: "Edit the existing context or choose another name."
+cli.context-source-conflict:
+  message: "`--connect` and `--context` select different kinds of target and cannot be used together."
+  solution: "Keep `--connect` for a temporary target, or keep `--context` for a saved context."
+cli.context-required:
+  message: "The `{verb}` command needs a server context, but no target was selected."
+  solution: "Use `--context`, set `TAPSTATE_CONTEXT`, bind this exact workspace, or use `--connect` for a temporary target."
 dsl.unknown-field:
   message: "Unknown field '{field}' at {path}."
   solution: "Remove it, or run `tapstate explain` to see the fields allowed here."
