@@ -31,6 +31,9 @@ final class LaunchOptions {
     @Option(names = {"-c", "--connect"}, paramLabel = "URL")
     String connect;
 
+    @Option(names = "--context", paramLabel = "NAME")
+    String context;
+
     @Option(names = {"-u", "--user"}, paramLabel = "NAME")
     String user;
 
@@ -61,6 +64,11 @@ final class LaunchOptions {
         return connect;
     }
 
+    /** The durable context explicitly selected for this process, or null when none was named. */
+    String context() {
+        return context;
+    }
+
     /** The user to sign in as, or null when this launch only connects. */
     String user() {
         return user;
@@ -75,6 +83,16 @@ final class LaunchOptions {
     LaunchOptions withEnv(UnaryOperator<String> replacement) {
         this.env = replacement;
         return this;
+    }
+
+    /** Reads one launch-related environment variable through the injectable process environment. */
+    String environment(String name) {
+        return env.apply(name);
+    }
+
+    /** Whether mutually exclusive temporary and durable target flags were supplied together. */
+    boolean hasConflictingTargets() {
+        return connects() && context != null && !context.isBlank();
     }
 
     /**

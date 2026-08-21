@@ -125,7 +125,13 @@ enum CliError implements TapstateErrorCode {
     CONTEXT_NOT_FOUND("cli.context-not-found", Set.of("name")),
 
     /** A context manager create operation tried to reuse an existing name. */
-    CONTEXT_ALREADY_EXISTS("cli.context-already-exists", Set.of("name"));
+    CONTEXT_ALREADY_EXISTS("cli.context-already-exists", Set.of("name")),
+
+    /** Mutually exclusive temporary and durable context sources were supplied together. */
+    CONTEXT_SOURCE_CONFLICT("cli.context-source-conflict", Set.of()),
+
+    /** An online verb has no explicit, environment, or exact workspace target. */
+    CONTEXT_REQUIRED("cli.context-required", Set.of("verb"));
 
     private final String code;
     private final Set<String> placeholders;

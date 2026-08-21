@@ -46,6 +46,7 @@ import java.util.function.Supplier;
                 "                        $TAPSTATE_WORKDIR)",
                 "  -c, --connect URL   reach a server before doing anything else; takes the",
                 "                        same seed list as `connect`",
+                "      --context NAME  select a saved context for online commands",
                 "  -u, --user NAME     sign in as this user once connected (needs -c)",
                 "  -p, --password PW   the password; else $TAPSTATE_PASSWORD, else asked for.",
                 "                        A password here is readable in the process list and",
@@ -410,8 +411,16 @@ public final class Cli implements Runnable {
             System.exit(newCommandLine().execute(args));
             return;
         }
-        if (!launch.connects() && launch.isOneShot()) {
-            System.exit(newCommandLine().execute(args));      // the plain one-shot path, unchanged
+        if (launch.hasConflictingTargets()) {
+            CommandLine commandLine = newCommandLine();
+            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
+            System.exit(EXIT_USAGE);
+            return;
+        }
+        if (launch.isOneShot() && !Repl.isOnlineVerb(launch.command().get(0))) {
+            // Offline verbs finish before context resolution. Launch-only target flags are intentionally
+            // discarded here, so even a configured or temporary seed cannot cause DNS or a socket.
+            System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
         System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
@@ -436,8 +445,20 @@ public final class Cli implements Runnable {
      */
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter) {
+        Path home = Path.of(System.getProperty("user.home"));
+        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
+        return runSession(launch, controlPlane, prompter, resolver);
+    }
+
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver) {
         try {
-            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane);
+            if (launch.hasConflictingTargets()) {
+                Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
+                return EXIT_USAGE;
+            }
+            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, null,
+                    launch::environment, resolver, launch.context());
             if (launch.connects()) {
                 int established = repl.signIn(launch.connect(), launch.user(),
                         () -> launch.resolvePassword(prompter), launch.isOneShot());
@@ -446,7 +467,7 @@ public final class Cli implements Runnable {
                 }
             }
             if (launch.isOneShot()) {
-                repl.dispatch(launch.command());
+                repl.dispatch(launch.command(), true);
                 return repl.lastExitCode();
             }
             repl.run();

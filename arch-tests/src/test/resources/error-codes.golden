@@ -40,6 +40,8 @@ cli.context-config-permissions
 cli.context-config-version
 cli.context-invalid
 cli.context-not-found
+cli.context-required
+cli.context-source-conflict
 cli.connector-not-official
 cli.demo-workspace-exists
 cli.if-match-needs-one-resource

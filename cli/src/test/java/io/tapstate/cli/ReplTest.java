@@ -7,6 +7,7 @@ import picocli.CommandLine;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -3892,6 +3893,52 @@ class ReplTest {
         // the whole chain ran off one line: probe, credential exchange, then the verb against the server
         assertThat(client.loginCalls).containsExactly("admin:pw@http://node1:7900");
         assertThat(client.listCalls).hasSize(1);
+    }
+
+    @Test
+    void onlineDispatcherLazilyConnectsTheExactWorkspaceContext(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://dev:7900");
+        ContextDefinition definition = new ContextDefinition(
+                java.util.UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"), List.of(seed),
+                new ContextTls(true),
+                java.util.UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed"));
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        PrintWriter writer = new PrintWriter(sink);
+        commandLine.setOut(writer);
+        commandLine.setErr(writer);
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null);
+
+        repl.dispatch(List.of("ls"));
+
+        assertThat(client.probed).containsExactly(seed);
+        assertThat(repl.session().isConnected()).isTrue();
+        assertThat(sink.toString()).contains("cli.not-authenticated");
+    }
+
+    @Test
+    void onlineDispatcherReportsContextRequiredWithoutGuessingATarget(@TempDir Path home) {
+        ContextResolver resolver = new ContextResolver(ContextConfig::empty, name -> null);
+        FakeControlPlane client = new FakeControlPlane();
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        PrintWriter writer = new PrintWriter(sink);
+        commandLine.setOut(writer);
+        commandLine.setErr(writer);
+        Repl repl = new Repl(commandLine, home, client, new ScriptedPrompter(), name -> null,
+                resolver, null);
+
+        repl.dispatch(List.of("get", "missing"));
+
+        assertThat(client.probed).isEmpty();
+        assertThat(repl.session().isConnected()).isFalse();
+        assertThat(sink.toString()).contains("cli.context-required").doesNotContain("cli.not-connected");
     }
 
     @Test

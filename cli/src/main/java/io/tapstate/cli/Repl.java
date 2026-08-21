@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
@@ -106,6 +107,12 @@ final class Repl {
     /** The transport seam to a server; a network-free fake is injected in tests. */
     private final ControlPlaneClient controlPlane;
 
+    /** The one shared lazy target resolver; absent only in legacy unit seams that exercise no contexts. */
+    private final ContextResolver contextResolver;
+
+    /** The durable target selected at process launch, or null when resolution may use lower sources. */
+    private final String explicitContext;
+
     /** Reads the login password masked; a scripted fake is injected in tests, a JLine one bound in {@link #run}. */
     private Prompter prompter;
 
@@ -166,11 +173,23 @@ final class Repl {
 
     Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
          UnaryOperator<String> env) {
+        this(commandLine, workdir, controlPlane, prompter, env, null, null);
+    }
+
+    Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
+         UnaryOperator<String> env, ContextResolver contextResolver, String explicitContext) {
         this.commandLine = commandLine;
         this.workdir = workdir;
         this.controlPlane = controlPlane;
         this.prompter = prompter;
         this.env = env;
+        this.contextResolver = contextResolver;
+        this.explicitContext = explicitContext;
+    }
+
+    /** Whether this verb can be routed to the control plane when a context resolves. */
+    static boolean isOnlineVerb(String verb) {
+        return ONLINE_VERBS.contains(verb);
     }
 
     /** The live-view verb this line opens with, or null when it opens with something else. */
@@ -296,6 +315,17 @@ final class Repl {
         return dispatchWords(words);
     }
 
+    /** Dispatches a scripted command without letting lazy target setup contaminate its stdout. */
+    boolean dispatch(List<String> words, boolean quiet) {
+        boolean previous = this.quiet;
+        this.quiet = quiet;
+        try {
+            return dispatchWords(words);
+        } finally {
+            this.quiet = previous;
+        }
+    }
+
     private boolean dispatchLine(String trimmed) {
         if (trimmed.isEmpty()) {
             lastExitCode = Cli.EXIT_OK;
@@ -388,6 +418,13 @@ final class Repl {
                     DataBrowserCall.parseLive(verb, String.join(" ", words.subList(1, words.size()))), verb);
             return true;
         }
+        if (!session.isConnected() && ONLINE_VERBS.contains(words.get(0)) && contextResolver != null) {
+            int resolved = resolveTarget(words);
+            if (resolved != Cli.EXIT_OK) {
+                lastExitCode = resolved;
+                return true;
+            }
+        }
         if (session.isConnected() && ONLINE_VERBS.contains(words.get(0))) {
             lastExitCode = onlineVerb(words);
             return true;
@@ -395,6 +432,44 @@ final class Repl {
         // the offline path already had a status -- picocli returns one -- and it was being discarded
         lastExitCode = commandLine.execute(withWorkspace(words));
         return true;
+    }
+
+    /** Resolves and reaches a target only after dispatch has established that the verb is online. */
+    private int resolveTarget(List<String> words) {
+        String verb = words.get(0);
+        try {
+            Optional<ResolvedContext> resolution = contextResolver.resolve(null, explicitContext,
+                    workspaceFor(words));
+            if (resolution.isEmpty()) {
+                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
+                return Cli.EXIT_VERB_UNAVAILABLE;
+            }
+            ResolvedContext target = resolution.orElseThrow();
+            String seeds = switch (target) {
+                case ResolvedContext.Temporary temporary -> temporary.seedExpression();
+                case ResolvedContext.Named named -> named.definition().seeds().stream()
+                        .map(URI::toString)
+                        .collect(Collectors.joining(","));
+            };
+            return connect(List.of("connect", seeds));
+        } catch (io.tapstate.core.common.TapstateException error) {
+            Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    /** The exact workspace root named on this line, otherwise the session's current root. */
+    private Path workspaceFor(List<String> words) {
+        for (int i = 1; i < words.size(); i++) {
+            String word = words.get(i);
+            if ((word.equals("-w") || word.equals("--workdir")) && i + 1 < words.size()) {
+                return Path.of(words.get(i + 1));
+            }
+            if (word.startsWith("-w=") || word.startsWith("--workdir=")) {
+                return Path.of(word.substring(word.indexOf('=') + 1));
+            }
+        }
+        return workdir;
     }
 
     /**

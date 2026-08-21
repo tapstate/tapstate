@@ -765,6 +765,17 @@ class CliTest {
     }
 
     @Test
+    void contextIsARootLaunchOptionAndConflictsWithTemporaryConnect() {
+        LaunchOptions selected = LaunchOptions.parse("--context", "dev", "ls");
+
+        assertThat(selected.context()).isEqualTo("dev");
+        assertThat(selected.command()).containsExactly("ls");
+        assertThat(selected.hasConflictingTargets()).isFalse();
+        assertThat(LaunchOptions.parse("--connect", "node:8080", "--context", "dev", "ls")
+                .hasConflictingTargets()).isTrue();
+    }
+
+    @Test
     void aVerbMakesTheLaunchOneShot() {
         assertThat(LaunchOptions.parse("validate").isOneShot()).isTrue();
         assertThat(LaunchOptions.parse("new", "--kind", "source").isOneShot()).isTrue();
