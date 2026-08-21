@@ -35,7 +35,7 @@ class AuthController {
         this.bootstrapService = bootstrapService;
     }
 
-    @PostMapping("/auth/login")
+    @PostMapping(AuthWire.LOGIN_PATH)
     ResponseEntity<LoginResponse> login(@RequestBody LoginRequest request) {
         // A missing / blank credential field is a malformed request (a 400), distinct from a present-but-wrong
         // credential (the auth-failed 401 the service raises); refuse it here before the service's bare guard.

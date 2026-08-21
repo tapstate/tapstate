@@ -1,0 +1,1 @@
+{"token":"access.jwt.fixture","accessExpiresAt":"2026-08-17T10:15:00Z","issuer":"urn:tapstate:cluster:01J5FIXTURE","principal":"admin","scopes":["read","write","admin"],"sessionToken":"tss_s01.session-secret","sessionIdleExpiresAt":"2026-09-16T10:00:00Z","sessionAbsoluteExpiresAt":"2026-11-15T10:00:00Z"}

@@ -174,6 +174,19 @@ class AuthTest {
         assertThat(body.code()).isEqualTo("control.unauthenticated");
     }
 
+    @Test
+    void aUserSessionSchemeCanNeverAuthenticateTheApiBearerSurface() {
+        ApiError body = client().get().uri("/api/artifacts")
+                .header("Authorization", "TapstateSession tss_s01.session-secret")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.params()).isEmpty();
+    }
+
     // ---- the grade check refuses an under-scoped caller but admits a sufficient one ----
 
     @Test
