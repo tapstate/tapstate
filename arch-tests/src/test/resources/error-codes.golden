@@ -34,6 +34,12 @@ cli.alias-link-failed
 cli.alias-name-taken
 cli.artifact-exists
 cli.connect-failed
+cli.context-already-exists
+cli.context-config-invalid
+cli.context-config-permissions
+cli.context-config-version
+cli.context-invalid
+cli.context-not-found
 cli.if-match-needs-one-resource
 cli.kind-dir-mismatch
 cli.mcp-unavailable
