@@ -107,7 +107,25 @@ enum CliError implements TapstateErrorCode {
      * A version precondition was offered for a batch holding more than one resource; {@code count} is how
      * many it holds. One hash names one version, so there is no resource it could be describing.
      */
-    IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count"));
+    IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count")),
+
+    /** The context configuration is not a valid, unambiguous versioned document. */
+    CONTEXT_CONFIG_INVALID("cli.context-config-invalid", Set.of("path", "reason")),
+
+    /** No registered migration can safely interpret the context configuration version. */
+    CONTEXT_CONFIG_VERSION("cli.context-config-version", Set.of("path", "version")),
+
+    /** The context configuration path cannot prove that only its owner may change it. */
+    CONTEXT_CONFIG_PERMISSIONS("cli.context-config-permissions", Set.of("path", "reason")),
+
+    /** A context definition supplied to the manager violates the persisted schema. */
+    CONTEXT_INVALID("cli.context-invalid", Set.of("name", "reason")),
+
+    /** A context manager operation named a context that does not exist. */
+    CONTEXT_NOT_FOUND("cli.context-not-found", Set.of("name")),
+
+    /** A context manager create operation tried to reuse an existing name. */
+    CONTEXT_ALREADY_EXISTS("cli.context-already-exists", Set.of("name"));
 
     private final String code;
     private final Set<String> placeholders;

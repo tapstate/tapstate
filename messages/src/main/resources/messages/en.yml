@@ -126,6 +126,24 @@ cli.watch-needs-a-terminal:
 cli.if-match-needs-one-resource:
   message: "`--if-match` names one version, but this apply covers {count} resources."
   solution: "Apply the single file you are editing, or drop `--if-match` and let the batch apply unconditionally."
+cli.context-config-invalid:
+  message: "The context configuration at `{path}` is unsafe or invalid: {reason}"
+  solution: "Fix or remove the configuration file, then run the context manager again. The invalid file was not overwritten."
+cli.context-config-version:
+  message: "The context configuration at `{path}` uses unsupported schema version `{version}`."
+  solution: "Use a compatible tapstate release or migrate the configuration with a release that supports this version."
+cli.context-config-permissions:
+  message: "The context configuration path `{path}` is not owner-only: {reason}"
+  solution: "Restore ownership and owner-only permissions, then retry. Tapstate will not read or overwrite an unsafe file."
+cli.context-invalid:
+  message: "Context `{name}` is invalid: {reason}"
+  solution: "Use a non-empty name, at least one absolute HTTP(S) seed, and valid context settings."
+cli.context-not-found:
+  message: "No context named `{name}` exists."
+  solution: "Open the context manager and choose an existing context or create this one."
+cli.context-already-exists:
+  message: "A context named `{name}` already exists."
+  solution: "Edit the existing context or choose another name."
 dsl.unknown-field:
   message: "Unknown field '{field}' at {path}."
   solution: "Remove it, or run `tapstate explain` to see the fields allowed here."
