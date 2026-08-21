@@ -82,7 +82,43 @@ enum CliError implements TapstateErrorCode {
      * A version precondition was offered for a batch holding more than one resource; {@code count} is how
      * many it holds. One hash names one version, so there is no resource it could be describing.
      */
-    IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count"));
+    IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count")),
+
+    /** The context configuration is not a valid, unambiguous versioned document. */
+    CONTEXT_CONFIG_INVALID("cli.context-config-invalid", Set.of("path", "reason")),
+
+    /** No registered migration can safely interpret the context configuration version. */
+    CONTEXT_CONFIG_VERSION("cli.context-config-version", Set.of("path", "version")),
+
+    /** The context configuration path cannot prove that only its owner may change it. */
+    CONTEXT_CONFIG_PERMISSIONS("cli.context-config-permissions", Set.of("path", "reason")),
+
+    /** A context definition supplied to the manager violates the persisted schema. */
+    CONTEXT_INVALID("cli.context-invalid", Set.of("name", "reason")),
+
+    /** A context manager operation named a context that does not exist. */
+    CONTEXT_NOT_FOUND("cli.context-not-found", Set.of("name")),
+
+    /** A context manager create operation tried to reuse an existing name. */
+    CONTEXT_ALREADY_EXISTS("cli.context-already-exists", Set.of("name")),
+
+    /** Mutually exclusive temporary and durable context sources were supplied together. */
+    CONTEXT_SOURCE_CONFLICT("cli.context-source-conflict", Set.of()),
+
+    /** An online verb has no explicit, environment, or exact workspace target. */
+    CONTEXT_REQUIRED("cli.context-required", Set.of("verb")),
+
+    /** A non-loopback seed would expose authentication traffic over plaintext HTTP. */
+    REMOTE_PLAINTEXT("cli.remote-plaintext", Set.of("seed")),
+
+    /** A configured seed did not answer anonymous issuer discovery. */
+    ISSUER_DISCOVERY_FAILED("cli.issuer-discovery-failed", Set.of("seed")),
+
+    /** A seed answered discovery with fields that cannot identify a Tapstate cluster. */
+    ISSUER_DISCOVERY_INVALID("cli.issuer-discovery-invalid", Set.of("seed", "reason")),
+
+    /** A cached issuer or another seed differs from the anonymously discovered issuer. */
+    AUTH_ISSUER_MISMATCH("cli.auth-issuer-mismatch", Set.of("expected", "actual", "seed"));
 
     private final String code;
     private final Set<String> placeholders;

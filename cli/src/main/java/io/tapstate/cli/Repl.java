@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
@@ -106,6 +107,12 @@ final class Repl {
     /** The transport seam to a server; a network-free fake is injected in tests. */
     private final ControlPlaneClient controlPlane;
 
+    /** The one shared lazy target resolver; absent only in legacy unit seams that exercise no contexts. */
+    private final ContextResolver contextResolver;
+
+    /** The durable target selected at process launch, or null when resolution may use lower sources. */
+    private final String explicitContext;
+
     /** Reads the login password masked; a scripted fake is injected in tests, a JLine one bound in {@link #run}. */
     private Prompter prompter;
 
@@ -166,11 +173,23 @@ final class Repl {
 
     Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
          UnaryOperator<String> env) {
+        this(commandLine, workdir, controlPlane, prompter, env, null, null);
+    }
+
+    Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
+         UnaryOperator<String> env, ContextResolver contextResolver, String explicitContext) {
         this.commandLine = commandLine;
         this.workdir = workdir;
         this.controlPlane = controlPlane;
         this.prompter = prompter;
         this.env = env;
+        this.contextResolver = contextResolver;
+        this.explicitContext = explicitContext;
+    }
+
+    /** Whether this verb can be routed to the control plane when a context resolves. */
+    static boolean isOnlineVerb(String verb) {
+        return ONLINE_VERBS.contains(verb) || Cli.LIVE_VIEW_VERBS.contains(verb);
     }
 
     /** The live-view verb this line opens with, or null when it opens with something else. */
@@ -256,7 +275,7 @@ final class Repl {
             if (connected != Cli.EXIT_OK || username == null || username.isBlank()) {
                 return connected;
             }
-            return login(username, password.get());
+            return login(username, password);
         } finally {
             this.quiet = false;
         }
@@ -294,6 +313,17 @@ final class Repl {
      */
     boolean dispatch(List<String> words) {
         return dispatchWords(words);
+    }
+
+    /** Dispatches a scripted command without letting lazy target setup contaminate its stdout. */
+    boolean dispatch(List<String> words, boolean quiet) {
+        boolean previous = this.quiet;
+        this.quiet = quiet;
+        try {
+            return dispatchWords(words);
+        } finally {
+            this.quiet = previous;
+        }
     }
 
     private boolean dispatchLine(String trimmed) {
@@ -388,6 +418,13 @@ final class Repl {
                     DataBrowserCall.parseLive(verb, String.join(" ", words.subList(1, words.size()))), verb);
             return true;
         }
+        if (!session.isConnected() && ONLINE_VERBS.contains(words.get(0)) && contextResolver != null) {
+            int resolved = resolveTarget(words);
+            if (resolved != Cli.EXIT_OK) {
+                lastExitCode = resolved;
+                return true;
+            }
+        }
         if (session.isConnected() && ONLINE_VERBS.contains(words.get(0))) {
             lastExitCode = onlineVerb(words);
             return true;
@@ -395,6 +432,44 @@ final class Repl {
         // the offline path already had a status -- picocli returns one -- and it was being discarded
         lastExitCode = commandLine.execute(withWorkspace(words));
         return true;
+    }
+
+    /** Resolves and reaches a target only after dispatch has established that the verb is online. */
+    private int resolveTarget(List<String> words) {
+        String verb = words.get(0);
+        try {
+            Optional<ResolvedContext> resolution = contextResolver.resolve(null, explicitContext,
+                    workspaceFor(words));
+            if (resolution.isEmpty()) {
+                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
+                return Cli.EXIT_VERB_UNAVAILABLE;
+            }
+            ResolvedContext target = resolution.orElseThrow();
+            String seeds = switch (target) {
+                case ResolvedContext.Temporary temporary -> temporary.seedExpression();
+                case ResolvedContext.Named named -> named.definition().seeds().stream()
+                        .map(URI::toString)
+                        .collect(Collectors.joining(","));
+            };
+            return connect(List.of("connect", seeds));
+        } catch (io.tapstate.core.common.TapstateException error) {
+            Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    /** The exact workspace root named on this line, otherwise the session's current root. */
+    private Path workspaceFor(List<String> words) {
+        for (int i = 1; i < words.size(); i++) {
+            String word = words.get(i);
+            if ((word.equals("-w") || word.equals("--workdir")) && i + 1 < words.size()) {
+                return Path.of(words.get(i + 1));
+            }
+            if (word.startsWith("-w=") || word.startsWith("--workdir=")) {
+                return Path.of(word.substring(word.indexOf('=') + 1));
+            }
+        }
+        return workdir;
     }
 
     /**
@@ -692,6 +767,12 @@ final class Repl {
             err.println(verb + ": " + malformed.reason());
             err.flush();
             return Cli.EXIT_USAGE;
+        }
+        if (!session.isConnected() && contextResolver != null) {
+            int resolved = resolveTarget(List.of(verb));
+            if (resolved != Cli.EXIT_OK) {
+                return resolved;
+            }
         }
         if (!session.isConnected()) {
             Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", verb));
@@ -2981,27 +3062,33 @@ final class Repl {
             err.flush();
             return Cli.EXIT_USAGE;
         }
-        return login(words.get(1), prompter.secret("Password"));
+        return login(words.get(1), () -> prompter.secret("Password"));
     }
 
     /**
-     * Signs in with a password already in hand. Split from the typed {@code login} so the password can
-     * come from somewhere other than the prompt — a one-line launch supplies its own — without either
-     * path having to know where the other got it.
+     * Signs in only after the connected seeds pass anonymous issuer discovery. The password supplier
+     * keeps an interactive prompt behind that preflight while allowing one-line launches to provide it.
      */
-    private int login(String username, String password) {
-        PrintWriter out = commandLine.getOut();
+    private int login(String username, Supplier<String> password) {
         PrintWriter err = commandLine.getErr();
-        URI node = session.landingNode();
-        return switch (controlPlane.login(node, username, password)) {
+        IssuerBinding.Verified verified;
+        try {
+            verified = new IssuerBinding(controlPlane).verify(session.seeds(), null);
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(err, failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+        return switch (verified.withCredential(password.get(),
+                (node, credential) -> controlPlane.login(node, username, credential))) {
             case LoginOutcome.Success success -> {
+                session.reland(verified.seed());
                 session.authenticate(success.token(), username, null, session.seeds());
                 confirm("logged in as " + username);
                 yield Cli.EXIT_OK;
             }
             case LoginOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case LoginOutcome.Unreachable ignored -> {
-                err.println("login: cannot reach " + hostPort(node));
+                err.println("login: cannot reach " + hostPort(verified.seed()));
                 err.flush();
                 yield Cli.EXIT_DIAGNOSTIC;
             }

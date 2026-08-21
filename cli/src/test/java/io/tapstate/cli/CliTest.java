@@ -78,6 +78,12 @@ class CliTest {
     }
 
     @Test
+    void liveViewVerbsAreOnlineLaunchesEvenThoughTheyProjectNoOperation() {
+        assertThat(Cli.LIVE_VIEW_VERBS).allSatisfy(verb ->
+                assertThat(Repl.isOnlineVerb(verb)).as(verb).isTrue());
+    }
+
+    @Test
     void mcpLauncherIsAOneShotMetaCommand() {
         Run help = run("mcp", "--help");
 
@@ -762,6 +768,17 @@ class CliTest {
         // the seed honours the flag with the option's own precedence
         assertThat(LaunchOptions.parse("-w", "foo").root()).isEqualTo(Path.of("foo"));
         assertThat(LaunchOptions.parse("--workdir=bar").root()).isEqualTo(Path.of("bar"));
+    }
+
+    @Test
+    void contextIsARootLaunchOptionAndConflictsWithTemporaryConnect() {
+        LaunchOptions selected = LaunchOptions.parse("--context", "dev", "ls");
+
+        assertThat(selected.context()).isEqualTo("dev");
+        assertThat(selected.command()).containsExactly("ls");
+        assertThat(selected.hasConflictingTargets()).isFalse();
+        assertThat(LaunchOptions.parse("--connect", "node:8080", "--context", "dev", "ls")
+                .hasConflictingTargets()).isTrue();
     }
 
     @Test

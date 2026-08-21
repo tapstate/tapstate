@@ -117,6 +117,44 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public DiscoveryOutcome discover(URI baseUrl) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/.well-known/tapstate"))
+                    .timeout(probeTimeout)
+                    .GET()
+                    .build();
+            HttpResponse<String> response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                Object parsed;
+                try {
+                    parsed = JsonReader.parse(response.body());
+                } catch (RuntimeException malformed) {
+                    return new DiscoveryOutcome.Invalid("response-body");
+                }
+                if (!(parsed instanceof Map<?, ?> fields)) {
+                    return new DiscoveryOutcome.Invalid("response-shape");
+                }
+                try {
+                    return new DiscoveryOutcome.Discovered(
+                            stringOrNull(fields.get("issuer")),
+                            stringOrNull(fields.get("clusterId")),
+                            stringOrNull(fields.get("apiVersion")),
+                            requiredStringList(fields.get("authModes")));
+                } catch (IllegalArgumentException invalid) {
+                    return new DiscoveryOutcome.Invalid("response-contract");
+                }
+            }
+            Rejection rejected = rejection(response.body(), "Issuer discovery was refused by the server.");
+            return new DiscoveryOutcome.Rejected(rejected.code(), rejected.message());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new DiscoveryOutcome.Unreachable();
+        } catch (IOException | RuntimeException failure) {
+            return new DiscoveryOutcome.Unreachable();
+        }
+    }
+
+    @Override
     public LoginOutcome login(URI baseUrl, String username, String password) {
         try {
             Map<String, String> payload = new LinkedHashMap<>();
@@ -679,6 +717,21 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     strings.add(string);
                 }
             }
+        }
+        return strings;
+    }
+
+    /** A discovery auth-mode array must contain strings only; malformed entries cannot be ignored. */
+    private static List<String> requiredStringList(Object value) {
+        if (!(value instanceof List<?> list)) {
+            throw new IllegalArgumentException("authModes must be an array");
+        }
+        List<String> strings = new ArrayList<>(list.size());
+        for (Object element : list) {
+            if (!(element instanceof String string)) {
+                throw new IllegalArgumentException("authModes must contain strings only");
+            }
+            strings.add(string);
         }
         return strings;
     }

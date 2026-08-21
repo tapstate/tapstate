@@ -182,7 +182,9 @@ run_cli() {
 }
 
 run_cli ls >"$out_dir/read-before.txt"
-grep -qx 'no resources' "$out_dir/read-before.txt" || fail 'legacy read did not report an empty server'
+# A fresh deployment registers its managed state store as `views` during startup. Seeing it here proves that
+# the legacy client exchanged a human credential and decoded the candidate server's authenticated list reply.
+grep -qx 'source  views' "$out_dir/read-before.txt" || fail 'legacy read did not list the managed state store'
 
 run_cli apply "$workspace" >"$out_dir/write-apply.txt"
 grep -q 'created' "$out_dir/write-apply.txt" || fail 'legacy write did not create the test workspace'
