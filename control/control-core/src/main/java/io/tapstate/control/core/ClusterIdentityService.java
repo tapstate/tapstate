@@ -22,7 +22,14 @@ public final class ClusterIdentityService {
         this.ids = Objects.requireNonNull(ids, "ids");
     }
 
-    public ClusterIdentity identity() {
+    /** Returns the storage identity inside control-core; presentation layers use {@link #identityView()}. */
+    ClusterIdentity identity() {
         return store.find().orElseGet(() -> store.createIfAbsent(new ClusterIdentity(ids.get())));
+    }
+
+    /** Projects the stable identity without exposing the storage port type to presentation layers. */
+    public ClusterIdentityView identityView() {
+        ClusterIdentity identity = identity();
+        return new ClusterIdentityView(identity.issuer(), identity.clusterId());
     }
 }

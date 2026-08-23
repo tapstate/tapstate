@@ -23,6 +23,15 @@ class ClusterIdentityServiceTest {
         assertThat(afterRestart.issuer()).isEqualTo("urn:tapstate:cluster:01J5FIRST");
     }
 
+    @Test
+    void exposesAControlCoreProjectionWithoutLeakingTheStorageIdentity() {
+        ClusterIdentityView view = new ClusterIdentityService(new MemoryStore(), () -> "01J5VIEW")
+                .identityView();
+
+        assertThat(view.clusterId()).isEqualTo("01J5VIEW");
+        assertThat(view.issuer()).isEqualTo("urn:tapstate:cluster:01J5VIEW");
+    }
+
     private static final class MemoryStore implements ClusterIdentityStore {
         private final AtomicReference<ClusterIdentity> identity = new AtomicReference<>();
 

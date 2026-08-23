@@ -1,7 +1,7 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.ClusterIdentityView;
 import io.tapstate.control.core.ClusterIdentityService;
-import io.tapstate.spi.store.ClusterIdentity;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
@@ -21,7 +21,7 @@ class IssuerDiscoveryController {
 
     @GetMapping(AuthWire.DISCOVERY_PATH)
     ResponseEntity<IssuerDiscoveryResponse> discover() {
-        ClusterIdentity identity = identities.getObject().identity();
+        ClusterIdentityView identity = identities.getObject().identityView();
         return ResponseEntity.ok(new IssuerDiscoveryResponse(
                 identity.issuer(),
                 identity.clusterId(),
