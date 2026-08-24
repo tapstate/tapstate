@@ -10,8 +10,12 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.UserPrincipal;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -20,6 +24,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -216,6 +221,103 @@ class AuthFileStoreTest {
     }
 
     @Test
+    void rejectsWrongOwnerAuthFileBeforeParsing(@TempDir Path home) throws IOException {
+        Path authDir = Files.createDirectories(home.resolve(".tapstate/auth"));
+        ownerOnlyDirectory(home.resolve(".tapstate"));
+        ownerOnlyDirectory(authDir);
+        Path authFile = authDir.resolve(AUTH_REF + ".json");
+        Files.writeString(authFile, "not-json-owned-by-someone-else", StandardCharsets.UTF_8);
+        ownerOnlyFile(authFile);
+        UserPrincipal wrongOwner = () -> "wrong-owner-fixture";
+        AuthFileStore store = AuthFileStore.underHome(home, directory -> { }, verified -> { }, path -> {
+            if (path.equals(authFile)) {
+                return wrongOwner;
+            }
+            return Files.getOwner(path, LinkOption.NOFOLLOW_LINKS);
+        });
+
+        assertThatThrownBy(() -> store.load(AUTH_REF, CONTEXT_ID))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-cache-permissions"));
+    }
+
+    @Test
+    void rejectsAuthFileSwappedToLinkBetweenVerificationAndDescriptorRead(@TempDir Path home) throws IOException {
+        AuthFileStore.underHome(home).save(RECORD, false);
+        Path authDir = home.resolve(".tapstate/auth");
+        Path authFile = authDir.resolve(AUTH_REF + ".json");
+        Path outside = home.resolve("outside.json");
+        String outsideJson = validJson().replace("tss_s01.session-secret", "tss_s99.outside-secret");
+        Files.writeString(outside, outsideJson, StandardCharsets.UTF_8);
+        AtomicInteger swaps = new AtomicInteger();
+        AuthFileStore store = AuthFileStore.underHome(home, directory -> { }, verified -> {
+            if (verified.equals(authFile) && swaps.getAndIncrement() == 0) {
+                Files.delete(authFile);
+                Files.createSymbolicLink(authFile, outside);
+            }
+        });
+
+        Throwable thrown = catchThrowable(() -> store.load(AUTH_REF, CONTEXT_ID));
+
+        assertThat(thrown).isInstanceOfSatisfying(TapstateException.class, error -> {
+            assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid");
+            assertThat(error.args()).containsEntry("reason", "file changed while it was being opened");
+            assertThat(error.getMessage()).doesNotContain("tss_s99.outside-secret");
+        });
+        assertThat(swaps).hasValue(1);
+        assertThat(Files.readString(outside)).isEqualTo(outsideJson);
+    }
+
+    @Test
+    void rejectsSameSizeRegularReplacementWhenFileKeysAreUnavailable(@TempDir Path home) throws IOException {
+        AuthFileStore.underHome(home).save(RECORD, false);
+        Path authDir = home.resolve(".tapstate/auth");
+        Path authFile = authDir.resolve(AUTH_REF + ".json");
+        String replacementJson = validJson().replace("tss_s01.session-secret", "tss_s99.session-secret");
+        assertThat(replacementJson.getBytes(StandardCharsets.UTF_8))
+                .hasSize(validJson().getBytes(StandardCharsets.UTF_8).length);
+        AtomicInteger swaps = new AtomicInteger();
+        AuthFileStore store = AuthFileStore.underHome(home, directory -> { }, verified -> {
+            if (verified.equals(authFile) && swaps.getAndIncrement() == 0) {
+                Files.delete(authFile);
+                Files.writeString(authFile, replacementJson, StandardCharsets.UTF_8);
+                ownerOnlyFile(authFile);
+            }
+        }, path -> Files.getOwner(path, LinkOption.NOFOLLOW_LINKS), path -> new NullFileKeyAttributes(
+                Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS)));
+
+        Throwable thrown = catchThrowable(() -> store.load(AUTH_REF, CONTEXT_ID));
+
+        assertThat(thrown).isInstanceOfSatisfying(TapstateException.class, error -> {
+            assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid");
+            assertThat(error.args()).containsEntry("reason", "file identity cannot be verified");
+            assertThat(error.getMessage()).doesNotContain("tss_s99.session-secret");
+        });
+        assertThat(swaps).hasValue(1);
+        assertThat(Files.readString(authFile)).isEqualTo(replacementJson);
+    }
+
+    @Test
+    void interactiveSaveFallsBackToMemoryOnlyWhenFileIdentityCannotBeEstablished(@TempDir Path home) {
+        AuthFileStore store = storeWithNullFileKeys(home);
+
+        assertThat(store.save(RECORD, true)).isEqualTo(AuthFileStore.SaveResult.MEMORY_ONLY);
+        assertThat(home.resolve(".tapstate/auth").resolve(AUTH_REF + ".json")).doesNotExist();
+    }
+
+    @Test
+    void nonInteractiveSaveRejectsWhenFileIdentityCannotBeEstablished(@TempDir Path home) {
+        AuthFileStore store = storeWithNullFileKeys(home);
+
+        assertThatThrownBy(() -> store.save(RECORD, false))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).isEqualTo("cli.auth-cache-permissions");
+                    assertThat(error.args()).containsEntry("reason", "file identity cannot be verified");
+                });
+        assertThat(home.resolve(".tapstate/auth").resolve(AUTH_REF + ".json")).doesNotExist();
+    }
+
+    @Test
     void ttyFallsBackToMemoryOnlyWhenPersistencePermissionsCannotBeProved(@TempDir Path home) throws IOException {
         Path authDir = Files.createDirectories(home.resolve(".tapstate/auth"));
         ownerOnlyDirectory(home.resolve(".tapstate"));
@@ -313,4 +415,60 @@ class AuthFileStoreTest {
                     Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
         }
     }
+
+    private static AuthFileStore storeWithNullFileKeys(Path home) {
+        return AuthFileStore.underHome(home, directory -> { }, verified -> { },
+                path -> Files.getOwner(path, LinkOption.NOFOLLOW_LINKS),
+                path -> new NullFileKeyAttributes(
+                        Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS)));
+    }
+
+    private record NullFileKeyAttributes(BasicFileAttributes delegate) implements BasicFileAttributes {
+
+        @Override
+        public FileTime lastModifiedTime() {
+            return delegate.lastModifiedTime();
+        }
+
+        @Override
+        public FileTime lastAccessTime() {
+            return delegate.lastAccessTime();
+        }
+
+        @Override
+        public FileTime creationTime() {
+            return delegate.creationTime();
+        }
+
+        @Override
+        public boolean isRegularFile() {
+            return delegate.isRegularFile();
+        }
+
+        @Override
+        public boolean isDirectory() {
+            return delegate.isDirectory();
+        }
+
+        @Override
+        public boolean isSymbolicLink() {
+            return delegate.isSymbolicLink();
+        }
+
+        @Override
+        public boolean isOther() {
+            return delegate.isOther();
+        }
+
+        @Override
+        public long size() {
+            return delegate.size();
+        }
+
+        @Override
+        public Object fileKey() {
+            return null;
+        }
+    }
+
 }

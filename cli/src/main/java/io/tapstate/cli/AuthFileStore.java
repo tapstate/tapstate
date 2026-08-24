@@ -59,16 +59,31 @@ final class AuthFileStore {
     private final Path root;
     private final Path authDir;
     private final DirectorySynchronizer directorySynchronizer;
+    private final VerifiedFileOpenHook verifiedFileOpenHook;
+    private final OwnerReader ownerReader;
+    private final AttributeReader attributeReader;
 
     private AuthFileStore(Path home) {
         this(home, AuthFileStore::syncDirectory);
     }
 
     private AuthFileStore(Path home, DirectorySynchronizer directorySynchronizer) {
+        this(home, directorySynchronizer, path -> { }, AuthFileStore::ownerOf, AuthFileStore::attributesOf);
+    }
+
+    private AuthFileStore(
+            Path home,
+            DirectorySynchronizer directorySynchronizer,
+            VerifiedFileOpenHook verifiedFileOpenHook,
+            OwnerReader ownerReader,
+            AttributeReader attributeReader) {
         this.home = home.toAbsolutePath().normalize();
         this.root = this.home.resolve(".tapstate");
         this.authDir = root.resolve("auth");
         this.directorySynchronizer = directorySynchronizer;
+        this.verifiedFileOpenHook = verifiedFileOpenHook;
+        this.ownerReader = ownerReader;
+        this.attributeReader = attributeReader;
     }
 
     static AuthFileStore underHome(Path home) {
@@ -77,6 +92,31 @@ final class AuthFileStore {
 
     static AuthFileStore underHome(Path home, DirectorySynchronizer directorySynchronizer) {
         return new AuthFileStore(home, directorySynchronizer);
+    }
+
+    static AuthFileStore underHome(
+            Path home, DirectorySynchronizer directorySynchronizer, VerifiedFileOpenHook verifiedFileOpenHook) {
+        return new AuthFileStore(
+                home, directorySynchronizer, verifiedFileOpenHook, AuthFileStore::ownerOf,
+                AuthFileStore::attributesOf);
+    }
+
+    static AuthFileStore underHome(
+            Path home,
+            DirectorySynchronizer directorySynchronizer,
+            VerifiedFileOpenHook verifiedFileOpenHook,
+            OwnerReader ownerReader) {
+        return new AuthFileStore(
+                home, directorySynchronizer, verifiedFileOpenHook, ownerReader, AuthFileStore::attributesOf);
+    }
+
+    static AuthFileStore underHome(
+            Path home,
+            DirectorySynchronizer directorySynchronizer,
+            VerifiedFileOpenHook verifiedFileOpenHook,
+            OwnerReader ownerReader,
+            AttributeReader attributeReader) {
+        return new AuthFileStore(home, directorySynchronizer, verifiedFileOpenHook, ownerReader, attributeReader);
     }
 
     synchronized Optional<AuthSessionRecord> load(UUID authRef, UUID contextId) {
@@ -89,10 +129,10 @@ final class AuthFileStore {
         if (!entryExists(file)) {
             return Optional.empty();
         }
-        verifyFile(file);
+        BasicFileAttributes verifiedAttributes = verifyFile(file);
         String json;
         try {
-            json = readNoFollow(file);
+            json = readNoFollow(file, verifiedAttributes);
         } catch (IOException failure) {
             throw invalid(file, "cannot read file: " + safeReason(failure), failure);
         }
@@ -279,7 +319,7 @@ final class AuthFileStore {
             }
             channel.force(true);
         }
-        verifyFile(path);
+        verifyPersistenceIdentity(path, verifyFile(path));
     }
 
     private void verifyDirectory(Path directory) {
@@ -291,7 +331,7 @@ final class AuthFileStore {
         verifyOwnerOnly(directory, DIRECTORY_PERMISSIONS);
     }
 
-    private void verifyFile(Path file) {
+    private BasicFileAttributes verifyFile(Path file) {
         BasicFileAttributes attributes = attributes(file);
         if (attributes.isSymbolicLink() || !attributes.isRegularFile()) {
             throw invalid(file, "path must be a regular file and not a link", null);
@@ -302,11 +342,12 @@ final class AuthFileStore {
         verifySingleLink(file);
         verifyOwner(file, home);
         verifyOwnerOnly(file, FILE_PERMISSIONS);
+        return attributes;
     }
 
     private BasicFileAttributes attributes(Path path) {
         try {
-            return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            return attributeReader.attributes(path);
         } catch (IOException failure) {
             throw invalid(path, "cannot inspect path: " + safeReason(failure), failure);
         }
@@ -327,8 +368,8 @@ final class AuthFileStore {
 
     private void verifyOwner(Path path, Path ownerReference) {
         try {
-            UserPrincipal actual = Files.getOwner(path, LinkOption.NOFOLLOW_LINKS);
-            UserPrincipal expected = Files.getOwner(ownerReference, LinkOption.NOFOLLOW_LINKS);
+            UserPrincipal actual = ownerReader.owner(path);
+            UserPrincipal expected = ownerReader.owner(ownerReference);
             if (!actual.equals(expected)) {
                 throw permissions(path, "owner differs from the user home", null);
             }
@@ -474,9 +515,19 @@ final class AuthFileStore {
         return Files.exists(path, LinkOption.NOFOLLOW_LINKS);
     }
 
-    private static String readNoFollow(Path path) throws IOException {
+    private static UserPrincipal ownerOf(Path path) throws IOException {
+        return Files.getOwner(path, LinkOption.NOFOLLOW_LINKS);
+    }
+
+    private static BasicFileAttributes attributesOf(Path path) throws IOException {
+        return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+    }
+
+    private String readNoFollow(Path path, BasicFileAttributes verifiedAttributes) throws IOException {
         try (var channel = Files.newByteChannel(path, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
              var output = new ByteArrayOutputStream()) {
+            verifiedFileOpenHook.afterOpen(path);
+            verifySameIdentity(path, verifiedAttributes, attributes(path));
             ByteBuffer buffer = ByteBuffer.allocate(8192);
             while (channel.read(buffer) >= 0) {
                 buffer.flip();
@@ -487,6 +538,24 @@ final class AuthFileStore {
                 }
             }
             return output.toString(StandardCharsets.UTF_8);
+        }
+    }
+
+    private static void verifySameIdentity(
+            Path path, BasicFileAttributes expected, BasicFileAttributes actual) {
+        Object expectedKey = expected.fileKey();
+        Object actualKey = actual.fileKey();
+        if (expectedKey == null || actualKey == null) {
+            throw invalid(path, "file identity cannot be verified", null);
+        }
+        if (!expectedKey.equals(actualKey)) {
+            throw invalid(path, "file changed while it was being opened", null);
+        }
+    }
+
+    private static void verifyPersistenceIdentity(Path path, BasicFileAttributes attributes) {
+        if (attributes.fileKey() == null) {
+            throw permissions(path, "file identity cannot be verified", null);
         }
     }
 
@@ -586,6 +655,24 @@ final class AuthFileStore {
     interface DirectorySynchronizer {
 
         void sync(Path directory) throws IOException;
+    }
+
+    @FunctionalInterface
+    interface VerifiedFileOpenHook {
+
+        void afterOpen(Path path) throws IOException;
+    }
+
+    @FunctionalInterface
+    interface OwnerReader {
+
+        UserPrincipal owner(Path path) throws IOException;
+    }
+
+    @FunctionalInterface
+    interface AttributeReader {
+
+        BasicFileAttributes attributes(Path path) throws IOException;
     }
 
     private static final class PersistenceOutcomeUncertain extends IOException {
