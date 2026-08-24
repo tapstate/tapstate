@@ -28,6 +28,8 @@ import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineRepresentation;
+import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.SessionService;
@@ -77,8 +79,10 @@ import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
@@ -286,6 +290,40 @@ class PipelineApiTest {
         });
     }
 
+    @Test
+    void listAndGetExposeTheStaticPipelineViewWithoutCanonicalYamlOrObservationState() {
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_X);
+
+        ResponseEntity<Map> listed = client().get().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+
+        assertThat(listed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(listed.getBody()).containsOnlyKeys("items");
+        assertThat((List<?>) listed.getBody().get("items")).hasSize(1);
+
+        ResponseEntity<Map> got = client().get().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+
+        assertThat(got.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(got.getHeaders().getETag()).matches("\"[0-9a-f]{64}\"");
+        assertPipelineView(got.getBody());
+        Map<?, ?> source = (Map<?, ?>) ((List<?>) got.getBody().get("sources")).getFirst();
+        assertThat(source.get("id")).isEqualTo("src_x");
+        assertThat(source.get("connector")).isEqualTo("mysql");
+
+        ApiError missing = client().get().uri("/api/pipelines/ghost")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(missing.code()).isEqualTo("pipeline.not-found");
+        assertThat(missing.params()).containsEntry("id", "ghost");
+    }
+
     // ---- the endpoint table is a derivation of the registry: the pipeline verbs project onto /api ----
 
     @Test
@@ -309,9 +347,10 @@ class PipelineApiTest {
         });
 
         assertThat(projectedPipelineVerbs)
-                .as("the full pipeline surface — four lifecycle writes and four observation reads — projects "
+                .as("the full pipeline surface — static reads, lifecycle writes, and observation reads — projects "
                         + "onto the authenticated /api surface (this test boots the whole face bundle)")
                 .containsExactlyInAnyOrder(
+                        "pipeline.list", "pipeline.get",
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs");
     }
@@ -325,6 +364,18 @@ class PipelineApiTest {
     /** The revision of a pipeline is the content hash of its canonical form — the value apply stamps. */
     private static String revisionOf(String dsl) {
         return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+    }
+
+    private static void assertPipelineView(Map<?, ?> view) {
+        for (String field : List.of("id", "sources", "settings", "serve", "contentHash")) {
+            assertThat(view.containsKey(field)).as(field).isTrue();
+        }
+        assertThat(view.get("id")).isEqualTo("pl1");
+        assertThat(String.valueOf(view.get("contentHash"))).matches("[0-9a-f]{64}");
+        for (String forbidden : List.of(
+                "version", "kind", "canonicalForm", "desiredState", "state", "metrics", "logs")) {
+            assertThat(view.containsKey(forbidden)).as(forbidden).isFalse();
+        }
     }
 
     private void seedUser(String username, String password, String role) {
@@ -361,6 +412,13 @@ class PipelineApiTest {
                   source: tgt_x
                   write_mode: upsert
                   ddl: apply
+            """;
+
+    private static final String SOURCE_X = """
+            version: tapstate/v1
+            kind: source
+            id: src_x
+            connector: mysql
             """;
 
     /**
@@ -511,6 +569,17 @@ class PipelineApiTest {
         @Bean
         ArtifactQueryService artifactQueryService(ArtifactStore store) {
             return new ArtifactQueryService(store);
+        }
+
+        @Bean
+        PipelineRepresentation pipelineRepresentation() {
+            return new PipelineRepresentation();
+        }
+
+        @Bean
+        PipelineViewService pipelineViewService(
+                ArtifactQueryService artifactQueryService, PipelineRepresentation representation) {
+            return new PipelineViewService(artifactQueryService, representation);
         }
 
         // The removal controller comes in with the whole ControlHttpFace bundle, so its service must be

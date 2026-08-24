@@ -161,9 +161,15 @@ public final class ControlOperations {
     // outside the registry. Reading topology mutates nothing, so it is read-scoped and unaudited.
     public static final Operation CLUSTER_MEMBERS = new Operation("cluster.members", Scope.READ, false, null, CLI_ONLY);
 
-    // pipeline domain: the four lifecycle verbs. Each writes the pipeline's desired state (an intent the
-    // runtime later converges), so all four are write-scoped and audited. There is no rewind verb — a
-    // re-dig is stop then start composed at the surface.
+    // pipeline domain: static projection reads and the four lifecycle verbs. Each lifecycle verb writes
+    // the pipeline's desired state (an intent the runtime later converges), so all four are write-scoped
+    // and audited. There is no rewind verb — a re-dig is stop then start composed at the surface.
+    public static final Operation PIPELINE_LIST = new Operation(
+            "pipeline.list", Scope.READ, false, null,
+            "List static Pipeline artifacts with resolved Source summaries.", CLI_ONLY);
+    public static final Operation PIPELINE_GET = new Operation(
+            "pipeline.get", Scope.READ, false, null,
+            "Get one static Pipeline artifact with resolved Source summaries.", CLI_ONLY);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
@@ -223,6 +229,8 @@ public final class ControlOperations {
             DATA_BROWSER_FIND,
             DATA_BROWSER_STATS,
             CLUSTER_MEMBERS,
+            PIPELINE_LIST,
+            PIPELINE_GET,
             PIPELINE_START,
             PIPELINE_STOP,
             PIPELINE_PAUSE,

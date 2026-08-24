@@ -102,6 +102,7 @@ class ApiExceptionHandler {
             // removal stands and must not be retried.
             case "artifact.reclaim-incomplete" -> HttpStatus.INTERNAL_SERVER_ERROR;
             case "connector.not-found" -> HttpStatus.NOT_FOUND;
+            case "pipeline.not-found" -> HttpStatus.NOT_FOUND;
             // A request refused at the HTTP boundary as structurally malformed is a client input error, like dsl.*.
             case "control.malformed-request" -> HttpStatus.BAD_REQUEST;
             // A lifecycle verb on a pipeline that was never applied is a 404; a verb the state machine forbids

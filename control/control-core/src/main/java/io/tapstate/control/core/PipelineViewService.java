@@ -1,5 +1,6 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -7,6 +8,7 @@ import io.tapstate.core.model.SourceResource;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -36,6 +38,13 @@ public final class PipelineViewService {
         return artifacts.getResource(id)
                 .filter(stored -> stored.resource() instanceof PipelineResource)
                 .map(this::view);
+    }
+
+    /** Returns a typed Pipeline view or the stable Pipeline not-found diagnostic. */
+    public PipelineView get(String id) {
+        Objects.requireNonNull(id, "id");
+        return find(id).orElseThrow(() -> new TapstateException(
+                PipelineError.NOT_FOUND, Map.of("id", id), null));
     }
 
     private PipelineView view(StoredResource stored) {
