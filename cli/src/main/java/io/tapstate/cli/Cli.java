@@ -47,6 +47,7 @@ import java.util.function.Supplier;
                 "  -c, --connect URL   reach a server before doing anything else; takes the",
                 "                        same seed list as `connect`",
                 "      --context NAME  select a saved context for online commands",
+                "                        (or place it after an auth action)",
                 "  -u, --user NAME     sign in as this user once connected (needs -c); the password",
                 "                        comes from $TAPSTATE_PASSWORD or a masked prompt",
                 ""},

@@ -5,6 +5,7 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 
+import java.util.ArrayList;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.function.Supplier;
@@ -136,6 +137,60 @@ final class LaunchOptions {
                 // verb's own options must reach the command table, not be parsed as launch options here
                 .setStopAtPositional(true)
                 .parseArgs(args);
+        options.rejectBlankContext();
+        options.consumeAuthContextAfterAction();
         return options;
+    }
+
+    /** Rejects an explicitly supplied root selector that cannot name a context. */
+    private void rejectBlankContext() {
+        if (context != null && context.isBlank()) {
+            throw new IllegalArgumentException("--context needs a non-empty name");
+        }
+    }
+
+    /**
+     * Lets one-shot auth follow the documented {@code auth <action> --context NAME} spelling without
+     * making unrelated command options look like launch options. The scanner rejects incomplete, empty,
+     * and duplicate selectors before resolving a context, so malformed input cannot reach a server.
+     */
+    private void consumeAuthContextAfterAction() {
+        if (command.size() < 2 || !command.getFirst().equals("auth")) {
+            return;
+        }
+        if (command.get(1).equals("--context") || command.get(1).startsWith("--context=")) {
+            throw new IllegalArgumentException("auth action must precede --context");
+        }
+        List<String> remaining = new ArrayList<>(command.size());
+        remaining.add(command.getFirst());
+        remaining.add(command.get(1));
+        for (int index = 2; index < command.size(); index++) {
+            String word = command.get(index);
+            if (word.equals("--context") && index + 1 < command.size()
+                    && !command.get(index + 1).startsWith("-")) {
+                selectTrailingAuthContext(command.get(++index));
+                continue;
+            }
+            if (word.startsWith("--context=")) {
+                selectTrailingAuthContext(word.substring("--context=".length()));
+                continue;
+            }
+            if (word.equals("--context")) {
+                throw new IllegalArgumentException("auth --context needs a non-empty name");
+            }
+            remaining.add(word);
+        }
+        command = List.copyOf(remaining);
+    }
+
+    /** Records exactly one non-empty trailing context selector for an auth command. */
+    private void selectTrailingAuthContext(String value) {
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("auth --context needs a non-empty name");
+        }
+        if (context != null) {
+            throw new IllegalArgumentException("auth accepts only one --context selector");
+        }
+        context = value;
     }
 }

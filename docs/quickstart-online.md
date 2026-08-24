@@ -372,8 +372,8 @@ tapstate(offline:work)> ls pipeline
 resumed admin@local
 ```
 
-Use `./tapstate-cli/bin/tapstate --context local auth status` to inspect the saved
-session and `./tapstate-cli/bin/tapstate --context local auth logout` to revoke it and
+Use `./tapstate-cli/bin/tapstate auth status --context local` to inspect the saved
+session and `./tapstate-cli/bin/tapstate auth logout --context local` to revoke it and
 remove the local cache. `connect` remains a temporary diagnostic connection: a later
 `connect` and `login` change only the current REPL process and do not update a context or
 save a session.

@@ -171,7 +171,7 @@ class SessionResumePtyIT {
                 Map.of(workspace.toRealPath().toString(), "dev"));
 
         ProcessResult login = runInPty(home, workspace, true, PASSWORD + "\n",
-                "--context", "dev", "auth", "login", USERNAME);
+                "auth", "login", USERNAME, "--context", "dev");
 
         assertThat(login.exitCode()).as("masked login exits successfully").isZero();
         assertThat(login.stdout().contains("signed in as " + USERNAME))
@@ -195,7 +195,7 @@ class SessionResumePtyIT {
         assertThat(((Map<?, ?>) response).get("connectors")).isInstanceOf(List.class);
 
         ProcessResult logout = runWithoutTerminal(home, workspace,
-                "--context", "dev", "auth", "logout");
+                "auth", "logout", "--context", "dev");
 
         assertThat(logout.exitCode()).isZero();
         assertThat(logout.stdout()).contains("session revoked and local cache removed");

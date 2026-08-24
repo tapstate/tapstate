@@ -89,6 +89,43 @@ class CliTest {
     }
 
     @Test
+    void authMaySelectItsContextAfterTheAction() {
+        LaunchOptions login = LaunchOptions.parse("auth", "login", "alice", "--context", "dev");
+        LaunchOptions status = LaunchOptions.parse("auth", "status", "--context=dev");
+        LaunchOptions logout = LaunchOptions.parse("auth", "logout", "--context", "dev", "--local-only");
+        LaunchOptions unrelated = LaunchOptions.parse("connectors", "--context", "dev");
+
+        assertThat(login.context()).isEqualTo("dev");
+        assertThat(login.command()).containsExactly("auth", "login", "alice");
+        assertThat(status.context()).isEqualTo("dev");
+        assertThat(status.command()).containsExactly("auth", "status");
+        assertThat(logout.context()).isEqualTo("dev");
+        assertThat(logout.command()).containsExactly("auth", "logout", "--local-only");
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "--context", "dev", "status"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(unrelated.context()).isNull();
+        assertThat(unrelated.command()).containsExactly("connectors", "--context", "dev");
+    }
+
+    @Test
+    void authRejectsMalformedOrDuplicateTrailingContextsBeforeSessionDispatch() {
+        assertThatThrownBy(() -> LaunchOptions.parse("--context=", "auth", "status"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("--context", "", "auth", "logout"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "status", "--context"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "status", "--context="))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "login", "alice",
+                "--context", "dev", "--context", "production"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("--context", "production",
+                "auth", "status", "--context", "dev"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void contextHelpIsAUsefulNarrowInteractiveSurface() {
         Run direct = run("context", "--help");
         Run helpCommand = run("help", "context");

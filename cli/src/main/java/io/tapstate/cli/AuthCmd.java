@@ -10,6 +10,7 @@ import java.util.concurrent.Callable;
         description = {
                 "Sign in to a named context, inspect its cached session, or revoke it.",
                 "login stores only an opaque owner-only session; logout revokes it remotely by default.",
+                "For one-shot auth, --context NAME may follow the action as well as precede auth.",
                 "Use logout --local-only only when the server is unreachable; the remote session then",
                 "remains valid until it expires."
         })
