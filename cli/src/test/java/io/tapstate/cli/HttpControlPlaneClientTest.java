@@ -269,6 +269,63 @@ class HttpControlPlaneClientTest {
         assertThat(outcome).isInstanceOf(LoginOutcome.Unreachable.class);
     }
 
+    // --- session exchange: POST /auth/session with TapstateSession auth ---------------------------
+
+    @Test
+    void sessionExchangeUsesTapstateSessionAuthorizationAndDecodesTheAccessGrant() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/auth/session", 200,
+                "{\"token\":\"jwt-access\",\"accessExpiresAt\":\"2026-08-17T10:15:00Z\","
+                        + "\"issuer\":\"urn:tapstate:cluster:01J5FIXTURE\",\"principal\":\"admin\","
+                        + "\"scopes\":[\"read\",\"write\",\"admin\"]}",
+                seen);
+        try {
+            SessionExchangeOutcome outcome = new HttpControlPlaneClient()
+                    .exchangeSession(baseOf(server), "tss_s01.session-secret");
+
+            assertThat(outcome).isEqualTo(new SessionExchangeOutcome.Success(
+                    "jwt-access", java.time.Instant.parse("2026-08-17T10:15:00Z"),
+                    "urn:tapstate:cluster:01J5FIXTURE", "admin", List.of("read", "write", "admin")));
+            assertThat(seen.get().method()).isEqualTo("POST");
+            assertThat(seen.get().authorization()).isEqualTo("TapstateSession tss_s01.session-secret");
+            assertThat(seen.get().body()).isEmpty();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sessionExchangeRefusalKeepsTheServerCodeWithoutLeakingTheSecret() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/auth/session", 401,
+                "{\"code\":\"control.auth-session-revoked\",\"message\":\"Session revoked.\",\"params\":{}}",
+                seen);
+        try {
+            SessionExchangeOutcome outcome = new HttpControlPlaneClient()
+                    .exchangeSession(baseOf(server), "tss_s01.session-secret");
+
+            assertThat(outcome).isEqualTo(
+                    new SessionExchangeOutcome.Rejected("control.auth-session-revoked", "Session revoked."));
+            assertThat(outcome.toString()).doesNotContain("tss_s01.session-secret");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sessionExchangeTreatsTransientServerFailuresAsUnreachableRatherThanCredentialRejection()
+            throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/auth/session", 503, "<html>maintenance</html>", seen);
+        try {
+            assertThat(new HttpControlPlaneClient().exchangeSession(baseOf(server), "tss_s01.session-secret"))
+                    .isInstanceOf(SessionExchangeOutcome.Unreachable.class);
+            assertThat(seen.get().authorization()).isEqualTo("TapstateSession tss_s01.session-secret");
+        } finally {
+            server.stop(0);
+        }
+    }
+
     // --- online verbs: apply / get / list under /api, authenticated by a bearer credential ---------
 
     /** What the fake server saw for one request: method, path, query, the Authorization header, and body. */

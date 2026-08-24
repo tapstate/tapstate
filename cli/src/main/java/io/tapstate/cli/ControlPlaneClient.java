@@ -31,6 +31,14 @@ interface ControlPlaneClient extends AutoCloseable {
     LoginOutcome login(URI baseUrl, String username, String password);
 
     /**
+     * Exchanges an opaque cached user session via {@code POST {baseUrl}/auth/session}; the presented
+     * credential uses the {@code TapstateSession} auth scheme and returns a short-lived bearer token.
+     */
+    default SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
+        return new SessionExchangeOutcome.Unreachable();
+    }
+
+    /**
      * Applies a batch of authored drafts via {@code POST {baseUrl}/api/artifacts:apply}, authenticated by
      * the bearer {@code credential}: the per-artifact results on success, a coded rejection when the server
      * refuses (a validation failure is a {@code dsl.*} code), or unreachable on any I/O failure. Never throws.

@@ -118,6 +118,21 @@ enum CliError implements TapstateErrorCode {
     /** The context configuration path cannot prove that only its owner may change it. */
     CONTEXT_CONFIG_PERMISSIONS("cli.context-config-permissions", Set.of("path", "reason")),
 
+    /** The auth cache is not a valid, unambiguous versioned session document. */
+    AUTH_CACHE_INVALID("cli.auth-cache-invalid", Set.of("path", "reason")),
+
+    /** No registered CLI release can safely interpret the auth cache version. */
+    AUTH_CACHE_VERSION("cli.auth-cache-version", Set.of("path", "version")),
+
+    /** The auth cache path cannot prove that only its owner may read or change it. */
+    AUTH_CACHE_PERMISSIONS("cli.auth-cache-permissions", Set.of("path", "reason")),
+
+    /** A cached session could not be exchanged because the server rejected it. */
+    AUTH_SESSION_REJECTED("cli.auth-session-rejected", Set.of("code", "principal")),
+
+    /** A cached session could not be exchanged because no server answered safely. */
+    AUTH_SESSION_UNREACHABLE("cli.auth-session-unreachable", Set.of("principal")),
+
     /** A context definition supplied to the manager violates the persisted schema. */
     CONTEXT_INVALID("cli.context-invalid", Set.of("name", "reason")),
 

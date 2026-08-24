@@ -184,6 +184,34 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/auth/session"))
+                    .timeout(probeTimeout)
+                    .header("Authorization", "TapstateSession " + sessionToken)
+                    .header("Accept", "application/json")
+                    .POST(HttpRequest.BodyPublishers.noBody())
+                    .build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                SessionExchangeOutcome.Success exchanged = sessionExchange(response.body());
+                return exchanged == null ? new SessionExchangeOutcome.Unreachable() : exchanged;
+            }
+            if (response.statusCode() == 401 || response.statusCode() == 403) {
+                Rejection rejected = rejection(response.body(), "Session exchange was refused by the server.");
+                return new SessionExchangeOutcome.Rejected(rejected.code(), rejected.message());
+            }
+            return new SessionExchangeOutcome.Unreachable();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new SessionExchangeOutcome.Unreachable();
+        } catch (IOException | RuntimeException failure) {
+            return new SessionExchangeOutcome.Unreachable();
+        }
+    }
+
+    @Override
     public DataBrowserOutcome.Collections collections(URI baseUrl, String credential, String sourceId) {
         ControlResponse response = sharedClient.get(
                 baseUrl, credential, "/api/sources/" + urlSegment(sourceId) + "/collections");
@@ -1372,6 +1400,34 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             }
         } catch (RuntimeException malformed) {
             // a malformed body has no usable field
+        }
+        return null;
+    }
+
+    /** The successful {@code /auth/session} response, or null when the body cannot be trusted. */
+    private static SessionExchangeOutcome.Success sessionExchange(String body) {
+        try {
+            if (JsonReader.parse(body) instanceof Map<?, ?> map
+                    && map.get("token") instanceof String token
+                    && map.get("accessExpiresAt") instanceof String accessExpiresAt
+                    && map.get("issuer") instanceof String issuer
+                    && map.get("principal") instanceof String principal
+                    && map.get("scopes") instanceof List<?> rawScopes
+                    && !token.isBlank()
+                    && !issuer.isBlank()
+                    && !principal.isBlank()) {
+                List<String> scopes = new ArrayList<>();
+                for (Object scope : rawScopes) {
+                    if (!(scope instanceof String text) || text.isBlank()) {
+                        return null;
+                    }
+                    scopes.add(text);
+                }
+                return new SessionExchangeOutcome.Success(
+                        token, Instant.parse(accessExpiresAt), issuer, principal, scopes);
+            }
+        } catch (RuntimeException malformed) {
+            // A malformed 200 body is not a usable exchange and must not authenticate the process.
         }
         return null;
     }
