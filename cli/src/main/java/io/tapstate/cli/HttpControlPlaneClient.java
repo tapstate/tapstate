@@ -156,10 +156,18 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public LoginOutcome login(URI baseUrl, String username, String password) {
+        return login(baseUrl, username, password, false);
+    }
+
+    @Override
+    public LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
         try {
-            Map<String, String> payload = new LinkedHashMap<>();
+            Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("username", username);
             payload.put("password", password);
+            if (createSession) {
+                payload.put("createSession", true);
+            }
             HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/auth/login"))
                     .timeout(probeTimeout)
                     .header("Content-Type", "application/json")
@@ -168,18 +176,45 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
-                String token = stringField(response.body(), "token");
-                return token == null || token.isBlank()
-                        ? new LoginOutcome.Unreachable()   // a 200 with no token is not a usable success
-                        : new LoginOutcome.Success(token);
+                LoginOutcome.Success success = loginSuccess(response.body(), createSession, password);
+                return success == null ? new LoginOutcome.Unreachable() : success;
             }
-            Rejection r = rejection(response.body(), "Login was refused by the server.");
-            return new LoginOutcome.Rejected(r.code(), r.message());
+            if (response.statusCode() == 401 || response.statusCode() == 403) {
+                Rejection r = rejection(response.body(), "Login was refused by the server.");
+                return new LoginOutcome.Rejected(r.code(), r.message());
+            }
+            return new LoginOutcome.Unreachable();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new LoginOutcome.Unreachable();
         } catch (IOException | RuntimeException e) {
             return new LoginOutcome.Unreachable();
+        }
+    }
+
+    @Override
+    public SessionLogoutOutcome logoutSession(URI baseUrl, String sessionToken) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/auth/logout"))
+                    .timeout(probeTimeout)
+                    .header("Authorization", "TapstateSession " + sessionToken)
+                    .POST(HttpRequest.BodyPublishers.noBody())
+                    .build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200 || response.statusCode() == 204) {
+                return new SessionLogoutOutcome.Success();
+            }
+            if (response.statusCode() == 401 || response.statusCode() == 403) {
+                Rejection rejected = rejection(response.body(), "Session logout was refused by the server.");
+                return new SessionLogoutOutcome.Rejected(rejected.code(), rejected.message());
+            }
+            return new SessionLogoutOutcome.Unreachable();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new SessionLogoutOutcome.Unreachable();
+        } catch (IOException | RuntimeException failure) {
+            return new SessionLogoutOutcome.Unreachable();
         }
     }
 
@@ -1430,6 +1465,42 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // A malformed 200 body is not a usable exchange and must not authenticate the process.
         }
         return null;
+    }
+
+    /** A successful login response, with the incremental session contract when requested. */
+    private static LoginOutcome.Success loginSuccess(String body, boolean requireSession, String password) {
+        try {
+            if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                    || !(map.get("token") instanceof String token) || token.isBlank()) {
+                return null;
+            }
+            if (!requireSession) {
+                return new LoginOutcome.Success(token);
+            }
+            if (!(map.get("accessExpiresAt") instanceof String accessExpiresAt)
+                    || !(map.get("issuer") instanceof String issuer) || issuer.isBlank()
+                    || !(map.get("principal") instanceof String principal) || principal.isBlank()
+                    || !(map.get("scopes") instanceof List<?> rawScopes)
+                    || !(map.get("sessionToken") instanceof String sessionToken)
+                    || !LoginOutcome.isValidSessionToken(sessionToken)
+                    || sessionToken.equals(token)
+                    || sessionToken.equals(password)
+                    || !(map.get("sessionIdleExpiresAt") instanceof String idleExpiresAt)
+                    || !(map.get("sessionAbsoluteExpiresAt") instanceof String absoluteExpiresAt)) {
+                return null;
+            }
+            List<String> scopes = new ArrayList<>();
+            for (Object scope : rawScopes) {
+                if (!(scope instanceof String text) || text.isBlank()) {
+                    return null;
+                }
+                scopes.add(text);
+            }
+            return new LoginOutcome.Success(token, Instant.parse(accessExpiresAt), issuer, principal, scopes,
+                    sessionToken, Instant.parse(idleExpiresAt), Instant.parse(absoluteExpiresAt));
+        } catch (RuntimeException malformed) {
+            return null;
+        }
     }
 
     /** A parsed coded refusal: the server's code and message, or a fixed generic message if not coded. */

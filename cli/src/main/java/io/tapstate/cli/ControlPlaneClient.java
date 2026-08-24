@@ -30,12 +30,22 @@ interface ControlPlaneClient extends AutoCloseable {
      */
     LoginOutcome login(URI baseUrl, String username, String password);
 
+    /** Requests an opaque persistent user session in addition to the short-lived access token. */
+    default LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
+        return createSession ? new LoginOutcome.Unreachable() : login(baseUrl, username, password);
+    }
+
     /**
      * Exchanges an opaque cached user session via {@code POST {baseUrl}/auth/session}; the presented
      * credential uses the {@code TapstateSession} auth scheme and returns a short-lived bearer token.
      */
     default SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
         return new SessionExchangeOutcome.Unreachable();
+    }
+
+    /** Revokes an opaque cached user session. */
+    default SessionLogoutOutcome logoutSession(URI baseUrl, String sessionToken) {
+        return new SessionLogoutOutcome.Unreachable();
     }
 
     /**

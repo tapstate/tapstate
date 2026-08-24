@@ -8,6 +8,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -35,9 +36,12 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Owner-only, atomic persistence for opaque CLI auth sessions. */
 final class AuthFileStore {
+
+    private static final Map<Path, Object> JVM_LOCKS = new ConcurrentHashMap<>();
 
     private static final Set<PosixFilePermission> DIRECTORY_PERMISSIONS = Set.of(
             PosixFilePermission.OWNER_READ,
@@ -111,7 +115,12 @@ final class AuthFileStore {
             throw new IllegalArgumentException("only the current auth cache version can be saved");
         }
         try {
-            saveStrict(record);
+            ensureDirectory(root, home);
+            ensureDirectory(authDir, root);
+            withAuthLock(record.authRef(), () -> {
+                saveStrict(record);
+                return null;
+            });
             return SaveResult.PERSISTED;
         } catch (TapstateException coded) {
             if (interactiveTerminal && coded.code() == CliError.AUTH_CACHE_PERMISSIONS
@@ -119,6 +128,34 @@ final class AuthFileStore {
                 return SaveResult.MEMORY_ONLY;
             }
             throw coded;
+        }
+    }
+
+    /** Deletes only the exact session that the caller acted on, never a newer replacement. */
+    synchronized DeleteResult delete(AuthSessionRecord expected) {
+        if (!entryExists(authDir)) {
+            return DeleteResult.ABSENT;
+        }
+        verifyDirectory(root);
+        verifyDirectory(authDir);
+        return withAuthLock(expected.authRef(), () -> deleteLocked(expected));
+    }
+
+    private DeleteResult deleteLocked(AuthSessionRecord expected) {
+        Path file = authFile(expected.authRef());
+        Optional<AuthSessionRecord> current = load(expected.authRef(), expected.contextId());
+        if (current.isEmpty()) {
+            return DeleteResult.ABSENT;
+        }
+        if (!current.orElseThrow().equals(expected)) {
+            return DeleteResult.CHANGED;
+        }
+        try {
+            Files.delete(file);
+            directorySynchronizer.sync(authDir);
+            return DeleteResult.DELETED;
+        } catch (IOException failure) {
+            throw permissions(file, safeReason(failure), failure);
         }
     }
 
@@ -175,6 +212,35 @@ final class AuthFileStore {
             throw invalid(file, "auth file path escapes the auth directory", null);
         }
         return file;
+    }
+
+    private Path lockFile(UUID authRef) {
+        return authDir.resolve(".auth.lock-" + authRef).normalize();
+    }
+
+    private <T> T withAuthLock(UUID authRef, LockedOperation<T> operation) {
+        Path lockPath = lockFile(authRef);
+        Object jvmLock = JVM_LOCKS.computeIfAbsent(lockPath, ignored -> new Object());
+        synchronized (jvmLock) {
+            FileAttribute<?>[] attributes = supportsPosix(authDir)
+                    ? new FileAttribute<?>[]{PosixFilePermissions.asFileAttribute(FILE_PERMISSIONS)}
+                    : new FileAttribute<?>[0];
+            try (FileChannel channel = FileChannel.open(lockPath,
+                    Set.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS),
+                    attributes)) {
+                if (!supportsPosix(authDir)) {
+                    installOwnerOnlyAcl(lockPath);
+                }
+                verifyFile(lockPath);
+                try (FileLock ignored = channel.lock()) {
+                    return operation.run();
+                }
+            } catch (TapstateException coded) {
+                throw coded;
+            } catch (IOException | RuntimeException failure) {
+                throw permissions(lockPath, safeReason(failure), failure);
+            }
+        }
     }
 
     private void ensureDirectory(Path directory, Path ownerReference) {
@@ -502,6 +568,18 @@ final class AuthFileStore {
     enum SaveResult {
         PERSISTED,
         MEMORY_ONLY
+    }
+
+    enum DeleteResult {
+        DELETED,
+        ABSENT,
+        CHANGED
+    }
+
+    @FunctionalInterface
+    private interface LockedOperation<T> {
+
+        T run();
     }
 
     @FunctionalInterface

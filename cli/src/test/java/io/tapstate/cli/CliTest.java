@@ -78,6 +78,17 @@ class CliTest {
     }
 
     @Test
+    void authHelpIsUsefulThroughBothSupportedHelpForms() {
+        Run direct = run("auth", "--help");
+        Run helpCommand = run("help", "auth");
+
+        assertThat(direct.code()).isZero();
+        assertThat(helpCommand.code()).isZero();
+        assertThat(direct.out()).contains("tapstate auth <login|status|logout>").contains("--local-only");
+        assertThat(helpCommand.out()).contains("tapstate auth <login|status|logout>").contains("--local-only");
+    }
+
+    @Test
     void liveViewVerbsAreOnlineLaunchesEvenThoughTheyProjectNoOperation() {
         assertThat(Cli.LIVE_VIEW_VERBS).allSatisfy(verb ->
                 assertThat(Repl.isOnlineVerb(verb)).as(verb).isTrue());

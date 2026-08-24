@@ -352,7 +352,17 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             self.end_headers()
     def do_GET(self):
-        self._send(200 if self.path == "/healthz" else 404)
+        if self.path == "/healthz":
+            self._send(200)
+        elif self.path == "/.well-known/tapstate":
+            self._send(200, {
+                "issuer": "urn:tapstate:cluster:native-smoke",
+                "clusterId": "native-smoke",
+                "apiVersion": "tapstate/v1",
+                "authModes": ["password", "machine_token"],
+            })
+        else:
+            self._send(404)
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if self.path == "/auth/login":

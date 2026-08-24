@@ -13,12 +13,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -88,6 +93,10 @@ class ReplTest {
         /** The canned login outcome and a log of the login calls made ({@code user:pass@base}). */
         LoginOutcome loginOutcome = new LoginOutcome.Unreachable();
         final List<String> loginCalls = new ArrayList<>();
+        SessionExchangeOutcome exchangeOutcome = new SessionExchangeOutcome.Unreachable();
+        SessionLogoutOutcome logoutOutcome = new SessionLogoutOutcome.Unreachable();
+        final List<String> sessionCalls = new ArrayList<>();
+        Runnable beforeLogoutResult = () -> { };
 
         TokenCreateOutcome tokenCreateOutcome = new TokenCreateOutcome.Unreachable();
         TokenListOutcome tokenListOutcome = new TokenListOutcome.Unreachable();
@@ -192,6 +201,25 @@ class ReplTest {
         public LoginOutcome login(URI baseUrl, String username, String password) {
             loginCalls.add(username + ":" + password + "@" + baseUrl);
             return loginOutcome;
+        }
+
+        @Override
+        public LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
+            loginCalls.add(username + ":" + password + "@" + baseUrl + " persistent=" + createSession);
+            return loginOutcome;
+        }
+
+        @Override
+        public SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
+            sessionCalls.add("exchange " + sessionToken + "@" + baseUrl);
+            return exchangeOutcome;
+        }
+
+        @Override
+        public SessionLogoutOutcome logoutSession(URI baseUrl, String sessionToken) {
+            sessionCalls.add("logout " + sessionToken + "@" + baseUrl);
+            beforeLogoutResult.run();
+            return logoutOutcome;
         }
 
         @Override
@@ -3967,6 +3995,311 @@ class ReplTest {
         assertThat(client.probed).containsExactly(seed);
         assertThat(repl.session().isConnected()).isTrue();
         assertThat(sink.toString()).contains("cli.not-authenticated");
+    }
+
+    @Test
+    void authCommandsPersistResumeReportAndRemotelyRevokeTheNamedContext(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        client.loginOutcome = new LoginOutcome.Success(
+                "jwt-login", now.plusSeconds(900), "urn:tapstate:cluster:test-cluster", "alice",
+                List.of("read", "write"), "tss_s01.session-secret", now.plusSeconds(2_592_000),
+                now.plusSeconds(7_776_000));
+        client.exchangeOutcome = new SessionExchangeOutcome.Success(
+                "jwt-resumed", now.plusSeconds(900), "urn:tapstate:cluster:test-cluster", "alice",
+                List.of("read", "write"));
+        client.logoutOutcome = new SessionLogoutOutcome.Success();
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        AuthFileStore store = AuthFileStore.underHome(home);
+        Clock clock = Clock.fixed(now, ZoneOffset.UTC);
+
+        CommandLine loginLine = Cli.newCommandLine();
+        StringWriter loginOut = new StringWriter();
+        StringWriter loginErr = new StringWriter();
+        loginLine.setOut(new PrintWriter(loginOut));
+        loginLine.setErr(new PrintWriter(loginErr));
+        Repl login = new Repl(loginLine, workspace, client, new ScriptedPrompter("pw"),
+                name -> null, resolver, null, new AuthService(client, store, clock));
+        login.terminalCheck(() -> true);
+        login.dispatch(List.of("auth", "login", "alice"), true);
+
+        assertThat(login.lastExitCode()).isZero();
+        assertThat(loginOut.toString()).isEmpty();
+        assertThat(loginErr.toString()).contains("signed in as alice").doesNotContain("pw");
+        assertThat(login.session().credential()).isEqualTo("jwt-login");
+        assertThat(client.loginCalls).containsExactly("alice:pw@http://127.0.0.1:7900 persistent=true");
+        assertThat(store.load(authRef, contextId)).get()
+                .extracting(AuthSessionRecord::sessionToken).isEqualTo("tss_s01.session-secret");
+        login.dispatch(List.of("disconnect"), true);
+        assertThat(login.session().isConnected()).isFalse();
+        assertThat(store.load(authRef, contextId)).isPresent();
+
+        CommandLine resumedLine = Cli.newCommandLine();
+        StringWriter resumedOutput = new StringWriter();
+        resumedLine.setOut(new PrintWriter(resumedOutput));
+        resumedLine.setErr(new PrintWriter(resumedOutput));
+        Repl resumed = new Repl(resumedLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null, new AuthService(client, store, clock));
+        resumed.dispatch(List.of("ls"), true);
+        resumed.dispatch(List.of("auth", "status"), true);
+        resumed.dispatch(List.of("auth", "logout"), true);
+
+        assertThat(client.sessionCalls).contains(
+                "exchange tss_s01.session-secret@http://127.0.0.1:7900",
+                "logout tss_s01.session-secret@http://127.0.0.1:7900");
+        assertThat(resumedOutput.toString()).contains("signed in as alice").contains("session revoked");
+        assertThat(store.load(authRef, contextId)).isEmpty();
+    }
+
+    @Test
+    void temporaryConnectAndLegacyLoginNeverCreateAnAuthCache(@TempDir Path home) {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.loginOutcome = new LoginOutcome.Success("jwt-temporary");
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, home, client, new ScriptedPrompter("pw"), name -> null,
+                new ContextResolver(ContextConfig::empty, name -> null), null,
+                new AuthService(client, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        repl.dispatch(List.of("connect", seed.toString()));
+        repl.dispatch(List.of("login", "alice"));
+
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(repl.session().credential()).isEqualTo("jwt-temporary");
+        assertThat(client.loginCalls).containsExactly("alice:pw@http://127.0.0.1:7900");
+        assertThat(home.resolve(".tapstate/auth")).doesNotExist();
+    }
+
+    @Test
+    void authHelpDoesNotResolveAContextOrTouchTheNetwork(@TempDir Path workspace) {
+        AtomicInteger configReads = new AtomicInteger();
+        ContextResolver resolver = new ContextResolver(() -> {
+            configReads.incrementAndGet();
+            return ContextConfig.empty();
+        }, name -> null);
+        FakeControlPlane client = new FakeControlPlane();
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null, null);
+
+        repl.dispatch(List.of("auth", "--help"), true);
+
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(output.toString()).contains("tapstate auth <login|status|logout>")
+                .contains("--local-only");
+        assertThat(configReads).hasValue(0);
+        assertThat(client.probed).isEmpty();
+    }
+
+    @Test
+    void failedRemoteLogoutKeepsTheCacheWhileLocalOnlyRemovesItWithAWarning(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthSessionRecord record = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.session-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(record, false);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null, new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.dispatch(List.of("auth", "logout"), true);
+        assertThat(repl.lastExitCode()).isNotZero();
+        assertThat(store.load(authRef, contextId)).contains(record);
+        assertThat(output.toString()).contains("local cache was kept");
+
+        repl.dispatch(List.of("auth", "logout", "--local-only"), true);
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(store.load(authRef, contextId)).isEmpty();
+        assertThat(output.toString()).contains("remote session remains valid until expiry");
+    }
+
+    @Test
+    void freshProcessLocalOnlyLogoutResolvesNamedContextWithoutAnyNetwork(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        FakeControlPlane unreachable = new FakeControlPlane();
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.session-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000)),
+                false);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, unreachable, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> config, name -> null), null,
+                new AuthService(unreachable, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.dispatch(List.of("auth", "logout", "--local-only"), true);
+
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(store.load(authRef, contextId)).isEmpty();
+        assertThat(unreachable.probed).isEmpty();
+        assertThat(unreachable.discovered).isEmpty();
+        assertThat(unreachable.sessionCalls).isEmpty();
+        assertThat(output.toString()).contains("remote session remains valid until expiry");
+    }
+
+    @Test
+    void remoteLogoutOfOldSessionNeverDeletesConcurrentReplacement(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.logoutOutcome = new SessionLogoutOutcome.Success();
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthSessionRecord oldRecord = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.old-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
+        AuthSessionRecord replacement = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "bob", List.of("read"),
+                "tss_s02.new-secret", now.plusSeconds(1), now.plusSeconds(2_592_001),
+                now.plusSeconds(7_776_001));
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(oldRecord, false);
+        client.beforeLogoutResult = () -> AuthFileStore.underHome(home).save(replacement, false);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> config, name -> null), null,
+                new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.dispatch(List.of("auth", "logout"), true);
+
+        assertThat(repl.lastExitCode()).isNotZero();
+        assertThat(store.load(authRef, contextId)).contains(replacement);
+        assertThat(client.sessionCalls).containsExactly("logout tss_s01.old-secret@" + seed);
+        assertThat(output.toString()).contains("cli.auth-logout-cache-changed")
+                .doesNotContain("tss_s01.old-secret", "tss_s02.new-secret");
+    }
+
+    @Test
+    void cachedNamedSessionResumesForDataBrowserAliasesAndLiveViews(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.session-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000)),
+                false);
+        List<String> commands = List.of(
+                "data-browser show collections views",
+                "show collections views",
+                "views.orders.find()",
+                "tail views.orders");
+
+        for (String command : commands) {
+            FakeControlPlane client = new FakeControlPlane(seed);
+            client.exchangeOutcome = new SessionExchangeOutcome.Success(
+                    "jwt-resumed", now.plusSeconds(900), "urn:tapstate:cluster:test-cluster", "alice",
+                    List.of("read"));
+            client.collectionsOutcome = new DataBrowserOutcome.Collections.Listed(List.of("orders"));
+            client.findOutcome = new DataBrowserOutcome.Find.Read(List.of(), null, false);
+            client.tailRefusal = "data-browser.follow-idle";
+            CommandLine commandLine = Cli.newCommandLine();
+            StringWriter output = new StringWriter();
+            commandLine.setOut(new PrintWriter(output));
+            commandLine.setErr(new PrintWriter(output));
+            Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                    new ContextResolver(() -> config, name -> null), null,
+                    new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+            repl.dispatch(command);
+
+            assertThat(client.discovered).as(command).containsExactly(seed);
+            assertThat(client.sessionCalls).as(command)
+                    .containsExactly("exchange tss_s01.session-secret@" + seed);
+            assertThat(client.dataBrowserCalls).as(command).isNotEmpty();
+        }
+    }
+
+    @Test
+    void cachedSessionIsNeverExchangedWhenAnonymousDiscoveryFindsAnotherIssuer(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:replaced", "alice", List.of("read"),
+                "tss_must-not-be-sent.secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000)),
+                false);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null, new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.dispatch("show collections views");
+
+        assertThat(repl.lastExitCode()).isNotZero();
+        assertThat(client.discovered).containsExactly(seed);
+        assertThat(client.sessionCalls).isEmpty();
+        assertThat(output.toString()).contains("cli.auth-issuer-mismatch")
+                .doesNotContain("tss_must-not-be-sent.secret");
     }
 
     @Test

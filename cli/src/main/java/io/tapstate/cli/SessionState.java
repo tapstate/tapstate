@@ -19,6 +19,7 @@ final class SessionState {
     private static final Set<String> DISPLAYABLE_REJECTION_CODES = Set.of(
             "control.unauthenticated",
             "control.auth-session-expired",
+            "control.auth-session-revoked",
             "control.auth-session-identity-mismatch",
             "control.auth-session-invalid-grant");
 
@@ -29,6 +30,14 @@ final class SessionState {
     SessionState(ControlPlaneClient client, Clock clock) {
         this.client = client;
         this.clock = clock;
+    }
+
+    /** Seeds process memory with the short access grant returned alongside a new persistent session. */
+    synchronized void remember(AuthSessionRecord cached, String token, Instant expiresAt) {
+        if (token == null || token.isBlank() || expiresAt == null || !expiresAt.isAfter(clock.instant())) {
+            throw rejected(cached, "control.auth-session-invalid-grant");
+        }
+        grants.put(cached, new AccessGrant(token, expiresAt));
     }
 
     synchronized String accessToken(URI baseUrl, AuthSessionRecord cached) {
@@ -81,7 +90,7 @@ final class SessionState {
                 Map.of("code", safeCode(code), "principal", cached.principal()), null);
     }
 
-    private static String safeCode(String code) {
+    static String safeCode(String code) {
         return DISPLAYABLE_REJECTION_CODES.contains(code) ? code : "unknown";
     }
 

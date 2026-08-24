@@ -60,6 +60,17 @@ class SessionStateTest {
     }
 
     @Test
+    void consumesTheAccessGrantReturnedByPersistentLoginBeforeAnyExchange() {
+        FakeClient client = new FakeClient();
+        SessionState state = new SessionState(client, fixed(NOW));
+
+        state.remember(CACHED, "jwt-from-login", NOW.plusSeconds(900));
+
+        assertThat(state.accessToken(BASE, CACHED)).isEqualTo("jwt-from-login");
+        assertThat(client.calls()).isZero();
+    }
+
+    @Test
     void neverReusesAnAccessTokenForAnotherCachedContext() {
         FakeClient client = new FakeClient();
         SessionState state = new SessionState(client, fixed(NOW));

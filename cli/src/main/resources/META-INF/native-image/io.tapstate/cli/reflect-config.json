@@ -1,0 +1,17 @@
+[
+  {
+    "name" : "io.tapstate.cli.LaunchOptions",
+    "allDeclaredConstructors" : true,
+    "allPublicConstructors" : true,
+    "allDeclaredMethods" : true,
+    "allPublicMethods" : true,
+    "fields" : [
+      { "name" : "connect" },
+      { "name" : "context" },
+      { "name" : "user" },
+      { "name" : "password" },
+      { "name" : "workdir" },
+      { "name" : "command" }
+    ]
+  }
+]

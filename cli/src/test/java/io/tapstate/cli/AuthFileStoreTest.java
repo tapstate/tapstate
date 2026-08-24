@@ -63,8 +63,37 @@ class AuthFileStoreTest {
         }
         try (var files = Files.list(authDir)) {
             assertThat(files.map(path -> path.getFileName().toString()).toList())
-                    .containsExactly(AUTH_REF + ".json");
+                    .containsExactlyInAnyOrder(AUTH_REF + ".json", ".auth.lock-" + AUTH_REF);
         }
+    }
+
+    @Test
+    void deletionVerifiesTheBoundRecordAndSynchronizesItsDirectory(@TempDir Path home) {
+        AtomicInteger syncs = new AtomicInteger();
+        AuthFileStore store = AuthFileStore.underHome(home, directory -> syncs.incrementAndGet());
+        store.save(RECORD, false);
+        int afterSave = syncs.get();
+
+        assertThat(store.delete(RECORD)).isEqualTo(AuthFileStore.DeleteResult.DELETED);
+        assertThat(store.load(AUTH_REF, CONTEXT_ID)).isEmpty();
+        assertThat(syncs.get()).isEqualTo(afterSave + 1);
+        assertThat(store.delete(RECORD)).isEqualTo(AuthFileStore.DeleteResult.ABSENT);
+    }
+
+    @Test
+    void deletionNeverRemovesAReplacementSessionForTheSameContext(@TempDir Path home) {
+        AuthFileStore firstProcess = AuthFileStore.underHome(home);
+        AuthFileStore secondProcess = AuthFileStore.underHome(home);
+        AuthSessionRecord replacement = new AuthSessionRecord(
+                RECORD.version(), RECORD.authRef(), RECORD.contextId(), RECORD.issuer(), "replacement-user",
+                List.of("read"), "tss_s02.replacement-secret", RECORD.createdAt().plusSeconds(1),
+                RECORD.idleExpiresAt().plusSeconds(1), RECORD.absoluteExpiresAt().plusSeconds(1));
+        firstProcess.save(RECORD, false);
+
+        secondProcess.save(replacement, false);
+
+        assertThat(firstProcess.delete(RECORD)).isEqualTo(AuthFileStore.DeleteResult.CHANGED);
+        assertThat(firstProcess.load(AUTH_REF, CONTEXT_ID)).contains(replacement);
     }
 
     @Test
@@ -195,7 +224,7 @@ class AuthFileStoreTest {
         assertThat(store.load(AUTH_REF, CONTEXT_ID)).contains(previous);
         try (var files = Files.list(authDir)) {
             assertThat(files.map(path -> path.getFileName().toString()).toList())
-                    .containsExactly(AUTH_REF + ".json");
+                    .containsExactlyInAnyOrder(AUTH_REF + ".json", ".auth.lock-" + AUTH_REF);
         }
         assertThat(syncAttempts).hasValue(2);
     }

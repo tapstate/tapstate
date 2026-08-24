@@ -150,6 +150,21 @@ cli.auth-session-rejected:
 cli.auth-session-unreachable:
   message: "The cached session for `{principal}` could not be exchanged because the server was unreachable."
   solution: "Check the server connection and retry, or run `tapstate auth login` again."
+cli.auth-login-unreachable:
+  message: "Login for context `{context}` did not return a usable persistent session."
+  solution: "Check the server connection and compatibility, then run `tapstate auth login` again."
+cli.auth-login-rejected:
+  message: "Login for `{principal}` was rejected by the server: {code}."
+  solution: "Check the username and password, then run `tapstate auth login` again."
+cli.auth-logout-unreachable:
+  message: "The remote session for context `{context}` could not be revoked; the local cache was kept."
+  solution: "Retry when the server is reachable, or use `tapstate auth logout --local-only` to remove only the local cache."
+cli.auth-logout-cache-changed:
+  message: "The session for context `{context}` changed while logout was in progress; the newer local session was kept."
+  solution: "Run `tapstate auth status` to inspect the current session, then retry logout if needed."
+cli.auth-usage:
+  message: "Invalid auth command: {reason}."
+  solution: "Use `tapstate auth login [username]`, `tapstate auth status`, or `tapstate auth logout [--local-only]`."
 cli.context-invalid:
   message: "Context `{name}` is invalid: {reason}"
   solution: "Use a non-empty name, at least one absolute HTTP(S) seed, and valid context settings."

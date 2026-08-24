@@ -30,6 +30,9 @@ record AuthSessionRecord(
             throw new IllegalArgumentException("scopes must contain non-empty values");
         }
         sessionToken = required(sessionToken, "sessionToken");
+        if (!LoginOutcome.isValidSessionToken(sessionToken)) {
+            throw new IllegalArgumentException("sessionToken has an invalid opaque-session shape");
+        }
         createdAt = Objects.requireNonNull(createdAt, "createdAt");
         idleExpiresAt = Objects.requireNonNull(idleExpiresAt, "idleExpiresAt");
         absoluteExpiresAt = Objects.requireNonNull(absoluteExpiresAt, "absoluteExpiresAt");

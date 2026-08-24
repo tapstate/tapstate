@@ -133,6 +133,21 @@ enum CliError implements TapstateErrorCode {
     /** A cached session could not be exchanged because no server answered safely. */
     AUTH_SESSION_UNREACHABLE("cli.auth-session-unreachable", Set.of("principal")),
 
+    /** Persistent login could not obtain the complete access-and-session response safely. */
+    AUTH_LOGIN_UNREACHABLE("cli.auth-login-unreachable", Set.of("context")),
+
+    /** Persistent login was rejected without rendering an untrusted server response body. */
+    AUTH_LOGIN_REJECTED("cli.auth-login-rejected", Set.of("code", "principal")),
+
+    /** Remote session revocation could not be confirmed, so the local cache was retained. */
+    AUTH_LOGOUT_UNREACHABLE("cli.auth-logout-unreachable", Set.of("context")),
+
+    /** Logout revoked an older session while a newer local session replaced its cache entry. */
+    AUTH_LOGOUT_CACHE_CHANGED("cli.auth-logout-cache-changed", Set.of("context")),
+
+    /** The persistent auth namespace was invoked with an invalid action or operand shape. */
+    AUTH_USAGE("cli.auth-usage", Set.of("reason")),
+
     /** A context definition supplied to the manager violates the persisted schema. */
     CONTEXT_INVALID("cli.context-invalid", Set.of("name", "reason")),
 

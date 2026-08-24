@@ -265,7 +265,7 @@ public final class Cli implements Runnable {
      * so appear on the table, but they project no operation and belong to no whitelist — the guard that
      * pins registered verbs to the offline whitelist reads this to tell "meta" from "undeclared".
      */
-    static final List<String> META_VERBS = List.of("help", "mcp", "alias");
+    static final List<String> META_VERBS = List.of("help", "mcp", "alias", "auth");
 
     /**
      * Help for the words the REPL handles itself. They are deliberately not subcommands — a connection
@@ -307,6 +307,7 @@ public final class Cli implements Runnable {
         // to be a word the CLI answers to, in both modes. Unregistered it was an unmatched argument,
         // answered with a spelling suggestion for a word that was spelt right.
         commandLine.addSubcommand(new CommandLine.HelpCommand());
+        commandLine.addSubcommand(new AuthCmd());
         for (String verb : CONNECTED_VERBS) {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
@@ -447,18 +448,33 @@ public final class Cli implements Runnable {
                           Supplier<Prompter> prompter) {
         Path home = Path.of(System.getProperty("user.home"));
         ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
-        return runSession(launch, controlPlane, prompter, resolver);
+        AuthService authService = new AuthService(
+                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        return runSession(launch, controlPlane, prompter, resolver, authService);
     }
 
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, ContextResolver resolver) {
+        return runSession(launch, controlPlane, prompter, resolver, null);
+    }
+
+    private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                                  Supplier<Prompter> prompter, ContextResolver resolver,
+                                  AuthService authService) {
+        Prompter oneShotPrompter = null;
         try {
             if (launch.hasConflictingTargets()) {
                 Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
                 return EXIT_USAGE;
             }
-            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, null,
-                    launch::environment, resolver, launch.context());
+            if (launch.isOneShot() && launch.command().size() >= 2
+                    && launch.command().get(0).equals("auth")
+                    && launch.command().get(1).equals("login")
+                    && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
+            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
+                    launch::environment, resolver, launch.context(), authService);
             if (launch.connects()) {
                 int established = repl.signIn(launch.connect(), launch.user(),
                         () -> launch.resolvePassword(prompter), launch.isOneShot());
@@ -473,6 +489,9 @@ public final class Cli implements Runnable {
             repl.run();
             return EXIT_OK;
         } finally {
+            if (oneShotPrompter instanceof JLinePrompter jline) {
+                jline.close();
+            }
             controlPlane.close();
         }
     }

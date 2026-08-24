@@ -10,6 +10,7 @@ import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -214,6 +215,30 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void persistentLoginRequestsAndDecodesTheIncrementalSessionFields() throws Exception {
+        AtomicReference<String> body = new AtomicReference<>();
+        String response = "{\"token\":\"jwt-access\",\"accessExpiresAt\":\"2026-08-17T10:15:00Z\","
+                + "\"issuer\":\"urn:tapstate:cluster:01J5FIXTURE\",\"principal\":\"alice\","
+                + "\"scopes\":[\"read\",\"write\"],\"sessionToken\":\"tss_s01.secret\","
+                + "\"sessionIdleExpiresAt\":\"2026-09-16T10:00:00Z\","
+                + "\"sessionAbsoluteExpiresAt\":\"2026-11-15T10:00:00Z\"}";
+        HttpServer server = loginServer(200, response, body);
+        try {
+            LoginOutcome outcome = new HttpControlPlaneClient().login(baseOf(server), "alice", "s3cret", true);
+
+            assertThat(outcome).isEqualTo(new LoginOutcome.Success(
+                    "jwt-access", Instant.parse("2026-08-17T10:15:00Z"),
+                    "urn:tapstate:cluster:01J5FIXTURE", "alice", List.of("read", "write"),
+                    "tss_s01.secret", Instant.parse("2026-09-16T10:00:00Z"),
+                    Instant.parse("2026-11-15T10:00:00Z")));
+            Map<?, ?> sent = (Map<?, ?>) JsonReader.parse(body.get());
+            assertThat(sent.get("createSession")).isEqualTo(true);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void loginReturnsRejectedWithTheServerCodeAndMessageOn401() throws Exception {
         String errorBody = "{\"code\":\"control.auth-failed\",\"params\":{},\"message\":\"Login failed.\"}";
         HttpServer server = loginServer(401, errorBody, new AtomicReference<>());
@@ -226,15 +251,33 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
-    void loginTreatsANonCodedErrorBodyAsAGenericRejectionRevealingNothing() throws Exception {
-        // a non-JSON error body (e.g. a container 500 page) must not crash login, and the raw body must
-        // not leak to the user: it is refused with a fixed generic message, no code
+    void loginTreatsServerFailureAsUnreachableRatherThanCredentialRejection() throws Exception {
         HttpServer server = loginServer(500, "<html>Internal Server Error</html>", new AtomicReference<>());
         try {
             LoginOutcome outcome = new HttpControlPlaneClient().login(baseOf(server), "a", "b");
-            assertThat(outcome).isEqualTo(new LoginOutcome.Rejected("", "Login was refused by the server."));
+            assertThat(outcome).isInstanceOf(LoginOutcome.Unreachable.class);
         } finally {
             server.stop(0);
+        }
+    }
+
+    @Test
+    void persistentLoginRejectsMalformedOrAccessTokenEchoedSessionCredentials() throws Exception {
+        String fields = "\"accessExpiresAt\":\"2026-08-17T10:15:00Z\","
+                + "\"issuer\":\"urn:tapstate:cluster:01J5FIXTURE\",\"principal\":\"alice\","
+                + "\"scopes\":[\"read\"],\"sessionIdleExpiresAt\":\"2026-09-16T10:00:00Z\","
+                + "\"sessionAbsoluteExpiresAt\":\"2026-11-15T10:00:00Z\"";
+        for (String sessionToken : List.of("opaque-but-not-a-session", "jwt-access", "tss_password.secret")) {
+            String response = "{\"token\":\"jwt-access\",\"sessionToken\":\""
+                    + sessionToken + "\"," + fields + "}";
+            HttpServer server = loginServer(200, response, new AtomicReference<>());
+            try {
+                assertThat(new HttpControlPlaneClient().login(baseOf(server), "alice", "tss_password.secret", true))
+                        .as("session token %s", sessionToken)
+                        .isInstanceOf(LoginOutcome.Unreachable.class);
+            } finally {
+                server.stop(0);
+            }
         }
     }
 
@@ -321,6 +364,33 @@ class HttpControlPlaneClientTest {
             assertThat(new HttpControlPlaneClient().exchangeSession(baseOf(server), "tss_s01.session-secret"))
                     .isInstanceOf(SessionExchangeOutcome.Unreachable.class);
             assertThat(seen.get().authorization()).isEqualTo("TapstateSession tss_s01.session-secret");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sessionLogoutUsesTheOpaqueCredentialAndTreatsSuccessAsIdempotent() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/auth/logout", 204, "", seen);
+        try {
+            assertThat(new HttpControlPlaneClient().logoutSession(baseOf(server), "tss_s01.session-secret"))
+                    .isInstanceOf(SessionLogoutOutcome.Success.class);
+            assertThat(seen.get().method()).isEqualTo("POST");
+            assertThat(seen.get().authorization()).isEqualTo("TapstateSession tss_s01.session-secret");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sessionLogoutTreatsServerFailureAsUnreachableWithoutLeakingTheCredential() throws Exception {
+        HttpServer server = apiServer("/auth/logout", 503, "<html>maintenance</html>", new AtomicReference<>());
+        try {
+            SessionLogoutOutcome outcome = new HttpControlPlaneClient()
+                    .logoutSession(baseOf(server), "tss_s01.session-secret");
+            assertThat(outcome).isInstanceOf(SessionLogoutOutcome.Unreachable.class);
+            assertThat(outcome.toString()).doesNotContain("tss_s01.session-secret");
         } finally {
             server.stop(0);
         }
