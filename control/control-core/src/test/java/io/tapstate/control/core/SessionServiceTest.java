@@ -76,6 +76,19 @@ class SessionServiceTest {
     }
 
     @Test
+    void absoluteExpiryRejectsASessionEvenWhenIdleExpiryIsStillInTheFuture() {
+        MemorySessionStore store = new MemorySessionStore();
+        service(store, NOW).create("admin", Scope.ADMIN, ISSUER);
+        SessionRecord record = store.records.get("s01");
+        store.records.put("s01", new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
+                record.scope(), record.issuer(), false, record.createdAt(), record.lastUsedAt(),
+                NOW.plusSeconds(1), NOW));
+
+        assertThat(service(store, NOW).exchange("tss_s01.session-secret", ISSUER)).isEmpty();
+        assertThat(store.records.get("s01").lastUsedAt()).isEqualTo(record.lastUsedAt());
+    }
+
+    @Test
     void logoutRejectsUnknownOrMismatchedCredentialsAndIsIdempotentForTheValidCredential() {
         MemorySessionStore store = new MemorySessionStore();
         SessionService service = service(store, NOW);

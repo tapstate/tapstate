@@ -856,24 +856,34 @@ class CliTest {
     }
 
     @Test
-    void machineTokenIsALaunchOnlySelectorWithAnEnvironmentFallback() {
-        LaunchOptions explicit = LaunchOptions.parse("--token", "machine-from-flag", "ls")
-                .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
+    void machineTokenFallsBackToTheEnvironmentWithoutChangingTheCommand() {
         LaunchOptions fromEnvironment = LaunchOptions.parse("ls")
+                .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
+
+        assertThat(fromEnvironment.machineToken()).isEqualTo("machine-from-env");
+        assertThat(fromEnvironment.command()).containsExactly("ls");
+        assertThat(LaunchOptions.parse("ls").withEnv(name -> null).machineToken()).isNull();
+        assertThat(LaunchOptions.parse("ls").withEnv(name -> "   ").machineToken()).isNull();
+    }
+
+    @Test
+    void explicitMachineTokenTakesPrecedenceOverTheEnvironment() {
+        LaunchOptions explicit = LaunchOptions.parse("--token", "machine-from-flag", "ls")
                 .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
 
         assertThat(explicit.machineToken()).isEqualTo("machine-from-flag");
         assertThat(explicit.command()).containsExactly("ls");
-        assertThat(fromEnvironment.machineToken()).isEqualTo("machine-from-env");
-        assertThat(LaunchOptions.parse("ls").withEnv(name -> null).machineToken()).isNull();
         assertThatThrownBy(() -> LaunchOptions.parse("--token=", "ls"))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    void passwordIsNotAcceptedAsALaunchOption() {
+    void passwordAndTheLegacyShortFormAreRejectedAsLaunchOptions() {
         assertThatThrownBy(() -> LaunchOptions.parse(
                 "--connect", "localhost:8080", "--user", "admin", "--password", "pw", "ls"))
+                .isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse(
+                "--connect", "localhost:8080", "--user", "admin", "-p", "pw", "ls"))
                 .isInstanceOf(RuntimeException.class);
     }
 

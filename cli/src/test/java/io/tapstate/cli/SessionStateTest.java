@@ -189,11 +189,23 @@ class SessionStateTest {
     }
 
     @Test
-    void recordAndTransportOutcomesRedactBearerAndOpaqueSessionTokens() {
+    void secretBearingAuthValuesRedactBearerAndOpaqueSessionTokens() {
+        String accessToken = "jwt-access-token";
+        AuthService.ActiveSession active = new AuthService.ActiveSession(BASE, accessToken, CACHED);
+        LoginOutcome.Success login = new LoginOutcome.Success(
+                accessToken, NOW.plusSeconds(900), CACHED.issuer(), CACHED.principal(), CACHED.scopes(),
+                CACHED.sessionToken(), CACHED.idleExpiresAt(), CACHED.absoluteExpiresAt());
+
         assertThat(CACHED.toString()).doesNotContain(CACHED.sessionToken());
-        assertThat(new SessionExchangeOutcome.Success("jwt-access-token", NOW.plusSeconds(900),
+        assertThat(login.toString()).doesNotContain(accessToken, CACHED.sessionToken());
+        assertThat(active.toString()).doesNotContain(accessToken, CACHED.sessionToken());
+        assertThat(new AuthService.LoginResult.Success(active, AuthFileStore.SaveResult.PERSISTED).toString())
+                .doesNotContain(accessToken, CACHED.sessionToken());
+        assertThat(new AuthService.Status.SignedIn(active).toString())
+                .doesNotContain(accessToken, CACHED.sessionToken());
+        assertThat(new SessionExchangeOutcome.Success(accessToken, NOW.plusSeconds(900),
                 CACHED.issuer(), CACHED.principal(), CACHED.scopes()).toString())
-                .doesNotContain("jwt-access-token");
+                .doesNotContain(accessToken);
         assertThat(new SessionExchangeOutcome.Rejected("control.auth-session-revoked",
                 "the server echoed tss_s01.session-secret").toString())
                 .doesNotContain(CACHED.sessionToken());
