@@ -808,6 +808,13 @@ class CliTest {
     }
 
     @Test
+    void passwordIsNotAcceptedAsALaunchOption() {
+        assertThatThrownBy(() -> LaunchOptions.parse(
+                "--connect", "localhost:8080", "--user", "admin", "--password", "pw", "ls"))
+                .isInstanceOf(RuntimeException.class);
+    }
+
+    @Test
     void aVerbMakesTheLaunchOneShot() {
         assertThat(LaunchOptions.parse("validate").isOneShot()).isTrue();
         assertThat(LaunchOptions.parse("new", "--kind", "source").isOneShot()).isTrue();

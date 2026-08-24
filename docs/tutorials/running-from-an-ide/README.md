@@ -203,7 +203,7 @@ thin jar for manual verification* - with its dependencies in `target/lib` beside
 ```sh
 cd <your-checkout>/tapstate
 java -jar cli/target/cli-0.2.1.jar --version        # -> tapstate 0.2.1
-java -jar cli/target/cli-0.2.1.jar -w ./work -c 127.0.0.1:8080 -u admin -p admin
+TAPSTATE_PASSWORD=admin java -jar cli/target/cli-0.2.1.jar -w ./work -c 127.0.0.1:8080 -u admin
 ```
 
 With no subcommand it opens a REPL - one session holding a workspace and a connection. With a
@@ -222,7 +222,8 @@ Worth a run configuration when you want to step through CLI code in a debugger, 
 | Name | `tapstate-cli` |
 | Module / classpath | `cli` |
 | Main class | `io.tapstate.cli.Cli` |
-| Program arguments | `-w ./work -c 127.0.0.1:8080 -u admin -p admin` |
+| Program arguments | `-w ./work -c 127.0.0.1:8080 -u admin` |
+| Environment variables | `TAPSTATE_PASSWORD=admin` |
 | Working directory | the parent of the directory holding your `.tap.yml` files |
 
 The IDE console is not a TTY, so JLine falls back to a dumb terminal and Tab completion is gone.
@@ -245,8 +246,9 @@ subcommand to the same line and the rule changes:
 | `tapstate … apply DIR` | accepted |
 | `TAPSTATE_WORKDIR=DIR tapstate … apply` | accepted by both kinds |
 
-`-c`, `-u` and `-p` before a subcommand are fine; `-w` is the only one that is not. `--help` lists them
-together as launch options, so following the help walks straight into it:
+`-c` and `-u` before a subcommand are fine; `-w` is the only one that is not. Set
+`TAPSTATE_PASSWORD` when a one-line launch needs a password. `--help` lists the launch options, so
+following the help walks straight into it:
 
 ```
 $ tapstate ... apply -w ./work

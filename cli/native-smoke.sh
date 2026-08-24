@@ -399,11 +399,11 @@ else
   bad "online register pty session failed (rc=$PTY_RC, port=${STUB_PORT:-none}); output:"; echo "$PTY_OUT"
 fi
 
-bold "[10] one-line launch — -c / -u / -p reach the server without a session"
+bold "[10] one-line launch — -c / -u reach the server without a session"
 # The scripting form: connect, sign in and run one command from the arguments alone. Checked on the
 # native binary because this path parses its own options before the command table is built, so an AOT
 # fault here would not show up in any of the interactive cases above.
-ONELINE_OUT=$("$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin -p smoke-pw \
+ONELINE_OUT=$(TAPSTATE_PASSWORD=smoke-pw "$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin \
                 register "$STUB_DIR/smoke.jar" 2>"$STUB_DIR/oneline.err") && ONELINE_RC=0 || ONELINE_RC=$?
 ONELINE_CLEAN=$(printf '%s' "$ONELINE_OUT" | strip_ansi)
 if (( ONELINE_RC == 0 )) \
@@ -418,7 +418,7 @@ else
 fi
 
 # a command that fails must fail the process: the whole point of running one from a script
-"$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin -p smoke-pw start >/dev/null 2>&1 && BADRC=0 || BADRC=$?
+TAPSTATE_PASSWORD=smoke-pw "$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin start >/dev/null 2>&1 && BADRC=0 || BADRC=$?
 if (( BADRC != 0 )); then
   ok "a one-line command that failed exited non-zero (rc=$BADRC)"
 else

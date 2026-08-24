@@ -335,7 +335,8 @@ Validate offline before going online (no server needed):
 ## 6. Save a context, sign in, and run
 
 Create a named context once, bind it to this workspace, and sign in from the same
-session. The password prompt is masked. Do not put a password in `-p` or `--password`.
+session. The password prompt is masked. The CLI does not accept a password option: use the prompt or
+`TAPSTATE_PASSWORD` for non-interactive use.
 
 ```console
 $ ./tapstate-cli/bin/tapstate -w work

@@ -13,7 +13,7 @@ import java.util.function.UnaryOperator;
 /**
  * The options that shape how the CLI starts, parsed off the front of the top-level arguments before a
  * command is chosen. They are a launch concern rather than a verb's: {@code -w} says where a session
- * begins, and {@code -c} / {@code -u} / {@code -p} say that it should begin already connected and
+ * begins, and {@code -c} / {@code -u} say that it should begin already connected and
  * signed in, so a whole session's worth of work fits on one line.
  *
  * <p>{@code stopAtPositional} is what makes that safe: everything from the first non-option token on is
@@ -21,9 +21,8 @@ import java.util.function.UnaryOperator;
  * command table untouched rather than being parsed as launch options here.
  *
  * <p>Credentials given this way are never written anywhere — they live in the session's memory for as
- * long as the process does. A password in {@code -p} is visible to anything that can read the process
- * list, and stays in the shell's history, which is why omitting it falls back to
- * {@code TAPSTATE_PASSWORD} and then to asking.
+ * long as the process does. The password comes from {@code TAPSTATE_PASSWORD} or a masked prompt, so
+ * it is never accepted through the process arguments.
  */
 @Command(name = "tapstate")
 final class LaunchOptions {
@@ -36,12 +35,6 @@ final class LaunchOptions {
 
     @Option(names = {"-u", "--user"}, paramLabel = "NAME")
     String user;
-
-    // -p always takes its value. An optional-value form was tried and removed: `-p` followed by a verb
-    // swallowed the verb as the password, so `-c URL -u admin -p ls` signed in with the password "ls"
-    // and ran nothing. Omitting -p already means "ask me", so the optional form bought nothing for it.
-    @Option(names = {"-p", "--password"}, paramLabel = "PW")
-    String password;
 
     @Option(names = {"-w", "--workdir"}, paramLabel = "DIR",
             defaultValue = "${env:TAPSTATE_WORKDIR:-tap-work}")
@@ -96,18 +89,10 @@ final class LaunchOptions {
     }
 
     /**
-     * The password to sign in with, in the order the ways of giving one should win: the value passed to
-     * {@code -p}, else {@code TAPSTATE_PASSWORD}, else asked for.
-     *
-     * <p>The last two exist because the first is the one that leaks. A password in {@code -p} is in the
-     * shell's history and in the process list, readable by anything on the machine; it is supported
-     * because a one-line launch is the point of these options, but a script that can avoid it should.
-     * Asking is the safest and stays the default when nothing else is given.
+     * The password to sign in with: {@code TAPSTATE_PASSWORD}, else a masked prompt. This avoids
+     * exposing a password through the process list or shell history.
      */
     String resolvePassword(Supplier<Prompter> prompter) {
-        if (password != null) {
-            return password;
-        }
         String fromEnv = env.apply("TAPSTATE_PASSWORD");
         if (fromEnv != null && !fromEnv.isEmpty()) {
             return fromEnv;

@@ -3921,7 +3921,7 @@ class ReplTest {
         assertThat(h.repl().lastExitCode()).isEqualTo(2);
     }
 
-    // --- one-line launch: -c / -u / -p establish the session before anything runs ------------------
+    // --- one-line launch: -c / -u establish the session before anything runs ------------------------
 
     @Test
     void aOneLineLaunchConnectsSignsInAndRunsTheCommand() {
@@ -3929,7 +3929,8 @@ class ReplTest {
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.listOutcome = new ListOutcome.Listed(List.of(
                 new RemoteArtifact("src_kfk", "source", "")));
-        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "-p", "pw", "ls");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "ls")
+                .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
         int code = Cli.runSession(launch, client, () -> new ScriptedPrompter());
         assertThat(code).isZero();
         // the whole chain ran off one line: probe, credential exchange, then the verb against the server
@@ -4446,14 +4447,16 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.getOutcome = new GetOutcome.Absent();
-        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "-p", "pw", "get", "nope");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "get", "nope")
+                .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
         assertThat(Cli.runSession(launch, client, () -> new ScriptedPrompter())).isNotZero();
     }
 
     @Test
     void aLaunchThatCannotConnectStopsBeforeRunningTheCommand() {
         FakeControlPlane client = new FakeControlPlane();   // nothing is healthy
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "ls");
+        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "ls")
+                .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
         int code = Cli.runSession(launch, client, () -> new ScriptedPrompter());
         // running the verb anyway would report a missing connection rather than why there is none
         assertThat(code).isNotZero();
@@ -4465,7 +4468,8 @@ class ReplTest {
     void aLaunchThatCannotSignInStopsBeforeRunningTheCommand() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Rejected("auth.bad-credentials", "Wrong password.");
-        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "-p", "nope", "ls");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "ls")
+                .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "nope" : null);
         assertThat(Cli.runSession(launch, client, () -> new ScriptedPrompter())).isNotZero();
         assertThat(client.listCalls).isEmpty();
     }
@@ -4498,14 +4502,6 @@ class ReplTest {
                 .withEnv(name -> null);
         Cli.runSession(launch, client, () -> new ScriptedPrompter("asked"));
         assertThat(client.loginCalls).containsExactly("admin:asked@http://localhost:7900");
-    }
-
-    @Test
-    void thePasswordFlagAlwaysTakesItsValueSoAVerbIsNeverSwallowed() {
-        // -p once had an optional value, and `-p ls` then signed in with the password "ls" and ran
-        // nothing. The command has to survive whatever precedes it
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "ls");
-        assertThat(launch.command()).containsExactly("ls");
     }
 
     @Test
