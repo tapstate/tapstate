@@ -230,6 +230,24 @@ PY
   return "$rc"
 }
 
+start_server() {
+  java -jar "$app_jar" \
+    --server.address=127.0.0.1 \
+    --server.port="$port" \
+    "--tapstate.store.mongo.uri=$mongo_uri" \
+    "--tapstate.control.auth.jwt-secret=$jwt_secret" \
+    >>"$out_dir/server.log" 2>&1 &
+  server_pid=$!
+
+  for _ in $(seq 1 60); do
+    if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/healthz" || true)" == 200 ]]; then
+      return
+    fi
+    sleep 1
+  done
+  fail 'candidate server never became healthy; see server.log'
+}
+
 printf 'building candidate worktree\n'
 if [[ "$use_native" -eq 1 ]]; then
   mvn --file "$root/pom.xml" -q -Pnative -pl app,cli -am clean package -DskipTests >"$out_dir/build.log" 2>&1 \
@@ -253,22 +271,7 @@ fi
 mkdir -p "$workspace"
 chmod 700 "$home_dir"
 
-java -jar "$app_jar" \
-  --server.address=127.0.0.1 \
-  --server.port="$port" \
-  "--tapstate.store.mongo.uri=$mongo_uri" \
-  "--tapstate.control.auth.jwt-secret=$jwt_secret" \
-  >"$out_dir/server.log" 2>&1 &
-server_pid=$!
-
-for _ in $(seq 1 60); do
-  if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/healthz" || true)" == 200 ]]; then
-    break
-  fi
-  sleep 1
-done
-[[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/healthz")" == 200 ]] \
-  || fail 'candidate server never became healthy; see server.log'
+start_server
 
 bootstrap_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
   --header 'Content-Type: application/json' --data-binary @- "$base_url/auth/bootstrap" <<EOF
@@ -378,6 +381,46 @@ grep -q 'local session removed; the remote session remains valid until expiry' "
   || fail 'offline local-only logout did not report the remote-session warning'
 [[ ! -e "$auth_file" ]] || fail 'local-only logout did not remove the local auth record'
 
+start_server
+chmod 740 "$auth_dir"
+permission_degraded_auth_dir_mode=$(mode "$auth_dir")
+[[ "$permission_degraded_auth_dir_mode" == 740 ]] \
+  || fail "permission-degradation setup produced mode $permission_degraded_auth_dir_mode, expected 740"
+
+if [[ "$use_native" -eq 1 ]]; then
+  run_pty "$password"$'\n' "$out_dir/permission-degraded-tty.pty" \
+    env "TAPSTATE_WORKDIR=$workspace" "$cli_binary" "-Duser.home=$home_dir" auth login "$username"
+else
+  run_pty "$password"$'\n' "$out_dir/permission-degraded-tty.pty" \
+    env "TAPSTATE_WORKDIR=$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" auth login "$username"
+fi
+grep -q 'signed in for this process only; owner-only session storage is unavailable' \
+  "$out_dir/permission-degraded-tty.pty" \
+  || fail 'TTY permission degradation did not fall back to a process-only session'
+[[ -z "$(find "$auth_dir" -maxdepth 1 -type f -name '*.json' -print -quit)" ]] \
+  || fail 'TTY permission degradation retained a cache record under broad permissions'
+
+set +e
+if [[ "$use_native" -eq 1 ]]; then
+  TAPSTATE_WORKDIR="$workspace" TAPSTATE_PASSWORD="$password" \
+    "$cli_binary" "-Duser.home=$home_dir" auth login "$username" \
+    >"$out_dir/permission-degraded-non-tty.stdout" 2>"$out_dir/permission-degraded-non-tty.stderr"
+else
+  TAPSTATE_WORKDIR="$workspace" TAPSTATE_PASSWORD="$password" \
+    java "-Duser.home=$home_dir" -jar "$cli_jar" auth login "$username" \
+    >"$out_dir/permission-degraded-non-tty.stdout" 2>"$out_dir/permission-degraded-non-tty.stderr"
+fi
+permission_degraded_non_tty_rc=$?
+set -e
+[[ "$permission_degraded_non_tty_rc" -ne 0 ]] \
+  || fail 'non-TTY permission degradation unexpectedly succeeded'
+[[ ! -s "$out_dir/permission-degraded-non-tty.stdout" ]] \
+  || fail 'non-TTY permission degradation polluted stdout'
+grep -q 'cli.auth-cache-permissions' "$out_dir/permission-degraded-non-tty.stderr" \
+  || fail 'non-TTY permission degradation did not return cli.auth-cache-permissions'
+[[ -z "$(find "$auth_dir" -maxdepth 1 -type f -name '*.json' -print -quit)" ]] \
+  || fail 'non-TTY permission degradation retained a cache record under broad permissions'
+
 empty_home="$out_dir/empty-home"
 mkdir -p "$empty_home"
 set +e
@@ -408,10 +451,10 @@ PY
 
 server_commit=$(git -C "$root" rev-parse HEAD)
 python3 - "$out_dir/auth-summary.json" "$out_dir/report.json" "$server_commit" "$timestamp" \
-  "$auth_dir_mode" "$auth_file_mode" "$config_mode" "$cli_runtime" <<'PY'
+  "$auth_dir_mode" "$auth_file_mode" "$config_mode" "$permission_degraded_auth_dir_mode" "$cli_runtime" <<'PY'
 import json, sys
 
-summary_path, report_path, commit, observed_at, auth_dir_mode, auth_file_mode, config_mode, cli_runtime = sys.argv[1:]
+summary_path, report_path, commit, observed_at, auth_dir_mode, auth_file_mode, config_mode, permission_degraded_auth_dir_mode, cli_runtime = sys.argv[1:]
 summary = json.load(open(summary_path, encoding="utf-8"))
 report = {
     "result": "passed",
@@ -420,6 +463,7 @@ report = {
     "cliRuntime": cli_runtime,
     "platform": "POSIX",
     "cacheModes": {"authDirectory": auth_dir_mode, "authRecord": auth_file_mode, "config": config_mode},
+    "permissionDegradation": {"unsafeAuthDirectoryMode": permission_degraded_auth_dir_mode},
     "authRecord": summary,
     "cases": [
         "pty-context-create-and-exact-workspace-bind",
@@ -428,6 +472,8 @@ report = {
         "fresh-process-session-resume-and-online-read",
         "server-side-session-revoke-rejects-resume",
         "offline-local-only-logout-removes-only-local-cache",
+        "tty-permission-degradation-is-process-only",
+        "non-tty-permission-degradation-is-a-hard-error-without-cache",
         "non-tty-no-context-is-prompt-free-and-stdout-clean",
         "password-absent-from-retained-test-artifacts",
     ],
