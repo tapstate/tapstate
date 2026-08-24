@@ -8,6 +8,8 @@ import java.util.Objects;
 /** Projects a canonical Pipeline artifact and its resolved Sources into a structured view. */
 public final class PipelineRepresentation {
 
+    private final PipelineDagProjection dagProjection = new PipelineDagProjection();
+
     /** Builds a Pipeline view while preserving the declared Source reference order. */
     public PipelineView toView(
             PipelineResource pipeline, String contentHash, List<PipelineSourceSummary> sourceSummaries) {
@@ -26,6 +28,7 @@ public final class PipelineRepresentation {
                 pipeline.serve(),
                 pipeline.settings(),
                 pipeline.experimental(),
+                dagProjection.project(pipeline),
                 contentHash);
     }
 }

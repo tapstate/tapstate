@@ -13,6 +13,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
@@ -21,12 +22,13 @@ import io.tapstate.spi.store.StorePort;
 import java.util.Objects;
 
 /**
- * The MongoDB implementation of the persistence port: it aggregates the ten sub-stores — the artifact
+ * The MongoDB implementation of the persistence port: it aggregates fourteen sub-stores — the artifact
  * truth layer, the epoch-fencing pipeline state store, the plain-upsert pipeline desired-state store,
  * the connection catalog, the discovered source-schema store, the connector distribution registry, the
  * derived connector catalog rows, the latest connection-test result per connection, the plain-upsert
- * per-pipeline observation store, and the SRS meta store (one durable coordination record per mining
- * chain) — each bound to its own collection (or GridFS bucket) on the verified connection's database.
+ * per-pipeline observation store, the SRS meta store (one durable coordination record per mining chain),
+ * and the editor-only Pipeline layout store — each bound to its own collection (or GridFS bucket) on the
+ * verified connection's database.
  * Operator state is the one exception and sits in a database of its own on the same client, for the
  * reasons on {@link #NEST_STATE_DATABASE}. This is the store bridge the assembly root wires into the
  * platform under {@code --role=all}; the app sees only the driver-free {@link StorePort}, so no driver
@@ -42,6 +44,8 @@ public final class MongoStorePort implements StorePort {
     public static final String PIPELINE_DESIRED = "pipeline_desired";
     /** The collection holding one plain-upsert observation doc per pipeline. */
     public static final String PIPELINE_OBSERVATION = "pipeline_observation";
+    /** The collection holding one editor-only canvas layout per pipeline. */
+    public static final String PIPELINE_LAYOUTS = "pipeline_layouts";
     /** The collection holding the registered connection configurations. */
     public static final String CONNECTIONS = "connections";
     /** The collection holding one discovered source model per connection. */
@@ -108,6 +112,7 @@ public final class MongoStorePort implements StorePort {
     private final ConnectorSpecStore connectorSpecs;
     private final ConnectionTestResultStore connectionTestResults;
     private final ObservationStore observations;
+    private final PipelineLayoutStore layouts;
     private final SrsMetaStore meta;
     private final KeyedStateStore keyedState;
     private final NestDeadLetterStore nestDeadLetters;
@@ -132,6 +137,7 @@ public final class MongoStorePort implements StorePort {
         this.connectionTestResults =
                 new MongoConnectionTestResultStore(database.getCollection(CONNECTION_TEST_RESULTS));
         this.observations = new MongoObservationStore(database.getCollection(PIPELINE_OBSERVATION));
+        this.layouts = new MongoPipelineLayoutStore(database.getCollection(PIPELINE_LAYOUTS));
         this.meta = new MongoSrsMetaStore(database.getCollection(SRS_META));
         // Operator state alone sits in its own database on the same client, for the reasons on the
         // constant. Same connection, same credentials, same lifecycle - a different database. What that
@@ -190,6 +196,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public ObservationStore observations() {
         return observations;
+    }
+
+    @Override
+    public PipelineLayoutStore layouts() {
+        return layouts;
     }
 
     @Override

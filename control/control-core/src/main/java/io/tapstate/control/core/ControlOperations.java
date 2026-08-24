@@ -170,6 +170,12 @@ public final class ControlOperations {
     public static final Operation PIPELINE_GET = new Operation(
             "pipeline.get", Scope.READ, false, null,
             "Get one static Pipeline artifact with resolved Source summaries.", CLI_ONLY);
+    public static final Operation PIPELINE_LAYOUT_GET = new Operation(
+            "pipeline.layout.get", Scope.READ, false, null,
+            "Read editor-only node positions and viewport state for one Pipeline.", CLI_ONLY);
+    public static final Operation PIPELINE_LAYOUT_UPDATE = new Operation(
+            "pipeline.layout.update", Scope.WRITE, false, null,
+            "Replace editor-only node positions and viewport state for one Pipeline.", CLI_ONLY);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
@@ -231,6 +237,8 @@ public final class ControlOperations {
             CLUSTER_MEMBERS,
             PIPELINE_LIST,
             PIPELINE_GET,
+            PIPELINE_LAYOUT_GET,
+            PIPELINE_LAYOUT_UPDATE,
             PIPELINE_START,
             PIPELINE_STOP,
             PIPELINE_PAUSE,

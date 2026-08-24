@@ -31,6 +31,7 @@ import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelineRepresentation;
@@ -527,6 +528,11 @@ class ControlPlaneConfiguration {
     PipelineViewService pipelineViewService(
             ArtifactQueryService artifactQueryService, PipelineRepresentation representation) {
         return new PipelineViewService(artifactQueryService, representation);
+    }
+
+    @Bean
+    PipelineLayoutService pipelineLayoutService(PipelineViewService pipelines, StorePort storePort) {
+        return new PipelineLayoutService(pipelines, storePort.layouts());
     }
 
     /**
