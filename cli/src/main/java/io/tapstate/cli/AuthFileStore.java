@@ -105,8 +105,8 @@ final class AuthFileStore {
             return Optional.of(record);
         } catch (TapstateException coded) {
             throw coded;
-        } catch (RuntimeException failure) {
-            throw invalid(file, "schema validation failed", failure);
+        } catch (RuntimeException ignored) {
+            throw invalid(file, "schema validation failed", null);
         }
     }
 

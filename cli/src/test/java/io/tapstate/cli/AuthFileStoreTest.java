@@ -6,6 +6,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,6 +20,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AuthFileStoreTest {
@@ -137,6 +140,36 @@ class AuthFileStoreTest {
         assertThatThrownBy(() -> store.load(AUTH_REF, CONTEXT_ID))
                 .isInstanceOfSatisfying(TapstateException.class,
                         error -> assertThat(error.getMessage()).doesNotContain(injectedSession));
+    }
+
+    @Test
+    void redactsInvalidCacheMaterialFromDeveloperAndRenderedDiagnosticLogs(@TempDir Path home) throws IOException {
+        AuthFileStore store = AuthFileStore.underHome(home);
+        Path authDir = Files.createDirectories(home.resolve(".tapstate/auth"));
+        ownerOnlyDirectory(home.resolve(".tapstate"));
+        ownerOnlyDirectory(authDir);
+        Path authFile = authDir.resolve(AUTH_REF + ".json");
+        String injectedSession = "tss_s01.session-secret";
+        String injectedPassword = "password-never-log-this";
+        String injectedAccess = "jwt-access-never-log-this";
+        String poisoned = validJson().replace(
+                CREATED.toString(), injectedSession + injectedPassword + injectedAccess);
+        Files.writeString(authFile, poisoned, StandardCharsets.UTF_8);
+        ownerOnlyFile(authFile);
+
+        TapstateException error = catchThrowableOfType(
+                () -> store.load(AUTH_REF, CONTEXT_ID), TapstateException.class);
+        StringWriter rendered = new StringWriter();
+        Diagnostics.printText(new PrintWriter(rendered), error.code(), error.args());
+        StringWriter stackTrace = new StringWriter();
+        error.printStackTrace(new PrintWriter(stackTrace));
+
+        assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid");
+        assertThat(error.getMessage()).contains("schema validation failed");
+        assertThat(error).hasNoCause();
+        assertThat(List.of(error.getMessage(), rendered.toString(), stackTrace.toString()))
+                .allSatisfy(diagnostic -> assertThat(diagnostic)
+                        .doesNotContain(injectedSession, injectedPassword, injectedAccess));
     }
 
     @Test
