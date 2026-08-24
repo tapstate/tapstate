@@ -37,6 +37,9 @@ final class LaunchOptions {
     @Option(names = {"-u", "--user"}, paramLabel = "NAME")
     String user;
 
+    @Option(names = "--token", paramLabel = "TOKEN")
+    String token;
+
     @Option(names = {"-w", "--workdir"}, paramLabel = "DIR",
             defaultValue = "${env:TAPSTATE_WORKDIR:-tap-work}")
     String workdir;
@@ -45,7 +48,7 @@ final class LaunchOptions {
     @Parameters
     List<String> command = List.of();
 
-    /** The environment {@code TAPSTATE_PASSWORD} is read from; a scripted stand-in is used in tests. */
+    /** The launch credential environment is read from here; a scripted stand-in is used in tests. */
     private UnaryOperator<String> env = System::getenv;
 
     /** The workspace a session starts in. */
@@ -68,12 +71,24 @@ final class LaunchOptions {
         return user;
     }
 
+    /**
+     * The process-only machine token: an explicit selector wins over {@code TAPSTATE_TOKEN}; a blank
+     * environment value means no selector. The value is intentionally never persisted by this type.
+     */
+    String machineToken() {
+        if (token != null) {
+            return token;
+        }
+        String fromEnv = env.apply("TAPSTATE_TOKEN");
+        return fromEnv == null || fromEnv.isBlank() ? null : fromEnv;
+    }
+
     /** The command to run, empty when a session was asked for. */
     List<String> command() {
         return command;
     }
 
-    /** Replaces the environment the password falls back to; for tests. */
+    /** Replaces the launch environment; for tests. */
     LaunchOptions withEnv(UnaryOperator<String> replacement) {
         this.env = replacement;
         return this;
@@ -138,6 +153,7 @@ final class LaunchOptions {
                 .setStopAtPositional(true)
                 .parseArgs(args);
         options.rejectBlankContext();
+        options.rejectBlankMachineToken();
         options.consumeAuthContextAfterAction();
         return options;
     }
@@ -146,6 +162,13 @@ final class LaunchOptions {
     private void rejectBlankContext() {
         if (context != null && context.isBlank()) {
             throw new IllegalArgumentException("--context needs a non-empty name");
+        }
+    }
+
+    /** Rejects an explicitly supplied machine-token selector that would otherwise mask the environment. */
+    private void rejectBlankMachineToken() {
+        if (token != null && token.isBlank()) {
+            throw new IllegalArgumentException("--token needs a non-empty value");
         }
     }
 

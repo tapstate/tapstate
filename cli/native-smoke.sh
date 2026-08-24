@@ -340,7 +340,14 @@ trap 'if [[ -f "$STUB_DIR/pid" ]]; then kill "$(cat "$STUB_DIR/pid")" 2>/dev/nul
 printf 'PK\003\004smoke-jar' > "$STUB_DIR/smoke.jar"   # any bytes; the stub does not inspect the jar
 cat > "$STUB_DIR/stub.py" <<'PY'
 import http.server, json, os, socketserver, sys
+EVENTS = sys.argv[3]
 class H(http.server.BaseHTTPRequestHandler):
+    def _event(self):
+        authorization = self.headers.get("Authorization")
+        authorization_kind = ("none" if authorization is None else
+                              "bearer" if authorization.startswith("Bearer ") else "other")
+        with open(EVENTS, "a") as f:
+            f.write(f"{self.command} {self.path} auth={authorization_kind}\n")
     def _send(self, code, obj=None):
         self.send_response(code)
         if obj is not None:
@@ -352,6 +359,7 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             self.end_headers()
     def do_GET(self):
+        self._event()
         if self.path == "/healthz":
             self._send(200)
         elif self.path == "/.well-known/tapstate":
@@ -364,6 +372,7 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             self._send(404)
     def do_POST(self):
+        self._event()
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if self.path == "/auth/login":
             self._send(200, {"token": "smoke-token"})
@@ -383,7 +392,7 @@ with open(sys.argv[2], "w") as f:                       # publish the child pid 
     f.write(str(os.getpid()))
 srv.serve_forever()
 PY
-python3 "$STUB_DIR/stub.py" "$STUB_DIR/port" "$STUB_DIR/pid"
+python3 "$STUB_DIR/stub.py" "$STUB_DIR/port" "$STUB_DIR/pid" "$STUB_DIR/events"
 STUB_PORT="$(cat "$STUB_DIR/port" 2>/dev/null || true)"
 printf -v online_in 'connect 127.0.0.1:%s\nlogin admin\nsmoke-pw\nregister %s\nexit\n' "$STUB_PORT" "$STUB_DIR/smoke.jar"
 pty_session "$online_in"
@@ -452,6 +461,26 @@ else
   bad "kafka.modes in the image is [$KAFKA_MODES], not the overlay-declared [stream]"
 fi
 rm -rf "$KAFKA_DIR"
+# --- 12. one-line machine token ---------------------------------------------------------------
+bold "[12] one-line machine token — discovery precedes Bearer and password login stays unused"
+MACHINE_TOKEN="native-smoke-machine-token"
+MACHINE_EVENT_COUNT=$(wc -l < "$STUB_DIR/events")
+MACHINE_OUT=$("$BINARY" --token "$MACHINE_TOKEN" -c "127.0.0.1:$STUB_PORT" \
+                register "$STUB_DIR/smoke.jar" 2>"$STUB_DIR/machine.err") && MACHINE_RC=0 || MACHINE_RC=$?
+MACHINE_CLEAN=$(printf '%s' "$MACHINE_OUT" | strip_ansi)
+MACHINE_EVENTS=$(tail -n +$((MACHINE_EVENT_COUNT + 1)) "$STUB_DIR/events" 2>/dev/null || true)
+DISCOVERY_LINE=$(printf '%s\n' "$MACHINE_EVENTS" | grep -n '^GET /.well-known/tapstate auth=none$' | head -1 | cut -d: -f1 || true)
+API_LINE=$(printf '%s\n' "$MACHINE_EVENTS" | grep -n '^POST /api/connectors:register auth=bearer$' | head -1 | cut -d: -f1 || true)
+if (( MACHINE_RC == 0 )) \
+   && printf '%s' "$MACHINE_CLEAN" | grep -qE 'registered[[:space:]]+smoke' \
+   && ! printf '%s' "$MACHINE_CLEAN" | grep -q "$MACHINE_TOKEN" \
+   && ! printf '%s\n' "$MACHINE_EVENTS" | grep -q '^POST /auth/login ' \
+   && [[ -n "$DISCOVERY_LINE" && -n "$API_LINE" ]] \
+   && (( DISCOVERY_LINE < API_LINE )); then
+  ok "one-line --token discovered the issuer before Bearer use and skipped password login"
+else
+  bad "one-line --token did not preserve its discovery and process-only credential contract (rc=$MACHINE_RC)"
+fi
 
 # --- summary ------------------------------------------------------------------------------------
 echo

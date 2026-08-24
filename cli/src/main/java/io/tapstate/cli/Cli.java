@@ -50,6 +50,8 @@ import java.util.function.Supplier;
                 "                        (or place it after an auth action)",
                 "  -u, --user NAME     sign in as this user once connected (needs -c); the password",
                 "                        comes from $TAPSTATE_PASSWORD or a masked prompt",
+                "      --token TOKEN   use a machine token for this process only (or",
+                "                        $TAPSTATE_TOKEN); it is never saved in a user session",
                 ""},
         footerHeading = "%nExamples:%n",
         footer = {
@@ -483,9 +485,15 @@ public final class Cli implements Runnable {
             Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
                     new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
+            String machineToken = launch.machineToken();
+            if (machineToken != null) {
+                repl.installMachineToken(machineToken);
+            }
             if (launch.connects()) {
-                int established = repl.signIn(launch.connect(), launch.user(),
-                        () -> launch.resolvePassword(prompter), launch.isOneShot());
+                int established = machineToken == null
+                        ? repl.signIn(launch.connect(), launch.user(),
+                                () -> launch.resolvePassword(prompter), launch.isOneShot())
+                        : repl.connectForLaunch(launch.connect(), launch.isOneShot());
                 if (established != EXIT_OK) {
                     return established;
                 }

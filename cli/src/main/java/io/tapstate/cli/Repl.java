@@ -142,6 +142,9 @@ final class Repl {
     /** The connection state, carried across read-loop iterations (offline until {@code connect}). */
     private final Session session = new Session();
 
+    /** The launch-scoped machine bearer, retained only in this process until logout or exit. */
+    private String machineToken;
+
     /** The session workspace: the current {@code cd} directory, injected into workspace-aware verbs. */
     private Path workdir;
 
@@ -247,6 +250,14 @@ final class Repl {
         return session;
     }
 
+    /** Installs a process-only machine token; issuer discovery runs before the bearer is attached or sent. */
+    void installMachineToken(String token) {
+        if (token == null || token.isBlank()) {
+            throw new IllegalArgumentException("machine token must not be blank");
+        }
+        machineToken = token;
+    }
+
     /**
      * The status the last dispatched line produced, in the same scheme one-shot mode exits with. The
      * read loop ignores it — a line that failed does not end a session — but a scripted invocation that
@@ -301,6 +312,16 @@ final class Repl {
                 return connected;
             }
             return login(username, password);
+        } finally {
+            this.quiet = false;
+        }
+    }
+
+    /** Establishes a quiet launch connection without invoking the human-password flow. */
+    int connectForLaunch(String seeds, boolean quiet) {
+        this.quiet = quiet;
+        try {
+            return connect(List.of("connect", seeds));
         } finally {
             this.quiet = false;
         }
@@ -450,6 +471,10 @@ final class Repl {
             return true;
         }
         if (words.get(0).equals("auth")) {
+            if (machineToken != null && isMachineTokenLocalAuth(words)) {
+                lastExitCode = auth(words);
+                return true;
+            }
             if (!session.isConnected()) {
                 int resolved = isLocalOnlyLogout(words)
                         ? resolveNamedContextWithoutConnect(words)
@@ -491,6 +516,10 @@ final class Repl {
         // the offline path already had a status -- picocli returns one -- and it was being discarded
         lastExitCode = commandLine.execute(withWorkspace(words));
         return true;
+    }
+
+    private static boolean isMachineTokenLocalAuth(List<String> words) {
+        return words.size() >= 2 && (words.get(1).equals("status") || words.get(1).equals("logout"));
     }
 
     private static boolean isLocalOnlyLogout(List<String> words) {
@@ -564,9 +593,9 @@ final class Repl {
      * another member and the verb is retried once against the new node.
      */
     private int onlineVerb(List<String> words) {
-        int resumed = resumeNamedSession();
-        if (resumed != Cli.EXIT_OK) {
-            return resumed;
+        int prepared = prepareCredential();
+        if (prepared != Cli.EXIT_OK) {
+            return prepared;
         }
         PrintWriter err = commandLine.getErr();
         if (!session.isAuthenticated()) {
@@ -653,6 +682,31 @@ final class Repl {
                     confirm("resumed " + active.record().principal() + "@" + namedContext.name());
                 }
             });
+            return Cli.EXIT_OK;
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    /** Prepares the only credential source allowed for this process before an API request. */
+    private int prepareCredential() {
+        return machineToken == null ? resumeNamedSession() : activateMachineToken();
+    }
+
+    /**
+     * Runs anonymous issuer discovery before putting a machine token into the transport session. This
+     * deliberately does not involve the human-session cache or session-exchange endpoint.
+     */
+    private int activateMachineToken() {
+        if (session.hasMachineCredential()) {
+            return Cli.EXIT_OK;
+        }
+        try {
+            List<URI> seeds = namedContext == null ? session.seeds() : namedContext.definition().seeds();
+            IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(seeds, null);
+            session.reland(verified.seed());
+            session.authenticateMachine(machineToken, session.seeds());
             return Cli.EXIT_OK;
         } catch (io.tapstate.core.common.TapstateException failure) {
             Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
@@ -887,9 +941,9 @@ final class Repl {
             Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", verb));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
-        int resumed = resumeNamedSession();
-        if (resumed != Cli.EXIT_OK) {
-            return resumed;
+        int prepared = prepareCredential();
+        if (prepared != Cli.EXIT_OK) {
+            return prepared;
         }
         if (!session.isAuthenticated()) {
             Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", verb));
@@ -3166,6 +3220,9 @@ final class Repl {
     private int login(List<String> words) {
         PrintWriter out = commandLine.getOut();
         PrintWriter err = commandLine.getErr();
+        if (machineToken != null) {
+            return machineTokenUsage("login cannot be combined with --token");
+        }
         if (!session.isConnected()) {
             Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", "login"));
             return Cli.EXIT_VERB_UNAVAILABLE;
@@ -3281,6 +3338,12 @@ final class Repl {
 
     /** Drops the credential while keeping the transport connection; a benign line either way. */
     private int logout() {
+        if (machineToken != null) {
+            clearMachineToken();
+            commandLine.getOut().println("machine token cleared");
+            commandLine.getOut().flush();
+            return Cli.EXIT_OK;
+        }
         if (namedContext != null && authService != null) {
             return authLogout(false);
         }
@@ -3299,6 +3362,9 @@ final class Repl {
     /** Dispatches the persistent auth namespace while keeping connect/disconnect transport-only. */
     private int auth(List<String> words) {
         PrintWriter err = commandLine.getErr();
+        if (machineToken != null) {
+            return machineTokenAuth(words);
+        }
         if (namedContext == null || authService == null) {
             Diagnostics.printText(err, CliError.CONTEXT_REQUIRED, Map.of("verb", "auth"));
             return Cli.EXIT_VERB_UNAVAILABLE;
@@ -3336,6 +3402,46 @@ final class Repl {
                 ? () -> environmentPassword
                 : () -> prompter.secret("Password");
         return persistentLogin(username, password);
+    }
+
+    /** Keeps persistent human-auth commands from operating on a launch-scoped machine bearer. */
+    private int machineTokenAuth(List<String> words) {
+        if (words.size() < 2) {
+            return authUsage("missing action");
+        }
+        return switch (words.get(1)) {
+            case "status" -> {
+                if (words.size() != 2) {
+                    yield authUsage("status takes no arguments");
+                }
+                commandLine.getOut().println("machine token selected for this process");
+                commandLine.getOut().flush();
+                yield Cli.EXIT_OK;
+            }
+            case "logout" -> {
+                if (words.size() > 3 || (words.size() == 3 && !words.get(2).equals("--local-only"))) {
+                    yield authUsage("logout accepts only --local-only");
+                }
+                clearMachineToken();
+                commandLine.getOut().println("machine token cleared");
+                commandLine.getOut().flush();
+                yield Cli.EXIT_OK;
+            }
+            case "login" -> machineTokenUsage("auth login cannot be combined with --token");
+            default -> authUsage("unknown action '" + words.get(1) + "'");
+        };
+    }
+
+    /** Removes only the process credential; it never invokes persistent human-session logout. */
+    private void clearMachineToken() {
+        machineToken = null;
+        session.logout();
+    }
+
+    private int machineTokenUsage(String reason) {
+        commandLine.getErr().println("login: " + reason);
+        commandLine.getErr().flush();
+        return Cli.EXIT_USAGE;
     }
 
     private int authStatus() {

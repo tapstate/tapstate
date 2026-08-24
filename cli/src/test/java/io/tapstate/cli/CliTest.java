@@ -89,6 +89,17 @@ class CliTest {
     }
 
     @Test
+    void rootHelpDocumentsProcessOnlyMachineTokenSelection() {
+        Run help = run("--help");
+
+        assertThat(help.code()).isZero();
+        assertThat(help.out()).contains("--token TOKEN")
+                .contains("TAPSTATE_TOKEN")
+                .contains("process only");
+        assertThat(help.err()).isEmpty();
+    }
+
+    @Test
     void authMaySelectItsContextAfterTheAction() {
         LaunchOptions login = LaunchOptions.parse("auth", "login", "alice", "--context", "dev");
         LaunchOptions status = LaunchOptions.parse("auth", "status", "--context=dev");
@@ -842,6 +853,21 @@ class CliTest {
         assertThat(selected.hasConflictingTargets()).isFalse();
         assertThat(LaunchOptions.parse("--connect", "node:8080", "--context", "dev", "ls")
                 .hasConflictingTargets()).isTrue();
+    }
+
+    @Test
+    void machineTokenIsALaunchOnlySelectorWithAnEnvironmentFallback() {
+        LaunchOptions explicit = LaunchOptions.parse("--token", "machine-from-flag", "ls")
+                .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
+        LaunchOptions fromEnvironment = LaunchOptions.parse("ls")
+                .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
+
+        assertThat(explicit.machineToken()).isEqualTo("machine-from-flag");
+        assertThat(explicit.command()).containsExactly("ls");
+        assertThat(fromEnvironment.machineToken()).isEqualTo("machine-from-env");
+        assertThat(LaunchOptions.parse("ls").withEnv(name -> null).machineToken()).isNull();
+        assertThatThrownBy(() -> LaunchOptions.parse("--token=", "ls"))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

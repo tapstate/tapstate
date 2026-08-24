@@ -88,6 +88,7 @@ class ReplTest {
      */
     private static final class FakeControlPlane implements ControlPlaneClient {
         private final Set<URI> healthy;
+        final List<String> events = new ArrayList<>();
         final List<URI> probed = new ArrayList<>();
         final List<URI> discovered = new ArrayList<>();
         /** The canned login outcome and a log of the login calls made ({@code user:pass@base}). */
@@ -184,6 +185,7 @@ class ReplTest {
 
         @Override
         public DiscoveryOutcome discover(URI baseUrl) {
+            events.add("discover " + baseUrl);
             discovered.add(baseUrl);
             return healthy.contains(baseUrl)
                     ? new DiscoveryOutcome.Discovered("urn:tapstate:cluster:test-cluster", "test-cluster",
@@ -199,24 +201,28 @@ class ReplTest {
 
         @Override
         public LoginOutcome login(URI baseUrl, String username, String password) {
+            events.add("login " + baseUrl);
             loginCalls.add(username + ":" + password + "@" + baseUrl);
             return loginOutcome;
         }
 
         @Override
         public LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
+            events.add("login " + baseUrl);
             loginCalls.add(username + ":" + password + "@" + baseUrl + " persistent=" + createSession);
             return loginOutcome;
         }
 
         @Override
         public SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
+            events.add("exchange " + baseUrl);
             sessionCalls.add("exchange " + sessionToken + "@" + baseUrl);
             return exchangeOutcome;
         }
 
         @Override
         public SessionLogoutOutcome logoutSession(URI baseUrl, String sessionToken) {
+            events.add("logout " + baseUrl);
             sessionCalls.add("logout " + sessionToken + "@" + baseUrl);
             beforeLogoutResult.run();
             return logoutOutcome;
@@ -287,6 +293,7 @@ class ReplTest {
 
         @Override
         public ListOutcome list(URI baseUrl, String credential, String kind) {
+            events.add("list " + baseUrl);
             listCalls.add(credential + "@" + baseUrl + "?" + kind);
             return healthy.contains(baseUrl) ? listOutcome : new ListOutcome.Unreachable();
         }
@@ -4328,6 +4335,213 @@ class ReplTest {
                     .containsExactly("exchange tss_s01.session-secret@" + seed);
             assertThat(client.dataBrowserCalls).as(command).isNotEmpty();
         }
+    }
+
+    @Test
+    void machineTokenWinsOverACachedHumanSessionWithoutPersistingOrExchangingIt(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        AuthSessionRecord cached = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.cached-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
+        store.save(cached, false);
+        Path cachePath = home.resolve(".tapstate/auth").resolve(authRef + ".json");
+        String cacheBefore = Files.readString(cachePath);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> config, name -> null), null,
+                new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.installMachineToken("machine-token-secret");
+        repl.dispatch(List.of("ls"), true);
+
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(client.discovered).containsExactly(seed);
+        assertThat(client.sessionCalls).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(client.listCalls).containsExactly("machine-token-secret@http://127.0.0.1:7900?null");
+        assertThat(Files.readString(cachePath)).isEqualTo(cacheBefore);
+        assertThat(output.toString()).doesNotContain("machine-token-secret", "tss_s01.cached-secret");
+    }
+
+    @Test
+    void launchMachineTokenDiscoversIssuerBeforeSendingBearerAndNeverUsesHumanAuth() {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        LaunchOptions launch = LaunchOptions.parse(
+                "--connect", seed.toString(), "--token", "machine-token-secret", "ls")
+                .withEnv(name -> null);
+
+        int code = Cli.runSession(launch, client, () -> new ScriptedPrompter());
+
+        assertThat(code).isZero();
+        assertThat(client.events).containsExactly(
+                "discover http://127.0.0.1:7900",
+                "list http://127.0.0.1:7900");
+        assertThat(client.sessionCalls).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(client.listCalls).containsExactly("machine-token-secret@http://127.0.0.1:7900?null");
+    }
+
+    @Test
+    void machineTokenAuthCommandsAndBareLogoutDoNotTouchCachedHumanAuth(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        AuthSessionRecord cached = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.cached-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
+        store.save(cached, false);
+        Path cachePath = home.resolve(".tapstate/auth").resolve(authRef + ".json");
+        byte[] cacheBefore = Files.readAllBytes(cachePath);
+
+        for (List<String> command : List.of(
+                List.of("auth", "status"),
+                List.of("auth", "logout"),
+                List.of("logout"))) {
+            FakeControlPlane client = new FakeControlPlane(seed);
+            CommandLine commandLine = Cli.newCommandLine();
+            StringWriter output = new StringWriter();
+            commandLine.setOut(new PrintWriter(output));
+            commandLine.setErr(new PrintWriter(output));
+            Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                    new ContextResolver(() -> config, name -> null), null,
+                    new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+            repl.installMachineToken("machine-token-secret");
+            repl.dispatch(command, true);
+
+            assertThat(repl.lastExitCode()).as(command.toString()).isZero();
+            assertThat(client.sessionCalls).as(command.toString()).isEmpty();
+            assertThat(client.loginCalls).as(command.toString()).isEmpty();
+            assertThat(Files.readAllBytes(cachePath)).as(command.toString()).isEqualTo(cacheBefore);
+            assertThat(output.toString()).as(command.toString())
+                    .doesNotContain("machine-token-secret", "tss_s01.cached-secret");
+        }
+    }
+
+    @Test
+    void machineTokenLocalAuthCommandsDoNotNeedAContextOrNetwork(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+
+        FakeControlPlane statusClient = new FakeControlPlane();
+        CommandLine statusLine = Cli.newCommandLine();
+        StringWriter statusOutput = new StringWriter();
+        statusLine.setOut(new PrintWriter(statusOutput));
+        statusLine.setErr(new PrintWriter(statusOutput));
+        Repl statusRepl = new Repl(statusLine, workspace, statusClient, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> new ContextConfig(1, null, Map.of(), Map.of()), name -> null), null,
+                new AuthService(statusClient, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        statusRepl.installMachineToken("machine-token-secret");
+        statusRepl.dispatch(List.of("auth", "status"), true);
+
+        assertThat(statusRepl.lastExitCode()).isZero();
+        assertThat(statusClient.probed).isEmpty();
+        assertThat(statusClient.discovered).isEmpty();
+        assertThat(statusClient.sessionCalls).isEmpty();
+        assertThat(statusClient.loginCalls).isEmpty();
+        assertThat(statusOutput.toString())
+                .contains("machine token selected")
+                .doesNotContain("machine-token-secret");
+
+        FakeControlPlane logoutClient = new FakeControlPlane();
+        CommandLine logoutLine = Cli.newCommandLine();
+        StringWriter logoutOutput = new StringWriter();
+        logoutLine.setOut(new PrintWriter(logoutOutput));
+        logoutLine.setErr(new PrintWriter(logoutOutput));
+        Repl logoutRepl = new Repl(logoutLine, workspace, logoutClient, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> new ContextConfig(1, null, Map.of(), Map.of()), name -> null), null,
+                new AuthService(logoutClient, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        logoutRepl.installMachineToken("machine-token-secret");
+        logoutRepl.dispatch(List.of("auth", "logout"), true);
+
+        assertThat(logoutRepl.lastExitCode()).isZero();
+        assertThat(logoutClient.probed).isEmpty();
+        assertThat(logoutClient.discovered).isEmpty();
+        assertThat(logoutClient.sessionCalls).isEmpty();
+        assertThat(logoutClient.loginCalls).isEmpty();
+        assertThat(logoutOutput.toString())
+                .contains("machine token cleared")
+                .doesNotContain("machine-token-secret");
+
+        FakeControlPlane localOnlyLogoutClient = new FakeControlPlane();
+        CommandLine localOnlyLogoutLine = Cli.newCommandLine();
+        StringWriter localOnlyLogoutOutput = new StringWriter();
+        localOnlyLogoutLine.setOut(new PrintWriter(localOnlyLogoutOutput));
+        localOnlyLogoutLine.setErr(new PrintWriter(localOnlyLogoutOutput));
+        Repl localOnlyLogoutRepl = new Repl(
+                localOnlyLogoutLine, workspace, localOnlyLogoutClient, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> new ContextConfig(1, null, Map.of(), Map.of()), name -> null), null,
+                new AuthService(localOnlyLogoutClient, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        localOnlyLogoutRepl.installMachineToken("machine-token-secret");
+        localOnlyLogoutRepl.dispatch(List.of("auth", "logout", "--local-only"), true);
+
+        assertThat(localOnlyLogoutRepl.lastExitCode()).isZero();
+        assertThat(localOnlyLogoutClient.probed).isEmpty();
+        assertThat(localOnlyLogoutClient.discovered).isEmpty();
+        assertThat(localOnlyLogoutClient.sessionCalls).isEmpty();
+        assertThat(localOnlyLogoutClient.loginCalls).isEmpty();
+        assertThat(localOnlyLogoutOutput.toString())
+                .contains("machine token cleared")
+                .doesNotContain("machine-token-secret");
+    }
+
+    @Test
+    void machineTokenRefusesRemotePlaintextBeforeDiscoveryOrBearerUse(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://node1:7900");
+        ContextDefinition definition = new ContextDefinition(
+                UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"), List.of(seed),
+                new ContextTls(true), UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed"));
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        FakeControlPlane client = new FakeControlPlane(seed);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> config, name -> null), null,
+                new AuthService(client, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        repl.installMachineToken("machine-token-secret");
+        repl.dispatch(List.of("ls"), true);
+
+        assertThat(repl.lastExitCode()).isNotZero();
+        assertThat(client.discovered).isEmpty();
+        assertThat(client.sessionCalls).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(client.listCalls).isEmpty();
+        assertThat(output.toString()).contains("cli.remote-plaintext")
+                .doesNotContain("machine-token-secret");
     }
 
     @Test

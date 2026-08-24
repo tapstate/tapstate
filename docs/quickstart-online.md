@@ -378,6 +378,21 @@ remove the local cache. `connect` remains a temporary diagnostic connection: a l
 `connect` and `login` change only the current REPL process and do not update a context or
 save a session.
 
+For automation, pass a machine token at launch with `--token TOKEN` or
+`TAPSTATE_TOKEN`. It wins over a cached human session for this process, is never read
+from or written to the human-session cache, and is not printed by CLI diagnostics. The
+CLI performs anonymous server discovery before attaching the bearer. Pair it with a
+temporary target when no context is selected:
+
+```console
+$ TAPSTATE_TOKEN=... ./tapstate-cli/bin/tapstate --connect http://127.0.0.1:8080 ls pipeline
+```
+
+In an interactive process, `auth status` reports that the machine token is selected and
+`auth logout` (or bare `logout`) only clears that in-process token; neither action
+requires a context or contacts the server. `auth login` is intentionally unavailable
+while a machine token is selected.
+
 - **`register`** uploads a connector jar to the server (content-addressed and
   idempotent; re-registering the same jar is a no-op). Its paths resolve against the
   workspace root — `work/` here — which is why the jars beside it are reached as
@@ -697,5 +712,6 @@ This runtime is a preview. Known constraints in this slice:
   and is often sparse; full runtime detail is in the server process log.
 - **No CLI bootstrap verb.** The compose stack creates the first admin for you; on
   the from-source path it is the `curl` above.
-- **One-shot online verbs don't persist a session.** The online verbs are driven from
-  the REPL, where the connection is session state.
+- **Temporary connections and machine tokens are process-scoped.** A persistent human
+  session is created only by `auth login` against a named context; `connect`,
+  `--connect`, `--token`, and `TAPSTATE_TOKEN` never create or update that cache.
