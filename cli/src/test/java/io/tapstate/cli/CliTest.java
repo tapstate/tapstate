@@ -89,6 +89,21 @@ class CliTest {
     }
 
     @Test
+    void contextHelpIsAUsefulNarrowInteractiveSurface() {
+        Run direct = run("context", "--help");
+        Run helpCommand = run("help", "context");
+
+        assertThat(direct.code()).isZero();
+        assertThat(helpCommand.code()).isZero();
+        assertThat(direct.out()).contains("tapstate context")
+                .contains("Create, choose, edit, bind, unbind, or delete saved contexts.");
+        assertThat(helpCommand.out()).contains("tapstate context")
+                .contains("Create, choose, edit, bind, unbind, or delete saved contexts.");
+        assertThat(Cli.newCommandLine().getSubcommands().get("context").getSubcommands())
+                .doesNotContainKeys("add", "use", "list", "show", "bind", "unbind", "remove");
+    }
+
+    @Test
     void liveViewVerbsAreOnlineLaunchesEvenThoughTheyProjectNoOperation() {
         assertThat(Cli.LIVE_VIEW_VERBS).allSatisfy(verb ->
                 assertThat(Repl.isOnlineVerb(verb)).as(verb).isTrue());

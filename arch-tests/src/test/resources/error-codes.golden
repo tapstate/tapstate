@@ -33,7 +33,17 @@ cli.alias-install-dir-unknown
 cli.alias-link-failed
 cli.alias-name-taken
 cli.artifact-exists
+cli.auth-cache-invalid
+cli.auth-cache-permissions
+cli.auth-cache-version
 cli.auth-issuer-mismatch
+cli.auth-login-rejected
+cli.auth-login-unreachable
+cli.auth-logout-cache-changed
+cli.auth-logout-unreachable
+cli.auth-session-rejected
+cli.auth-session-unreachable
+cli.auth-usage
 cli.connect-failed
 cli.context-already-exists
 cli.context-config-invalid
@@ -43,6 +53,7 @@ cli.context-invalid
 cli.context-not-found
 cli.context-required
 cli.context-source-conflict
+cli.context-usage
 cli.connector-not-official
 cli.demo-workspace-exists
 cli.if-match-needs-one-resource

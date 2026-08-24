@@ -64,7 +64,7 @@ final class Repl {
 
     /** REPL-only words handled here rather than by the command table; completed alongside the verbs. */
     static final List<String> BUILTINS =
-            List.of("help", "exit", "quit", "cd", "pwd", "connect", "disconnect", "login", "logout");
+            List.of("help", "exit", "quit", "cd", "pwd", "connect", "disconnect", "login", "logout", ":ctx");
 
     /**
      * Registry verbs a connected session routes to the server instead of the offline command table. The
@@ -115,6 +115,9 @@ final class Repl {
 
     /** Shared persistent human-auth service; absent only from legacy network-free unit seams. */
     private final AuthService authService;
+
+    /** Shared interactive context manager; absent only from legacy seams that exercise no contexts. */
+    private final ContextManager contextManager;
 
     /** The named context that established the current transport, if this is not a temporary connect. */
     private ResolvedContext.Named namedContext;
@@ -190,6 +193,13 @@ final class Repl {
     Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
          UnaryOperator<String> env, ContextResolver contextResolver, String explicitContext,
          AuthService authService) {
+        this(commandLine, workdir, controlPlane, prompter, env, contextResolver, explicitContext,
+                authService, null);
+    }
+
+    Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
+         UnaryOperator<String> env, ContextResolver contextResolver, String explicitContext,
+         AuthService authService, ContextManager contextManager) {
         this.commandLine = commandLine;
         this.workdir = workdir;
         this.controlPlane = controlPlane;
@@ -198,11 +208,13 @@ final class Repl {
         this.contextResolver = contextResolver;
         this.explicitContext = explicitContext;
         this.authService = authService;
+        this.contextManager = contextManager;
     }
 
     /** Whether this verb can be routed to the control plane when a context resolves. */
     static boolean isOnlineVerb(String verb) {
-        return ONLINE_VERBS.contains(verb) || Cli.LIVE_VIEW_VERBS.contains(verb) || verb.equals("auth");
+        return ONLINE_VERBS.contains(verb) || Cli.LIVE_VIEW_VERBS.contains(verb)
+                || verb.equals("auth") || verb.equals("context");
     }
 
     /** The live-view verb this line opens with, or null when it opens with something else. */
@@ -360,6 +372,10 @@ final class Repl {
             lastExitCode = Cli.EXIT_OK;
             return true;
         }
+        if (trimmed.equals(":ctx")) {
+            lastExitCode = context();
+            return true;
+        }
         // The read shell is matched on the whole line rather than on its first word, because what it names
         // is a place in the data — `views.orders.find({...})` — and a filter written across several words
         // does not survive being split into them.
@@ -415,6 +431,16 @@ final class Repl {
         }
         if (words.get(0).equals("logout")) {
             lastExitCode = logout();
+            return true;
+        }
+        if (words.get(0).equals("context")
+                && words.stream().anyMatch(word -> word.equals("-h") || word.equals("--help")
+                        || word.equals("-V") || word.equals("--version"))) {
+            lastExitCode = commandLine.execute(words.toArray(new String[0]));
+            return true;
+        }
+        if (words.get(0).equals("context")) {
+            lastExitCode = context();
             return true;
         }
         if (words.get(0).equals("auth")
@@ -3393,6 +3419,16 @@ final class Repl {
     private int authUsage(String reason) {
         Diagnostics.printText(commandLine.getErr(), CliError.AUTH_USAGE, Map.of("reason", reason));
         return Cli.EXIT_USAGE;
+    }
+
+    private int context() {
+        if (contextManager == null) {
+            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_USAGE,
+                    Map.of("reason", "context manager is unavailable in this session"));
+            return Cli.EXIT_USAGE;
+        }
+        return new ContextConsole(contextManager, prompter, workdir,
+                commandLine.getOut(), commandLine.getErr()).run();
     }
 
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */

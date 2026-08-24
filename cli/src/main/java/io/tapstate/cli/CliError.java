@@ -148,6 +148,9 @@ enum CliError implements TapstateErrorCode {
     /** The persistent auth namespace was invoked with an invalid action or operand shape. */
     AUTH_USAGE("cli.auth-usage", Set.of("reason")),
 
+    /** The interactive context manager could not continue with the current input or terminal state. */
+    CONTEXT_USAGE("cli.context-usage", Set.of("reason")),
+
     /** A context definition supplied to the manager violates the persisted schema. */
     CONTEXT_INVALID("cli.context-invalid", Set.of("name", "reason")),
 

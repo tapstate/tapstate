@@ -4108,6 +4108,67 @@ class ReplTest {
     }
 
     @Test
+    void contextCommandCreatesAndBindsThroughTheSharedManager(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+        ScriptedPrompter prompter = new ScriptedPrompter(
+                "Create a context", "dev", "http://127.0.0.1:7900", "", "y");
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, new FakeControlPlane(), prompter, name -> null,
+                new ContextResolver(store, name -> null), null, null, new ContextManager(store));
+
+        repl.dispatch(List.of("context"), true);
+
+        ContextConfig saved = store.load();
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(saved.contexts()).containsOnlyKeys("dev");
+        assertThat(saved.contexts().get("dev").seeds()).containsExactly(URI.create("http://127.0.0.1:7900"));
+        assertThat(saved.workspaceBindings()).containsEntry(workspace.toRealPath().toString(), "dev");
+        assertThat(output.toString()).contains("created context dev").contains("bound dev");
+    }
+
+    @Test
+    void ctxBuiltinCanChooseEditUnbindAndDeleteThroughTheSharedManager(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+        ContextManager manager = new ContextManager(store);
+        manager.create("dev", List.of(URI.create("http://127.0.0.1:7900")), true);
+        manager.create("prod", List.of(URI.create("https://prod.example.com")), true);
+        manager.bind(workspace, "dev");
+        ScriptedPrompter prompter = new ScriptedPrompter(
+                "Choose a context", "prod",
+                "Edit a context", "prod", "https://prod2.example.com", "n",
+                "Unbind this workspace",
+                "Delete a context", "prod", "yes", "yes");
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, new FakeControlPlane(), prompter, name -> null,
+                new ContextResolver(store, name -> null), null, null, manager);
+
+        repl.dispatch(":ctx");
+        repl.dispatch(":ctx");
+        repl.dispatch(":ctx");
+        repl.dispatch(":ctx");
+
+        ContextConfig saved = store.load();
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(saved.lastContext()).isNull();
+        assertThat(saved.contexts()).containsOnlyKeys("dev");
+        assertThat(saved.workspaceBindings()).isEmpty();
+        assertThat(output.toString()).contains("chose context prod")
+                .contains("updated context prod")
+                .contains("unbound dev")
+                .contains("authRef")
+                .contains("deleted context prod");
+    }
+
+    @Test
     void failedRemoteLogoutKeepsTheCacheWhileLocalOnlyRemovesItWithAWarning(@TempDir Path home)
             throws IOException {
         Path workspace = Files.createDirectory(home.resolve("orders"));

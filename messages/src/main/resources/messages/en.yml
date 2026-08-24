@@ -165,6 +165,9 @@ cli.auth-logout-cache-changed:
 cli.auth-usage:
   message: "Invalid auth command: {reason}."
   solution: "Use `tapstate auth login [username]`, `tapstate auth status`, or `tapstate auth logout [--local-only]`."
+cli.context-usage:
+  message: "Invalid context manager input: {reason}."
+  solution: "Run `tapstate context` in an interactive terminal and choose one of the offered actions."
 cli.context-invalid:
   message: "Context `{name}` is invalid: {reason}"
   solution: "Use a non-empty name, at least one absolute HTTP(S) seed, and valid context settings."

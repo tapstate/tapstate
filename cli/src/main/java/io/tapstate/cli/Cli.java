@@ -265,7 +265,7 @@ public final class Cli implements Runnable {
      * so appear on the table, but they project no operation and belong to no whitelist — the guard that
      * pins registered verbs to the offline whitelist reads this to tell "meta" from "undeclared".
      */
-    static final List<String> META_VERBS = List.of("help", "mcp", "alias", "auth");
+    static final List<String> META_VERBS = List.of("help", "mcp", "alias", "auth", "context");
 
     /**
      * Help for the words the REPL handles itself. They are deliberately not subcommands — a connection
@@ -286,6 +286,8 @@ public final class Cli implements Runnable {
                     "Sign in; prompts for the password.")),
             Map.entry("logout", new VerbHelp("",
                     "Drop the credential, stay connected.")),
+            Map.entry(":ctx", new VerbHelp("",
+                    "Manage saved contexts.")),
             Map.entry("cd", new VerbHelp("<dir>",
                     "Change the session workspace.")),
             Map.entry("pwd", new VerbHelp("",
@@ -308,6 +310,7 @@ public final class Cli implements Runnable {
         // answered with a spelling suggestion for a word that was spelt right.
         commandLine.addSubcommand(new CommandLine.HelpCommand());
         commandLine.addSubcommand(new AuthCmd());
+        commandLine.addSubcommand(new ContextCmd());
         for (String verb : CONNECTED_VERBS) {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
@@ -473,8 +476,14 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
+            if (launch.isOneShot() && launch.command().size() == 1
+                    && launch.command().get(0).equals("context")
+                    && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
             Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
-                    launch::environment, resolver, launch.context(), authService);
+                    launch::environment, resolver, launch.context(), authService,
+                    new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
             if (launch.connects()) {
                 int established = repl.signIn(launch.connect(), launch.user(),
                         () -> launch.resolvePassword(prompter), launch.isOneShot());

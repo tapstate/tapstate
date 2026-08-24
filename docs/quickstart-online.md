@@ -332,17 +332,24 @@ Validate offline before going online (no server needed):
 ./tapstate-cli/bin/tapstate validate work       # expects: valid: 3 resources in work
 ```
 
-## 6. Go online and run
+## 6. Save a context, sign in, and run
 
-Start the interactive REPL and drive it. The connection is session state, so these
-run inside one REPL session. The REPL does not expand shell variables, so the address is
-written out below; type your own port instead if you moved it:
+Create a named context once, bind it to this workspace, and sign in from the same
+session. The password prompt is masked. Do not put a password in `-p` or `--password`.
 
 ```console
 $ ./tapstate-cli/bin/tapstate -w work
-tapstate(offline:work)> connect http://127.0.0.1:8080
-tapstate(127.0.0.1:8080)> login admin
+tapstate(offline:work)> :ctx
+Context action: Create a context
+Context name: local
+Server URL: http://127.0.0.1:8080
+Verify TLS [Y]:
+Bind local to /.../work [Y]:
+created context local
+bound local to /.../work
+tapstate(offline:work)> auth login admin
 Password:                       # the admin password from step 2 (not echoed)
+signed in as admin (read, write, admin)
 tapstate(admin@127.0.0.1:8080)> register ../mysql-connector.jar
 tapstate(admin@127.0.0.1:8080)> register ../postgres-connector.jar
 tapstate(admin@127.0.0.1:8080)> register ../mongodb-connector.jar
@@ -353,6 +360,22 @@ tapstate(admin@127.0.0.1:8080)> discover-schema fulfillment_db
 tapstate(admin@127.0.0.1:8080)> apply
 tapstate(admin@127.0.0.1:8080)> start order_pipeline
 ```
+
+The context stores the server target and workspace binding. The CLI stores a revocable
+opaque session separately, never the password or access token. After a process restart,
+the workspace binding selects `local` and the first online command resumes that session:
+
+```console
+$ ./tapstate-cli/bin/tapstate -w work
+tapstate(offline:work)> ls pipeline
+resumed admin@local
+```
+
+Use `./tapstate-cli/bin/tapstate --context local auth status` to inspect the saved
+session and `./tapstate-cli/bin/tapstate --context local auth logout` to revoke it and
+remove the local cache. `connect` remains a temporary diagnostic connection: a later
+`connect` and `login` change only the current REPL process and do not update a context or
+save a session.
 
 - **`register`** uploads a connector jar to the server (content-addressed and
   idempotent; re-registering the same jar is a no-op). Its paths resolve against the
