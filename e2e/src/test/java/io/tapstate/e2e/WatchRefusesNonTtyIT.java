@@ -59,7 +59,7 @@ class WatchRefusesNonTtyIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliRun run = runCli("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD,
+            CliRun run = runCli(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER,
                     "watch", NAMESPACE);
 
             // Refused, not degraded. An implementation that warned and redrew anyway would leave cursor
@@ -83,14 +83,16 @@ class WatchRefusesNonTtyIT {
     }
 
     /** Launches the CLI as its own process on the classpath the build recorded, and waits for it. */
-    private static CliRun runCli(String... args) {
+    private static CliRun runCli(String password, String... args) {
         List<String> command = new ArrayList<>(List.of(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-cp", cliClasspath(),
                 "io.tapstate.cli.Cli"));
         command.addAll(List.of(args));
         try {
-            Process process = new ProcessBuilder(command).start();
+            ProcessBuilder builder = new ProcessBuilder(command);
+            builder.environment().put("TAPSTATE_PASSWORD", password);
+            Process process = builder.start();
             String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             String err = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
             if (!process.waitFor(2, TimeUnit.MINUTES)) {

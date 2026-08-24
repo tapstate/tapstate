@@ -106,8 +106,8 @@ class TailIT {
             // (1) A change to a row nobody named reaches a tail. Driven on a pipe on purpose: this is
             // the command that is meant to work in one, and it is the difference the refusal that
             // watch gives in a pipe points at.
-            try (CliProcess tail = CliProcess.onAPipe(
-                    "-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD,
+            try (CliProcess tail = CliProcess.onAPipe(Map.of("TAPSTATE_PASSWORD", PASSWORD),
+                    "-c", server.baseUrl().toString(), "-u", USER,
                     "tail", SOURCE_ID + "." + COLLECTION)) {
                 awaitFollowing(control);
                 change(CHANGED_ROW);
@@ -122,8 +122,8 @@ class TailIT {
             // No filter: unasked, watch holds the first row the database hands back, which for this
             // connector is the first in the file. Which row that is does not have to be guaranteed for
             // the assertion below to hold - it only has to not be the one that changes.
-            try (CliProcess watch = CliProcess.onATerminal(
-                    "-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD,
+            try (CliProcess watch = CliProcess.onATerminal(Map.of("TAPSTATE_PASSWORD", PASSWORD),
+                    "-c", server.baseUrl().toString(), "-u", USER,
                     "watch", SOURCE_ID + "." + COLLECTION)) {
                 String firstFrame = watch.awaitOutput(seen -> seen.contains("row-1"), TIMEOUT,
                         "watch to draw the row it was asked to hold");

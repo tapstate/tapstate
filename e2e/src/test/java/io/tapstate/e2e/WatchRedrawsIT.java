@@ -128,8 +128,8 @@ class WatchRedrawsIT {
             awaitViewRow(mongo, viewUri, document -> document.get("regions") instanceof List<?> list
                     && list.size() == 2);
 
-            try (CliProcess watch = CliProcess.onATerminal(
-                    "-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD,
+            try (CliProcess watch = CliProcess.onATerminal(Map.of("TAPSTATE_PASSWORD", PASSWORD),
+                    "-c", server.baseUrl().toString(), "-u", USER,
                     "watch", VIEW_ID + "." + COLLECTION)) {
 
                 // (1) The array reaches the screen as an array. A read face that handed the list back as
