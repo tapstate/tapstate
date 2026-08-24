@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.ArtifactQueryService;
@@ -15,6 +16,7 @@ import io.tapstate.spi.store.RegistrationOutcome;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ConnectorRegisterService;
+import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.DataBrowserFollows;
@@ -28,6 +30,7 @@ import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
+import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.TokenSecrets;
@@ -49,6 +52,8 @@ import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResultStore;
+import io.tapstate.spi.store.ClusterIdentity;
+import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.core.logging.LogSink;
@@ -58,6 +63,8 @@ import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
+import io.tapstate.spi.store.SessionRecord;
+import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.User;
 import io.tapstate.spi.store.UserStore;
 import org.junit.jupiter.api.AfterAll;
@@ -415,13 +422,66 @@ class PipelineApiTest {
         }
 
         @Bean
+        ClusterIdentityService clusterIdentityService() {
+            ClusterIdentity identity = new ClusterIdentity("01J5PIPELINEFIXTURE");
+            ClusterIdentityStore store = new ClusterIdentityStore() {
+                @Override
+                public Optional<ClusterIdentity> find() {
+                    return Optional.of(identity);
+                }
+
+                @Override
+                public ClusterIdentity createIfAbsent(ClusterIdentity proposed) {
+                    return identity;
+                }
+            };
+            return new ClusterIdentityService(store, () -> "unused");
+        }
+
+        @Bean
+        SessionStore sessionStore() {
+            return new SessionStore() {
+                @Override
+                public void save(SessionRecord record) {
+                }
+
+                @Override
+                public Optional<SessionRecord> find(String sessionId) {
+                    return Optional.empty();
+                }
+
+                @Override
+                public Optional<SessionRecord> exchange(
+                        String sessionId, String secretHash, String issuer, Instant now, Instant idleExpiresAt) {
+                    return Optional.empty();
+                }
+
+                @Override
+                public boolean revoke(String sessionId, String secretHash, String issuer, Instant now) {
+                    return false;
+                }
+            };
+        }
+
+        @Bean
+        AccessTokenService accessTokenService(TokenSigner signer, Clock clock) {
+            return new AccessTokenService(signer, clock);
+        }
+
+        @Bean
+        SessionService sessionService(
+                SessionStore store, TokenSecrets secrets, AccessTokenService accessTokens, Clock clock) {
+            return new SessionService(store, secrets, accessTokens, clock);
+        }
+
+        @Bean
         TokenService tokenService(TokenStore store, TokenSecrets secrets, Clock clock) {
             return new TokenService(store, secrets, clock);
         }
 
         @Bean
-        LoginService loginService(UserStore users, PasswordHasher hasher, TokenSigner signer) {
-            return new LoginService(users, hasher, signer);
+        LoginService loginService(UserStore users, PasswordHasher hasher, AccessTokenService accessTokens) {
+            return new LoginService(users, hasher, accessTokens);
         }
 
         @Bean

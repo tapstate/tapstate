@@ -10,9 +10,9 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * The human login flow: verify a username / password pair and, on success, mint a session token
- * carrying the user's capability grade. The service holds no state — it composes the user store, the
- * password verifier and the token signer, each a port bound at the assembly root.
+ * The human login flow: verify a username / password pair and, on success, mint a short-lived access
+ * token carrying the user's capability grade. The service holds no state — it composes the user store,
+ * the password verifier and the token issuer, each a port bound at the assembly root.
  *
  * <p>Two properties are load-bearing and must not be "simplified" away:
  *
@@ -36,12 +36,16 @@ public final class LoginService {
 
     private final UserStore userStore;
     private final PasswordHasher passwordHasher;
-    private final TokenSigner tokenSigner;
+    private final AccessTokenService accessTokens;
 
     public LoginService(UserStore userStore, PasswordHasher passwordHasher, TokenSigner tokenSigner) {
+        this(userStore, passwordHasher, new AccessTokenService(tokenSigner, java.time.Clock.systemUTC()));
+    }
+
+    public LoginService(UserStore userStore, PasswordHasher passwordHasher, AccessTokenService accessTokens) {
         this.userStore = Objects.requireNonNull(userStore, "userStore");
         this.passwordHasher = Objects.requireNonNull(passwordHasher, "passwordHasher");
-        this.tokenSigner = Objects.requireNonNull(tokenSigner, "tokenSigner");
+        this.accessTokens = Objects.requireNonNull(accessTokens, "accessTokens");
     }
 
     /**
@@ -50,6 +54,11 @@ public final class LoginService {
      * the password does not match.
      */
     public String login(String username, String password) {
+        return loginGrant(username, password).token();
+    }
+
+    /** Verifies the credentials and returns the full short-lived access-token grant on success. */
+    public AccessTokenGrant loginGrant(String username, String password) {
         Objects.requireNonNull(username, "username");
         Objects.requireNonNull(password, "password");
 
@@ -65,7 +74,7 @@ public final class LoginService {
         }
 
         Scope scope = scopeOf(found.get().role());
-        return tokenSigner.issue(username, scope);
+        return accessTokens.issue(username, scope);
     }
 
     /**

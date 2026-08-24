@@ -17,6 +17,11 @@ public interface TokenSecrets {
     /** Generates a fresh token id, its one-time secret, and the secret's stored hash. */
     GeneratedSecret generate();
 
+    /** Hashes a presented high-entropy secret into the canonical value used for conditional storage mutations. */
+    default String hash(String presentedSecret) {
+        throw new IllegalStateException("token secret implementation does not expose its canonical hash");
+    }
+
     /** Whether {@code presentedSecret} hashes to {@code storedHash}; a constant-time comparison. */
     boolean matches(String presentedSecret, String storedHash);
 }

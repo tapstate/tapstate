@@ -12,6 +12,7 @@ import io.tapstate.adapters.pdk.PdkSchemaDiscoverer;
 import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -40,6 +41,7 @@ import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -73,6 +75,7 @@ import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.SchemaDiscoverer;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.TokenStore;
 import io.tapstate.spi.store.UserStore;
@@ -135,6 +138,11 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    SessionStore sessionStore(MongoAuthStores authStores) {
+        return authStores.sessions();
+    }
+
+    @Bean
     AuditStore auditStore(MongoAuthStores authStores) {
         return authStores.audit();
     }
@@ -184,8 +192,20 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    LoginService loginService(UserStore userStore, PasswordHasher passwordHasher, TokenSigner tokenSigner) {
-        return new LoginService(userStore, passwordHasher, tokenSigner);
+    AccessTokenService accessTokenService(TokenSigner tokenSigner, Clock clock) {
+        return new AccessTokenService(tokenSigner, clock);
+    }
+
+    @Bean
+    SessionService sessionService(
+            SessionStore sessionStore, TokenSecrets tokenSecrets, AccessTokenService accessTokens, Clock clock) {
+        return new SessionService(sessionStore, tokenSecrets, accessTokens, clock);
+    }
+
+    @Bean
+    LoginService loginService(
+            UserStore userStore, PasswordHasher passwordHasher, AccessTokenService accessTokens) {
+        return new LoginService(userStore, passwordHasher, accessTokens);
     }
 
     @Bean
