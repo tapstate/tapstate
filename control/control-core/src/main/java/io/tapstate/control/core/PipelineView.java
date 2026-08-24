@@ -20,11 +20,13 @@ public record PipelineView(
         ServeBlock serve,
         Settings settings,
         Map<String, Object> experimental,
+        PipelineDag dag,
         String contentHash) {
 
     public PipelineView {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(sources, "sources");
+        Objects.requireNonNull(dag, "dag");
         Objects.requireNonNull(contentHash, "contentHash");
         sources = List.copyOf(sources);
         transforms = transforms == null ? null : List.copyOf(transforms);

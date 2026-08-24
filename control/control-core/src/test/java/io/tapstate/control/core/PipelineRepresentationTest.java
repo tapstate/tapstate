@@ -11,10 +11,13 @@ import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.PushElement;
+import io.tapstate.core.model.SyncElement;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -109,6 +112,121 @@ class PipelineRepresentationTest {
                 .doesNotContain("state", "failure", "metrics", "snapshot", "positions");
     }
 
+    @Test
+    void projectsNormalizedFromWiringIntoANonVisualDag() {
+        PipelineResource pipeline = new PipelineResource(
+                "orders_sync",
+                null,
+                List.of("mysql_orders", "mysql_customers"),
+                List.of(
+                        Step.inline(
+                                "active_orders",
+                                FromClause.list(FromRef.literal("orders")),
+                                new TransformBody.Filter("status == 'active'"),
+                                null,
+                                null),
+                        Step.inline(
+                                "orders_with_customer",
+                                FromClause.aliases(orderCustomerAliases()),
+                                new TransformBody.Join("duckdb", "select * from order"),
+                                null,
+                                null)),
+                new ViewBlock.Use("warehouse_orders", "warehouse_orders", FromRef.literal("orders_with_customer")),
+                new ServeBlock.Use("orders_api", "orders_api", FromRef.literal("warehouse_orders")),
+                null,
+                null);
+
+        PipelineView view = representation.toView(
+                pipeline,
+                "d".repeat(64),
+                List.of(
+                        new PipelineSourceSummary("mysql_orders", null, "mysql"),
+                        new PipelineSourceSummary("mysql_customers", null, "mysql")));
+
+        assertThat(view.dag().nodes()).containsExactly(
+                new PipelineDagNode("source:orders", "source", "orders", null),
+                new PipelineDagNode("source:customers", "source", "customers", null),
+                new PipelineDagNode("transform:active_orders", "transform", "active_orders", "filter"),
+                new PipelineDagNode("transform:orders_with_customer", "transform",
+                        "orders_with_customer", "join"),
+                new PipelineDagNode("view:warehouse_orders", "view", "warehouse_orders", null),
+                new PipelineDagNode("serve:orders_api", "serve", "orders_api", null));
+        assertThat(view.dag().edges()).containsExactly(
+                new PipelineDagEdge("source:orders->transform:active_orders", "source:orders", "transform:active_orders", null),
+                new PipelineDagEdge("transform:active_orders->transform:orders_with_customer:order",
+                        "transform:active_orders", "transform:orders_with_customer", "order"),
+                new PipelineDagEdge("source:customers->transform:orders_with_customer:customer",
+                        "source:customers", "transform:orders_with_customer", "customer"),
+                new PipelineDagEdge("transform:orders_with_customer->view:warehouse_orders",
+                        "transform:orders_with_customer", "view:warehouse_orders", null),
+                new PipelineDagEdge("view:warehouse_orders->serve:orders_api",
+                        "view:warehouse_orders", "serve:orders_api", null));
+    }
+
+    @Test
+    void preservesRegexReferencesAsSourceNodesRatherThanPretendingTheyAreStaticTables() {
+        PipelineResource pipeline = new PipelineResource(
+                "orders_sync",
+                null,
+                List.of("mysql"),
+                List.of(Step.inline(
+                        "all_orders",
+                        FromClause.list(FromRef.regex("orders_.*")),
+                        new TransformBody.Union(),
+                        null,
+                        null)),
+                null,
+                new ServeBlock.Inline(null, FromRef.literal("all_orders"), null, null, null),
+                null,
+                null);
+
+        PipelineView view = representation.toView(
+                pipeline,
+                "e".repeat(64),
+                List.of(new PipelineSourceSummary("mysql", null, "mysql")));
+
+        assertThat(view.dag().nodes()).contains(
+                new PipelineDagNode("source:/orders_.*/", "source", "/orders_.*/", null));
+        assertThat(view.dag().edges()).contains(
+                new PipelineDagEdge("source:/orders_.*/->transform:all_orders",
+                        "source:/orders_.*/", "transform:all_orders", null));
+    }
+
+    @Test
+    void projectsServeTargetsAsSourceBackedTerminalNodes() {
+        PipelineResource pipeline = new PipelineResource(
+                "orders_sync",
+                null,
+                List.of("orders", "warehouse"),
+                null,
+                null,
+                new ServeBlock.Inline(
+                        null,
+                        FromRef.literal("orders"),
+                        List.of(new SyncElement(null, "warehouse", null, null, null, null)),
+                        null,
+                        List.of(new PushElement(null, "warehouse", null, null, null))),
+                null,
+                null);
+
+        PipelineView view = representation.toView(
+                pipeline,
+                "f".repeat(64),
+                List.of(
+                        new PipelineSourceSummary("orders", null, "mysql"),
+                        new PipelineSourceSummary("warehouse", null, "mongodb")));
+
+        assertThat(view.dag().nodes()).containsExactly(
+                new PipelineDagNode("source:orders", "source", "orders", null),
+                new PipelineDagNode("serve:orders_sync_serve", "serve", "orders_sync_serve", null),
+                new PipelineDagNode("target:warehouse", "target", "warehouse", "sync + push"));
+        assertThat(view.dag().edges()).containsExactly(
+                new PipelineDagEdge("source:orders->serve:orders_sync_serve",
+                        "source:orders", "serve:orders_sync_serve", null),
+                new PipelineDagEdge("serve:orders_sync_serve->target:warehouse",
+                        "serve:orders_sync_serve", "target:warehouse", null));
+    }
+
     private static PipelineResource pipeline(List<String> sourceIds) {
         return new PipelineResource(
                 "orders_sync",
@@ -125,5 +243,12 @@ class PipelineRepresentationTest {
                 new Settings(
                         ErrorPolicy.DEAD_LETTER, 500, 2, "0 2 * * *", ReadMode.CDC_ONLY, "earliest"),
                 Map.of("preview", List.of("orders")));
+    }
+
+    private static Map<String, FromRef> orderCustomerAliases() {
+        Map<String, FromRef> aliases = new LinkedHashMap<>();
+        aliases.put("order", FromRef.literal("active_orders"));
+        aliases.put("customer", FromRef.literal("customers"));
+        return aliases;
     }
 }

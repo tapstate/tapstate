@@ -34,6 +34,7 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -574,6 +575,11 @@ class StoreBackedDagSourceTest {
 
         @Override
         public ObservationStore observations() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public PipelineLayoutStore layouts() {
             throw new UnsupportedOperationException();
         }
 

@@ -6,6 +6,7 @@ import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestService;
 import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
+import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -37,6 +38,7 @@ class ControlPlaneStartupTest {
                     assertThat(context).doesNotHaveBean(LoginService.class);
                     assertThat(context).doesNotHaveBean(BootstrapService.class);
                     assertThat(context).doesNotHaveBean(ApplyService.class);
+                    assertThat(context).doesNotHaveBean(PipelineLayoutService.class);
                     // The connection-test verb's service is part of the same Mongo-gated plane, not unconditional.
                     assertThat(context).doesNotHaveBean(ConnectionTestService.class);
                 });

@@ -1,5 +1,6 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
@@ -8,6 +9,8 @@ import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ArtifactWrite;
+import io.tapstate.spi.store.PipelineLayout;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import org.junit.jupiter.api.Test;
 
 import java.util.LinkedHashMap;
@@ -85,6 +88,31 @@ class PipelineViewServiceTest {
                 .hasMessageContaining("Source");
     }
 
+    @Test
+    void savesEditorLayoutWithoutChangingThePipelineArtifactOrAcceptingAnUnknownPipeline() {
+        ReadOnlyArtifactStore artifacts = new ReadOnlyArtifactStore();
+        artifacts.seed(source("orders", "Orders", "mysql"));
+        artifacts.seed(pipeline("daily", List.of("orders")));
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(artifacts), new PipelineRepresentation());
+        InMemoryPipelineLayoutStore layouts = new InMemoryPipelineLayoutStore();
+        PipelineLayoutService service = new PipelineLayoutService(pipelines, layouts);
+
+        String before = pipelines.get("daily").contentHash();
+        PipelineLayout layout = service.save("daily", Map.of(
+                "source:orders", new PipelineLayout.NodePosition(120.0, 240.0)),
+                new PipelineLayout.Viewport(-10.0, 20.0, 0.75));
+
+        assertThat(service.get("daily")).isEqualTo(layout);
+        assertThat(layouts.get("daily")).contains(layout);
+        assertThat(pipelines.get("daily").contentHash()).isEqualTo(before);
+        assertThatThrownBy(() -> service.get("ghost"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(PipelineError.NOT_FOUND);
+                    assertThat(error.args()).containsEntry("id", "ghost");
+                });
+    }
+
     private static SourceResource source(String id, String description, String connector) {
         return new SourceResource(
                 id,
@@ -143,6 +171,26 @@ class PipelineViewServiceTest {
         @Override
         public List<Resource> list() {
             return List.copyOf(resources.values());
+        }
+    }
+
+    private static final class InMemoryPipelineLayoutStore implements PipelineLayoutStore {
+
+        private final Map<String, PipelineLayout> layouts = new LinkedHashMap<>();
+
+        @Override
+        public Optional<PipelineLayout> get(String pipelineId) {
+            return Optional.ofNullable(layouts.get(pipelineId));
+        }
+
+        @Override
+        public void save(PipelineLayout layout) {
+            layouts.put(layout.pipelineId(), layout);
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            layouts.remove(pipelineId);
         }
     }
 }
