@@ -36,6 +36,8 @@ import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
+import io.tapstate.control.core.PipelineRepresentation;
+import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
@@ -561,6 +563,17 @@ class ControlPlaneConfiguration {
             SourceRepresentation representation) {
         return new SourceProjectionService(
                 applyService, artifactQueryService, artifactMutationService, representation);
+    }
+
+    @Bean
+    PipelineRepresentation pipelineRepresentation() {
+        return new PipelineRepresentation();
+    }
+
+    @Bean
+    PipelineViewService pipelineViewService(
+            ArtifactQueryService artifactQueryService, PipelineRepresentation representation) {
+        return new PipelineViewService(artifactQueryService, representation);
     }
 
     /**
