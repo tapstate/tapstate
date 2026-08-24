@@ -13,6 +13,7 @@ Required:
 Options:
   --out-dir DIR          New directory for a redacted report and diagnostics.
   --port NUMBER          Loopback HTTP port; default is a free ephemeral port.
+  --native               Build and verify the production native CLI instead of the JVM jar.
   --cleanup              Drop only the generated tapstate_cli_session_verify_* database.
   --help                 Show this help.
 
@@ -32,6 +33,7 @@ mongo_template=''
 out_dir=''
 port=''
 drop_database=0
+use_native=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,6 +56,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || fail '--port needs a number'
       port=$2
       shift 2
+      ;;
+    --native)
+      use_native=1
+      shift
       ;;
     --cleanup)
       drop_database=1
@@ -225,12 +231,25 @@ PY
 }
 
 printf 'building candidate worktree\n'
-mvn --file "$root/pom.xml" -q -pl app,cli -am clean package -DskipTests >"$out_dir/build.log" 2>&1 \
-  || fail 'candidate build failed; see build.log'
+if [[ "$use_native" -eq 1 ]]; then
+  mvn --file "$root/pom.xml" -q -Pnative -pl app,cli -am clean package -DskipTests >"$out_dir/build.log" 2>&1 \
+    || fail 'candidate native build failed; see build.log'
+else
+  mvn --file "$root/pom.xml" -q -pl app,cli -am clean package -DskipTests >"$out_dir/build.log" 2>&1 \
+    || fail 'candidate build failed; see build.log'
+fi
 
 app_jar=$(find "$root/app/target" -maxdepth 1 -type f -name 'app-*-boot.jar' -print -quit)
-cli_jar=$(find "$root/cli/target" -maxdepth 1 -type f -name 'cli-*.jar' -print -quit)
-[[ -n "$app_jar" && -n "$cli_jar" ]] || fail 'candidate deliverables are missing after the build'
+[[ -n "$app_jar" ]] || fail 'candidate server deliverable is missing after the build'
+if [[ "$use_native" -eq 1 ]]; then
+  cli_binary="$root/cli/target/tapstate"
+  [[ -x "$cli_binary" ]] || fail 'candidate native CLI is missing after the build'
+  cli_runtime='native'
+else
+  cli_jar=$(find "$root/cli/target" -maxdepth 1 -type f -name 'cli-*.jar' -print -quit)
+  [[ -n "$cli_jar" ]] || fail 'candidate JVM CLI jar is missing after the build'
+  cli_runtime='jvm'
+fi
 mkdir -p "$workspace"
 chmod 700 "$home_dir"
 
@@ -260,13 +279,23 @@ EOF
 
 cd "$out_dir"
 context_input=$'1\ndev\n'"$base_url"$'\n\n\n'
-run_pty "$context_input" "$out_dir/context.pty" \
-  env "TAPSTATE_WORKDIR=$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" context
+if [[ "$use_native" -eq 1 ]]; then
+  run_pty "$context_input" "$out_dir/context.pty" \
+    env "TAPSTATE_WORKDIR=$workspace" "$cli_binary" "-Duser.home=$home_dir" context
+else
+  run_pty "$context_input" "$out_dir/context.pty" \
+    env "TAPSTATE_WORKDIR=$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" context
+fi
 grep -q 'created context dev' "$out_dir/context.pty" || fail 'context creation was not observed'
 grep -q 'bound dev' "$out_dir/context.pty" || fail 'exact workspace binding was not observed'
 
-run_pty "$password"$'\n' "$out_dir/login.pty" \
-  env "TAPSTATE_WORKDIR=$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" auth login "$username"
+if [[ "$use_native" -eq 1 ]]; then
+  run_pty "$password"$'\n' "$out_dir/login.pty" \
+    env "TAPSTATE_WORKDIR=$workspace" "$cli_binary" "-Duser.home=$home_dir" auth login "$username"
+else
+  run_pty "$password"$'\n' "$out_dir/login.pty" \
+    env "TAPSTATE_WORKDIR=$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" auth login "$username"
+fi
 grep -q 'signed in as' "$out_dir/login.pty" || fail 'masked terminal login was not observed'
 
 [[ -d "$auth_dir" ]] || fail 'auth directory was not created'
@@ -303,10 +332,18 @@ json.dump({
 }, open(summary_path, "w", encoding="utf-8"), indent=2, sort_keys=True)
 PY
 
-TAPSTATE_WORKDIR="$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" auth status >"$out_dir/status.stdout" 2>"$out_dir/status.stderr"
+run_cli() {
+  if [[ "$use_native" -eq 1 ]]; then
+    TAPSTATE_WORKDIR="$workspace" "$cli_binary" "-Duser.home=$home_dir" "$@"
+  else
+    TAPSTATE_WORKDIR="$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" "$@"
+  fi
+}
+
+run_cli auth status >"$out_dir/status.stdout" 2>"$out_dir/status.stderr"
 grep -q 'signed in as' "$out_dir/status.stdout" || fail 'fresh-process auth status did not resume the session'
 [[ ! -s "$out_dir/status.stderr" ]] || fail 'fresh-process auth status wrote unexpected diagnostics'
-TAPSTATE_WORKDIR="$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" ls >"$out_dir/resume.stdout" 2>"$out_dir/resume.stderr"
+run_cli ls >"$out_dir/resume.stdout" 2>"$out_dir/resume.stderr"
 grep -q '^source  views$' "$out_dir/resume.stdout" || fail 'fresh-process authenticated read did not list the managed store'
 [[ ! -s "$out_dir/resume.stderr" ]] || fail 'fresh-process authenticated read wrote unexpected diagnostics'
 
@@ -325,7 +362,7 @@ if response.status != 204:
 PY
 
 set +e
-TAPSTATE_WORKDIR="$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" ls >"$out_dir/revoked.stdout" 2>"$out_dir/revoked.stderr"
+run_cli ls >"$out_dir/revoked.stdout" 2>"$out_dir/revoked.stderr"
 revoked_rc=$?
 set -e
 [[ "$revoked_rc" -ne 0 ]] || fail 'revoked session unexpectedly resumed'
@@ -334,7 +371,7 @@ grep -q 'cli.auth-session-rejected' "$out_dir/revoked.stderr" || fail 'revoked r
 kill -TERM "$server_pid"
 wait "$server_pid" || true
 server_pid=''
-TAPSTATE_WORKDIR="$workspace" java "-Duser.home=$home_dir" -jar "$cli_jar" auth logout --local-only \
+run_cli auth logout --local-only \
   >"$out_dir/local-only.stdout" 2>"$out_dir/local-only.stderr"
 [[ ! -s "$out_dir/local-only.stdout" ]] || fail 'local-only logout polluted stdout'
 grep -q 'local session removed; the remote session remains valid until expiry' "$out_dir/local-only.stderr" \
@@ -344,7 +381,13 @@ grep -q 'local session removed; the remote session remains valid until expiry' "
 empty_home="$out_dir/empty-home"
 mkdir -p "$empty_home"
 set +e
-TAPSTATE_WORKDIR="$workspace" java "-Duser.home=$empty_home" -jar "$cli_jar" ls >"$out_dir/no-context.stdout" 2>"$out_dir/no-context.stderr"
+if [[ "$use_native" -eq 1 ]]; then
+  TAPSTATE_WORKDIR="$workspace" "$cli_binary" "-Duser.home=$empty_home" ls \
+    >"$out_dir/no-context.stdout" 2>"$out_dir/no-context.stderr"
+else
+  TAPSTATE_WORKDIR="$workspace" java "-Duser.home=$empty_home" -jar "$cli_jar" ls \
+    >"$out_dir/no-context.stdout" 2>"$out_dir/no-context.stderr"
+fi
 no_context_rc=$?
 set -e
 [[ "$no_context_rc" -ne 0 ]] || fail 'non-TTY online call without a context unexpectedly succeeded'
@@ -365,15 +408,16 @@ PY
 
 server_commit=$(git -C "$root" rev-parse HEAD)
 python3 - "$out_dir/auth-summary.json" "$out_dir/report.json" "$server_commit" "$timestamp" \
-  "$auth_dir_mode" "$auth_file_mode" "$config_mode" <<'PY'
+  "$auth_dir_mode" "$auth_file_mode" "$config_mode" "$cli_runtime" <<'PY'
 import json, sys
 
-summary_path, report_path, commit, observed_at, auth_dir_mode, auth_file_mode, config_mode = sys.argv[1:]
+summary_path, report_path, commit, observed_at, auth_dir_mode, auth_file_mode, config_mode, cli_runtime = sys.argv[1:]
 summary = json.load(open(summary_path, encoding="utf-8"))
 report = {
     "result": "passed",
     "observedAtUtc": observed_at,
     "candidateCommit": commit,
+    "cliRuntime": cli_runtime,
     "platform": "POSIX",
     "cacheModes": {"authDirectory": auth_dir_mode, "authRecord": auth_file_mode, "config": config_mode},
     "authRecord": summary,
@@ -381,7 +425,7 @@ report = {
         "pty-context-create-and-exact-workspace-bind",
         "pty-masked-password-login",
         "owner-only-cache-modes-and-opaque-record",
-        "fresh-jvm-process-session-resume-and-online-read",
+        "fresh-process-session-resume-and-online-read",
         "server-side-session-revoke-rejects-resume",
         "offline-local-only-logout-removes-only-local-cache",
         "non-tty-no-context-is-prompt-free-and-stdout-clean",
