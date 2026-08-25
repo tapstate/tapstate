@@ -479,7 +479,7 @@
   "provenance": {
     "connectorRepoSha": "d889798e",
     "specPath": "connectors/excel-connector/src/main/resources/spec_excel.json",
-    "specContentHash": "2c84eeee598f2afe",
+    "specContentHash": "133e1a9b1069192d",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
