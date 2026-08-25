@@ -11,7 +11,7 @@ import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
-import io.tapstate.core.model.PushElement;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SyncElement;
 import org.junit.jupiter.api.Test;
 
@@ -149,8 +149,7 @@ class PipelineRepresentationTest {
                 new PipelineDagNode("transform:active_orders", "transform", "active_orders", "filter"),
                 new PipelineDagNode("transform:orders_with_customer", "transform",
                         "orders_with_customer", "join"),
-                new PipelineDagNode("view:warehouse_orders", "view", "warehouse_orders", null),
-                new PipelineDagNode("serve:orders_api", "serve", "orders_api", null));
+                new PipelineDagNode("view:warehouse_orders", "view", "warehouse_orders", null));
         assertThat(view.dag().edges()).containsExactly(
                 new PipelineDagEdge("source:orders->transform:active_orders", "source:orders", "transform:active_orders", null),
                 new PipelineDagEdge("transform:active_orders->transform:orders_with_customer:order",
@@ -158,9 +157,7 @@ class PipelineRepresentationTest {
                 new PipelineDagEdge("source:customers->transform:orders_with_customer:customer",
                         "source:customers", "transform:orders_with_customer", "customer"),
                 new PipelineDagEdge("transform:orders_with_customer->view:warehouse_orders",
-                        "transform:orders_with_customer", "view:warehouse_orders", null),
-                new PipelineDagEdge("view:warehouse_orders->serve:orders_api",
-                        "view:warehouse_orders", "serve:orders_api", null));
+                        "transform:orders_with_customer", "view:warehouse_orders", null));
     }
 
     @Test
@@ -186,45 +183,104 @@ class PipelineRepresentationTest {
                 List.of(new PipelineSourceSummary("mysql", null, "mysql")));
 
         assertThat(view.dag().nodes()).contains(
-                new PipelineDagNode("source:/orders_.*/", "source", "/orders_.*/", null));
+                new PipelineDagNode("source:mysql:/orders_.*/", "source", "/orders_.*/", "mysql"));
         assertThat(view.dag().edges()).contains(
-                new PipelineDagEdge("source:/orders_.*/->transform:all_orders",
-                        "source:/orders_.*/", "transform:all_orders", null));
+                new PipelineDagEdge("source:mysql:/orders_.*/->transform:all_orders",
+                        "source:mysql:/orders_.*/", "transform:all_orders", null));
     }
 
     @Test
-    void projectsServeTargetsAsSourceBackedTerminalNodes() {
+    void projectsSyncAsADirectSourceTableToTargetTableFlowWithoutAServeNode() {
         PipelineResource pipeline = new PipelineResource(
-                "orders_sync",
+                "mysql_to_mongodb",
                 null,
-                List.of("orders", "warehouse"),
+                List.of("mysql_feynman"),
                 null,
                 null,
                 new ServeBlock.Inline(
+                        "serve",
+                        FromRef.literal("Player"),
+                        List.of(new SyncElement("mongodb_player", "mongodb_target", null, null, null, null)),
                         null,
-                        FromRef.literal("orders"),
-                        List.of(new SyncElement(null, "warehouse", null, null, null, null)),
-                        null,
-                        List.of(new PushElement(null, "warehouse", null, null, null))),
+                        null),
                 null,
                 null);
 
         PipelineView view = representation.toView(
                 pipeline,
                 "f".repeat(64),
-                List.of(
-                        new PipelineSourceSummary("orders", null, "mysql"),
-                        new PipelineSourceSummary("warehouse", null, "mongodb")));
+                List.of(new PipelineSourceSummary("mysql_feynman", null, "mysql")));
 
         assertThat(view.dag().nodes()).containsExactly(
-                new PipelineDagNode("source:orders", "source", "orders", null),
-                new PipelineDagNode("serve:orders_sync_serve", "serve", "orders_sync_serve", null),
-                new PipelineDagNode("target:warehouse", "target", "warehouse", "sync + push"));
+                new PipelineDagNode("source:mysql_feynman:Player", "source", "Player", "mysql_feynman"),
+                new PipelineDagNode("target:mongodb_target:Player", "target", "Player", "mongodb_target"));
         assertThat(view.dag().edges()).containsExactly(
-                new PipelineDagEdge("source:orders->serve:orders_sync_serve",
-                        "source:orders", "serve:orders_sync_serve", null),
-                new PipelineDagEdge("serve:orders_sync_serve->target:warehouse",
-                        "serve:orders_sync_serve", "target:warehouse", null));
+                new PipelineDagEdge("source:mysql_feynman:Player->target:mongodb_target:Player:mongodb_player",
+                        "source:mysql_feynman:Player", "target:mongodb_target:Player", "mongodb_player"));
+    }
+
+    @Test
+    void appliesSyncRenameWhenNamingTheTargetTableNode() {
+        PipelineResource pipeline = new PipelineResource(
+                "mysql_to_mongodb",
+                null,
+                List.of("mysql_feynman"),
+                null,
+                null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromRef.literal("Player"),
+                        List.of(new SyncElement("mongodb_player", "mongodb_target", null,
+                                new RenameSpec(Map.of("Player", "players_v2"), null, null, null), null, null)),
+                        null,
+                        null),
+                null,
+                null);
+
+        PipelineView view = representation.toView(
+                pipeline,
+                "g".repeat(64),
+                List.of(new PipelineSourceSummary("mysql_feynman", null, "mysql")));
+
+        assertThat(view.dag().nodes()).containsExactly(
+                new PipelineDagNode("source:mysql_feynman:Player", "source", "Player", "mysql_feynman"),
+                new PipelineDagNode("target:mongodb_target:players_v2", "target", "players_v2", "mongodb_target"));
+        assertThat(view.dag().edges()).containsExactly(
+                new PipelineDagEdge("source:mysql_feynman:Player->target:mongodb_target:players_v2:mongodb_player",
+                        "source:mysql_feynman:Player", "target:mongodb_target:players_v2", "mongodb_player"));
+    }
+
+    @Test
+    void connectsASyncTargetToTheViewItServesInsteadOfInventingASourceOrServeNode() {
+        PipelineResource pipeline = new PipelineResource(
+                "mysql_to_mongodb",
+                null,
+                List.of("mysql_feynman"),
+                null,
+                new ViewBlock.Inline("players_view", FromRef.literal("Player"), null, null, null),
+                new ServeBlock.Inline(
+                        "serve",
+                        FromRef.literal("players_view"),
+                        List.of(new SyncElement("mongodb_player", "mongodb_target", null, null, null, null)),
+                        null,
+                        null),
+                null,
+                null);
+
+        PipelineView view = representation.toView(
+                pipeline,
+                "h".repeat(64),
+                List.of(new PipelineSourceSummary("mysql_feynman", null, "mysql")));
+
+        assertThat(view.dag().nodes()).containsExactly(
+                new PipelineDagNode("source:mysql_feynman:Player", "source", "Player", "mysql_feynman"),
+                new PipelineDagNode("view:players_view", "view", "players_view", null),
+                new PipelineDagNode("target:mongodb_target:players_view", "target", "players_view", "mongodb_target"));
+        assertThat(view.dag().edges()).containsExactly(
+                new PipelineDagEdge("source:mysql_feynman:Player->view:players_view",
+                        "source:mysql_feynman:Player", "view:players_view", null),
+                new PipelineDagEdge("view:players_view->target:mongodb_target:players_view:mongodb_player",
+                        "view:players_view", "target:mongodb_target:players_view", "mongodb_player"));
     }
 
     private static PipelineResource pipeline(List<String> sourceIds) {

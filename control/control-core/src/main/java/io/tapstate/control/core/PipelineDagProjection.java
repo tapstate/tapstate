@@ -7,6 +7,7 @@ import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.TableRename;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 
@@ -17,35 +18,39 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /** Projects normalized DSL wiring to a graph without assigning editor coordinates. */
 final class PipelineDagProjection {
 
-    PipelineDag project(PipelineResource pipeline) {
+    PipelineDag project(PipelineResource pipeline, List<PipelineSourceSummary> sourceSummaries) {
         Objects.requireNonNull(pipeline, "pipeline");
+        Objects.requireNonNull(sourceSummaries, "sourceSummaries");
         List<Step> transforms = pipeline.transforms() == null ? List.of() : pipeline.transforms();
-        Set<String> transformIds = transforms.stream().map(Step::id).collect(Collectors.toSet());
+        Map<String, String> upstreamNodes = new LinkedHashMap<>();
+        for (Step transform : transforms) {
+            upstreamNodes.put(transform.id(), transformNodeId(transform.id()));
+        }
+        if (pipeline.view() != null) {
+            String viewId = viewId(pipeline.view());
+            upstreamNodes.put(viewId, viewNodeId(viewId));
+        }
         LinkedHashMap<String, PipelineDagNode> sourceNodes = new LinkedHashMap<>();
+        LinkedHashMap<String, PipelineDagNode> targetNodes = new LinkedHashMap<>();
         List<PipelineDagEdge> edges = new ArrayList<>();
         Set<String> usedEdgeIds = new LinkedHashSet<>();
         Map<String, Integer> edgeCounts = new LinkedHashMap<>();
 
         for (Step transform : transforms) {
-            addWiring(transform.from(), transformNodeId(transform.id()), transformIds, sourceNodes, edges, usedEdgeIds, edgeCounts);
-        }
-        if (pipeline.view() != null) {
-            addWiring(viewFrom(pipeline.view()), viewNodeId(viewId(pipeline.view())), transformIds,
+            addWiring(transform.from(), transformNodeId(transform.id()), upstreamNodes, sourceSummaries,
                     sourceNodes, edges, usedEdgeIds, edgeCounts);
         }
-        if (pipeline.serve() != null) {
-            String serveNodeId = serveNodeId(serveId(pipeline.serve(), pipeline.id()));
-            FromRef serveFrom = serveFrom(pipeline.serve());
-            if (pipeline.view() != null && isViewReference(serveFrom, pipeline.view())) {
-                addKnownEdge(viewNodeId(viewId(pipeline.view())), serveNodeId, edges, usedEdgeIds);
-            } else {
-                addWiring(serveFrom, serveNodeId, transformIds, sourceNodes, edges, usedEdgeIds, edgeCounts);
-            }
+        if (pipeline.view() != null) {
+            addWiring(viewFrom(pipeline.view()), viewNodeId(viewId(pipeline.view())), upstreamNodes, sourceSummaries,
+                    sourceNodes, edges, usedEdgeIds, edgeCounts);
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve) {
+            addServeTerminals(serve, upstreamNodes, sourceSummaries, sourceNodes, targetNodes,
+                    edges, usedEdgeIds, edgeCounts);
         }
 
         List<PipelineDagNode> nodes = new ArrayList<>(sourceNodes.values());
@@ -57,55 +62,56 @@ final class PipelineDagProjection {
             String id = viewId(pipeline.view());
             nodes.add(new PipelineDagNode(viewNodeId(id), "view", id, null));
         }
-        if (pipeline.serve() != null) {
-            String id = serveId(pipeline.serve(), pipeline.id());
-            nodes.add(new PipelineDagNode(serveNodeId(id), "serve", id, null));
-            addTargets(pipeline.serve(), serveNodeId(id), nodes, edges, usedEdgeIds);
-        }
+        nodes.addAll(targetNodes.values());
         return new PipelineDag(nodes, edges);
     }
 
     private static void addWiring(
             FromClause from,
             String target,
-            Set<String> transformIds,
+            Map<String, String> upstreamNodes,
+            List<PipelineSourceSummary> sourceSummaries,
             Map<String, PipelineDagNode> sourceNodes,
             List<PipelineDagEdge> edges,
             Set<String> usedEdgeIds,
             Map<String, Integer> edgeCounts) {
         if (from instanceof FromClause.Flow flow) {
             for (FromRef reference : flow.refs()) {
-                addEdge(reference, null, target, transformIds, sourceNodes, edges, usedEdgeIds, edgeCounts);
+                addEdge(reference, null, target, upstreamNodes, sourceSummaries,
+                        sourceNodes, edges, usedEdgeIds, edgeCounts);
             }
             return;
         }
         FromClause.Aliases aliases = (FromClause.Aliases) from;
         for (Map.Entry<String, FromRef> entry : aliases.aliases().entrySet()) {
-            addEdge(entry.getValue(), entry.getKey(), target, transformIds, sourceNodes, edges, usedEdgeIds, edgeCounts);
+            addEdge(entry.getValue(), entry.getKey(), target, upstreamNodes, sourceSummaries,
+                    sourceNodes, edges, usedEdgeIds, edgeCounts);
         }
     }
 
     private static void addWiring(
             FromRef from,
             String target,
-            Set<String> transformIds,
+            Map<String, String> upstreamNodes,
+            List<PipelineSourceSummary> sourceSummaries,
             Map<String, PipelineDagNode> sourceNodes,
             List<PipelineDagEdge> edges,
             Set<String> usedEdgeIds,
             Map<String, Integer> edgeCounts) {
-        addEdge(from, null, target, transformIds, sourceNodes, edges, usedEdgeIds, edgeCounts);
+        addEdge(from, null, target, upstreamNodes, sourceSummaries, sourceNodes, edges, usedEdgeIds, edgeCounts);
     }
 
     private static void addEdge(
             FromRef reference,
             String alias,
             String target,
-            Set<String> transformIds,
+            Map<String, String> upstreamNodes,
+            List<PipelineSourceSummary> sourceSummaries,
             Map<String, PipelineDagNode> sourceNodes,
             List<PipelineDagEdge> edges,
             Set<String> usedEdgeIds,
             Map<String, Integer> edgeCounts) {
-        String source = nodeFor(reference, transformIds, sourceNodes);
+        String source = nodeFor(reference, upstreamNodes, sourceSummaries, sourceNodes);
         String base = source + "->" + target;
         int occurrence = edgeCounts.merge(base, 1, Integer::sum);
         String id = alias == null ? base : base + ":" + alias;
@@ -115,23 +121,20 @@ final class PipelineDagProjection {
         edges.add(new PipelineDagEdge(id, source, target, alias));
     }
 
-    private static void addKnownEdge(
-            String source, String target, List<PipelineDagEdge> edges, Set<String> usedEdgeIds) {
-        String id = source + "->" + target;
-        if (!usedEdgeIds.add(id)) {
-            throw new IllegalStateException("Pipeline graph contains a duplicate edge: " + id);
-        }
-        edges.add(new PipelineDagEdge(id, source, target, null));
-    }
-
     private static String nodeFor(
-            FromRef reference, Set<String> transformIds, Map<String, PipelineDagNode> sourceNodes) {
-        if (reference instanceof FromRef.Literal literal && transformIds.contains(literal.ref())) {
-            return transformNodeId(literal.ref());
+            FromRef reference,
+            Map<String, String> upstreamNodes,
+            List<PipelineSourceSummary> sourceSummaries,
+            Map<String, PipelineDagNode> sourceNodes) {
+        if (reference instanceof FromRef.Literal literal && upstreamNodes.containsKey(literal.ref())) {
+            return upstreamNodes.get(literal.ref());
         }
         String label = referenceLabel(reference);
-        String id = sourceNodeId(label);
-        sourceNodes.putIfAbsent(id, new PipelineDagNode(id, "source", label, null));
+        SourceTable sourceTable = resolveSourceTable(reference, sourceSummaries);
+        String id = sourceTable == null ? sourceNodeId(label) : sourceNodeId(sourceTable.sourceId(), sourceTable.table());
+        sourceNodes.putIfAbsent(id, sourceTable == null
+                ? new PipelineDagNode(id, "source", label, null)
+                : new PipelineDagNode(id, "source", sourceTable.table(), sourceTable.sourceId()));
         return id;
     }
 
@@ -143,35 +146,52 @@ final class PipelineDagProjection {
         return "use";
     }
 
-    private static void addTargets(
-            ServeBlock serve,
-            String serveNodeId,
-            List<PipelineDagNode> nodes,
+    private static void addServeTerminals(
+            ServeBlock.Inline serve,
+            Map<String, String> upstreamNodes,
+            List<PipelineSourceSummary> sourceSummaries,
+            Map<String, PipelineDagNode> sourceNodes,
+            Map<String, PipelineDagNode> targetNodes,
             List<PipelineDagEdge> edges,
-            Set<String> usedEdgeIds) {
-        if (!(serve instanceof ServeBlock.Inline inline)) {
-            return;
-        }
-        Map<String, List<String>> targetKinds = new LinkedHashMap<>();
-        if (inline.sync() != null) {
-            for (SyncElement sync : inline.sync()) {
-                targetKinds.computeIfAbsent(sync.source(), ignored -> new ArrayList<>()).add("sync");
+            Set<String> usedEdgeIds,
+            Map<String, Integer> edgeCounts) {
+        if (serve.sync() != null) {
+            for (SyncElement sync : serve.sync()) {
+                String sourceTable = tableForTerminal(serve.from());
+                String targetTable = TableRename.apply(sourceTable, sync.rename());
+                String targetNodeId = targetNodeId(sync.source(), targetTable);
+                targetNodes.putIfAbsent(targetNodeId,
+                        new PipelineDagNode(targetNodeId, "target", targetTable, sync.source()));
+                addWiring(serve.from(), targetNodeId, upstreamNodes, sourceSummaries,
+                        sourceNodes, edges, usedEdgeIds, edgeCounts, sync.id());
             }
         }
-        if (inline.push() != null) {
-            for (PushElement push : inline.push()) {
-                targetKinds.computeIfAbsent(push.source(), ignored -> new ArrayList<>()).add("push");
+        if (serve.push() != null) {
+            for (int index = 0; index < serve.push().size(); index++) {
+                PushElement push = serve.push().get(index);
+                String id = push.id() == null ? "push_" + (index + 1) : push.id();
+                String targetNodeId = "target:" + push.source() + ":push:" + id;
+                String label = push.topic() == null ? id : push.topic();
+                targetNodes.putIfAbsent(targetNodeId,
+                        new PipelineDagNode(targetNodeId, "target", label, push.source()));
+                addWiring(serve.from(), targetNodeId, upstreamNodes, sourceSummaries,
+                        sourceNodes, edges, usedEdgeIds, edgeCounts, push.id());
             }
         }
-        for (Map.Entry<String, List<String>> target : targetKinds.entrySet()) {
-            String targetNodeId = "target:" + target.getKey();
-            nodes.add(new PipelineDagNode(targetNodeId, "target", target.getKey(), String.join(" + ", target.getValue())));
-            String edgeId = serveNodeId + "->" + targetNodeId;
-            if (!usedEdgeIds.add(edgeId)) {
-                throw new IllegalStateException("Pipeline graph contains a duplicate target edge: " + edgeId);
-            }
-            edges.add(new PipelineDagEdge(edgeId, serveNodeId, targetNodeId, null));
-        }
+    }
+
+    private static void addWiring(
+            FromRef from,
+            String target,
+            Map<String, String> upstreamNodes,
+            List<PipelineSourceSummary> sourceSummaries,
+            Map<String, PipelineDagNode> sourceNodes,
+            List<PipelineDagEdge> edges,
+            Set<String> usedEdgeIds,
+            Map<String, Integer> edgeCounts,
+            String edgeLabel) {
+        addEdge(from, edgeLabel, target, upstreamNodes, sourceSummaries,
+                sourceNodes, edges, usedEdgeIds, edgeCounts);
     }
 
     private static String viewId(ViewBlock view) {
@@ -188,24 +208,6 @@ final class PipelineDagProjection {
         };
     }
 
-    private static String serveId(ServeBlock serve, String pipelineId) {
-        return switch (serve) {
-            case ServeBlock.Inline inline -> inline.id() == null ? pipelineId + "_serve" : inline.id();
-            case ServeBlock.Use use -> use.id();
-        };
-    }
-
-    private static FromRef serveFrom(ServeBlock serve) {
-        return switch (serve) {
-            case ServeBlock.Inline inline -> inline.from();
-            case ServeBlock.Use use -> use.from();
-        };
-    }
-
-    private static boolean isViewReference(FromRef reference, ViewBlock view) {
-        return reference instanceof FromRef.Literal literal && literal.ref().equals(viewId(view));
-    }
-
     private static String referenceLabel(FromRef reference) {
         return switch (reference) {
             case FromRef.Literal literal -> literal.ref();
@@ -217,6 +219,14 @@ final class PipelineDagProjection {
         return "source:" + reference;
     }
 
+    private static String sourceNodeId(String sourceId, String table) {
+        return "source:" + sourceId + ":" + table;
+    }
+
+    private static String targetNodeId(String sourceId, String table) {
+        return "target:" + sourceId + ":" + table;
+    }
+
     private static String transformNodeId(String id) {
         return "transform:" + id;
     }
@@ -225,7 +235,37 @@ final class PipelineDagProjection {
         return "view:" + id;
     }
 
-    private static String serveNodeId(String id) {
-        return "serve:" + id;
+    private static String tableForTerminal(FromRef reference) {
+        if (reference instanceof FromRef.Literal literal) {
+            String value = literal.ref();
+            int separator = value.indexOf('.');
+            return separator < 0 ? value : value.substring(separator + 1);
+        }
+        return referenceLabel(reference);
+    }
+
+    private static SourceTable resolveSourceTable(FromRef reference, List<PipelineSourceSummary> sourceSummaries) {
+        if (reference instanceof FromRef.Literal literal) {
+            String value = literal.ref();
+            int separator = value.indexOf('.');
+            if (separator >= 0) {
+                String sourceId = value.substring(0, separator);
+                if (sourceSummaries.stream().anyMatch(source -> source.id().equals(sourceId))) {
+                    return new SourceTable(sourceId, value.substring(separator + 1));
+                }
+                return null;
+            }
+            if (sourceSummaries.size() == 1) {
+                return new SourceTable(sourceSummaries.getFirst().id(), value);
+            }
+            return null;
+        }
+        if (sourceSummaries.size() == 1) {
+            return new SourceTable(sourceSummaries.getFirst().id(), referenceLabel(reference));
+        }
+        return null;
+    }
+
+    private record SourceTable(String sourceId, String table) {
     }
 }
