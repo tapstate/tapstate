@@ -27,8 +27,11 @@ import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineRepresentation;
+import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
@@ -56,6 +59,8 @@ import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayout;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SessionRecord;
 import io.tapstate.spi.store.SessionStore;
@@ -841,6 +846,40 @@ class AuthTest {
         @Bean
         ArtifactQueryService artifactQueryService(InMemoryArtifactStore store) {
             return new ArtifactQueryService(store);
+        }
+
+        @Bean
+        PipelineRepresentation pipelineRepresentation() {
+            return new PipelineRepresentation();
+        }
+
+        @Bean
+        PipelineViewService pipelineViewService(
+                ArtifactQueryService artifacts, PipelineRepresentation representation) {
+            return new PipelineViewService(artifacts, representation);
+        }
+
+        @Bean
+        PipelineLayoutStore pipelineLayoutStore() {
+            return new PipelineLayoutStore() {
+                @Override
+                public Optional<PipelineLayout> get(String pipelineId) {
+                    return Optional.empty();
+                }
+
+                @Override
+                public void save(PipelineLayout layout) {
+                }
+
+                @Override
+                public void delete(String pipelineId) {
+                }
+            };
+        }
+
+        @Bean
+        PipelineLayoutService pipelineLayoutService(PipelineViewService pipelines, PipelineLayoutStore layouts) {
+            return new PipelineLayoutService(pipelines, layouts);
         }
 
         // The removal controller comes in with the whole ControlHttpFace bundle, so its service must be

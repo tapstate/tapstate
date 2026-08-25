@@ -8,6 +8,7 @@ import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.Scope;
@@ -447,7 +448,7 @@ class SourceApiTest {
         @Bean ArtifactMutationService artifactMutationService(ArtifactStore store, AuditGate auditGate) {
             return new ArtifactMutationService(
                     store, NoReclaimStores.desired(), NoReclaimStores.state(),
-                    NoReclaimStores.observations(), NoReclaimStores.srsMeta(), auditGate);
+                    NoReclaimStores.observations(), NoReclaimStores.srsMeta(), auditGate, DataBrowserFollows.NONE);
         }
         @Bean OperationRegistry operationRegistry() { return ControlOperations.registry(); }
         @Bean TokenStore tokenStore() { return new EmptyTokenStore(); }

@@ -49,7 +49,7 @@ class SourceProjectionServiceTest {
             new ArtifactQueryService(store),
             new ArtifactMutationService(store, new EmptyDesiredStore(), new EmptyStateStore(),
                     new EmptyObservationStore(), new EmptySrsMetaStore(),
-                    new AuditGate(record -> { }, Clock.systemUTC())),
+                    new AuditGate(record -> { }, Clock.systemUTC()), DataBrowserFollows.NONE),
             new SourceRepresentation(() -> catalog));
 
     @Test

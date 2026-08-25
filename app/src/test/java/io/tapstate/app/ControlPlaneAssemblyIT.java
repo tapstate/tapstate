@@ -310,7 +310,7 @@ class ControlPlaneAssemblyIT {
     }
 
     @Test
-    void connectorListIsWiredOverARealStoreAndReturnsTheBundledCatalog() {
+    void connectorListIsWiredOverARealStoreAndStartsEmptyBeforeRegistration() {
         int port = start();
         RestClient client = RestClient.create("http://localhost:" + port);
 
@@ -320,19 +320,16 @@ class ControlPlaneAssemblyIT {
                 .body(Map.of("username", "admin", "password", "s3cret")).retrieve().body(Map.class);
         String token = (String) login.get("token");
 
-        // The connector.list read verb is assembled over the real store: the online catalog view (the
-        // bundled snapshot union the derived rows for registered connectors) is served through the
-        // authenticated /api face. With no connector registered yet the view is the bundled snapshot, every
-        // row tagged bundled — proving the endpoint, the view and the store are wired, not stubbed. The
-        // register -> derive -> list happy path needs a real connector jar (a gated real-jar test), so it is
-        // not exercised here; the empty-jar register above proves the write chain reaches the introspector.
+        // The connector.list read verb is assembled over the real store and exposed through the authenticated
+        // /api face. The authoring list contains only connectors whose specs were registered in this control
+        // plane, so a fresh store is empty. The register -> derive -> list happy path needs a real connector
+        // jar (a gated real-jar test), while the empty-jar register above proves the write chain reaches the
+        // introspector.
         Map<?, ?> body = client.get().uri("/api/connectors")
                 .header("Authorization", "Bearer " + token)
                 .retrieve().body(Map.class);
         List<?> connectors = (List<?>) body.get("connectors");
-        assertThat(connectors).isNotEmpty();
-        assertThat(connectors).allSatisfy(row ->
-                assertThat(((Map<?, ?>) row).get("origin")).isEqualTo("bundled"));
+        assertThat(connectors).isEmpty();
 
         // The read verb is guarded like every other: an anonymous request is refused.
         HttpStatusCode anonymous = client.get().uri("/api/connectors")
