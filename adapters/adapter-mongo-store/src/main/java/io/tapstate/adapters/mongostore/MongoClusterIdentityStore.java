@@ -42,6 +42,10 @@ public final class MongoClusterIdentityStore implements ClusterIdentityStore {
 
     private static ClusterIdentity read(Document document) {
         Object id = document == null ? DOCUMENT_ID : document.get("_id");
+        if (document == null) {
+            throw new TapstateException(
+                    IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+        }
         try {
             return new ClusterIdentity(document.getString("clusterId"));
         } catch (RuntimeException invalid) {

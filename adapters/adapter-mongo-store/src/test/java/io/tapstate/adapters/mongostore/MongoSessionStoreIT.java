@@ -15,6 +15,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -59,7 +60,10 @@ class MongoSessionStoreIT {
                                 "urn:tapstate:cluster:01J5FIXTURE", now, desiredIdle).isPresent(),
                         () -> store.exchange("s01", "sha256-fixture",
                                 "urn:tapstate:cluster:01J5FIXTURE", now, desiredIdle).isPresent());
-                assertThat(executor.invokeAll(exchanges)).allSatisfy(future -> assertThat(future.get()).isTrue());
+                List<Future<Boolean>> results = executor.invokeAll(exchanges);
+                assertThat(results)
+                        .hasSize(2)
+                        .allSatisfy(future -> assertThat(future.get()).isTrue());
             }
 
             SessionRecord touched = store.find("s01").orElseThrow();

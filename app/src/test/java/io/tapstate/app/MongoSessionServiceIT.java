@@ -26,6 +26,7 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -60,7 +61,9 @@ class MongoSessionServiceIT {
                 var futures = exchanges.stream().map(executor::submit).toList();
                 ready.await();
                 start.countDown();
-                assertThat(futures).allSatisfy(future -> assertThat(future.get()).isTrue());
+                assertThat(futures)
+                        .hasSize(2)
+                        .allSatisfy(future -> assertThat(future.get()).isTrue());
             }
 
             assertThat(sessionToken).isEqualTo("tss_s01.session-secret");
