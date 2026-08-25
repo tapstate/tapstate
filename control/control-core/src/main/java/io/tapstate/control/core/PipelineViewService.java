@@ -17,10 +17,19 @@ public final class PipelineViewService {
 
     private final ArtifactQueryService artifacts;
     private final PipelineRepresentation representation;
+    private final PipelineObservationQueryService observations;
 
     public PipelineViewService(ArtifactQueryService artifacts, PipelineRepresentation representation) {
+        this(artifacts, representation, null);
+    }
+
+    public PipelineViewService(
+            ArtifactQueryService artifacts,
+            PipelineRepresentation representation,
+            PipelineObservationQueryService observations) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.representation = Objects.requireNonNull(representation, "representation");
+        this.observations = observations;
     }
 
     /** Lists stored Pipelines in stable id order. */
@@ -49,7 +58,8 @@ public final class PipelineViewService {
 
     private PipelineView view(StoredResource stored) {
         PipelineResource pipeline = pipeline(stored.resource());
-        return representation.toView(pipeline, stored.contentHash(), sourceSummaries(pipeline));
+        PipelineStatus status = observations == null ? null : observations.findStatus(pipeline.id()).orElse(null);
+        return representation.toView(pipeline, stored.contentHash(), sourceSummaries(pipeline), status);
     }
 
     private List<PipelineSourceSummary> sourceSummaries(PipelineResource pipeline) {

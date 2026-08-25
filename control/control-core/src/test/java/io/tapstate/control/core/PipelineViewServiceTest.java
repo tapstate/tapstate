@@ -5,12 +5,15 @@ import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
 
 import java.util.LinkedHashMap;
@@ -57,6 +60,27 @@ class PipelineViewServiceTest {
         assertThat(view.sources()).containsExactly(
                 new PipelineSourceSummary(
                         "orders", new Metadata(Map.of("team", "sales"), "Orders"), "mysql"));
+    }
+
+    @Test
+    void listAttachesAvailableRuntimeStatusAndLeavesUnobservedPipelinesUnavailable() {
+        ReadOnlyArtifactStore artifacts = new ReadOnlyArtifactStore();
+        artifacts.seed(source("orders", "Orders", "mysql"));
+        artifacts.seed(pipeline("running", List.of("orders")));
+        artifacts.seed(pipeline("pending", List.of("orders")));
+        InMemoryObservationStore observations = new InMemoryObservationStore();
+        observations.save(new Observation("running", PipelineState.RUNNING, Map.of(), Map.of(), Map.of()));
+
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(artifacts),
+                new PipelineRepresentation(),
+                new PipelineObservationQueryService(new ArtifactQueryService(artifacts), observations));
+
+        List<PipelineView> listed = pipelines.list();
+        assertThat(listed).extracting(PipelineView::id).containsExactly("pending", "running");
+        assertThat(listed.get(0).status()).isNull();
+        assertThat(listed.get(1).status())
+                .isEqualTo(new PipelineStatus("running", PipelineState.RUNNING, null));
     }
 
     @Test
@@ -191,6 +215,26 @@ class PipelineViewServiceTest {
         @Override
         public void delete(String pipelineId) {
             layouts.remove(pipelineId);
+        }
+    }
+
+    private static final class InMemoryObservationStore implements ObservationStore {
+
+        private final Map<String, Observation> observations = new LinkedHashMap<>();
+
+        @Override
+        public void save(Observation observation) {
+            observations.put(observation.pipelineId(), observation);
+        }
+
+        @Override
+        public Optional<Observation> read(String pipelineId) {
+            return Optional.ofNullable(observations.get(pipelineId));
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            observations.remove(pipelineId);
         }
     }
 }
