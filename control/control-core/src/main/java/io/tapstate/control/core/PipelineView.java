@@ -21,7 +21,8 @@ public record PipelineView(
         Settings settings,
         Map<String, Object> experimental,
         PipelineDag dag,
-        String contentHash) {
+        String contentHash,
+        PipelineStatus status) {
 
     public PipelineView {
         Objects.requireNonNull(id, "id");

@@ -526,8 +526,10 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineViewService pipelineViewService(
-            ArtifactQueryService artifactQueryService, PipelineRepresentation representation) {
-        return new PipelineViewService(artifactQueryService, representation);
+            ArtifactQueryService artifactQueryService,
+            PipelineRepresentation representation,
+            PipelineObservationQueryService observations) {
+        return new PipelineViewService(artifactQueryService, representation, observations);
     }
 
     @Bean

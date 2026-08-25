@@ -13,6 +13,15 @@ public final class PipelineRepresentation {
     /** Builds a Pipeline view while preserving the declared Source reference order. */
     public PipelineView toView(
             PipelineResource pipeline, String contentHash, List<PipelineSourceSummary> sourceSummaries) {
+        return toView(pipeline, contentHash, sourceSummaries, null);
+    }
+
+    /** Builds a Pipeline view and attaches the latest optional runtime observation. */
+    public PipelineView toView(
+            PipelineResource pipeline,
+            String contentHash,
+            List<PipelineSourceSummary> sourceSummaries,
+            PipelineStatus status) {
         Objects.requireNonNull(pipeline, "pipeline");
         Objects.requireNonNull(contentHash, "contentHash");
         Objects.requireNonNull(sourceSummaries, "sourceSummaries");
@@ -29,6 +38,7 @@ public final class PipelineRepresentation {
                 pipeline.settings(),
                 pipeline.experimental(),
                 dagProjection.project(pipeline, sourceSummaries),
-                contentHash);
+                contentHash,
+                status);
     }
 }
