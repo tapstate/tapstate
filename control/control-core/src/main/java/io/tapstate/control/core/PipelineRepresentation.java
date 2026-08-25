@@ -28,7 +28,7 @@ public final class PipelineRepresentation {
                 pipeline.serve(),
                 pipeline.settings(),
                 pipeline.experimental(),
-                dagProjection.project(pipeline),
+                dagProjection.project(pipeline, sourceSummaries),
                 contentHash);
     }
 }

@@ -316,6 +316,28 @@ class PipelineApiTest {
         Map<?, ?> source = (Map<?, ?>) ((List<?>) got.getBody().get("sources")).getFirst();
         assertThat(source.get("id")).isEqualTo("src_x");
         assertThat(source.get("connector")).isEqualTo("mysql");
+        Map<?, ?> dag = (Map<?, ?>) got.getBody().get("dag");
+        List<?> nodes = (List<?>) dag.get("nodes");
+        List<?> edges = (List<?>) dag.get("edges");
+        assertThat(nodes).allSatisfy(node -> assertThat(((Map<?, ?>) node).get("type")).isNotEqualTo("serve"));
+        assertThat(nodes).anySatisfy(node -> {
+            Map<?, ?> mapped = (Map<?, ?>) node;
+            assertThat(mapped.get("id")).isEqualTo("source:src_x:/.*/");
+            assertThat(mapped.get("label")).isEqualTo("/.*/");
+            assertThat(mapped.get("detail")).isEqualTo("src_x");
+        });
+        assertThat(nodes).anySatisfy(node -> {
+            Map<?, ?> mapped = (Map<?, ?>) node;
+            assertThat(mapped.get("id")).isEqualTo("target:tgt_x:/.*/");
+            assertThat(mapped.get("label")).isEqualTo("/.*/");
+            assertThat(mapped.get("detail")).isEqualTo("tgt_x");
+        });
+        assertThat(edges).anySatisfy(edge -> {
+            Map<?, ?> mapped = (Map<?, ?>) edge;
+            assertThat(mapped.get("source")).isEqualTo("source:src_x:/.*/");
+            assertThat(mapped.get("target")).isEqualTo("target:tgt_x:/.*/");
+            assertThat(mapped.get("label")).isEqualTo("sink1");
+        });
 
         ApiError missing = client().get().uri("/api/pipelines/ghost")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
