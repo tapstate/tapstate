@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -33,9 +34,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Owner-only, atomic persistence for the non-secret context configuration. */
 final class ContextConfigStore {
+
+    private static final Map<Path, Object> JVM_LOCKS = new ConcurrentHashMap<>();
 
     private static final Set<PosixFilePermission> DIRECTORY_PERMISSIONS = Set.of(
             PosixFilePermission.OWNER_READ,
@@ -129,6 +133,10 @@ final class ContextConfigStore {
             throw new IllegalArgumentException("only the current context configuration can be saved");
         }
         ensureDirectory();
+        withConfigLock(() -> saveStrict(config));
+    }
+
+    private void saveStrict(ContextConfig config) {
         if (entryExists(configFile)) {
             load();
         }
@@ -156,6 +164,31 @@ final class ContextConfigStore {
         }
     }
 
+    private void withConfigLock(LockedOperation operation) {
+        Path lockPath = root.resolve(".config.lock");
+        Object jvmLock = JVM_LOCKS.computeIfAbsent(lockPath, ignored -> new Object());
+        synchronized (jvmLock) {
+            FileAttribute<?>[] attributes = supportsPosix(root)
+                    ? new FileAttribute<?>[]{PosixFilePermissions.asFileAttribute(FILE_PERMISSIONS)}
+                    : new FileAttribute<?>[0];
+            try (FileChannel channel = FileChannel.open(lockPath,
+                    Set.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS),
+                    attributes)) {
+                if (!supportsPosix(root)) {
+                    installOwnerOnlyAcl(lockPath);
+                }
+                verifyFile(lockPath);
+                try (FileLock ignored = channel.lock()) {
+                    operation.run();
+                }
+            } catch (TapstateException coded) {
+                throw coded;
+            } catch (IOException | RuntimeException failure) {
+                throw permissions(lockPath, safeReason(failure), failure);
+            }
+        }
+    }
+
     private void ensureDirectory() {
         if (entryExists(root)) {
             verifyDirectory(root);
@@ -173,6 +206,10 @@ final class ContextConfigStore {
         } catch (TapstateException coded) {
             throw coded;
         } catch (IOException failure) {
+            if (entryExists(root)) {
+                verifyDirectory(root);
+                return;
+            }
             throw permissions(root, safeReason(failure), failure);
         }
     }
@@ -329,6 +366,12 @@ final class ContextConfigStore {
         } catch (IOException ignored) {
             // A same-directory temp is never read as configuration and is safe to leave after failure.
         }
+    }
+
+    @FunctionalInterface
+    private interface LockedOperation {
+
+        void run();
     }
 
     private ContextConfig decodeCurrent(Map<String, Object> document) {

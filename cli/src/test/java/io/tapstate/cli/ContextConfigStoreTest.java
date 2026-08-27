@@ -58,9 +58,12 @@ class ContextConfigStoreTest {
                             PosixFilePermission.OWNER_EXECUTE));
             assertThat(Files.getPosixFilePermissions(home.resolve(".tapstate/config.yaml")))
                     .isEqualTo(Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
+            assertThat(Files.getPosixFilePermissions(home.resolve(".tapstate/.config.lock")))
+                    .isEqualTo(Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
         }
         try (var files = Files.list(home.resolve(".tapstate"))) {
-            assertThat(files.map(path -> path.getFileName().toString()).toList()).containsExactly("config.yaml");
+            assertThat(files.map(path -> path.getFileName().toString()).toList())
+                    .containsExactlyInAnyOrder(".config.lock", "config.yaml");
         }
     }
 
@@ -123,30 +126,35 @@ class ContextConfigStoreTest {
     @Test
     void concurrentSavesAlwaysLeaveOneCompleteReadableDocument(@TempDir Path home) throws Exception {
         ContextConfigStore.underHome(home).save(ContextConfig.empty());
-        ContextConfigStore firstStore = ContextConfigStore.underHome(home);
-        ContextConfigStore secondStore = ContextConfigStore.underHome(home);
         ContextConfig alpha = configNamed("alpha", UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"));
         ContextConfig beta = configNamed("beta", UUID.fromString("118f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"));
-        CountDownLatch start = new CountDownLatch(1);
-        try (var pool = Executors.newFixedThreadPool(2)) {
-            var first = pool.submit(() -> {
-                start.await();
-                firstStore.save(alpha);
-                return null;
-            });
-            var second = pool.submit(() -> {
-                start.await();
-                secondStore.save(beta);
-                return null;
-            });
-            start.countDown();
-            first.get();
-            second.get();
+
+        for (int attempt = 0; attempt < 100; attempt++) {
+            saveConcurrently(home, alpha, beta);
         }
 
         assertThat(ContextConfigStore.underHome(home).load()).isIn(alpha, beta);
         try (var files = Files.list(home.resolve(".tapstate"))) {
-            assertThat(files.map(path -> path.getFileName().toString()).toList()).containsExactly("config.yaml");
+            assertThat(files.map(path -> path.getFileName().toString()).toList())
+                    .containsExactlyInAnyOrder(".config.lock", "config.yaml");
+        }
+    }
+
+    @Test
+    void concurrentFirstSavesCreateTheSecureDirectoryWithoutAFalsePermissionFailure(@TempDir Path home) throws Exception {
+        ContextConfig alpha = configNamed("alpha", UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"));
+        ContextConfig beta = configNamed("beta", UUID.fromString("118f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"));
+
+        for (int attempt = 0; attempt < 100; attempt++) {
+            Path attemptHome = Files.createDirectory(home.resolve("home-" + attempt));
+
+            saveConcurrently(attemptHome, alpha, beta);
+
+            assertThat(ContextConfigStore.underHome(attemptHome).load()).isIn(alpha, beta);
+            try (var files = Files.list(attemptHome.resolve(".tapstate"))) {
+                assertThat(files.map(path -> path.getFileName().toString()).toList())
+                        .containsExactlyInAnyOrder(".config.lock", "config.yaml");
+            }
         }
     }
 
@@ -212,6 +220,27 @@ class ContextConfigStoreTest {
                 Map.of(name, new ContextDefinition(id, List.of(URI.create("https://" + name + ".example.com")),
                         new ContextTls(true), UUID.randomUUID())),
                 Map.of());
+    }
+
+    private static void saveConcurrently(Path home, ContextConfig first, ContextConfig second) throws Exception {
+        ContextConfigStore firstStore = ContextConfigStore.underHome(home);
+        ContextConfigStore secondStore = ContextConfigStore.underHome(home);
+        CountDownLatch start = new CountDownLatch(1);
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            var firstSave = pool.submit(() -> {
+                start.await();
+                firstStore.save(first);
+                return null;
+            });
+            var secondSave = pool.submit(() -> {
+                start.await();
+                secondStore.save(second);
+                return null;
+            });
+            start.countDown();
+            firstSave.get();
+            secondSave.get();
+        }
     }
 
     private static void assertRejectedAndUnchanged(
