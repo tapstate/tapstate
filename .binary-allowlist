@@ -15,3 +15,5 @@
 # an image, a keystore, a compiled fixture — is the only thing that belongs
 # here. A source file with a stray control character does not: write the
 # character as a language-level escape instead.
+
+docs/assets/stack-comparison.png

@@ -12,3 +12,7 @@
 # It ships EMPTY on purpose. No directory — tests, data fixtures, or locale
 # resource bundles included — is exempt by default. Adding a path here is a
 # reviewed decision.
+
+# Binary asset, not text: the scan reads its compressed bytes and reports a
+# spurious match. Also listed in .binary-allowlist.
+docs/assets/stack-comparison.png
