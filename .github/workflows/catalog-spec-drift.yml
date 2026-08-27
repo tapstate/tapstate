@@ -72,6 +72,10 @@ permissions:
 env:
   UPSTREAM: https://github.com/tapdata/tapdata-connectors.git
   CATALOG_DIR: core/core-catalog/src/main/resources/catalog
+  # Named once because two steps must agree on it: the one that asks whether a pull request is
+  # already open, and the one that opens it. Were they to disagree the scan would decide to hold
+  # against a branch nobody is looking at, and push to the branch everyone is.
+  DRIFT_BRANCH: ws/catalog-spec-drift
 
 jobs:
   scan:
@@ -135,6 +139,33 @@ jobs:
           git -C upstream sparse-checkout set --no-cone --stdin < fetch-list.txt
           git -C upstream checkout
 
+      - name: Is the drift pull request already open
+        id: existing
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        # Held drift accumulates into whichever pull request opens next, so while one is open that is
+        # the accumulator and holding against it means letting it go stale. What it carries is a
+        # regenerated catalog - generated artifacts - so anything that regenerates them on main
+        # conflicts with it outright, and no reviewer resolves that by hand. Answering this question
+        # is what lets the triage refresh it instead.
+        #
+        # Not on pull request runs. Those are here to exercise the lane rather than act on what it
+        # finds, and the drift pull request is open often enough that reading it here would put the
+        # expensive rebuild into every run that touches this file. The catalog-drift-pr label is how
+        # a run is sent down that path on purpose.
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "open=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          count=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$DRIFT_BRANCH" --state open --json number --jq 'length')
+          echo "$count open pull request(s) on $DRIFT_BRANCH"
+          if [ "$count" -gt 0 ]; then
+            echo "open=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "open=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: What drifted, and does it open a pull request
         id: drift
         env:
@@ -154,6 +185,7 @@ jobs:
             -Dtapstate.catalog.fetched="$PWD/upstream" \
             -Dtapstate.catalog.fetch-list="$PWD/fetch-list.txt" \
             -Dtapstate.catalog.catalog-age-days="${AGE_OVERRIDE:-$(.github/scripts/catalog-age-days.sh)}" \
+            -Dtapstate.catalog.drift-pr-open="${{ steps.existing.outputs.open }}" \
             -Dtapstate.catalog.drift-report="$PWD/drift-report.txt"
           if [ ! -s drift-report.txt ]; then
             echo "the drift report is empty - the comparison did not run" >&2
@@ -192,7 +224,7 @@ jobs:
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ steps.token.outputs.token }}
-          branch: ws/catalog-spec-drift
+          branch: ${{ env.DRIFT_BRANCH }}
           # Only the paths a refresh writes. Without this the action commits everything untracked in
           # the workspace, and this job leaves plenty there: the upstream partial clone and the path,
           # fetch and decision lists it drives the scan from. A pull request carrying those is not a
@@ -203,8 +235,10 @@ jobs:
             tools/catalog-assembler/ingest-report.md
             tools/catalog-assembler/capability-bitmap.tsv
           # main is protected with "require branches to be up to date", so a pull request left alone
-          # goes stale within a day. Rebasing onto main each run keeps one open pull request that can
-          # actually merge, rather than a growing pile of them that cannot.
+          # goes stale within a day. This action resets the branch onto main and re-applies the
+          # regenerated files every time it runs, which keeps one open pull request that can actually
+          # merge rather than a growing pile of them that cannot - but only on the runs that reach it,
+          # which is why an open pull request is one of the things the triage decides on.
           base: main
           title: "Carry upstream connector specification drift into the catalog"
           commit-message: "Carry upstream connector specification drift into the catalog"

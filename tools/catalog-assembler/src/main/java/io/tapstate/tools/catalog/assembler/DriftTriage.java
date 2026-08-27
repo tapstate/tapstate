@@ -19,6 +19,15 @@ import io.tapstate.core.catalog.OfficialConnectors;
  * effect a timer; once the set is large the trigger takes over and the ceiling is the safety net it
  * reads like. Both are the intended behaviour — a scan that has not opened anything in a while is not
  * evidence it is broken.
+ *
+ * <p>Holding stops once a pull request is open, and that is not a second policy but the same one read
+ * correctly: holding means accumulating into whichever pull request opens next, and while one is open
+ * that is the accumulator. Leaving it alone does not defer an interruption — the interruption already
+ * happened — it lets an open pull request carry a catalog regenerated from a revision of this
+ * repository that is falling further behind by the day. What it carries are generated artifacts, so
+ * anything that regenerates them on the default branch conflicts with it outright and no reviewer can
+ * resolve that by hand. Refreshing it is a force-push onto an unread pull request; the alternative is
+ * one nobody can merge.
  */
 final class DriftTriage {
 
@@ -42,12 +51,18 @@ final class DriftTriage {
     private DriftTriage() {
     }
 
-    static Decision decide(List<String> changedConnectorIds, int daysSinceLastPullRequest) {
+    static Decision decide(
+            List<String> changedConnectorIds, int daysSinceLastPullRequest, boolean pullRequestAlreadyOpen) {
         if (changedConnectorIds.isEmpty()) {
-            // Checked before the ceiling: the ceiling exists to flush held drift, and with nothing
-            // held there is nothing to flush - an empty pull request every seventh day would train
-            // its reviewers to close this one unread.
+            // Checked before both of the reasons to open: the ceiling exists to flush held drift and
+            // the open pull request is where held drift goes, and with nothing held there is nothing
+            // to flush - an empty pull request every seventh day would train its reviewers to close
+            // this one unread. An open pull request with nothing left to carry is a different
+            // question, and closing it is not this class's to answer.
             return Decision.NOTHING;
+        }
+        if (pullRequestAlreadyOpen) {
+            return Decision.OPEN;
         }
         if (changedConnectorIds.stream().anyMatch(OfficialConnectors::isOfficial)) {
             return Decision.OPEN;

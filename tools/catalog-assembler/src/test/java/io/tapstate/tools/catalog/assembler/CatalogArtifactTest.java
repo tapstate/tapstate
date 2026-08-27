@@ -82,6 +82,14 @@ class CatalogArtifactTest {
         assumeTrue(reportPath != null, "no -Dtapstate.catalog.drift-report — not a drift-scan run, skipping");
         Path fetched = Path.of(requireProperty("tapstate.catalog.fetched"));
         int ageDays = Integer.parseInt(requireProperty("tapstate.catalog.catalog-age-days"));
+        // Boolean.parseBoolean reads anything that is not "true" as false, and false is the value
+        // that changes nothing - so a property name typed wrong upstream would leave the decision
+        // exactly as it was before this input existed, which is the miswiring it was added to stop.
+        String pullRequestAlreadyOpen = requireProperty("tapstate.catalog.drift-pr-open");
+        if (!pullRequestAlreadyOpen.equals("true") && !pullRequestAlreadyOpen.equals("false")) {
+            throw new IllegalStateException(
+                    "-Dtapstate.catalog.drift-pr-open must be true or false, not " + pullRequestAlreadyOpen);
+        }
 
         Map<String, String> fetchedByPath = new LinkedHashMap<>();
         for (String path : Files.readAllLines(Path.of(requireProperty("tapstate.catalog.fetch-list")))) {
@@ -98,12 +106,14 @@ class CatalogArtifactTest {
         }
 
         SpecDrift.Report drift = SpecDrift.compare(TapstateCatalog.load().all(), fetchedByPath);
-        DriftTriage.Decision decision = DriftTriage.decide(drift.allIds(), ageDays);
+        DriftTriage.Decision decision =
+                DriftTriage.decide(drift.allIds(), ageDays, pullRequestAlreadyOpen.equals("true"));
         Files.writeString(Path.of(reportPath), String.join("\n",
                 "decision=" + decision,
                 "changed=" + String.join(" ", drift.changedIds()),
                 "vanished=" + String.join(" ", drift.vanishedIds()),
-                "new_connectors=" + String.join(" ", drift.newConnectorIds())) + "\n");
+                "new_connectors=" + String.join(" ", drift.newConnectorIds()),
+                "pr_already_open=" + pullRequestAlreadyOpen) + "\n");
     }
 
     /** A property this step cannot proceed without — absent means the caller is wired wrong. */

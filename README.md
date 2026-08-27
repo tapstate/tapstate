@@ -17,17 +17,11 @@ live operational state.
 
 ## Why Tapstate
 
-A typical operational data path:
+![Assembled streaming stack versus Tapstate: six separate systems reduced to one deployable](docs/assets/stack-comparison.png)
 
-```text
-Database → CDC → Kafka → Flink / jobs → serving database → application
-```
-
-With Tapstate:
-
-```text
-Database → Tapstate → live operational state → application
-```
+A typical operational data path chains a database, CDC, Kafka, Flink or custom jobs,
+and a serving database before an application sees anything. Tapstate collapses that
+into one deployable.
 
 One data path. One operational surface.
 
