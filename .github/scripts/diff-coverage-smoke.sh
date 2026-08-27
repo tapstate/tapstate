@@ -144,6 +144,45 @@ git add -A && git commit -qm "docs only"
 jacoco_report core/target/site/jacoco/jacoco.xml io/tapstate/demo Widget.java 5:3 7:0
 expect "a change with no new Java says so" "no new executable lines"
 
+# --- two reports disagree about the same line ----------------------------------------------------
+# The one that decides is the highest count, never the one `find | sort` ended on. Without that the
+# figure is a property of the filenames: `jacoco-it/` sorts before `jacoco/`, so the unit report
+# overwrites the integration one and a line only an integration test reaches reads as missed.
+fresh_repo
+add_widget
+jacoco_report core/target/site/jacoco/jacoco.xml    io/tapstate/demo Widget.java 5:0 7:0
+jacoco_report core/target/site/jacoco-it/jacoco.xml io/tapstate/demo Widget.java 5:3 7:4
+expect "a line covered only by the integration report counts as covered" "2 of 2"
+refute "the last report read does not decide" "0 of 2"
+
+# --- a file no report mentions is not 'nothing to measure' ---------------------------------------
+# The mirror of the no-report-at-all case above, one level down: reports were found, just none that
+# has ever heard of this file. A module whose own tests never ran writes no execution data, so
+# `jacoco:report` skips it while every other module reports normally. Folding that into "the added
+# lines are comments and blanks" is the same collapse this file exists to catch.
+fresh_repo
+add_widget
+jacoco_report other/target/site/jacoco/jacoco.xml io/tapstate/other Other.java 3:4
+expect "a file in no report says it was not measured" "not measured"
+expect "and it names the file nobody measured" "Widget.java"
+refute "it is not called comments and blanks" "comments, blanks"
+refute "and it invents no percentage for it" "%"
+
+# --- measured and unmeasured in the same change --------------------------------------------------
+# The mirror that keeps the case above from being satisfied by a gate that gives up on everything:
+# the file the reports do cover still gets its number, and the one they do not is named beside it
+# rather than counted as uncovered.
+fresh_repo
+add_widget
+mkdir -p tool/src/main/java/io/tapstate/tool
+printf 'package io.tapstate.tool;\n\nfinal class Tool {\n    static int go() { return 1; }\n}\n' \
+  > tool/src/main/java/io/tapstate/tool/Tool.java
+git add -A && git commit -qm "add a tool"
+jacoco_report core/target/site/jacoco/jacoco.xml io/tapstate/demo Widget.java 5:3 7:0
+expect "the measured file still reports its number" "1 of 2"
+expect "the unmeasured file is named beside it" "Tool.java"
+refute "the unmeasured file is not counted as uncovered" "1 of 3"
+
 # --- an unresolvable range must not read as 'nothing new' ----------------------------------------
 fresh_repo
 add_widget

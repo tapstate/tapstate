@@ -117,8 +117,18 @@ trap 'rm -f "$comment"' EXIT
 } > "$comment"
 
 # Ours is the one carrying the marker. Not the first, not the latest.
-existing="$(gh api --paginate "repos/$repo/issues/$num/comments" \
-              --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" 2>/dev/null | head -n1)"
+#
+# The lookup's own failure gets its own refusal, and never falls through to the post below. A
+# listing that could not be read and a thread with no translation on it yet are the same empty
+# string, and treating them alike posts a second comment under an issue that already has one -
+# then a third on the next edit. That growing pile is the exact thing the marker exists to
+# prevent, so an unreadable listing stops here rather than guessing the thread is empty.
+if ! listing="$(gh api --paginate "repos/$repo/issues/$num/comments" \
+                  --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" 2>/dev/null)"; then
+  say "Skipped: the comments on this issue could not be read, so whether a translation is already
+here is unknown. Nothing was posted - a second copy is worse than none."
+fi
+existing="$(printf '%s' "$listing" | head -n1)"
 
 if [ -n "$existing" ]; then
   if gh api --method PATCH "repos/$repo/issues/comments/$existing" \

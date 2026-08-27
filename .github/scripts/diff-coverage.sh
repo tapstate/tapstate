@@ -98,18 +98,34 @@ result="$(printf '%s\n' "$added" | awk -v covfile="${TMPDIR:-/tmp}/dc-cov.$$" '
     while ((getline line < covfile) > 0) {
       n = split(line, f, " ")
       if (n < 3) continue
-      ci[f[1] SUBSEP f[2]] = f[3] + 0
-      seen[f[1] SUBSEP f[2]] = 1
+      k = f[1] SUBSEP f[2]
+      v = f[3] + 0
+      # The highest count across every report, never the last one read. The same line appears in
+      # more than one report - jacoco/ and jacoco-it/ at least - and each of those describes only
+      # the runs that wrote it, so a line exercised by an integration test reads as missed in the
+      # unit report. Keeping whichever file `find | sort` happened to end on makes the figure a
+      # property of the filenames.
+      if (!(k in seen) || v > ci[k]) ci[k] = v
+      seen[k] = 1
+      reported[f[1]] = 1
     }
   }
   {
     k = $1 SUBSEP $2
-    if (!(k in seen)) next          # not an executable line: never in the denominator
+    if (!(k in seen)) {
+      # Two different things reach here, and only one of them is "this line is not executable".
+      # A file no report mentions at all was never looked at, and folding that into the same
+      # silence renders "could not look" as "found nothing" - one level below the guard above,
+      # which only fires when there is no report anywhere.
+      if (!($1 in reported)) nofile[$1]++
+      next
+    }
     total++
     if (ci[k] > 0) hit++; else { miss++; per[$1]++ }
   }
   END {
     printf "%d %d\n", total + 0, hit + 0
+    for (src in nofile) printf "NOFILE %s %d\n", src, nofile[src]
     # Not `f`: the BEGIN block split into an array by that name, and awk refuses to reuse it as
     # a scalar - on stderr, while still exiting 0 and printing a table with no rows in it.
     for (src in per) printf "FILE %s %d\n", src, per[src]
@@ -120,7 +136,15 @@ rm -f "${TMPDIR:-/tmp}/dc-cov.$$"
 total="$(printf '%s' "$result" | head -n1 | cut -d' ' -f1)"
 hit="$(printf '%s' "$result" | head -n1 | cut -d' ' -f2)"
 
+# Files that added lines and appear in no report at all - a module whose own tests never ran, so
+# nothing wrote its exec file and `jacoco:report` skipped it. Named, never counted: putting them
+# in the denominator would report untested code and code nobody measured as the same thing.
+nofile="$(printf '%s\n' "$result" | awk '$1 == "NOFILE" { printf "`%s`\n", $2 }' | sort)"
+
 if [ "${total:-0}" -eq 0 ]; then
+  if [ -n "$nofile" ]; then
+    not_measured "$(printf 'These files added lines and appear in no JaCoCo report, so nothing here was measured:\n\n%s\n\nA module whose own tests did not run writes no execution data, and its report is skipped. This is not the same as a change that added no executable code.' "$nofile")"
+  fi
   printf '### Diff coverage: no new executable lines in this change\n\nThe added lines are comments, blanks or declarations that JaCoCo does not instrument.\n'
   exit 0
 fi
@@ -131,6 +155,12 @@ printf '### Diff coverage: **%d of %d new executable lines covered (%d%%)**\n\n'
 if [ "$hit" -lt "$total" ]; then
   printf 'New lines with no test exercising them:\n\n| File | Uncovered new lines |\n|---|---|\n'
   printf '%s\n' "$result" | awk '$1 == "FILE" { printf "| `%s` | %s |\n", $2, $3 }' | sort
+  printf '\n'
+fi
+
+if [ -n "$nofile" ]; then
+  printf 'Not measured at all - these files appear in no JaCoCo report, so they are in neither number above:\n\n'
+  printf '%s\n' "$nofile" | sed 's/^/- /'
   printf '\n'
 fi
 

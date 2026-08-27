@@ -58,7 +58,10 @@ done
 [ "$(cat "$SMOKE_SCRATCH/gh-mode" 2>/dev/null || echo ok)" = fail ] && exit 1
 case "$*" in
   *"--method PATCH"*|*"--method POST"*) exit 0 ;;
-  *) cat "$SMOKE_SCRATCH/gh-existing" 2>/dev/null || true ;;
+  # The read is stageable on its own, so a case can fail the listing while leaving the write
+  # working - the shape where "no translation here yet" and "could not tell" are one answer.
+  *) [ "$(cat "$SMOKE_SCRATCH/gh-list-mode" 2>/dev/null || echo ok)" = fail ] && exit 1
+     cat "$SMOKE_SCRATCH/gh-existing" 2>/dev/null || true ;;
 esac
 STUB
 chmod +x "$scratch/bin/curl" "$scratch/bin/gh"
@@ -66,13 +69,14 @@ PATH="$scratch/bin:$PATH"
 export PATH
 
 # --- the harness --------------------------------------------------------------------------------
-stage() { # stage <content the model returns> [curl-mode] [existing comment id] [gh-mode]
+stage() { # stage <content the model returns> [curl-mode] [existing comment id] [gh-mode] [gh-list-mode]
   rm -f "$scratch/gh-log" "$scratch/comment-body" "$scratch/curl-stdin" "$scratch/curl-argv"
   printf '{"choices":[{"message":{"content":%s}}]}\n' "$(printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')" \
     > "$scratch/curl-out"
   printf '%s' "${2:-ok}" > "$scratch/curl-mode"
   printf '%s' "${3:-}"   > "$scratch/gh-existing"
   printf '%s' "${4:-ok}" > "$scratch/gh-mode"
+  printf '%s' "${5:-ok}" > "$scratch/gh-list-mode"
 }
 
 run() { # run <issue body> [api key] -> stdout of the script
@@ -172,6 +176,18 @@ check "second time: edits that comment by id" "$(in_file "$scratch/gh-log" "comm
 check "second time: says it updated one" "$(has "$out" "updated" && echo 0 || echo 1)"
 check "the comment is found by the marker, not by position" "$(in_file "$scratch/gh-log" "tapstate:translation:v1" && echo 0 || echo 1)"
 check "it does not ask for the last comment by author" "$(in_file "$scratch/gh-log" "edit-last" && echo 1 || echo 0)"
+
+# An unreadable listing is its own refusal and never falls through to the post. Empty is what both
+# "no translation here yet" and "the listing could not be read" look like, and posting on the second
+# puts a second comment under an issue that already has one - then a third on the next edit, which
+# is the pile the marker exists to prevent.
+stage "An English translation." ok "" ok fail
+out="$(run "Le connecteur echoue au demarrage, voici la trace.")"; code=$?
+check "the listing cannot be read: exits 0" "$([ $code = 0 ] && echo 0 || echo 1)"
+check "the listing cannot be read: says it could not be read" "$(has "$out" "could not be read" && echo 0 || echo 1)"
+check "the listing cannot be read: is not reported as a refused write" "$(has "$out" "GitHub refused" && echo 1 || echo 0)"
+check "the listing cannot be read: posts nothing" "$(in_file "$scratch/gh-log" "--method POST" && echo 1 || echo 0)"
+check "the listing cannot be read: edits nothing either" "$(in_file "$scratch/gh-log" "--method PATCH" && echo 1 || echo 0)"
 
 # --- the report's text is data, in and out --------------------------------------------------------
 stage "An English translation."
