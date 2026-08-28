@@ -124,6 +124,25 @@ more than one pull request, sometimes by more than one person. The first merge w
 still in flight and take everyone else's remaining scope with it. Closing is a decision someone
 makes once the work is actually done.
 
+### If your push is refused over a workflow scope
+
+**Sync your fork first.** If your branch is cut from an up-to-date `main` while your fork is behind,
+your push carries this repository's own changes to `.github/workflows/` as though they were new, and
+GitHub refuses it:
+
+```
+refusing to allow a Personal Access Token to create or update workflow
+`.github/workflows/ci.yml` without `workflow` scope
+```
+
+**The fix is not a wider token.** Sync your fork's default branch - the "Sync fork" button on your
+fork's page, or `git fetch upstream && git push origin upstream/main:main` - and push again. GitHub
+judges the delta, so once those commits are already on your fork, the same branch pushes with the
+token you had. Measured, both ways, on 2026-08-28.
+
+Granting the `workflow` scope would also work, and we would rather you did not: it is a wider
+permission than contributing here needs, held for longer than this one push.
+
 ### Your first pull request waits on a click
 
 **Until a maintainer approves it, a pull request from a fork runs no checks at all.** GitHub holds a
@@ -139,6 +158,23 @@ been longer, say so on the pull request. The wait is entirely ours.
 before you start and nobody rules on whether your change is wanted while you wait. What is being
 approved is only that your branch's workflows may run on our machines - a decision about running
 code, not about your work.
+
+### What SonarQube says about your pull request, and when
+
+**Nothing, at first, and the check being green does not mean it passed.** A workflow run started by
+a pull request from a fork is never given this repository's secrets, so the analysis cannot run. The
+`sonarqube` check goes green because it was skipped, and it says so in a notice on the run.
+
+**A maintainer runs the analysis on your branch and posts what it found**, as a comment here. That
+is a manual step on our side; if your pull request is labelled `needs-sonar-review` and nothing has
+appeared, say so - the wait is ours.
+
+**The quality gate itself is measured after your change merges**, when `main` is analysed. So a
+review here is a person reading your diff plus whatever that comment reported, not a gate verdict.
+
+**What you can see immediately**, with no secrets and no waiting: the **Diff coverage** section on
+the CI run's summary page. It reports how much of the code you added is covered, the figure expected
+of new code, and the commands to produce the same number on your own machine.
 
 ### Sign your commits (DCO)
 
