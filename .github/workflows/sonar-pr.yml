@@ -1,0 +1,92 @@
+name: sonar-pr
+# Analyze ONE pull request on demand, including one from a fork.
+#
+# Why it is manual: the analysis needs this repository's secrets, and a fork's own workflow run is
+# never given them. So the decision to run this repository's token over somebody else's code is a
+# person's, taken once, at the moment they have already read the diff - which is the same moment
+# and the same person as the approval a fork's first pull request already waits on.
+#
+# It checks out refs/pull/<n>/merge, the MERGE RESULT, because that is what review is about and what
+# the branch alone cannot show.
+#
+# The three sonar.pullrequest.* properties are passed explicitly on purpose. sonar-maven-plugin
+# autodetects them from a GitHub Actions `pull_request` event, and this is a workflow_dispatch, so
+# there is nothing for it to detect: omit them and the run is filed as a BRANCH analysis, which on
+# this server overwrites the project's own state.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to analyze"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Community Edition keeps a single project state; serialize with sonarqube.yml's own group shape so
+# an on-demand run and a push analysis cannot interleave.
+concurrency:
+  group: sonarqube-${{ inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      # Read through env, never interpolated into the script body: the same rule the intake
+      # translation follows, and the input here is a string a human typed into a form.
+      - name: Resolve the pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          case "$PR" in ''|*[!0-9]*) echo "::error::pr must be a number, got: $PR"; exit 1 ;; esac
+          json="$(gh pr view "$PR" -R "$REPO" --json headRefName,baseRefName,state)"
+          state="$(printf '%s' "$json" | jq -r .state)"
+          [ "$state" = OPEN ] || { echo "::error::pull request $PR is $state, not open"; exit 1; }
+          {
+            printf 'head=%s\n' "$(printf '%s' "$json" | jq -r .headRefName)"
+            printf 'base=%s\n' "$(printf '%s' "$json" | jq -r .baseRefName)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pr }}/merge
+          fetch-depth: 0 # full history for accurate new-code dating and SCM blame
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # Same three commands as sonarqube.yml, in the same order and for the same reasons - a result
+      # produced differently is not comparable with the one every other pull request gets.
+      - name: Build, test and analyze
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          PR: ${{ inputs.pr }}
+          HEAD_REF: ${{ steps.pr.outputs.head }}
+          BASE_REF: ${{ steps.pr.outputs.base }}
+        run: |
+          set -euo pipefail
+          [ -n "${SONAR_TOKEN:-}" ] && [ -n "${SONAR_HOST_URL:-}" ] \
+            || { echo "::error::SONAR_TOKEN / SONAR_HOST_URL are not configured on this repository"; exit 1; }
+          mvn -B verify
+          mvn -B -N jacoco:merge@jacoco-merge-reactor
+          mvn -B jacoco:report@jacoco-report-reactor
+          # No qualitygate.wait: the caller reads the gate from the server afterwards, and a red gate
+          # here would be indistinguishable from an analysis that never reached it.
+          mvn -B sonar:sonar \
+            -Dsonar.projectKey=tapstate \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.login="$SONAR_TOKEN" \
+            -Dsonar.pullrequest.key="$PR" \
+            -Dsonar.pullrequest.branch="$HEAD_REF" \
+            -Dsonar.pullrequest.base="$BASE_REF"
