@@ -1,0 +1,46 @@
+# Developer Certificate of Origin.
+#
+# Every commit in an external pull request carries a `Signed-off-by:` line — the contributor
+# certifying they have the right to submit this code under the project's license. It is a statement
+# about origin, not about who wrote what, which is why it does not collide with the rule that keeps
+# attribution footers out of commit messages here.
+#
+# Meant to be a required status check on main. The job therefore always runs and always concludes:
+# an internal pull request passes with a reason rather than being skipped, because a required check
+# that never reports leaves every pull request waiting on something that will not arrive.
+#
+# The decision lives in a script, held to its own cases, which run first. Most of what those cases
+# cover is what the gate deliberately admits — internal branches, merge commits, a sign-off naming
+# someone other than the author. Each of those is indistinguishable from the gate being broken, and
+# only a case that also proves it still refuses tells the two apart.
+name: dco
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: the range is the merge base with the target branch
+
+      - name: The gate still decides the way it is supposed to
+        run: |
+          shellcheck .github/scripts/dco.sh .github/scripts/dco-smoke.sh
+          bash .github/scripts/dco-smoke.sh
+
+      - name: Every commit in an external pull request is signed off
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          git rev-parse --verify --quiet "origin/${BASE_REF}" >/dev/null \
+            || git fetch --quiet --no-tags origin "${BASE_REF}"
+          bash .github/scripts/dco.sh

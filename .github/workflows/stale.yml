@@ -1,0 +1,44 @@
+# The automatic half of triage.
+#
+# A report nobody answers does not turn any check red. Nothing in this repository fails because
+# an issue sat untouched for a month, so the failure mode of triage is silence — and silence is
+# invisible by construction. This workflow is the half that does not depend on anyone remembering
+# to look; a maintainer reading the triage queue is the other half, and neither covers the other.
+#
+# Deliberately narrow, in two ways:
+#
+#   - It only ever touches issues still carrying `needs-triage`. Once an issue is triaged the
+#     label comes off and this workflow can no longer see it, so execution work is never nagged
+#     for being long-running — which is what execution work looks like.
+#   - It never closes anything. A real bug closed by a bot is worse than a real bug nobody
+#     answered: the reporter is told, wrongly, that a decision was made. So it comments and
+#     labels, and the decision stays with a person.
+name: stale
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v11
+        with:
+          only-issue-labels: needs-triage
+          days-before-issue-stale: 30
+          days-before-issue-close: -1
+          # PRs are out of scope here: an unanswered pull request is a review backlog, not an
+          # untriaged report, and nagging a contributor about ours is the wrong way round.
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          stale-issue-label: stale
+          stale-issue-message: >
+            This has been waiting for triage for 30 days without activity, which means we have
+            not answered it — not that it is unimportant. It stays open; nothing here closes it
+            automatically. If you can still reproduce it, or it has stopped mattering, saying so
+            helps us decide.

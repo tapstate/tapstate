@@ -1,0 +1,53 @@
+name: Propose a change you will implement
+description: You have a design and you intend to build it. Write it in any language - nothing gates you before you start.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the lane for **doing it yourself**. There is no approval step before you open your
+        editor: the gates are on the pull request — CI, review, and a live verification we can rerun.
+
+        **Write in whichever language you think in.** A bot adds an English translation below
+        what you wrote; your own text stays exactly as it is and is the version that counts.
+        Machine-translated English is just as welcome. Nothing here is checked for language.
+
+        **Write the design here, in full.** This issue is the only context a reviewer will have —
+        our own planning documents are not public, so nothing outside this issue is going to explain
+        what you meant. Link the pull request back with `Refs #<this issue>`, not `Fixes`.
+
+        Opening this issue does not mean we have agreed to merge it. If it changes product behaviour
+        in a direction we are not going, we would rather say so here than at review time — so a
+        proposal that is large or invasive is worth posting before you spend the weekend on it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What does not work today, or cannot be expressed today. Concretely.
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Design
+      description: >
+        What you intend to change and where — which modules, which surfaces, what a user
+        sees afterwards. Include the alternatives you rejected and why; that is usually the
+        part a reviewer would otherwise have to ask about.
+    validations:
+      required: true
+  - type: textarea
+    id: case
+    attributes:
+      label: How it will be proven
+      description: >
+        The end-to-end case you plan to add (see CONTRIBUTING.md, "End-to-end cases"), and the
+        live verification scenario a maintainer can run by hand to see it work.
+    validations:
+      required: true
+  - type: checkboxes
+    id: intent
+    attributes:
+      label: Intent
+      options:
+        - label: I intend to implement this myself and open the pull request.
+          required: true

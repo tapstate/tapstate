@@ -10,9 +10,34 @@ name: docs-followup
 #                     write to another repository.
 #   FEISHU_WEBHOOK  - optional. Feishu custom-bot webhook URL. If unset, the
 #                     Feishu step is skipped.
+#
+# `pull_request_target`, not `pull_request`, and the difference is the whole reason an outside
+# contribution used to leave no trace here. A workflow run triggered by `pull_request` from a fork
+# is given no repository secrets at all, so DOCS_REPO_TOKEN arrived empty and this job did nothing
+# - no issue, no notification, and no error either, because an empty token is not a failure until
+# something tries to use it. Documentation follow-up therefore existed for our own pull requests
+# and silently did not for anyone else's, which is the wrong way round: an outside contribution is
+# the one most likely to need a page written by someone other than its author.
+#
+# `pull_request_target` runs in the base repository's context, so the secrets are there. That is
+# the same property that makes it dangerous in general - and the danger is entirely about running
+# the pull request's code with them. This workflow never checks anything out: it reads the event
+# payload and calls two APIs, so nothing the contributor wrote is ever executed. The contributor's
+# title and body do reach those calls, as data - through a github-script string and through
+# `jq --arg`, never through a shell command line.
+#
+# So the rule for anyone editing this file: no `actions/checkout` step, ever. That line is drawn
+# wider than the actual hazard on purpose. The hazard is checking out the *contributor's* commit -
+# a bare `actions/checkout` under `pull_request_target` takes the base branch and would be safe -
+# but "no checkout at all" is a rule a reviewer can verify at a glance, and "a checkout, but look
+# closely at its `ref:`" is the shape that gets waved through.
+#
+# The trigger is also narrower than it looks. The job runs only on a pull request that was merged
+# and carries `docs-needed`, and both of those are maintainer actions - so nothing here fires on
+# anything a stranger can cause on their own.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [closed]
 
 permissions:

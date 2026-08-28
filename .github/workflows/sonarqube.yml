@@ -6,9 +6,12 @@
 #
 # Decoupled from the fast build gate (ci.yml) on purpose: this workflow depends on an external
 # server, a secret, and network egress, none of which should be able to block the core build.
-# A fork pull request has no access to secrets, so the guard step skips the analysis cleanly
-# (the job stays green) rather than failing. The same guard means the workflow is a no-op until
-# the SONAR_TOKEN / SONAR_HOST_URL secrets are configured, so adding this file never reddens CI.
+# A fork pull request has no access to secrets, so the guard step skips the analysis rather than
+# failing - a red there would make outside contributions unmergeable, which no configuration can
+# work around. It stays green but never silently: a skipped run says so in a notice annotation and
+# in the job summary, because a required check's green tick otherwise reads as "quality measured"
+# to every reviewer. The same guard means the workflow is a no-op until the SONAR_TOKEN /
+# SONAR_HOST_URL secrets are configured, so adding this file never reddens CI.
 #
 # Secrets (repo Settings -> Secrets and variables -> Actions):
 #   SONAR_TOKEN     a least-privilege project-analysis token (never an admin token)
@@ -56,14 +59,39 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
           set -euo pipefail
-          if [ -z "${SONAR_TOKEN:-}" ] || [ -z "${SONAR_HOST_URL:-}" ]; then
-            echo "SONAR_TOKEN/SONAR_HOST_URL unavailable (fork PR, or secrets not yet configured) - skipping analysis."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
+          if [ -n "${SONAR_TOKEN:-}" ] && [ -n "${SONAR_HOST_URL:-}" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
+          # From here the job ends green having analyzed nothing, and saying that quietly is the
+          # dangerous part: this is a required check, so the checks list shows the same tick here
+          # as on a run where the quality gate genuinely passed. Whoever reviews an outside
+          # contribution reads that tick as "quality measured" - and so do we, on our own repository,
+          # if the secrets are ever rotated away.
+          #
+          # Failing instead is not the repair. A fork's workflow run cannot be given repository
+          # secrets by any configuration, so a red here would mean no outside contribution can ever
+          # merge - the failure this workflow's fork guard exists to avoid. The fix is not to change
+          # the colour but to stop the colour from being the only thing said.
+          if [ "${IS_FORK_PR:-false}" = "true" ]; then
+            why="this pull request comes from a fork, and a fork's workflow run is never given repository secrets"
+          else
+            why="SONAR_TOKEN / SONAR_HOST_URL are not configured on this repository"
+          fi
+          echo "::notice title=SonarQube not evaluated::No analysis ran: ${why}. This check is green because it was skipped, not because the quality gate passed."
+          {
+            printf '## SonarQube: not evaluated\n\n'
+            printf 'No analysis ran on this commit, because %s.\n\n' "$why"
+            printf '**This check is green because it was skipped, not because the quality gate passed.**\n\n'
+            printf 'Neither code quality nor the new-code coverage condition was measured here. The\n'
+            printf 'diff-coverage summary on the CI workflow is what a run without secrets can still\n'
+            printf 'produce; the quality gate itself is measured once the change reaches `main`.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout
         if: steps.guard.outputs.run == 'true'

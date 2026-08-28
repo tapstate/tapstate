@@ -1,0 +1,34 @@
+# The two pull-request sections that cannot be recovered from the diff: which issue this belongs to,
+# and how to watch it work by hand.
+#
+# Weak on purpose, and not a required check. Whether an answer is any good is the reviewer's call and
+# no grep takes that over; what this catches is the section left exactly as the template shipped it,
+# which is how both get skipped — not by anyone deciding to, by scrolling past. The `edited` trigger
+# is part of the gate: fixing the body has to be able to clear the red, or the only way out would be
+# an empty push.
+name: pr-template
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The gate still decides the way it is supposed to
+        run: |
+          shellcheck .github/scripts/pr-template.sh .github/scripts/pr-template-smoke.sh
+          bash .github/scripts/pr-template-smoke.sh
+
+      - name: The linked issue and the live verification scenario are both answered
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash .github/scripts/pr-template.sh

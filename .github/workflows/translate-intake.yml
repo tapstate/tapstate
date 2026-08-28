@@ -1,0 +1,59 @@
+name: translate-intake
+
+# Leave one English translation under an issue that was not filed in English.
+#
+# The project works in English and a gate enforces that over repository content. Nothing enforces
+# it over the person filing a report, and nothing should: somebody who has just hit a bug writes in
+# the language they think in, and the alternative to a rough translation is not a better report, it
+# is no report at all. So the report stays exactly as its author wrote it, and an English rendering
+# is added beside it for whoever reads the thread next.
+#
+# An `issues` event always runs in this repository's own context, so the key below is there even
+# when the report was filed by somebody with no association to the project at all. That is what
+# makes this work for the people it is for; a `pull_request` run from a fork is given no secrets,
+# which is the trap two other workflows here had to be pulled out of.
+#
+# `issues`, not `issue_comment`, so the reply this workflow leaves cannot trigger it again. The
+# translation is written into a single comment claimed by an HTML marker, so `edited` updates that
+# one comment instead of adding another.
+#
+# It is a courtesy and never a gate. `.github/scripts/translate-intake.sh` exits 0 on every failure
+# path - no key, no answer, an oversized body, a refused comment - and says on the run summary which
+# one it was. That last part is the point: a quiet failure and a workflow nobody ever configured
+# leave identical evidence behind, so the step runs unconditionally and always writes a line. There
+# is deliberately no `if:` on the secret here; a step that is skipped writes nothing, and "no
+# summary" is the state this is trying to be distinguishable from.
+#
+# The engine is named in exactly three places, all of them below: the key, the base URL and the
+# model. The script itself knows no vendor, so moving to any other OpenAI-compatible provider is a
+# change to these three lines.
+#
+# ON THE CONTRIBUTOR'S TEXT. The issue body is written by a stranger and reaches the script through
+# `env:` only. It must never be interpolated into a `run:` block as `${{ github.event.issue.body }}`
+# - a workflow expression is substituted into the script text before bash sees it, so a body
+# containing `$(...)` would execute on the runner. The `actions/checkout` here is safe for the
+# ordinary reason: an `issues` event has no contributor commit to check out, so this takes the
+# default branch.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: read # actions/checkout
+  issues: write # the one comment this leaves
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Translate the report unless it is already English
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRANSLATE_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          TRANSLATE_BASE_URL: https://api.deepseek.com
+          TRANSLATE_MODEL: deepseek-chat
+        run: bash .github/scripts/translate-intake.sh >> "$GITHUB_STEP_SUMMARY"

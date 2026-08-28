@@ -31,6 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the diff-coverage step below needs a merge base with the target branch
       - uses: actions/setup-java@v4
         with:
           # Root pom pins the toolchain by version only (21, no vendor);
@@ -40,6 +42,35 @@ jobs:
           cache: maven
       - name: Build and test
         run: mvn -B verify
+
+      # Coverage of the lines this pull request adds, written to the run summary.
+      #
+      # This is the only coverage figure an outside contribution can get. The new-code coverage
+      # condition lives on the SonarQube server, a fork's workflow run is never given the token
+      # that reaches it, and that workflow consequently reports green having measured nothing. A
+      # contributor asking the one question worth asking - is what I just wrote tested? - had
+      # nowhere to read the answer. No secret, no server and no network call are involved here:
+      # the reports were already written by the verify above.
+      #
+      # The merge pass first, for the reason the sonarqube workflow spells out: each module's
+      # report otherwise describes that module's classes against that module's own runs, so a
+      # type declared in one ring and exercised from another reads as untested. Reporting every
+      # module against the merged execution data is what makes the figure mean anything.
+      #
+      # continue-on-error, because this is a report and not a gate. A coverage number that can
+      # redden the build gate is a threshold applied to outside contributions that our own pull
+      # requests are measured against somewhere else entirely.
+      - name: Diff coverage
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          git rev-parse --verify --quiet "$base" >/dev/null 2>&1 \
+            || git fetch --quiet --no-tags origin "${{ github.base_ref }}" || true
+          mvn -B -N jacoco:merge@jacoco-merge-reactor
+          mvn -B jacoco:report@jacoco-report-reactor
+          DIFF_RANGE="$base...HEAD" bash .github/scripts/diff-coverage.sh >> "$GITHUB_STEP_SUMMARY"
 
       # What the end-to-end run saw at the moment it failed, written before its containers went away.
       # Without it a red specification leaves one assertion message and everything that would explain it
@@ -95,13 +126,23 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh
       - name: refresh driver cases
         run: bash scripts/refresh-catalog-smoke.sh
       - name: connector build cases
         run: bash scripts/build-real-connectors-smoke.sh
       - name: catalog age cases
         run: bash .github/scripts/catalog-age-days-smoke.sh
+      # Not a catalog script, but this is the job where a shell gate's cases run, and the coverage
+      # summary is shell whose failure mode is the one this job exists for: a number that is quietly
+      # wrong reads exactly like a number that is right.
+      - name: diff coverage cases
+        run: bash .github/scripts/diff-coverage-smoke.sh
+      # Also not a catalog script. Its own workflow fires on `issues`, so these cases would never
+      # run on a pull request if they lived there - and this gate's every failure path is a silent
+      # skip, which is precisely the shape that rots unnoticed.
+      - name: intake translation cases
+        run: bash .github/scripts/translate-intake-smoke.sh
 
   image-smoke:
     # Build the server image for the runner's native architecture and smoke it as a black box: it boots

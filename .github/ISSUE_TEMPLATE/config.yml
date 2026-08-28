@@ -1,0 +1,15 @@
+# Two lanes enter this repository, and a blank issue belongs to neither.
+#
+#   - report something          -> intake.yml, labelled `needs-triage`
+#   - propose and implement it  -> proposal.yml, no triage label: you are already the assignee
+#
+# Blank issues are off because the label is what routes an issue. The project board adds
+# everything that is *not* `needs-triage`, so an unlabelled blank issue would land on the
+# execution board without anyone having decided it is execution work — the exact boundary
+# the two lanes exist to draw.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/tapstate/tapstate/security/advisories/new
+    about: Privately, never as a public issue. See SECURITY.md.
