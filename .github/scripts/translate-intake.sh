@@ -50,6 +50,25 @@ body="${ISSUE_BODY:-}"
 [ "${#body}" -le "$MAX_CHARS" ] || say \
   "The issue body is longer than $MAX_CHARS characters, so it was left alone. Whole log files are
 better as an attachment than as a report body."
+
+# Is this already English? Decided HERE, locally, and the engine is not asked - not once, not even
+# to confirm. Twice it was trusted with this question and twice it was wrong: first it ignored the
+# ALREADY_ENGLISH instruction and answered with the body verbatim, then it ignored it again and
+# answered with a PARAPHRASE of the body - measured on a real issue, and no comparison against the
+# input catches a paraphrase. Whether text is English is not a question to put to the thing being
+# asked to translate it, and the second failure is what makes that a rule rather than a preference.
+#
+# The test is a byte test: a report written in another language carries characters outside ASCII.
+#
+# KNOWN LIMIT, written down rather than discovered later: a language that is written in plain ASCII
+# - Indonesian, Dutch, Portuguese with the accents dropped - is skipped here as though it were
+# English. That is the price of a check that cannot be talked out of its answer. It fails towards
+# silence, which is the safer of the two directions: a missing translation is visible to the person
+# who needed it, while a translation of English into English is noise nobody asks about.
+if ! printf '%s' "$body" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
+  say "Not translated: the report is plain ASCII, which this reads as already in English.
+Nothing was sent to the translation engine."
+fi
 [ -n "${TRANSLATE_API_KEY:-}" ] || say \
   "Skipped: no engine is configured. This run reached the step and found no API key, so the key is
 not set on this repository. Note that an issue event always runs in this repository's own context,
