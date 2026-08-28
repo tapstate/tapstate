@@ -335,3 +335,5 @@ Use the **bug or idea** template — the first lane in
 [External contributions](#external-contributions). Include the version and, where relevant, a
 minimal reproduction (for the CLI, the `.tap.yml` input and the exact command). For a security
 vulnerability, do not open an issue at all: see [SECURITY.md](SECURITY.md).
+
+<!-- rehearsal: the fork sonar notice; not intended to merge -->
