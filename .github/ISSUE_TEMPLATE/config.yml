@@ -1,15 +1,20 @@
 # Two lanes enter this repository, and a blank issue belongs to neither.
 #
 #   - report something          -> intake.yml, labelled `needs-triage`
-#   - propose and implement it  -> proposal.yml, no triage label: you are already the assignee
+#   - propose and implement it  -> proposal.yml, labelled `needs-triage` too
 #
-# Blank issues are off because the label is what routes an issue. The project board adds
-# everything that is *not* `needs-triage`, so an unlabelled blank issue would land on the
-# execution board without anyone having decided it is execution work — the exact boundary
-# the two lanes exist to draw.
+# Both lanes carry the label because both are somebody outside asking, and the triage list keys on
+# it: a proposal that arrived without one was filed under "triaged, nobody took it" and nobody owed
+# it a reply - measured on a real proposal fifteen minutes old.
+#
+# Blank issues are off because the label is what routes an issue. The project board adds everything
+# that is *not* `needs-triage`, so an unlabelled blank issue would land on the execution board
+# without anyone having decided it is execution work - the exact boundary the two lanes exist to
+# draw.
+#
+# There are no contact_links here, and that is deliberate. This repository has private vulnerability
+# reporting enabled, so GitHub adds its own "Report a security vulnerability" entry to this chooser.
+# A hand-written link with the same title sat beside it, pointing at the same place, and the chooser
+# showed the identical heading twice - which is what a broken page looks like to somebody who came
+# here to report a vulnerability. Ours is the one that goes.
 blank_issues_enabled: false
-
-contact_links:
-  - name: Report a security vulnerability
-    url: https://github.com/tapstate/tapstate/security/advisories/new
-    about: Privately, never as a public issue. See SECURITY.md.
