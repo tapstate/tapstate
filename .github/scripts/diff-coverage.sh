@@ -24,12 +24,14 @@
 #     git print nothing and fail, and nothing is also what a change with no Java looks like. The
 #     two get different words, because the first is a broken invocation and the second is fine.
 #
-# Reads DIFF_RANGE (default origin/main...HEAD) and, optionally, JACOCO_REPORTS - a space-separated
+# Reads DIFF_RANGE (default origin/main...HEAD), NEW_CODE_COVERAGE_MIN (default 80, the figure the
+# quality gate expects of new code) and, optionally, JACOCO_REPORTS - a space-separated
 # list of report paths, otherwise they are discovered under */target/site/jacoco*/. Writes markdown
 # on stdout; the caller appends it to $GITHUB_STEP_SUMMARY.
 set -uo pipefail
 
 range="${DIFF_RANGE:-origin/main...HEAD}"
+min="${NEW_CODE_COVERAGE_MIN:-80}"
 
 not_measured() { # not_measured <reason>
   printf '### Diff coverage: not measured\n\n%s\n' "$1"
@@ -151,6 +153,24 @@ fi
 
 pct=$(( hit * 100 / total ))
 printf '### Diff coverage: **%d of %d new executable lines covered (%d%%)**\n\n' "$hit" "$total" "$pct"
+
+# What is expected of the number, and how to get it again without pushing. Both are things a run
+# with no secrets can still say, and a contributor who is shown only "50%" cannot tell whether that
+# is a problem, nor try again without opening another round trip through us.
+#
+# Read, not written in: with the default in place a hardcoded figure and a figure that was actually
+# read produce identical output, so the threshold comes from the environment and a case asks for a
+# value that is not the default.
+printf 'The new-code coverage condition on the SonarQube quality gate expects **%s%%**. ' "$min"
+printf 'It measures its own new-code period while this figure measures the diff of this pull '
+printf 'request, so the two are not the same number: read this one as an indication of where you '
+printf 'stand, never as the verdict of that gate.\n\n'
+printf 'To measure it yourself before pushing:\n\n'
+printf '```sh\n'
+printf 'mvn -B verify\n'
+printf 'mvn -B -N jacoco:merge@jacoco-merge-reactor && mvn -B jacoco:report@jacoco-report-reactor\n'
+printf 'DIFF_RANGE="origin/main...HEAD" bash .github/scripts/diff-coverage.sh\n'
+printf '```\n\n'
 
 if [ "$hit" -lt "$total" ]; then
   printf 'New lines with no test exercising them:\n\n| File | Uncovered new lines |\n|---|---|\n'
