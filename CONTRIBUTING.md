@@ -71,7 +71,9 @@ if it disagrees with this paragraph, believe it.
 assign it to you.** You cannot do that yourself, and the reason is worth stating rather than
 leaving you hunting for a menu that is not there: GitHub will only assign an issue to a member of
 the organisation or a collaborator on the repository, so the click exists for us and not for you.
-That makes the waiting entirely our doing, and we hold ourselves to **3 days** on it.
+That makes the waiting entirely our doing, and we hold ourselves to **3 days** on it. If what you
+want to work on is not something you reported, see *Taking something we have already planned*
+below.
 
 ### The Triage role
 
@@ -84,6 +86,23 @@ This is not a badge. Someone who has already fixed two things in this codebase c
 the third bug report faster than we can, and any report that waits on one of two people is a
 report that waits. Declining changes nothing else about how your work is reviewed, and nothing
 about it happens without your say-so.
+
+### Taking something we have already planned
+
+Some issues here describe work we have designed but not started, and **you do not have to have
+reported something to take it**. The ones we would most like someone to pick up carry
+**`help wanted`**.
+
+Say so on the issue and it is yours. Two mechanical details, stated so they do not read as a snub:
+
+- **The assignee will be one of us, not you.** GitHub assigns issues only to organisation members
+  and repository collaborators, and the internal bookkeeping that assignment mirrors lives in a
+  repository you cannot reach. So one of us holds the assignment as the person shepherding the
+  line, and names you in a comment as the person doing the work. Once you hold the Triage role it
+  can move to you.
+- **The issue text is the whole brief.** The design behind it is in a private repository and is not
+  going to be published. If the issue does not tell you enough to build the thing, that is a defect
+  in the issue rather than something you are expected to infer - asking on it is the right response.
 
 ### Does it need an issue first?
 
@@ -104,6 +123,22 @@ Write **`Refs #123`**, not `Fixes #123`.
 more than one pull request, sometimes by more than one person. The first merge would then close work
 still in flight and take everyone else's remaining scope with it. Closing is a decision someone
 makes once the work is actually done.
+
+### Your first pull request waits on a click
+
+**Until a maintainer approves it, a pull request from a fork runs no checks at all.** GitHub holds a
+first-time contributor's workflows until someone here presses "Approve and run", and until that
+happens the pull request shows no check runs - not pending ones, none. A required check that never
+ran and a required check that is broken look identical from where you are standing, so if you see
+nothing at all, it is almost certainly the former.
+
+We hold ourselves to the same clock as triage on it: **3 days**, and usually far less. If it has
+been longer, say so on the pull request. The wait is entirely ours.
+
+**This is not the approval step the proposal lane deliberately does not have.** Nothing gates you
+before you start and nobody rules on whether your change is wanted while you wait. What is being
+approved is only that your branch's workflows may run on our machines - a decision about running
+code, not about your work.
 
 ### Sign your commits (DCO)
 

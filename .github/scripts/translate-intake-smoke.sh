@@ -218,6 +218,26 @@ check "the answer reaches only the comments endpoint" "$(grep -v '/comments' "$s
 # A workflow expression is substituted into the script text before bash ever sees it, so moving the
 # body from `env:` to an inline `${{ }}` in a `run:` line turns a stranger's issue into code on the
 # runner - and it would look like a tidy-up in review. The trigger is the other one: `issue_comment`
+# --- the engine answers with the body itself ------------------------------------------------------
+# The sentinel is an instruction, and an instruction is not a check. Measured 2026-08-28 on an
+# English execution issue: the engine ignored ALREADY_ENGLISH and answered with the body, so the
+# issue got a "translation" that was its own text, verbatim. Whatever it was meant to be, an answer
+# that is the input is not a translation.
+english="This issue is already written in English, so there is nothing here to translate."
+stage "$english"
+out="$(run "$english")"; code=$?
+check "the answer is the body: exits 0" "$([ $code = 0 ] && echo 0 || echo 1)"
+check "the answer is the body: says it is already English" "$(has "$out" "already in English" && echo 0 || echo 1)"
+check "the answer is the body: posts nothing" "$(in_file "$scratch/gh-log" "--method POST" && echo 1 || echo 0)"
+check "the answer is the body: edits nothing either" "$(in_file "$scratch/gh-log" "--method PATCH" && echo 1 || echo 0)"
+
+# The control that keeps the case above from being satisfied by a script that refuses everything:
+# a real translation still goes out.
+stage "The connector fails at startup, here is the trace."
+out="$(run "Le connecteur echoue au demarrage, voici la trace.")"
+check "a real translation is still posted" "$(in_file "$scratch/gh-log" "--method POST" && echo 0 || echo 1)"
+check "a real translation is not called already English" "$(has "$out" "already in English" && echo 1 || echo 0)"
+
 # would make the reply this leaves trigger it again, forever, and the first sign would be the bill.
 wf="$here/../workflows/translate-intake.yml"
 # Read the directives, not the prose: the header comment names `issue_comment` in order to say the

@@ -106,6 +106,18 @@ changed."
 [ "$(printf '%s' "$text" | tr -d '[:space:]')" != "$SENTINEL" ] || say \
   "Not translated: the report is already in English."
 
+# The sentinel above is an instruction, and an instruction is not a check. Measured 2026-08-28 on an
+# English execution issue: the engine ignored it and answered with the body itself, so the issue got
+# a "translation" that was its own text, verbatim - and the note under it said the report had been
+# written in some other language, which it had not. Whatever the answer was meant to be, one that is
+# the input is not a translation.
+#
+# Trimmed equality, like the sentinel, and not `contains` for the same reason. This compares the
+# engine's whole answer against the whole body, so there is nothing a report can carry that makes
+# the two match without the report already being the English it would have been translated into.
+[ "$(printf '%s' "$text" | tr -d '[:space:]')" != "$(printf '%s' "$body" | tr -d '[:space:]')" ] || say \
+  "Not translated: the report is already in English."
+
 comment="$(mktemp)"
 trap 'rm -f "$comment"' EXIT
 {

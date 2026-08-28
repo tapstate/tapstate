@@ -1,5 +1,6 @@
 name: Propose a change you will implement
 description: You have a design and you intend to build it. Write it in any language - nothing gates you before you start.
+labels: ["needs-triage"]
 body:
   - type: markdown
     attributes:

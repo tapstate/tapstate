@@ -183,6 +183,24 @@ expect "the measured file still reports its number" "1 of 2"
 expect "the unmeasured file is named beside it" "Tool.java"
 refute "the unmeasured file is not counted as uncovered" "1 of 3"
 
+# --- the report says what is expected of it, and how to get it yourself ---------------------------
+# A contributor reading "1 of 2 (50%)" learns nothing until something says whether 50 is enough, and
+# has no way to try again without pushing until something names the commands. Neither is a secret,
+# so both belong on the one report a fork's run can still produce.
+fresh_repo
+add_widget
+jacoco_report core/target/site/jacoco/jacoco.xml io/tapstate/demo Widget.java 5:3 7:0
+expect "it reports the number it measured"        "1 of 2"
+expect "and the threshold expected of new code"   "80%"
+expect "and how to reproduce it locally"          "diff-coverage.sh"
+# Not the gate's verdict: this figure is the pull request's diff, SonarQube's is its new-code
+# period, and a report that conflates them teaches people to argue with the wrong number.
+refute "it does not claim to be the quality gate" "quality gate passed"
+
+# The threshold is read, not written into the script. With the default in place a hardcoded 80 and a
+# value that was actually read are the same output, so the case has to ask for a different one.
+NEW_CODE_COVERAGE_MIN=65 expect "the expected figure is configurable" "65%"
+
 # --- an unresolvable range must not read as 'nothing new' ----------------------------------------
 fresh_repo
 add_widget

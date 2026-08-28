@@ -1,0 +1,56 @@
+name: fork-sonar-notice
+# A pull request from a fork arrives with no SonarQube result, and the run that opened it cannot say
+# so: a workflow triggered by `pull_request` from a fork is given a READ-ONLY GITHUB_TOKEN, so it can
+# neither label nor comment. That is the whole reason this file uses `pull_request_target`, which runs
+# in this repository's context with a writable token.
+#
+# THE ONE RULE THAT KEEPS pull_request_target SAFE IS THAT THIS FILE NEVER CHECKS OUT THE PULL
+# REQUEST. There is no actions/checkout below, and a case asserts there is none. `pull_request_target`
+# hands a writable token to a workflow whose code comes from the default branch; the moment such a
+# workflow also checks out and runs the contributor's code, that token is effectively theirs. This job
+# reads the event payload and writes a label and one comment. Nothing else. If this ever needs to
+# build anything, it belongs in a different file with a different trigger.
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  notice:
+    # Only a fork. A branch in this repository gets a real analysis from sonarqube.yml, so saying
+    # this there would be false.
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label it, and say what happens next
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr edit "$PR" -R "$REPO" --add-label needs-sonar-review
+
+          # The marker is here for the same reason it is on the translation comment: whoever else
+          # writes on this pull request, this one is findable by what it carries rather than by
+          # where it sits.
+          body="$(mktemp)"
+          cat > "$body" <<'EOF'
+          <!-- tapstate:fork-sonar:v1 -->
+          ### SonarQube has not looked at this pull request
+
+          A workflow run started by a pull request from a fork is never given this repository's
+          secrets, so the analysis could not run. The `sonarqube` check beside this pull request is
+          green because it was **skipped**, not because a quality gate passed.
+
+          That is ours to fix rather than yours: a maintainer runs the analysis and posts what it
+          found, here, in a comment.
+
+          In the meantime the **Diff coverage** section on the CI run's summary page does work
+          without secrets. It reports how much of the code you added is covered, what is expected of
+          it, and the commands to reproduce the same number locally.
+          EOF
+          sed -i 's/^          //' "$body"
+          gh pr comment "$PR" -R "$REPO" --body-file "$body"
