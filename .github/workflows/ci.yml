@@ -126,7 +126,7 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh
       - name: refresh driver cases
         run: bash scripts/refresh-catalog-smoke.sh
       - name: connector build cases
@@ -143,6 +143,11 @@ jobs:
       # skip, which is precisely the shape that rots unnoticed.
       - name: intake translation cases
         run: bash .github/scripts/translate-intake-smoke.sh
+
+      # File-level, and that is the point: the property being asserted about the notice workflow is
+      # the ABSENCE of a checkout step, which no runtime test can establish.
+      - name: fork sonar workflow cases
+        run: bash .github/scripts/fork-sonar-smoke.sh
 
   image-smoke:
     # Build the server image for the runner's native architecture and smoke it as a black box: it boots
