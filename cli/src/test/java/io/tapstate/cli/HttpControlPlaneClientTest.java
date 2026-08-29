@@ -1057,6 +1057,19 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void getReturnsUnreachableForAnUnreadableArtifactPayload() throws Exception {
+        HttpServer server = apiServer("/api/artifacts/", 200,
+                "{\"id\":\"p1\",\"kind\":\"pipeline\",\"readable\":false}",
+                new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().get(baseOf(server), "tok", "p1"))
+                    .isInstanceOf(GetOutcome.Unreachable.class);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void listReturnsTheArtifactsAndSendsTheKindFilterAndCredential() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/artifacts", 200,
@@ -1069,6 +1082,23 @@ class HttpControlPlaneClientTest {
             assertThat(seen.get().path()).isEqualTo("/api/artifacts");
             assertThat(seen.get().query()).isEqualTo("kind=source");
             assertThat(seen.get().authorization()).isEqualTo("Bearer tok-1");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listDecodesAnUnreadableArtifactWithoutDroppingItsRawCanonicalForm() throws Exception {
+        HttpServer server = apiServer("/api/artifacts", 200,
+                "{\"artifacts\":[{\"id\":\"p1\","
+                        + "\"kind\":\"pipeline\",\"canonicalForm\":\"not: [valid\","
+                        + "\"readable\":false}]}", new AtomicReference<>());
+        try {
+            ListOutcome outcome = new HttpControlPlaneClient().list(baseOf(server), "tok", null);
+
+            assertThat(outcome).isInstanceOf(ListOutcome.Listed.class);
+            assertThat(((ListOutcome.Listed) outcome).artifacts())
+                    .containsExactly(new RemoteArtifact("p1", "pipeline", "not: [valid", false));
         } finally {
             server.stop(0);
         }

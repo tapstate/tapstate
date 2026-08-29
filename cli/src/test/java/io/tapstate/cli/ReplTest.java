@@ -1793,6 +1793,22 @@ class ReplTest {
     }
 
     @Test
+    void lsWhileConnectedShowsUnreadableServerArtifactsWithoutFailingTheListing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.listOutcome = new ListOutcome.Listed(List.of(
+                new RemoteArtifact("src_kfk", "source", "kind: source\n"),
+                new RemoteArtifact("p1", "pipeline", "not: [valid", false)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("ls")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("src_kfk").contains("p1").contains("unreadable");
+        assertThat(h.repl().lastExitCode()).isZero();
+    }
+
+    @Test
     void lsWithAKindPassesTheKindFilterToTheServer() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of());

@@ -1634,7 +1634,8 @@ final class Repl {
                     out.println("no resources");
                 } else {
                     for (RemoteArtifact artifact : listed.artifacts()) {
-                        out.println(artifact.kind() + "  " + artifact.id());
+                        out.println(artifact.kind() + "  " + artifact.id()
+                                + (artifact.readable() ? "" : "  (unreadable)"));
                     }
                 }
                 out.flush();

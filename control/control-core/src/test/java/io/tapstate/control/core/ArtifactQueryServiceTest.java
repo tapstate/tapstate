@@ -6,6 +6,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -83,12 +84,33 @@ class ArtifactQueryServiceTest {
     void listReturnsEveryStoredArtifactAsItsCanonicalForm() {
         apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
 
-        assertThat(query.list()).extracting(StoredArtifact::id)
+        assertThat(query.list()).extracting(ArtifactListEntry::id)
                 .containsExactlyInAnyOrder("src_ora", "tgt_my", "ora2my_ods");
         // Each listed artifact carries the same canonical form its own get returns.
         assertThat(query.list()).allSatisfy(a ->
                 assertThat(a.canonicalForm())
                         .isEqualTo(query.get(a.id()).orElseThrow().canonicalForm()));
+    }
+
+    @Test
+    void listKeepsAnUnreadableStoredRowVisibleWhileGetRemainsStrict() {
+        apply.apply("alice", List.of(draft(TGT_MY)));
+        store.putUnreadable("corrupt", "pipeline", "not: [valid");
+
+        List<ArtifactListEntry> listed = query.list();
+
+        assertThat(listed).extracting(ArtifactListEntry::id)
+                .containsExactlyInAnyOrder("tgt_my", "corrupt");
+        assertThat(listed).filteredOn(a -> a.id().equals("tgt_my")).singleElement()
+                .satisfies(a -> assertThat(a.readable()).isTrue());
+        assertThat(listed).filteredOn(a -> a.id().equals("corrupt")).singleElement()
+                .satisfies(a -> {
+                    assertThat(a.kind()).isEqualTo("pipeline");
+                    assertThat(a.canonicalForm()).isEqualTo("not: [valid");
+                    assertThat(a.readable()).isFalse();
+                });
+        assertThatThrownBy(() -> query.get("corrupt"))
+                .isInstanceOf(RuntimeException.class);
     }
 
     @Test
@@ -152,9 +174,9 @@ class ArtifactQueryServiceTest {
         // stays a pure projection: list("source") returns the two sources, list("pipeline") the pipeline.
         apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
 
-        assertThat(query.list("source")).extracting(StoredArtifact::id)
+        assertThat(query.list("source")).extracting(ArtifactListEntry::id)
                 .containsExactlyInAnyOrder("src_ora", "tgt_my");
-        assertThat(query.list("pipeline")).extracting(StoredArtifact::id)
+        assertThat(query.list("pipeline")).extracting(ArtifactListEntry::id)
                 .containsExactly("ora2my_ods");
     }
 
@@ -165,9 +187,9 @@ class ArtifactQueryServiceTest {
         // to list-all.
         apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
 
-        assertThat(query.list((String) null)).extracting(StoredArtifact::id)
+        assertThat(query.list((String) null)).extracting(ArtifactListEntry::id)
                 .containsExactlyInAnyOrder("src_ora", "tgt_my", "ora2my_ods");
-        assertThat(query.list("   ")).extracting(StoredArtifact::id)
+        assertThat(query.list("   ")).extracting(ArtifactListEntry::id)
                 .containsExactlyInAnyOrder("src_ora", "tgt_my", "ora2my_ods");
     }
 
@@ -259,6 +281,12 @@ class ArtifactQueryServiceTest {
         private final CanonicalWriter writer = new CanonicalWriter();
         private final DslParser parser = new DslParser();
         private final Map<String, String> byId = new LinkedHashMap<>();
+        private final Map<String, String> kindById = new LinkedHashMap<>();
+
+        void putUnreadable(String id, String kind, String canonical) {
+            byId.put(id, canonical);
+            kindById.put(id, kind);
+        }
 
         @Override
         public void saveAll(List<Resource> artifacts) {
@@ -268,6 +296,9 @@ class ArtifactQueryServiceTest {
                 staged.put(artifact.id(), writer.write(artifact));
             }
             byId.putAll(staged);
+            for (Resource artifact : artifacts) {
+                kindById.put(artifact.id(), artifact.kind());
+            }
         }
 
         @Override
@@ -283,6 +314,21 @@ class ArtifactQueryServiceTest {
                 resources.add(parser.parse(canonical));
             }
             return resources;
+        }
+
+        @Override
+        public List<StoredArtifactRecord> listStored() {
+            List<StoredArtifactRecord> rows = new ArrayList<>();
+            for (Map.Entry<String, String> entry : byId.entrySet()) {
+                try {
+                    rows.add(StoredArtifactRecord.of(parser.parse(entry.getValue())));
+                } catch (RuntimeException unreadable) {
+                    rows.add(new StoredArtifactRecord(
+                            entry.getKey(), kindById.getOrDefault(entry.getKey(), "unknown"),
+                            entry.getValue(), null, false));
+                }
+            }
+            return rows;
         }
     }
 }

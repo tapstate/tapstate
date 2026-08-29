@@ -46,12 +46,12 @@ class ContextConfigStoreTest {
         String yaml = Files.readString(home.resolve(".tapstate/config.yaml"));
         assertThat(yaml).contains(
                 "version: 1",
-                "lastContext: dev",
+                "lastContext: \"dev\"",
                 "id: 018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2",
                 "- https://tapstate.example.com",
                 "verify: true",
                 "authRef: 5c199643-04da-4f72-9831-3a77e3590eed",
-                "\"" + workspace + "\": dev");
+                "\"" + workspace + "\": \"dev\"");
         if (Files.getFileStore(home).supportsFileAttributeView("posix")) {
             assertThat(Files.getPosixFilePermissions(home.resolve(".tapstate")))
                     .isEqualTo(Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
@@ -65,6 +65,28 @@ class ContextConfigStoreTest {
             assertThat(files.map(path -> path.getFileName().toString()).toList())
                     .containsExactlyInAnyOrder(".config.lock", "config.yaml");
         }
+    }
+
+    @Test
+    void quotesNumericContextNamesSoYamlKeepsThemAsStrings(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders")).toRealPath();
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+        ContextDefinition numeric = new ContextDefinition(
+                CONTEXT_ID,
+                List.of(URI.create("http://127.0.0.1:8081")),
+                new ContextTls(true),
+                AUTH_REF);
+        ContextConfig expected = new ContextConfig(
+                ContextConfig.CURRENT_VERSION,
+                "1",
+                Map.of("1", numeric),
+                Map.of(workspace.toString(), "1"));
+
+        store.save(expected);
+
+        assertThat(store.load()).isEqualTo(expected);
+        String yaml = Files.readString(home.resolve(".tapstate/config.yaml"));
+        assertThat(yaml).contains("  \"1\":", "\"" + workspace + "\": \"1\"");
     }
 
     @Test

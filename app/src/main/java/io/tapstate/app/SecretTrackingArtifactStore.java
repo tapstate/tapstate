@@ -3,11 +3,13 @@ package io.tapstate.app;
 import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -33,7 +35,20 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.redactor = Objects.requireNonNull(redactor, "redactor");
-        delegate.list().forEach(this::track);
+        // Startup secret tracking must not make the whole service fail because one stored body is
+        // unreadable. The browse projection keeps the good rows available and leaves the bad row for
+        // repair/diagnostics; its secrets cannot be inferred safely, so it is skipped here.
+        DslParser parser = new DslParser();
+        delegate.listStored().stream()
+                .filter(StoredArtifactRecord::readable)
+                .filter(row -> row.canonicalForm() != null)
+                .forEach(row -> {
+                    try {
+                        track(parser.parse(row.canonicalForm()));
+                    } catch (RuntimeException ignored) {
+                        // The store already classified this row; tracking is best effort on startup.
+                    }
+                });
     }
 
     @Override
@@ -90,6 +105,11 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     @Override
     public List<Resource> list() {
         return delegate.list();
+    }
+
+    @Override
+    public List<StoredArtifactRecord> listStored() {
+        return delegate.listStored();
     }
 
     private void track(Resource resource) {

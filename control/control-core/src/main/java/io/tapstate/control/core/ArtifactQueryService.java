@@ -4,6 +4,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 
 import java.util.List;
 import java.util.Objects;
@@ -35,9 +36,9 @@ public final class ArtifactQueryService {
         return store.get(id).map(this::view);
     }
 
-    /** Lists every stored artifact as its canonical form. */
-    public List<StoredArtifact> list() {
-        return store.list().stream().map(this::view).toList();
+    /** Lists every stored artifact, retaining rows whose stored body is unreadable. */
+    public List<ArtifactListEntry> list() {
+        return store.listStored().stream().map(this::view).toList();
     }
 
     /**
@@ -45,11 +46,14 @@ public final class ArtifactQueryService {
      * "no filter" and returns every artifact, the same as {@link #list()}. Read-by-kind lives here in
      * the read service so a face stays a pure projection of the verb rather than filtering results itself.
      */
-    public List<StoredArtifact> list(String kind) {
+    public List<ArtifactListEntry> list(String kind) {
         if (kind == null || kind.isBlank()) {
             return list();
         }
-        return store.list().stream().filter(r -> r.kind().equals(kind)).map(this::view).toList();
+        return store.listStored().stream()
+                .filter(r -> r.kind().equals(kind))
+                .map(this::view)
+                .toList();
     }
 
     private StoredArtifact view(Resource resource) {
@@ -58,5 +62,10 @@ public final class ArtifactQueryService {
         String canonicalForm = writer.write(resource);
         return new StoredArtifact(
                 resource.id(), resource.kind(), canonicalForm, CanonicalHash.of(canonicalForm));
+    }
+
+    private ArtifactListEntry view(StoredArtifactRecord row) {
+        return new ArtifactListEntry(
+                row.id(), row.kind(), row.canonicalForm(), row.contentHash(), row.readable());
     }
 }

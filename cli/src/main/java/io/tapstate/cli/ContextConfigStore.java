@@ -405,13 +405,13 @@ final class ContextConfigStore {
 
     private static String encode(ContextConfig config) {
         StringBuilder yaml = new StringBuilder("version: 1\n");
-        yaml.append("lastContext: ").append(config.lastContext() == null ? "null" : config.lastContext()).append('\n');
+        yaml.append("lastContext: ").append(config.lastContext() == null ? "null" : quote(config.lastContext())).append('\n');
         if (config.contexts().isEmpty()) {
             yaml.append("contexts: {}\n");
         } else {
             yaml.append("contexts:\n");
             new TreeMap<>(config.contexts()).forEach((name, context) -> {
-                yaml.append("  ").append(name).append(":\n");
+                yaml.append("  ").append(quote(name)).append(":\n");
                 yaml.append("    id: ").append(context.id()).append('\n');
                 yaml.append("    seeds:\n");
                 context.seeds().forEach(seed -> yaml.append("      - ").append(seed).append('\n'));
@@ -425,9 +425,13 @@ final class ContextConfigStore {
         } else {
             yaml.append("workspaceBindings:\n");
             new TreeMap<>(config.workspaceBindings()).forEach((path, context) -> yaml
-                    .append("  \"").append(escape(path)).append("\": ").append(context).append('\n'));
+                    .append("  \"").append(escape(path)).append("\": ").append(quote(context)).append('\n'));
         }
         return yaml.toString();
+    }
+
+    private static String quote(String value) {
+        return "\"" + escape(value) + "\"";
     }
 
     private static String escape(String value) {

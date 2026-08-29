@@ -1393,10 +1393,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return named;
     }
 
-    /** One stored artifact decoded from a 200 body, or {@code null} if the body is not a usable artifact. */
+    /** One strictly readable artifact decoded from a 200 body, or {@code null} if it is not usable. */
     private static RemoteArtifact remoteArtifact(String body) {
         if (JsonReader.parse(body) instanceof Map<?, ?> m) {
-            return artifactOf(m);
+            return readableArtifactOf(m);
         }
         return null;
     }
@@ -1417,11 +1417,22 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return artifacts;
     }
 
-    /** One artifact from a decoded JSON object, or {@code null} unless it carries all three string fields. */
+    /** One artifact from a decoded JSON object, or {@code null} unless it carries its id and kind. */
     private static RemoteArtifact artifactOf(Map<?, ?> m) {
+        if (m.get("id") instanceof String id && m.get("kind") instanceof String kind) {
+            String canonical = m.get("canonicalForm") instanceof String s ? s : null;
+            boolean readable = !(m.get("readable") instanceof Boolean b) || b;
+            return new RemoteArtifact(id, kind, canonical, readable);
+        }
+        return null;
+    }
+
+    /** One strictly readable artifact from a single-artifact response. */
+    private static RemoteArtifact readableArtifactOf(Map<?, ?> m) {
         if (m.get("id") instanceof String id
                 && m.get("kind") instanceof String kind
-                && m.get("canonicalForm") instanceof String canonical) {
+                && m.get("canonicalForm") instanceof String canonical
+                && (!(m.get("readable") instanceof Boolean readable) || readable)) {
             return new RemoteArtifact(id, kind, canonical);
         }
         return null;
