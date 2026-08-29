@@ -135,10 +135,19 @@ refusing to allow a Personal Access Token to create or update workflow
 `.github/workflows/ci.yml` without `workflow` scope
 ```
 
-**The fix is not a wider token.** Sync your fork's default branch - the "Sync fork" button on your
-fork's page, or `git fetch upstream && git push origin upstream/main:main` - and push again. GitHub
-judges the delta, so once those commits are already on your fork, the same branch pushes with the
-token you had. Measured, both ways, on 2026-08-28.
+**The fix is not a wider token, it is to sync your fork.** The **Sync fork** button on your fork's
+page is the whole of it - press it, then push again, with nothing to change locally. What was
+refused is the difference between your push and what your fork already has; once your fork has
+those commits, the same branch pushes with the same token.
+
+From a terminal instead, if your clone has no `upstream` remote yet - and a clone of your own fork
+does not:
+
+```sh
+git remote add upstream https://github.com/tapstate/tapstate.git
+git fetch upstream
+git push origin upstream/main:main
+```
 
 Granting the `workflow` scope would also work, and we would rather you did not: it is a wider
 permission than contributing here needs, held for longer than this one push.
@@ -166,8 +175,9 @@ a pull request from a fork is never given this repository's secrets, so the anal
 `sonarqube` check goes green because it was skipped, and it says so in a notice on the run.
 
 **A maintainer runs the analysis on your branch and posts what it found**, as a comment here. That
-is a manual step on our side; if your pull request is labelled `needs-sonar-review` and nothing has
-appeared, say so - the wait is ours.
+is a manual step on our side, and we hold ourselves to **3 days** on it, the same as the two clocks
+above. If your pull request is labelled `needs-sonar-review` and nothing has appeared in that time,
+say so on the pull request. The wait is entirely ours.
 
 **The quality gate itself is measured after your change merges**, when `main` is analysed. So a
 review here is a person reading your diff plus whatever that comment reported, not a gate verdict.
