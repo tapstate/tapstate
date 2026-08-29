@@ -380,4 +380,7 @@ it.** You are never asked to author directly in the documentation repository.
 Use the **bug or idea** template — the first lane in
 [External contributions](#external-contributions). Include the version and, where relevant, a
 minimal reproduction (for the CLI, the `.tap.yml` input and the exact command). For a security
-vulnerability, do not open an issue at all: see [SECURITY.md](SECURITY.md).
+vulnerability, do not open an issue at all: see [SECURITY.md](SECURITY.md). Which releases still
+receive fixes is answered in that same file, under
+[Supported versions](SECURITY.md#supported-versions) — being on an earlier line of the current
+major version does not put you out of scope.

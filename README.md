@@ -105,6 +105,7 @@ Tapstate is evolving toward the complete Capture → Transform → Serve path:
 - [Operations](https://tapstate.dev/docs/guides/observe-a-pipeline) — pipelines, status, metrics, logs, and runtime behavior
 - [MCP & AI](https://tapstate.dev/docs/reference/mcp) — use Tapstate with AI agents and developer tools
 - [Build & contribute](CONTRIBUTING.md) — build from source and contribute to Tapstate
+- [Security & supported versions](SECURITY.md) — report a vulnerability, and which release lines still receive fixes
 
 [tapstate.dev/docs](https://tapstate.dev/docs) is the reviewed, published documentation
 and the one to read. Pages under `docs/` in this repository are engineering drafts kept
