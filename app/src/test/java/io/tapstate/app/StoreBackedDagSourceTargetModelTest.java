@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.model.FromClause;
@@ -109,6 +110,30 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
 
         assertThat(bound).containsExactly((TargetTable) null);
+    }
+
+    @Test
+    void refuses_a_sync_start_when_the_source_schema_was_never_discovered() {
+        InMemoryStorePort store = seededPipeline();
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("orders_src");
+    }
+
+    @Test
+    void leaves_a_view_only_pipeline_allowed_before_source_schema_discovery() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+        store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
+                "mongodb", Map.of("uri", "u"), null, null, null, null, null));
+        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src"), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
+                null, null, null));
+
+        new StoreBackedDagSource(store).validateStart("p");
     }
 
     @Test

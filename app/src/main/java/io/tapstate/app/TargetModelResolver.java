@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SourceResource;
@@ -7,6 +8,7 @@ import io.tapstate.core.model.TableRename;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
 import java.util.ArrayList;
@@ -32,6 +34,25 @@ final class TargetModelResolver {
 
     TargetModelResolver(StorePort storePort) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
+    }
+
+    /**
+     * Requires every source model a sync pipeline will write from to have been discovered. Literal table
+     * selectors can still resolve without discovery for legacy view/nest paths, but a sync target needs the
+     * discovered fields and primary key before capture or a sink can safely start.
+     */
+    void requireAllDiscovered(PipelineResource pipeline) {
+        for (String sourceId : pipeline.sources()) {
+            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            if (discovered == null) {
+                throw new TapstateException(
+                        ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED, Map.of("source", source.id()), null);
+            }
+            // Preserve existing selector diagnostics for a discovered source whose literal/regex no longer
+            // names a table, instead of converting that distinct error into a missing-schema refusal.
+            SourceTableSelection.resolve(source, discovered);
+        }
     }
 
     /** Resolves one target model per selected source table across the pipeline, in source and discovery order. */

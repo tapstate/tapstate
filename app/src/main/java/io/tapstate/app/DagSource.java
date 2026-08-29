@@ -18,6 +18,14 @@ import java.util.Set;
  */
 interface DagSource {
 
+    /**
+     * Validates the pipeline's start preconditions before the actuator starts capture or submits a job.
+     * Store-backed implementations use this to reject a sync whose source model has not been discovered;
+     * lightweight test sources have no store-backed preconditions and keep the no-op default.
+     */
+    default void validateStart(String pipelineId) {
+    }
+
     /** The topology to run for {@code pipelineId}. */
     DAG dagFor(String pipelineId);
 

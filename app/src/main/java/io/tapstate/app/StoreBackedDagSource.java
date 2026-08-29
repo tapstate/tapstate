@@ -116,6 +116,16 @@ final class StoreBackedDagSource implements DagSource {
         return sinkWriterBinder;
     }
 
+    @Override
+    public void validateStart(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        if (pipeline.serve() instanceof ServeBlock.Inline serve
+                && serve.sync() != null && !serve.sync().isEmpty()) {
+            targetModelResolver.requireAllDiscovered(pipeline);
+        }
+    }
+
     StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder) {
         this(storePort, sinkWriterBinder, NestSettings.defaults());
     }
