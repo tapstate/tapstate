@@ -1,0 +1,11 @@
+version: tapstate/v1
+kind: pipeline
+id: e2e_pipeline
+source: src_file
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - { id: changes, from: [orders], type: filter, expr: "op == 'i'" }
+serve:
+  from: changes
+  sync:
+    - source: tgt_file
