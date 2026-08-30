@@ -174,7 +174,11 @@ case "${1:-}" in
     found="$(printf '%s' "$hits" | name_unknown)"
     if [ -n "$found" ]; then
       echo "::error::character(s) not on the allow-list, in tracked files:"
-      printf '%s\n' "$found" | head -50
+      # `|| true` is load-bearing. head stops reading at fifty lines, printf takes SIGPIPE once the
+      # report outgrows the pipe buffer, and under pipefail that ends the script right here - after
+      # the fifty findings and before the count of the rest and the advice below. The message is
+      # the whole point of this check, and it went missing at exactly the size where it matters.
+      printf '%s\n' "$found" | head -50 || true
       total="$(printf '%s\n' "$found" | wc -l | tr -d ' ')"
       [ "$total" -gt 50 ] && echo "  ... and $((total - 50)) more"
       echo "add the character to ${CHARSET_ALLOWLIST} if English typesetting here needs it, or add the file to ${PATH_ALLOWLIST}."
@@ -228,7 +232,7 @@ case "${1:-}" in
     done
     if [ -n "$found" ]; then
       echo "::error::character(s) not on the allow-list, in commit message(s):"
-      printf '%s' "$found" | head -50
+      printf '%s' "$found" | head -50 || true   # see the tracked-files mode: SIGPIPE, and pipefail
       echo "commit messages here are English. Rewrite the message with git commit --amend or git rebase."
       exit 1
     fi

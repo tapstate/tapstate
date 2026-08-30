@@ -134,6 +134,25 @@ fresh_repo
 printf 'a %s b\n' "$han" > untracked.md
 expect "an untracked file is outside the scan" files 0 "clean: every character in tracked files"
 
+# Big enough that the report does not fit in a pipe buffer, which is the only size at which this
+# goes wrong. The findings are truncated to fifty and the count of the rest, and the advice line
+# after them says what to do about it - and both of those are printed AFTER the truncation, so a
+# report long enough to fill the buffer used to end at line fifty with neither. A reader then sees
+# exactly fifty findings, no sign that anything was cut, and no advice; the run also ends 141
+# rather than 1. Every other fixture here is a handful of lines, so nothing reached it.
+fresh_repo
+yes "a ${han} b" | head -3000 > big.md
+git add -A && git commit -qm "a large finding set"
+expect "a report too big for a pipe still says how many were cut" files 1 "and 2950 more"
+expect "and still prints the advice after it" files 1 "add the character to"
+
+fresh_repo
+base_sha="$(git rev-parse HEAD)"
+echo more > file.txt; git add -A
+git commit -q -m "$(yes "subject ${han}" | head -3000)"
+EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
+  expect "the same holds for a large commit-message report" messages 1 "Rewrite the message"
+
 echo "the allow-list itself"
 
 # A missing allow-list and a repository full of unknown characters are both red. Only one of them
