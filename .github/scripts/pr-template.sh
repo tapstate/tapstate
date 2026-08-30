@@ -23,7 +23,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/_pr-section.sh"
 fail=0
 for name in "${required[@]}"; do
-  if ! printf '%s\n' "$body" | grep -qE "^## ${name}[[:space:]]*$"; then
+  # Not piped into `grep -q`: it closes the pipe on its first match, the writer behind it dies of
+  # that, and under `pipefail` the pipeline reports the signal rather than the match.
+  if ! grep -qE "^## ${name}[[:space:]]*$" <<<"$body"; then
     echo "::error::the pull request body has no \"## ${name}\" section — it is in the template, and removing it does not answer it"
     fail=1
     continue

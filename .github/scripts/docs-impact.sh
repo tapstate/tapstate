@@ -42,7 +42,7 @@ case "$actor" in
   *'[bot]') echo "clean: $actor is a bot, and the template is not asked of one."; exit 0 ;;
 esac
 
-if ! printf '%s\n' "$body" | grep -qE "^## ${section}[[:space:]]*$"; then
+if ! grep -qE "^## ${section}[[:space:]]*$" <<<"$body"; then
   echo "::error::the pull request body has no \"## ${section}\" section — it is in the template, and removing it does not answer it"
   echo "Two answers are wanted, and \"none\" is one of them. See .github/PULL_REQUEST_TEMPLATE.md."
   exit 1
