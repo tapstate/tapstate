@@ -488,7 +488,8 @@ class AuthTest {
         // entry points, and the framework's own error endpoint (which renders only the current request's
         // error, no application data). A future plain @Controller added at the root would escape both the
         // verb-derivation gate and the interceptor — this pins the anonymous surface to exactly that set.
-        Set<String> allowedRootPaths = Set.of("/healthz", "/auth/login", "/auth/bootstrap", "/error");
+        Set<String> allowedRootPaths =
+                Set.of("/healthz", "/version", "/auth/login", "/auth/bootstrap", "/error");
 
         RequestMappingHandlerMapping mapping =
                 context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
