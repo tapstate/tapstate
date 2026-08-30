@@ -43,3 +43,15 @@ strip_comments() {
     }
   '
 }
+
+# Whether what an author wrote amounts to "none". Shared because two gates ask it -- the check on a
+# pull request, and the collection of release notes -- and they must not answer differently: a field
+# read as an answer by one and as a value by the other refuses a pull request that is correct, and
+# tells its author to add a label they must not add.
+#
+# The first word decides, so a full stop or a reason after it still counts. Real answers look like
+# "none.", "none -- the lane documents itself in its header", "None"; all of them are the author
+# having judged it. "nonetheless" is not, which is why it is the whole first word and not a prefix.
+is_none() {
+  [ "$(printf '%s' "$1" | head -1 | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z].*//')" = none ]
+}

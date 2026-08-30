@@ -69,7 +69,7 @@ for name in "${fields[@]}"; do
   value="$(field_value "$name")"
   if [ -z "$value" ]; then
     unanswered+=("$name")
-  elif [ "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" != "none" ]; then
+  elif ! is_none "$value"; then
     declared=1
   fi
 done

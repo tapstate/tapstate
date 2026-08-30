@@ -6,9 +6,10 @@
 #
 # The first half is the same judgement the pull-request check makes, made again over a whole range.
 # It is asked twice on purpose: the check at pull-request time is what makes the answer exist, and
-# this is what makes it count. A body cannot be repaired here -- by now every one of these pull
-# requests is merged -- so this reads a record rather than asking for one, which is why a range
-# containing a pull request that predates the check refuses instead of passing.
+# this is what makes it count. Every pull request it reads is merged by now, which does not make
+# them unfixable -- a merged body and its labels are both still editable -- but it does mean nobody
+# is looking any more, which is why the check at pull-request time exists and why a range containing
+# a pull request that predates it refuses rather than passing.
 #
 # The second half exists only at release time: for a pull request labelled `docs-needed`, the
 # follow-up issue that its merge opened in the documentation repository. Two strictnesses, taken from
@@ -69,7 +70,7 @@ for n in $numbers; do
   url="$(printf '%s' "$pr" | jq -r '.url // ""')"
 
   if ! verdict="$(PR_BODY="$body" PR_LABELS="$labels" PR_ACTOR="$actor" bash "$here/docs-impact.sh" 2>&1)"; then
-    echo "::error::#${n} did not answer its documentation impact, and by now nobody can fix it there — ${url}"
+    echo "::error::#${n} did not answer its documentation impact — ${url}"
     printf '%s\n' "$verdict" | sed 's/^::error:://; s/^/    /'
     fail=1
     continue
@@ -104,7 +105,7 @@ for n in $numbers; do
 done
 
 if [ "$fail" -ne 0 ]; then
-  echo "Nothing was released. Each pull request named above is already merged, so the fix is in the documentation repository or in the label, not in the pull request body."
+  echo "Nothing was released. Each one named above is merged, but a merged pull request's body and labels are both still editable, and that is where these are answered."
   exit 1
 fi
 

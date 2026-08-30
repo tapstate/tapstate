@@ -70,8 +70,7 @@ for n in $numbers; do
   [ -n "$note" ] || continue
   # "none" is a conclusion the author reached, with or without a reason after it, and it produces no
   # entry. Left as a bullet with nothing in it, it would read as a change nobody could describe.
-  first="$(printf '%s' "$note" | head -1 | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z].*//')"
-  [ "$first" = "none" ] && continue
+  is_none "$note" && continue
   entries="${entries}* $(printf '%s' "$note" | tr '\n' ' ' | sed 's/[ \t]*$//')
 "
 done

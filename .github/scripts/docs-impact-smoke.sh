@@ -75,6 +75,16 @@ expect "a page named without the label is refused" 1 "no \`docs-needed\` label" 
 expect "a draft named without the label is refused" 1 "no \`docs-needed\` label" "$half_answered" ""
 expect "none twice with the label is refused"      1 "carries \`docs-needed\`"  "$declined" "docs-needed"
 
+# What people actually write when they mean none, taken from pull requests already merged here: a
+# full stop after it, or a sentence saying why. Comparing the whole field to the word "none" reads
+# every one of those as a documentation path, and then refuses the pull request for not carrying a
+# label it must not carry.
+expect "'none.' is none"                           0 "clean:"          "$(section 'none.' 'none.')" ""
+expect "none with a reason after it is none"       0 "clean:"          "$(section 'none -- the lane documents itself' 'none')" ""
+expect "and the capitalised one too"               0 "clean:"          "$(section 'None' 'NONE')" ""
+# The whole first word, not a prefix: a real answer can begin with those four letters.
+expect "'nonetheless ...' is not none"             1 "no \`docs-needed\` label" "$(section 'nonetheless docs/a.md' 'none')" ""
+
 expect "a deleted section is refused by name"      1 "no \"## Documentation impact\"" "$no_section" ""
 expect "an empty body is refused"                  1 "no \"## Documentation impact\"" ""          ""
 
