@@ -18,6 +18,11 @@
 # Layer 3 is why nothing here writes a "## What's Changed": GitHub appends its list after this body,
 # so emitting one would put it in the middle and give a reader two lists of different lengths.
 #
+# The supported-versions link at the end is an absolute URL on purpose. A release body is rendered on
+# the releases page, not from a file in the tree, so a relative path resolves against that page and
+# 404s. `blob/HEAD` names no branch, so it follows the default branch and keeps pointing at the
+# current promise rather than at the one this release happened to ship with.
+#
 # The range is `<base>..<sha>`, and base is the version tag on this commit's own ancestry -- handed
 # in rather than worked out again, because working it out twice is two chances to take the newest tag
 # in the repository instead. On a fix to a line that has been overtaken those differ, and the notes
@@ -115,4 +120,8 @@ ${entries}
      be: it lives outside this repository, and anything copied from it would name records that
      have no business in a public release body. Look it up where it is kept, and write only what
      a user of this build would recognise. -->
+
+---
+
+Which releases still receive fixes: [Supported versions](https://github.com/tapstate/tapstate/blob/HEAD/SECURITY.md#supported-versions).
 EOF

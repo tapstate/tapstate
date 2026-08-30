@@ -607,6 +607,52 @@ jobs:
             echo "* floating \`latest\` marker moved here: ${{ needs.version.outputs.is_latest }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  roadmap:
+    # The board says what shipped, and in which release. Nothing else does: the execution issue for a
+    # line is closed when its pull request merges, which is before the release that carries it, so by
+    # the time anything goes out the issue has been closed for days and cannot carry the answer.
+    #
+    # Every release, not only the newest line. A fix released onto an overtaken line shipped work too,
+    # and leaving it off the roadmap is how an old line looks abandoned while it is being maintained.
+    #
+    # Allowed to fail, and that is the whole reason it is a job of its own. The release is already out
+    # by the time this runs; holding it back over a roadmap that can be corrected by hand would trade
+    # something that cannot be undone for something that can.
+    needs: [version, publish]
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # the board is written with the app token below, not with this one
+    steps:
+      # Not GITHUB_TOKEN: it reaches this repository and nothing above it, and the board belongs to
+      # the organization. `owner` is what widens the app token past this one repository.
+      - id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0   # the range back to the previous tag is where the shipped work is read from
+      - name: move what this release shipped to Shipped
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          .github/scripts/roadmap-shipped.sh \
+            --version "${{ needs.version.outputs.version }}" \
+            --base "${{ needs.version.outputs.base }}" \
+            --sha "${{ needs.version.outputs.sha }}" 2>&1 | tee roadmap.log
+          code=${PIPESTATUS[0]}
+          {
+            echo "### Roadmap"
+            echo
+            sed 's/^/    /' roadmap.log
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+
   write-back:
     # The version this release just took is written into the default branch, so the next release
     # counts up from it and the one-click demo on main points at something that exists.

@@ -107,6 +107,14 @@ has  "and GitHub appends its own list"        draft  'generate_release_notes: tr
 # The draft is a draft, and creates no tag until somebody publishes it.
 has "the release starts as a draft"           draft  'draft: true'
 
+# --- the roadmap is written after the release, and never holds one back -------------------------
+# Both halves are one edit away from inverting. Drop `continue-on-error` and a board the credential
+# cannot reach turns every release run red -- after the release is already out, so the red says to
+# re-run a publish that must not be re-run. Move it off `publish` and it marks work Shipped that a
+# rejected approval means nobody ever received.
+has "the roadmap job is allowed to fail"        roadmap 'continue-on-error: true'
+has "and it writes the board only once the release is out" roadmap 'needs: \[version, publish\]'
+
 # --- every needs.<job>.outputs.<name> is one the job actually declares --------------------------
 # An undeclared output is not an error anywhere: the expression resolves to the empty string, the
 # step runs with a missing argument, and what fails is whatever the argument was for -- somewhere

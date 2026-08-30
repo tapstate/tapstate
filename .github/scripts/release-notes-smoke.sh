@@ -141,6 +141,11 @@ fi
 # Layer 3 is appended by GitHub after this body. Emitting it here would put it in the middle.
 hasnt "the generated list is not written here" "## What's Changed"
 
+# The one link out of the body. A relative path here 404s -- a release body is rendered on the
+# releases page, not from a file in the tree -- so the case is the whole URL, not the filename.
+has "the supported-versions link is in the body" \
+    "https://github.com/tapstate/tapstate/blob/HEAD/SECURITY.md#supported-versions"
+
 # An empty range still has to produce a valid body: a release with no harvested note is normal.
 empty="$(cd "$repo" && bash "$script" --version 0.4.0 --base HEAD --sha HEAD \
   --macos-req 'Recommended macOS: 15.0 or newer.' --glibc-req 'Recommended glibc: 2.34 or newer.' 2>&1)"
