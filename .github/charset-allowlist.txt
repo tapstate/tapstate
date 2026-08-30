@@ -37,6 +37,7 @@ U+00EF  LATIN SMALL LETTER I WITH DIAERESIS      Table-rename fixture exercising
 
 # --- Mathematical and technical symbols ---
 U+00D7  MULTIPLICATION SIGN                      Dimensions and matrix-shaped tables.
+U+00F7  DIVISION SIGN                            Ratios in prose, beside the multiplication sign.
 U+20AC  EURO SIGN                                Currency fixture in serialization tests.
 U+2192  RIGHTWARDS ARROW                         "maps to" in prose, tables and diagnostics.
 U+2194  LEFT RIGHT ARROW                         Round-trip relation between two encodings.

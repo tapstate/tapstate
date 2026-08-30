@@ -252,10 +252,6 @@ check "and the engine was actually asked" "$([ -f "$scratch/curl-stdin" ] && ech
 # own English. The question changed to the one the character check already asks - is every character
 # one this repository's English typesetting uses - and the two now read the same list, from the same
 # file, through the same script.
-#
-# Both fixtures are built from bytes, and that is not fussiness. The list this reads is also what
-# the character gate holds tracked files to, so a fixture that is literally not-English would redden
-# the repository that stores it. Anything here that must read as foreign has to be spelled in bytes.
 em="$(printf '\xE2\x80\x94')"              # U+2014 EM DASH - on the allow-list, English prose uses it
 zh="$(printf '\xE4\xB8\xAD\xE6\x96\x87')"  # two han characters - not on it
 
@@ -264,6 +260,25 @@ out="$(run "The gate refuses the push ${em} and names the character ${em} but no
 check "an English body with em dashes: never reaches the engine" "$([ ! -f "$scratch/curl-stdin" ] && echo 0 || echo 1)"
 check "an English body with em dashes: says every character is allowed typesetting" "$(has "$out" "English typesetting" && echo 0 || echo 1)"
 check "an English body with em dashes: posts nothing" "$(in_file "$scratch/gh-log" "--method POST" && echo 1 || echo 0)"
+
+# The three English execution issues the byte criterion was measured against, each carrying exactly
+# the characters that decide the answer for it. Measured off the live issues on 2026-08-30, not read
+# out of prose about them: #84 two em dashes, #91 one, #88 thirteen em dashes and two division
+# signs. That last pair is the whole reason U+00F7 is on the allow-list - without it #88 is still
+# "not English", which is the failure this task exists to end, and only running the real inventory
+# finds that out.
+div="$(printf '\xC3\xB7')"                # U+00F7 DIVISION SIGN
+thirteen="${em}${em}${em}${em}${em}${em}${em}${em}${em}${em}${em}${em}${em}"
+for shape in \
+  "84:A gate refuses the push ${em} and the run says which character ${em} but never which line." \
+  "91:The installer picks a port ${em} and then nothing says which one it picked." \
+  "88:Rows ${thirteen} arrive at 40 ${div} 60 on two shards, and the split ${div} is what drifts."
+do
+  stage "should not be used"
+  out="$(run "${shape#*:}")"
+  check "issue #${shape%%:*}, as filed: never reaches the engine" "$([ ! -f "$scratch/curl-stdin" ] && echo 0 || echo 1)"
+  check "issue #${shape%%:*}, as filed: is read as English" "$(has "$out" "English typesetting" && echo 0 || echo 1)"
+done
 
 # The control that keeps the three above from being satisfied by a script that translates nothing.
 stage "The connector fails at startup."
