@@ -25,11 +25,22 @@
 # Refuses rather than answering with nothing. An empty tag flows on into `git show "$tag:path"` and
 # into a deploy, and fails somewhere far enough away that the cause is not obvious.
 #
+# With --previous, answer with the release published before that one instead. That is what an upgrade
+# lane starts from: it installs the previous release, puts data in it, and upgrades to the newest. The
+# skipping above happens first and the counting second -- indexing the raw list hands back the newest
+# version under the name of the previous one, and the lane then "upgrades" a version to itself, which
+# reads in the log exactly like a working upgrade.
+#
 # Pass a file holding the release list as JSON to resolve against that instead of asking GitHub;
 # that is how the cases build lists this repository does not currently produce.
 
 set -eu
 
+want=0
+if [ "${1:-}" = "--previous" ]; then
+    want=1
+    shift
+fi
 list_file="${1:-}"
 
 if [ -n "$list_file" ]; then
@@ -38,10 +49,15 @@ else
     releases="$(gh release list --limit 30 --exclude-drafts --json tagName)"
 fi
 
-tag="$(printf '%s' "$releases" | jq -r 'map(select(.tagName | startswith("v"))) | first | .tagName // empty')"
+tag="$(printf '%s' "$releases" \
+    | jq -r --argjson want "$want" 'map(select(.tagName | startswith("v"))) | .[$want].tagName // empty')"
 
 if [ -z "$tag" ]; then
-    echo "no published release carries a version tag - only non-version tags such as connectors-preview" >&2
+    if [ "$want" -eq 0 ]; then
+        echo "no published release carries a version tag - only non-version tags such as connectors-preview" >&2
+    else
+        echo "only one published release carries a version tag - there is no earlier one to upgrade from" >&2
+    fi
     exit 1
 fi
 

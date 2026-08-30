@@ -566,6 +566,44 @@ The pulled/built images remain — remove them with `docker image rm <image>` if
 want the machine back exactly as it was. The jars, `work/`, and `.env` you created
 here are just files; delete them as usual.
 
+## Upgrading to a newer release
+
+A newer release drops into the same directory. Your data lives in the named volumes,
+so the one thing not to do here is `down -v` — that is the teardown above, not an
+upgrade.
+
+Stop the stack, keeping its volumes:
+
+```sh
+docker compose down          # no -v: the store, MySQL and PostgreSQL data all stay
+```
+
+Point the compose file at the new version, and take the new CLI beside it:
+
+```sh
+sed -i.bak 's|ghcr.io/tapstate/tapstate:.*|ghcr.io/tapstate/tapstate:<new-version>|' docker-compose.yml
+curl -sSL https://install.tapstate.dev/cli | TAPSTATE_INSTALL_DIR=. TAPSTATE_VERSION=<new-version> sh
+```
+
+Then start it again, and start your pipeline again with it:
+
+```sh
+docker compose up -d
+```
+
+```console
+tapstate(admin@127.0.0.1:8080)> start order_pipeline
+```
+
+The server reads the store it finds, so everything you registered — connectors,
+resources, pipelines — is still there and needs no re-applying. Running pipelines are
+the exception: nothing restarts them for you, on this or any other server restart, so
+the `start` above is a step and not a formality.
+
+Upgrades are supported within one MAJOR line — `0.2.1` to `0.3.0` and onward. Check
+`./tapstate --version` afterwards: it is the CLI's own version, and it should be the
+one you just installed.
+
 ## Alternative: build and run the server from source
 
 Prefer to run the server process directly on the host — to attach a debugger, or to

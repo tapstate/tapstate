@@ -59,12 +59,20 @@ jobs:
     # is not hypothetical -- an apply-order incompatibility sat undetected behind exactly this gap until
     # somebody ran the demo by hand against a locally built image. Only running the second is the mirror
     # hole: regressions in the released artifacts would go unwatched. Both, or neither is worth much.
+    #
+    # The third entry is an entry, not a second axis. Crossing server against architecture would build
+    # from source on arm too -- a long build answering a question the x64 leg already answers. What arm
+    # is here for is the one thing nothing else covers: the arm64 half of the published multi-arch
+    # image. It has been built and pushed every release and never once started, on any lane.
     strategy:
       fail-fast: false
       matrix:
-        server: [published, from-source]
-    name: quickstart-live (${{ matrix.server }})
-    runs-on: ubuntu-latest
+        include:
+          - { server: published,   arch: amd64, runner: ubuntu-latest }
+          - { server: from-source, arch: amd64, runner: ubuntu-latest }
+          - { server: published,   arch: arm64, runner: ubuntu-24.04-arm }
+    name: quickstart-live (${{ matrix.server }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -232,6 +240,60 @@ jobs:
             [ -z "$digests" ] || { echo "the server image carries a repo digest -- it was pulled, not built here: $digests" >&2; exit 1; }
             echo "built from this checkout: no repo digest"
           fi
+          # And it is the architecture this leg was added to exercise. Two ways this lane can quietly
+          # stop covering arm64 and stay green either way: a runner label that goes away or is edited
+          # back to ubuntu-latest, and a manifest that ships without its arm64 half -- both leave three
+          # legs passing while two of them run the same amd64 image.
+          arch="$(docker image inspect "${{ steps.leg.outputs.ref }}" --format '{{.Architecture}}')"
+          [ "$arch" = "${{ matrix.arch }}" ] || {
+            echo "the server image is $arch, but this leg exists to run ${{ matrix.arch }}" >&2
+            exit 1
+          }
+          echo "architecture: $arch"
+
+      - name: The CLI the quickstart installed is the release's own
+        # The two halves of a release arrive by different routes -- the server as an image tag in the
+        # compose file, the CLI as a version the script pins and the installer serves -- and nothing
+        # makes them agree except a line in the script. They have come apart before: the published
+        # one-liner installed 0.2.0 for a whole release cycle while every pin in the tree read 0.2.1,
+        # and every lane was green throughout, because each half was internally consistent.
+        #
+        # Held to the image tag rather than to a version named here: the tag is what this leg actually
+        # started, so the two are compared against each other instead of both against a literal that
+        # would have to be moved every release.
+        env:
+          PREPARED: ${{ steps.leg.outputs.ref }}
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/tapstate-demo"
+          want="${PREPARED##*:}"
+          got="$(./tapstate --version)"
+          case "$got" in
+            *"$want"*) echo "cli and server agree: $got, against $PREPARED" ;;
+            *) echo "the stack runs $PREPARED but the CLI beside it reports '$got'" >&2; exit 1 ;;
+          esac
+
+      - name: The connector jars the quickstart fetched are readable jars
+        # These are fetched from a release, not built here, and a jar that arrives mangled or with its
+        # entries encrypted is still a file of the right name and roughly the right size. The failure it
+        # produces is a first read that throws from inside the server, with no filename in it -- from
+        # the outside that is a pipeline that will not start, and the fetch is the last place anyone
+        # looks. Opening each one here separates "fetched something" from "fetched a jar", where the
+        # answer is still cheap.
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/tapstate-demo"
+          python3 -c '
+          import sys, zipfile
+          for path in sys.argv[1:]:
+              z = zipfile.ZipFile(path)
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit(path + ": opens, but entry " + bad + " does not read back")
+              if not any(n.endswith(".class") for n in z.namelist()):
+                  raise SystemExit(path + ": opens as a zip but carries no classes")
+              print(path + ": " + str(len(z.namelist())) + " entries")
+          ' ./*.jar
 
       - name: The target really holds the seeded rows
         # Read the target directly. The script prints a count of its own, and a check that only re-reads
@@ -343,3 +405,216 @@ jobs:
             esac
           done
           echo "teardown: nothing left but the pulled images"
+
+  quickstart-upgrade:
+    # Publishing a release and being able to move onto it are two different claims, and only the lane
+    # above makes the first one. This lane makes the second: a machine already running the previous
+    # release moves to the newest one and keeps the data it had.
+    #
+    # That is the half where the two releases actually meet, and nothing else in this repository looks
+    # at it. Resources the older server persisted have to be readable by the newer one; the store has to
+    # survive an image that did not write it; the pipeline has to run again against a target that is
+    # already populated. Both releases are green on their own the whole time -- they only meet on
+    # somebody's machine, which is the worst place to find out.
+    #
+    # The steps are the ones the online quickstart's upgrade section hands a user, in that order, and
+    # against the same live install edge. Upgrading some other way here would prove a path nobody has
+    # been given, and would keep proving it after the documented one broke.
+    name: quickstart-upgrade (previous -> newest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the two releases this leg moves between
+        # Both ends come from the release list, never from this checkout: the pin here moves ahead of
+        # the release the moment a version is bumped, and this lane's question is about what shipped.
+        #
+        # The demo's own shape is read out of the release being started, not restated here. It has
+        # already moved once -- the target database was `warehouse` and is now `views`, and the demo
+        # pipeline was `sync_orders` and is now `order_pipeline` -- so anything named here would be
+        # right for one release and quietly wrong for the other, which is the failure this whole lane
+        # is about.
+        id: leg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          from="$(.github/scripts/latest-release-tag.sh --previous)"
+          to="$(.github/scripts/latest-release-tag.sh)"
+          [ "$from" != "$to" ] || {
+            echo "resolved the same release at both ends ($from); this would upgrade a version to itself" >&2
+            exit 1
+          }
+          mkdir -p "$RUNNER_TEMP/script"
+          script="$RUNNER_TEMP/script/quickstart.sh"
+          curl -fsSL "https://raw.githubusercontent.com/$REPO/$from/deploy/quickstart/quickstart.sh" -o "$script"
+          db="$(sed -n 's|.*mongodb://mongo:27017/\([A-Za-z0-9_]*\)?directConnection.*|\1|p' "$script" | head -1)"
+          [ -n "$db" ] || { echo "no target database found in the $from quickstart" >&2; exit 1; }
+          pipeline="$(sed -n 's|.*start \([A-Za-z0-9_]*\)\\nexit.*|\1|p' "$script" | head -1)"
+          [ -n "$pipeline" ] || { echo "no demo pipeline found in the $from quickstart" >&2; exit 1; }
+          { echo "from=$from"; echo "to=$to"; echo "to_ver=${to#v}"
+            echo "script=$script"; echo "db=$db"; echo "pipeline=$pipeline"; } >> "$GITHUB_OUTPUT"
+          echo "upgrade: $from -> $to   target database: $db   demo pipeline: $pipeline"
+
+      - name: The runner is a clean machine
+        run: |
+          set -eu
+          if docker volume ls --format '{{.Name}}' | grep -q quickstart; then
+            echo "quickstart volumes already exist; this run would start from someone else's state" >&2
+            exit 1
+          fi
+          echo "clean: no quickstart volumes"
+
+      - name: Bring up the previous release, the way a user brought it up when it was current
+        env:
+          SCRIPT: ${{ steps.leg.outputs.script }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cat "$SCRIPT" | sh 2>&1 | tee run.log
+          test -d tapstate-demo || { echo "the piped run did not make its own directory" >&2; exit 1; }
+
+      - name: Put data in it, and let change-data-capture carry it
+        # The state the upgrade has to preserve, and it is deliberately made here rather than taken from
+        # the seed: a row that arrived through the running pipeline proves the store holds the pipeline's
+        # own progress, not just the fixtures the databases were initialised with.
+        #
+        # The count is recorded rather than named. What the demo seeds has changed between releases and
+        # will again, and a literal here would fail on the release rather than on the upgrade.
+        env:
+          DB: ${{ steps.leg.outputs.db }}
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/tapstate-demo"
+          uri="mongodb://mongo:27017/$DB?directConnection=true"
+          read_number() { docker compose exec -T mongo mongosh --quiet "$uri" --eval "$1" | tr -d '[:space:]'; }
+          docker compose exec -T mysql mysql -uroot -psecret appdb -e "INSERT INTO orders VALUES (6,'frank',60.00);"
+          i=0
+          until [ "$(read_number 'db.order_state.countDocuments({id:6})')" = 1 ]; do
+            i=$((i + 1))
+            [ "$i" -lt 60 ] || { echo "the row inserted before the upgrade never crossed" >&2; exit 1; }
+            sleep 1
+          done
+          read_number 'db.order_state.countDocuments()' > "$RUNNER_TEMP/before.count"
+          echo "before the upgrade: $(cat "$RUNNER_TEMP/before.count") documents, including the one typed in just now"
+
+      - name: Upgrade in place, following the documented steps
+        # `down`, not `down -v`. The whole subject of this lane is the volumes, and the one-character
+        # difference between an upgrade and a teardown is a plausible edit that leaves every assertion
+        # below still passing -- against a stack that started from nothing.
+        env:
+          TO_VER: ${{ steps.leg.outputs.to_ver }}
+          PIPELINE: ${{ steps.leg.outputs.pipeline }}
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/tapstate-demo"
+          docker compose down
+          sed -i.bak "s|ghcr.io/tapstate/tapstate:.*|ghcr.io/tapstate/tapstate:$TO_VER|" docker-compose.yml
+          curl -sSL https://install.tapstate.dev/cli | TAPSTATE_INSTALL_DIR=. TAPSTATE_VERSION="$TO_VER" sh
+          docker compose up -d
+          i=0
+          until [ "$(curl -fsS http://127.0.0.1:8080/healthz 2>/dev/null || true)" = ok ]; do
+            i=$((i + 1))
+            [ "$i" -lt 120 ] || {
+              echo "the upgraded server did not come up" >&2
+              docker compose logs server --tail 200 >&2
+              exit 1
+            }
+            sleep 1
+          done
+          admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
+          printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nstart %s\nexit\n' "$admin_pw" "$PIPELINE" \
+            | ./tapstate -w work > start.log 2>&1 || { cat start.log >&2; exit 1; }
+          cat start.log
+
+      - name: The new release is what is running, and the old data is still there
+        env:
+          TO_VER: ${{ steps.leg.outputs.to_ver }}
+          DB: ${{ steps.leg.outputs.db }}
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/tapstate-demo"
+          # The container's image, not the compose file's: editing the file is the step above, and
+          # re-reading it would only prove the sed ran.
+          cid="$(docker compose ps -q server)"
+          [ -n "$cid" ] || { echo "no server container is running after the upgrade" >&2; exit 1; }
+          running="$(docker inspect --format '{{.Config.Image}}' "$cid")"
+          [ "$running" = "ghcr.io/tapstate/tapstate:$TO_VER" ] || {
+            echo "the stack is running $running, but the upgrade was to $TO_VER" >&2
+            exit 1
+          }
+          version="$(./tapstate --version)"
+          case "$version" in
+            *"$TO_VER"*) echo "cli: $version" ;;
+            *) echo "the CLI still reports '$version' after upgrading to $TO_VER" >&2; exit 1 ;;
+          esac
+          uri="mongodb://mongo:27017/$DB?directConnection=true"
+          now="$(docker compose exec -T mongo mongosh --quiet "$uri" \
+            --eval 'db.order_state.countDocuments()' | tr -d '[:space:]')"
+          want="$(cat "$RUNNER_TEMP/before.count")"
+          [ "$now" = "$want" ] || {
+            echo "the target held $want documents before the upgrade and holds $now after it" >&2
+            exit 1
+          }
+          echo "carried over: $now documents, and the store the older server wrote is the one this reads"
+
+      - name: The same smoke still works on the upgraded stack
+        env:
+          DB: ${{ steps.leg.outputs.db }}
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/tapstate-demo"
+          uri="mongodb://mongo:27017/$DB?directConnection=true"
+          await() {
+            i=0
+            while [ "$i" -lt 90 ]; do
+              if docker compose exec -T mongo mongosh --quiet "$uri" --eval "quit($2 ? 0 : 1)" >/dev/null 2>&1; then
+                echo "cdc: $1 reached the target"
+                return 0
+              fi
+              i=$((i + 1)); sleep 1
+            done
+            echo "cdc: $1 never reached the target after the upgrade" >&2
+            docker compose logs server --tail 200 >&2
+            exit 1
+          }
+          docker compose exec -T mysql mysql -uroot -psecret appdb -e "INSERT INTO orders VALUES (7,'gina',70.00);"
+          await 'an order added after the upgrade' 'db.order_state.countDocuments({id:7}) === 1'
+          docker compose exec -T mysql mysql -uroot -psecret appdb -e "DELETE FROM orders WHERE id=7;"
+          await 'that order deleted again' '!db.order_state.countDocuments({id:7})'
+
+      - name: Nothing had to be migrated, and this step says so rather than staying silent
+        # No changeset exists in any tree yet, so what the step above proved is that an upgrade with
+        # nothing to migrate keeps its data -- which is the whole claim available today, and worth
+        # making, because it is the floor every later migration stands on.
+        #
+        # What it must never become is quietly weaker than it reads. The day a migration runner lands,
+        # an upgrade will do work this lane does not look at, and every assertion here would go on
+        # passing without ever seeing it. So it refuses then, naming what has to be added, instead of
+        # going green over the gap.
+        run: |
+          set -eu
+          if git ls-files | grep -q '/MigrationRunner\.java$'; then
+            echo "a migration runner exists now, and this lane still asserts nothing about it." >&2
+            echo "An upgrade across a changeset does work no step here reads. Add the assertions --" >&2
+            echo "the migration log for this upgrade, and the installed version it advanced to." >&2
+            exit 1
+          fi
+          echo "no migration runner in the tree: this upgrade had no changeset to apply"
+
+      - name: Server log on failure
+        if: failure()
+        run: |
+          cd "$RUNNER_TEMP/tapstate-demo" || exit 0
+          docker compose ps -a || true
+          docker compose logs server --tail 300 || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/tapstate-demo" 2>/dev/null || exit 0
+          docker compose down -v
+          cd "$RUNNER_TEMP" && rm -rf tapstate-demo
