@@ -36,6 +36,7 @@ cyrillic="$(printf '\xD0\xB0')"         # U+0430   CYRILLIC SMALL LETTER A, a lo
 zwsp="$(printf '\xE2\x80\x8B')"         # U+200B   ZERO WIDTH SPACE
 rtl="$(printf '\xE2\x80\xAE')"          # U+202E   RIGHT-TO-LEFT OVERRIDE
 emdash="$(printf '\xE2\x80\x94')"       # U+2014   EM DASH, on the allow-list
+jose="Jos$(printf '\xC3\xA9') Garc$(printf '\xC3\xADa')"   # U+00E9, U+00ED - neither on the list
 
 fresh_repo() {
   rm -rf "${scratch:?}/repo"
@@ -230,6 +231,82 @@ CHARSET_UNKNOWN_PATTERN='.' \
   expect "a pattern that flags plain ASCII refuses to report" files 1 "flagged plain ASCII"
 CHARSET_UNKNOWN_PATTERN='[^\x00-\x7F]' \
   expect "a pattern the allow-list never reached refuses to report" files 1 "never reached the pattern"
+
+echo "author and sign-off lines"
+
+# A person's name is not ours to constrain, and this project asks contributors to sign their
+# commits - so a check that reddened on the name they signed with would turn that into a door.
+# U+00ED is deliberately not on the allow-list: if it were, these cases would pass for the wrong
+# reason and would keep passing after the exemption was deleted.
+fresh_repo
+echo more > file.txt; git add -A
+git commit -q -m "an ordinary English subject
+
+Signed-off-by: ${jose} <jose@example.invalid>"
+base_sha="$(git rev-parse HEAD~1)"
+EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
+  expect "a sign-off in any script passes" messages 0 "clean: every character in the commit messages"
+
+fresh_repo
+echo more > file.txt; git add -A
+git commit -q -m "an ordinary English subject
+
+Co-authored-by: ${jose} <jose@example.invalid>"
+base_sha="$(git rev-parse HEAD~1)"
+EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
+  expect "a co-author trailer in any script passes" messages 0 "clean: every character in the commit messages"
+
+fresh_repo
+echo more > file.txt; git add -A
+git commit -q -m "an ordinary English subject
+
+signed-off-by: ${jose} <jose@example.invalid>"
+base_sha="$(git rev-parse HEAD~1)"
+EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
+  expect "the trailer is recognised whatever its capitalisation" messages 0 "clean: every character in the commit messages"
+
+# The negative half, and the reason the exemption is by line shape rather than by adding these
+# characters to the allow-list: the same name in the message body is still refused.
+fresh_repo
+echo more > file.txt; git add -A
+git commit -q -m "a subject mentioning ${jose} in prose"
+base_sha="$(git rev-parse HEAD~1)"
+EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
+  expect "the same name in the message body is still refused" messages 1 "U+00ED"
+
+# The exemption is anchored at the start of the line. Unanchored, a sentence that merely mentions
+# the trailer would exempt itself - and prose is exactly where someone would mention it.
+fresh_repo
+echo more > file.txt; git add -A
+git commit -q -m "I added a Signed-off-by: line for ${jose}"
+base_sha="$(git rev-parse HEAD~1)"
+EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
+  expect "prose that merely mentions the trailer is not exempt" messages 1 "U+00ED"
+
+fresh_repo
+printf 'Signed-off-by: %s <jose@example.invalid>\n' "$jose" > patch.txt
+git add -A && git commit -qm "a file holding a sign-off line"
+expect "a sign-off line inside a tracked file passes" files 0 "clean: every character in tracked files"
+
+fresh_repo
+printf 'Signed-off-by: %s <jose@example.invalid>\nand %s again, in prose\n' "$jose" "$jose" > patch.txt
+git add -A && git commit -qm "a file holding a sign-off line and prose"
+expect "and the exemption does not leak to the next line" files 1 "patch.txt:2"
+
+fresh_repo
+printf '%s <jose@example.invalid>\n' "$jose" > AUTHORS
+git add -A && git commit -qm "AUTHORS"
+expect "the AUTHORS file carries names in any script" files 0 "clean: every character in tracked files"
+
+# Exactly that path, not anything starting with it: a wildcard here would exempt whatever someone
+# names AUTHORS-something, which is a different decision from the one that was made.
+fresh_repo
+printf '%s <jose@example.invalid>\n' "$jose" > AUTHORS.md
+git add -A && git commit -qm "AUTHORS.md"
+expect "a file merely named like AUTHORS is not exempt" files 1 "AUTHORS.md:1"
+
+PR_BODY="$(printf 'An English body.\n\nCo-authored-by: %s <jose@example.invalid>' "$jose")" \
+  expect "a co-author trailer in a pull request body passes" pr-body 0 "clean: every character in the pull request body"
 
 echo "invocation"
 

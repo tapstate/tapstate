@@ -102,12 +102,22 @@ if [ -n "${CHARSET_UNKNOWN_PATTERN:-}" ]; then
 fi
 
 # Turn "file:line:text" on stdin into one report line per unknown character. The same function
-# serves all three modes, so a character is named the same way wherever it was found.
+# serves all three modes, so a character is named the same way wherever it was found - and so the
+# one exemption below holds everywhere rather than in whichever mode someone remembered.
+#
+# A person's name is not English prose and is not ours to constrain. Sign-off and authorship
+# trailers therefore carry any script at all: this project asks contributors to sign their commits,
+# and a check that reddens on the name they signed with would turn that into a door. The exemption
+# is by line shape, never by widening the allowed characters - widening would let the same
+# characters through anywhere in the file, which is the thing being kept out. It costs one hole,
+# stated rather than discovered: prose written on a line that begins with one of these trailers is
+# not scanned.
 name_unknown() {
   ALLOWED_HEX="$allowed_hex" perl -CSD -ne '
     BEGIN { %ok = map { hex($_) => 1 } split " ", $ENV{ALLOWED_HEX} }
     next unless /^(.*?):(\d+):(.*)$/;
     my ($where, $ln, $text) = ($1, $2, $3);
+    next if $text =~ /^\s*(?:Signed-off-by|Co-authored-by)\s*:/i;
     for my $c (split //, $text) {
       my $o = ord $c;
       next if $o < 0x80 || $ok{$o};
@@ -141,8 +151,11 @@ fi
 
 case "${1:-}" in
   files)
-    # Build pathspec exclusions from the path allow-list; ignore comments / blanks.
-    pathspec=(':(top)')
+    # Build pathspec exclusions from the path allow-list; ignore comments / blanks. AUTHORS is
+    # excluded ahead of it and not through it: the path allow-list is the per-file escape hatch
+    # somebody reviews, and a file whose every line is a person's name is the same decision as the
+    # trailer exemption above rather than an exception to the rule.
+    pathspec=(':(top)' ':(top,exclude)AUTHORS')
     if [ -f "$PATH_ALLOWLIST" ]; then
       while IFS= read -r line; do
         line="${line%%#*}"
@@ -204,7 +217,9 @@ case "${1:-}" in
     found=""
     for sha in $shas; do
       msg="$(git log -1 --format='%B' "$sha" | awk -v s="$sha" '{printf "%s:%d:%s\n", s, NR, $0}' | name_unknown)"
-      found="${found}${msg}"
+      # Command substitution eats the trailing newline, so put one back per commit. Without it two
+      # commits' reports run together on one line, and so does the advice printed after them.
+      [ -n "$msg" ] && found="${found}${msg}"$'\n'
     done
     if [ -n "$found" ]; then
       echo "::error::character(s) not on the allow-list, in commit message(s):"
