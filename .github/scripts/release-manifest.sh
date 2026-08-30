@@ -130,4 +130,4 @@ if [ "$problems" -ne 0 ]; then
     exit 1
 fi
 
-echo "release $version is complete: $(printf '%s' "$platforms" | tr '\n' ' ')CLI assets carrying their sidecar, both server image architectures, and the two files nothing fetches"
+echo "release $version is complete: $(printf '%s' "$platforms" | tr '\n' ' ') CLI assets carrying their sidecar, both server image architectures, and the two files nothing fetches"
