@@ -36,7 +36,10 @@ cyrillic="$(printf '\xD0\xB0')"         # U+0430   CYRILLIC SMALL LETTER A, a lo
 zwsp="$(printf '\xE2\x80\x8B')"         # U+200B   ZERO WIDTH SPACE
 rtl="$(printf '\xE2\x80\xAE')"          # U+202E   RIGHT-TO-LEFT OVERRIDE
 emdash="$(printf '\xE2\x80\x94')"       # U+2014   EM DASH, on the allow-list
-jose="Jos$(printf '\xC3\xA9') Garc$(printf '\xC3\xADa')"   # U+00E9, U+00ED - neither on the list
+# U+00ED is not on the allow-list, and that is what makes the cases below discriminate: with the
+# trailer exemption deleted they go red on it. U+00E9 IS on the list - a JSON escaping fixture needs
+# it - so it carries none of that weight. Do not reduce this name to the e-acute half.
+jose="Jos$(printf '\xC3\xA9') Garc$(printf '\xC3\xADa')"   # U+00E9 (allowed), U+00ED (not)
 
 fresh_repo() {
   rm -rf "${scratch:?}/repo"
@@ -134,6 +137,56 @@ fresh_repo
 printf 'a %s b\n' "$han" > untracked.md
 expect "an untracked file is outside the scan" files 0 "clean: every character in tracked files"
 
+# A name is not in any file's bytes. git grep reads content, so a tree whose file names carried
+# kana - or a right-to-left override, which is the whole reason to name that one - was reported
+# clean, and every case here seeded content and so none of them could see it.
+fresh_repo
+printf 'plain ascii content\n' > "kana-${kana}.md"
+git add -A && git commit -qm "a file whose name is not ASCII"
+expect "an unknown character in a file NAME is refused" files 1 "U+3042"
+expect "and the report says it was a name" files 1 "in the name(s) of tracked files"
+
+# The control: the name pass must not redden a tree it has no business reddening. Without it the
+# case above is satisfied by a pass that reddens everything, which is the shape the detector
+# self-checks exist to catch in the content scan and this pass would otherwise reintroduce.
+fresh_repo
+seed_file "kana-${kana}.md" b
+# Left untracked on purpose: committing it would put the kana into a scanned file's CONTENT, and
+# the case would then be red for a reason that has nothing to do with the name it is about.
+printf 'kana-%s.md\n' "$kana" > .cjk-allowlist
+expect "a name on the path allow-list is exempt like a content match" files 0 "clean: every character in tracked files"
+
+# git reads this one as binary and reports it as `Binary file <path> matches`, with no line number.
+# Every report line without one is dropped, so its bytes used to leave no trace at all and the mode
+# printed the clean line. It cannot be read as text, so it is named as unscanned instead.
+fresh_repo
+seed_file asset.bin "$han"
+head -c 8 /dev/zero >> asset.bin
+git add -A && git commit -qm "a file git reads as binary"
+expect "a file that cannot be read as text is refused, not passed over" files 1 "cannot read as text"
+expect "and it is named, so it can be reviewed onto the path allow-list" files 1 "asset.bin"
+
+# The path allow-list holds git pathspecs, and a pathspec may hold a space or a hash. Deleting
+# every space in the line and cutting at the first hash rewrote both into a different path than the
+# reviewer approved - silently, and in the widening direction for the hash.
+fresh_repo
+seed_file "release notes.md" "$han"
+printf 'release notes.md\n' > .cjk-allowlist
+git add -A && git commit -qm allowlist
+expect "a path allow-list entry holding a space exempts that file" files 0 "clean: every character in tracked files"
+
+fresh_repo
+seed_file 'c#-notes.md' "$han"
+printf 'c#-notes.md\n' > .cjk-allowlist
+git add -A && git commit -qm allowlist
+expect "a path allow-list entry is not cut short at a hash" files 0 "clean: every character in tracked files"
+
+fresh_repo
+seed_file doc.md "$han"
+printf '   # doc.md\n' > .cjk-allowlist
+git add -A && git commit -qm allowlist
+expect "an indented comment in the path allow-list is still a comment" files 1 "doc.md:1"
+
 # Big enough that the report does not fit in a pipe buffer, which is the only size at which this
 # goes wrong. The findings are truncated to fifty and the count of the rest, and the advice line
 # after them says what to do about it - and both of those are printed AFTER the truncation, so a
@@ -152,6 +205,8 @@ echo more > file.txt; git add -A
 git commit -q -m "$(yes "subject ${han}" | head -3000)"
 EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
   expect "the same holds for a large commit-message report" messages 1 "Rewrite the message"
+EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
+  expect "and it says how many findings were cut, as the file report does" messages 1 "and 2950 more"
 
 echo "the allow-list itself"
 
@@ -455,6 +510,23 @@ if [ "$code" = 1 ] && printf '%s' "$out" | grep -qF "needs a mode"; then
   passed=$((passed + 1))
 else
   printf '  FAIL  %s\n        got exit %s: %s\n' "no mode at all is refused" "$code" "$out"
+  failed=$((failed + 1))
+fi
+
+# git grep says 1 for "nothing matched" and 128 for "there is no work tree here". Both used to be
+# discarded alike, so a scan that never ran printed the same clean line as a clean tree - which is
+# what the commit-message mode refuses by name, and what this mode did anyway. Driven from outside
+# a repository because that is the one trigger needing no fixture: a build without PCRE and a
+# pathspec git cannot parse arrive at the same place.
+mkdir -p "$scratch/norepo" && cd "$scratch/norepo" || exit 1
+printf 'a %s b\n' "$han" > doc.md
+out="$(CHARSET_ALLOWLIST="$real_allowlist" bash "$gate" files 2>&1)"; code=$?
+if [ "$code" = 1 ] && printf '%s' "$out" | grep -qF "could not run"; then
+  printf '  ok    %s\n' "a scan that could not run is refused, not reported clean"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s\n        got exit %s: %s\n' \
+    "a scan that could not run is refused, not reported clean" "$code" "$out"
   failed=$((failed + 1))
 fi
 

@@ -23,7 +23,8 @@
 # Three modes, one per thing that gets asked about, so each keeps its own step and its own
 # narrowing:
 #
-#   files      scan tracked files. Honours the path allow-list (git pathspec, one per line).
+#   files      scan the names and the contents of tracked files. Honours the path allow-list
+#              (git pathspec, one per line).
 #   messages   scan commit messages. Reads EVENT_NAME, BASE_REF, EVENT_BEFORE, EVENT_SHA.
 #   text       name the unknown characters in stdin, and exit 0 either way. A question, not a
 #              gate - see the mode itself for why that difference is load-bearing.
@@ -163,14 +164,65 @@ case "${1:-}" in
     pathspec=(':(top)' ':(top,exclude)AUTHORS')
     if [ -f "$PATH_ALLOWLIST" ]; then
       while IFS= read -r line; do
-        line="${line%%#*}"
-        line="$(printf '%s' "$line" | tr -d '[:space:]')"
-        [ -z "$line" ] && continue
+        # Only the ends are trimmed, and only a whole line is a comment. Deleting every space in
+        # the line turned `docs/release notes.md` into a path that excludes nothing, and cutting at
+        # the first `#` turned `docs/c#-notes.md` into the directory `docs/c` - both legal paths,
+        # both silently made into a different one than the person who was reviewed wrote.
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        case "$line" in '' | \#*) continue ;; esac
         pathspec+=(":(top,exclude)$line")
       done < "$PATH_ALLOWLIST"
     fi
 
-    hits="$(git grep -nP "$UNKNOWN" -- "${pathspec[@]}" || true)"
+    # A name is not in any file's bytes, so it takes its own pass. git grep reads content, and a
+    # tree whose file names carry kana - or a right-to-left override, which is the whole point of
+    # naming that one - was reported clean. Quoting is turned off so a path arrives as its own
+    # bytes rather than as backslash escapes, which are ASCII and would hide what is being sought.
+    rc=0
+    paths="$(git -c core.quotePath=false ls-files -- "${pathspec[@]}")" || rc=$?
+    if [ "$rc" != 0 ]; then
+      echo "::error::the scan of tracked files could not run (git ls-files exit ${rc}), so nothing was checked."
+      echo "a scan that could not look is not a scan that found nothing."
+      exit 1
+    fi
+    names="$(printf '%s\n' "$paths" | awk '{printf "%s:0:%s\n", $0, $0}' | name_unknown)"
+    if [ -n "$names" ]; then
+      echo "::error::character(s) not on the allow-list, in the name(s) of tracked files:"
+      printf '%s\n' "$names" | head -50 || true
+      echo "rename the file, or add the character to ${CHARSET_ALLOWLIST} if English typesetting here needs it."
+      exit 1
+    fi
+
+    # git grep says 1 for "nothing matched" and 2 or more for "could not look" - a pathspec it
+    # cannot parse, a build without PCRE, no work tree at all. Discarding both alike printed the
+    # clean line over a scan that never ran, which is the shape the messages mode below refuses by
+    # name and this one used to produce.
+    #
+    # NO CASE REACHES THIS ONE, and that is worth saying rather than leaving to be discovered. The
+    # cases drive the pass above out of a directory that is no work tree, and ls-files fails there
+    # first; the only trigger that gets past it and stops here is a git built without PCRE, which
+    # no fixture can produce. It is kept because that git exists and the failure is silent without
+    # it, not because anything holds it honest.
+    rc=0
+    hits="$(git grep -nP "$UNKNOWN" -- "${pathspec[@]}")" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+      echo "::error::the scan of tracked files could not run (git grep exit ${rc}), so nothing was checked."
+      echo "a scan that could not look is not a scan that found nothing."
+      exit 1
+    fi
+
+    # A file git reads as binary is reported as `Binary file <path> matches`, with no line number -
+    # and the reporting below drops every line without one, so whatever it holds left the report
+    # without a trace. It cannot be read as text, so it is named as unscanned rather than dropped.
+    binary="$(printf '%s\n' "$hits" | sed -n 's/^Binary file \(.*\) matches$/\1/p')"
+    if [ -n "$binary" ]; then
+      echo "::error::file(s) this check cannot read as text, so their contents were not scanned:"
+      printf '%s\n' "$binary" | sed 's/^/  /'
+      echo "add the path to ${PATH_ALLOWLIST} if it is an asset rather than text."
+      exit 1
+    fi
+
     found="$(printf '%s' "$hits" | name_unknown)"
     if [ -n "$found" ]; then
       echo "::error::character(s) not on the allow-list, in tracked files:"
@@ -233,6 +285,8 @@ case "${1:-}" in
     if [ -n "$found" ]; then
       echo "::error::character(s) not on the allow-list, in commit message(s):"
       printf '%s' "$found" | head -50 || true   # see the tracked-files mode: SIGPIPE, and pipefail
+      total="$(printf '%s' "$found" | wc -l | tr -d ' ')"
+      [ "$total" -gt 50 ] && echo "  ... and $((total - 50)) more"
       echo "commit messages here are English. Rewrite the message with git commit --amend or git rebase."
       exit 1
     fi
