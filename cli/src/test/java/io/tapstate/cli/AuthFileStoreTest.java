@@ -132,6 +132,22 @@ class AuthFileStoreTest {
     }
 
     @Test
+    void acceptsJsonEscapesWhileScanningTheAuthCache(@TempDir Path home) throws IOException {
+        AuthFileStore store = AuthFileStore.underHome(home);
+        Path authDir = Files.createDirectories(home.resolve(".tapstate/auth"));
+        ownerOnlyDirectory(home.resolve(".tapstate"));
+        ownerOnlyDirectory(authDir);
+        Path authFile = authDir.resolve(AUTH_REF + ".json");
+        String escapedPrincipal = "a\\\"b\\\\c\\/d\\b\\f\\n\\r\\t\\u0041";
+        Files.writeString(authFile, validJson().replace("\"principal\":\"admin\"",
+                "\"principal\":\"" + escapedPrincipal + "\""), StandardCharsets.UTF_8);
+        ownerOnlyFile(authFile);
+
+        assertThat(store.load(AUTH_REF, CONTEXT_ID)).get().extracting(AuthSessionRecord::principal)
+                .isEqualTo("a\"b\\c/d\b\f\n\r\tA");
+    }
+
+    @Test
     void doesNotEchoOpaqueSessionMaterialFromAnInvalidCacheDocument(@TempDir Path home) throws IOException {
         AuthFileStore store = AuthFileStore.underHome(home);
         Path authDir = Files.createDirectories(home.resolve(".tapstate/auth"));
