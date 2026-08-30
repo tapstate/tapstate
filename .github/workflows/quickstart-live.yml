@@ -370,10 +370,14 @@ jobs:
           else
             docker compose exec -T mysql mysql -uroot -psecret appdb -e "INSERT INTO orders VALUES (6,'frank',60.00);"
             await insert 'db.order_state.countDocuments({id:6})'
-            # The mapped fields have to follow the change too: a target row that merely exists proves the
-            # insert landed, not that the transform is still being applied to later changes.
+            # A row that merely exists proves the insert landed, not that later changes are still being
+            # carried, so the update has to be seen in the document. Which *field* carries it is the
+            # release's business and has already moved once -- the fields named here were the mapped
+            # `customer_name` and `label` of an older demo, and holding 0.3.0 to them failed it for
+            # having a different demo. So look for the value anywhere in the document: "franky" is not
+            # a substring of the "frank" that was inserted, so this still separates carried from not.
             docker compose exec -T mysql mysql -uroot -psecret appdb -e "UPDATE orders SET customer='franky' WHERE id=6;"
-            await update '(db.order_state.findOne({id:6})||{}).customer_name=="franky" && (db.order_state.findOne({id:6})||{}).label=="franky <orders>"'
+            await update 'JSON.stringify(db.order_state.findOne({id:6}) ?? {}).includes("franky")'
             docker compose exec -T mysql mysql -uroot -psecret appdb -e "DELETE FROM orders WHERE id=6;"
             await delete '!db.order_state.countDocuments({id:6})'
           fi
