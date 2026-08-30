@@ -20,17 +20,20 @@
 # reporting clean until a person happened to read the diff. A false green and a real green are the
 # same text, so the cases are the only thing that tells them apart.
 #
-# Three modes, one per thing that gets scanned, so each keeps its own step and its own narrowing:
+# Four modes, one per thing that gets asked about, so each keeps its own step and its own
+# narrowing:
 #
 #   files      scan tracked files. Honours the path allow-list (git pathspec, one per line).
 #   messages   scan commit messages. Reads EVENT_NAME, BASE_REF, EVENT_BEFORE, EVENT_SHA.
 #   pr-body    scan a pull request body. Reads PR_BODY.
+#   text       name the unknown characters in stdin, and exit 0 either way. A question, not a
+#              gate - see the mode itself for why that difference is load-bearing.
 #
 # Paths are read from CHARSET_ALLOWLIST and PATH_ALLOWLIST so a copy of this script can run in a
 # repository that keeps them elsewhere.
 #
-# Exits 0 with a "clean:" line, or 1 naming every unknown character with its code point and where
-# it is.
+# The scanning modes exit 0 with a "clean:" line, or 1 naming every unknown character with its
+# code point and where it is. `text` is the exception and says so where it is defined.
 set -euo pipefail
 
 # A UTF-8 locale is required so PCRE treats the pattern as code points rather than bytes. Set,
@@ -102,7 +105,7 @@ if [ -n "${CHARSET_UNKNOWN_PATTERN:-}" ]; then
 fi
 
 # Turn "file:line:text" on stdin into one report line per unknown character. The same function
-# serves all three modes, so a character is named the same way wherever it was found - and so the
+# serves every mode, so a character is named the same way wherever it was found - and so the
 # one exemption below holds everywhere rather than in whichever mode someone remembered.
 #
 # A person's name is not English prose and is not ours to constrain. Sign-off and authorship
@@ -246,8 +249,25 @@ case "${1:-}" in
     echo "clean: every character in the pull request body is on the allow-list."
     ;;
 
+  text)
+    # Answers a question; it does not gate. Reads text on stdin and prints the unknown characters
+    # in it, one per line, and nothing at all when there are none. Exit status says only whether
+    # the check could run: a non-zero exit here means the allow-list guards above refused, never
+    # that the text was dirty. Read the output for that.
+    #
+    # The one caller is the intake translator, which asks "was this report written in English" and
+    # is a courtesy beside somebody's bug report - it must never fail, so a mode that reddened on
+    # finding something would be unusable to it. It also has to tell "this text is foreign" from
+    # "nobody could look", and a gate collapses those two into one non-zero exit.
+    #
+    # It goes through name_unknown like every other mode rather than asking the same question a
+    # second way. Two spellings of "which characters are English here" drift, and the drift shows
+    # up as one of them quietly answering for the other.
+    awk '{printf "(text):%d:%s\n", NR, $0}' | name_unknown
+    ;;
+
   *)
-    echo "::error::no-cjk.sh needs a mode: files | messages | pr-body (got '${1:-}')."
+    echo "::error::no-cjk.sh needs a mode: files | messages | pr-body | text (got '${1:-}')."
     exit 1
     ;;
 esac

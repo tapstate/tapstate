@@ -13,10 +13,10 @@
 #
 # That last clause is the whole reason the wording below is fussy. A quiet failure and a thing that
 # was never wired up produce identical evidence - an issue with no translation under it - so each
-# refusal names itself: no key configured, body empty, body too long, engine unreachable, engine
-# said nothing usable, already English, GitHub refused the comment. Those are seven different
-# sentences on purpose. "It ran and decided not to speak" and "this has been dead for a month" are
-# otherwise the same observation.
+# refusal names itself: no key configured, body empty, body too long, the character allow-list
+# unreadable, engine unreachable, engine said nothing usable, already English, GitHub refused the
+# comment. Those are eight different sentences on purpose. "It ran and decided not to speak" and
+# "this has been dead for a month" are otherwise the same observation.
 #
 # THE REPORT'S TEXT IS DATA, BOTH WAYS.
 #   Inbound: a stranger writes ISSUE_BODY. It is read from the environment and reaches the request
@@ -58,16 +58,39 @@ better as an attachment than as a report body."
 # input catches a paraphrase. Whether text is English is not a question to put to the thing being
 # asked to translate it, and the second failure is what makes that a rule rather than a preference.
 #
-# The test is a byte test: a report written in another language carries characters outside ASCII.
+# The test is a character test, and the characters are not enumerated here. They are in
+# `.github/charset-allowlist.txt`, read through the same script the character check reads it with,
+# because "which characters does English typesetting here use" written down in two places is written
+# down wrong in one of them - and the copy that drifts goes on answering for the other without
+# saying so.
+#
+# It used to be a byte test: anything outside ASCII meant the report was not English. Measured
+# 2026-08-28 on our own issues, that criterion never fired once - #84, #88 and #91 all carry em
+# dashes, because English prose uses them, so all three went to the engine and one came back as a
+# rewrite of its own English. A criterion that is right about everything and a criterion that never
+# fires leave the same evidence until somebody goes and looks.
+#
+# Three answers, not two. Every character is one we use -> English. Something here is not on the
+# list -> translate it. The list could not be read -> neither of those, and it says so: an
+# unreadable list would otherwise read as a report written entirely in some other language, which
+# is the one wrong answer that looks exactly like a right one.
 #
 # KNOWN LIMIT, written down rather than discovered later: a language that is written in plain ASCII
 # - Indonesian, Dutch, Portuguese with the accents dropped - is skipped here as though it were
 # English. That is the price of a check that cannot be talked out of its answer. It fails towards
 # silence, which is the safer of the two directions: a missing translation is visible to the person
 # who needed it, while a translation of English into English is noise nobody asks about.
-if ! printf '%s' "$body" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
-  say "Not translated: the report is plain ASCII, which this reads as already in English.
-Nothing was sent to the translation engine."
+here="$(cd "$(dirname "$0")" && pwd)"
+export CHARSET_ALLOWLIST="${CHARSET_ALLOWLIST:-$here/../charset-allowlist.txt}"
+if ! unknown="$(printf '%s' "$body" | bash "$here/no-cjk.sh" text 2>&1)"; then
+  say "Skipped: the character allow-list could not be read, so whether this report was written in
+English is unknown. Nothing was sent to the translation engine.
+
+$unknown"
+fi
+if [ -z "$unknown" ]; then
+  say "Not translated: every character in the report is one this repository's English typesetting
+uses, which this reads as already in English. Nothing was sent to the translation engine."
 fi
 [ -n "${TRANSLATE_API_KEY:-}" ] || say \
   "Skipped: no engine is configured. This run reached the step and found no API key, so the key is
