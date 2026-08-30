@@ -99,5 +99,27 @@ has  "and GitHub appends its own list"        draft  'generate_release_notes: tr
 # The draft is a draft, and creates no tag until somebody publishes it.
 has "the release starts as a draft"           draft  'draft: true'
 
+# --- every needs.<job>.outputs.<name> is one the job actually declares --------------------------
+# An undeclared output is not an error anywhere: the expression resolves to the empty string, the
+# step runs with a missing argument, and what fails is whatever the argument was for -- somewhere
+# else, saying something else. This one shipped: the tag the version counted up from was written to
+# the step's output and never lifted to the job's, so both jobs that read the release range would
+# have received nothing and refused every release.
+missing=""
+while IFS= read -r ref; do
+  [ -n "$ref" ] || continue
+  from="$(printf '%s' "$ref" | cut -d. -f2)"
+  what="$(printf '%s' "$ref" | cut -d. -f4)"
+  job "$from" | awk '/^    outputs:$/ { inside = 1; next } /^    [a-z]/ { inside = 0 } inside' \
+    | grep -qE "^      ${what}:" || missing="${missing} ${ref}"
+done <<EOF
+$(grep -oE 'needs\.[a-z][a-z0-9_-]*\.outputs\.[a-z_][a-z0-9_]*' "$workflow" | sort -u)
+EOF
+if [ -z "$missing" ]; then
+  ok "every output read from another job is one that job declares"
+else
+  bad "every output read from another job is one that job declares" "undeclared:${missing}"
+fi
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

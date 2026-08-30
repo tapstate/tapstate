@@ -62,6 +62,10 @@ jobs:
       tag: ${{ steps.next.outputs.tag }}
       is_latest: ${{ steps.next.outputs.is_latest }}
       sha: ${{ steps.sha.outputs.sha }}
+      # The tag the version was counted up from. Two jobs downstream need the same range -- the
+      # documentation gate and the notes -- and working it out a second time is a second chance to
+      # take the newest tag in the repository rather than the newest one on this commit's ancestry.
+      base: ${{ steps.next.outputs.base }}
     steps:
       # Full history and every tag: the version is counted up from the newest version tag on this
       # commit's own ancestry, and a shallow checkout can see neither the ancestry nor the tags.

@@ -122,6 +122,37 @@ rm -f "$scratch/issue/24"
 expect "a missing follow-up issue blocks a minor"  minor 1 "no follow-up issue"
 expect "and blocks a patch too"                    patch 1 "no follow-up issue"
 
+# "The documentation repository could not be read" and "there is no follow-up issue" are the same
+# empty list, and only one of them is about documentation. Sending somebody to open an issue that is
+# already there is the cost of folding them together.
+cat > "$scratch/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  pr)
+    for a in "$@"; do case "$a" in [0-9]*) n="$a"; break ;; esac; done
+    [ -f "$SMOKE_SCRATCH/pr/$n" ] || exit 1
+    cat "$SMOKE_SCRATCH/pr/$n" ;;
+  issue) echo "HTTP 404: Not Found" >&2; exit 1 ;;
+  *) exit 1 ;;
+esac
+STUB
+expect "an unreadable docs repository is not a missing issue" minor 1 "could not read"
+refute "and it is not reported as a missing issue"            minor "no follow-up issue"
+
+cat > "$scratch/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  pr)
+    for a in "$@"; do case "$a" in [0-9]*) n="$a"; break ;; esac; done
+    [ -f "$SMOKE_SCRATCH/pr/$n" ] || exit 1
+    cat "$SMOKE_SCRATCH/pr/$n" ;;
+  issue)
+    for a in "$@"; do case "$a" in *"/pull/"*) u="${a##*/pull/}" ;; esac; done
+    cat "$SMOKE_SCRATCH/issue/${u:-none}" 2>/dev/null || echo '[]' ;;
+  *) exit 1 ;;
+esac
+STUB
+
 # An empty range is a real release shape, not a pass to be manufactured.
 git -C "$repo" reset -q --hard v0.3.0
 expect "an empty range passes and says it was empty" minor 0 "no pull requests"

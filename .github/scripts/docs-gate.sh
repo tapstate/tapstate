@@ -79,7 +79,15 @@ for n in $numbers; do
 
   # The issue `docs-followup.yml` opens on merge, found by the link back to this pull request that it
   # writes into the body. Looked up by that link rather than by title: a title is edited.
-  issue="$(gh issue list --repo "$docs_repo" --state all --search "$url" --json number,state 2>/dev/null)" || issue=""
+  if ! issue="$(gh issue list --repo "$docs_repo" --state all --search "$url" --json number,state 2>&1)"; then
+    # Not the same thing as finding no issue, and reported as itself. The credential that can read
+    # that repository is a separate one; without it this call fails, and folded into "no follow-up
+    # issue" it would send somebody to open an issue that is already there.
+    echo "::error::could not read ${docs_repo} to look for #${n}'s follow-up issue: ${issue}"
+    echo "    That is a missing credential, not a missing issue. Nothing here says whether the documentation exists."
+    fail=1
+    continue
+  fi
   number="$(printf '%s' "${issue:-[]}" | jq -r 'first(.[].number) // empty' 2>/dev/null)"
   if [ -z "$number" ]; then
     echo "::error::#${n} carries \`docs-needed\` and has no follow-up issue in ${docs_repo} — the label is what opens it, so the documentation owner was never told — ${url}"
