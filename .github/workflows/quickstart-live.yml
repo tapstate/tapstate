@@ -93,12 +93,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/script"
           script="$RUNNER_TEMP/script/quickstart.sh"
           if [ "$LEG" = published ]; then
-            # Version tags only. The release list also carries the connector-jar prerelease, which is
-            # re-published on its own schedule and would otherwise become "the newest release".
-            tag="$(gh release list --limit 30 --exclude-drafts --json tagName \
-                     --jq 'map(select(.tagName | startswith("v"))) | first | .tagName')"
-            [ -n "$tag" ] && [ "$tag" != null ] \
-              || { echo "no published version tag to run the published leg against" >&2; exit 1; }
+            tag="$(.github/scripts/latest-release-tag.sh)"
             raw="https://raw.githubusercontent.com/$REPO/$tag"
             curl -fsSL "$raw/deploy/quickstart/quickstart.sh" -o "$script"
             curl -fsSL "$raw/deploy/quickstart/docker-compose.yml" -o "$RUNNER_TEMP/script/compose.yml"

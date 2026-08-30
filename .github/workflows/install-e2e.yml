@@ -119,9 +119,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          tag="$(gh release list --limit 30 --exclude-drafts --json tagName \
-                   --jq 'first | .tagName')"
-          test -n "$tag" || { echo "no published release to compare the edge against" >&2; exit 1; }
+          tag="$(.github/scripts/latest-release-tag.sh)"
           echo "newest published release: $tag"
           git fetch --quiet origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null || true
           site="$(mktemp -d)"

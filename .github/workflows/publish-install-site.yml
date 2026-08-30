@@ -90,10 +90,8 @@ jobs:
           set -eu
           tag="${INPUT_TAG:-${EVENT_TAG:-}}"
           if [ -z "$tag" ]; then
-            tag="$(gh release list --limit 30 --exclude-drafts --json tagName \
-                     --jq 'first | .tagName')"
+            tag="$(.github/scripts/latest-release-tag.sh)"
           fi
-          test -n "$tag" || { echo "no published release to publish" >&2; exit 1; }
           echo "publishing tag: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
