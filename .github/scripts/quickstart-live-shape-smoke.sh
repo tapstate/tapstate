@@ -71,7 +71,10 @@ done
 
 live="$(job quickstart-live)"
 upgrade="$(job quickstart-upgrade)"
-[ -n "$live" ] && [ -n "$upgrade" ] || { echo "one of the two jobs read back empty" >&2; exit 1; }
+if [ -z "$live" ] || [ -z "$upgrade" ]; then
+  echo "one of the two jobs read back empty" >&2
+  exit 1
+fi
 
 # --- the arm64 leg -------------------------------------------------------------------------------
 has "the live lane has an arm64 leg, on an arm runner" "$live" \
