@@ -238,8 +238,194 @@ jobs:
           path: ${{ runner.temp }}/server-image.tar
           if-no-files-found: error
 
+  connectors:
+    # The one lane that drives real Tapdata connectors, started here so it overlaps the build
+    # instead of following it. It is not in any merge gate -- the default build has no connector
+    # jars -- so without this a release could go out having never been run against the connectors
+    # at all, which is the first thing a user touches.
+    #
+    # Dispatched, not waited on here: this job starts it and the gate below joins. Measured medians
+    # are ~38 minutes for the lane against ~7 for everything else, so starting it after the build
+    # would add the whole 38 to every release rather than overlapping it.
+    #
+    # `workflow_dispatch` takes a branch or tag, never a bare commit. When the release commit is the
+    # tip of the ref this was dispatched from, that ref is the commit and the lane can be started.
+    # When it is not -- a fix built from an older line's branch -- nothing is started, and the gate
+    # then asks for a run that already exists on that commit. It refuses if there is none, which is
+    # the correct answer: it says the lane has not seen this commit.
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write   # dispatch the connector lane
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: start the real-connector lane on the commit being released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tip="$(gh api "repos/${{ github.repository }}/commits/${GITHUB_REF_NAME}" --jq '.sha' 2>/dev/null || true)"
+          if [ "$tip" != "${{ needs.version.outputs.sha }}" ]; then
+            echo "The release commit is not the tip of ${GITHUB_REF_NAME}, so the lane cannot be dispatched at it."
+            echo "The gate will ask for a run that already succeeded on ${{ needs.version.outputs.sha }}."
+            exit 0
+          fi
+          gh workflow run nightly-real-connectors.yml --ref "${GITHUB_REF_NAME}"
+          echo "Dispatched the real-connector lane on ${GITHUB_REF_NAME} (${tip})."
+
+  gates:
+    # The release gate. Six conditions, all decided by machine, none of them a box a person can tick
+    # -- a switch somebody can flip is not a check, and every one of them is another way to produce a
+    # release that did not go the standard way.
+    #
+    # Two of the six are not steps here, because they are already the reason this job can run at all,
+    # and re-asserting them would be this workflow grading its own dependency graph:
+    #
+    #   2. the release smoke tests are green   `cli-native` runs the native and MCP smokes against
+    #                                          each produced binary; a red one fails that job and
+    #                                          nothing downstream of it starts
+    #   3. the distribution is complete        `release-manifest.sh`, in the job below, opening every
+    #                                          asset before the draft is assembled
+    #
+    # The four that are steps are the ones nothing else was asking.
+    needs: [version, connectors, cli-native, server-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0   # the notes and the docs gate both read the range back to the previous tag
+
+      - name: The gates still decide the way they are supposed to
+        run: |
+          shellcheck .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh \
+            .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh \
+            .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh \
+            .github/scripts/docs-impact.sh .github/scripts/_pr-section.sh
+          bash .github/scripts/checks-on-commit-smoke.sh
+          bash .github/scripts/docs-gate-smoke.sh
+          bash .github/scripts/release-notes-smoke.sh
+
+      # 1. The required checks ran on this commit and were green. Not "the last run was green" -- the
+      #    set is read from the branch's rules at this moment rather than copied into this file, and
+      #    every name in it has to be present before any conclusion is looked at.
+      - name: 1. the required checks are green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/checks-on-commit.sh \
+            --sha "${{ needs.version.outputs.sha }}" \
+            --from-ruleset "${{ github.event.repository.default_branch }}"
+
+      # 6. And so is the connector lane, which no merge gate covers. This is where the lane started
+      #    in `connectors` is joined: poll until it has finished on this commit, then judge it the
+      #    same way as everything else. Failing closed in both directions is the point -- a lane that
+      #    never started and a lane still running are both refusals, and neither can be read off a
+      #    count of failures.
+      - name: 6. the real-connector lane is green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deadline=$(( SECONDS + 75 * 60 ))
+          until .github/scripts/checks-on-commit.sh --sha "${{ needs.version.outputs.sha }}" --required real-connectors; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::the real-connector lane has not finished on ${{ needs.version.outputs.sha }} within 75 minutes"
+              exit 1
+            fi
+            echo "waiting for the real-connector lane..."
+            sleep 60
+          done
+
+      # 4. Every pull request in this release's range answered its documentation impact, and the ones
+      #    that said documentation was needed have it. How strictly the second half is read comes from
+      #    this release's own bump, which is the only semantic thing a person stated.
+      - name: 4. the documentation for this range has landed
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_REPO_TOKEN || github.token }}
+        run: |
+          .github/scripts/docs-gate.sh \
+            --base "${{ needs.version.outputs.base }}" \
+            --sha "${{ needs.version.outputs.sha }}" \
+            --bump "${{ inputs.bump }}"
+
+      # 5. The notes exist, assembled rather than remembered. Assembling them here rather than in the
+      #    job that creates the draft is what makes this a gate: a range that cannot be collected, or
+      #    a base tag that is not in this history, stops the release instead of producing a release
+      #    with an empty body.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-minimum-*
+          path: minimums
+          merge-multiple: true
+      # Publish the minimums as an asset the installer reads, and say the same thing in the notes. Both
+      # come from the same measurement, so the promise made to a reader and the check made on a user's
+      # machine can never drift apart -- and neither needs anyone to remember to update a number.
+      - name: platform-minimums.txt + the requirement sentences for the notes
+        shell: bash
+        run: |
+          cat minimums/*.minimum | sort > platform-minimums.txt
+          cat platform-minimums.txt
+          # One sentence per requirement kind: a single version when every platform agrees, and per
+          # platform when they do not, which they need not -- the legs are built on separate machines.
+          summarize() {   # $1 = requirement, $2 = how to name it to a reader
+            local distinct
+            distinct="$(awk -v k="$1" '$2 == k { print $3 }' platform-minimums.txt | sort -uV)"
+            [ -n "$distinct" ] || return 0
+            if [ "$(echo "$distinct" | wc -l)" -eq 1 ]; then
+              echo "Recommended $2: $distinct or newer."
+            else
+              echo "Recommended $2: $(awk -v k="$1" '$2 == k { printf "%s%s or newer on %s", sep, $3, $1; sep="; " } END { print "." }' platform-minimums.txt)"
+            fi
+          }
+          {
+            echo "MACOS_REQ=$(summarize macos macOS)"
+            echo "GLIBC_REQ=$(summarize glibc glibc)"
+          } | tee -a "$GITHUB_ENV"
+      - name: 5. the release notes assemble
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/release-notes.sh \
+            --version "${{ needs.version.outputs.version }}" \
+            --base "${{ needs.version.outputs.base }}" \
+            --sha "${{ needs.version.outputs.sha }}" \
+            --macos-req "${MACOS_REQ}" \
+            --glibc-req "${GLIBC_REQ}" \
+            > release-notes.md
+          test -s release-notes.md
+      # Both halves of what the next job needs from this one: the body it publishes, and the asset
+      # whose numbers that body quotes. One measurement, so the sentence a reader is given and the
+      # check made on their machine cannot drift apart.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: |
+            release-notes.md
+            platform-minimums.txt
+          if-no-files-found: error
+
+      - name: what the gate decided
+        run: |
+          {
+            echo "### Release gate for ${{ needs.version.outputs.tag }}"
+            echo
+            echo "| | gate | where it was decided |"
+            echo "|---|---|---|"
+            echo "| 1 | required CI green on \`${{ needs.version.outputs.sha }}\` | this job |"
+            echo "| 2 | release smoke green | \`cli-native\`, which this job needs |"
+            echo "| 3 | distribution complete | \`draft\`, before the release is assembled |"
+            echo "| 4 | documentation for the range has landed | this job |"
+            echo "| 5 | release notes assemble | this job |"
+            echo "| 6 | real-connector lane green on that commit | this job |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   draft:
-    needs: [version, cli-native, server-image]
+    needs: [version, cli-native, server-image, gates]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create the draft release
@@ -263,43 +449,23 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@v4
         with:
-          pattern: cli-minimum-*
-          path: minimums
-          merge-multiple: true
-      - uses: actions/download-artifact@v4
-        with:
           name: server-image
           path: image
+      # The body the gate assembled, and the minimums asset whose numbers that body quotes. Both are
+      # taken from the gate rather than rebuilt here: a body assembled twice can differ from the one
+      # that was checked, and a release whose notes were never gated is what gate 5 exists to prevent.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: notes
       - name: checksums (per-asset .sha256 + aggregate checksums.txt)
-        working-directory: staging
+        shell: bash
         run: |
+          cp notes/platform-minimums.txt staging/
+          cd staging
           for f in tapstate-*.tar.gz; do sha256sum "$f" > "$f.sha256"; done
           sha256sum tapstate-*.tar.gz > checksums.txt
           ls -la
-      # Publish the minimums as an asset the installer reads, and say the same thing in the notes. Both
-      # come from the same measurement, so the promise made to a reader and the check made on a user's
-      # machine can never drift apart -- and neither needs anyone to remember to update a number.
-      - name: platform-minimums.txt + the requirement sentences for the notes
-        shell: bash
-        run: |
-          cat minimums/*.minimum | sort > staging/platform-minimums.txt
-          cat staging/platform-minimums.txt
-          # One sentence per requirement kind: a single version when every platform agrees, and per
-          # platform when they do not, which they need not -- the legs are built on separate machines.
-          summarize() {   # $1 = requirement, $2 = how to name it to a reader
-            local distinct
-            distinct="$(awk -v k="$1" '$2 == k { print $3 }' staging/platform-minimums.txt | sort -uV)"
-            [ -n "$distinct" ] || return 0
-            if [ "$(echo "$distinct" | wc -l)" -eq 1 ]; then
-              echo "Recommended $2: $distinct or newer."
-            else
-              echo "Recommended $2: $(awk -v k="$1" '$2 == k { printf "%s%s or newer on %s", sep, $3, $1; sep="; " } END { print "." }' staging/platform-minimums.txt)"
-            fi
-          }
-          {
-            echo "MACOS_REQ=$(summarize macos macOS)"
-            echo "GLIBC_REQ=$(summarize glibc glibc)"
-          } | tee -a "$GITHUB_ENV"
       # Every check that can be made before anything leaves the runner, is made before anything leaves
       # the runner. What this catches is a release that looks successful and is missing a piece: a
       # platform the installer offers with no asset behind it, an architecture that quietly did not
@@ -321,35 +487,15 @@ jobs:
           # of every other version -- not here, and never by hand.
           draft: true
           name: tapstate ${{ needs.version.outputs.tag }}
-          # The "known limits" section below is not optional prose. A release of this runtime has to say
-          # out loud that an insert-only target can end up with duplicate rows, and that a change written
-          # while the change stream is still positioning itself can be missed -- neither has a scenario
-          # covering it, so a reader who is not told has no other way to find out. It must also claim
-          # neither production readiness nor exactly-once delivery. Removing or softening any of those
-          # four is a reviewed decision, never an edit made in passing.
-          body: |
-            Preview build — single-node, in-memory runtime, not for production.
-
-            Native CLI binaries for macOS (arm64 / x64) and Linux (x64 / arm64). Verify a download against
-            its `.sha256` or `checksums.txt` before use.
-
-            ${{ env.MACOS_REQ }} ${{ env.GLIBC_REQ }} (`sw_vers -productVersion` and `ldd --version`
-            report what a machine has.) Both are measured from these binaries and follow the build
-            machines, so they can move between releases; an older system may refuse to launch them. They
-            are recommendations, not gates — the installer names them and carries on rather than blocking
-            you. `platform-minimums.txt` carries the same numbers in machine-readable form.
-
-            ### Known limits in this preview
-
-            These are disclosed rather than fixed, and no shipped scenario covers either one. For a change
-            the connector has read, delivery is at-least-once — never exactly-once. The second limit below
-            is a change the connector never reads at all, which no delivery guarantee can cover.
-
-            * **Duplicate rows on an insert-only target.** Where the target does not upsert, the snapshot
-              read and the change-data-capture read overlap, and a row seen by both is written twice.
-            * **Changes lost while the change stream positions itself.** The position is recorded before
-              the snapshot runs and is not handed to the connector's stream read until afterwards, so a
-              change written to the source inside that window can be missed.
+          # The body was assembled and checked under gate 5. `body_path`, never an inline body: the
+          # four disclosures in it -- what an insert-only target can end up with, what a positioning
+          # change stream can miss, that this is not for production, and that delivery is at-least-once
+          # -- are load-bearing, and as a literal here nothing could assert they were still present.
+          body_path: notes/release-notes.md
+          # GitHub's own list of merged pull requests, appended after that body. It is the backstop for
+          # everything nobody wrote a sentence for, and it is the reason the assembled body never
+          # writes a "## What's Changed" of its own.
+          generate_release_notes: true
           files: |
             staging/tapstate-*.tar.gz
             staging/tapstate-*.tar.gz.sha256
@@ -514,8 +660,8 @@ jobs:
 
             ## Documentation impact
 
-            Docs affected: none
-            Follow-up issue: none
+            - **Draft in this repository:** none
+            - **Public page it is headed for:** none
 
             ### Release note
 
