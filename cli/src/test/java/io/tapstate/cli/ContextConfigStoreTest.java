@@ -97,6 +97,7 @@ class ContextConfigStoreTest {
         ContextConfigStore store = ContextConfigStore.underHome(home);
 
         assertRejectedAndUnchanged(store, config, "version: [not yaml\n", "cli.context-config-invalid");
+        assertRejectedAndUnchanged(store, config, "version: 1\ncontexts: {}\n", "cli.context-config-invalid");
         assertRejectedAndUnchanged(store, config, "version: 1\nversion: 1\ncontexts: {}\nworkspaceBindings: {}\n",
                 "cli.context-config-invalid");
         assertRejectedAndUnchanged(store, config, "version: 99\ncontexts: {}\nworkspaceBindings: {}\n",

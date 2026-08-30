@@ -8,6 +8,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ClusterIdentityServiceTest {
 
@@ -30,6 +31,14 @@ class ClusterIdentityServiceTest {
 
         assertThat(view.clusterId()).isEqualTo("01J5VIEW");
         assertThat(view.issuer()).isEqualTo("urn:tapstate:cluster:01J5VIEW");
+    }
+
+    @Test
+    void rejectsUnsafeClusterIdentityValuesBeforeTheyReachStorage() {
+        assertThatThrownBy(() -> new ClusterIdentity(" "))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new ClusterIdentity("tenant:other"))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     private static final class MemoryStore implements ClusterIdentityStore {

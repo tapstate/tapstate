@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class SessionServiceTest {
 
@@ -113,6 +114,17 @@ class SessionServiceTest {
         assertThat(service.logout("Bearer tss_id.secret", ISSUER)).isFalse();
         assertThat(store.exchangeCalls).isZero();
         assertThat(store.revokeCalls).isZero();
+    }
+
+    @Test
+    void rejectsIncompletePersistedSessionAndGrantRecords() {
+        assertThatThrownBy(() -> new SessionRecord("s01", "hash", "admin", "ADMIN", ISSUER,
+                false, null, NOW, NOW.plusSeconds(1), NOW.plusSeconds(2)))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new AccessTokenGrant("token", NOW, "", Scope.READ))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new CreatedSession("", NOW, NOW.plusSeconds(1)))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     private static SessionService service(MemorySessionStore store, Instant now) {

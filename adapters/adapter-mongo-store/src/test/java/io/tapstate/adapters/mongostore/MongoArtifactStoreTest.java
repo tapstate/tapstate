@@ -178,6 +178,18 @@ class MongoArtifactStoreTest {
                 .containsExactly("corrupt", "pipeline", "not: [valid", "stale-hash", false);
     }
 
+    @Test
+    void browseProjectionToleratesMissingOrNonTextMetadata() {
+        StoredArtifactRecord row = MongoArtifactStore.toStoredArtifactRecord(
+                new Document("_id", 42).append("canonical", 17));
+
+        assertThat(row.id()).isEqualTo("42");
+        assertThat(row.kind()).isEqualTo("unknown");
+        assertThat(row.canonicalForm()).isNull();
+        assertThat(row.contentHash()).isNull();
+        assertThat(row.readable()).isFalse();
+    }
+
     /** Normalizes raw YAML to its canonical form (the form the store persists). */
     private static String canonical(String raw) {
         return WRITER.write(PARSER.parse(raw));

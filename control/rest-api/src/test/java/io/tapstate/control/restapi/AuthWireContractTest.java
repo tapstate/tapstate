@@ -16,6 +16,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class AuthWireContractTest {
 
+    @Test
+    void legacyLoginResponseConstructorKeepsOptionalMetadataAbsent() {
+        LoginResponse response = new LoginResponse("legacy-token");
+
+        assertThat(response.token()).isEqualTo("legacy-token");
+        assertThat(response.scopes()).isNull();
+        assertThat(response.sessionToken()).isNull();
+    }
+
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String ACCESS_TOKEN = "access.jwt.fixture";
     private static final String ISSUER = "urn:tapstate:cluster:01J5FIXTURE";

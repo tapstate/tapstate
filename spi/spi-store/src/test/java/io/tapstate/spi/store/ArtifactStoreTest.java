@@ -104,6 +104,23 @@ class ArtifactStoreTest {
         assertThat(store.saveAll(List.of(source("localhost")), Map.of())).isEmpty();
     }
 
+    @Test
+    void defaultBrowseProjectionKeepsLegacyStoresReadable() {
+        DefaultingStore store = new DefaultingStore();
+        Resource resource = source("localhost");
+        store.saveAll(List.of(resource));
+
+        assertThat(store.listStored())
+                .singleElement()
+                .satisfies(row -> {
+                    assertThat(row.id()).isEqualTo("orders");
+                    assertThat(row.kind()).isEqualTo("source");
+                    assertThat(row.canonicalForm()).isEqualTo(WRITER.write(resource));
+                    assertThat(row.contentHash()).isEqualTo(hash(resource));
+                    assertThat(row.readable()).isTrue();
+                });
+    }
+
     private static Resource source(String host) {
         return source("orders", host);
     }
