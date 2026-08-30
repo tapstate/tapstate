@@ -597,8 +597,11 @@ jobs:
               i=$((i + 1)); sleep 1
             done
             echo "cdc: $1 never reached the target after the upgrade." >&2
-            echo "The store survived and '$PIPELINE' is still RUNNING in it -- so this is the" >&2
-            echo "reconciler not bringing that pipeline back, not the data being lost." >&2
+            echo "Nothing here is lost data: the step above showed every document carried over, and" >&2
+            echo "'$PIPELINE' is still RUNNING in the store. What stopped is the carrying. The last" >&2
+            echo "time this fired, the server log below showed the job restarted and the source" >&2
+            echo "connector attached to its position -- so read it for what did happen, not for a" >&2
+            echo "crash." >&2
             docker compose logs server --tail 200 >&2
             exit 1
           }
