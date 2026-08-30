@@ -335,5 +335,24 @@ check "the trigger is issues, not issue_comment" \
 check "the trigger fires on opened and edited" \
   "$(grep -qF 'types: [opened, edited]' "$yml" && echo 0 || echo 1)"
 
+
+# --- one list, and the reconciliation that keeps it one -------------------------------------------
+# "Which characters does English typesetting here use" is answered in three places: this script, the
+# character check's two scanning modes, and a vendored copy in the skills repository. The copy is
+# held by a checksum and a byte comparison. These two hold the other seam, which has no checksum
+# because it is not a copy - it is a delegation, and a delegation stops being one the moment
+# somebody finds it easier to write the test out again here.
+#
+# The behavioural half is already above: U+00F7 went onto the list, and issue #88's answer moved
+# with it. That says the two agree today. These say the reason they agree is that there is only one
+# answer, not two that currently coincide.
+check "the language decision is delegated, not re-implemented" \
+  "$(grep -qF 'no-cjk.sh" text' "$gate" && echo 0 || echo 1)"
+# Comment lines are dropped, for the same reason the workflow mode drops them: a comment naming a
+# code point explains the decision, it does not make one, and a case that reddens on the
+# explanation gets deleted rather than obeyed.
+check "and this script enumerates no code points of its own" \
+  "$(grep -vE '^[[:space:]]*#' "$gate" | grep -qE 'x\{[0-9A-Fa-f]{4}\}|U\+[0-9A-Fa-f]{4}' && echo 1 || echo 0)"
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
