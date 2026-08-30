@@ -6,7 +6,9 @@
 
 set -eu
 
-script="$(cd "$(dirname "$0")" && pwd)/next-version.sh"
+here="$(cd "$(dirname "$0")" && pwd)"
+script="$here/next-version.sh"
+repo="$(cd "$here/../.." && pwd)"
 failures=0
 
 check() {
@@ -60,6 +62,12 @@ check "a patch on the older line counts up from that line" "0.5.1" "$(answer "$d
 check "a release ahead of every tag is the latest"        "true"  "$(answer "$dir" minor main is_latest)"
 check "a fix on an older line is not the latest"          "false" "$(answer "$dir" patch line-0.5 is_latest)"
 
+# The tag it counted up from, handed back. The release-notes range and the changeset parity check both
+# need it, and both need this same ancestry rule -- working it out a second time downstream is how the
+# two come to disagree on which line a release belongs to.
+check "the base tag is reported, on main"                "v0.6.0" "$(answer "$dir" minor main base)"
+check "and on the older line it is that line's tag"      "v0.5.0" "$(answer "$dir" patch line-0.5 base)"
+
 rm -rf "$dir"
 
 # A repository with no version tag at all has nothing to count up from. Answering 0.0.1 or 1.0.0 would
@@ -86,6 +94,18 @@ else
     echo "ok   - an unknown bump refuses"
 fi
 rm -rf "$dir"
+
+# --- is_latest is what gates the write-back, and that is the whole of the condition ---------------
+# A fix to an older line must not open a pull request putting its version on the default branch: 0.5.1
+# over 0.6.0 walks the branch backwards, all six pins agree with each other so every existing check is
+# green, and the next release counts up from the wrong number.
+wf="$repo/.github/workflows/release.yml"
+if sed -n '/^  write-back:/,/^  [a-z]/p' "$wf" | grep -q "if: needs.version.outputs.is_latest == 'true'"; then
+    echo "ok   - the write-back pull request is opened only when this release is the newest line"
+else
+    echo "FAIL - the write-back pull request is not gated on is_latest"
+    failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures case(s) failed" >&2

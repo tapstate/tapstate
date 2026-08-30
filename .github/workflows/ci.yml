@@ -126,7 +126,7 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh
       - name: refresh driver cases
         run: bash scripts/refresh-catalog-smoke.sh
       - name: connector build cases
@@ -164,6 +164,11 @@ jobs:
       # way out, not read straight from the tag.
       - name: install-site entry point cases
         run: bash .github/scripts/site-from-tag-smoke.sh
+
+      # Vacuous against this tree -- no changeset exists yet -- so its cases seed their own. Running
+      # it here is what stops it from still being vacuous, and unnoticed, on the day one lands.
+      - name: changeset parity cases
+        run: bash .github/scripts/changeset-parity-smoke.sh
 
       # The gate itself, not its cases: six files pin the release version, and rewriting them from
       # <revision> has to be a no-op. Five of the six already had something watching them one at a

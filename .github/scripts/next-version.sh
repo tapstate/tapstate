@@ -9,6 +9,7 @@
 #   version=0.6.1
 #   tag=v0.6.1
 #   is_latest=false
+#   base=v0.6.0
 #
 # Counts up from the newest version tag that is an ANCESTOR of the commit being released, not from
 # the newest tag in the repository. Those differ exactly when they matter: once 0.6.0 is out, a fix
@@ -22,6 +23,11 @@
 # line, and both are wrong quietly: a user installing from the official entry point would land on the
 # older line, and the write-back would walk the default branch's version backwards in a pull request
 # where every pin agrees with every other and nothing looks amiss.
+#
+# base is the tag it counted up from, handed back rather than left to be worked out a second time.
+# Two things downstream need it -- the release-notes range and the changeset parity check -- and both
+# need the same ancestry rule, so a second `git describe` elsewhere is a second implementation of the
+# split this script exists to get right.
 #
 # Refuses rather than guessing, in three places: an unknown bump, an ancestry with no version tag on
 # it, and a version that already exists. A guessed version cannot be taken back once it is published.
@@ -42,6 +48,7 @@ if [ -z "$base" ]; then
     exit 1
 fi
 
+base_tag="$base"
 base="${base#v}"
 major="${base%%.*}"
 rest="${base#*.}"
@@ -71,3 +78,4 @@ fi
 echo "version=$version"
 echo "tag=v$version"
 echo "is_latest=$is_latest"
+echo "base=$base_tag"

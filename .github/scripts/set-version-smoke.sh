@@ -6,7 +6,9 @@
 
 set -eu
 
-script="$(cd "$(dirname "$0")" && pwd)/set-version.sh"
+here="$(cd "$(dirname "$0")" && pwd)"
+script="$here/set-version.sh"
+repo="$(cd "$here/../.." && pwd)"
 failures=0
 
 check() {
@@ -93,6 +95,34 @@ else
     echo "ok   - a renamed pin refuses"
 fi
 rm -rf "$dir"
+
+# --- the write-back pull request carries every pin this script writes ----------------------------
+# release.yml opens a pull request putting the released version onto the default branch, and it lists
+# the paths that pull request may contain. That list and the pins below are the same set stated twice.
+# A seventh pin added here and not there does not fail anything: the release run writes it, the pull
+# request quietly leaves it out, and the default branch keeps one file at the old version -- which is
+# exactly the single unwatched pin this script was written to end, back again by another route.
+wf="$repo/.github/workflows/release.yml"
+pinned="$(sed -n 's/^pin \([^ ]*\) .*/\1/p' "$here/set-version.sh" | sort)"
+listed="$(sed -n '/add-paths: |/,/^          [a-z]/p' "$wf" | sed -n 's/^            \([^ ]*\)$/\1/p' | sort)"
+if [ "$pinned" = "$listed" ]; then
+    echo "ok   - the write-back pull request lists exactly the files this script pins"
+else
+    echo "FAIL - the write-back pull request and this script disagree about which files pin a version"
+    diff <(printf '%s\n' "$pinned") <(printf '%s\n' "$listed") | sed 's/^/       /'
+    failures=$((failures + 1))
+fi
+
+# Both steps, not one. A push or a pull request made with the default GITHUB_TOKEN triggers no
+# workflow, so the required checks would be permanently absent; and giving the app token only to the
+# pull request step leaves checkout's persisted credentials to push the branch, which produces the
+# same absent checks and looks identical to the secret not being set.
+if [ "$(grep -c 'steps.token.outputs.token' "$wf")" -ge 2 ]; then
+    echo "ok   - the write-back gives its app token to checkout as well as to the pull request"
+else
+    echo "FAIL - the write-back does not give its app token to both checkout and the pull request"
+    failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures case(s) failed" >&2

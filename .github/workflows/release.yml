@@ -73,6 +73,17 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - id: next
         run: .github/scripts/next-version.sh "${{ inputs.bump }}" HEAD >> "$GITHUB_OUTPUT"
+      # A patch is cherry-picked onto a line that has been overtaken, and a changeset riding along on
+      # one is the failure nothing downstream can see: 0.5.1 takes a database to changeset 8, and
+      # 0.6.0 -- which knows up to 7 -- then refuses to start against every instance 0.5.1 upgraded.
+      # Both releases build, both install, and the two only ever meet on somebody's server.
+      #
+      # Vacuous today, and it says so in the log rather than passing in silence: no changeset exists
+      # in any tree yet. It is here now because the path that would carry one onto an old line is
+      # being built now, and a check added after the first patch release was not there for it.
+      - name: a patch ships the same changesets as the release it patches
+        if: inputs.bump == 'patch'
+        run: .github/scripts/changeset-parity.sh "${{ steps.next.outputs.base }}" HEAD
       - name: say what this run is about to make
         run: |
           {
@@ -440,6 +451,73 @@ jobs:
             echo "* image: \`ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}\`"
             echo "* floating \`latest\` marker moved here: ${{ needs.version.outputs.is_latest }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  write-back:
+    # The version this release just took is written into the default branch, so the next release
+    # counts up from it and the one-click demo on main points at something that exists.
+    #
+    # Only when this release is the newest line, and that condition is the whole job. Opening it for
+    # a fix to an older line walks the default branch's version *backwards* -- 0.5.1 over 0.6.0 --
+    # in a pull request where all six pins agree with each other, every existing check is green
+    # (they compare the six against each other, not against what came before), and the person
+    # merging it has no reason to look twice. Afterwards the demo on main installs an old tag and
+    # the next `bump=minor` counts up from the wrong number.
+    #
+    # Forgetting to merge this is soft: main stays a version behind, pinned to a release that exists
+    # and installs. That is why an app token is enough and no admin credential is wanted here -- this
+    # pull request goes through the same checks as any other, and is allowed to wait.
+    needs: [version, publish]
+    if: needs.version.outputs.is_latest == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Not GITHUB_TOKEN. A push or a pull request made with it triggers no push or pull_request
+      # workflow, by design, so every required check on the default branch would be permanently
+      # absent -- not unverified but unmergeable. The token goes to checkout as well as to the pull
+      # request step: with only the latter, the credentials checkout persisted are what push the
+      # branch, the checks stay absent, and it looks exactly like the secret not being set.
+      - id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.token.outputs.token }}
+          ref: ${{ github.event.repository.default_branch }}
+      - name: write the released version into every file that pins one
+        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.token.outputs.token }}
+          branch: ws/write-back-${{ needs.version.outputs.version }}
+          # Only the files that pin a version. Anything else in the tree at this point is not part of
+          # this change and would arrive as a diff nobody asked a reviewer to read.
+          add-paths: |
+            pom.xml
+            cli/src/main/java/io/tapstate/cli/Cli.java
+            control/mcp-server/src/main/resources/application.properties
+            deploy/quickstart/quickstart.sh
+            install/install.sh
+            deploy/quickstart/docker-compose.yml
+          title: "Write ${{ needs.version.outputs.version }} into the version pins"
+          commit-message: "Write ${{ needs.version.outputs.version }} into the version pins"
+          body: |
+            ${{ needs.version.outputs.tag }} is published and is the newest line, so the default
+            branch should say so.
+
+            Every one of these six files is written by `.github/scripts/set-version.sh`, which the
+            release run had already applied inside its own runner -- that write is never committed,
+            which is why the tag points at a tree still pinning the previous release and why this
+            pull request exists.
+
+            ## Documentation impact
+
+            Docs affected: none
+            Follow-up issue: none
+
+            ### Release note
+
+            none -- version pins only, no user-visible change.
 
   discard:
     # Rejected, timed out, or failed on the way. A draft left on the Releases page is the one thing a
