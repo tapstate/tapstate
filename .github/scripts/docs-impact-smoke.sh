@@ -24,7 +24,7 @@ expect() {
   local out code
   out="$(PR_BODY="$pr_body" PR_LABELS="$labels" PR_ACTOR="$actor" bash "$gate" 2>&1)"
   code=$?
-  if [ "$code" = "$want_code" ] && printf '%s' "$out" | grep -qF -- "$want_text"; then
+  if [ "$code" = "$want_code" ] && grep -qF -- "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"
     passed=$((passed + 1))
   else
@@ -38,7 +38,7 @@ refute() {
   local name="$1" unwanted="$2" pr_body="$3" labels="$4"
   local out
   out="$(PR_BODY="$pr_body" PR_LABELS="$labels" PR_ACTOR=someone bash "$gate" 2>&1)"
-  if printf '%s' "$out" | grep -qF -- "$unwanted"; then
+  if grep -qF -- "$unwanted" <<<"$out"; then
     printf '  FAIL  %s\n        did not want %s, got: %s\n' "$name" "$unwanted" "$out"
     failed=$((failed + 1))
   else

@@ -74,7 +74,7 @@ run() { ( cd "$repo" && bash "$script" --base v0.3.0 --sha HEAD --bump "$1" 2>&1
 expect() {   # name, bump, want exit, text
   local out code
   out="$(run "$2")"; code=$?
-  if [ "$code" = "$3" ] && printf '%s' "$out" | grep -qF -- "$4"; then
+  if [ "$code" = "$3" ] && grep -qF -- "$4" <<<"$out"; then
     printf '  ok    %s\n' "$1"; passed=$((passed + 1))
   else
     printf '  FAIL  %s\n        wanted exit %s containing %s\n        got exit %s: %s\n' "$1" "$3" "$4" "$code" "$out"
@@ -84,7 +84,7 @@ expect() {   # name, bump, want exit, text
 refute() {   # name, bump, text
   local out
   out="$(run "$2")"
-  if printf '%s' "$out" | grep -qF -- "$3"; then
+  if grep -qF -- "$3" <<<"$out"; then
     printf '  FAIL  %s\n        did not want %s, got: %s\n' "$1" "$3" "$out"; failed=$((failed + 1))
   else
     printf '  ok    %s\n' "$1"; passed=$((passed + 1))

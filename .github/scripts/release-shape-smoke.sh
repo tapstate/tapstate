@@ -42,8 +42,8 @@ jobs_list="$(awk '/^  [a-z][a-z0-9_-]*:[ \t]*$/ { gsub(/[ :]/, ""); print }' "$w
 ok()   { printf '  ok    %s\n' "$1"; passed=$((passed + 1)); }
 bad()  { printf '  FAIL  %s\n        %s\n' "$1" "$2"; failed=$((failed + 1)); }
 
-has()    { if job "$2" | grep -qE -- "$3"; then ok "$1"; else bad "$1" "job '$2' has no line matching /$3/"; fi }
-hasnt()  { if job "$2" | grep -qE -- "$3"; then bad "$1" "job '$2' still matches /$3/: $(job "$2" | grep -E -- "$3" | head -1)"; else ok "$1"; fi }
+has()    { if grep -qE -- "$3" <<<"$(job "$2")"; then ok "$1"; else bad "$1" "job '$2' has no line matching /$3/"; fi }
+hasnt()  { if grep -qE -- "$3" <<<"$(job "$2")"; then bad "$1" "job '$2' still matches /$3/: $(grep -E -- "$3" <<<"$(job "$2")" | head -1)"; else ok "$1"; fi }
 
 # --- the approval is upstream of everything irreversible -------------------------------------------
 has "the publish job waits on the approval" publish 'needs:.*approve'
@@ -54,9 +54,9 @@ has "the publish job waits on the approval" publish 'needs:.*approve'
 for j in $jobs_list; do
   case "$j" in publish) continue ;; esac
   body="$(job "$j")"
-  if printf '%s' "$body" | grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest='; then
+  if grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest=' <<<"$body"; then
     bad "no irreversible act in '$j'" \
-        "$(printf '%s' "$body" | grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=' | head -1)"
+        "$(grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=' <<<"$body" | head -1)"
   else
     ok "no irreversible act in '$j'"
   fi
@@ -79,6 +79,14 @@ hasnt "and does not run the release action again"    publish 'action-gh-release'
 has "a rejected run deletes its draft"        discard 'gh release delete'
 has "and it runs even when the run failed"    discard 'always\(\)'
 has "and only when nothing was published"     discard "publish.result != 'success'"
+
+# Gate 2 is the only one of the six with no step of its own: it is the smokes in `cli-native`, and it
+# blocks by being something the gate needs. Both halves are asserted, because either one going away
+# retires the gate in silence -- drop the smokes and the job still builds and still passes; drop the
+# dependency and a red smoke stops blocking anything downstream of it.
+has "the smokes gate 2 is made of are run"    cli-native 'native-smoke\.sh'
+has "and so is the sidecar's"                 cli-native 'mcp-smoke\.sh'
+has "and a red smoke blocks the gate"         gates      'needs:.*cli-native'
 
 # --- the gate is upstream of the draft -------------------------------------------------------------
 has "the draft waits on the gate"             draft  'needs:.*gates'
@@ -111,7 +119,9 @@ while IFS= read -r ref; do
   from="$(printf '%s' "$ref" | cut -d. -f2)"
   what="$(printf '%s' "$ref" | cut -d. -f4)"
   job "$from" | awk '/^    outputs:$/ { inside = 1; next } /^    [a-z]/ { inside = 0 } inside' \
-    | grep -qE "^      ${what}:" || missing="${missing} ${ref}"
+    > /tmp/rss-outputs.$$
+  grep -qE "^      ${what}:" /tmp/rss-outputs.$$ || missing="${missing} ${ref}"
+  rm -f /tmp/rss-outputs.$$
 done <<EOF
 $(grep -oE 'needs\.[a-z][a-z0-9_-]*\.outputs\.[a-z_][a-z0-9_]*' "$workflow" | sort -u)
 EOF

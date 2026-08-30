@@ -49,7 +49,7 @@ expect() {
   local out code
   out="$(bash "$gate" "$@" 2>&1)"
   code=$?
-  if [ "$code" = "$want_code" ] && printf '%s' "$out" | grep -qF -- "$want_text"; then
+  if [ "$code" = "$want_code" ] && grep -qF -- "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"
     passed=$((passed + 1))
   else
@@ -63,7 +63,7 @@ refute() {
   local name="$1" unwanted="$2"; shift 2
   local out
   out="$(bash "$gate" "$@" 2>&1)"
-  if printf '%s' "$out" | grep -qF -- "$unwanted"; then
+  if grep -qF -- "$unwanted" <<<"$out"; then
     printf '  FAIL  %s\n        did not want %s, got: %s\n' "$name" "$unwanted" "$out"
     failed=$((failed + 1))
   else
@@ -88,18 +88,29 @@ refute "and does not call the green one absent"    "no-cjk never ran"  --sha "$s
 # The whole reason this script exists rather than a `--jq 'select(.conclusion != "success")' | wc -l`.
 reset
 runs $'build\tcompleted\tsuccess'
-expect "a check that never ran refuses"          1 "never ran"         --sha "$sha" --required build,no-cjk
-expect "and it names the absent one"             1 "no-cjk"            --sha "$sha" --required build,no-cjk
-refute "absence is not reported as a conclusion"   "concluded"         --sha "$sha" --required build,no-cjk
+expect "a check that never ran refuses"          3 "never ran"         --sha "$sha" --required build,no-cjk
+expect "and it names the absent one"             3 "no-cjk"            --sha "$sha" --required build,no-cjk
+# Narrower than "the word concluded does not appear": the summary line legitimately says nothing has
+# concluded yet. What must not happen is the absent check being given one.
+refute "absence is not reported as a conclusion"   "no-cjk' concluded" --sha "$sha" --required build,no-cjk
 
 reset
 runs $'build\tin_progress\t'
-expect "a check still running is not green"      1 "still running"     --sha "$sha" --required build
+expect "a check still running is not green"      3 "still running"     --sha "$sha" --required build
 refute "and that is not called never ran"          "never ran"         --sha "$sha" --required build
 
 reset
 runs $'build\tcompleted\tskipped'
 expect "a skipped check is not green"            1 "concluded skipped" --sha "$sha" --required build
+
+# 3 means "nothing has concluded yet", 1 means "something concluded and it was not success". A
+# caller waiting for a lane loops on the first and stops on the second; folded together, a lane that
+# already failed is polled until its deadline while the log says it is waiting. A commit carrying
+# both a red check and an absent one has an answer, so it is 1.
+reset
+runs $'build\tcompleted\tfailure'
+expect "one red and one absent is a verdict, not a wait" 1 "never ran" --sha "$sha" --required build,no-cjk
+refute "and it does not claim nothing concluded"          "says nothing about" --sha "$sha" --required build,no-cjk
 
 # The commit is asked for by SHA, never the branch or the pull request: a branch-wide listing carries
 # the previous push's runs, so the same job name appears twice and the stale one can be the green.
@@ -122,7 +133,7 @@ refute "a check outside the required set is not judged" "extra" --sha "$sha" --f
 reset
 ruleset $'build\nsonarqube'
 runs $'build\tcompleted\tsuccess'
-expect "a required check missing on the commit refuses" 1 "sonarqube" --sha "$sha" --from-ruleset main
+expect "a required check missing on the commit refuses" 3 "sonarqube" --sha "$sha" --from-ruleset main
 
 # An empty required set is the failure this repository has already had once, in another gate: an
 # input nobody produces reads exactly like a check that looked and found nothing wrong.

@@ -336,7 +336,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           deadline=$(( SECONDS + 75 * 60 ))
-          until .github/scripts/checks-on-commit.sh --sha "${{ needs.version.outputs.sha }}" --required real-connectors; do
+          while true; do
+            .github/scripts/checks-on-commit.sh --sha "${{ needs.version.outputs.sha }}" --required real-connectors && break
+            # 3 is the only answer worth waiting on: nothing has concluded yet. Anything else has
+            # concluded something, and polling a lane that already failed would burn the whole
+            # deadline printing that it is waiting.
+            [ "$?" = 3 ] || exit 1
             if [ "$SECONDS" -ge "$deadline" ]; then
               echo "::error::the real-connector lane has not finished on ${{ needs.version.outputs.sha }} within 75 minutes"
               exit 1

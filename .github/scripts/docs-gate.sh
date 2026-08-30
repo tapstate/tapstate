@@ -75,7 +75,9 @@ for n in $numbers; do
     continue
   fi
 
-  printf '%s' "$labels" | tr ',' '\n' | grep -qx docs-needed || continue
+  # Matched against a built list rather than piped into `grep -q`: grep exiting on the first match
+  # kills the writer behind it, and under `pipefail` the pipeline reports that instead of the match.
+  grep -qx docs-needed <<<"$(printf '%s\n' "$labels" | tr ',' '\n')" || continue
 
   # The issue `docs-followup.yml` opens on merge, found by the link back to this pull request that it
   # writes into the body. Looked up by that link rather than by title: a title is edited.

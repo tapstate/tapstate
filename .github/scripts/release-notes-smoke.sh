@@ -75,7 +75,7 @@ code=$?
 
 has() {
   local name="$1" needle="$2"
-  if printf '%s' "$out" | grep -qF -- "$needle"; then
+  if grep -qF -- "$needle" <<<"$out"; then
     printf '  ok    %s\n' "$name"; passed=$((passed + 1))
   else
     printf '  FAIL  %s\n        wanted: %s\n' "$name" "$needle"; failed=$((failed + 1))
@@ -83,7 +83,7 @@ has() {
 }
 hasnt() {
   local name="$1" needle="$2"
-  if printf '%s' "$out" | grep -qF -- "$needle"; then
+  if grep -qF -- "$needle" <<<"$out"; then
     printf '  FAIL  %s\n        did not want: %s\n' "$name" "$needle"; failed=$((failed + 1))
   else
     printf '  ok    %s\n' "$name"; passed=$((passed + 1))
@@ -123,7 +123,7 @@ else
   failed=$((failed + 1))
 fi
 hasnt "a none with a reason is not carried over" "build configuration only"
-if printf '%s' "$out" | grep -qE '^\*[[:space:]]*$'; then
+if grep -qE '^\*[[:space:]]*$' <<<"$whats_new"; then
   printf '  FAIL  %s\n' "and none of them leaves an empty bullet"; failed=$((failed + 1))
 else
   printf '  ok    %s\n' "and none of them leaves an empty bullet"; passed=$((passed + 1))
@@ -132,7 +132,7 @@ fi
 # The slots the approver fills. A prompt, never material.
 has  "there is a breaking-changes slot"    "Breaking changes"
 has  "there is a known-issues slot"        "Known issues"
-if printf '%s' "$out" | grep -qE 'ADR-[0-9]|adr/|plans/|progress/'; then
+if grep -qE 'ADR-[0-9]|adr/|plans/|progress/' <<<"$out"; then
   printf '  FAIL  %s\n' "the slots name no ADR and no docs path"; failed=$((failed + 1))
 else
   printf '  ok    %s\n' "the slots name no ADR and no docs path"; passed=$((passed + 1))
@@ -145,7 +145,7 @@ hasnt "the generated list is not written here" "## What's Changed"
 empty="$(cd "$repo" && bash "$script" --version 0.4.0 --base HEAD --sha HEAD \
   --macos-req 'Recommended macOS: 15.0 or newer.' --glibc-req 'Recommended glibc: 2.34 or newer.' 2>&1)"
 empty_code=$?
-if [ "$empty_code" = 0 ] && printf '%s' "$empty" | grep -qF "not for production" && printf '%s' "$empty" | grep -qF "What's new"; then
+if [ "$empty_code" = 0 ] && grep -qF -- "not for production" <<<"$empty" && grep -qF -- "What's new" <<<"$empty"; then
   printf '  ok    %s\n' "an empty range still assembles a body"; passed=$((passed + 1))
 else
   printf '  FAIL  an empty range still assembles a body:\n%s\n' "$empty"; failed=$((failed + 1))
@@ -154,7 +154,7 @@ fi
 # A range whose base does not exist is a mis-wired release, not an empty one.
 bad="$(cd "$repo" && bash "$script" --version 0.4.0 --base v9.9.9 --sha HEAD --macos-req a --glibc-req b 2>&1)"
 bad_code=$?
-if [ "$bad_code" != 0 ] && printf '%s' "$bad" | grep -qF "v9.9.9"; then
+if [ "$bad_code" != 0 ] && grep -qF -- "v9.9.9" <<<"$bad"; then
   printf '  ok    %s\n' "an unknown base refuses by name"; passed=$((passed + 1))
 else
   printf '  FAIL  an unknown base refuses by name: %s\n' "$bad"; failed=$((failed + 1))

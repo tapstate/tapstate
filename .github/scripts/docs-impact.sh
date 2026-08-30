@@ -87,9 +87,14 @@ if [ "${#unanswered[@]}" -ne 0 ]; then
   exit 1
 fi
 
-# Exactly the label, not a label that contains it.
+# Exactly the label, not a label that contains it. The list is built first and matched against as a
+# whole word, rather than piped into `grep -q`: under `pipefail`, grep exiting the moment it matches
+# kills the writer behind it, and the pipeline then reports that signal instead of the match. Which
+# way the race falls depends on the machine, so the failure is a pull request refused for carrying a
+# label it does carry, on some runs and not others.
 has_label=0
-printf '%s\n' "$labels" | tr ',' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//' | grep -qx -- "$label" && has_label=1
+label_list="$(printf '%s\n' "$labels" | tr ',' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//')"
+if grep -qx -- "$label" <<<"$label_list"; then has_label=1; fi
 
 if [ "$declared" = 1 ] && [ "$has_label" = 0 ]; then
   echo "::error::this pull request names documentation to follow up on, but carries no \`${label}\` label — nothing opens the follow-up issue, and the docs owner is never told"

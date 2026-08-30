@@ -20,8 +20,12 @@
 #     diverge silently in the direction of passing. `--from-ruleset` reads it from the branch's rules
 #     at the moment of the release, and refuses an empty answer rather than passing over one.
 #
-# An in-progress run is not green either. It is refused separately from a red one: the repair is to
-# wait, not to fix anything.
+# An in-progress run is not green either. It is refused separately from a red one, and with a
+# different exit code: 3 when everything wrong with the commit is still unsettled -- a check that has
+# not started, or has not finished -- and 1 once at least one of them has concluded something other
+# than success. A caller waiting for a lane to finish loops on 3 and stops on 1. Without the split it
+# would keep polling a lane that already failed, for as long as its deadline allows, printing that it
+# is waiting while the answer has been in for an hour.
 set -uo pipefail
 
 sha=""
@@ -72,19 +76,20 @@ if ! observed="$(gh api --paginate "repos/${repo}/commits/${sha}/check-runs" \
 fi
 
 fail=0
+unsettled=0
 while IFS= read -r name; do
   [ -n "$name" ] || continue
   line="$(printf '%s\n' "$observed" | awk -F'\t' -v want="$name" '$1 == want { print; exit }')"
   if [ -z "$line" ]; then
     echo "::error::'${name}' never ran on ${sha} — a check that was not dispatched leaves no record, so this cannot be read off the failures"
-    fail=1
+    unsettled=1
     continue
   fi
   status="$(printf '%s' "$line" | cut -f2)"
   conclusion="$(printf '%s' "$line" | cut -f3)"
   if [ "$status" != "completed" ]; then
     echo "::error::'${name}' is still running on ${sha} (${status}) — this is not a failure to fix, it is a result to wait for"
-    fail=1
+    unsettled=1
   elif [ "$conclusion" != "success" ]; then
     echo "::error::'${name}' concluded ${conclusion} on ${sha}"
     fail=1
@@ -96,6 +101,10 @@ EOF
 if [ "$fail" -ne 0 ]; then
   echo "Nothing was released. Fix or re-run what is named above against ${sha}; a release is built from a commit that was checked, not from one that was checked once."
   exit 1
+fi
+if [ "$unsettled" -ne 0 ]; then
+  echo "Nothing above has concluded anything yet, so this says nothing about ${sha} either way."
+  exit 3
 fi
 
 echo "clean: $(printf '%s\n' "$names" | wc -l | tr -d ' ') named check(s) ran on ${sha} and are green."
