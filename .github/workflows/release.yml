@@ -469,6 +469,8 @@ jobs:
     needs: [version, publish]
     if: needs.version.outputs.is_latest == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read   # everything this job writes, it writes with the app token below
     steps:
       # Not GITHUB_TOKEN. A push or a pull request made with it triggers no push or pull_request
       # workflow, by design, so every required check on the default branch would be permanently
