@@ -109,6 +109,8 @@ has "the upgrade starts from the release before the newest" "$resolve_step" \
 # shellcheck disable=SC2016
 has "and refuses if both ends resolve to the same release" "$resolve_step" \
   'from" != "\$to'
+has "and refuses if the two come back in the wrong version order" "$resolve_step" \
+  'sort -V'
 
 # --- what it upgrades across ---------------------------------------------------------------------
 upgrade_step="$(step 'Upgrade in place, following the documented steps')"

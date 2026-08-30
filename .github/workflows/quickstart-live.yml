@@ -447,6 +447,17 @@ jobs:
             echo "resolved the same release at both ends ($from); this would upgrade a version to itself" >&2
             exit 1
           }
+          # Both ends are ordered by publication date, which is not the same as version order: a patch
+          # shipped onto an older line publishes after the newer line it does not belong to, so the two
+          # can come back the wrong way round. Refuse rather than run, because the run would be a
+          # downgrade wearing an upgrade's name and every assertion below would still pass. Teaching
+          # this lane to pick the ancestor of a given release is the fix when that day comes; until
+          # there are two lines it would be untestable machinery.
+          [ "$(printf '%s\n%s\n' "${from#v}" "${to#v}" | sort -V | tail -1)" = "${to#v}" ] || {
+            echo "the newest published release ($to) is an older version than the one before it ($from)." >&2
+            echo "That is two release lines, and this lane would upgrade backwards across them." >&2
+            exit 1
+          }
           mkdir -p "$RUNNER_TEMP/script"
           script="$RUNNER_TEMP/script/quickstart.sh"
           curl -fsSL "https://raw.githubusercontent.com/$REPO/$from/deploy/quickstart/quickstart.sh" -o "$script"
