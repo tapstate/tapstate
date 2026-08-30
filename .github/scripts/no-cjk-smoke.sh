@@ -303,10 +303,133 @@ printf '%s <jose@example.invalid>\n' "$jose" > AUTHORS.md
 git add -A && git commit -qm "AUTHORS.md"
 expect "a file merely named like AUTHORS is not exempt" files 1 "AUTHORS.md:1"
 
+echo "the workflow wiring"
+
+# The one invariant this check inherits rather than decides: a required check named for characters
+# reads tracked files and commit messages, and nothing else. Both repositories had a step reading
+# pull request text - one the body, narrowed to same-repository pull requests, the other title and
+# body both - and both are gone. Nothing but this stops one coming back, and it comes back easily,
+# because reading the body is the obvious way to check a pull request's own text.
+#
+# It judges TEXT, not behaviour, and saying so is part of the case. Somebody who copies the field
+# into an environment variable in one step and uses it in another goes around this, and no grep can
+# tell. What it buys is that the direct way back in is red.
+#
+# Scope is the workflow that RUNS this check, located by looking for it rather than named here, so
+# the same script makes the same statement in a repository whose workflow is called something else.
+# That narrowing carries weight in the other direction too: this repository has workflows that read
+# pull request text for their own reasons, and none of them is this check.
+
+workflow_dir() { rm -rf wf && mkdir -p wf; }
+
+clean_gate_workflow() {
+  cat > wf/no-cjk.yml <<'YML'
+name: no-cjk
+on: [push, pull_request]
+jobs:
+  no-cjk:
+    steps:
+      - run: bash .github/scripts/no-cjk.sh files
+      - run: bash .github/scripts/no-cjk.sh messages
+YML
+}
+
+fresh_repo; workflow_dir; clean_gate_workflow
+WORKFLOW_DIR=wf expect "a character check that reads no pull request text passes" \
+  workflows 0 "clean: no workflow that runs the character check"
+
+fresh_repo; workflow_dir
+cat > wf/no-cjk.yml <<'YML'
+name: no-cjk
+on: [push, pull_request]
+jobs:
+  no-cjk:
+    steps:
+      - run: bash .github/scripts/no-cjk.sh files
+      - env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s' "$PR_BODY" | bash .github/scripts/no-cjk.sh text
+YML
+WORKFLOW_DIR=wf expect "a step reading the pull request body is refused" workflows 1 "pull_request.body"
+WORKFLOW_DIR=wf expect "and the file holding it is named" workflows 1 "wf/no-cjk.yml"
+
+fresh_repo; workflow_dir
+cat > wf/no-cjk.yml <<'YML'
+name: no-cjk
+on: [push, pull_request]
+jobs:
+  no-cjk:
+    steps:
+      - env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s' "$PR_TITLE" | bash .github/scripts/no-cjk.sh text
+YML
+WORKFLOW_DIR=wf expect "a step reading the pull request title is refused" workflows 1 "pull_request.title"
+
+# The narrowing, as its own case. Without it this mode reddens every workflow that reads a pull
+# request for a reason of its own - the template check and the agent-footprint check both do - and
+# a mode that cannot be satisfied gets deleted rather than obeyed.
+fresh_repo; workflow_dir; clean_gate_workflow
+cat > wf/pr-template.yml <<'YML'
+name: pr-template
+on: pull_request
+jobs:
+  pr-template:
+    steps:
+      - env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash .github/scripts/pr-template.sh
+YML
+WORKFLOW_DIR=wf expect "a workflow that is not this check may read pull request text" \
+  workflows 0 "clean: no workflow that runs the character check"
+
+# A comment cannot read anything. Without this the first person to write down WHY this workflow does
+# not read the body reddens the check by saying so - and the quickest way out of that is to delete
+# the check, which is how a gate that cannot be satisfied dies. Whole-line comments only: text after
+# a `run:` line is shell, not YAML, and is not treated as a comment here.
+fresh_repo; workflow_dir
+cat > wf/no-cjk.yml <<'YML'
+name: no-cjk
+on: [push, pull_request]
+# This check deliberately does not read ${{ github.event.pull_request.body }}: a title and a body
+# are conversation, and they are refused before they are published.
+jobs:
+  no-cjk:
+    steps:
+      - run: bash .github/scripts/no-cjk.sh files
+YML
+WORKFLOW_DIR=wf expect "a comment saying the field is not read is not a use of it" \
+  workflows 0 "clean: no workflow that runs the character check"
+
+# The anti-hollow control, and the reason this mode is not simply a grep. Its scope is found by
+# looking, so a repository where the wiring was renamed away has nothing in scope - and "no
+# workflow reads pull request text" would then be true of an empty set and print the same green.
+fresh_repo; workflow_dir
+cat > wf/build.yml <<'YML'
+name: build
+on: [push]
+jobs:
+  build:
+    steps:
+      - run: mvn -B verify
+YML
+WORKFLOW_DIR=wf expect "a workflow directory that no longer runs this check is refused, not passed" \
+  workflows 1 "nothing to check"
+
+fresh_repo
+WORKFLOW_DIR=no-such-dir expect "a missing workflow directory is refused" workflows 1 "no workflow directory"
+
+# The regression guard proper: this repository's own workflows, as they stand right now. Every case
+# above runs against a fixture, and a fixture cannot go red when somebody edits the real thing.
+fresh_repo
+WORKFLOW_DIR="$here/../workflows" expect "this repository's own workflows pass" \
+  workflows 0 "clean: no workflow that runs the character check"
+
 echo "invocation"
 
 fresh_repo
 expect "an unknown mode is refused rather than assumed" bogus 1 "needs a mode"
+expect "the mode that read the pull request body is gone" pr-body 1 "needs a mode"
 out="$(bash "$gate" 2>&1)"; code=$?
 if [ "$code" = 1 ] && printf '%s' "$out" | grep -qF "needs a mode"; then
   printf '  ok    %s\n' "no mode at all is refused"

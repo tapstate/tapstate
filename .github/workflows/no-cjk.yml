@@ -47,6 +47,14 @@ jobs:
           shellcheck .github/scripts/no-cjk.sh .github/scripts/no-cjk-smoke.sh
           bash .github/scripts/no-cjk-smoke.sh
 
+      # The invariant this check inherits: it reads tracked files and commit messages, and nothing
+      # else. The step that read the pull request body was removed from here and from the sibling
+      # repository, and this is what stops one coming back - reading the body is the obvious way to
+      # check a pull request's own text, and it was done twice already. It judges the wiring as
+      # text, so it is not proof; it makes the direct way back in red on the commit that writes it.
+      - name: This check is still wired to read nothing but files and commit messages
+        run: bash .github/scripts/no-cjk.sh workflows
+
       - name: Every character in tracked files is on the allow-list
         run: bash .github/scripts/no-cjk.sh files
 

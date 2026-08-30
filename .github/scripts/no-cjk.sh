@@ -27,9 +27,11 @@
 #   messages   scan commit messages. Reads EVENT_NAME, BASE_REF, EVENT_BEFORE, EVENT_SHA.
 #   text       name the unknown characters in stdin, and exit 0 either way. A question, not a
 #              gate - see the mode itself for why that difference is load-bearing.
+#   workflows  check that the workflow running this check reads no pull request text. The only
+#              mode that judges the wiring rather than the content, and it judges TEXT.
 #
-# Paths are read from CHARSET_ALLOWLIST and PATH_ALLOWLIST so a copy of this script can run in a
-# repository that keeps them elsewhere.
+# Paths are read from CHARSET_ALLOWLIST, PATH_ALLOWLIST and WORKFLOW_DIR so a copy of this script
+# can run in a repository that keeps them elsewhere.
 #
 # The scanning modes exit 0 with a "clean:" line, or 1 naming every unknown character with its
 # code point and where it is. `text` is the exception and says so where it is defined.
@@ -42,6 +44,7 @@ export LC_ALL=C.UTF-8
 
 CHARSET_ALLOWLIST="${CHARSET_ALLOWLIST:-.github/charset-allowlist.txt}"
 PATH_ALLOWLIST="${PATH_ALLOWLIST:-.cjk-allowlist}"
+WORKFLOW_DIR="${WORKFLOW_DIR:-.github/workflows}"
 
 # The count the allow-list is not allowed to fall below. A floor, never an equality: legitimate
 # characters arrive - one did between this list being measured and being written down - and an
@@ -249,8 +252,60 @@ case "${1:-}" in
     awk '{printf "(text):%d:%s\n", NR, $0}' | name_unknown
     ;;
 
+  workflows)
+    # The invariant this check inherits rather than decides: a check named for characters reads
+    # tracked files and commit messages, and nothing else. A pull request's title and body are
+    # conversation. Both repositories running this check had a step reading them, and both steps
+    # are gone; this is what stops one coming back, because reading the body is the obvious way to
+    # check a pull request's own text and somebody will think of it again.
+    #
+    # It judges TEXT, and that is a real limit rather than a caveat: a workflow that copies the
+    # field into an environment variable in one step and uses it in another satisfies this and
+    # reads the body anyway. No grep sees that. What this buys is that the direct way back in is
+    # red on the commit that writes it.
+    #
+    # Scope is found by looking - whichever workflow invokes this script - rather than named here,
+    # so the same statement holds in a repository whose workflow file is called something else.
+    # The narrowing matters in both directions: other workflows read pull request text for reasons
+    # of their own, and a check that reddened those would be deleted rather than obeyed.
+    if [ ! -d "$WORKFLOW_DIR" ]; then
+      echo "::error::no workflow directory at ${WORKFLOW_DIR}, so the wiring was not checked."
+      exit 1
+    fi
+
+    # With nothing in scope every statement below is true of an empty set and prints the same
+    # clean line - the shape this whole check keeps being broken into. So an empty scope is red.
+    wired="$(grep -rlF -- 'no-cjk.sh' "$WORKFLOW_DIR" || true)"
+    if [ -z "$wired" ]; then
+      echo "::error::no workflow in ${WORKFLOW_DIR} runs no-cjk.sh, so there was nothing to check."
+      echo "this mode reports on whichever workflow invokes the character check. Renaming that"
+      echo "wiring away would otherwise leave it passing over nothing."
+      exit 1
+    fi
+
+    found=""
+    while IFS= read -r wf; do
+      [ -n "$wf" ] || continue
+      # Whole-line YAML comments are dropped: a comment reads nothing, and the person who writes
+      # down why this workflow does not read the body would otherwise redden it by saying so.
+      # Deliberately not clever about anything else - text after a `run:` line is shell, not a
+      # comment, and pretending to parse YAML here would claim a precision this does not have.
+      hits="$(grep -nE 'pull_request\.(title|body)' "$wf" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+      [ -n "$hits" ] && found="${found}$(printf '%s\n' "$hits" | sed "s|^|  ${wf}:|")"$'\n'
+    done <<< "$wired"
+
+    if [ -n "$found" ]; then
+      echo "::error::the workflow that runs the character check reads pull request text:"
+      printf '%s' "$found"
+      echo "this check reads tracked files and commit messages. A title or a body is conversation,"
+      echo "and it is refused before it is published rather than scanned once it is."
+      exit 1
+    fi
+    echo "clean: no workflow that runs the character check reads pull request title or body."
+    ;;
+
   *)
-    echo "::error::no-cjk.sh needs a mode: files | messages | text (got '${1:-}')."
+    echo "::error::no-cjk.sh needs a mode: files | messages | text | workflows (got '${1:-}')."
     exit 1
     ;;
 esac
