@@ -1,24 +1,22 @@
-# No-CJK gate.
-# tapstate is a public, English-only codebase. Source, build files, scripts, docs,
-# and commit messages must contain zero CJK characters: Chinese/Japanese/Korean
-# ideographs, CJK punctuation, and full-width / half-width forms. No directory is
-# exempt by default — this includes tests, data fixtures, and locale resource
-# bundles.
+# Character check for an English-only repository.
 #
-# Escape hatch: list explicit path patterns in .cjk-allowlist at the repo root
-# (git pathspec syntax, one per line). It ships empty on purpose; adding a path
-# is a reviewed decision, not a default.
+# It asks whether every character is one this repository has agreed to use, and names the ones
+# that are not. It used to ask the opposite - whether any character fell inside a list of CJK
+# ranges - and the difference is which way it fails. The ranges in use here admitted Japanese
+# kana, Korean hangul, Cyrillic look-alikes, the zero-width space and the right-to-left override,
+# and when the check itself broke it turned green rather than red.
 #
-# Like no-agent-footprint, this is meant to be a required status check on main
-# (branch protection); a workflow that merely runs is not a gate until merges
-# depend on it.
+# What is allowed: ASCII, plus the code points enumerated in .github/charset-allowlist.txt. That
+# file is the only place they are written down. Adding a character to it is a reviewed decision,
+# the same as adding a path to .cjk-allowlist, which stays the escape hatch for a whole file.
 #
-# The decision lives in a script, held to its own cases, which run first. It used
-# to live in the `run:` blocks here, and that made this the one gate nothing could
-# reach: when its commit-message scan was broken into scanning nothing at all, it
-# reported clean on every push until a person happened to read the diff. A false
-# green is the same text as a real one, so the cases are the only thing that tells
-# them apart.
+# The workflow keeps the name it is registered under as a required status check. Renaming it would
+# leave every pull request waiting on a check that never reports, which is worse than any red.
+#
+# The decision lives in a script, held to its own cases, which run first. It used to live in the
+# `run:` blocks here, and that made this the one check nothing could reach: when its
+# commit-message scan was broken into scanning nothing at all, it reported clean on every push
+# until a person happened to read the diff. A false green is the same text as a real one.
 name: no-cjk
 
 on:
@@ -48,14 +46,14 @@ jobs:
           shellcheck .github/scripts/no-cjk.sh .github/scripts/no-cjk-smoke.sh
           bash .github/scripts/no-cjk-smoke.sh
 
-      - name: No CJK in tracked files
+      - name: Every character in tracked files is on the allow-list
         run: bash .github/scripts/no-cjk.sh files
 
       # A commit message is repository content: this repository squashes with the commit-message
       # mode, so a message written in another language lands in main's history verbatim and the
       # merge does not launder it. Rewriting one afterwards means a force-push. So this step, like
       # the tracked-files step above, applies to everyone with no exception.
-      - name: No CJK in commit messages
+      - name: Every character in the commit messages is on the allow-list
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
@@ -74,7 +72,7 @@ jobs:
       # at all, and a required check that never reports leaves the pull request permanently
       # unmergeable - which converts "wrote CJK, so red" into something far worse and entirely
       # silent.
-      - name: No CJK in the pull request body
+      - name: Every character in the pull request body is on the allow-list
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
