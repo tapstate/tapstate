@@ -585,20 +585,16 @@ sed -i.bak 's|ghcr.io/tapstate/tapstate:.*|ghcr.io/tapstate/tapstate:<new-versio
 curl -sSL https://install.tapstate.dev/cli | TAPSTATE_INSTALL_DIR=. TAPSTATE_VERSION=<new-version> sh
 ```
 
-Then start it again, and start your pipeline again with it:
+Then start it again:
 
 ```sh
 docker compose up -d
 ```
 
-```console
-tapstate(admin@127.0.0.1:8080)> start order_pipeline
-```
-
 The server reads the store it finds, so everything you registered — connectors,
-resources, pipelines — is still there and needs no re-applying. Running pipelines are
-the exception: nothing restarts them for you, on this or any other server restart, so
-the `start` above is a step and not a formality.
+resources, pipelines — is still there and needs no re-applying, and a pipeline that
+was running is still recorded as running. There is nothing to `start` by hand;
+starting one that the store already calls running is refused.
 
 Upgrades are supported within one MAJOR line — `0.2.1` to `0.3.0` and onward. Check
 `./tapstate --version` afterwards: it is the CLI's own version, and it should be the

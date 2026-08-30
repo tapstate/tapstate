@@ -187,23 +187,22 @@ jobs:
             exit 1
           }
           echo "stack ran: $started"
-          # Read the count line off the script's own summary. This grep has drifted from that summary
-          # twice now, and both times it could only fail on a run that delivered every row: first when
-          # the line became "the view now holds" as the demo started declaring a view, then again when
-          # a second engine arrived and the summary began naming both engines' counts instead of "rows".
+          # The summary is read only on the leg whose summary this checkout wrote. Match on the numbers
+          # rather than on whichever nouns it happens to use -- the counts are what this is about, and
+          # they are what a half-arrived demo cannot produce. Both are required: a run that carried
+          # MySQL and dropped PostgreSQL is the failure the second engine exists to make visible.
           if [ "$LEG" = from-source ]; then
-            # Match on the numbers rather than on whichever nouns the summary happens to use -- the
-            # counts are what this assertion is actually about, and they are what a half-arrived demo
-            # cannot produce. Both are required: a run that carried MySQL and dropped PostgreSQL is the
-            # failure the second engine exists to make visible.
             grep -qE '[0-9]+ orders from MySQL' run.log && grep -qE '[0-9]+ of them, in one object per order' run.log
-          else
-            # The released summary is whatever that release wrote, and it changes between releases. This
-            # leg cannot be held to the current demo's wording without going red every time the wording
-            # moves ahead of the newest release -- which says nothing about the release. What survives
-            # every rewording is the property the wording carries: a count, and not zero.
-            grep -qE 'holds [1-9][0-9]* ' run.log
           fi
+          # The released leg deliberately reads no summary at all. Three assertions have been written
+          # for that one line and all three were wordings: "rows", then "the view now holds N", then
+          # this checkout's two-engine sentence -- and the released leg went red on two nightlies for
+          # having read a release that had moved on. Every one of those reds was on a run that
+          # delivered every row, which is the tell that the assertion was about prose.
+          #
+          # Nothing is lost by its absence. The script's own exit status is already this step's,
+          # through pipefail above, and what the script *claims* is worth less here than what the
+          # target actually holds -- which the step two below reads directly, off the release itself.
           test -d tapstate-demo || { echo "the piped run did not make its own directory" >&2; exit 1; }
 
           # The store this release registers by itself is this release's claim, so it is asserted where
@@ -517,7 +516,6 @@ jobs:
         # below still passing -- against a stack that started from nothing.
         env:
           TO_VER: ${{ steps.leg.outputs.to_ver }}
-          PIPELINE: ${{ steps.leg.outputs.pipeline }}
         run: |
           set -eu
           cd "$RUNNER_TEMP/tapstate-demo"
@@ -535,10 +533,16 @@ jobs:
             }
             sleep 1
           done
-          admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
-          printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nstart %s\nexit\n' "$admin_pw" "$PIPELINE" \
-            | ./tapstate -w work > start.log 2>&1 || { cat start.log >&2; exit 1; }
-          cat start.log
+          # Nothing is started by hand here, and the step that used to do it was wrong twice over. The
+          # store keeps the pipeline's desired state across the restart, and the server reconciles
+          # actual toward desired on a timer, so the pipeline is meant to come back on its own -- and
+          # a `start` is refused outright ("Cannot start a pipeline in state RUNNING"), because the
+          # verb reads that same desired state and it never stopped saying RUNNING.
+          #
+          # Whether it does come back is what the change-data-capture step below asks, and it is the
+          # question this whole lane was added for. Do not answer it here with a `stop` followed by a
+          # `start`: that would make this lane green over a pipeline the upgrade did not resume, and
+          # `stop` discards the progress that resuming is supposed to preserve.
 
       - name: The new release is what is running, and the old data is still there
         env:
@@ -574,6 +578,7 @@ jobs:
       - name: The same smoke still works on the upgraded stack
         env:
           DB: ${{ steps.leg.outputs.db }}
+          PIPELINE: ${{ steps.leg.outputs.pipeline }}
         run: |
           set -eu
           cd "$RUNNER_TEMP/tapstate-demo"
@@ -587,7 +592,9 @@ jobs:
               fi
               i=$((i + 1)); sleep 1
             done
-            echo "cdc: $1 never reached the target after the upgrade" >&2
+            echo "cdc: $1 never reached the target after the upgrade." >&2
+            echo "The store survived and '$PIPELINE' is still RUNNING in it -- so this is the" >&2
+            echo "reconciler not bringing that pipeline back, not the data being lost." >&2
             docker compose logs server --tail 200 >&2
             exit 1
           }
