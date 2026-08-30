@@ -13,10 +13,14 @@
 #                                 is what a quickstart user actually runs. Either one moving without a
 #                                 matching asset is a 404 for somebody, and this is where it surfaces.
 #
-#   Named outright                checksums.txt, platform-minimums.txt, and the linux/arm64 server
-#                                 image. Nothing automated fetches any of the three, so nothing else
-#                                 would ever notice them missing. Naming them is the only coverage
-#                                 they have, and it is why this list is written by hand rather than
+#   Named outright                checksums.txt, platform-minimums.txt, the linux/arm64 server image,
+#                                 and what has to be inside each CLI asset. Nothing automated fetches
+#                                 the first three, so nothing else would ever notice them missing.
+#                                 The fourth has one consumer and it is on the wrong side of the
+#                                 release: install.sh refuses a bundle without an executable and a
+#                                 sidecar, but that refusal runs on a user's machine after the
+#                                 release is public. Naming them is the only coverage they have
+#                                 before it, and it is why this list is written by hand rather than
 #                                 derived from what the build produced.
 #
 # Both directions are checked. An asset with no platform offering it is as wrong as a platform with no
@@ -71,6 +75,23 @@ $platform
     esac
 done
 
+# --- named outright: an asset being present is not an asset being complete -----------------------
+# The archive is opened, not weighed. A packaging step that dropped the sidecar, or wrote an error
+# message where the tarball should be, produces a file of plausible name and size either way, and
+# every other check here is satisfied by the name alone.
+for platform in $platforms; do
+    asset="$staging/tapstate-${version}-${platform}.tar.gz"
+    [ -f "$asset" ] || continue    # already reported above as the asset that is not there at all
+    if ! listing="$(tar -tzf "$asset" 2>/dev/null)"; then
+        problem "tapstate-${version}-${platform}.tar.gz is not readable as a gzipped archive"
+        continue
+    fi
+    printf '%s\n' "$listing" | grep -qE '(^|/)bin/tapstate$' \
+        || problem "tapstate-${version}-${platform}.tar.gz has no bin/tapstate (the CLI itself)"
+    printf '%s\n' "$listing" | grep -qE '(^|/)libexec/tapstate-mcp(\.jar)?$' \
+        || problem "tapstate-${version}-${platform}.tar.gz has no libexec MCP sidecar (install.sh refuses a bundle without one)"
+done
+
 # --- named outright: nothing fetches these, so nothing else would report them gone ---------------
 [ -s "$staging/checksums.txt" ] || problem "checksums.txt (the only verification path that does not go through our own tooling)"
 [ -s "$staging/platform-minimums.txt" ] || problem "platform-minimums.txt (the installer reads it to warn about an old system)"
@@ -109,4 +130,4 @@ if [ "$problems" -ne 0 ]; then
     exit 1
 fi
 
-echo "release $version is complete: $(printf '%s' "$platforms" | tr '\n' ' ')CLI assets with checksums, both server image architectures, and the two files nothing fetches"
+echo "release $version is complete: $(printf '%s' "$platforms" | tr '\n' ' ')CLI assets carrying their sidecar, both server image architectures, and the two files nothing fetches"

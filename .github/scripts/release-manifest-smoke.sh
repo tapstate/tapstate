@@ -47,11 +47,24 @@ make_root() {   # version pinned in compose
     echo "$dir"
 }
 
+# One release asset, built the way the assembly descriptor builds one: a versioned directory holding
+# the native CLI and its MCP sidecar. Real tar.gz, because the check opens them -- a fixture of text
+# files named .tar.gz would pass an existence check and nothing else, which is the state this replaced.
+make_asset() {   # staging dir, platform, [omit: bin | mcp | nothing]
+    local dir="$1" platform="$2" omit="${3:-}" build
+    build="$(mktemp -d)"
+    mkdir -p "$build/tapstate-cli-9.9.9/bin" "$build/tapstate-cli-9.9.9/libexec"
+    [ "$omit" = bin ] || echo "native CLI for $platform" > "$build/tapstate-cli-9.9.9/bin/tapstate"
+    [ "$omit" = mcp ] || echo "sidecar for $platform"    > "$build/tapstate-cli-9.9.9/libexec/tapstate-mcp.jar"
+    tar -czf "$dir/tapstate-9.9.9-$platform.tar.gz" -C "$build" tapstate-cli-9.9.9
+    echo "sha for $platform" > "$dir/tapstate-9.9.9-$platform.tar.gz.sha256"
+    rm -rf "$build"
+}
+
 make_staging() {   # every asset a complete release has
     local dir; dir="$(mktemp -d)"
     for p in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
-        echo "binary for $p" > "$dir/tapstate-9.9.9-$p.tar.gz"
-        echo "sha for $p"    > "$dir/tapstate-9.9.9-$p.tar.gz.sha256"
+        make_asset "$dir" "$p"
     done
     ( cd "$dir" && ls tapstate-*.tar.gz > checksums.txt )
     echo "linux glibc 2.35" > "$dir/platform-minimums.txt"
@@ -90,7 +103,7 @@ echo "linux glibc 2.35" > "$staging/platform-minimums.txt"
 # 404 for whoever runs on it, and nothing else in the release would notice.
 rm -f "$staging/tapstate-9.9.9-linux-arm64.tar.gz"
 fail_case "a platform the installer offers with no asset is caught" "$root" "$staging" "$oci" "linux-arm64"
-echo "binary for linux-arm64" > "$staging/tapstate-9.9.9-linux-arm64.tar.gz"
+make_asset "$staging" linux-arm64
 
 rm -f "$staging/tapstate-9.9.9-darwin-x64.tar.gz.sha256"
 fail_case "a missing per-asset checksum is caught" "$root" "$staging" "$oci" "darwin-x64"
@@ -98,7 +111,7 @@ echo "sha for darwin-x64" > "$staging/tapstate-9.9.9-darwin-x64.tar.gz.sha256"
 
 # The other direction. An asset for a platform the installer does not offer cannot be reached by any
 # documented path, so it is either a leftover or the list is wrong; both want a person to look.
-echo "surprise" > "$staging/tapstate-9.9.9-freebsd-x64.tar.gz"
+make_asset "$staging" freebsd-x64
 fail_case "an asset for a platform nobody offers is caught" "$root" "$staging" "$oci" "freebsd-x64"
 rm -f "$staging/tapstate-9.9.9-freebsd-x64.tar.gz"
 
@@ -107,6 +120,30 @@ rm -f "$staging/tapstate-9.9.9-freebsd-x64.tar.gz"
 oci_one="$(make_oci amd64)"
 fail_case "a server image missing an architecture is caught" "$root" "$staging" "$oci_one" "arm64"
 rm -rf "$oci_one"
+
+# What is inside an asset, not only that one is there. install.sh refuses a bundle missing either of
+# these, but that refusal runs on a user's machine after the release is public; before this point
+# nothing opens an asset at all. Dropping the sidecar from the assembly descriptor renames nothing and
+# breaks no build -- the tarball is still produced, still checksummed, still the right size to look
+# right -- and `tapstate mcp` is simply gone for everyone who installs that version.
+rm -f "$staging/tapstate-9.9.9-linux-x64.tar.gz"
+make_asset "$staging" linux-x64 mcp
+fail_case "an asset built without its MCP sidecar is caught" "$root" "$staging" "$oci" "linux-x64"
+rm -f "$staging/tapstate-9.9.9-linux-x64.tar.gz"
+make_asset "$staging" linux-x64
+
+rm -f "$staging/tapstate-9.9.9-darwin-arm64.tar.gz"
+make_asset "$staging" darwin-arm64 bin
+fail_case "an asset built without the CLI itself is caught" "$root" "$staging" "$oci" "darwin-arm64"
+rm -f "$staging/tapstate-9.9.9-darwin-arm64.tar.gz"
+make_asset "$staging" darwin-arm64
+
+# The shape the old fixture had by accident: a file with the right name that is not an archive. A
+# packaging step that wrote an error message where the tarball should be produces exactly this.
+echo "not an archive" > "$staging/tapstate-9.9.9-linux-arm64.tar.gz"
+fail_case "an asset that is not readable as an archive is caught" "$root" "$staging" "$oci" "linux-arm64"
+rm -f "$staging/tapstate-9.9.9-linux-arm64.tar.gz"
+make_asset "$staging" linux-arm64
 
 # Asked of the compose file, which is what a quickstart user actually runs.
 root_wrong="$(make_root 9.9.8)"
