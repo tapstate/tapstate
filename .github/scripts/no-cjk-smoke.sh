@@ -164,6 +164,16 @@ echo more > file.txt; git add -A; git commit -qm "an ordinary English subject"
 EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
   expect "English commit messages pass" messages 0 "clean: every character in the commit messages"
 
+# An allowed character has to pass HERE too, not only in a tracked file. The messages in this
+# repository do carry em dashes, and until this case existed the only thing pinning that was a
+# fixture in the pull-request-body mode - which is gone, because that mode was reading
+# conversational text a required check has no business reading.
+fresh_repo
+base_sha="$(git rev-parse HEAD)"
+echo more > file.txt; git add -A; git commit -qm "$(printf 'a subject %s with an em dash' "$emdash")"
+EVENT_NAME=push EVENT_BEFORE="$base_sha" EVENT_SHA="$(git rev-parse HEAD)" \
+  expect "an allowed character in a commit message passes" messages 0 "clean: every character in the commit messages"
+
 # The case the extraction exists for. Reverting the format string to the doubled-percent form
 # makes git emit the format verbatim, so nothing is scanned and this goes green - which is exactly
 # what shipped once and reported clean for as long as it was there.
@@ -205,18 +215,6 @@ EVENT_NAME=pull_request BASE_REF=main \
 fresh_repo
 EVENT_NAME=pull_request BASE_REF=no-such-branch \
   expect "an unresolvable range is refused, not reported clean" messages 1 "no commit message was checked"
-
-echo "pull request body"
-
-fresh_repo
-PR_BODY="$(printf 'body with %s in it' "$han")" \
-  expect "an unknown character in a pull request body is refused" pr-body 1 "U+4E2D"
-PR_BODY="an ordinary English body" \
-  expect "an English pull request body passes" pr-body 0 "clean: every character in the pull request body"
-PR_BODY="$(printf 'an English body %s with an em dash' "$emdash")" \
-  expect "an em dash in a pull request body passes" pr-body 0 "clean: every character in the pull request body"
-PR_BODY="" \
-  expect "an empty pull request body passes" pr-body 0 "clean: every character in the pull request body"
 
 echo "the detector itself"
 
@@ -304,9 +302,6 @@ fresh_repo
 printf '%s <jose@example.invalid>\n' "$jose" > AUTHORS.md
 git add -A && git commit -qm "AUTHORS.md"
 expect "a file merely named like AUTHORS is not exempt" files 1 "AUTHORS.md:1"
-
-PR_BODY="$(printf 'An English body.\n\nCo-authored-by: %s <jose@example.invalid>' "$jose")" \
-  expect "a co-author trailer in a pull request body passes" pr-body 0 "clean: every character in the pull request body"
 
 echo "invocation"
 

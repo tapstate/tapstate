@@ -20,12 +20,11 @@
 # reporting clean until a person happened to read the diff. A false green and a real green are the
 # same text, so the cases are the only thing that tells them apart.
 #
-# Four modes, one per thing that gets asked about, so each keeps its own step and its own
+# Three modes, one per thing that gets asked about, so each keeps its own step and its own
 # narrowing:
 #
 #   files      scan tracked files. Honours the path allow-list (git pathspec, one per line).
 #   messages   scan commit messages. Reads EVENT_NAME, BASE_REF, EVENT_BEFORE, EVENT_SHA.
-#   pr-body    scan a pull request body. Reads PR_BODY.
 #   text       name the unknown characters in stdin, and exit 0 either way. A question, not a
 #              gate - see the mode itself for why that difference is load-bearing.
 #
@@ -233,22 +232,6 @@ case "${1:-}" in
     echo "clean: every character in the commit messages is on the allow-list."
     ;;
 
-  pr-body)
-    # A pull request body is conversational text, and that is a different thing from repository
-    # content even though the same check reads both. Which pull requests reach this mode is the
-    # caller's decision, not this script's.
-    found=""
-    if [ -n "${PR_BODY:-}" ]; then
-      found="$(printf '%s\n' "$PR_BODY" | awk '{printf "(pull request body):%d:%s\n", NR, $0}' | name_unknown)"
-    fi
-    if [ -n "$found" ]; then
-      echo "::error::character(s) not on the allow-list, in the pull request body:"
-      printf '%s\n' "$found" | head -50
-      exit 1
-    fi
-    echo "clean: every character in the pull request body is on the allow-list."
-    ;;
-
   text)
     # Answers a question; it does not gate. Reads text on stdin and prints the unknown characters
     # in it, one per line, and nothing at all when there are none. Exit status says only whether
@@ -267,7 +250,7 @@ case "${1:-}" in
     ;;
 
   *)
-    echo "::error::no-cjk.sh needs a mode: files | messages | pr-body | text (got '${1:-}')."
+    echo "::error::no-cjk.sh needs a mode: files | messages | text (got '${1:-}')."
     exit 1
     ;;
 esac

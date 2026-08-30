@@ -27,11 +27,12 @@ on:
   pull_request:
     branches:
       - main
-    # `edited` is not in the default set, and without it a red here cannot be cleared by fixing
-    # what made it red: the body and the title are both editable, and editing one re-runs nothing.
-    # The contributor's only remaining move is to push another commit, which is a strange thing to
-    # ask for a typo in prose.
-    types: [opened, synchronize, reopened, edited]
+    # No `edited`: this check reads tracked files and commit messages, and neither of those can
+    # change by editing a pull request's title or body. It was in the list while the body was
+    # scanned here, so that a red on prose could be cleared by fixing the prose. Nothing is scanned
+    # that an edit can change any more, so the trigger would only re-run a decision that cannot
+    # have moved.
+    types: [opened, synchronize, reopened]
 
 jobs:
   no-cjk:
@@ -60,20 +61,3 @@ jobs:
           EVENT_BEFORE: ${{ github.event.before }}
           EVENT_SHA: ${{ github.sha }}
         run: bash .github/scripts/no-cjk.sh messages
-
-      # A pull request body is conversational text, and that is a different thing from repository
-      # content even though the same gate used to check both. English is this project's public
-      # working language, but a person reporting a real defect in their own language is a
-      # submission worth having, and a required check that reddens on their prose turns a habit
-      # into a door. So the English-only habit is enforced here only where it is ours to keep:
-      # pull requests from a branch in this repository.
-      #
-      # Narrowed at the step, never at the job. A job skipped by an `if` never reports its check
-      # at all, and a required check that never reports leaves the pull request permanently
-      # unmergeable - which converts "wrote CJK, so red" into something far worse and entirely
-      # silent.
-      - name: Every character in the pull request body is on the allow-list
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: bash .github/scripts/no-cjk.sh pr-body
