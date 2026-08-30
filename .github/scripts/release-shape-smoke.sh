@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# The release workflow's shape, checked as a text.
+#
+# What this holds down is the one property the whole arrangement rests on and that nothing else can
+# see: the three acts that cannot be taken back -- creating the tag, publishing, pushing the image --
+# are all downstream of the pause a person approves, and none of them happens before it. Every one of
+# them is one line away from moving. A `push: true` on the image build, a second release action after
+# the approval, a job that stops needing `approve`: each is a small, plausible edit, each leaves the
+# workflow green, and each is only discovered by rejecting a release and finding something left over.
+#
+# The body assembled before the pause is the other half. Whoever approves may edit it on the Releases
+# page, and re-sending an assembled body afterwards puts their edit back the way it was -- silently,
+# with the release published and the run green. Nothing about that is visible except the body.
+#
+# Reads the workflow as text, attributing each line to the job it is under. Exits 0 if every case
+# holds.
+set -uo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+workflow="$here/../workflows/release.yml"
+passed=0
+failed=0
+
+[ -f "$workflow" ] || { echo "no release workflow at $workflow"; exit 1; }
+
+# Every line of one job, from its two-space key to the next one, with whole-line comments dropped.
+# Dropping them is not tidiness: this file is heavily commented, and the comments say what the rules
+# are -- "`--notes` is deliberately not passed" is a sentence about the absence of `--notes`. Match
+# against the prose and every check here answers about the explanation rather than the workflow,
+# which fails in both directions: a rule that was removed while its comment stayed reads as present,
+# and a rule that is present reads as broken because something described it.
+job() {
+  awk -v want="  $1:" '
+    $0 == want { inside = 1; next }
+    /^  [a-z][a-z0-9_-]*:[ \t]*$/ { inside = 0 }
+    inside && $0 !~ /^[ \t]*#/ { print }
+  ' "$workflow"
+}
+
+jobs_list="$(awk '/^  [a-z][a-z0-9_-]*:[ \t]*$/ { gsub(/[ :]/, ""); print }' "$workflow")"
+
+ok()   { printf '  ok    %s\n' "$1"; passed=$((passed + 1)); }
+bad()  { printf '  FAIL  %s\n        %s\n' "$1" "$2"; failed=$((failed + 1)); }
+
+has()    { if job "$2" | grep -qE -- "$3"; then ok "$1"; else bad "$1" "job '$2' has no line matching /$3/"; fi }
+hasnt()  { if job "$2" | grep -qE -- "$3"; then bad "$1" "job '$2' still matches /$3/: $(job "$2" | grep -E -- "$3" | head -1)"; else ok "$1"; fi }
+
+# --- the approval is upstream of everything irreversible -------------------------------------------
+has "the publish job waits on the approval" publish 'needs:.*approve'
+
+# Anything that pushes an image, publishes a release, or moves the floating pointer, in a job that
+# does not need the approval, is the failure this file exists for. Checked over every job there is,
+# so a new one is covered without this list being edited.
+for j in $jobs_list; do
+  case "$j" in publish) continue ;; esac
+  body="$(job "$j")"
+  if printf '%s' "$body" | grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest='; then
+    bad "no irreversible act in '$j'" \
+        "$(printf '%s' "$body" | grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=' | head -1)"
+  else
+    ok "no irreversible act in '$j'"
+  fi
+done
+
+# The image is built before the pause and pushed after it. Both halves, or the archive is pointless.
+has   "the image is built into an archive"      server-image 'type=oci'
+has   "and explicitly not pushed"               server-image 'push: false'
+has   "and the archive is what gets pushed"     publish      'oci-layout://'
+hasnt "the image is not rebuilt after approval" publish      'build-push-action'
+
+# C6. The publish step edits the existing release; it never re-sends a body. Re-running the action
+# that assembled the draft would overwrite whatever the approver wrote, and nothing would say so.
+has   "publishing edits the draft that was reviewed" publish 'gh release edit'
+hasnt "publishing re-sends no body"                  publish '\-\-notes|body_path|body:'
+hasnt "and does not run the release action again"    publish 'action-gh-release'
+
+# C7. Rejected, timed out, or failed on the way: the draft is the one thing a rejection can leave
+# behind that still looks publishable.
+has "a rejected run deletes its draft"        discard 'gh release delete'
+has "and it runs even when the run failed"    discard 'always\(\)'
+has "and only when nothing was published"     discard "publish.result != 'success'"
+
+# --- the gate is upstream of the draft -------------------------------------------------------------
+has "the draft waits on the gate"             draft  'needs:.*gates'
+has "the gate waits on the connector lane"    gates  'needs:.*connectors'
+# The slow lane starts alongside the build, not after it, which is the only reason its ~38 minutes
+# overlap the release rather than being added to it. "Not after the gate" is too weak a way to say
+# that -- waiting on the build instead would cost the same and still satisfy it -- so what is pinned
+# is that it waits on the version and nothing else.
+if [ "$(job connectors | grep -cE '^    needs: version[ \t]*$')" = 1 ]; then
+  ok "the connector lane starts as early as it can"
+else
+  bad "the connector lane starts as early as it can" \
+      "wanted exactly 'needs: version', got: $(job connectors | grep -E '^    needs:' | head -1)"
+fi
+has  "the draft body comes from the gate"     draft  'body_path'
+has  "and GitHub appends its own list"        draft  'generate_release_notes: true'
+
+# The draft is a draft, and creates no tag until somebody publishes it.
+has "the release starts as a draft"           draft  'draft: true'
+
+printf '\n%s passed, %s failed\n' "$passed" "$failed"
+[ "$failed" = 0 ]
