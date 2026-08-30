@@ -133,6 +133,27 @@ else
   bad "--print-platform unsupported (rc=$rc, out='$out')"
 fi
 
+# --- the declared platform list: what a release is checked against -----------------------------------
+# The release manifest check asks the installer which platforms it can serve, and fails a release whose
+# assets do not match. So the list has to be answerable on a machine no build exists for -- the check
+# runs on one runner and speaks for all four -- and it has to be the same list detect_platform maps
+# onto, which the four positive cases above already prove by installing through it.
+unsupported_shim="$(mktemp -d)"
+cat > "$unsupported_shim/uname" <<'EOF'
+#!/bin/sh
+case "$1" in -s) echo Plan9 ;; -m) echo sparc ;; *) echo unknown ;; esac
+EOF
+chmod +x "$unsupported_shim/uname"
+idir="$(mktemp -d)/bin"
+out="$(PATH="$unsupported_shim:$PATH" TAPSTATE_INSTALL_DIR="$idir" sh "$INSTALL_SH" --print-platforms 2>&1)"; rc=$?
+rm -rf "$unsupported_shim"
+expected="$(printf 'darwin-arm64\ndarwin-x64\nlinux-arm64\nlinux-x64')"
+if [ "$rc" -eq 0 ] && [ "$out" = "$expected" ] && [ ! -e "$idir" ]; then
+  ok "--print-platforms lists every published platform, from a machine that is not one of them"
+else
+  bad "--print-platforms (rc=$rc, out='$(printf '%s' "$out" | tr '\n' ' ')', install dir present=$( [ -e "$idir" ] && echo yes || echo no ))"
+fi
+
 # --- idempotent: an identical version retains the live bundle before updating the stable entry --------
 idir="$(mktemp -d)/bin"
 run_install Darwin arm64 glibc "$idir"; rc1=$RC
