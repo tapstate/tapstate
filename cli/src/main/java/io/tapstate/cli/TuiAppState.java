@@ -7,13 +7,18 @@ import java.util.List;
  * Repl; this record contains only state that can be reduced without I/O.
  */
 record TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
-                   List<String> palette, TuiDashboard.Prompt prompt, List<String> activity) {
+                   List<String> palette, TuiDashboard.Prompt prompt, List<String> activity, long ticks) {
 
     static final int MAX_ACTIVITY = 8;
 
     TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
                 List<String> palette, TuiDashboard.Prompt prompt) {
-        this(command, notice, paletteOpen, paletteIndex, palette, prompt, List.of());
+        this(command, notice, paletteOpen, paletteIndex, palette, prompt, List.of(), 0L);
+    }
+
+    TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
+                List<String> palette, TuiDashboard.Prompt prompt, List<String> activity) {
+        this(command, notice, paletteOpen, paletteIndex, palette, prompt, activity, 0L);
     }
 
     TuiAppState {
@@ -32,6 +37,6 @@ record TuiAppState(String command, String notice, boolean paletteOpen, int palet
     }
 
     static TuiAppState initial(String notice) {
-        return new TuiAppState("", notice, false, 0, List.of(), null, List.of());
+        return new TuiAppState("", notice, false, 0, List.of(), null, List.of(), 0L);
     }
 }

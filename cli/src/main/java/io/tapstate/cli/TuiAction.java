@@ -5,7 +5,7 @@ sealed interface TuiAction
         permits TuiAction.SetCommand, TuiAction.ClearCommand, TuiAction.SetNotice,
         TuiAction.OpenPalette, TuiAction.ClosePalette, TuiAction.MovePalette,
         TuiAction.SelectPaletteCommand, TuiAction.SetPrompt, TuiAction.ClearPrompt,
-        TuiAction.AppendActivity {
+        TuiAction.AppendActivity, TuiAction.Tick {
 
     record SetCommand(String value) implements TuiAction {
     }
@@ -35,5 +35,8 @@ sealed interface TuiAction
     }
 
     record AppendActivity(String value) implements TuiAction {
+    }
+
+    record Tick() implements TuiAction {
     }
 }
