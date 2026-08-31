@@ -30,6 +30,17 @@ final class TuiDashboard {
         }
     }
 
+    /** A redacted, render-ready summary of one local workspace artifact. */
+    record ResourceSummary(String kind, String id, String detail, String connector,
+                           boolean readable, boolean misplaced) {
+        ResourceSummary {
+            kind = kind == null || kind.isBlank() ? "other" : kind;
+            id = id == null || id.isBlank() ? "?" : id;
+            detail = detail == null ? "" : detail;
+            connector = connector == null || connector.isBlank() ? null : connector;
+        }
+    }
+
     record Prompt(String question, String input, String hint, boolean secret, List<String> options,
                   int selectedIndex, List<String> lines) {
         Prompt {
@@ -57,7 +68,8 @@ final class TuiDashboard {
 
     record State(Path workspace, String context, String principal, Connection connection, String notice,
                  String command, List<String> palette, int paletteIndex, Prompt prompt,
-                 String endpoint, String clusterName, String authStatus, List<String> activity) {
+                 String endpoint, String clusterName, String authStatus, List<String> activity,
+                 List<ResourceSummary> resources) {
         State {
             if (workspace == null || connection == null) {
                 throw new IllegalArgumentException("workspace and connection are required");
@@ -65,20 +77,28 @@ final class TuiDashboard {
             command = command == null ? "" : command;
             palette = palette == null ? List.of() : List.copyOf(palette);
             activity = activity == null ? List.of() : List.copyOf(activity);
+            resources = resources == null ? List.of() : List.copyOf(resources);
             paletteIndex = palette.isEmpty() ? 0 : Math.max(0, Math.min(paletteIndex, palette.size() - 1));
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    null, null, null, List.of());
+                    null, null, null, List.of(), List.of());
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt,
               String endpoint, String clusterName, String authStatus) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    endpoint, clusterName, authStatus, List.of());
+                    endpoint, clusterName, authStatus, List.of(), List.of());
+        }
+
+        State(Path workspace, String context, String principal, Connection connection, String notice,
+              String command, List<String> palette, int paletteIndex, Prompt prompt,
+              String endpoint, String clusterName, String authStatus, List<String> activity) {
+            this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
+                    endpoint, clusterName, authStatus, activity, List.of());
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice) {
@@ -118,50 +138,44 @@ final class TuiDashboard {
             rows.add(row("  Cluster      " + state.clusterName(), width));
         }
         rows.add(row("  Auth         " + authLabel(state), width));
-        rows.add(row("  Pipelines     use start, stop, status, logs", width));
-        rows.add(row("  Sources       use ls and discover-schema", width));
-        rows.add(row("  Connectors    use connectors and test", width));
         int bodyRows = Math.max(0, height - 2 - rows.size());
+        List<String> body = new ArrayList<>();
         if (!state.palette().isEmpty() && bodyRows > 0) {
             int visible = Math.min(bodyRows, state.palette().size());
             int start = Math.min(Math.max(0, state.paletteIndex() - visible + 1),
                     state.palette().size() - visible);
             for (int index = start; index < start + visible; index++) {
                 String marker = index == state.paletteIndex() ? "› " : "  ";
-                rows.add(row("  " + marker + state.palette().get(index), width));
+                body.add("  " + marker + state.palette().get(index));
             }
         }
         if (state.prompt() != null && bodyRows > 0) {
             Prompt prompt = state.prompt();
-            int remaining = Math.max(0, height - 2 - rows.size());
             if (!prompt.options().isEmpty()) {
-                int visible = Math.min(remaining, prompt.options().size());
+                int visible = Math.min(bodyRows, prompt.options().size());
                 int start = Math.min(Math.max(0, prompt.selectedIndex() - visible + 1),
                         prompt.options().size() - visible);
                 for (int index = start; index < start + visible; index++) {
                     String marker = index == prompt.selectedIndex() ? "› " : "  ";
-                    rows.add(row("  " + marker + prompt.options().get(index), width));
+                    body.add("  " + marker + prompt.options().get(index));
                 }
             } else if (!prompt.lines().isEmpty()) {
-                int visible = Math.min(remaining, prompt.lines().size());
+                int visible = Math.min(bodyRows, prompt.lines().size());
                 int start = prompt.lines().size() - visible;
                 for (int index = start; index < prompt.lines().size(); index++) {
-                    rows.add(row("  | " + prompt.lines().get(index), width));
+                    body.add("  | " + prompt.lines().get(index));
                 }
             }
-        } else if (state.palette().isEmpty()) {
-            rows.add(row("  Activity", width));
+        } else {
+            body.addAll(resourceRows(state.resources()));
+            body.add("  Activity");
             if (state.activity().isEmpty()) {
-                rows.add(row("  none yet", width));
+                body.add("  none yet");
             } else {
-                int remaining = Math.max(0, height - 2 - rows.size());
-                int visible = Math.min(remaining, state.activity().size());
-                int start = state.activity().size() - visible;
-                for (int index = start; index < state.activity().size(); index++) {
-                    rows.add(row("  " + state.activity().get(index), width));
-                }
+                body.addAll(state.activity().stream().map(line -> "  " + line).toList());
             }
         }
+        appendBody(rows, body, bodyRows, width);
         while (rows.size() < height - 2) {
             rows.add(row("", width));
         }
@@ -179,6 +193,65 @@ final class TuiDashboard {
             rows.add(row("> " + promptInput + (prompt.hint().isBlank() ? "" : "  " + prompt.hint()), width));
         }
         return List.copyOf(rows);
+    }
+
+    private static List<String> resourceRows(List<ResourceSummary> resources) {
+        if (resources.isEmpty()) {
+            return List.of("  Resources", "    no local resources");
+        }
+        List<ResourceSummary> pipelines = resources.stream().filter(r -> r.kind().equals("pipeline")).toList();
+        List<ResourceSummary> sources = resources.stream().filter(r -> r.kind().equals("source")).toList();
+        List<ResourceSummary> other = resources.stream()
+                .filter(r -> !r.kind().equals("pipeline") && !r.kind().equals("source"))
+                .toList();
+        List<String> rows = new ArrayList<>();
+        rows.add("  Resources");
+        addResourceGroup(rows, "Pipelines", pipelines);
+        addResourceGroup(rows, "Sources", sources);
+        java.util.Map<String, Integer> connectorCounts = new java.util.LinkedHashMap<>();
+        for (ResourceSummary source : sources) {
+            if (source.readable() && !source.misplaced() && source.connector() != null) {
+                connectorCounts.merge(source.connector(), 1, Integer::sum);
+            }
+        }
+        rows.add("    Connectors (" + connectorCounts.size() + ")");
+        if (connectorCounts.isEmpty()) {
+            rows.add("      none");
+        } else {
+            connectorCounts.forEach((connector, count) ->
+                    rows.add("      " + connector + " · " + count + (count == 1 ? " source" : " sources")));
+        }
+        if (!other.isEmpty()) {
+            addResourceGroup(rows, "Other resources", other);
+        }
+        return rows;
+    }
+
+    private static void addResourceGroup(List<String> rows, String label, List<ResourceSummary> resources) {
+        rows.add("    " + label + " (" + resources.size() + ")");
+        for (ResourceSummary resource : resources) {
+            String detail = resource.detail();
+            rows.add("      " + resource.id() + (detail.isBlank() ? "" : "  " + detail));
+        }
+    }
+
+    private static void appendBody(List<AttributedString> rows, List<String> body, int capacity, int width) {
+        if (capacity <= 0 || body.isEmpty()) {
+            return;
+        }
+        if (body.size() <= capacity) {
+            body.forEach(line -> rows.add(row(line, width)));
+            return;
+        }
+        if (capacity == 1) {
+            rows.add(row("  +" + body.size() + " more", width));
+            return;
+        }
+        int shown = capacity - 1;
+        for (int index = 0; index < shown; index++) {
+            rows.add(row(body.get(index), width));
+        }
+        rows.add(row("  +" + (body.size() - shown) + " more", width));
     }
 
     private static List<AttributedString> compact(State state, int width) {

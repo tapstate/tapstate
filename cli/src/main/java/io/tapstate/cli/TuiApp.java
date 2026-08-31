@@ -408,7 +408,8 @@ final class TuiApp {
         return new TuiDashboard.State(repl.workdir(), context, session.principal(), connection, uiState.notice(),
                 uiState.command(), uiState.palette(), uiState.paletteIndex(), uiState.prompt(),
                 session.landingNode() == null ? null : session.landingNode().toString(),
-                session.clusterName(), authStatus(session), uiState.activity());
+                session.clusterName(), authStatus(session), uiState.activity(),
+                TuiWorkspaceSnapshot.scan(repl.workdir()));
     }
 
     private static String authStatus(Session session) {

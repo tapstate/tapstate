@@ -142,4 +142,57 @@ class TuiDashboardTest {
         assertThat(lines).anyMatch(line -> line.contains("✓ 2 collections"));
         assertThat(lines).noneMatch(line -> line.contains("tok_live") || line.contains("hunter2"));
     }
+
+    @Test
+    void rendersLocalResourceSummariesAndConnectorCounts() {
+        List<TuiDashboard.ResourceSummary> resources = List.of(
+                new TuiDashboard.ResourceSummary("source", "orders", "mysql · cdc", "mysql", true, false),
+                new TuiDashboard.ResourceSummary("source", "audit", "unreadable", null, false, false),
+                new TuiDashboard.ResourceSummary("pipeline", "sync", "2 sources · view · serve", null, true, false),
+                new TuiDashboard.ResourceSummary("view", "orders_view", "", null, true, false),
+                new TuiDashboard.ResourceSummary("pipeline", "stray", "misplaced: declares 'source'", null, true, true));
+
+        List<String> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", "alice@example.com",
+                        TuiDashboard.Connection.ONLINE, null, "", List.of(), 0, null,
+                        "http://127.0.0.1:8081", "tapstate-prod", "authenticated", List.of(), resources), 120, 24)
+                .stream().map(AttributedString::toString).toList();
+
+        assertThat(lines).anyMatch(line -> line.contains("Pipelines (2)"))
+                .anyMatch(line -> line.contains("sync  2 sources · view · serve"))
+                .anyMatch(line -> line.contains("Sources (2)"))
+                .anyMatch(line -> line.contains("audit  unreadable"))
+                .anyMatch(line -> line.contains("Connectors (1)"))
+                .anyMatch(line -> line.contains("mysql · 1 source"))
+                .anyMatch(line -> line.contains("Other resources (1)"))
+                .anyMatch(line -> line.contains("stray  misplaced: declares 'source'"));
+    }
+
+    @Test
+    void rendersAnExplicitEmptyWorkspaceState() {
+        List<String> lines = dashboard.render(
+                TuiDashboard.State.offline(Path.of("empty"), null), 80, 14)
+                .stream().map(AttributedString::toString).toList();
+
+        assertThat(lines).anyMatch(line -> line.contains("Resources"))
+                .anyMatch(line -> line.contains("no local resources"))
+                .noneMatch(line -> line.contains("use start, stop"));
+    }
+
+    @Test
+    void truncatesLongResourceRowsWithoutOverflowingTheTerminal() {
+        List<TuiDashboard.ResourceSummary> resources = List.of(
+                new TuiDashboard.ResourceSummary("source", "a-very-long-source-name-that-does-not-fit",
+                        "mongodb · snapshot", "mongodb", true, false),
+                new TuiDashboard.ResourceSummary("pipeline", "a-very-long-pipeline-name-that-does-not-fit",
+                        "1 source", null, true, false));
+
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", null,
+                        TuiDashboard.Connection.OFFLINE, null, "", List.of(), 0, null,
+                        null, null, null, List.of(), resources), 44, 10);
+
+        assertThat(lines).hasSize(10).allSatisfy(line -> assertThat(line.toString()).hasSize(44));
+        assertThat(lines).anyMatch(line -> line.toString().contains("+"));
+    }
 }
