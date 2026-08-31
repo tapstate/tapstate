@@ -159,6 +159,7 @@ class IssuerBindingTest {
         }
 
         @Override public boolean isHealthy(URI baseUrl) { return false; }
+        @Override public String serverVersion(URI baseUrl) { return null; }
         @Override public LoginOutcome login(URI baseUrl, String username, String password) { throw new AssertionError(); }
         @Override public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) { throw new AssertionError(); }
         @Override public GetOutcome get(URI baseUrl, String credential, String id) { throw new AssertionError(); }

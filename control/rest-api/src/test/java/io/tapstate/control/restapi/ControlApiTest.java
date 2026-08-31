@@ -650,6 +650,35 @@ class ControlApiTest {
     }
 
     @Test
+    void versionAnswersAtTheRootWithWhatTheBuildStampedIn() {
+        // The server's own version must be askable before anyone logs in: the CLI reads it while
+        // connecting, and connecting is decoupled from authenticating. So this is the second anonymous
+        // root endpoint, and like the probe it is a plain @Controller outside the /api prefix.
+        // The expected value comes from the build, not from a constant in this module -- a version the
+        // code carries can only be compared with itself, which pins nothing.
+        String projectVersion = System.getProperty("tapstate.project.version");
+        assertThat(projectVersion)
+                .as("the build must pass -Dtapstate.project.version so this guard can run at all")
+                .isNotBlank();
+
+        ResponseEntity<Map<String, Object>> answer = client().get().uri("/version")
+                .retrieve().toEntity(new ParameterizedTypeReference<>() { });
+
+        assertThat(answer.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(answer.getBody()).containsEntry("version", projectVersion);
+        // Both reserved fields are in the shape from the first release on, so a client that learns to
+        // read them never has to tell "this server is too old" from "this server left them out". They
+        // stay empty until what fills them lands. None of the three numbers derives from another: the
+        // product version here, the DSL grammar version, and the system-data version are independent.
+        assertThat(answer.getBody()).containsKeys("dslVersions", "dataVersion");
+        assertThat((List<?>) answer.getBody().get("dslVersions")).isEmpty();
+
+        HttpStatusCode versionUnderApi = client().get().uri("/api/version")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(versionUnderApi).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
     void clusterMembersIsRoutedButNotYetImplemented() {
         // Topology must never leak anonymously: until the authentication interceptor and the member
         // listing land, the endpoint is reserved and answers 501 — it exposes nothing.
@@ -725,7 +754,8 @@ class ControlApiTest {
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, SourceDraftTestConfiguration.class, ArtifactController.class,
             SourceDraftController.class, ConnectionController.class,
-            ClusterController.class, HealthController.class, ApiExceptionHandler.class, FaultController.class})
+            ClusterController.class, HealthController.class, VersionController.class,
+            ApiExceptionHandler.class, FaultController.class})
     static class TestApp {
 
         @Bean

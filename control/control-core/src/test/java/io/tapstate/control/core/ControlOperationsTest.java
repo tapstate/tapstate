@@ -14,6 +14,7 @@ class ControlOperationsTest {
     void registersExactlyTheL1OperationSet() {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
+                        "system.version",
                         "artifact.apply",
                         "artifact.validate",
                         "artifact.get",
@@ -129,6 +130,7 @@ class ControlOperationsTest {
             assertThat(registry.resolve(id).audited()).as(id).isTrue();
         }
         for (String id : List.of(
+                "system.version",
                 "artifact.get",
                 "artifact.list",
                 "artifact.validate",
@@ -158,7 +160,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(36);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(37);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
@@ -179,6 +181,7 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.MCP))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "system.version",
                         "connector.list", "connector.get",
                         "source.draft",
                         "connection.test", "connection.test-result",

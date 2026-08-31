@@ -24,6 +24,14 @@ interface ControlPlaneClient extends AutoCloseable {
     boolean isHealthy(URI baseUrl);
 
     /**
+     * The version the server reports over {@code GET {baseUrl}/version}, or {@code null} when it does
+     * not say — unreachable, refused, unparseable, or a server old enough to predate the endpoint.
+     * Anonymous like the probe, because this is read while connecting and connecting does not
+     * authenticate. Never throws: not knowing the server's version is an answer, not a failure.
+     */
+    String serverVersion(URI baseUrl);
+
+    /**
      * Verifies a username / password via {@code POST {baseUrl}/auth/login} and returns the outcome: a
      * bearer token on success, a coded rejection when the server refuses, or unreachable on any I/O
      * failure. Never throws.

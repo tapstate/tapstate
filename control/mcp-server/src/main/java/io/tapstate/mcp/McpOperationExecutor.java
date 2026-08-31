@@ -45,6 +45,7 @@ final class McpOperationExecutor {
         Map<String, Object> args = arguments == null ? Map.of() : arguments;
         try {
             return switch (operation.id()) {
+                case "system.version" -> get("/version");
                 case "connector.list" -> get("/api/connectors");
                 case "connector.get" -> get("/api/connectors/" + segment(required(args, "id")));
                 case "source.draft" -> sourceDraft(args);

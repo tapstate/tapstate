@@ -18,34 +18,14 @@ set -uo pipefail
 body="${PR_BODY:-}"
 required=("Linked issue" "Live verification scenario")
 
-# The text under one "## <heading>", with HTML comments removed. The template writes its guidance as
-# comments, so a section left untouched reduces to nothing here and an answered one does not — which
-# is the whole distinction between "the author skipped it" and "the author wrote none, deliberately".
-section_body() {
-  printf '%s\n' "$body" | awk -v want="## $1" '
-    { heading = $0; sub(/[ \t\r]+$/, "", heading) }
-    heading == want { inside = 1; next }
-    /^## / { inside = 0 }
-    inside { print }
-  ' | awk '
-    {
-      line = $0
-      if (comment) {
-        if (index(line, "-->")) { sub(/.*-->/, "", line); comment = 0 } else { line = "" }
-      }
-      if (!comment) {
-        sub(/<!--.*-->/, "", line)
-        if (index(line, "<!--")) { sub(/<!--.*/, "", line); comment = 1 }
-      }
-      gsub(/^[ \t\r]+|[ \t\r]+$/, "", line)
-      if (line != "") print line
-    }
-  '
-}
-
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/_pr-section.sh
+. "$here/_pr-section.sh"
 fail=0
 for name in "${required[@]}"; do
-  if ! printf '%s\n' "$body" | grep -qE "^## ${name}[[:space:]]*$"; then
+  # Not piped into `grep -q`: it closes the pipe on its first match, the writer behind it dies of
+  # that, and under `pipefail` the pipeline reports the signal rather than the match.
+  if ! grep -qE "^## ${name}[[:space:]]*$" <<<"$body"; then
     echo "::error::the pull request body has no \"## ${name}\" section — it is in the template, and removing it does not answer it"
     fail=1
     continue

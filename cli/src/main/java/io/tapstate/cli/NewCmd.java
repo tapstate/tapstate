@@ -481,14 +481,8 @@ final class NewCmd implements Callable<Integer> {
                 o.flush();
             }
             default -> {
-                MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(e.code(), e.args());
-                PrintWriter err = CliIo.err(spec);
-                err.println(Ansi.AUTO.string("@|bold,red error:|@") + " " + e.code().code());
-                err.println("  " + rendered.message());
-                if (rendered.solution() != null) {
-                    err.println("  " + rendered.solution());
-                }
-                err.flush();
+                // printText flushes; the writer it was flushing is the one it now owns.
+                Diagnostics.printText(CliIo.err(spec), e.code(), e.args());
             }
         }
         return EXIT_DIAGNOSTIC;

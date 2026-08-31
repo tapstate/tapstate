@@ -69,6 +69,7 @@ cli.request-timed-out
 cli.resource-not-found
 cli.unknown-connector
 cli.verb-not-implemented
+cli.version-mismatch
 cli.watch-needs-a-terminal
 cli.workspace-not-writable
 connector.ambiguous-connector-class

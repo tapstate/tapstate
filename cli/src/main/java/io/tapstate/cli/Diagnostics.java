@@ -18,6 +18,9 @@ import java.util.TreeMap;
  */
 final class Diagnostics {
 
+    /** What the pair reads as with no session in hand -- every one-shot offline command is here. */
+    static final String OFFLINE_VERSIONS = "cli " + Cli.VERSION_NUMBER + ", server not connected";
+
     private Diagnostics() {
     }
 
@@ -29,12 +32,26 @@ final class Diagnostics {
      * raised it; the message and solution come from the same bundled catalog as the structured form.
      */
     static void printText(PrintWriter err, TapstateErrorCode code, Map<String, Object> args) {
+        printText(err, code, args, OFFLINE_VERSIONS);
+    }
+
+    /**
+     * The same, stamped with which two builds produced it. Every reported problem carries the pair so
+     * that pasting the error is enough -- a reader does not have to know that the CLI and the server are
+     * separate installs, let alone that they can differ, and the question "which version are you on" has
+     * already been answered before anyone asks it. Uniform rather than judged per code: deciding which
+     * diagnostics look version-related is a judgement that would have to be made again for every code
+     * ever added, and the ones that get it wrong are exactly the surprising ones.
+     */
+    static void printText(
+            PrintWriter err, TapstateErrorCode code, Map<String, Object> args, String versions) {
         MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(code, args);
         err.println(Ansi.AUTO.string("@|bold,red error:|@") + " " + code.code());
         err.println("  " + rendered.message());
         if (rendered.solution() != null) {
             err.println("  " + rendered.solution());
         }
+        err.println("  (" + versions + ")");
         err.flush();
     }
 

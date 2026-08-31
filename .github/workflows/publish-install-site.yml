@@ -90,18 +90,24 @@ jobs:
           set -eu
           tag="${INPUT_TAG:-${EVENT_TAG:-}}"
           if [ -z "$tag" ]; then
-            tag="$(gh release list --limit 30 --exclude-drafts --json tagName \
-                     --jq 'first | .tagName')"
+            tag="$(.github/scripts/latest-release-tag.sh)"
           fi
-          test -n "$tag" || { echo "no published release to publish" >&2; exit 1; }
           echo "publishing tag: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Assemble the site from that tag
         id: site
-        # The two scripts come from the tag -- they are the release's content. The routing comes from
-        # the tag too when it has it, and falls back to this checkout for the first release cut before
-        # the config was checked in, which is stated out loud rather than silently substituted.
+        # The two scripts come from the tag -- they are the release's content -- but the version they
+        # pin comes from the tag's name, written in by site-from-tag.sh. A release is cut by naming a
+        # bump: the number is written into the tree inside the release runner, which never commits,
+        # so the tag lands on the commit as CI validated it and that tree still pins the release
+        # before this one. Reading these two files straight out of the tag publishes an installer
+        # that hands people the previous version, and nothing anywhere reports it -- the file is
+        # present, the version it names exists, and every downstream check passes.
+        #
+        # The routing comes from the tag too when it has it, and falls back to this checkout for the
+        # first release cut before the config was checked in, which is stated out loud rather than
+        # silently substituted.
         #
         # The tag arrives through the environment and is checked before use. Interpolating it into the
         # script text would make a dispatch input part of this job's source, and this job holds the
@@ -115,8 +121,11 @@ jobs:
           tag="$TAG"
           git fetch --quiet origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null || true
           site="$(mktemp -d)"
-          git show "$tag:deploy/quickstart/quickstart.sh" > "$site/quickstart.sh"
-          git show "$tag:install/install.sh"              > "$site/install.sh"
+          # Assigned before it is printed. Inside `echo "... $(...)"` the exit status is echo's, so a
+          # refusal here would be swallowed by `set -e` and the empty directory below would be
+          # deployed to the domain the README tells people to pipe into sh.
+          pinned="$(.github/scripts/site-from-tag.sh "$tag" "$site")"
+          echo "publishing the entry points pinned to $pinned"
           if git show "$tag:deploy/install-site/vercel.json" > "$site/vercel.json" 2>/dev/null; then
             echo "routing: from $tag"
           else

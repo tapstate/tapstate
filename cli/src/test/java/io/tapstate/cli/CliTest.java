@@ -196,6 +196,18 @@ class CliTest {
         assertThat(r.err()).isEmpty();
     }
 
+    @Test
+    void theVersionVerbNamesBothHalvesAndSaysWhenThereIsNoServer() {
+        // Offline it still prints two lines. A reader told to paste this output has no way to know the
+        // CLI and the server are separate builds, so the pair is the answer and a missing half is said
+        // out loud -- a blank where the second number belongs reads as "there is only one".
+        Run r = run("version");
+
+        assertThat(r.code()).isZero();
+        assertThat(r.out()).contains("cli").contains(Cli.VERSION_NUMBER);
+        assertThat(r.out()).contains("server").contains("not connected");
+    }
+
     @ParameterizedTest
     @MethodSource("offlineVerbs")
     void everyVerbThatAdvertisesVersionPrintsOne(String verb) {
@@ -273,6 +285,18 @@ class CliTest {
         // the dsl-domain error code surfaces, located at the offending file
         assertThat(r.all()).contains("dsl.unknown-field");
         assertThat(r.all()).contains("src_typo.tap.yml");
+    }
+
+    @Test
+    void aReportedProblemSaysWhichBuildsProducedIt() {
+        // The point of the stamp: pasting the error is enough. A reporter does not have to know the CLI
+        // and the server are separate installs, and nobody has to ask "which version are you on" -- the
+        // answer arrived with the complaint. Offline it says so rather than leaving the half blank.
+        Run r = run("validate", resource("ws-invalid").toString());
+
+        assertThat(r.code()).isEqualTo(1);
+        assertThat(r.all()).contains("cli " + Cli.VERSION_NUMBER);
+        assertThat(r.all()).contains("server not connected");
     }
 
     @Test

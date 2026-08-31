@@ -25,13 +25,18 @@ We credit reporters in the advisory unless you ask us not to.
 
 ## Supported versions
 
-Tapstate is pre-1.0 and moves fast. **Fixes land on `main` and ship in the next release; only
-the latest release line receives them.** There are no backports to earlier 0.x lines.
+Tapstate is pre-1.0 and moves fast. There is deliberately no version table below: one goes
+stale on the next release and still reads as current.
 
-| Version | Supported |
-| --- | --- |
-| 0.3.x | Yes |
-| < 0.3 | No — upgrade |
+**The current major version is supported — all of its release lines, not only the newest.**
+A fix lands on `main` and ships in the next release; when it matters to someone on an earlier
+line of that same major version, it can also ship there as a patch release. Once a newer major
+version exists, the previous one stops receiving fixes.
+
+**Today that means every `0.x` release is supported**, since they are all one major version:
+if `0.6.0` is out and you are still on `0.5`, a fix for you can ship as `0.5.1`. That changes
+the day `1.0.0` is released — from then on the `0.x` series stops receiving fixes, and
+upgrading to `1.x` is the path.
 
 ## Scope
 

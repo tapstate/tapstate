@@ -38,6 +38,9 @@ final class Session {
     /** The cluster name once known; {@code null} until membership discovery yields one (none in L1). */
     private String clusterName;
 
+    /** What the landing node reported as its version when this connection was made; null if it did not. */
+    private String serverVersion;
+
     /** The member base URLs to fail over across; the seeds until discovery refines them. */
     private List<URI> members = List.of();
 
@@ -59,6 +62,21 @@ final class Session {
     /** The base URL that answered the probe, or {@code null} while offline. */
     URI landingNode() {
         return landingNode;
+    }
+
+    /**
+     * How the pair of versions reads right now, for anything that reports a problem. Remembered from
+     * the connection rather than asked for again: a diagnostic is already a bad moment to spend a round
+     * trip in, and one that hung waiting for a version would be a worse failure than the one it came to
+     * report. What the server said when the connection was made is what the session has been talking to
+     * since.
+     */
+    String versions() {
+        if (!connected) {
+            return "cli " + Cli.VERSION_NUMBER + ", server not connected";
+        }
+        return "cli " + Cli.VERSION_NUMBER
+                + ", server " + (serverVersion == null ? "not reported" : serverVersion);
     }
 
     /** The ordered seed list used to connect (unmodifiable); empty while offline. */
@@ -97,6 +115,15 @@ final class Session {
         this.credentialKind = null;
         this.principal = null;
         this.clusterName = null;
+        // Reset with the rest: a version carried over from the node this session used to be on would be
+        // reported as the new one's, which is worse than not knowing it.
+        this.serverVersion = null;
+    }
+
+    /** The same, plus what that node answered when asked its version ({@code null} = it did not say). */
+    void connect(List<URI> seeds, URI landingNode, String serverVersion) {
+        connect(seeds, landingNode);
+        this.serverVersion = serverVersion;
     }
 
     /** Records an authenticated session: the credential, the principal, an optional cluster name, and members. */
@@ -140,6 +167,7 @@ final class Session {
         this.credentialKind = null;
         this.principal = null;
         this.clusterName = null;
+        this.serverVersion = null;
         this.members = List.of();
     }
 }

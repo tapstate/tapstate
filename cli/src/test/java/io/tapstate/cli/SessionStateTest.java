@@ -300,6 +300,11 @@ class SessionStateTest {
         }
 
         @Override
+        public String serverVersion(URI baseUrl) {
+            return null;
+        }
+
+        @Override
         public LoginOutcome login(URI baseUrl, String username, String password) {
             return new LoginOutcome.Unreachable();
         }

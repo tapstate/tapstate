@@ -1,120 +1,112 @@
-# CLI native release assets — the "zero build" enabler for the quickstart: a user downloads a prebuilt
-# tapstate binary for their platform instead of installing GraalVM and building it from source.
+# Making a release, end to end, from two answers a person gives and nothing else.
 #
-# Manual only (workflow_dispatch): nothing outward-facing fires on a push. On each of the four target
-# platforms it builds the native CLI and its stdio MCP Boot JAR sidecar with Liberica NIK, runs their smoke suites, then
-# packages tapstate-<version>-<os>-<arch>.tar.gz (the complete bin/ + libexec/ bundle + LICENSE + NOTICE).
-# A final job adds a per-asset
-# .sha256 and an aggregate checksums.txt and assembles a DRAFT, prerelease GitHub release. A human
-# reviews the draft and publishes it — nothing is published automatically, and no :latest / floating
-# pointer is ever produced (make_latest: false), which is the lever that keeps a preview build from
-# looking production-ready.
+# The person says how big the change is (`bump`) and, if it is not the tip of the default branch,
+# which commit ships (`commit`). Everything else is worked out: the version number, every file that
+# pins it, the assets, the checksums, the platform minimums, whether this release is the newest line.
+# There is deliberately no input for the version, for the release notes, for skipping a check, or for
+# "docs are ready" -- a switch a person can flip is not a check, and each one is another way to
+# produce a release that did not go the standard way.
 #
-# The public v<version> tag currently points at the initial commit with no release attached. Moving it
-# to the release commit is a deliberate, outward-facing, irreversible human step: do it before
-# publishing the draft, never as a side effect of this workflow. A draft release does not create or move
-# the tag; publishing it does, at target_commitish. Keep that commit aligned with the one these assets
-# were built from.
+# One dispatch, two halves, with a person in the middle:
 #
-# workflow_dispatch is only offered for workflows on the default branch, so this becomes runnable once
-# the branch it lives on merges to main.
+#   1. machine   work out the version -> write it into all six places that pin it -> build and smoke
+#                four native CLI binaries -> build both server image architectures into a local
+#                archive, pushing nothing -> check the release is complete -> create a DRAFT release,
+#                which is private and creates no tag
+#   2. person    the run pauses on an environment with required reviewers. Read the draft on the
+#                Releases page, edit the body if it needs it, then Approve or Reject in Actions
+#   3. machine   publish the draft, which creates the tag -> push the image archive -> point the
+#                floating "latest" marker here, but only if this release is ahead of every other
 #
-# The multi-arch server image shares this same tag lane: one dispatch builds linux/amd64 + linux/arm64
-# and pushes ghcr.io/<owner>/tapstate:<version> and :preview, never :latest (the lever that keeps a
-# preview build from looking production-ready). Mind one asymmetry with the CLI assets: an image has no
-# draft state. Pushing it is the only step here that cannot be taken back -- a draft release is private
-# until a human publishes it, and a tag is moved by hand -- so the image job runs last, gated on the
-# whole CLI half having already succeeded. The order is: build and smoke four binaries, package and
-# checksum them into a private draft, then push the images.
+# The three irreversible acts -- creating the tag, publishing, pushing the image -- are all in step 3,
+# all after the pause, and all done by the machine. A person judges; a person does not operate. Moving
+# a tag by hand used to be a step in this process, and it was the one step nothing checked.
 #
-# That gate is deliberate and was earned twice. The image job used to be a parallel sibling of the CLI
-# matrix, so the images went out whether or not the CLI half worked: one rehearsal built no CLI assets
-# at all (a retired runner label), and the next built all four and then failed packaging them. Either
-# would have left public preview images with no CLI to drive them.
+# Reject, or let the approval time out, and nothing is left behind: the draft is deleted, no tag was
+# ever created, no image was ever pushed, and the version number is unspent -- the next dispatch works
+# out the same one. That is also how a rehearsal is done now. There used to be a `dry_run` input for
+# it, which had the property that the rehearsal did not go down the same code path as the real thing;
+# the part it could never rehearse was the release body.
 #
-# Hence also the dry_run input: a rehearsal builds and smokes everything and publishes nothing -- both
-# image architectures are built but not pushed, all four CLI assets are built, smoked, packaged and
-# checksummed but no draft is created. Rehearse first, then dispatch for real.
+# The image is built early and pushed late for the same reason. Building it before the check means the
+# completeness check can look inside the archive and see both architectures -- a registry manifest
+# would only exist after the push, which would put an irreversible act before the check that is
+# supposed to gate it. The archive is two independent sources reconciled, not a build grading itself.
+#
+# Connector jars are not part of a versioned release; they are carried by a floating prerelease that
+# is republished on its own schedule. The completeness check knows that, so their absence here is a
+# recorded boundary rather than a gap nobody noticed.
 name: release
 
 on:
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "Rehearsal: build and smoke everything, publish nothing (no image push, no draft release)."
-        type: boolean
-        default: false
+      bump:
+        description: "How big is this release? The version number follows from this and the commit's history."
+        type: choice
+        options: [minor, patch, major]
+        required: true
+      commit:
+        description: "Which commit ships. Leave empty for the tip of the branch this is dispatched from."
+        type: string
+        required: false
 
 permissions:
   contents: read
 
 jobs:
-  prepare:
+  version:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.v.outputs.version }}
+      version: ${{ steps.next.outputs.version }}
+      tag: ${{ steps.next.outputs.tag }}
+      is_latest: ${{ steps.next.outputs.is_latest }}
+      sha: ${{ steps.sha.outputs.sha }}
+      # The tag the version was counted up from. Two jobs downstream need the same range -- the
+      # documentation gate and the notes -- and working it out a second time is a second chance to
+      # take the newest tag in the repository rather than the newest one on this commit's ancestry.
+      base: ${{ steps.next.outputs.base }}
     steps:
+      # Full history and every tag: the version is counted up from the newest version tag on this
+      # commit's own ancestry, and a shallow checkout can see neither the ancestry nor the tags.
       - uses: actions/checkout@v4
-      - id: v
-        # Portable read of the single ${revision} version source (works with BSD and GNU sed); no Maven.
-        run: echo "version=$(sed -n 's/.*<revision>\(.*\)<\/revision>.*/\1/p' pom.xml | head -1)" >> "$GITHUB_OUTPUT"
-
-  server-image:
-    # The server-image half of the tag lane. The Spring Boot jar is platform-independent, so both
-    # architectures share the one jar and differ only in the JRE base image and its apt layer -- which
-    # is what makes building arm64 under QEMU emulation cheap here. The jar is built first and copied in
-    # by the Dockerfile (the image is a runtime image, it does not build the jar itself), so the tiny
-    # build context the .dockerignore admits stays tiny. There is no draft state for an image, so this
-    # push is the one step that cannot be taken back -- which is why it waits for `release`: by the time
-    # it runs, all four CLI bundles exist, are smoked, packaged, checksummed and staged. Depending on
-    # `release` rather than on `cli-native` is the point: the CLI matrix going green does not mean the
-    # assets made it into the draft, and a rehearsal proved exactly that failure.
-    needs: [prepare, release]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write   # push the image to GHCR under the repository's own namespace
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-      - name: build the boot jar the image ships
-        run: mvn -B -pl app -am -DskipTests package
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          # A rehearsal still builds both architectures (that is the part worth proving); it just does
-          # not push. This is the only irreversible step in the job, so it is the only one gated.
-          push: ${{ !inputs.dry_run }}
-          # :<version> pins this exact build; :preview is the moving pointer the quickstart stack
-          # tracks. No :latest, deliberately -- the runtime is single-node and in-memory and must not
-          # be mistaken for a production default.
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}
-            ghcr.io/${{ github.repository }}:preview
+          ref: ${{ inputs.commit || github.ref }}
+          fetch-depth: 0
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: next
+        run: .github/scripts/next-version.sh "${{ inputs.bump }}" HEAD >> "$GITHUB_OUTPUT"
+      # A patch is cherry-picked onto a line that has been overtaken, and a changeset riding along on
+      # one is the failure nothing downstream can see: 0.5.1 takes a database to changeset 8, and
+      # 0.6.0 -- which knows up to 7 -- then refuses to start against every instance 0.5.1 upgraded.
+      # Both releases build, both install, and the two only ever meet on somebody's server.
+      #
+      # Vacuous today, and it says so in the log rather than passing in silence: no changeset exists
+      # in any tree yet. It is here now because the path that would carry one onto an old line is
+      # being built now, and a check added after the first patch release was not there for it.
+      - name: a patch ships the same changesets as the release it patches
+        if: inputs.bump == 'patch'
+        run: .github/scripts/changeset-parity.sh "${{ steps.next.outputs.base }}" HEAD
+      - name: say what this run is about to make
+        run: |
+          {
+            echo "### Releasing ${{ steps.next.outputs.tag }}"
+            echo
+            echo "* commit: \`${{ steps.sha.outputs.sha }}\`"
+            echo "* newest line: ${{ steps.next.outputs.is_latest }} (decides whether the floating \`latest\` marker moves here)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   cli-native:
-    needs: prepare
+    needs: version
     strategy:
       fail-fast: false
-      # Platform differences come from the runner + toolchain, never a Maven profile (ADR-0022 D6-3);
-      # os/arch are fixed labels here so the published asset names are a stable contract, not uname output.
-      # Only the newest two macOS versions are hosted, so a runner label ages out of existence rather
-      # than failing loudly: a job asking for a removed one queues forever with no runner assigned and
-      # never reports an error. macos-13 had already been removed and macos-14 is deprecated. The Intel
-      # image now carries an explicit -intel label; the plain label is Apple Silicon.
+      # Platform differences come from the runner + toolchain, never a Maven profile; os/arch are fixed
+      # labels here so the published asset names are a stable contract, not uname output. Only the
+      # newest two macOS versions are hosted, so a runner label ages out of existence rather than
+      # failing loudly: a job asking for a removed one queues forever with no runner assigned and never
+      # reports an error. The Intel image carries an explicit -intel label; the plain label is Apple
+      # Silicon.
       matrix:
         include:
           - { runner: macos-15,         os: darwin, arch: arm64 }
@@ -124,12 +116,19 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      # Before anything is built. The version enters the tree once, here, and the build downstream of
+      # it cannot disagree with the release it is part of.
+      - name: write the release version into every file that pins one
+        shell: bash
+        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
       - uses: graalvm/setup-graalvm@v1
         with:
           # The native artifact is the CLI only. The MCP sidecar remains a JVM Boot JAR, so this
           # release stays on the project's JDK 21 baseline instead of requiring a Java 25 AOT toolchain.
           java-version: '21'
-          distribution: 'liberica'   # Liberica NIK 21 (GPLv2+CPE) — the release toolchain; Oracle GraalVM (GFTC) is local dev only
+          distribution: 'liberica'   # Liberica NIK 21 (GPLv2+CPE) -- the release toolchain; Oracle GraalVM (GFTC) is local dev only
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: register the Liberica NIK JDK as the Maven toolchain (version 21, any vendor)
         shell: bash
@@ -191,7 +190,7 @@ jobs:
       - name: package the release asset
         shell: bash
         run: |
-          version='${{ needs.prepare.outputs.version }}'
+          version='${{ needs.version.outputs.version }}'
           asset="tapstate-${version}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
           bundle="$(find distribution/cli-bundle/target -type f -name '*-native.tar.gz' | head -1)"
           [ -n "$bundle" ] || { echo "native CLI bundle assembly not found" >&2; exit 1; }
@@ -203,30 +202,170 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
-  release:
-    needs: [prepare, cli-native]
+  server-image:
+    # A sibling of the CLI matrix again, which it could not be while it pushed: the push is the one act
+    # here that cannot be taken back, and it has moved to after the approval. What is left is a build,
+    # and a build that fails costs nothing. The Spring Boot jar is platform-independent, so both
+    # architectures share the one jar and differ only in the JRE base image and its apt layer, which is
+    # what makes building arm64 under emulation cheap.
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: write the release version into every file that pins one
+        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: build the boot jar the image ships
+        run: mvn -B -pl app -am -DskipTests package
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      # Into a local archive, not a registry. The completeness check reads both architectures out of
+      # this archive; a registry manifest would only exist after a push, and a push before the approval
+      # is exactly what this rearrangement removes.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}
+          outputs: type=oci,dest=${{ runner.temp }}/server-image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-image
+          path: ${{ runner.temp }}/server-image.tar
+          if-no-files-found: error
+
+  connectors:
+    # The one lane that drives real Tapdata connectors, started here so it overlaps the build
+    # instead of following it. It is not in any merge gate -- the default build has no connector
+    # jars -- so without this a release could go out having never been run against the connectors
+    # at all, which is the first thing a user touches.
+    #
+    # Dispatched, not waited on here: this job starts it and the gate below joins. Measured medians
+    # are ~38 minutes for the lane against ~7 for everything else, so starting it after the build
+    # would add the whole 38 to every release rather than overlapping it.
+    #
+    # `workflow_dispatch` takes a branch or tag, never a bare commit. When the release commit is the
+    # tip of the ref this was dispatched from, that ref is the commit and the lane can be started.
+    # When it is not -- a fix built from an older line's branch -- nothing is started, and the gate
+    # then asks for a run that already exists on that commit. It refuses if there is none, which is
+    # the correct answer: it says the lane has not seen this commit.
+    needs: version
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # create the draft release (and, only on a human publish, its tag)
+      contents: read
+      actions: write   # dispatch the connector lane
     steps:
-      # Take only the CLI assets. The image job's action uploads a build record artifact of its own, and
-      # an unfiltered download pulls that too -- so this job's success came to depend on an artifact it
-      # never uses, and one that failed to download sank the whole release step. Narrow it to the four
-      # tarballs: whatever else the other jobs upload, now or later, is none of this job's business.
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          pattern: tapstate-*.tar.gz
-          path: staging
-          merge-multiple: true
-      - name: checksums (per-asset .sha256 + aggregate checksums.txt)
-        working-directory: staging
+          ref: ${{ needs.version.outputs.sha }}
+      - name: start the real-connector lane on the commit being released
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          for f in tapstate-*.tar.gz; do sha256sum "$f" > "$f.sha256"; done
-          sha256sum tapstate-*.tar.gz > checksums.txt
-          ls -la
-      # The measured minimums, collected from every leg. This is a separate, explicitly named download
-      # rather than a widening of the one above: that one is narrow because it must not depend on artifacts
-      # this job does not use, and these it does use.
+          tip="$(gh api "repos/${{ github.repository }}/commits/${GITHUB_REF_NAME}" --jq '.sha' 2>/dev/null || true)"
+          if [ "$tip" != "${{ needs.version.outputs.sha }}" ]; then
+            echo "The release commit is not the tip of ${GITHUB_REF_NAME}, so the lane cannot be dispatched at it."
+            echo "The gate will ask for a run that already succeeded on ${{ needs.version.outputs.sha }}."
+            exit 0
+          fi
+          gh workflow run nightly-real-connectors.yml --ref "${GITHUB_REF_NAME}"
+          echo "Dispatched the real-connector lane on ${GITHUB_REF_NAME} (${tip})."
+
+  gates:
+    # The release gate. Six conditions, all decided by machine, none of them a box a person can tick
+    # -- a switch somebody can flip is not a check, and every one of them is another way to produce a
+    # release that did not go the standard way.
+    #
+    # Two of the six are not steps here, because they are already the reason this job can run at all,
+    # and re-asserting them would be this workflow grading its own dependency graph:
+    #
+    #   2. the release smoke tests are green   `cli-native` runs the native and MCP smokes against
+    #                                          each produced binary; a red one fails that job and
+    #                                          nothing downstream of it starts
+    #   3. the distribution is complete        `release-manifest.sh`, in the job below, opening every
+    #                                          asset before the draft is assembled
+    #
+    # The four that are steps are the ones nothing else was asking.
+    needs: [version, connectors, cli-native, server-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0   # the notes and the docs gate both read the range back to the previous tag
+
+      - name: The gates still decide the way they are supposed to
+        run: |
+          shellcheck .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh \
+            .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh \
+            .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh \
+            .github/scripts/docs-impact.sh .github/scripts/_pr-section.sh
+          bash .github/scripts/checks-on-commit-smoke.sh
+          bash .github/scripts/docs-gate-smoke.sh
+          bash .github/scripts/release-notes-smoke.sh
+
+      # 1. The required checks ran on this commit and were green. Not "the last run was green" -- the
+      #    set is read from the branch's rules at this moment rather than copied into this file, and
+      #    every name in it has to be present before any conclusion is looked at.
+      - name: 1. the required checks are green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/checks-on-commit.sh \
+            --sha "${{ needs.version.outputs.sha }}" \
+            --from-ruleset "${{ github.event.repository.default_branch }}"
+
+      # 6. And so is the connector lane, which no merge gate covers. This is where the lane started
+      #    in `connectors` is joined: poll until it has finished on this commit, then judge it the
+      #    same way as everything else. Failing closed in both directions is the point -- a lane that
+      #    never started and a lane still running are both refusals, and neither can be read off a
+      #    count of failures.
+      - name: 6. the real-connector lane is green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deadline=$(( SECONDS + 75 * 60 ))
+          while true; do
+            .github/scripts/checks-on-commit.sh --sha "${{ needs.version.outputs.sha }}" --required real-connectors && break
+            # 3 is the only answer worth waiting on: nothing has concluded yet. Anything else has
+            # concluded something, and polling a lane that already failed would burn the whole
+            # deadline printing that it is waiting.
+            [ "$?" = 3 ] || exit 1
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::the real-connector lane has not finished on ${{ needs.version.outputs.sha }} within 75 minutes"
+              exit 1
+            fi
+            echo "waiting for the real-connector lane..."
+            sleep 60
+          done
+
+      # 4. Every pull request in this release's range answered its documentation impact, and the ones
+      #    that said documentation was needed have it. How strictly the second half is read comes from
+      #    this release's own bump, which is the only semantic thing a person stated.
+      - name: 4. the documentation for this range has landed
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_REPO_TOKEN || github.token }}
+        run: |
+          .github/scripts/docs-gate.sh \
+            --base "${{ needs.version.outputs.base }}" \
+            --sha "${{ needs.version.outputs.sha }}" \
+            --bump "${{ inputs.bump }}"
+
+      # 5. The notes exist, assembled rather than remembered. Assembling them here rather than in the
+      #    job that creates the draft is what makes this a gate: a range that cannot be collected, or
+      #    a base tag that is not in this history, stops the release instead of producing a release
+      #    with an empty body.
       - uses: actions/download-artifact@v4
         with:
           pattern: cli-minimum-*
@@ -238,83 +377,376 @@ jobs:
       - name: platform-minimums.txt + the requirement sentences for the notes
         shell: bash
         run: |
-          cat minimums/*.minimum | sort > staging/platform-minimums.txt
-          cat staging/platform-minimums.txt
+          cat minimums/*.minimum | sort > platform-minimums.txt
+          cat platform-minimums.txt
           # One sentence per requirement kind: a single version when every platform agrees, and per
           # platform when they do not, which they need not -- the legs are built on separate machines.
           summarize() {   # $1 = requirement, $2 = how to name it to a reader
             local distinct
-            distinct="$(awk -v k="$1" '$2 == k { print $3 }' staging/platform-minimums.txt | sort -uV)"
+            distinct="$(awk -v k="$1" '$2 == k { print $3 }' platform-minimums.txt | sort -uV)"
             [ -n "$distinct" ] || return 0
             if [ "$(echo "$distinct" | wc -l)" -eq 1 ]; then
               echo "Recommended $2: $distinct or newer."
             else
-              echo "Recommended $2: $(awk -v k="$1" '$2 == k { printf "%s%s or newer on %s", sep, $3, $1; sep="; " } END { print "." }' staging/platform-minimums.txt)"
+              echo "Recommended $2: $(awk -v k="$1" '$2 == k { printf "%s%s or newer on %s", sep, $3, $1; sep="; " } END { print "." }' platform-minimums.txt)"
             fi
           }
           {
             echo "MACOS_REQ=$(summarize macos macOS)"
             echo "GLIBC_REQ=$(summarize glibc glibc)"
           } | tee -a "$GITHUB_ENV"
-      - name: assemble the DRAFT prerelease (a human reviews and publishes it)
-        if: ${{ !inputs.dry_run }}
+      - name: 5. the release notes assemble
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/release-notes.sh \
+            --version "${{ needs.version.outputs.version }}" \
+            --base "${{ needs.version.outputs.base }}" \
+            --sha "${{ needs.version.outputs.sha }}" \
+            --macos-req "${MACOS_REQ}" \
+            --glibc-req "${GLIBC_REQ}" \
+            > release-notes.md
+          test -s release-notes.md
+      # Both halves of what the next job needs from this one: the body it publishes, and the asset
+      # whose numbers that body quotes. One measurement, so the sentence a reader is given and the
+      # check made on their machine cannot drift apart.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: |
+            release-notes.md
+            platform-minimums.txt
+          if-no-files-found: error
+
+      - name: what the gate decided
+        run: |
+          {
+            echo "### Release gate for ${{ needs.version.outputs.tag }}"
+            echo
+            echo "| | gate | where it was decided |"
+            echo "|---|---|---|"
+            echo "| 1 | required CI green on \`${{ needs.version.outputs.sha }}\` | this job |"
+            echo "| 2 | release smoke green | \`cli-native\`, which this job needs |"
+            echo "| 3 | distribution complete | \`draft\`, before the release is assembled |"
+            echo "| 4 | documentation for the range has landed | this job |"
+            echo "| 5 | release notes assemble | this job |"
+            echo "| 6 | real-connector lane green on that commit | this job |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  draft:
+    needs: [version, cli-native, server-image, gates]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the draft release
+    outputs:
+      url: ${{ steps.create.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      # The completeness check asks the compose file which image a quickstart user runs, so the tree it
+      # asks has to be the tree this release was built from.
+      - name: write the release version into every file that pins one
+        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      # Take only the CLI assets. An unfiltered download pulls in whatever else the other jobs upload,
+      # so this job's success came to depend on artifacts it never uses, and one that failed to download
+      # sank the whole release step.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tapstate-*.tar.gz
+          path: staging
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-image
+          path: image
+      # The body the gate assembled, and the minimums asset whose numbers that body quotes. Both are
+      # taken from the gate rather than rebuilt here: a body assembled twice can differ from the one
+      # that was checked, and a release whose notes were never gated is what gate 5 exists to prevent.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: notes
+      - name: checksums (per-asset .sha256 + aggregate checksums.txt)
+        shell: bash
+        run: |
+          cp notes/platform-minimums.txt staging/
+          cd staging
+          for f in tapstate-*.tar.gz; do sha256sum "$f" > "$f.sha256"; done
+          sha256sum tapstate-*.tar.gz > checksums.txt
+          ls -la
+      # Every check that can be made before anything leaves the runner, is made before anything leaves
+      # the runner. What this catches is a release that looks successful and is missing a piece: a
+      # platform the installer offers with no asset behind it, an architecture that quietly did not
+      # build, or one of the two files nothing automated ever fetches.
+      - name: the release is complete
+        shell: bash
+        run: |
+          mkdir -p image/layout
+          tar -xf image/server-image.tar -C image/layout
+          .github/scripts/release-manifest.sh "${{ needs.version.outputs.version }}" staging image/layout
+      - name: assemble the draft release
+        id: create
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.prepare.outputs.version }}
-          target_commitish: ${{ github.sha }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ needs.version.outputs.sha }}
+          # Private until a person publishes it, and it creates no tag while it is a draft. Whether this
+          # release becomes the floating `latest` is decided at publish time, from whether it is ahead
+          # of every other version -- not here, and never by hand.
           draft: true
-          prerelease: true
-          make_latest: false
-          name: tapstate v${{ needs.prepare.outputs.version }} (preview)
-          # The "known limits" section below is not optional prose. A release of this runtime has to say
-          # out loud that an insert-only target can end up with duplicate rows, and that a change written
-          # while the change stream is still positioning itself can be missed -- neither has a scenario
-          # covering it, so a reader who is not told has no other way to find out. It must also claim
-          # neither production readiness nor exactly-once delivery. Removing or softening any of those
-          # four is a reviewed decision, never an edit made in passing.
-          body: |
-            Preview build — single-node, in-memory runtime, not for production.
-
-            Native CLI binaries for macOS (arm64 / x64) and Linux (x64 / arm64). Verify a download against
-            its `.sha256` or `checksums.txt` before use. No `:latest` / floating pointer is published.
-
-            ${{ env.MACOS_REQ }} ${{ env.GLIBC_REQ }} (`sw_vers -productVersion` and `ldd --version`
-            report what a machine has.) Both are measured from these binaries and follow the build
-            machines, so they can move between releases; an older system may refuse to launch them. They
-            are recommendations, not gates — the installer names them and carries on rather than blocking
-            you. `platform-minimums.txt` carries the same numbers in machine-readable form.
-
-            ### Known limits in this preview
-
-            These are disclosed rather than fixed, and no shipped scenario covers either one. For a change
-            the connector has read, delivery is at-least-once — never exactly-once. The second limit below
-            is a change the connector never reads at all, which no delivery guarantee can cover.
-
-            * **Duplicate rows on an insert-only target.** Where the target does not upsert, the snapshot
-              read and the change-data-capture read overlap, and a row seen by both is written twice.
-            * **Changes lost while the change stream positions itself.** The position is recorded before
-              the snapshot runs and is not handed to the connector's stream read until afterwards, so a
-              change written to the source inside that window can be missed.
+          name: tapstate ${{ needs.version.outputs.tag }}
+          # The body was assembled and checked under gate 5. `body_path`, never an inline body: the
+          # four disclosures in it -- what an insert-only target can end up with, what a positioning
+          # change stream can miss, that this is not for production, and that delivery is at-least-once
+          # -- are load-bearing, and as a literal here nothing could assert they were still present.
+          body_path: notes/release-notes.md
+          # GitHub's own list of merged pull requests, appended after that body. It is the backstop for
+          # everything nobody wrote a sentence for, and it is the reason the assembled body never
+          # writes a "## What's Changed" of its own.
+          generate_release_notes: true
           files: |
             staging/tapstate-*.tar.gz
             staging/tapstate-*.tar.gz.sha256
             staging/checksums.txt
             staging/platform-minimums.txt
-
-      # A rehearsal has proven the whole lane up to this point: four platforms built, smoked and packaged,
-      # checksums generated, both image architectures built. Say plainly that nothing left the runner, so a
-      # green rehearsal is never mistaken for a release.
-      - name: rehearsal summary (nothing was published)
-        if: ${{ inputs.dry_run }}
-        working-directory: staging
+      - name: where to look before approving
         run: |
           {
-            echo "### Rehearsal only — nothing was published"
+            echo "### Draft ${{ needs.version.outputs.tag }} is ready for review"
             echo
-            echo "No image was pushed to GHCR, no draft release was created, no tag was touched."
+            echo "[Read it here](${{ steps.create.outputs.url }}), edit the body if it needs editing,"
+            echo "then come back to this run and Approve or Reject."
             echo
-            echo "Assets that a real run would have staged:"
-            echo '```'
-            ls -1
-            echo '```'
+            echo "Reject and nothing is left: the draft is deleted, no tag exists, no image was pushed,"
+            echo "and the next dispatch works out ${{ needs.version.outputs.tag }} again."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  approve:
+    # Nothing but the pause. The environment carries the required reviewers, and this job exists so the
+    # run stops here rather than inside the job that does the irreversible work.
+    #
+    # The `release` environment needs required reviewers configured, and needs "Prevent self-review"
+    # left OFF -- what this pause is for is that somebody looked, not that a second person did, and
+    # switching it on deadlocks a release nobody else is around for. It must also not carry a
+    # deployment branch policy limiting it to the default branch: a release can legitimately be built
+    # from an older line's branch, and the policy would refuse exactly those.
+    needs: [version, draft]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      # An environment that does not exist is created on first use with no rules at all, and a job
+      # naming it then runs straight through. That failure is invisible in every direction: the YAML
+      # says `environment: release`, the run is green, the release goes out, and nothing anywhere
+      # reports that the review step did not happen. So the pause checks that it was a pause. Refusing
+      # here still costs nothing -- the draft is deleted, no tag was created, no image was pushed.
+      - name: the pause has to be a real pause
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reviewers="$(gh api "repos/${{ github.repository }}/environments/release" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length' 2>/dev/null || echo 0)"
+          if [ "${reviewers:-0}" -lt 1 ]; then
+            echo "the 'release' environment has no required reviewers, so this run never paused for one." >&2
+            echo "nothing was published. Add reviewers under Settings > Environments > release, then dispatch again." >&2
+            exit 1
+          fi
+          echo "Approved ${{ needs.version.outputs.tag }}."
+
+  publish:
+    needs: [version, draft, approve]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # publishing the draft is what creates the tag
+      packages: write   # push the image to GHCR under the repository's own namespace
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-image
+          path: image
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The archive built before the approval, pushed unchanged. Not rebuilt: a rebuild here would push
+      # something no check has looked at, and the whole point of the archive is that what ships is what
+      # was checked.
+      - name: push the server image that was built and checked
+        shell: bash
+        run: |
+          mkdir -p image/layout
+          tar -xf image/server-image.tar -C image/layout
+          digest="$(jq -r '.manifests[0].digest' image/layout/index.json)"
+          docker buildx imagetools create \
+            --tag "ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}" \
+            "oci-layout://$(pwd)/image/layout@${digest}"
+      # Publishing is what creates the tag, at the commit the draft named. `--notes` is deliberately not
+      # passed: whoever reviewed the draft may have edited the body, and re-sending the assembled body
+      # would silently put their edit back the way it was.
+      #
+      # `--latest` is the floating pointer, and it is the reason a fix to an older line is worked out
+      # from that line's own history. Publishing 0.5.1 after 0.6.0 must not point new installs at 0.5.1.
+      - name: publish the draft, and move the floating pointer only if this is the newest line
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ needs.version.outputs.tag }}" \
+            --draft=false \
+            --latest=${{ needs.version.outputs.is_latest }}
+      - name: what went out
+        run: |
+          {
+            echo "### Published ${{ needs.version.outputs.tag }}"
+            echo
+            echo "* image: \`ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}\`"
+            echo "* floating \`latest\` marker moved here: ${{ needs.version.outputs.is_latest }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  roadmap:
+    # The board says what shipped, and in which release. Nothing else does: the execution issue for a
+    # line is closed when its pull request merges, which is before the release that carries it, so by
+    # the time anything goes out the issue has been closed for days and cannot carry the answer.
+    #
+    # Every release, not only the newest line. A fix released onto an overtaken line shipped work too,
+    # and leaving it off the roadmap is how an old line looks abandoned while it is being maintained.
+    #
+    # Allowed to fail, and that is the whole reason it is a job of its own. The release is already out
+    # by the time this runs; holding it back over a roadmap that can be corrected by hand would trade
+    # something that cannot be undone for something that can.
+    needs: [version, publish]
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # the board is written with the app token below, not with this one
+    steps:
+      # Not GITHUB_TOKEN: it reaches this repository and nothing above it, and the board belongs to
+      # the organization. `owner` is what widens the app token past this one repository.
+      - id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0   # the range back to the previous tag is where the shipped work is read from
+      - name: move what this release shipped to Shipped
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          # pipefail is on under `shell: bash`, so this pipeline would trip errexit and skip the
+          # summary that exists to name which of the board, the field, the option or the credential
+          # was the problem. Off for this one pipeline; PIPESTATUS still carries the script's status.
+          set +o pipefail
+          .github/scripts/roadmap-shipped.sh \
+            --version "${{ needs.version.outputs.version }}" \
+            --base "${{ needs.version.outputs.base }}" \
+            --sha "${{ needs.version.outputs.sha }}" 2>&1 | tee roadmap.log
+          code=${PIPESTATUS[0]}
+          {
+            echo "### Roadmap"
+            echo
+            sed 's/^/    /' roadmap.log
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+
+  write-back:
+    # The version this release just took is written into the default branch, so the next release
+    # counts up from it and the one-click demo on main points at something that exists.
+    #
+    # Only when this release is the newest line, and that condition is the whole job. Opening it for
+    # a fix to an older line walks the default branch's version *backwards* -- 0.5.1 over 0.6.0 --
+    # in a pull request where all six pins agree with each other, every existing check is green
+    # (they compare the six against each other, not against what came before), and the person
+    # merging it has no reason to look twice. Afterwards the demo on main installs an old tag and
+    # the next `bump=minor` counts up from the wrong number.
+    #
+    # Forgetting to merge this is soft: main stays a version behind, pinned to a release that exists
+    # and installs. That is why an app token is enough and no admin credential is wanted here -- this
+    # pull request goes through the same checks as any other, and is allowed to wait.
+    needs: [version, publish]
+    if: needs.version.outputs.is_latest == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # everything this job writes, it writes with the app token below
+    steps:
+      # Not GITHUB_TOKEN. A push or a pull request made with it triggers no push or pull_request
+      # workflow, by design, so every required check on the default branch would be permanently
+      # absent -- not unverified but unmergeable. The token goes to checkout as well as to the pull
+      # request step: with only the latter, the credentials checkout persisted are what push the
+      # branch, the checks stay absent, and it looks exactly like the secret not being set.
+      - id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.token.outputs.token }}
+          ref: ${{ github.event.repository.default_branch }}
+      - name: write the released version into every file that pins one
+        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.token.outputs.token }}
+          branch: ws/write-back-${{ needs.version.outputs.version }}
+          # Only the files that pin a version. Anything else in the tree at this point is not part of
+          # this change and would arrive as a diff nobody asked a reviewer to read.
+          add-paths: |
+            pom.xml
+            cli/src/main/java/io/tapstate/cli/Cli.java
+            control/mcp-server/src/main/resources/application.properties
+            deploy/quickstart/quickstart.sh
+            install/install.sh
+            deploy/quickstart/docker-compose.yml
+          title: "Write ${{ needs.version.outputs.version }} into the version pins"
+          commit-message: "Write ${{ needs.version.outputs.version }} into the version pins"
+          body: |
+            ${{ needs.version.outputs.tag }} is published and is the newest line, so the default
+            branch should say so.
+
+            Every one of these six files is written by `.github/scripts/set-version.sh`, which the
+            release run had already applied inside its own runner -- that write is never committed,
+            which is why the tag points at a tree still pinning the previous release and why this
+            pull request exists.
+
+            ## Documentation impact
+
+            - **Draft in this repository:** none
+            - **Public page it is headed for:** none
+
+            ### Release note
+
+            none -- version pins only, no user-visible change.
+
+  discard:
+    # Rejected, timed out, or failed on the way. A draft left on the Releases page is the one thing a
+    # rejection can leave behind that still looks publishable -- one click and it goes out having gone
+    # round everything above.
+    needs: [version, draft, publish]
+    if: always() && needs.draft.result == 'success' && needs.publish.result != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: delete the draft that was not published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Only ever a draft. Publish creates the tag and makes the release public one step before
+          # its last, and `always()` fires on cancellation too, so a half-finished publish can leave a
+          # real release here -- deleting that one keeps the tag and spends the version for good.
+          if [ "$(gh release view "${{ needs.version.outputs.tag }}" --json isDraft --jq '.isDraft' 2>/dev/null)" != true ]; then
+            echo "${{ needs.version.outputs.tag }} is not an unpublished draft; leaving it alone." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh release delete "${{ needs.version.outputs.tag }}" --yes
+          echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. No tag was created, no image was pushed." >> "$GITHUB_STEP_SUMMARY"

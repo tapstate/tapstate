@@ -25,8 +25,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 class HttpControlPlaneClientTest {
 
     private static HttpServer serverReplying(int status, String body) throws Exception {
+        return serverReplying("/healthz", status, body);
+    }
+
+    private static HttpServer serverReplying(String path, int status, String body) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        server.createContext("/healthz", exchange -> {
+        server.createContext(path, exchange -> {
             byte[] bytes = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(status, bytes.length == 0 ? -1 : bytes.length);
             if (bytes.length > 0) {
@@ -110,6 +114,26 @@ class HttpControlPlaneClientTest {
         }
     }
 
+    // --- the version the server reports: one field, and never a throw -----------------------------
+
+    /*
+     * Every way of not getting a version is the same answer -- null -- and the caller renders it as "not
+     * reported". That makes the negative cases indistinguishable from each other by their result, which
+     * is exactly why each needs its own case: the code has a separate branch for each, and a
+     * simplification that collapses two of them changes no test that only checks the happy path.
+     */
+
+    @Test
+    void theServerVersionIsTheVersionFieldTheServerAnswered() throws Exception {
+        HttpServer server = serverReplying("/version", 200,
+                "{\"version\":\"9.9.9\",\"dslVersions\":[],\"dataVersion\":null}");
+        try {
+            assertThat(new HttpControlPlaneClient().serverVersion(baseOf(server))).isEqualTo("9.9.9");
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void malformedIssuerDiscoveryResponseIsReportedAsInvalidRatherThanUnreachable() throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -125,6 +149,17 @@ class HttpControlPlaneClientTest {
         try {
             assertThat(new HttpControlPlaneClient().discover(baseOf(server)))
                     .isEqualTo(new DiscoveryOutcome.Invalid("response-body"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void noVersionWhenTheServerRefusesThatPath() throws Exception {
+        // an older build with no such endpoint: the connection is fine, the question is not understood
+        HttpServer server = serverReplying("/version", 404, null);
+        try {
+            assertThat(new HttpControlPlaneClient().serverVersion(baseOf(server))).isNull();
         } finally {
             server.stop(0);
         }
@@ -151,6 +186,55 @@ class HttpControlPlaneClientTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void noVersionWhenTheAnswerIsNotAnObject() throws Exception {
+        HttpServer server = serverReplying("/version", 200, "[\"9.9.9\"]");
+        try {
+            assertThat(new HttpControlPlaneClient().serverVersion(baseOf(server))).isNull();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void noVersionWhenTheObjectCarriesNoVersionField() throws Exception {
+        HttpServer server = serverReplying("/version", 200, "{\"dataVersion\":null}");
+        try {
+            assertThat(new HttpControlPlaneClient().serverVersion(baseOf(server))).isNull();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void noVersionWhenTheVersionFieldIsBlank() throws Exception {
+        // a blank is worse than an absence: printed as-is it leaves the half a reader is meant to
+        // compare looking answered
+        HttpServer server = serverReplying("/version", 200, "{\"version\":\"  \"}");
+        try {
+            assertThat(new HttpControlPlaneClient().serverVersion(baseOf(server))).isNull();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void noVersionForAnUnreachablePortWithoutThrowing() throws Exception {
+        int closedPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            closedPort = socket.getLocalPort();
+        }   // the port is closed on scope exit -> a connect there is refused
+        assertThat(new HttpControlPlaneClient().serverVersion(URI.create("http://127.0.0.1:" + closedPort)))
+                .isNull();
+    }
+
+    @Test
+    void noVersionForAHostlessUriWithoutThrowing() {
+        // throws while the request is being built, before any I/O -- a different branch from the one a
+        // refused connection takes, and the never-throws contract covers both
+        assertThat(new HttpControlPlaneClient().serverVersion(URI.create("http://foo:bar"))).isNull();
     }
 
     // --- stream endpoint URI: http(s) base -> ws(s) with the path appended ------------------------

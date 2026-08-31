@@ -60,6 +60,28 @@ check enforces it. See CONTRIBUTING.md, "Documentation".
 - **Draft in this repository:** <!-- path under docs/, or "none" -->
 - **Public page it is headed for:** <!-- URL under https://tapstate.dev/docs, or "none" -->
 
+### Release note
+
+<!--
+One sentence, as a user story: as <who>, I can <do what>, so that <what I am spared or gain>.
+
+- "as <who>" only when the change means something to one kind of user in particular; a generic
+  subject says nothing, so leave it out.
+- "so that" has to be specific enough to be wrong. "Improves the experience" is not; "so that
+  rows deleted at the source disappear from the target too, and stale data need not be cleaned
+  up by hand" is.
+- Cannot fill in "so that"? Write `none`. That is a conclusion -- you judged it and there is no
+  user-visible change -- not a section skipped.
+- Write it from the issue this belongs to and what it promised, and look at the diff last. Starting
+  from the diff produces "reordered the initialisation of X"; starting from the issue produces
+  "you no longer have to register it first".
+
+This sentence is collected into the release notes, unedited, when a release is cut. See
+CONTRIBUTING.md, "Release notes".
+-->
+
+none
+
 ## Checks
 
 - [ ] `mvn verify` is green locally

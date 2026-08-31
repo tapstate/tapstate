@@ -366,6 +366,51 @@ it.** You are never asked to author directly in the documentation repository.
    documentation owner, linking back to this pull request. A pull request closed
    without merging produces nothing.
 
+## Release notes
+
+Every release says what changed in it, and the sentence describing your change is
+written by you, in the pull request, while you still have it in your head. Nothing
+is collected afterwards and no changelog file is edited: at release time the
+`### Release note` line from each merged pull request in the range is copied into
+the notes as you wrote it.
+
+**Write it as a user story:** *as \<who\>, I can \<do what\>, so that \<what I am
+spared or gain\>.*
+
+That shape is not a house style. It has no slot for implementation detail, which is
+what makes it work — "refactored the connector registry" cannot be written in it at
+all. Drop "as \<who\>" unless the change matters to one kind of user in particular;
+a generic subject is noise, and the sentence reads normally without it:
+
+> You can assemble tables from MySQL and PostgreSQL into one object, without
+> creating a view or a cross-database join.
+
+**"so that" has to be falsifiable.** This is the one failure the shape does not
+prevent, so it is the one thing to check:
+
+| Not this | This |
+|---|---|
+| so that the experience is better | so that stale rows need not be cleaned up by hand |
+| so that it is more robust | so that a column added at the source does not require rebuilding the task |
+
+**Write it from the issue, and read the diff last.** The issue says what was
+promised and to whom; the diff says which files moved. Starting from the diff
+reliably produces a sentence about the code. A useful self-check: name which part
+of the issue the sentence came from. If you cannot, it came from the diff — rewrite
+it.
+
+**`none` is an answer.** If you cannot fill in "so that", write `none`: an internal
+refactor, a build change, a test. It means you judged it, which is why the section
+is not simply left blank — a blank and a decision must not look the same. A
+performance change that cannot say what got faster from where the user sits does not
+belong in the notes either.
+
+One consistency check runs as a bot comment, never a gate: a pull request labelled
+`docs-needed` whose release note says `none` is contradicting itself, since both
+sections are asking the same question — can a user see this? One of the two is
+wrong. Nothing is blocked over it; a purely internal fix is never held up for
+documentation it does not need.
+
 ## Guidelines
 
 - **Java 21.** The build targets JDK 21; the native CLI requires GraalVM for JDK 21.
@@ -385,4 +430,7 @@ it.** You are never asked to author directly in the documentation repository.
 Use the **bug or idea** template — the first lane in
 [External contributions](#external-contributions). Include the version and, where relevant, a
 minimal reproduction (for the CLI, the `.tap.yml` input and the exact command). For a security
-vulnerability, do not open an issue at all: see [SECURITY.md](SECURITY.md).
+vulnerability, do not open an issue at all: see [SECURITY.md](SECURITY.md). Which releases still
+receive fixes is answered in that same file, under
+[Supported versions](SECURITY.md#supported-versions) — being on an earlier line of the current
+major version does not put you out of scope.

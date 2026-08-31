@@ -5,15 +5,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -35,9 +26,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("the CLI reaches a running server from its arguments alone")
 class CliOneLineLaunchIT {
 
-    /** Where the build wrote the classpath the CLI is launched from. */
-    private static final String CLI_CLASSPATH_PROPERTY = "tapstate.e2e.cli-classpath";
-
     private static final String USER = "e2e";
     private static final String PASSWORD = "e2e-password";
 
@@ -52,7 +40,7 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliRun run = runCli(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER, "ls");
+            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD, "ls");
 
             // `ls` is a credentialed read: reaching an answer at all proves the connection was made and
             // the credential exchanged, both from the arguments, with no session ever opened
@@ -75,7 +63,7 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliRun run = runCli(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER,
+            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD,
                     "get", "no-such-artifact");
 
             // running one command from a script is only worth anything if its outcome is the process's
@@ -89,54 +77,12 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliRun run = runCli("wrong", "-c", server.baseUrl().toString(), "-u", USER, "ls");
+            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", "wrong", "ls");
 
             assertThat(run.exitCode()).isNotZero();
             // the reason reported is the sign-in, not a missing connection reported by the verb that
             // should never have run
             assertThat(run.stdout()).doesNotContain("no resources");
-        }
-    }
-
-    /** What one CLI process produced. */
-    private record CliRun(int exitCode, String stdout, String stderr) {
-    }
-
-    /** Launches the CLI as its own process on the classpath the build recorded, and waits for it. */
-    private static CliRun runCli(String password, String... args) {
-        List<String> command = new ArrayList<>(List.of(
-                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                "-cp", cliClasspath(),
-                "io.tapstate.cli.Cli"));
-        command.addAll(List.of(args));
-        try {
-            ProcessBuilder builder = new ProcessBuilder(command);
-            builder.environment().put("TAPSTATE_PASSWORD", password);
-            Process process = builder.start();
-            String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            String err = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
-            if (!process.waitFor(2, TimeUnit.MINUTES)) {
-                process.destroyForcibly();
-                throw new AssertionError("the CLI did not exit; output so far:\n" + out + err);
-            }
-            return new CliRun(process.exitValue(), out, err);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted waiting for the CLI", e);
-        }
-    }
-
-    private static String cliClasspath() {
-        String file = System.getProperty(CLI_CLASSPATH_PROPERTY);
-        assertThat(file)
-                .as("the build must set %s so the CLI can be launched", CLI_CLASSPATH_PROPERTY)
-                .isNotBlank();
-        try {
-            return Files.readString(Path.of(file)).trim();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
         }
     }
 }
