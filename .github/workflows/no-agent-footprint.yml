@@ -27,59 +27,22 @@ jobs:
         with:
           fetch-depth: 0 # full history for the commit-message scan
 
-      - name: No agent instruction files
+      - name: The gate still decides the way it is supposed to
         run: |
-          set -euo pipefail
-          hits="$(find . -path ./.git -prune -o -type f \
-            \( -iname 'CLAUDE.md' -o -iname 'AGENTS.md' -o -iname 'GEMINI.md' \
-               -o -iname 'CODEX.md' -o -iname 'COPILOT.md' \) -print)"
-          if [ -n "$hits" ]; then
-            echo "::error::agent instruction file(s) found in a zero-footprint repo:"
-            echo "$hits"
-            exit 1
-          fi
-          echo "clean: no agent instruction files."
+          shellcheck .github/scripts/no-agent-footprint.sh .github/scripts/no-agent-footprint-smoke.sh
+          bash .github/scripts/no-agent-footprint-smoke.sh
+
+      - name: No agent instruction files
+        run: bash .github/scripts/no-agent-footprint.sh files
 
       - name: No .claude directory
-        run: |
-          set -euo pipefail
-          hits="$(find . -path ./.git -prune -o -type d -name '.claude' -print)"
-          if [ -n "$hits" ]; then
-            echo "::error::.claude directory found in a zero-footprint repo:"
-            echo "$hits"
-            exit 1
-          fi
-          echo "clean: no .claude directory."
+        run: bash .github/scripts/no-agent-footprint.sh dir
 
       - name: No agent footers in commits or PR body
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_SHA: ${{ github.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          set -euo pipefail
-          # Common agent footers; case-insensitive.
-          pattern='Generated with \[?Claude Code|🤖 Generated with|Co-[Aa]uthored-[Bb]y:.*(Claude|GPT|Codex|Copilot|Gemini)|noreply@anthropic\.com'
-          fail=0
-
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="origin/${{ github.base_ref }}"
-            git rev-parse --verify --quiet "$base" >/dev/null 2>&1 \
-              || git fetch --quiet --no-tags origin "${{ github.base_ref }}" || true
-            range="$base..HEAD"
-          else
-            range="${{ github.event.before }}..${{ github.sha }}"
-          fi
-
-          msgs="$(git log --format='%H %B' "$range" 2>/dev/null || true)"
-          if [ -n "$msgs" ] && printf '%s' "$msgs" | grep -qEi "$pattern"; then
-            echo "::error::agent footer found in commit message(s):"
-            printf '%s' "$msgs" | grep -Ei "$pattern" || true
-            fail=1
-          fi
-
-          if [ -n "${PR_BODY:-}" ] && printf '%s' "$PR_BODY" | grep -qEi "$pattern"; then
-            echo "::error::agent footer found in the PR body."
-            fail=1
-          fi
-
-          if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "clean: no agent footers."
+        run: bash .github/scripts/no-agent-footprint.sh messages
