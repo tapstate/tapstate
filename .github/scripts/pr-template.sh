@@ -45,6 +45,30 @@ for entry in "${required[@]}"; do
   fi
 done
 
+# The release note also says which kind of change it is -- and only when it says anything, because
+# `none` has nothing to file. Without it a release's notes are one flat list in which a reader
+# looking for what broke has to read every line to learn that none of them is about that. Asked
+# here, beside the sentence the author is already writing, rather than taken from a label: a label
+# is a second place to keep the same fact, and across the sixteen pull requests of the first
+# release not one carried `bug` or `enhancement`, so grouping on labels would have put everything
+# in one bucket while reporting itself grouped.
+note="$(section_body "Release note" "###")"
+if [ -n "$note" ] && ! is_none "$(without_field Kind "$note")"; then
+  kind="$(printf '%s' "$(field_value Kind "$note")" | tr '[:upper:]' '[:lower:]')"
+  case "$kind" in
+    new|fix) ;;
+    "")
+      echo "::error::\"### Release note\" says something, but carries no \"**Kind:**\" — a sentence with no kind is filed under neither heading in the release"
+      echo "Write \`**Kind:** new\` for a capability or \`**Kind:** fix\` for a fix, on its own line above the sentence."
+      fail=1
+      ;;
+    *)
+      echo "::error::\"**Kind:** ${kind}\" is not one of new or fix"
+      fail=1
+      ;;
+  esac
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "All three are short to answer and expensive to leave out. See .github/PULL_REQUEST_TEMPLATE.md,"
   echo "and CONTRIBUTING.md -> External contributions for what a linked issue is expected to carry."

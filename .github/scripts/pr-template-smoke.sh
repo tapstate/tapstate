@@ -45,7 +45,7 @@ refute() {
   fi
 }
 
-answered=$'## Linked issue\n\nRefs #12. The design is in the issue body, under "Design".\n\n## Live verification scenario\n\nStart the demo workspace, apply the pipeline, insert a row, watch it land in the sink.\n\n\n### Release note\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
+answered=$'## Linked issue\n\nRefs #12. The design is in the issue body, under "Design".\n\n## Live verification scenario\n\nStart the demo workspace, apply the pipeline, insert a row, watch it land in the sink.\n\n\n### Release note\n\n**Kind:** new\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
 
 untouched=$'## Linked issue\n\n<!--\nWhich issue, and where its design is written.\n-->\n\n## Live verification scenario\n\n<!-- How a maintainer sees this work by hand. -->\n'
 
@@ -53,9 +53,9 @@ half=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\n<!-- How
 
 deleted=$'## What changed\n\nA fix.\n\n## Live verification scenario\n\nRun the CLI against the sample workspace.\n'
 
-inline=$'## Linked issue\n\nRefs #12 <!-- not Fixes, on purpose -->\n\n## Live verification scenario\n\nRun it <!-- see below --> against the demo workspace.\n\n\n### Release note\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
+inline=$'## Linked issue\n\nRefs #12 <!-- not Fixes, on purpose -->\n\n## Live verification scenario\n\nRun it <!-- see below --> against the demo workspace.\n\n\n### Release note\n\n**Kind:** new\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
 
-other_sections=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n## Checks\n\n<!-- unfilled, and none of this gate\x27s business -->\n\n\n### Release note\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
+other_sections=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n## Checks\n\n<!-- unfilled, and none of this gate\x27s business -->\n\n\n### Release note\n\n**Kind:** new\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
 
 # The section the gate is being taught. `none` is an answer and must pass -- a release-tooling
 # change has no user-visible effect, and a sentence invented for it travels all the way to a user.
@@ -75,6 +75,13 @@ expect "an empty body is refused"               1 "has no"            ""
 expect "an answer beside a comment passes"      0 "clean:"            "$inline"
 expect "other unfilled sections are not ours"   0 "clean:"            "$other_sections"
 
+# A sentence has to say which kind it is; `none` does not, because there is nothing to file.
+relnote_nokind=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n### Release note\n\nas an operator, I can see the version.\n'
+
+relnote_badkind=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n### Release note\n\n**Kind:** bugfix\n\nas an operator, I can see the version.\n'
+
+relnote_fix=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n### Release note\n\n**Kind:** fix\n\nas an operator, I no longer see a stale row.\n'
+
 expect "a missing release note is refused by name" 1 'has no "### Release note"' "$relnote_missing"
 expect "a release note left as the prompt refused" 1 "### Release note" "$relnote_unfilled"
 # The control, and the reason `none` stays legal: without it, "refuse anything that is not a
@@ -87,6 +94,13 @@ expect "a written none is an answer and passes"    0 "clean:" "$relnote_none"
 # literal word `none`, an untouched body and a considered one were the same body, and the gate
 # would pass every pull request while reporting itself clean. So the template is a case.
 expect "the shipped template does not pre-answer" 1 '"### Release note" is still' "$(cat "$here/../PULL_REQUEST_TEMPLATE.md")"
+
+expect "a sentence without a Kind is refused"      1 "Kind" "$relnote_nokind"
+expect "a Kind that is neither is refused"         1 "bugfix" "$relnote_badkind"
+expect "fix is a Kind and passes"                  0 "clean:" "$relnote_fix"
+# The control that keeps the escape hatch open: `none` needs no classification, so demanding one
+# everywhere would refuse exactly the pull requests the escape hatch was written for.
+refute "a written none is not asked for a Kind"      "Kind" "$relnote_none"
 
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

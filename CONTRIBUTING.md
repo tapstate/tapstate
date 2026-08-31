@@ -405,6 +405,12 @@ is not simply left blank — a blank and a decision must not look the same. A
 performance change that cannot say what got faster from where the user sits does not
 belong in the notes either.
 
+**Say which kind it is.** Above the sentence, write `**Kind:** new` for a capability
+somebody gains or `**Kind:** fix` for something that stopped being wrong. That is what
+puts it under the right heading in the release -- a flat list makes a reader hunting
+for what broke read every line to find out none of them is about that. `none` needs no
+Kind, because there is nothing to file.
+
 A check refuses a pull request whose `### Release note` section is missing, or left as
 the template's prompt with nothing written under it. `none` passes it — the point is
 not to extract a sentence from every change, it is that the section cannot be skipped
