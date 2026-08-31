@@ -30,24 +30,28 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The persisted source read offset never moves backwards, across a restart included.
+ * The persisted source read offset never moves backwards.
  *
- * <p>A restart is where this can happen at all. The offset is ranked by the order the engine assigned as
- * it read -- the pair (generation, ring sequence) -- while the value written down is the connector token.
- * A restart raises the generation and, with the position supplied by a per-run monotonic watermark rather
- * than by the connector, hands the new run tokens that start over from the beginning. So the order rises
- * while the token falls, the sink-acked clamp sees a rising order and admits the advance, and the durable
- * offset is silently set to a position earlier than one already reached.
+ * <p>The offset is written down as the source's own token, but it is <em>ranked</em> by the order the
+ * engine assigned as it read — the pair (generation, ring sequence) — and it is clamped so it never
+ * passes the slowest consumer's durably acked position. That clamp is where a rewind comes from: the
+ * minimum it resolves to can fall, while nothing about the falling is visible at the time. A second
+ * pipeline joining a shared chain with a sink further behind is enough, and so is a restart, which
+ * raises the generation while every consumer's acked position still sits in the generation before it.
  *
- * <p>Nothing about that is visible at the time: the write succeeds, the run keeps going, and the loss
- * shows up only on the next restart, which resumes from the earlier position and re-mines -- or, once the
+ * <p>Nothing about a rewind announces itself: the write succeeds, the run keeps going, and the loss
+ * shows up only on the next restart, which resumes from the earlier position and re-mines — or, once the
  * source has aged past it, cannot.
+ *
+ * <p>What stops it is the store's own guarantee that this value only ever moves forward. The guarantee
+ * is on the store rather than on its callers because the caller resolving the rewinding candidate is
+ * behaving correctly: clamping to the slowest sink is exactly what keeps unacked changes re-minable. The
+ * fake here honours that contract, as any implementation must; the real one is held to it against a live
+ * database by {@code MongoSrsMetaStoreIT}.
  */
 class SourceReadOffsetOnlyMovesForwardTest {
 
@@ -86,61 +90,86 @@ class SourceReadOffsetOnlyMovesForwardTest {
     }
 
     @Test
-    void doesNotRewindThePersistedOffsetWhenARestartStartsItsPositionsOver() {
-        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.forward")));
-        LastWriteWinsMeta meta = new LastWriteWinsMeta();
+    void doesNotRewindWhenASlowerConsumerJoinsAndDropsTheClamp() {
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.forward-join")));
+        AdvanceOnlyMeta meta = new AdvanceOnlyMeta();
 
-        // Run 1 reads five changes and a consumer durably acks all of them, so the offset reaches w5.
-        runOnce(gate, meta, FIRST_GENERATION, 5, ackedAt(FIRST_GENERATION, 4, "w5"));
-        assertThat(meta.current).isEqualTo("w5");
+        // One consumer, acked through the fifth change, so the offset reaches s5.
+        runOnce(gate, meta, FIRST_GENERATION, 5, List.of(ackedAt("p1", FIRST_GENERATION, 4, "s5")));
+        assertThat(meta.current()).isEqualTo("s5");
 
-        // The restart: a new generation, and a watermark that starts its tokens over at w1. It reads
-        // fewer changes than the first run did, so its tokens stay strictly below the position already
-        // reached -- the two runs' tokens must not be allowed to coincide, or a rewind and a legitimate
-        // re-advance to the same place would be the same observation.
-        runOnce(gate, meta, RESTARTED_GENERATION, 3, ackedAt(RESTARTED_GENERATION, 7, "w3"));
+        // A second pipeline joins the shared chain and its sink is further behind. The clamp now resolves
+        // to its position, which is a place this chain has already read past.
+        runOnce(gate, meta, FIRST_GENERATION, 2, List.of(
+                ackedAt("p1", FIRST_GENERATION, 4, "s5"),
+                ackedAt("p2", FIRST_GENERATION, 1, "s2")));
 
-        // w3 here is a position already passed. Persisting it means the next restart resumes from there
-        // and re-mines everything after it -- or, once the source has aged past it, cannot.
-        assertThat(meta.current)
-                .as("persisted offset after the restart; every advance in order was %s", meta.advances)
-                .isEqualTo("w5");
+        assertThat(meta.current())
+                .as("persisted offset after the slower consumer joined; every advance in order was %s",
+                        meta.advances)
+                .isEqualTo("s5");
     }
 
-    /** Drives one cdc run of {@code changes} inserts over its own fresh watermark, as a restarted process would. */
+    @Test
+    void doesNotRewindWhenARestartRaisesTheGenerationAboveEveryAckedPosition() {
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.forward-restart")));
+        AdvanceOnlyMeta meta = new AdvanceOnlyMeta();
+
+        runOnce(gate, meta, FIRST_GENERATION, 5, List.of(ackedAt("p1", FIRST_GENERATION, 4, "s5")));
+        assertThat(meta.current()).isEqualTo("s5");
+
+        // The restart: a new generation, so every change it reads outranks every acked position from the
+        // generation before -- and the clamp therefore resolves to one of those older acks, whose token is
+        // a place this chain read past before the restart.
+        runOnce(gate, meta, RESTARTED_GENERATION, 3, List.of(ackedAt("p1", FIRST_GENERATION, 2, "s3")));
+
+        assertThat(meta.current())
+                .as("persisted offset after the restart; every advance in order was %s", meta.advances)
+                .isEqualTo("s5");
+    }
+
+    /**
+     * Drives one cdc run of {@code changes} inserts, as a restarted process would. The source states each
+     * change's position itself -- s1, s2, ... -- which is what a real one does and what the run under test
+     * now reads; nothing on the write side hands positions out any more.
+     */
     private static void runOnce(
             SrsWriteGate gate, SrsMetaStore meta, long generation, int changes, List<ConsumerOffset> consumers) {
-        CdcChain chain = new CdcChain(gate, meta, "chain", monotonicWatermark(), generation, 0L);
+        CdcChain chain = new CdcChain(gate, meta, "chain", generation, 0L);
         List<Envelope> events = new ArrayList<>();
         for (int i = 1; i <= changes; i++) {
             events.add(Envelope.insert(i, "orders", Map.of("id", i), Map.of()));
         }
-        FakeCdcPort port = new FakeCdcPort(events);
-        CdcPhase.run(port, new CaptureConfig("mysql", Map.of(), List.of("orders")), chain,
+        CdcPhase.run(new FakeCdcPort(events), new CaptureConfig("mysql", Map.of(), List.of("orders")), chain,
                 () -> Long.MAX_VALUE, () -> consumers, new CaptureHealth());
     }
 
     /** One consumer whose sink has durably landed everything up to the given position. */
-    private static List<ConsumerOffset> ackedAt(long generation, long seq, String token) {
-        return List.of(new ConsumerOffset(
-                "p1", Map.of("orders", seq), new ChainPosition(new SourceOrder(generation, seq), token)));
+    private static ConsumerOffset ackedAt(String pipelineId, long generation, long seq, String token) {
+        return new ConsumerOffset(
+                pipelineId, Map.of("orders", seq), new ChainPosition(new SourceOrder(generation, seq), token));
     }
 
-    /** A mock cdc watermark: w1, w2, ... per run -- a restarted process starts a fresh one at w1. */
-    private static Supplier<SourcePosition> monotonicWatermark() {
-        AtomicLong n = new AtomicLong();
-        return () -> new SourcePosition("w" + n.incrementAndGet());
-    }
-
-    /** A meta store keeping only the current offset, the way a {@code $set} on one field does. */
-    private static final class LastWriteWinsMeta implements SrsMetaStore {
-        String current;
+    /**
+     * A meta store holding only the source read offset, and honouring the one guarantee its contract makes
+     * about it: it only ever moves forward. A position that does not rank after the recorded one is
+     * ignored, silently and successfully.
+     */
+    private static final class AdvanceOnlyMeta implements SrsMetaStore {
+        ChainPosition recorded;
         final List<String> advances = new ArrayList<>();
 
+        String current() {
+            return recorded == null ? null : recorded.token();
+        }
+
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
-            current = sourceReadOffset;
-            advances.add(sourceReadOffset);
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+            advances.add(position.token());
+            if (recorded != null && position.order().compareTo(recorded.order()) <= 0) {
+                return;
+            }
+            recorded = position;
         }
 
         @Override
@@ -199,7 +228,7 @@ class SourceReadOffsetOnlyMovesForwardTest {
         }
     }
 
-    /** A cdc port replaying a fixed list of change events to the listener. */
+    /** A cdc port replaying a fixed list of change events, stating a position for each the way a source does. */
     private static final class FakeCdcPort implements CapturePort {
         private final List<Envelope> events;
 
@@ -209,8 +238,9 @@ class SourceReadOffsetOnlyMovesForwardTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            int n = 0;
             for (Envelope e : events) {
-                listener.onEvent(e);
+                listener.onEvent(e, Optional.of(new SourcePosition("s" + ++n)));
             }
             return () -> {
             };

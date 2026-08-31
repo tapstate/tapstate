@@ -37,7 +37,7 @@ class MongoSrsMetaStoreTest {
     void metaRoundTripsThroughTheDocumentMapping() {
         SrsMeta meta = new SrsMeta(
                 "orders@mysql-1",
-                "gtid:aaa-1:900",
+                new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"),
                 List.of(
                         new ConsumerOffset("p1", Map.of("orders", 42L), new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100")),
                         new ConsumerOffset("p2", new LinkedHashMap<>(Map.of("orders", 7L, "items", 3L)), null)),

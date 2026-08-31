@@ -18,6 +18,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -231,7 +232,7 @@ class PdkCapturePortTest {
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
         List<Envelope> got = new CopyOnWriteArrayList<>();
         CountDownLatch three = new CountDownLatch(3);
-        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), e -> {
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), (e, pos) -> {
             got.add(e);
             three.countDown();
         })) {
@@ -264,7 +265,7 @@ class PdkCapturePortTest {
         // the reading would be a timeout rather than the reason for it.
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event) {
+            public void onEvent(Envelope event, Optional<SourcePosition> position) {
                 got.add(event);
                 settled.countDown();
             }
@@ -296,7 +297,7 @@ class PdkCapturePortTest {
         CountDownLatch failed = new CountDownLatch(1);
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event) {
+            public void onEvent(Envelope event, Optional<SourcePosition> position) {
             }
 
             @Override
@@ -336,7 +337,7 @@ class PdkCapturePortTest {
         CountDownLatch failed = new CountDownLatch(1);
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event) {
+            public void onEvent(Envelope event, Optional<SourcePosition> position) {
             }
 
             @Override
@@ -369,7 +370,7 @@ class PdkCapturePortTest {
         // second interrupt / stop / loader close.
         Path jar = Synthetic.emittingSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
-        Subscription sub = port.cdc(config("t1"), CaptureStart.present(), e -> {
+        Subscription sub = port.cdc(config("t1"), CaptureStart.present(), (e, pos) -> {
         });
         sub.close();
         assertThatCode(sub::close).doesNotThrowAnyException();
@@ -377,33 +378,108 @@ class PdkCapturePortTest {
 
 
     @Test
-    void resumingAtARecordedPositionIsRefusedInsteadOfQuietlyStartingSomewhereElse(@TempDir Path dir)
-            throws Exception {
-        // A connector's position is an object of its own making, and nothing here renders one as a token
-        // yet. Starting the stream anyway - at the present, or at a string the connector never issued -
-        // is the failure this refusal exists to prevent: the tail runs, the job is healthy, and every
-        // change between the recorded position and wherever it actually began is simply gone.
-        Path jar = Synthetic.emittingSource(dir);
-        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+    void handsARecordedPositionBackToTheConnectorAsTheObjectItIssued(@TempDir Path dir) throws Exception {
+        // The whole of a resume, end to end: the connector states a position as an object of its own
+        // class, that object becomes a token, and the token becomes the object again -- resolved through
+        // the connector's own loader, which is the only place its class exists. The connector reports the
+        // position it was started from as the row it emits, so this observes the object arriving rather
+        // than merely that the call did not throw.
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
 
-        assertThatThrownBy(() -> port.cdc(
-                config("t1"), CaptureStart.resume(new SourcePosition("binlog.000042:1234")), e -> { }))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("binlog.000042:1234");
+        String token;
+        try (CaptureBatch batch = port.snapshot(config("t1"))) {
+            token = batch.seam().orElseThrow().token();
+        }
+
+        List<Envelope> seen = new CopyOnWriteArrayList<>();
+        CountDownLatch two = new CountDownLatch(2);
+        try (Subscription sub = port.cdc(config("t1"),
+                CaptureStart.resume(new SourcePosition(token)), (event, position) -> {
+                    seen.add(event);
+                    two.countDown();
+                })) {
+            assertThat(two.await(5, TimeUnit.SECONDS)).as("two change events delivered").isTrue();
+        }
+
+        assertThat(seen.get(0).after())
+                .as("the connector reports the position it was started from as the row it emits")
+                .containsEntry("id", "seam-1");
     }
 
     @Test
-    void aSnapshotBatchReportsNoSeamWhileAConnectorOffsetCannotBeRenderedAsAToken(@TempDir Path dir)
+    void refusesARecordedPositionThisConnectorCannotReadInsteadOfBeginningAtThePresent(@TempDir Path dir)
             throws Exception {
+        // Starting at the present instead is the silent form of the same failure: the tail runs, the job
+        // is healthy, and every change between the recorded position and where it actually began is gone.
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
+
+        assertThatThrownBy(() -> port.cdc(
+                config("t1"), CaptureStart.resume(new SourcePosition("not-a-position")),
+                (event, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .extracting(e -> ((TapstateException) e).code())
+                .isEqualTo(ConnectorError.POSITION_UNREADABLE);
+    }
+
+    @Test
+    void reportsTheSeamSampledBeforeTheSnapshotRead(@TempDir Path dir) throws Exception {
+        // Sampled before the first row, so a change made while the snapshot runs falls after the seam and
+        // is re-delivered by the tail. Sampled after, it would fall before and never be delivered at all.
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
+
+        String token;
+        try (CaptureBatch batch = port.snapshot(config("t1"))) {
+            assertThat(batch.seam()).isPresent();
+            token = batch.seam().orElseThrow().token();
+        }
+
+        // The token really is the connector's own offset object and not a rendering of whatever it
+        // prints as: read back against the host's loader it is refused, because the class it names
+        // exists only inside the connector jar. The port reads it back through the connector's loader,
+        // which the resume test drives end to end.
+        assertThatThrownBy(() -> ConnectorOffsetCodec.fromToken(
+                "demo", token, getClass().getClassLoader()))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("PositionedSource");
+    }
+
+    @Test
+    void aSnapshotBatchReportsNoSeamWhenTheConnectorNamesNoPosition(@TempDir Path dir) throws Exception {
         // Reporting none is the honest answer, and it is what makes a caller that needs a seam refuse.
         // The failure it replaces is a caller inventing one, which puts the tail somewhere the source
-        // never was.
+        // never was. This connector registers no offset function at all, so there is nothing to report.
         Path jar = Synthetic.emittingSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
 
         try (CaptureBatch batch = port.snapshot(config("t1"))) {
             assertThat(batch.seam()).isEmpty();
         }
+    }
+
+    @Test
+    void carriesTheBatchPositionOnTheChangeThatClosesTheBatchAndOnNoOther(@TempDir Path dir)
+            throws Exception {
+        // One position stands for a run of changes and means "everything up to here has been handed
+        // over". On any change but the last that sentence is false, and a run interrupted between them
+        // would resume past changes it never delivered.
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
+
+        List<Optional<SourcePosition>> positions = new CopyOnWriteArrayList<>();
+        CountDownLatch two = new CountDownLatch(2);
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(),
+                (event, position) -> {
+                    positions.add(position);
+                    two.countDown();
+                })) {
+            assertThat(two.await(5, TimeUnit.SECONDS)).as("two change events delivered").isTrue();
+        }
+
+        assertThat(positions.get(0)).isEmpty();
+        assertThat(positions.get(1)).isPresent();
     }
 
     // ---- testConnection / discoverSchema drive ---------------------------------------------------

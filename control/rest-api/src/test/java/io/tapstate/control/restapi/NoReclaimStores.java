@@ -113,7 +113,7 @@ final class NoReclaimStores {
             }
 
             @Override
-            public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+            public void advanceSourceReadOffset(String miningChainId, io.tapstate.core.event.ChainPosition position) {
                 throw unexpected("SrsMetaStore.advanceSourceReadOffset");
             }
 

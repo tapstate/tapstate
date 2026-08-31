@@ -496,7 +496,7 @@ class StorePortTest {
     void metaCreateIsInsertOnlyAndDoesNotDiscardAccumulatedTruth() {
         SrsMetaStore meta = new InMemoryStore().meta();
         meta.create("chain", "7d");
-        meta.advanceSourceReadOffset("chain", "gtid:aaa-1:500");
+        meta.advanceSourceReadOffset("chain", new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
 
         meta.create("chain", "30d"); // a second seed must not wipe the advanced offset
 
@@ -508,7 +508,7 @@ class StorePortTest {
         SrsMetaStore meta = new InMemoryStore().meta();
         meta.create("chain", null);
 
-        meta.advanceSourceReadOffset("chain", "gtid:aaa-1:900");
+        meta.advanceSourceReadOffset("chain", new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
 
         assertThat(meta.read("chain").orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
     }
@@ -578,7 +578,7 @@ class StorePortTest {
         meta.setCdcStart("chain", "binlog.000042:1024", running);
 
         meta.markSnapshotComplete("chain", "orders");
-        meta.advanceSourceReadOffset("chain", "gtid:aaa-1:900");
+        meta.advanceSourceReadOffset("chain", new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
         meta.appendSchemaVersion("chain", new SchemaVersion(0, Map.of("id", "int"), 0));
 
         // Each facet is an independent writer of one record. A mutator that rebuilt the record without
@@ -667,7 +667,7 @@ class StorePortTest {
     void detachConsumerRemovesOnlyThatConsumerAndKeepsTheChainsOwnAccumulatedTruth() {
         SrsMetaStore meta = new InMemoryStore().meta();
         meta.create("chain", "7d");
-        meta.advanceSourceReadOffset("chain", "gtid:aaa-1:500");
+        meta.advanceSourceReadOffset("chain", new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
         meta.setCdcStart("chain", "gtid:aaa-1:1", 1L);
         meta.appendSchemaVersion("chain", new SchemaVersion(0, Map.of("id", "int"), 0));
         meta.upsertConsumerOffset("chain", new ConsumerOffset("leaving", Map.of("orders", 10L), null));
@@ -743,7 +743,7 @@ class StorePortTest {
         meta.create("chain", null);
         meta.markSnapshotComplete("chain", "orders");
 
-        meta.advanceSourceReadOffset("chain", "gtid:aaa-1:900");
+        meta.advanceSourceReadOffset("chain", new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
         meta.setCdcStart("chain", "binlog.000042:1024", 1L);
         meta.openEpoch("chain");
         meta.appendSchemaVersion("chain", new SchemaVersion(0, Map.of("id", "int"), 0));
@@ -759,7 +759,7 @@ class StorePortTest {
         SrsMetaStore meta = new InMemoryStore().meta();
         // every mutator requires the chain to have been seeded by create first; a mutate on an unseeded
         // chain is a caller ordering error, surfaced bare.
-        assertThatThrownBy(() -> meta.advanceSourceReadOffset("nope", "x")).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> meta.advanceSourceReadOffset("nope", new ChainPosition(new SourceOrder(1L, 1L), "x"))).isInstanceOf(IllegalStateException.class);
         assertThatThrownBy(() -> meta.upsertConsumerOffset("nope", new ConsumerOffset("p", Map.of(), null)))
                 .isInstanceOf(IllegalStateException.class);
         assertThatThrownBy(() -> meta.setCdcStart("nope", "x", 1L)).isInstanceOf(IllegalStateException.class);
@@ -1086,9 +1086,15 @@ class StorePortTest {
                 }
 
                 @Override
-                public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+                public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
                     SrsMeta current = require(miningChainId);
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), sourceReadOffset,
+                    // Advance-only, per the contract: a position that does not rank after the one already
+                    // recorded is ignored, silently and successfully.
+                    if (current.sourceRead() != null
+                            && position.order().compareTo(current.sourceRead().order()) <= 0) {
+                        return;
+                    }
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), position,
                             current.consumerOffsets(), current.cdcStartPosition(), current.schemaHistory(),
                             current.retention(), current.snapshotCompletedTables(), current.epoch(), current.snapshotEpoch()));
                 }
@@ -1109,7 +1115,7 @@ class StorePortTest {
                     if (!replaced) {
                         merged.add(offset);
                     }
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceReadOffset(),
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
                             merged, current.cdcStartPosition(), current.schemaHistory(), current.retention(),
                             current.snapshotCompletedTables(), current.epoch(), current.snapshotEpoch()));
                 }
@@ -1134,7 +1140,7 @@ class StorePortTest {
                         // A reader may advance before the sink first acks: create the entry, acked absent.
                         merged.add(new ConsumerOffset(pipelineId, Map.of(table, lastReadSeq), null));
                     }
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceReadOffset(),
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
                             merged, current.cdcStartPosition(), current.schemaHistory(), current.retention(),
                             current.snapshotCompletedTables(), current.epoch(), current.snapshotEpoch()));
                 }
@@ -1157,7 +1163,7 @@ class StorePortTest {
                         // A sink may ack before the reader first publishes a cursor: create the entry, cursor empty.
                         merged.add(new ConsumerOffset(pipelineId, Map.of(), position));
                     }
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceReadOffset(),
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
                             merged, current.cdcStartPosition(), current.schemaHistory(), current.retention(),
                             current.snapshotCompletedTables(), current.epoch(), current.snapshotEpoch()));
                 }
@@ -1165,7 +1171,7 @@ class StorePortTest {
                 @Override
                 public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
                     SrsMeta current = require(miningChainId);
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceReadOffset(),
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
                             current.consumerOffsets(), cdcStartPosition, current.schemaHistory(),
                             current.retention(), current.snapshotCompletedTables(), current.epoch(), snapshotEpoch));
                 }
@@ -1174,7 +1180,7 @@ class StorePortTest {
                 public long openEpoch(String miningChainId) {
                     SrsMeta current = require(miningChainId);
                     long opened = current.epoch() + 1;
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceReadOffset(),
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
                             current.consumerOffsets(), current.cdcStartPosition(), current.schemaHistory(),
                             current.retention(), current.snapshotCompletedTables(), opened, current.snapshotEpoch()));
                     return opened;
@@ -1185,7 +1191,7 @@ class StorePortTest {
                     SrsMeta current = require(miningChainId);
                     List<SchemaVersion> history = new ArrayList<>(current.schemaHistory());
                     history.add(version);
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceReadOffset(),
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
                             current.consumerOffsets(), current.cdcStartPosition(), history, current.retention(),
                             current.snapshotCompletedTables(), current.epoch(), current.snapshotEpoch()));
                 }
@@ -1198,7 +1204,7 @@ class StorePortTest {
                     }
                     List<String> completed = new ArrayList<>(current.snapshotCompletedTables());
                     completed.add(table);
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceReadOffset(),
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
                             current.consumerOffsets(), current.cdcStartPosition(), current.schemaHistory(),
                             current.retention(), completed, current.epoch(), current.snapshotEpoch()));
                 }
@@ -1226,7 +1232,7 @@ class StorePortTest {
                     List<ConsumerOffset> kept = current.consumerOffsets().stream()
                             .filter(offset -> !offset.pipelineId().equals(pipelineId))
                             .toList();
-                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceReadOffset(),
+                    srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
                             kept, current.cdcStartPosition(), current.schemaHistory(), current.retention()));
                 }
 

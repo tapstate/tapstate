@@ -71,9 +71,61 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
-        Objects.requireNonNull(sourceReadOffset, "sourceReadOffset");
-        update(miningChainId, new Document("$set", new Document("sourceReadOffset", sourceReadOffset)));
+    public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        // Two updates, and the split is the guard. The first carries the ordering condition in its own
+        // filter, so the comparison and the write are one atomic act: a read-then-write would let a second
+        // member land its advance in between and be overwritten by this one, which is the rewind this
+        // exists to stop. It matches nothing when the recorded position already ranks at or after this one.
+        long matched = StoreIo.call(() -> collection.updateOne(
+                sourceReadAdvanceFilter(miningChainId, position.order()),
+                new Document("$set", sourceReadFields(position))).getMatchedCount());
+        if (matched > 0) {
+            return;
+        }
+        // Nothing matched, which is either "the chain is not seeded" -- a caller ordering error the other
+        // mutators raise too -- or "this position does not move the chain forward", which is ordinary and
+        // silent. Only a second look tells them apart, and it runs on the path that changed nothing.
+        requireSeeded(miningChainId);
+    }
+
+    /**
+     * The filter that admits an advance: this chain, and a recorded position strictly before {@code order}
+     * — no record yet, or a lower generation, or the same generation and a lower sequence. Positions are
+     * ranked by generation first because a rebuilt ring numbers its sequences from zero again, so a
+     * sequence alone is only meaningful within the ring that assigned it.
+     */
+    static Document sourceReadAdvanceFilter(String miningChainId, SourceOrder order) {
+        return new Document("_id", miningChainId).append("$or", List.of(
+                new Document("sourceReadEpoch", new Document("$exists", false)),
+                new Document("sourceReadEpoch", new Document("$lt", order.epoch())),
+                new Document("sourceReadEpoch", order.epoch())
+                        .append("sourceReadSeq", new Document("$lt", order.seq()))));
+    }
+
+    /**
+     * The fields one advance writes: the order it reached and, when the position carries one, the token.
+     * They move together — a token stored without its order can no longer be ranked, and an order without
+     * its token is nothing a read can resume from.
+     */
+    private static Document sourceReadFields(ChainPosition position) {
+        Document fields = new Document("sourceReadEpoch", position.order().epoch())
+                .append("sourceReadSeq", position.order().seq());
+        if (position.token() != null) {
+            fields.append("sourceReadOffset", position.token());
+        }
+        return fields;
+    }
+
+    /** Raises the caller ordering error the advancing mutators share when a chain has no record. */
+    private void requireSeeded(String miningChainId) {
+        Document existing = StoreIo.call(() -> collection.find(new Document("_id", miningChainId)).first());
+        if (existing == null) {
+            throw new IllegalStateException("srs meta mutate on an unseeded mining chain: " + miningChainId
+                    + " (create must seed it first)");
+        }
     }
 
     @Override
@@ -270,8 +322,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .append("consumerOffsets", consumers)
                 .append("schemaHistory", schemaHistory)
                 .append("snapshotCompletedTables", List.copyOf(meta.snapshotCompletedTables()));
-        if (meta.sourceReadOffset() != null) {
-            document.append("sourceReadOffset", meta.sourceReadOffset());
+        if (meta.sourceRead() != null) {
+            document.putAll(sourceReadFields(meta.sourceRead()));
         }
         if (meta.cdcStartPosition() != null) {
             document.append("cdcStartPosition", meta.cdcStartPosition());
@@ -336,7 +388,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 snapshotCompletedTables.add(String.valueOf(entry));
             }
         }
-        return new SrsMeta(id, document.getString("sourceReadOffset"), consumers,
+        return new SrsMeta(id, sourceReadFrom(document), consumers,
                 document.getString("cdcStartPosition"), schemaHistory, document.getString("retention"),
                 snapshotCompletedTables, readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"));
     }
@@ -384,6 +436,22 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * nothing acked: that pins a source-read advance where it stands, which only ever costs re-mining
      * changes already read - the direction that keeps them re-minable at all.
      */
+    /**
+     * How far the chain has read, or null when nothing has read it. A document written before this record
+     * carried an order has a token and no order: it reads back as nothing read, which costs re-mining
+     * changes already read rather than skipping changes that were not — the direction that loses nothing.
+     */
+    private static ChainPosition sourceReadFrom(Document document) {
+        Object epoch = document.get("sourceReadEpoch");
+        Object seq = document.get("sourceReadSeq");
+        if (!(epoch instanceof Number) || !(seq instanceof Number)) {
+            return null;
+        }
+        return new ChainPosition(
+                new SourceOrder(((Number) epoch).longValue(), ((Number) seq).longValue()),
+                document.getString("sourceReadOffset"));
+    }
+
     private static ChainPosition sinkAckedFrom(Document document) {
         Object epoch = document.get("sinkAckedEpoch");
         Object seq = document.get("sinkAckedSeq");

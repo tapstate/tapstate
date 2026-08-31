@@ -432,7 +432,9 @@ class NestOverTwoSourcesDataFlowTest {
 
         @Override
         public Optional<SourcePosition> seam() {
-            return Optional.empty();
+            // Sampled by the source before its first row. The run refuses to start a tail without one,
+            // because a tail that begins wherever it likes loses every change made while the snapshot ran.
+            return Optional.of(new SourcePosition("seam-0"));
         }
 
         @Override

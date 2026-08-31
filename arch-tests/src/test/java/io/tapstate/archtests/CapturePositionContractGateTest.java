@@ -3,6 +3,7 @@ package io.tapstate.archtests;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.spi.capture.CaptureBatch;
+import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.SourcePosition;
@@ -42,9 +43,17 @@ import org.junit.jupiter.api.Test;
  */
 class CapturePositionContractGateTest {
 
-    /** The read-side contract. Everything that carries a position is reached from one of these. */
-    private static final List<Class<?>> CONTRACT =
-            List.of(CapturePort.class, CaptureBatch.class, CaptureStart.class, SourcePosition.class);
+    /**
+     * The read-side contract. Everything that carries a position is reached from one of these.
+     *
+     * <p>{@code CaptureListener} is one of them because a change now arrives with the position the source
+     * stated for it. Dropping that parameter compiles, leaves the build green, and leaves the durable read
+     * offset with nothing to advance on — a pipeline that runs, reports healthy, and resumes from the
+     * beginning every time.
+     */
+    private static final List<Class<?>> CONTRACT = List.of(
+            CapturePort.class, CaptureBatch.class, CaptureStart.class, SourcePosition.class,
+            CaptureListener.class);
 
     private static final Path GOLDEN = Path.of("src", "test", "resources", "capture-position-contract.golden");
 

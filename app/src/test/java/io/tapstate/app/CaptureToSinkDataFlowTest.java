@@ -173,7 +173,7 @@ class CaptureToSinkDataFlowTest {
         // carrying the injected stream name and the source position the projection lifted from the ring item.
         // Their arrival proves the whole path AND that the capture and the reader derived the same ring.
         assertThat(CapturingSinkWriter.collected())
-                .containsExactly(TABLE + "|w1|0", TABLE + "|w3|2");
+                .containsExactly(TABLE + "|src-0|0", TABLE + "|src-2|2");
 
         // Stop tore the capture down: the fake source's subscription was closed (the cdc daemon is gone, no
         // leak), the pipeline's Jet job is terminal, and the coordinator dropped the handle.
@@ -243,7 +243,7 @@ class CaptureToSinkDataFlowTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             for (Envelope change : changes) {
-                listener.onEvent(change);
+                listener.onEvent(change, java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }
             return () -> cdcClosed = true;
         }
@@ -280,7 +280,9 @@ class CaptureToSinkDataFlowTest {
 
         @Override
         public Optional<SourcePosition> seam() {
-            return Optional.empty();
+            // Sampled by the source before its first row. The run refuses to start a tail without one,
+            // because a tail that begins wherever it likes loses every change made while the snapshot ran.
+            return Optional.of(new SourcePosition("seam-0"));
         }
 
         @Override

@@ -830,7 +830,8 @@ class ArtifactMutationServiceTest {
 
         void seed(String miningChainId, ConsumerOffset... consumers) {
             chains.put(miningChainId,
-                    new SrsMeta(miningChainId, "srcpos-1", List.of(consumers), null, List.of(), null));
+                    new SrsMeta(miningChainId, new ChainPosition(new SourceOrder(1L, 1L), "srcpos-1"),
+                            List.of(consumers), null, List.of(), null));
         }
 
         /** Arms one chain to refuse a detach, standing in for a chain whose store is momentarily down. */
@@ -872,7 +873,7 @@ class ArtifactMutationServiceTest {
             List<ConsumerOffset> kept = chain.consumerOffsets().stream()
                     .filter(offset -> !offset.pipelineId().equals(pipelineId))
                     .toList();
-            chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceReadOffset(), kept,
+            chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceRead(), kept,
                     chain.cdcStartPosition(), chain.schemaHistory(), chain.retention()));
         }
 
@@ -882,7 +883,7 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             throw new UnsupportedOperationException("the delete path never advances a chain");
         }
 

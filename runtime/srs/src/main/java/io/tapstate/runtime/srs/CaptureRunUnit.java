@@ -6,6 +6,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
@@ -32,8 +33,8 @@ import java.util.function.Supplier;
  * consumer with no ring or coordinator. See {@link #start} for the exact ordering.
  *
  * <p>A shared-ring run reads every configured stream through one connector subscription and routes each
- * stream into its own per-table ring. The mock watermark and position order the spec carries stand in for
- * real connector machinery.
+ * stream into its own per-table ring. Where the tail begins and what position each change carries are the
+ * source's own, read back from the durable record and learned from the changes respectively.
  */
 public final class CaptureRunUnit {
 
@@ -97,7 +98,14 @@ public final class CaptureRunUnit {
 
             long snapshotCount = 0;
             Map<String, Long> snapshotCounts = new LinkedHashMap<>();
-            if (plan.snapshot()) {
+            // A chain that has already read every selected table to exhaustion does not read them again:
+            // this run is resuming, and the whole point of resuming is not redoing the full load. The
+            // question is asked of the durable record, so it survives the process that answered it last.
+            // Which tables individually still owe a read is a finer question than this one asks.
+            boolean fullLoadAlreadyDone = chainId != null && meta.read(chainId.value())
+                    .map(record -> record.snapshotCompletedTables().containsAll(tables))
+                    .orElse(false);
+            if (plan.snapshot() && !fullLoadAlreadyDone) {
                 Consumer<Envelope> snapshotPassthrough = event -> {
                     snapshotCounts.merge(event.src(), 1L, Long::sum);
                     passthrough.accept(event);
@@ -105,7 +113,7 @@ public final class CaptureRunUnit {
                 // A chainless read has no ring and so no generation to order its rows against: they carry no
                 // order at all, which a stateful node downstream rejects rather than guesses at.
                 snapshotCount = chainId != null
-                        ? SnapshotPhase.run(port, spec.config(), chainId.value(), tables, spec.cdcStart(), epoch,
+                        ? SnapshotPhase.run(port, spec.config(), chainId.value(), tables, epoch,
                                 meta, snapshotPassthrough)
                         : SnapshotPhase.drain(port, spec.config(), snapshotPassthrough);
             }
@@ -126,11 +134,12 @@ public final class CaptureRunUnit {
                     // One generation across the chain's tables: they are rebuilt together, so a sequence of
                     // one ring is comparable with a sequence of another exactly when both were opened by the
                     // same provisioning.
-                    CdcChain chain = new CdcChain(gate, meta, cid, spec.watermark(), ringEpoch, spec.schemaVer());
+                    CdcChain chain = new CdcChain(gate, meta, cid, ringEpoch, spec.schemaVer());
                     routes.put(table, new CdcPhase.TableRoute(
                             chain, () -> minConsumerReadSeq(meta, cid, table), consumers));
                 }
-                subscription = Optional.of(CdcPhase.run(port, spec.config(), routes, health));
+                subscription = Optional.of(
+                        CdcPhase.run(port, spec.config(), tailStart(meta, cid), routes, health));
                 String firstTable = tables.getFirst();
                 String firstRing = SrsRingbuffer.ringName(cid, firstTable);
                 ringSource = Optional.of(SrsRingSource.create(
@@ -138,11 +147,12 @@ public final class CaptureRunUnit {
             } else if (plan.directTail()) {
                 // srs.enabled:false: the tail streams straight to the consumer, with no shared ring,
                 // no coordinator chain and no durable meta -- the lightweight direct path.
-                // Starting at the present is what this path asks for, the same as the shared-ring tail:
-                // no recorded position is read back yet, and an unsaid start is how a run silently begins
-                // somewhere other than where it left off.
-                subscription = Optional.of(port.cdc(
-                        spec.config(), CaptureStart.present(), health.recording(passthrough::accept)));
+                // This path keeps no durable record at all -- no chain, no meta -- so there is nothing here
+                // to resume from and the run says present() because that is the truth of it, not because a
+                // start was left unsaid. Positions still arrive with the changes; nobody on this path has
+                // anywhere to put them yet.
+                subscription = Optional.of(port.cdc(spec.config(), CaptureStart.present(),
+                        health.recording((event, position) -> passthrough.accept(event))));
             }
 
             return new CaptureRun(
@@ -186,6 +196,35 @@ public final class CaptureRunUnit {
             firstFailure.addSuppressed(failure);
         }
         return firstFailure;
+    }
+
+    /**
+     * Where this chain's tail begins, read back from the durable record rather than assumed.
+     *
+     * <p>Three states, in this order, and the order is the whole of it:
+     *
+     * <ol>
+     *   <li>a recorded read offset — the tail ran before and got this far, so it picks up there;</li>
+     *   <li>no read offset but a recorded seam — the snapshot ran and the tail has not advanced past
+     *       where the snapshot began, so it starts at the seam and the idempotent sink absorbs the
+     *       overlap;</li>
+     *   <li>neither — nothing has read this chain, so the caller asked for changes from now on.</li>
+     * </ol>
+     *
+     * <p>Taking the present in any of the first two states is the silent loss this exists to prevent: the
+     * tail comes up healthy, and every change between where it had reached and now is simply gone.
+     */
+    private static CaptureStart tailStart(SrsMetaStore meta, String miningChainId) {
+        return meta.read(miningChainId)
+                .map(record -> {
+                    if (record.sourceReadOffset() != null) {
+                        return CaptureStart.resume(new SourcePosition(record.sourceReadOffset()));
+                    }
+                    return record.cdcStartPosition() == null
+                            ? CaptureStart.present()
+                            : CaptureStart.resume(new SourcePosition(record.cdcStartPosition()));
+                })
+                .orElseGet(CaptureStart::present);
     }
 
     /**

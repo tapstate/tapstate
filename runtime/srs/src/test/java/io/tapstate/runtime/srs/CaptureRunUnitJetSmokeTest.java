@@ -61,9 +61,6 @@ class CaptureRunUnitJetSmokeTest {
 
     private static HazelcastInstance hz;
 
-    /** Orders the mock positions {@code w1 < w2 < ...} by numeric suffix; a source position is never ordered lexically. */
-    private static final Comparator<String> NUMERIC_ORDER = Comparator.comparingInt(p -> Integer.parseInt(p.substring(1)));
-
     @BeforeAll
     static void startMember() {
         Config config = new Config();
@@ -212,8 +209,7 @@ class CaptureRunUnitJetSmokeTest {
     /** A run spec keyed by an explicit {@code srsKey} so each shared-ring test gets its own chain and per-table ring. */
     private static CaptureRunSpec spec(ReadMode mode, String srsKey) {
         return new CaptureRunSpec(
-                config(), mode, srsKey, true, "src-1", "pipe-1", StartFrom.earliest(),
-                new SourcePosition("cdc-start-0"), null, 0L, monotonicWatermark());
+                config(), mode, srsKey, true, "src-1", "pipe-1", StartFrom.earliest(), null, 0L);
     }
 
     private static CaptureConfig config() {
@@ -226,12 +222,6 @@ class CaptureRunUnitJetSmokeTest {
 
     private static Envelope change(int id) {
         return Envelope.insert(id, "orders", Map.of("id", id), Map.of());
-    }
-
-    /** A mock cdc watermark: a monotonic source-position generator (w1, w2, ...) standing in for the connector position. */
-    private static Supplier<SourcePosition> monotonicWatermark() {
-        AtomicLong n = new AtomicLong();
-        return () -> new SourcePosition("w" + n.incrementAndGet());
     }
 
     /** This consumer's last read sequence on {@code table}, read back from the chain's durable consumer offsets. */
@@ -273,7 +263,7 @@ class CaptureRunUnitJetSmokeTest {
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             cdcStarted = true;
             for (Envelope e : changes) {
-                listener.onEvent(e);
+                listener.onEvent(e, Optional.of(new SourcePosition("src-" + e.ts())));
             }
             return () -> cdcClosed = true;
         }
@@ -309,7 +299,10 @@ class CaptureRunUnitJetSmokeTest {
 
         @Override
         public Optional<SourcePosition> seam() {
-            return Optional.empty();
+            // The source sampled this before reading its first row; the run under test refuses to start a
+            // tail without one, because a tail that begins wherever it likes loses every change made while
+            // the snapshot ran.
+            return Optional.of(new SourcePosition("seam-0"));
         }
 
         @Override
@@ -353,10 +346,10 @@ class CaptureRunUnitJetSmokeTest {
         }
 
         @Override
-        public synchronized void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), sourceReadOffset, m.consumerOffsets(), m.cdcStartPosition(),
+                    m.miningChainId(), position, m.consumerOffsets(), m.cdcStartPosition(),
                     m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
@@ -367,7 +360,7 @@ class CaptureRunUnitJetSmokeTest {
             next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
             next.add(offset);
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
+                    m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                     m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
@@ -388,7 +381,7 @@ class CaptureRunUnitJetSmokeTest {
             ChainPosition ack = existing == null ? null : existing.sinkAcked();
             next.add(new ConsumerOffset(pipelineId, perTable, ack));
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
+                    m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                     m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
@@ -407,7 +400,7 @@ class CaptureRunUnitJetSmokeTest {
             Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
             next.add(new ConsumerOffset(pipelineId, perTable, position));
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
+                    m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                     m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
@@ -415,7 +408,7 @@ class CaptureRunUnitJetSmokeTest {
         public synchronized void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), cdcStartPosition,
+                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(), cdcStartPosition,
                     m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), snapshotEpoch));
         }
 
@@ -424,7 +417,7 @@ class CaptureRunUnitJetSmokeTest {
             SrsMeta m = require(miningChainId);
             long opened = m.epoch() + 1;
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
+                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
                     m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), opened, m.snapshotEpoch()));
             return opened;
         }
@@ -435,7 +428,7 @@ class CaptureRunUnitJetSmokeTest {
             List<SchemaVersion> next = new ArrayList<>(m.schemaHistory());
             next.add(version);
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
+                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
                     next, m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
         }
 
@@ -448,7 +441,7 @@ class CaptureRunUnitJetSmokeTest {
             List<String> next = new ArrayList<>(m.snapshotCompletedTables());
             next.add(table);
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
+                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
                     m.schemaHistory(), m.retention(), next, m.epoch(), m.snapshotEpoch()));
         }
 

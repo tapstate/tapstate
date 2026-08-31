@@ -6,6 +6,7 @@ import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.DataBrowser;
@@ -38,6 +39,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.StringJoiner;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -203,7 +205,9 @@ public final class PdkDataBrowser implements DataBrowser {
                     CaptureStart.present(),
                     new CaptureListener() {
                         @Override
-                        public void onEvent(Envelope event) {
+                        public void onEvent(Envelope event, Optional<SourcePosition> position) {
+                            // The position is ignored on purpose: this follow records nothing and resumes
+                            // nothing, so there is no later run for a position to be of use to.
                             DataBrowserChange change = project(event);
                             // A stream also carries schema changes, which are not a row changing and
                             // have nowhere to go in a view of rows.

@@ -35,11 +35,24 @@ public interface SrsMetaStore {
     void create(String miningChainId, String retention);
 
     /**
-     * Sets the chain's source read offset to {@code sourceReadOffset}, an opaque source capture
-     * watermark. The durable-frontier bound is the caller's concern; this persists the resolved value.
-     * A mutate on an unseeded chain is a caller ordering error.
+     * Advances the chain's source read offset to {@code position} — the source's own token paired with
+     * the order the engine assigned it. The durable-frontier bound (an advance must not pass the slowest
+     * consumer's acked position) is the caller's concern; this persists the resolved value. A mutate on
+     * an unseeded chain is a caller ordering error.
+     *
+     * <p><strong>It only ever moves forward.</strong> A position that does not rank after the one already
+     * recorded is ignored, silently and successfully — not an error, because two writers racing to advance
+     * the same chain is ordinary, and the loser has nothing to report. This is a store guarantee rather
+     * than a caller convention because the failure it prevents is invisible in every other way: a restart
+     * raises the generation while the consumers' acked positions still sit in the generation before it, so
+     * the clamp resolves to a position the chain has already passed. Written down, the next restart resumes
+     * from there and re-mines everything after it — or, once the source has aged past it, cannot.
+     *
+     * <p>Both halves are persisted. The token is what a read resumes from; the order is what the next
+     * comparison — this one included — runs on, and a stored token without it can no longer be ranked
+     * against anything.
      */
-    void advanceSourceReadOffset(String miningChainId, String sourceReadOffset);
+    void advanceSourceReadOffset(String miningChainId, ChainPosition position);
 
     /**
      * Inserts or replaces one consumer pipeline's cursor on the chain, keyed by its pipeline id. A

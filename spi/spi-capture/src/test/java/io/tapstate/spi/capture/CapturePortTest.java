@@ -86,7 +86,7 @@ class CapturePortTest {
         List<Op> delivered = new ArrayList<>();
 
         Subscription subscription =
-                capture.cdc(CONFIG, CaptureStart.present(), event -> delivered.add(event.op()));
+                capture.cdc(CONFIG, CaptureStart.present(), (event, position) -> delivered.add(event.op()));
 
         assertThat(delivered).containsExactly(Op.INSERT, Op.UPDATE, Op.DELETE, Op.DDL);
 
@@ -100,10 +100,10 @@ class CapturePortTest {
     void cdcIsToldWhereToBeginAndTheTwoStartsReachThePortAsThemselves() {
         StubCapture capture = new StubCapture();
 
-        capture.cdc(CONFIG, CaptureStart.resume(new SourcePosition("gtid:9-17")), event -> { });
+        capture.cdc(CONFIG, CaptureStart.resume(new SourcePosition("gtid:9-17")), (event, position) -> { });
         assertThat(capture.lastStart).isEqualTo(CaptureStart.resume(new SourcePosition("gtid:9-17")));
 
-        capture.cdc(CONFIG, CaptureStart.present(), event -> { });
+        capture.cdc(CONFIG, CaptureStart.present(), (event, position) -> { });
         assertThat(capture.lastStart)
                 .as("beginning at the present is what the caller asked for, not what an omitted "
                         + "position decayed into inside the port")
@@ -129,11 +129,29 @@ class CapturePortTest {
     @Test
     void captureListenerIsAFunctionalInterface() {
         List<Envelope> collected = new ArrayList<>();
-        CaptureListener listener = collected::add;
+        CaptureListener listener = (event, position) -> collected.add(event);
 
-        listener.onEvent(Envelope.insert(1L, "orders", Map.of("id", 1), null));
+        listener.onEvent(Envelope.insert(1L, "orders", Map.of("id", 1), null), Optional.empty());
 
         assertThat(collected).hasSize(1);
+    }
+
+    /**
+     * A change carries the position the source reported for it, and only the change the source named a
+     * position at carries one. The absence on the others is the contract, not a gap: one position stands
+     * for a run of changes and means "everything up to here has been handed over", which is untrue of
+     * every change but the last.
+     */
+    @Test
+    void deliversTheSourcePositionWithTheChangeItWasReportedAt() {
+        StubCapture capture = new StubCapture();
+        List<Optional<SourcePosition>> positions = new ArrayList<>();
+
+        capture.cdc(CONFIG, CaptureStart.present(), (event, position) -> positions.add(position));
+
+        assertThat(positions).hasSize(4);
+        assertThat(positions.subList(0, 3)).allSatisfy(p -> assertThat(p).isEmpty());
+        assertThat(positions.get(3)).contains(new SourcePosition("binlog.000042:1400"));
     }
 
     private static final DiscoveredSchema SCHEMA =
@@ -158,10 +176,14 @@ class CapturePortTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             lastStart = start;
-            listener.onEvent(Envelope.insert(10L, "orders", Map.of("id", 1), null));
-            listener.onEvent(Envelope.update(11L, "orders", Map.of("id", 1), Map.of("id", 1, "n", 2), null));
-            listener.onEvent(Envelope.delete(12L, "orders", Map.of("id", 1), null));
-            listener.onEvent(Envelope.ddl(13L, "orders", Map.of("added", "n")));
+            // One batch: the source names where it had read to once the whole batch is handed over, so
+            // only its last change carries a position.
+            listener.onEvent(Envelope.insert(10L, "orders", Map.of("id", 1), null), Optional.empty());
+            listener.onEvent(Envelope.update(11L, "orders", Map.of("id", 1), Map.of("id", 1, "n", 2), null),
+                    Optional.empty());
+            listener.onEvent(Envelope.delete(12L, "orders", Map.of("id", 1), null), Optional.empty());
+            listener.onEvent(Envelope.ddl(13L, "orders", Map.of("added", "n")),
+                    Optional.of(new SourcePosition("binlog.000042:1400")));
             lastSubscription = new RecordingSubscription();
             return lastSubscription;
         }

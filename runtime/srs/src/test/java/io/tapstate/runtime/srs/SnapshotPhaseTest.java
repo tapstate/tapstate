@@ -52,11 +52,11 @@ class SnapshotPhaseTest {
     @Test
     void drainsTheSnapshotBatchStraightToTheSinkInOrder() {
         List<Envelope> rows = List.of(row(1), row(2), row(3));
-        FakePort port = new FakePort(new FakeBatch(rows));
+        FakePort port = new FakePort(new FakeBatch(rows, "p0"));
         List<Envelope> sink = new ArrayList<>();
 
         long count = SnapshotPhase.run(
-                port, config(), "chain", List.of("orders"), new SourcePosition("p0"),
+                port, config(), "chain", List.of("orders"),
                 1L, new RecordingMeta(new ArrayList<>()), sink::add);
 
         // Straight through in batch order, each row stamped with the generation and otherwise untouched.
@@ -68,7 +68,7 @@ class SnapshotPhaseTest {
     @Test
     void drainPassesTheSnapshotBatchStraightToTheSinkWithoutRecordingACdcStart() {
         List<Envelope> rows = List.of(row(1), row(2), row(3));
-        FakePort port = new FakePort(new FakeBatch(rows));
+        FakePort port = new FakePort(new FakeBatch(rows, "p0"));
         List<Envelope> sink = new ArrayList<>();
 
         // drain is the pure pass-through with no meta collaborator: it never records a cdc-start position.
@@ -82,7 +82,7 @@ class SnapshotPhaseTest {
 
     @Test
     void drainClosesTheSnapshotBatch() {
-        FakeBatch batch = new FakeBatch(List.of(row(1)));
+        FakeBatch batch = new FakeBatch(List.of(row(1)), "p0");
 
         SnapshotPhase.drain(new FakePort(batch), config(), e -> {});
 
@@ -91,10 +91,10 @@ class SnapshotPhaseTest {
 
     @Test
     void closesTheSnapshotBatchAfterDraining() {
-        FakeBatch batch = new FakeBatch(List.of(row(1)));
+        FakeBatch batch = new FakeBatch(List.of(row(1)), "p0");
 
         SnapshotPhase.run(
-                new FakePort(batch), config(), "chain", List.of("orders"), new SourcePosition("p0"),
+                new FakePort(batch), config(), "chain", List.of("orders"),
                 1L, new RecordingMeta(new ArrayList<>()), e -> {});
 
         assertThat(batch.closed).isTrue();
@@ -107,8 +107,8 @@ class SnapshotPhaseTest {
         Consumer<Envelope> sink = e -> trace.add("event");
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1), row(2)))), config(), "chain", List.of("orders"),
-                new SourcePosition("binlog.000042:1024"), 1L, meta, sink);
+                new FakePort(new FakeBatch(List.of(row(1), row(2)), "binlog.000042:1024")), config(), "chain", List.of("orders"),
+                1L, meta, sink);
 
         // The cdc-start position is the source log position sampled at snapshot start: recorded before the
         // snapshot drains, so the cdc tail resumes from before the snapshot and the idempotent sink absorbs
@@ -117,13 +117,34 @@ class SnapshotPhaseTest {
         assertThat(trace).startsWith("cdc-start", "event", "event");
     }
 
+    /**
+     * A batch that reports no seam stops the run with a code, rather than the caller choosing a start.
+     *
+     * <p>The alternative is what makes this worth a test: carrying on and beginning the tail at the
+     * source's present moment compiles, runs, and reports a healthy pipeline, while every change made
+     * during the snapshot falls between the two and is never delivered. Nothing throws and nothing logs.
+     */
+    @Test
+    void refusesToSnapshotWhenTheBatchReportsNoSeamForItsTailToJoinAt() {
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>());
+
+        assertThatThrownBy(() -> SnapshotPhase.run(
+                new FakePort(new FakeBatch(List.of(row(1)))), config(), "chain", List.of("orders"),
+                1L, meta, e -> { }))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .extracting(e -> ((io.tapstate.core.common.TapstateException) e).code())
+                .isEqualTo(CaptureError.SNAPSHOT_REPORTS_NO_SEAM);
+
+        assertThat(meta.cdcStart).as("nothing was recorded for a seam that does not exist").isNull();
+    }
+
     @Test
     void stampsEverySnapshotRowWithTheGenerationTheSnapshotBeganIn() {
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1), row(2)))), config(), "chain", List.of("orders"),
-                new SourcePosition("p0"), 4L, new RecordingMeta(new ArrayList<>()), sink::add);
+                new FakePort(new FakeBatch(List.of(row(1), row(2)), "p0")), config(), "chain", List.of("orders"),
+                4L, new RecordingMeta(new ArrayList<>()), sink::add);
 
         // A snapshot row has no position in the change stream, so nothing else can say where it sits
         // against the changes that follow. Every row of one snapshot shares the reserved sequence, which
@@ -138,8 +159,8 @@ class SnapshotPhaseTest {
         RecordingMeta meta = new RecordingMeta(new ArrayList<>());
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)))), config(), "chain", List.of("orders"),
-                new SourcePosition("binlog.000042:1024"), 4L, meta, e -> { });
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), config(), "chain", List.of("orders"),
+                4L, meta, e -> { });
 
         assertThat(meta.cdcStart).isEqualTo("binlog.000042:1024");
         assertThat(meta.pinnedEpoch).isEqualTo(4L);
@@ -155,8 +176,8 @@ class SnapshotPhaseTest {
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)))), config(), "chain", List.of("orders"),
-                new SourcePosition("binlog.000042:1024"), 2L, meta, sink::add);
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), config(), "chain", List.of("orders"),
+                2L, meta, sink::add);
 
         // This is the whole reason the two generations are kept apart. Rows of a rerun that took the
         // current generation would beat every change generation 1 already applied and roll each of those
@@ -175,8 +196,8 @@ class SnapshotPhaseTest {
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)))), config(), "chain", List.of("orders"),
-                new SourcePosition("binlog.000099:1"), 2L, meta, sink::add);
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000099:1")), config(), "chain", List.of("orders"),
+                2L, meta, sink::add);
 
         assertThat(sink).extracting(event -> event.position().order()).containsOnly(SourceOrder.snapshotRow(2L));
         assertThat(meta.pinnedEpoch).isEqualTo(2L);
@@ -190,8 +211,8 @@ class SnapshotPhaseTest {
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)))), config(), "chain", List.of("orders"),
-                new SourcePosition("p0"), 2L, meta, sink::add);
+                new FakePort(new FakeBatch(List.of(row(1)), "p0")), config(), "chain", List.of("orders"),
+                2L, meta, sink::add);
 
         assertThat(sink).extracting(event -> event.position().order()).containsOnly(SourceOrder.snapshotRow(2L));
     }
@@ -203,8 +224,8 @@ class SnapshotPhaseTest {
         Consumer<Envelope> sink = e -> trace.add("event");
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1), row(2)))), config(), "chain", List.of("orders"),
-                new SourcePosition("binlog.000042:1024"), 1L, meta, sink);
+                new FakePort(new FakeBatch(List.of(row(1), row(2)), "binlog.000042:1024")), config(), "chain", List.of("orders"),
+                1L, meta, sink);
 
         // The two marks answer different questions and must not be conflated: the cdc-start position is
         // written before the drain (it means the snapshot has started, and must precede it or a change made
@@ -220,8 +241,8 @@ class SnapshotPhaseTest {
         RecordingMeta meta = new RecordingMeta(new ArrayList<>());
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)))), multiTableConfig(), "chain",
-                List.of("orders", "customers"), new SourcePosition("p0"), 1L, meta, e -> { });
+                new FakePort(new FakeBatch(List.of(row(1)), "p0")), multiTableConfig(), "chain",
+                List.of("orders", "customers"), 1L, meta, e -> { });
 
         // One bounded read covers every selected stream, so when it returns to exhaustion each of them has
         // been read to exhaustion. Marking only the first would leave the rest looking un-drained -- which a
@@ -239,8 +260,8 @@ class SnapshotPhaseTest {
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)))), multiTableConfig(), "chain",
-                List.of("orders", "customers"), new SourcePosition("binlog.000042:1024"), 2L, meta, sink::add);
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), multiTableConfig(), "chain",
+                List.of("orders", "customers"), 2L, meta, sink::add);
 
         // The whole selection is re-read by the one drain, the already-drained table included. Judging the
         // resume on that table alone would call this a fresh re-mine and stamp its rows with the generation
@@ -262,8 +283,8 @@ class SnapshotPhaseTest {
         RecordingMeta meta = new RecordingMeta(new ArrayList<>());
 
         assertThatThrownBy(() -> SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1), row(2)))), config(), "chain", List.of("orders"),
-                new SourcePosition("p0"), 1L, meta, failingOnSecond))
+                new FakePort(new FakeBatch(List.of(row(1), row(2)), "p0")), config(), "chain", List.of("orders"),
+                1L, meta, failingOnSecond))
                 .isInstanceOf(IllegalStateException.class);
 
         // An aborted snapshot is not a completed one. The mark is what downstream reads as "every row of
@@ -276,13 +297,13 @@ class SnapshotPhaseTest {
 
     @Test
     void closesTheSnapshotBatchEvenWhenTheSinkThrows() {
-        FakeBatch batch = new FakeBatch(List.of(row(1)));
+        FakeBatch batch = new FakeBatch(List.of(row(1)), "p0");
         Consumer<Envelope> failing = e -> {
             throw new IllegalStateException("sink down");
         };
 
         assertThatThrownBy(() -> SnapshotPhase.run(
-                new FakePort(batch), config(), "chain", List.of("orders"), new SourcePosition("p0"),
+                new FakePort(batch), config(), "chain", List.of("orders"),
                 1L, new RecordingMeta(new ArrayList<>()), failing))
                 .isInstanceOf(IllegalStateException.class);
 
@@ -295,8 +316,8 @@ class SnapshotPhaseTest {
         List<String> trace = new ArrayList<>();
 
         assertThatThrownBy(() -> SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of())), config(), "chain", List.of("orders"),
-                new SourcePosition("p0"), 1L, new RecordingMeta(trace), null))
+                new FakePort(new FakeBatch(List.of(), "p0")), config(), "chain", List.of("orders"),
+                1L, new RecordingMeta(trace), null))
                 .isInstanceOf(NullPointerException.class);
 
         // Args are validated up front: a null sink fails fast without first recording the cdc-start position.
@@ -306,10 +327,18 @@ class SnapshotPhaseTest {
     /** A bounded snapshot batch over a fixed list of events; records whether it was closed. */
     private static final class FakeBatch implements CaptureBatch {
         private final Iterator<Envelope> events;
+        private final String seam;
         boolean closed;
 
-        FakeBatch(List<Envelope> events) {
+        /** A batch that reports the seam its source sampled before the read -- the usual case. */
+        FakeBatch(List<Envelope> events, String seam) {
             this.events = events.iterator();
+            this.seam = seam;
+        }
+
+        /** A batch whose source named no seam, so the tail has nothing to join to. */
+        FakeBatch(List<Envelope> events) {
+            this(events, null);
         }
 
         @Override
@@ -324,7 +353,7 @@ class SnapshotPhaseTest {
 
         @Override
         public Optional<SourcePosition> seam() {
-            return Optional.empty();
+            return Optional.ofNullable(seam).map(SourcePosition::new);
         }
 
         @Override
@@ -422,7 +451,7 @@ class SnapshotPhaseTest {
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             throw new UnsupportedOperationException();
         }
 

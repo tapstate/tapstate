@@ -69,6 +69,9 @@ capture.start-from-unparsable:
 capture.event-table-not-selected:
   message: "The capture stream emitted table `{table}`, which this pipeline did not select."
   solution: "Update the source table selection or verify the connector emits the configured table names."
+capture.snapshot-reports-no-seam:
+  message: "The snapshot of chain `{chain}` reported no position for the change tail to resume from."
+  solution: "This source cannot hand its full load over to an incremental tail; read it as snapshot only, or use a connector build that reports a stream position."
 cli.alias-install-dir-unknown:
   message: "No installed `tapstate` was found in `{path}`."
   solution: "Run this where tapstate is installed, or set TAPSTATE_INSTALL_DIR to that directory - the same variable the installer honours."
@@ -264,6 +267,12 @@ connector.projection-failed:
 connector.capture-failed:
   message: "Connector '{connector}' failed while reading: {detail}."
   solution: "Check the source is reachable and the connection settings are correct."
+connector.position-unrenderable:
+  message: "Connector '{connector}' produced a stream position that could not be recorded: {detail}."
+  solution: "Without a recordable position this source can only be read from the present; report the connector build that produced it."
+connector.position-unreadable:
+  message: "Connector '{connector}' could not read back the recorded stream position: {detail}."
+  solution: "Read the source from the beginning again, or set an explicit start point, so a fresh position is recorded."
 connector.discover-failed:
   message: "Connector '{connector}' could not discover its schema: {detail}."
   solution: "The connector failed while discovering the source model; check the source is reachable and the connection settings are correct."

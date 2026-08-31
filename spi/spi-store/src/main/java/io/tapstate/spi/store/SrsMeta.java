@@ -1,5 +1,7 @@
 package io.tapstate.spi.store;
 
+import io.tapstate.core.event.ChainPosition;
+
 import java.util.List;
 
 /**
@@ -7,9 +9,10 @@ import java.util.List;
  * in-memory change ring. A mining chain is the shared cdc capture keyed by physical source coordinates,
  * so one record serves every table and every consumer pipeline on that chain.
  *
- * <p>Fields — {@code miningChainId} (the chain this record is keyed by), {@code sourceReadOffset} (the
- * opaque source capture watermark the chain has read up to; absent until the first cdc read; its
- * durable advance is bounded by the slowest consumer's acked position), {@code consumerOffsets} (one
+ * <p>Fields — {@code miningChainId} (the chain this record is keyed by), {@code sourceRead} (how far the
+ * chain has read: the source's own position paired with the order the engine assigned it; absent until
+ * the first cdc read; its durable advance is bounded by the slowest consumer's acked position, and it
+ * only ever moves forward), {@code consumerOffsets} (one
  * cursor per consumer pipeline), {@code cdcStartPosition} (the opaque position the cdc tail starts from,
  * recorded at the snapshot-to-cdc seam; absent until a snapshot seam or start point resolves it),
  * {@code schemaHistory} (the append-only versioned schema), {@code retention} (the retention
@@ -43,7 +46,7 @@ import java.util.List;
  */
 public record SrsMeta(
         String miningChainId,
-        String sourceReadOffset,
+        ChainPosition sourceRead,
         List<ConsumerOffset> consumerOffsets,
         String cdcStartPosition,
         List<SchemaVersion> schemaHistory,
@@ -75,18 +78,26 @@ public record SrsMeta(
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
     }
 
+    /**
+     * The token the chain has read up to, or null before its first cdc read — what a resuming read is
+     * started from, and the only half a connector understands.
+     */
+    public String sourceReadOffset() {
+        return sourceRead == null ? null : sourceRead.token();
+    }
+
     /** A record with no table marked snapshot-complete — the shape every producer predating the mark builds. */
-    public SrsMeta(String miningChainId, String sourceReadOffset, List<ConsumerOffset> consumerOffsets,
+    public SrsMeta(String miningChainId, ChainPosition sourceRead, List<ConsumerOffset> consumerOffsets,
             String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention) {
-        this(miningChainId, sourceReadOffset, consumerOffsets, cdcStartPosition, schemaHistory, retention,
+        this(miningChainId, sourceRead, consumerOffsets, cdcStartPosition, schemaHistory, retention,
                 List.of());
     }
 
     /** A record with no generation opened and no snapshot pinned — the shape a freshly seeded chain has. */
-    public SrsMeta(String miningChainId, String sourceReadOffset, List<ConsumerOffset> consumerOffsets,
+    public SrsMeta(String miningChainId, ChainPosition sourceRead, List<ConsumerOffset> consumerOffsets,
             String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention,
             List<String> snapshotCompletedTables) {
-        this(miningChainId, sourceReadOffset, consumerOffsets, cdcStartPosition, schemaHistory, retention,
+        this(miningChainId, sourceRead, consumerOffsets, cdcStartPosition, schemaHistory, retention,
                 snapshotCompletedTables, 0L, 0L);
     }
 }

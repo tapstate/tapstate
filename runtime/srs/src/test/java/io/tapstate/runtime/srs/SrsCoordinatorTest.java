@@ -265,7 +265,7 @@ class SrsCoordinatorTest {
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             mutations.add("advance:" + miningChainId);
         }
 

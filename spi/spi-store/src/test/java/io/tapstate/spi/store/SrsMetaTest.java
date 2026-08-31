@@ -23,9 +23,13 @@ class SrsMetaTest {
 
     @Test
     void holdsTheMiningChainMetaFields() {
-        SrsMeta meta = new SrsMeta("chain-1", "gtid:aaa-1:120",
+        SrsMeta meta = new SrsMeta("chain-1",
+                new ChainPosition(new SourceOrder(1L, 120L), "gtid:aaa-1:120"),
                 List.of(consumer()), "gtid:aaa-1:0", List.of(schema()), "7d", List.of("orders"));
         assertThat(meta.miningChainId()).isEqualTo("chain-1");
+        // The pair, and the token on its own: the order is what a later comparison runs on, the token is
+        // what a read resumes from, and dropping either leaves a record no advance can be ranked against.
+        assertThat(meta.sourceRead()).isEqualTo(new ChainPosition(new SourceOrder(1L, 120L), "gtid:aaa-1:120"));
         assertThat(meta.sourceReadOffset()).isEqualTo("gtid:aaa-1:120");
         assertThat(meta.consumerOffsets()).containsExactly(consumer());
         assertThat(meta.cdcStartPosition()).isEqualTo("gtid:aaa-1:0");

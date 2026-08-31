@@ -59,6 +59,82 @@ final class Synthetic {
                 + "}";
     }
 
+    /**
+     * A source that states where it has read to, the way a real one does: it answers
+     * {@code timestampToStreamOffset} with an offset object of its own class, and closes each stream
+     * batch by naming one.
+     *
+     * <p>That class exists only inside the jar, so nothing on the host can name it. This is what makes it
+     * a witness rather than a fixture: a position that round-trips through it has been through the
+     * connector's own loader, which is the one thing a host-side round-trip of a host-visible class
+     * cannot show.
+     *
+     * <p>Its stream read also reports the offset it was <em>started</em> from, as the {@code id} of the
+     * row it emits — so a resume is observable from outside as "the connector was handed back the object
+     * it issued", rather than only as "the call did not throw".
+     */
+    static Path positionedSource(Path dir) {
+        String source = ""
+                + "package synthetic;"
+                + "import io.tapdata.pdk.apis.TapConnector;"
+                + "import io.tapdata.pdk.apis.functions.ConnectorFunctions;"
+                + "import io.tapdata.entity.codec.TapCodecsRegistry;"
+                + "import io.tapdata.pdk.apis.context.TapConnectionContext;"
+                + "import io.tapdata.pdk.apis.entity.ConnectionOptions;"
+                + "import io.tapdata.pdk.apis.entity.TestItem;"
+                + "import io.tapdata.entity.schema.TapTable;"
+                + "import io.tapdata.entity.schema.TapField;"
+                + "import io.tapdata.entity.event.TapEvent;"
+                + "import io.tapdata.entity.event.dml.TapInsertRecordEvent;"
+                + "import java.util.ArrayList;"
+                + "import java.util.LinkedHashMap;"
+                + "import java.util.List;"
+                + "import java.util.Map;"
+                + "import java.util.function.Consumer;"
+                + "public class PositionedSource implements TapConnector {"
+                + "  public static class Offset implements java.io.Serializable {"
+                + "    public String mark;"
+                + "    public Offset() {}"
+                + "    public Offset(String mark) { this.mark = mark; }"
+                + "  }"
+                + "  public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {"
+                + "    functions.supportTimestampToStreamOffset((context, timestamp) -> new Offset(\"seam-1\"));"
+                + "    functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "      List<TapEvent> evs = new ArrayList<>();"
+                + row("r1", 1)
+                + "      evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(r1));"
+                + "      consumer.accept(evs, null);"
+                + "    });"
+                + "    functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "      consumer.streamReadStarted();"
+                + "      String startedAt = (offset instanceof Offset) ? ((Offset) offset).mark : \"none\";"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Map<String,Object> a = new LinkedHashMap<>(); a.put(\"id\", startedAt);"
+                + "      batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "      Map<String,Object> b = new LinkedHashMap<>(); b.put(\"id\", \"second\");"
+                + "      batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(2L).after(b));"
+                + "      consumer.accept(batch, new Offset(\"batch-9\"));"
+                + "      consumer.streamReadEnded();"
+                + "    });"
+                + "  }"
+                + "  public void init(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
+                + "    TapTable table = new TapTable(\"t1\");"
+                + "    table.add(new TapField(\"id\", \"int\"));"
+                + "    List<TapTable> tables = new ArrayList<>();"
+                + "    tables.add(table);"
+                + "    s.accept(tables);"
+                + "  }"
+                + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {"
+                + "    s.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY));"
+                + "    return ConnectionOptions.create();"
+                + "  }"
+                + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.PositionedSource", source);
+    }
+
     /** A row map {@code {id: value}} as a Java expression string. */
     private static String row(String var, int id) {
         return "Map<String,Object> " + var + " = new LinkedHashMap<>(); " + var + ".put(\"id\", " + id + ");";

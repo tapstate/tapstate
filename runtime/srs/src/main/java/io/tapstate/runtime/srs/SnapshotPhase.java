@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.CaptureBatch;
@@ -10,6 +11,7 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.function.Consumer;
 
@@ -38,9 +40,11 @@ public final class SnapshotPhase {
      * already recorded for a snapshot that is resuming — see {@link #pinnedEpoch}.
      *
      * <p>The two marks bracket the drain and answer different questions. The cdc-start position — the
-     * source log position sampled at snapshot start — is recorded before the batch drains, so the cdc tail
-     * that follows resumes from before the snapshot and the idempotent sink absorbs the overlap; no change
-     * made while the snapshot runs is missed. Its presence therefore means the snapshot has <em>started</em>.
+     * seam the batch itself sampled at the source, before its first row — is recorded before the batch
+     * drains, so the cdc tail that follows resumes from before the snapshot and the idempotent sink
+     * absorbs the overlap; no change made while the snapshot runs is missed. A batch that reports no seam
+     * stops the run with a code rather than letting the caller pick a start of its own.
+     * Its presence therefore means the snapshot has <em>started</em>.
      * The completion mark is written only after the drain returns, so its presence means the table has been
      * read to exhaustion. A drain that fails partway marks nothing: an aborted snapshot is not a completed
      * one, and a reader treating a partial drain as exhausted would conclude rows are absent from the source
@@ -55,7 +59,6 @@ public final class SnapshotPhase {
             CaptureConfig config,
             String miningChainId,
             List<String> tables,
-            SourcePosition cdcStart,
             long ringEpoch,
             SrsMetaStore meta,
             Consumer<Envelope> sink) {
@@ -63,7 +66,6 @@ public final class SnapshotPhase {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(tables, "tables");
-        Objects.requireNonNull(cdcStart, "cdcStart");
         Objects.requireNonNull(meta, "meta");
         Objects.requireNonNull(sink, "sink");
         if (tables.isEmpty()) {
@@ -72,8 +74,20 @@ public final class SnapshotPhase {
 
         long epoch = pinnedEpoch(meta, miningChainId, tables, ringEpoch);
         SourceOrder order = SourceOrder.snapshotRow(epoch);
-        meta.setCdcStart(miningChainId, cdcStart.token(), epoch);
-        long count = drain(port, config, row -> sink.accept(row.withOrder(order)));
+        long count = 0;
+        try (CaptureBatch batch = port.snapshot(config)) {
+            // The seam comes from the batch, which sampled it at the source before reading its first row.
+            // A source that reports none leaves the tail nothing to join to, and the run stops here rather
+            // than proceeding: a snapshot whose tail then begins wherever it likes drops every change made
+            // while the snapshot ran, with nothing thrown and nothing logged.
+            SourcePosition seam = batch.seam().orElseThrow(() -> new TapstateException(
+                    CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
+            meta.setCdcStart(miningChainId, seam.token(), epoch);
+            while (batch.hasNext()) {
+                sink.accept(batch.next().withOrder(order));
+                count++;
+            }
+        }
         // One drain reads every selected table to exhaustion, so each of them is marked - marking only the
         // first would leave the rest looking un-drained and pin a later re-mine to this run's generation.
         for (String table : tables) {

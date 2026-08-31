@@ -63,20 +63,30 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(spec.schemaVer()).isZero();
     }
 
+    /**
+     * The run spec carries no position of any kind, and that absence is the point.
+     *
+     * <p>A seam and a per-change position are the source's own, learned from it as the read happens. When
+     * this layer supplied them instead, both were invented here: a fixed seam token, and a generator that
+     * began again at its first value on every run. The second is what silently rewound the durable offset
+     * — a restarted run's invented positions start over while its ring generation rises, so every ordering
+     * check reads the rewind as an advance.
+     *
+     * <p>Asserted structurally, over the record's components, so that putting either back is a red test
+     * rather than a thing a reader has to notice.
+     */
     @Test
-    void theL1MockWatermarkIsMonotonicAndItsOrderIsNumericNotLexical() {
+    void carriesNoPositionOfItsOwnBecausePositionsAreTheSourcesToState() {
         SourceResource source = cdcSource("orders_src", "orders", null);
         Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest");
 
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
                 "pipe-1", settings, source, SourceCaptureResolution.of(source));
 
-        // The mock watermark is a monotonic source-position generator. What ranks the tokens it hands out
-        // is not carried here at all: the order is the ring's own, assigned on append, so the spec has
-        // nothing to say about it - and nothing that could disagree with what the sink ranks by.
-        assertThat(spec.watermark().get()).isEqualTo(new SourcePosition("w1"));
-        assertThat(spec.watermark().get()).isEqualTo(new SourcePosition("w2"));
-        assertThat(spec.cdcStart()).isNotNull();
+        assertThat(spec.getClass().getRecordComponents())
+                .extracting(java.lang.reflect.RecordComponent::getType)
+                .as("no component of the run spec is a source position, nor a supplier of one")
+                .doesNotContain(SourcePosition.class, java.util.function.Supplier.class);
     }
 
     @Test

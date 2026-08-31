@@ -345,7 +345,7 @@ class HazelcastMemberTest {
             throw new UnsupportedOperationException();
         }
 
-        @Override public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        @Override public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             throw new UnsupportedOperationException();
         }
 

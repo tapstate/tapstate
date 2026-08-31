@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.SourcePosition;
 
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
@@ -35,8 +36,8 @@ public final class CaptureHealth {
     CaptureListener recording(CaptureListener onEvent) {
         return new CaptureListener() {
             @Override
-            public void onEvent(Envelope event) {
-                onEvent.onEvent(event);
+            public void onEvent(Envelope event, Optional<SourcePosition> position) {
+                onEvent.onEvent(event, position);
             }
 
             @Override

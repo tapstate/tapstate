@@ -36,10 +36,13 @@ public final class SrsDurableFrontier {
      * consumer has acked nothing). {@code candidate} is the position the reader has read up to.
      *
      * <p>Empty also covers a winning position that carries no token of its own — a frontier that has
-     * reached snapshot rows and no change yet. There is nothing to write down for it, and leaving the
-     * offset where it was only ever means re-mining changes that were already read.
+     * reached snapshot rows, or changes the source stated no position at. There is nothing to write down
+     * for it, and leaving the offset where it was only ever means re-mining changes that were already read.
+     *
+     * <p>The pair is returned, never the token alone. The order is what the store ranks the advance
+     * against, and a store handed a token with no order cannot tell an advance from a rewind.
      */
-    public static Optional<String> safeAdvance(
+    public static Optional<ChainPosition> safeAdvance(
             ChainPosition candidate, Collection<ConsumerOffset> consumers) {
         Objects.requireNonNull(candidate, "candidate");
         Objects.requireNonNull(consumers, "consumers");
@@ -59,6 +62,6 @@ public final class SrsDurableFrontier {
                 safe = acked;
             }
         }
-        return Optional.ofNullable(safe.token());
+        return safe.token() == null ? Optional.empty() : Optional.of(safe);
     }
 }

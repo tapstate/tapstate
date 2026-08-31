@@ -28,6 +28,7 @@ artifact.reclaim-incomplete
 artifact.version-conflict
 boot.hazelcast-unavailable
 capture.event-table-not-selected
+capture.snapshot-reports-no-seam
 capture.start-from-unparsable
 cli.alias-install-dir-unknown
 cli.alias-link-failed
@@ -63,6 +64,8 @@ connector.no-connector-class
 connector.not-found
 connector.not-official
 connector.not-registered
+connector.position-unreadable
+connector.position-unrenderable
 connector.projection-failed
 connector.read-abandoned
 connector.read-failed

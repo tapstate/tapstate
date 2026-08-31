@@ -66,10 +66,18 @@ public final class SrsCoordinator {
         ChainState state = chains.get(chainId.value());
         boolean merged = state != null;
         if (state == null) {
-            // Seed only a chain that has none. The durable record outlives this process, so after a restart
-            // the chain is opened again with its record already there; seeding is insert-only precisely so
-            // an accumulated offset / cursor / schema truth is never discarded, and skipping the seed is how
-            // that is honoured. Opening still happens either way -- a rebuilt ring is a new generation.
+            // Seed only a chain that has none, and open regardless. The durable record outlives this
+            // process, so after a restart the chain is opened again with its record already there; seeding
+            // is insert-only precisely so an accumulated offset / cursor / schema truth is never discarded,
+            // and skipping the seed is how that is honoured. Opening still happens either way -- a rebuilt
+            // ring is a new generation.
+            //
+            // Re-opening a chain that already has durable history stays a quiet, ordinary act, and the
+            // reason has changed rather than merely survived: the record it preserves is now read back by
+            // the run that follows -- the position its tail starts from, and whether its full load already
+            // finished. Refusing here, or branching on "this chain has been read before", would announce
+            // what the caller is about to ask the store anyway, and would refuse the one case resuming is
+            // for. What would be wrong is discarding the record, which insert-only seeding already stops.
             if (meta.read(chainId.value()).isEmpty()) {
                 meta.create(chainId.value(), retention);
             }

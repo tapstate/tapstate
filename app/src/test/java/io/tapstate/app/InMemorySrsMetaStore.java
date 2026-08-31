@@ -36,10 +36,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public synchronized void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+    public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
         SrsMeta m = require(miningChainId);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), sourceReadOffset, m.consumerOffsets(), m.cdcStartPosition(),
+                m.miningChainId(), position, m.consumerOffsets(), m.cdcStartPosition(),
                 m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
     }
 
@@ -50,7 +50,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
         next.add(offset);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
+                m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                 m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
     }
 
@@ -72,7 +72,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         ChainPosition ack = existing == null ? null : existing.sinkAcked();
         next.add(new ConsumerOffset(pipelineId, perTable, ack));
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
+                m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                 m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
     }
 
@@ -91,7 +91,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
         next.add(new ConsumerOffset(pipelineId, perTable, position));
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
+                m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                 m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
     }
 
@@ -99,7 +99,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     public synchronized void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
         SrsMeta m = require(miningChainId);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), cdcStartPosition,
+                m.miningChainId(), m.sourceRead(), m.consumerOffsets(), cdcStartPosition,
                 m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), snapshotEpoch));
     }
 
@@ -108,7 +108,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         SrsMeta m = require(miningChainId);
         long opened = m.epoch() + 1;
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
+                m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
                 m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), opened, m.snapshotEpoch()));
         return opened;
     }
@@ -119,7 +119,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         List<SchemaVersion> next = new ArrayList<>(m.schemaHistory());
         next.add(version);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
+                m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
                 next, m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
     }
 
@@ -132,7 +132,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         List<String> next = new ArrayList<>(m.snapshotCompletedTables());
         next.add(table);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
+                m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
                 m.schemaHistory(), m.retention(), next, m.epoch(), m.snapshotEpoch()));
     }
 
@@ -157,7 +157,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(pipelineId));
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
+                m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                 m.schemaHistory(), m.retention()));
     }
 

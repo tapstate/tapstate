@@ -260,7 +260,7 @@ class UpsertOverlapIdempotencyTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             for (Envelope change : changes) {
-                listener.onEvent(change);
+                listener.onEvent(change, java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }
             return () -> { };
         }
@@ -297,7 +297,9 @@ class UpsertOverlapIdempotencyTest {
 
         @Override
         public Optional<SourcePosition> seam() {
-            return Optional.empty();
+            // Sampled by the source before its first row. The run refuses to start a tail without one,
+            // because a tail that begins wherever it likes loses every change made while the snapshot ran.
+            return Optional.of(new SourcePosition("seam-0"));
         }
 
         @Override

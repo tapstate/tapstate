@@ -62,7 +62,7 @@ class MongoSrsMetaStoreIT {
     void createIsInsertOnlyAndDoesNotDiscardAccumulatedTruth() {
         withStore(store -> {
             store.create(CHAIN, "7d");
-            store.advanceSourceReadOffset(CHAIN, "gtid:aaa-1:500");
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
 
             // a second seed must be refused: overwriting would discard the advanced offset. The
             // collision is a caller ordering error, surfaced bare like the unseeded-mutate error.
@@ -77,9 +77,52 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            store.advanceSourceReadOffset(CHAIN, "gtid:aaa-1:900");
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
 
             assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
+        });
+    }
+
+    @Test
+    void advanceSourceReadOffsetPersistsTheOrderBesideTheToken() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(3L, 42L), "gtid:aaa-1:42"));
+
+            // Both halves survive the round trip. The token is what a read resumes from; the order is what
+            // the next advance is ranked against, and a stored token whose order was dropped can no longer
+            // be told from a rewind.
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .isEqualTo(new ChainPosition(new SourceOrder(3L, 42L), "gtid:aaa-1:42"));
+        });
+    }
+
+    @Test
+    void sourceReadOffsetOnlyEverMovesForward() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
+
+            // Lower sequence, same generation: a clamp to a consumer that is behind. Ignored.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
+
+            // Lower generation: a stale writer from before a restart. Ignored.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(0L, 9999L), "gtid:aaa-1:1"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
+
+            // The same position again: not an advance either, and not an error.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
+
+            // Forward, same generation.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 901L), "gtid:aaa-1:901"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:901");
+
+            // Forward by generation, even though the sequence restarts: a rebuilt ring numbers from zero.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(2L, 0L), "gtid:aaa-2:1"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-2:1");
         });
     }
 
@@ -257,7 +300,7 @@ class MongoSrsMetaStoreIT {
         // every mutator requires the chain to have been seeded by create first; a mutate on an unseeded
         // chain is a caller ordering error, not a silent no-op.
         withStore(store -> {
-            assertThatThrownBy(() -> store.advanceSourceReadOffset("nope", "x"))
+            assertThatThrownBy(() -> store.advanceSourceReadOffset("nope", new ChainPosition(new SourceOrder(1L, 1L), "x")))
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.upsertConsumerOffset("nope", new ConsumerOffset("p", Map.of(), null)))
                     .isInstanceOf(IllegalStateException.class);
@@ -280,7 +323,7 @@ class MongoSrsMetaStoreIT {
     void detachConsumerRemovesOneCursorAndLeavesTheChainAndItsOtherConsumersByteForByte() {
         withStore(store -> {
             store.create(CHAIN, "7d");
-            store.advanceSourceReadOffset(CHAIN, "gtid:aaa-1:500");
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
             store.setCdcStart(CHAIN, "gtid:aaa-1:1", 1L);
             store.appendSchemaVersion(CHAIN, new SchemaVersion(0, Map.of("id", "int"), 0));
             store.upsertConsumerOffset(CHAIN, new ConsumerOffset("departing", Map.of("orders", 100L),

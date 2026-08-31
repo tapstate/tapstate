@@ -14,6 +14,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.LongSupplier;
@@ -26,13 +27,13 @@ import java.util.function.Supplier;
  * (op {@code r}) never reaches here; the ring item rejects it by construction.
  *
  * <p>The per-event source position is threaded at this seam: the event envelope carries no position slot,
- * so each change is stamped with the next {@link CdcChain#watermark() watermark} position — at L1 a mock
- * monotonic generator standing in for the connector-defined position order.
+ * so each change is stamped with the position the source reported for it. Most changes carry none — a
+ * source names one position for a run of changes — and the durable read offset therefore advances at
+ * those boundaries rather than on every change, which is exactly where the claim "everything up to here
+ * has been read" is true.
  *
- * <p>Every tail here starts at the source's present moment, and says so rather than leaving it unsaid.
- * Nothing yet reads a recorded position back out of the durable meta to start from, so there is no other
- * start to ask for; when there is, this is the one line that changes, and until then the run that begins
- * at now does it because a caller asked, not because a null decayed into it inside a connector.
+ * <p>Where a tail begins is the caller's to say, and it says it: {@link CaptureStart#present()} for a run
+ * asked to take only new changes, a recorded position for one picking up where it left off.
  */
 public final class CdcPhase {
 
@@ -49,7 +50,7 @@ public final class CdcPhase {
 
     /**
      * Starts the cdc stream and returns the subscription that stops it. Each change event is projected to
-     * a ring item stamped with the next watermark position and appended through the headroom gate, which
+     * a ring item carrying the position the source reported for it and appended through the headroom gate, which
      * refuses a write that would overwrite a change the slowest consumer has not read.
      *
      * @param minConsumerReadSeq the slowest consumer's read cursor into the ring, the headroom bound
@@ -68,8 +69,27 @@ public final class CdcPhase {
         Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
         Objects.requireNonNull(consumers, "consumers");
         Objects.requireNonNull(health, "health");
-        return port.cdc(config, CaptureStart.present(),
-                health.recording(event -> writeChange(chain, event, minConsumerReadSeq, consumers)));
+        return run(port, config, CaptureStart.present(), chain, minConsumerReadSeq, consumers, health);
+    }
+
+    /** As above, beginning where {@code start} says rather than always at the source's present moment. */
+    public static Subscription run(
+            CapturePort port,
+            CaptureConfig config,
+            CaptureStart start,
+            CdcChain chain,
+            LongSupplier minConsumerReadSeq,
+            Supplier<Collection<ConsumerOffset>> consumers,
+            CaptureHealth health) {
+        Objects.requireNonNull(port, "port");
+        Objects.requireNonNull(config, "config");
+        Objects.requireNonNull(start, "start");
+        Objects.requireNonNull(chain, "chain");
+        Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
+        Objects.requireNonNull(consumers, "consumers");
+        Objects.requireNonNull(health, "health");
+        return port.cdc(config, start, health.recording(
+                (event, position) -> writeChange(chain, event, position, minConsumerReadSeq, consumers)));
     }
 
     /** Starts one connector subscription and routes each event to the ring for its source table. */
@@ -78,18 +98,32 @@ public final class CdcPhase {
             CaptureConfig config,
             Map<String, TableRoute> routes,
             CaptureHealth health) {
+        return run(port, config, CaptureStart.present(), routes, health);
+    }
+
+    /**
+     * As above, beginning where {@code start} says. One subscription serves every table of the chain, so
+     * the start is the chain's — the tail is one log read, not one per table.
+     */
+    public static Subscription run(
+            CapturePort port,
+            CaptureConfig config,
+            CaptureStart start,
+            Map<String, TableRoute> routes,
+            CaptureHealth health) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
+        Objects.requireNonNull(start, "start");
         Objects.requireNonNull(routes, "routes");
         Objects.requireNonNull(health, "health");
         Map<String, TableRoute> routeSnapshot = Map.copyOf(routes);
-        return port.cdc(config, CaptureStart.present(), health.recording(event -> {
+        return port.cdc(config, start, health.recording((event, position) -> {
             TableRoute route = routeSnapshot.get(event.src());
             if (route == null) {
                 throw new TapstateException(
                         CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
             }
-            writeChange(route.chain(), event, route.minConsumerReadSeq(), route.consumers());
+            writeChange(route.chain(), event, position, route.minConsumerReadSeq(), route.consumers());
         }));
     }
 
@@ -106,15 +140,16 @@ public final class CdcPhase {
     }
 
     /**
-     * Projects one change event to a ring item stamped with the next watermark position, admits it through
+     * Projects one change event to a ring item carrying the position the source reported for it, admits it through
      * the headroom gate, and advances the durable read offset to its position.
      */
     private static void writeChange(
             CdcChain chain,
             Envelope event,
+            Optional<SourcePosition> position,
             LongSupplier minConsumerReadSeq,
             Supplier<Collection<ConsumerOffset>> consumers) {
-        SourcePosition pos = chain.watermark().get();
+        SourcePosition pos = position.orElse(null);
         SrsItem item = new SrsItem(
                 pos, event.op(), event.ts(), event.before(), event.after(), chain.schemaVer());
         long seq;
@@ -135,7 +170,8 @@ public final class CdcPhase {
         // stay re-minable from the source until a sink has durably landed it.
         // The sequence the ring just assigned, paired with the generation it is running under, is what
         // ranks this position against the consumers' acked ones: a token says nothing about order.
-        ChainPosition read = new ChainPosition(new SourceOrder(chain.epoch(), seq), pos.token());
+        ChainPosition read = new ChainPosition(
+                new SourceOrder(chain.epoch(), seq), pos == null ? null : pos.token());
         SrsDurableFrontier.safeAdvance(read, consumers.get())
                 .ifPresent(safe -> chain.meta().advanceSourceReadOffset(chain.miningChainId(), safe));
     }

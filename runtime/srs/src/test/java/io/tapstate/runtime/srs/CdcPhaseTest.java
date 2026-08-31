@@ -95,8 +95,14 @@ class CdcPhaseTest {
         return new CaptureConfig("mysql", Map.of(), List.of("orders"));
     }
 
-    /** A mock cdc watermark: a monotonic source-position generator (w1, w2, ...) standing in for the connector-defined per-event position. */
-    private static Supplier<SourcePosition> monotonicWatermark() {
+    /**
+     * The positions this fake source states for the changes it streams: w1, w2, ... one per change.
+     *
+     * <p>They are the <em>source's</em>, handed over with each change, which is what the phase under test
+     * now reads. Nothing on the write side hands positions out any more — a generator there is what makes
+     * a restart's positions begin again from w1 while the ring generation rises.
+     */
+    private static Supplier<SourcePosition> sourceStatedPositions() {
         AtomicLong n = new AtomicLong();
         return () -> new SourcePosition("w" + n.incrementAndGet());
     }
@@ -122,7 +128,7 @@ class CdcPhaseTest {
     void projectsEachCdcChangeToTheRingInOrder() throws Exception {
         Ringbuffer<SrsItem> ring = hz.getRingbuffer("srs.chain.order");
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(ring));
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(
                 Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
                 Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 1, "n", 9), Map.of()),
@@ -151,7 +157,7 @@ class CdcPhaseTest {
         RecordingMeta meta = new RecordingMeta();
         // One consumer has durably acked its sink up to w2; the persisted read offset must never pass it.
         List<ConsumerOffset> consumers = List.of(new ConsumerOffset("p1", Map.of("orders", 9L), new ChainPosition(new SourceOrder(RING_GENERATION, 1), "w2")));
-        CdcChain chain = new CdcChain(gate, meta, "chain", monotonicWatermark(), RING_GENERATION, 0L);
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(
                 Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
                 Envelope.insert(2, "orders", Map.of("id", 2), Map.of()),
@@ -176,7 +182,7 @@ class CdcPhaseTest {
         // seq 0 on the next -- modeling the source read pausing until a consumer frees a slot.
         AtomicLong polls = new AtomicLong();
         LongSupplier minRead = () -> polls.getAndIncrement() == 0 ? -1L : 0L;
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
         CdcPhase.run(port, config(), chain, minRead, List::of, new CaptureHealth());
@@ -199,7 +205,7 @@ class CdcPhaseTest {
         // The slowest consumer reads nothing until the test frees a slot: the write stays backpressured.
         AtomicBoolean freed = new AtomicBoolean(false);
         LongSupplier minRead = () -> freed.get() ? 0L : -1L;
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
         Thread writer = new Thread(() -> CdcPhase.run(port, config(), chain, minRead, List::of, new CaptureHealth()), "cdc-writer");
@@ -225,7 +231,7 @@ class CdcPhaseTest {
     @Test
     void stopsTheStreamThroughTheReturnedSubscription() {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.sub")));
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of());
 
         Subscription sub = CdcPhase.run(port, config(), chain, () -> Long.MAX_VALUE, List::of, new CaptureHealth());
@@ -238,7 +244,7 @@ class CdcPhaseTest {
     @Test
     void rejectsIncompleteWiringBeforeStartingTheStream() {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.guard")));
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
 
         assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, null, List::of, new CaptureHealth()))
@@ -253,7 +259,7 @@ class CdcPhaseTest {
         CaptureHealth health = new CaptureHealth();
         RuntimeException boom = new RuntimeException("stream boom");
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.fail")));
-        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", monotonicWatermark(), RING_GENERATION, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
 
         CdcPhase.run(FakeCdcPort.failing(boom), config(), chain, () -> Long.MAX_VALUE, List::of, health);
 
@@ -273,10 +279,14 @@ class CdcPhaseTest {
                 });
     }
 
-    /** A cdc port that drives a fixed list of change events into the listener when the stream starts. */
+    /**
+     * A cdc port that drives a fixed list of change events into the listener when the stream starts,
+     * stating a position for each one the way a source does.
+     */
     private static final class FakeCdcPort implements CapturePort {
         private final List<Envelope> events;
         private final Throwable error;
+        private final Supplier<SourcePosition> positions = sourceStatedPositions();
         boolean subscribed;
         boolean closed;
 
@@ -302,7 +312,7 @@ class CdcPhaseTest {
                 return () -> closed = true;
             }
             for (Envelope e : events) {
-                listener.onEvent(e);
+                listener.onEvent(e, Optional.of(positions.get()));
             }
             return () -> closed = true;
         }
@@ -338,8 +348,8 @@ class CdcPhaseTest {
         final List<String> advances = new ArrayList<>();
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
-            advances.add(sourceReadOffset);
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+            advances.add(position.token());
         }
 
         @Override

@@ -14,7 +14,6 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
-import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -28,9 +27,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -39,16 +36,12 @@ import java.util.stream.Collectors;
  * tear them down. It derives each source run spec identically to how the topology builder derives the ring
  * the run fills, through the shared source resolution, so the capture and the reader agree on the ring.
  *
- * <p>The run spec carries L1 mock collaborators standing in for real connector machinery: a fixed cdc-start
- * token, a monotonic watermark generator, and a position order that ranks those watermark tokens by numeric
- * suffix (never lexically). The watermark token format and the position order are a matched pair. Snapshot
- * rows drain to a shared buffer keyed by the source's change-ring name; the source vertex reading that ring
+ * <p>No positions are supplied here. A run's seam and its per-change positions are the source's own and are
+ * learned from it as the read happens, so there is nothing for this layer to stand in with. Snapshot rows
+ * drain to a shared buffer keyed by the source's change-ring name; the source vertex reading that ring
  * drains the buffer and emits its rows through the same transform-to-sink chain as cdc, strictly before it.
  */
 final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoordinator {
-
-    /** The fixed cdc-start position for an L1 run: a mock stand-in for the position sampled at snapshot start. */
-    private static final SourcePosition MOCK_CDC_START = new SourcePosition("cdc-start-0");
 
     /** The schema version stamped on ring items at L1 (schema evolution is a later increment). */
     private static final long MOCK_SCHEMA_VER = 0L;
@@ -216,7 +209,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /**
      * Derives one source run spec from the source, the pipeline settings, and the shared resolution. The read
      * axis comes from settings (read mode defaulting to snapshot-then-cdc, start position to earliest); srs is
-     * on unless the source declares it off; the L1 mock collaborators are fresh per run.
+     * on unless the source declares it off.
      */
     static CaptureRunSpec deriveSpec(
             String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution) {
@@ -233,10 +226,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 resolution.sourceId(),
                 pipelineId,
                 StartFrom.parse(startFromRaw),
-                MOCK_CDC_START,
                 retention,
-                MOCK_SCHEMA_VER,
-                monotonicWatermark());
+                MOCK_SCHEMA_VER);
     }
 
     @Override
@@ -267,12 +258,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
         Boolean enabled = source.srs().enabled();
         return enabled == null || enabled;
-    }
-
-    /** A mock cdc watermark: a monotonic source-position generator (w1, w2, ...) standing in for the connector. */
-    private static Supplier<SourcePosition> monotonicWatermark() {
-        AtomicLong counter = new AtomicLong();
-        return () -> new SourcePosition("w" + counter.incrementAndGet());
     }
 
     private ArtifactStore artifacts() {

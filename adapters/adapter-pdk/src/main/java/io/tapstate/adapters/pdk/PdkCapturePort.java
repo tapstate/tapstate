@@ -68,9 +68,9 @@ public final class PdkCapturePort implements CapturePort {
             // invariant violation (the modes were validated upstream) and crashes bare here rather than
             // being laundered into a coded capture failure.
             BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
-            List<TapEvent> raw = read(connector, () -> batchRead(connector, config, batch));
-            List<Envelope> rows = decodeSnapshot(connector.connectorId(), raw);
-            return new PdkCaptureBatch(rows, seam(), connector);
+            SnapshotRead snapshot = read(connector, () -> batchRead(connector, config, batch));
+            List<Envelope> rows = decodeSnapshot(connector.connectorId(), snapshot.raw());
+            return new PdkCaptureBatch(rows, position(connector, snapshot.seam()), connector);
         } catch (RuntimeException e) {
             connector.stopQuietly();
             connector.close();
@@ -81,30 +81,36 @@ public final class PdkCapturePort implements CapturePort {
     /**
      * {@inheritDoc}
      *
-     * <p>Resuming at a recorded position is refused here, before anything is opened. A connector states
-     * its position as an object of its own making - a binlog coordinate, a resume token - and nothing in
-     * this adapter yet renders one of those as the token a position carries, nor reads it back. Handing
-     * the token string over in its place is not a partial version of that: the connector is given a
-     * position of a type it never issued, and what it does with one is its own affair. Nothing in the
-     * product asks for one yet, so this is an unreachable caller mistake and crashes bare, the way the
-     * other caller invariants in this port do - and it crashes to the caller rather than inside the
-     * stream thread, where the loop's own catch-all would deliver it as a coded connector failure.
+     * <p>A {@link CaptureStart.Resume} is read back into the object the connector issued and handed to its
+     * stream read as the position to pick up from; a {@link CaptureStart.Present} samples the connector's
+     * current position instead, so the tail begins at now because the caller asked for now. The token
+     * itself never reaches a connector: it is this adapter's rendering of the connector's own offset, and
+     * a connector only accepts one of those back.
+     *
+     * <p>A recorded position this connector can no longer read is a coded refusal, raised before anything
+     * is opened. Beginning at the present instead would be the silent form of the same failure — every
+     * change made since the position was recorded dropped, with nothing thrown and nothing logged.
      */
     @Override
     public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-        if (start instanceof CaptureStart.Resume resume) {
-            throw new IllegalStateException("cdc was asked to resume at " + resume.position().token()
-                    + ", but a recorded position cannot yet be handed to a connector");
-        }
         PdkConnector connector = open(config);
         StreamReadFunction stream;
+        Object resumeAt;
         try {
             stream = requireFunction(connector.functions().getStreamReadFunction());
+            // Read the recorded position back here, on the caller's thread, rather than inside the stream
+            // loop: the loop's catch-all delivers everything it catches as a coded connector read failure,
+            // which would report "the source failed" for what is really a position this build cannot read.
+            // It needs the connector's loader, not an inited connector, so this is the earliest point.
+            resumeAt = start instanceof CaptureStart.Resume resume
+                    ? ConnectorOffsetCodec.fromToken(connector.connectorId(), resume.position().token(),
+                            connector.connector().getClass().getClassLoader())
+                    : null;
         } catch (RuntimeException e) {
             connector.close();
             throw e;
         }
-        Thread thread = new Thread(() -> streamLoop(connector, config, listener, stream),
+        Thread thread = new Thread(() -> streamLoop(connector, config, resumeAt, listener, stream),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
@@ -152,9 +158,23 @@ public final class PdkCapturePort implements CapturePort {
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
     }
 
-    /** Inits the connector once, then batch-reads the configured streams (or every discovered stream). */
-    private List<TapEvent> batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
+    /** The rows a snapshot read gathered, and the stream position sampled before it began. */
+    private record SnapshotRead(List<TapEvent> raw, Object seam) {
+    }
+
+    /**
+     * Inits the connector once, samples the seam, then batch-reads the configured streams (or every
+     * discovered stream).
+     *
+     * <p>The seam is sampled <em>before</em> the first row is read, which is what makes the join to the
+     * change tail gapless. A change made while the snapshot runs then falls after the seam and is
+     * re-delivered by the tail, and the idempotent write downstream absorbs that overlap. Sampled after
+     * the read instead, every change made during it would fall before the seam and never be delivered at
+     * all — the same shape of loss, but silent.
+     */
+    private SnapshotRead batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
         connector.connector().init(connector.context());
+        Object seam = startOffset(connector);
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
         Map<String, TapTable> discovered = byId(discoverTables(connector, config.streams()));
@@ -172,7 +192,7 @@ public final class PdkCapturePort implements CapturePort {
             connector.fillFieldTypes(table);
             batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
         }
-        return raw;
+        return new SnapshotRead(raw, seam);
     }
 
     /** Indexes discovered tables by id, keeping discovery order. */
@@ -234,8 +254,8 @@ public final class PdkCapturePort implements CapturePort {
         return new Probe(tables, sample);
     }
 
-    private void streamLoop(PdkConnector connector, CaptureConfig config, CaptureListener listener,
-            StreamReadFunction stream) {
+    private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt,
+            CaptureListener listener, StreamReadFunction stream) {
         try {
             connector.underLoader(() -> {
                 connector.connector().init(connector.context());
@@ -248,15 +268,27 @@ public final class PdkCapturePort implements CapturePort {
                 Map<String, TapTable> tables = byId(discoverTables(connector, config.streams()));
                 tables.values().forEach(connector::fillFieldTypes);
                 connector.context().setTableMap(tableMap(tables));
-                Object startOffset = startOffset(connector);
+                // Resuming uses the position the caller recorded; starting at the present samples the
+                // connector's current one, which also keeps a null offset out of the connector -- that
+                // drives a schema-only recovery with no stored offset to recover from.
+                Object startOffset = resumeAt != null ? resumeAt : startOffset(connector);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
+                    // A change stream also carries control events (heartbeats and the like) that signal
+                    // the tail is alive but carry no row; they are not decodable changes, so skip them.
+                    List<TapEvent> changes = new ArrayList<>(events.size());
                     for (TapEvent event : events) {
-                        // A change stream also carries control events (heartbeats and the like) that signal
-                        // the tail is alive but carry no row; they are not decodable changes, so skip them.
-                        if (event instanceof ControlEvent) {
-                            continue;
+                        if (!(event instanceof ControlEvent)) {
+                            changes.add(event);
                         }
-                        listener.onEvent(TapEventCodec.decodeChange(event));
+                    }
+                    // The offset names where the source had read to once this whole batch was handed over,
+                    // so it rides out with the last change of the batch and no other. Put on every change,
+                    // it would say of the first one that the source had already read past the last -- and a
+                    // run interrupted between them would resume past changes it never delivered.
+                    for (int i = 0; i < changes.size(); i++) {
+                        boolean closesTheBatch = i == changes.size() - 1;
+                        listener.onEvent(TapEventCodec.decodeChange(changes.get(i)),
+                                closesTheBatch ? position(connector, offset) : Optional.empty());
                     }
                 });
                 stream.streamRead(connector.context(), config.streams(), startOffset, BATCH_SIZE, consumer);
@@ -345,16 +377,15 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     /**
-     * The seam a snapshot batch reports, which for now is none.
-     *
-     * <p>The position is there to be had - the connector answers with its current one, and a batch read
-     * hands back an offset of its own - but both arrive as objects of the connector's own making, and
-     * nothing here yet renders one of those as a token. Reporting none says exactly that, and leaves the
-     * caller to refuse; reporting a position built out of whatever the object prints as would give it one
-     * that no connector can be started from again.
+     * A connector's own offset rendered as the position it stands for, or empty when the connector named
+     * none. Empty is a statement, not a gap: this source did not say where it had read to, so a caller
+     * needing a position has to refuse rather than invent one that no connector could be started from.
      */
-    private static Optional<SourcePosition> seam() {
-        return Optional.empty();
+    private static Optional<SourcePosition> position(PdkConnector connector, Object offset) {
+        return offset == null
+                ? Optional.empty()
+                : Optional.of(new SourcePosition(
+                        ConnectorOffsetCodec.toToken(connector.connectorId(), offset)));
     }
 
     /** Runs a read action under the connector loader, mapping a connector-side failure to a code. */
