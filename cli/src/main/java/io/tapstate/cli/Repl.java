@@ -104,6 +104,9 @@ final class Repl {
 
     private final CommandLine commandLine;
 
+    /** Command vocabulary shared with one-shot mode and the terminal workbench. */
+    private final CommandRegistry registry;
+
     /** The transport seam to a server; a network-free fake is injected in tests. */
     private final ControlPlaneClient controlPlane;
 
@@ -204,6 +207,7 @@ final class Repl {
          UnaryOperator<String> env, ContextResolver contextResolver, String explicitContext,
          AuthService authService, ContextManager contextManager) {
         this.commandLine = commandLine;
+        this.registry = CommandRegistry.forCommandLine(commandLine, SchemaNavigator.bundled());
         this.workdir = workdir;
         this.controlPlane = controlPlane;
         this.prompter = prompter;
@@ -368,7 +372,7 @@ final class Repl {
      * and the shell has already done that job.
      */
     boolean dispatch(List<String> words) {
-        return dispatchWords(words);
+        return registry.dispatch(this, registry.invocation(words)).keepRunning();
     }
 
     /** Dispatches a scripted command without letting lazy target setup contaminate its stdout. */
@@ -376,10 +380,20 @@ final class Repl {
         boolean previous = this.quiet;
         this.quiet = quiet;
         try {
-            return dispatchWords(words);
+            return registry.dispatch(this, registry.invocation(words)).keepRunning();
         } finally {
             this.quiet = previous;
         }
+    }
+
+    /** Dispatches one parsed command and reports both its exit status and session-loop decision. */
+    CommandResult dispatchInvocation(CommandInvocation invocation) {
+        boolean keepRunning = dispatchWords(invocation.words());
+        return new CommandResult(keepRunning, lastExitCode);
+    }
+
+    CommandRegistry registry() {
+        return registry;
     }
 
     private boolean dispatchLine(String trimmed) {
@@ -423,7 +437,7 @@ final class Repl {
                     DataBrowserCall.parseLive(live, trimmed.substring(live.length())), live);
             return true;
         }
-        return dispatchWords(tokenize(trimmed));
+        return registry.dispatch(this, registry.invocation(trimmed)).keepRunning();
     }
 
     /** The shared tail of both entry points: everything decided by the words rather than the raw line. */

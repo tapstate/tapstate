@@ -43,9 +43,7 @@ final class TapstateCompleter implements Completer {
 
     /** Builds the completer for a REPL command table: registered subcommands plus the REPL builtins. */
     static TapstateCompleter forRepl(CommandLine commandLine, SchemaNavigator schema) {
-        TreeSet<String> verbs = new TreeSet<>(commandLine.getSubcommands().keySet());
-        verbs.addAll(Repl.BUILTINS);
-        return new TapstateCompleter(verbs, schema, TapstateCatalog.load());
+        return CommandRegistry.forCommandLine(commandLine, schema).completer();
     }
 
     /** Options that consume a following value token (so completion skips past the value). */

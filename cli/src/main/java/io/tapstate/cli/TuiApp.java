@@ -210,27 +210,27 @@ final class TuiApp {
         // Give the user one frame that reflects the network transition before a lazy context
         // resolution or control-plane request blocks this event-loop thread.
         draw(display, terminal);
-        boolean keepGoing;
+        CommandResult commandResult;
         try {
-            keepGoing = repl.dispatch(line);
+            commandResult = repl.registry().dispatch(repl, repl.registry().invocation(line));
         } finally {
             commandRunning = false;
         }
         String result = consumeOutput();
         if (!result.isBlank()) {
-            String marker = repl.lastExitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";
+            String marker = commandResult.exitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";
             uiState = TuiReducer.reduce(uiState, new TuiAction.AppendActivity(marker + result));
             uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice(result));
-        } else if (repl.lastExitCode() == Cli.EXIT_OK) {
+        } else if (commandResult.exitCode() == Cli.EXIT_OK) {
             uiState = TuiReducer.reduce(uiState, new TuiAction.AppendActivity("✓ ready"));
             uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice("ready"));
         } else {
-            String failure = "command failed (exit " + repl.lastExitCode() + ")";
+            String failure = "command failed (exit " + commandResult.exitCode() + ")";
             uiState = TuiReducer.reduce(uiState, new TuiAction.AppendActivity("✕ " + failure));
             uiState = TuiReducer.reduce(uiState,
                     new TuiAction.SetNotice(failure));
         }
-        return keepGoing;
+        return commandResult.keepRunning();
     }
 
     /** Reads a single TUI-owned answer while keeping the dashboard and raw terminal active. */
