@@ -101,5 +101,25 @@ expect "and a human with the same body is not"     1 "answered neither" "$untouc
 expect "a lookalike label is not the label"        1 "no \`docs-needed\` label" "$answered" "docs-needed-later"
 expect "the label is found among others"           0 "clean:"          "$answered"      "bug,docs-needed,area/cli"
 
+# --- and the gate reaches the contributions it exists for ---------------------------------------
+# Every case above asks what the gate decides. This one asks whether it gets to decide at all on a
+# pull request from a fork, which is a property of the workflow's trigger and of nothing the script
+# can see. `pull_request_target` is the plausible edit -- it is what the sibling workflow needs, and
+# switching to it costs no visible behaviour on our own branches while silently ending every report
+# on an outside contribution. An absent check-run is not a lenient one: nothing counting failures
+# can see it, so "nobody looked" and "nothing was wrong" arrive as the same empty answer.
+workflow="$here/../workflows/docs-impact.yml"
+if [ ! -f "$workflow" ]; then
+  printf '  FAIL  the gate runs on pull requests from forks\n        no workflow at %s\n' "$workflow"
+  failed=$((failed + 1))
+elif grep -qE '^  pull_request:' "$workflow" && ! grep -qE '^  pull_request_target:' "$workflow"; then
+  printf '  ok    the gate runs on pull requests from forks\n'
+  passed=$((passed + 1))
+else
+  printf '  FAIL  the gate runs on pull requests from forks\n        %s\n' \
+    "wanted a 'pull_request:' trigger and no 'pull_request_target:' one"
+  failed=$((failed + 1))
+fi
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

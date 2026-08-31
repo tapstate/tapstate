@@ -115,6 +115,15 @@ has "the release starts as a draft"           draft  'draft: true'
 has "the roadmap job is allowed to fail"        roadmap 'continue-on-error: true'
 has "and it writes the board only once the release is out" roadmap 'needs: \[version, publish\]'
 
+# --- the version write-back runs for the newest line and no other -------------------------------
+# The condition is the whole job. Opening the write-back for a fix to an older line walks the default
+# branch's version backwards -- 0.5.1 replacing 0.6.0 -- in a pull request where all six pins agree
+# with each other, so every check that compares them is green and the person merging has no reason to
+# look twice. Whether a release is the newest line is decided elsewhere and has its own cases; what is
+# unheld without this one is that the job asks. Deleting the `if` leaves the workflow valid, every
+# other case here passing, and the failure arriving as a version number nobody can explain.
+has "the write-back only opens for the newest line" write-back "if: needs.version.outputs.is_latest == 'true'"
+
 # --- every needs.<job>.outputs.<name> is one the job actually declares --------------------------
 # An undeclared output is not an error anywhere: the expression resolves to the empty string, the
 # step runs with a missing argument, and what fails is whatever the argument was for -- somewhere

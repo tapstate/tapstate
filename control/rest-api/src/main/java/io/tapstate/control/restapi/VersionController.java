@@ -59,11 +59,20 @@ class VersionController {
      * and is otherwise served to clients as if it were a version.
      */
     private static String readVersion() {
-        try (InputStream properties =
-                     VersionController.class.getResourceAsStream("/tapstate-version.properties")) {
-            if (properties == null) {
-                throw new IllegalStateException("tapstate-version.properties is not on the classpath");
-            }
+        return versionIn(VersionController.class.getResourceAsStream("/tapstate-version.properties"));
+    }
+
+    /**
+     * The reading itself, taking the stream rather than finding it, so that the shapes a broken build
+     * leaves behind can be put in front of it. Package-private for that reason and no other: each
+     * refusal below is reachable only from a build that is already wrong, and a guard nothing can put
+     * into its failing state is a guard nobody knows still works.
+     */
+    static String versionIn(InputStream properties) {
+        if (properties == null) {
+            throw new IllegalStateException("tapstate-version.properties is not on the classpath");
+        }
+        try (properties) {
             Properties parsed = new Properties();
             parsed.load(properties);
             String version = parsed.getProperty("version");

@@ -705,6 +705,48 @@ class ReplTest {
         assertThat(diagnostic).contains("cli " + buildVersion()).contains("server 9.9.9");
     }
 
+    /**
+     * The same stamp on the read shell's own refusal. Its connection checks are a second copy, made
+     * before the verb table is reached, so a version reaching the diagnostic above says nothing about
+     * this one: the shortcut that breaks it -- stamping where the verbs are dispatched -- leaves every
+     * other case exactly as it was.
+     */
+    @Test
+    void theReadShellsRefusalCarriesTheVersionsThisSessionIsRunning() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = harness(Path.of("tap-work"), client);
+        assertThat(h.repl().dispatch("connect node1:7900")).isTrue();
+
+        int mark = h.sink().toString().length();
+        h.repl().dispatch(List.of("data-browser", "views.order_state.find()"));
+        String diagnostic = h.sink().toString().substring(mark);
+
+        assertThat(diagnostic).contains("cli.not-authenticated");
+        assertThat(diagnostic).contains("cli " + buildVersion()).contains("server 9.9.9");
+    }
+
+    /**
+     * A server that answers the connection and says nothing about its version -- an older build, or one
+     * behind something that does not forward the endpoint. Not knowing is printed as not knowing. The
+     * two shapes it could take instead are both read as agreement: a blank where a number belongs, and
+     * the CLI's own number standing in for an answer that never came.
+     */
+    @Test
+    void theVersionVerbSaysNotReportedWhenTheServerAnswersWithoutOne() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = null;
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out).contains("not reported").contains("node1:7900");
+        // never its own number in the server's half -- that is the failure this shape exists to avoid
+        assertThat(out).doesNotContain("server " + buildVersion());
+    }
+
     /** The version the build was run at -- handed in by surefire, so it is not read back off the code. */
     private static String buildVersion() {
         String projectVersion = System.getProperty("tapstate.project.version");
