@@ -1,17 +1,22 @@
-# No-CJK gate.
-# tapstate is a public, English-only codebase. Source, build files, scripts, docs,
-# and commit messages must contain zero CJK characters: Chinese/Japanese/Korean
-# ideographs, CJK punctuation, and full-width / half-width forms. No directory is
-# exempt by default — this includes tests, data fixtures, and locale resource
-# bundles.
+# Character check for an English-only repository.
 #
-# Escape hatch: list explicit path patterns in .cjk-allowlist at the repo root
-# (git pathspec syntax, one per line). It ships empty on purpose; adding a path
-# is a reviewed decision, not a default.
+# It asks whether every character is one this repository has agreed to use, and names the ones
+# that are not. It used to ask the opposite - whether any character fell inside a list of CJK
+# ranges - and the difference is which way it fails. The ranges in use here admitted Japanese
+# kana, Korean hangul, Cyrillic look-alikes, the zero-width space and the right-to-left override,
+# and when the check itself broke it turned green rather than red.
 #
-# Like no-agent-footprint, this is meant to be a required status check on main
-# (branch protection); a workflow that merely runs is not a gate until merges
-# depend on it.
+# What is allowed: ASCII, plus the code points enumerated in .github/charset-allowlist.txt. That
+# file is the only place they are written down. Adding a character to it is a reviewed decision,
+# the same as adding a path to .cjk-allowlist, which stays the escape hatch for a whole file.
+#
+# The workflow keeps the name it is registered under as a required status check. Renaming it would
+# leave every pull request waiting on a check that never reports, which is worse than any red.
+#
+# The decision lives in a script, held to its own cases, which run first. It used to live in the
+# `run:` blocks here, and that made this the one check nothing could reach: when its
+# commit-message scan was broken into scanning nothing at all, it reported clean on every push
+# until a person happened to read the diff. A false green is the same text as a real one.
 name: no-cjk
 
 on:
@@ -22,93 +27,45 @@ on:
   pull_request:
     branches:
       - main
-    # `edited` is not in the default set, and without it a red here cannot be cleared by fixing
-    # what made it red: the body and the title are both editable, and editing one re-runs nothing.
-    # The contributor's only remaining move is to push another commit, which is a strange thing to
-    # ask for a typo in prose.
-    types: [opened, synchronize, reopened, edited]
+    # No `edited`: this check reads tracked files and commit messages, and neither of those can
+    # change by editing a pull request's title or body. It was in the list while the body was
+    # scanned here, so that a red on prose could be cleared by fixing the prose. Nothing is scanned
+    # that an edit can change any more, so the trigger would only re-run a decision that cannot
+    # have moved.
+    types: [opened, synchronize, reopened]
 
 jobs:
   no-cjk:
     runs-on: ubuntu-latest
-    # A UTF-8 locale is required so PCRE treats the pattern as code points, not bytes.
-    env:
-      LC_ALL: C.UTF-8
-      # CJK Unified Ideographs + Ext-A + Ext-B, CJK symbols/punctuation, and full-width /
-      # half-width forms (catches full-width punctuation too). Defined once for every step
-      # below: separate copies drift, and a gate whose steps disagree about what CJK is goes
-      # green on the character one of them stopped catching.
-      CJK: '[\x{3000}-\x{303f}\x{3400}-\x{4dbf}\x{4e00}-\x{9fff}\x{ff00}-\x{ffef}\x{20000}-\x{2a6df}]'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history for the commit-message scan
 
-      - name: No CJK in tracked files
+      - name: The gate still decides the way it is supposed to
         run: |
-          set -euo pipefail
-          # Build pathspec exclusions from the allowlist; ignore comments / blanks.
-          pathspec=(':(top)')
-          if [ -f .cjk-allowlist ]; then
-            while IFS= read -r line; do
-              line="${line%%#*}"
-              line="$(printf '%s' "$line" | tr -d '[:space:]')"
-              [ -z "$line" ] && continue
-              pathspec+=(":(top,exclude)$line")
-            done < .cjk-allowlist
-          fi
+          shellcheck .github/scripts/no-cjk.sh .github/scripts/no-cjk-smoke.sh
+          bash .github/scripts/no-cjk-smoke.sh
 
-          if git grep -nP "$CJK" -- "${pathspec[@]}"; then
-            echo "::error::CJK character(s) found in an English-only repo (matches above)."
-            echo "tapstate is English-only. If a file legitimately needs CJK, add its path to .cjk-allowlist."
-            exit 1
-          fi
-          echo "clean: no CJK in tracked files."
+      # The invariant this check inherits: it reads tracked files and commit messages, and nothing
+      # else. The step that read the pull request body was removed from here and from the sibling
+      # repository, and this is what stops one coming back - reading the body is the obvious way to
+      # check a pull request's own text, and it was done twice already. It judges the wiring as
+      # text, so it is not proof; it makes the direct way back in red on the commit that writes it.
+      - name: This check is still wired to read nothing but files and commit messages
+        run: bash .github/scripts/no-cjk.sh workflows
+
+      - name: Every character in tracked files is on the allow-list
+        run: bash .github/scripts/no-cjk.sh files
 
       # A commit message is repository content: this repository squashes with the commit-message
       # mode, so a message written in another language lands in main's history verbatim and the
       # merge does not launder it. Rewriting one afterwards means a force-push. So this step, like
       # the tracked-files step above, applies to everyone with no exception.
-      - name: No CJK in commit messages
-        run: |
-          set -euo pipefail
-
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="origin/${{ github.base_ref }}"
-            git rev-parse --verify --quiet "$base" >/dev/null 2>&1 \
-              || git fetch --quiet --no-tags origin "${{ github.base_ref }}" || true
-            range="$base..HEAD"
-          else
-            range="${{ github.event.before }}..${{ github.sha }}"
-          fi
-
-          msgs="$(git log --format='%H %B' "$range" 2>/dev/null || true)"
-          if [ -n "$msgs" ] && printf '%s' "$msgs" | grep -qP "$CJK"; then
-            echo "::error::CJK found in commit message(s):"
-            printf '%s' "$msgs" | grep -nP "$CJK" || true
-            exit 1
-          fi
-          echo "clean: no CJK in commit messages."
-
-      # A pull request body is conversational text, and that is a different thing from repository
-      # content even though the same gate used to check both. English is this project's public
-      # working language, but a person reporting a real defect in their own language is a
-      # submission worth having, and a required check that reddens on their prose turns a habit
-      # into a door. So the English-only habit is enforced here only where it is ours to keep:
-      # pull requests from a branch in this repository.
-      #
-      # Narrowed at the step, never at the job. A job skipped by an `if` never reports its check
-      # at all, and a required check that never reports leaves the pull request permanently
-      # unmergeable - which converts "wrote CJK, so red" into something far worse and entirely
-      # silent. That is the same defect this task is repairing one workflow over, in sonarqube.
-      - name: No CJK in the pull request body
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+      - name: Every character in the commit messages is on the allow-list
         env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          set -euo pipefail
-          if [ -n "${PR_BODY:-}" ] && printf '%s' "$PR_BODY" | grep -qP "$CJK"; then
-            echo "::error::CJK found in the pull request body."
-            exit 1
-          fi
-          echo "clean: no CJK in the pull request body."
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_SHA: ${{ github.sha }}
+        run: bash .github/scripts/no-cjk.sh messages
