@@ -477,7 +477,7 @@ if (( MACHINE_RC == 0 )) \
    && ! printf '%s\n' "$MACHINE_EVENTS" | grep -q '^POST /auth/login ' \
    && [[ -n "$DISCOVERY_LINE" && -n "$API_LINE" ]] \
    && (( DISCOVERY_LINE < API_LINE )); then
-  ok "one-line --token discovered the issuer before Bearer use and skipped password login"
+  ok "one-line machine-token launch discovered the issuer before Bearer use and skipped password login"
 else
   bad "one-line --token did not preserve its discovery and process-only credential contract (rc=$MACHINE_RC)"
 fi
