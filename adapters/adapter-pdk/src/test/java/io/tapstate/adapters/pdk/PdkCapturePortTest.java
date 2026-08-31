@@ -6,8 +6,10 @@ import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -229,7 +231,7 @@ class PdkCapturePortTest {
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
         List<Envelope> got = new CopyOnWriteArrayList<>();
         CountDownLatch three = new CountDownLatch(3);
-        try (Subscription sub = port.cdc(config("t1"), e -> {
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), e -> {
             got.add(e);
             three.countDown();
         })) {
@@ -273,7 +275,7 @@ class PdkCapturePortTest {
                 settled.countDown();
             }
         };
-        try (Subscription sub = port.cdc(config("t1"), listener)) {
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), listener)) {
             assertThat(settled.await(5, TimeUnit.SECONDS)).as("the cdc drive settled").isTrue();
         }
         assertThat(failure.get()).as("walking the table map must not fail the stream").isNull();
@@ -303,7 +305,7 @@ class PdkCapturePortTest {
                 failed.countDown();
             }
         };
-        try (Subscription sub = port.cdc(config("t1"), listener)) {
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), listener)) {
             assertThat(failed.await(5, TimeUnit.SECONDS))
                     .as("the cdc stream failure was reported through onError")
                     .isTrue();
@@ -343,7 +345,7 @@ class PdkCapturePortTest {
                 failed.countDown();
             }
         };
-        try (Subscription sub = port.cdc(config("t1"), listener)) {
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), listener)) {
             assertThat(failed.await(5, TimeUnit.SECONDS)).isTrue();
         }
 
@@ -367,10 +369,41 @@ class PdkCapturePortTest {
         // second interrupt / stop / loader close.
         Path jar = Synthetic.emittingSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
-        Subscription sub = port.cdc(config("t1"), e -> {
+        Subscription sub = port.cdc(config("t1"), CaptureStart.present(), e -> {
         });
         sub.close();
         assertThatCode(sub::close).doesNotThrowAnyException();
+    }
+
+
+    @Test
+    void resumingAtARecordedPositionIsRefusedInsteadOfQuietlyStartingSomewhereElse(@TempDir Path dir)
+            throws Exception {
+        // A connector's position is an object of its own making, and nothing here renders one as a token
+        // yet. Starting the stream anyway - at the present, or at a string the connector never issued -
+        // is the failure this refusal exists to prevent: the tail runs, the job is healthy, and every
+        // change between the recorded position and wherever it actually began is simply gone.
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+
+        assertThatThrownBy(() -> port.cdc(
+                config("t1"), CaptureStart.resume(new SourcePosition("binlog.000042:1234")), e -> { }))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("binlog.000042:1234");
+    }
+
+    @Test
+    void aSnapshotBatchReportsNoSeamWhileAConnectorOffsetCannotBeRenderedAsAToken(@TempDir Path dir)
+            throws Exception {
+        // Reporting none is the honest answer, and it is what makes a caller that needs a seam refuse.
+        // The failure it replaces is a caller inventing one, which puts the tail somewhere the source
+        // never was.
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+
+        try (CaptureBatch batch = port.snapshot(config("t1"))) {
+            assertThat(batch.seam()).isEmpty();
+        }
     }
 
     // ---- testConnection / discoverSchema drive ---------------------------------------------------

@@ -7,6 +7,7 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.SourcePosition;
@@ -322,6 +323,11 @@ class SnapshotPhaseTest {
         }
 
         @Override
+        public Optional<SourcePosition> seam() {
+            return Optional.empty();
+        }
+
+        @Override
         public void close() {
             closed = true;
         }
@@ -341,7 +347,7 @@ class SnapshotPhaseTest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             throw new UnsupportedOperationException();
         }
 

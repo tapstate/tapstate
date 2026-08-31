@@ -39,8 +39,10 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -55,6 +57,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -387,7 +390,7 @@ class NestOverTwoSourcesDataFlowTest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             // Nothing changes after the snapshot: what is under test is that the rows already there
             // assemble, which is exactly what the real two-source witness seeds.
             return () -> { };
@@ -425,6 +428,11 @@ class NestOverTwoSourcesDataFlowTest {
         @Override
         public Envelope next() {
             return rows.next();
+        }
+
+        @Override
+        public Optional<SourcePosition> seam() {
+            return Optional.empty();
         }
 
         @Override

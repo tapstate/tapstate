@@ -44,8 +44,10 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -54,6 +56,7 @@ import io.tapstate.spi.store.SrsMetaStore;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -382,7 +385,7 @@ class CaptureToSinkAckFrontierTest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             running = true;
             daemon = new Thread(() -> {
                 while (running) {
@@ -427,6 +430,11 @@ class CaptureToSinkAckFrontierTest {
         @Override
         public Envelope next() {
             throw new java.util.NoSuchElementException();
+        }
+
+        @Override
+        public Optional<SourcePosition> seam() {
+            return Optional.empty();
         }
 
         @Override

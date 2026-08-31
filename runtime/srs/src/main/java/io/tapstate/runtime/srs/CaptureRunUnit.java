@@ -5,6 +5,7 @@ import com.hazelcast.jet.pipeline.StreamSource;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
@@ -137,7 +138,11 @@ public final class CaptureRunUnit {
             } else if (plan.directTail()) {
                 // srs.enabled:false: the tail streams straight to the consumer, with no shared ring,
                 // no coordinator chain and no durable meta -- the lightweight direct path.
-                subscription = Optional.of(port.cdc(spec.config(), health.recording(passthrough::accept)));
+                // Starting at the present is what this path asks for, the same as the shared-ring tail:
+                // no recorded position is read back yet, and an unsaid start is how a run silently begins
+                // somewhere other than where it left off.
+                subscription = Optional.of(port.cdc(
+                        spec.config(), CaptureStart.present(), health.recording(passthrough::accept)));
             }
 
             return new CaptureRun(

@@ -34,8 +34,10 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -44,6 +46,7 @@ import java.time.Duration;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -238,7 +241,7 @@ class CaptureToSinkDataFlowTest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             for (Envelope change : changes) {
                 listener.onEvent(change);
             }
@@ -273,6 +276,11 @@ class CaptureToSinkDataFlowTest {
         @Override
         public Envelope next() {
             return events.next();
+        }
+
+        @Override
+        public Optional<SourcePosition> seam() {
+            return Optional.empty();
         }
 
         @Override

@@ -1,0 +1,27 @@
+# The read-side capture contract, at the points that carry a source position.
+#
+# These four types are what every connector adapter implements and what the runtime calls, so a change
+# here reaches code that is not in this repository. The failure this file exists to catch is narrower
+# than "the contract changed": it is a position quietly ceasing to be threaded.
+#
+#   - cdc losing its start, so the port decides where to begin for a caller who never said;
+#   - the snapshot seam narrowed, or removed, so a caller has to invent the position instead.
+#
+# Both compile. Both leave the rest of the build green. Both produce a pipeline that runs, reports
+# healthy, and silently drops every change between where it should have resumed and where it began.
+#
+# Updating this file is therefore a decision, not a formality: say which of the two above is not being
+# reintroduced, or say what replaces it.
+
+io.tapstate.spi.capture.CaptureBatch :: method :: close() -> void
+io.tapstate.spi.capture.CaptureBatch :: method :: seam() -> java.util.Optional<io.tapstate.spi.capture.SourcePosition>
+io.tapstate.spi.capture.CapturePort :: method :: cdc(io.tapstate.spi.capture.CaptureConfig, io.tapstate.spi.capture.CaptureStart, io.tapstate.spi.capture.CaptureListener) -> io.tapstate.spi.capture.Subscription
+io.tapstate.spi.capture.CapturePort :: method :: discoverSchema(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.DiscoveredSchema
+io.tapstate.spi.capture.CapturePort :: method :: snapshot(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.CaptureBatch
+io.tapstate.spi.capture.CapturePort :: method :: testConnection(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.ConnectionReport
+io.tapstate.spi.capture.CaptureStart :: method :: present() -> io.tapstate.spi.capture.CaptureStart
+io.tapstate.spi.capture.CaptureStart :: method :: resume(io.tapstate.spi.capture.SourcePosition) -> io.tapstate.spi.capture.CaptureStart
+io.tapstate.spi.capture.CaptureStart :: permits :: io.tapstate.spi.capture.CaptureStart$Present
+io.tapstate.spi.capture.CaptureStart :: permits :: io.tapstate.spi.capture.CaptureStart$Resume
+io.tapstate.spi.capture.CaptureStart$Resume :: component :: position :: io.tapstate.spi.capture.SourcePosition
+io.tapstate.spi.capture.SourcePosition :: component :: token :: java.lang.String

@@ -6,9 +6,11 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.capture.TableSchema;
 import io.tapdata.entity.event.TapEvent;
@@ -28,6 +30,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -67,7 +70,7 @@ public final class PdkCapturePort implements CapturePort {
             BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
             List<TapEvent> raw = read(connector, () -> batchRead(connector, config, batch));
             List<Envelope> rows = decodeSnapshot(connector.connectorId(), raw);
-            return new PdkCaptureBatch(rows, connector);
+            return new PdkCaptureBatch(rows, seam(), connector);
         } catch (RuntimeException e) {
             connector.stopQuietly();
             connector.close();
@@ -75,8 +78,24 @@ public final class PdkCapturePort implements CapturePort {
         }
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Resuming at a recorded position is refused here, before anything is opened. A connector states
+     * its position as an object of its own making - a binlog coordinate, a resume token - and nothing in
+     * this adapter yet renders one of those as the token a position carries, nor reads it back. Handing
+     * the token string over in its place is not a partial version of that: the connector is given a
+     * position of a type it never issued, and what it does with one is its own affair. Nothing in the
+     * product asks for one yet, so this is an unreachable caller mistake and crashes bare, the way the
+     * other caller invariants in this port do - and it crashes to the caller rather than inside the
+     * stream thread, where the loop's own catch-all would deliver it as a coded connector failure.
+     */
     @Override
-    public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+    public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+        if (start instanceof CaptureStart.Resume resume) {
+            throw new IllegalStateException("cdc was asked to resume at " + resume.position().token()
+                    + ", but a recorded position cannot yet be handed to a connector");
+        }
         PdkConnector connector = open(config);
         StreamReadFunction stream;
         try {
@@ -215,7 +234,8 @@ public final class PdkCapturePort implements CapturePort {
         return new Probe(tables, sample);
     }
 
-    private void streamLoop(PdkConnector connector, CaptureConfig config, CaptureListener listener, StreamReadFunction stream) {
+    private void streamLoop(PdkConnector connector, CaptureConfig config, CaptureListener listener,
+            StreamReadFunction stream) {
         try {
             connector.underLoader(() -> {
                 connector.connector().init(connector.context());
@@ -322,6 +342,19 @@ public final class PdkCapturePort implements CapturePort {
     private static Object startOffset(PdkConnector connector) throws Throwable {
         TimestampToStreamOffsetFunction offset = connector.functions().getTimestampToStreamOffsetFunction();
         return offset == null ? null : offset.timestampToStreamOffset(connector.context(), null);
+    }
+
+    /**
+     * The seam a snapshot batch reports, which for now is none.
+     *
+     * <p>The position is there to be had - the connector answers with its current one, and a batch read
+     * hands back an offset of its own - but both arrive as objects of the connector's own making, and
+     * nothing here yet renders one of those as a token. Reporting none says exactly that, and leaves the
+     * caller to refuse; reporting a position built out of whatever the object prints as would give it one
+     * that no connector can be started from again.
+     */
+    private static Optional<SourcePosition> seam() {
+        return Optional.empty();
     }
 
     /** Runs a read action under the connector loader, mapping a connector-side failure to a code. */

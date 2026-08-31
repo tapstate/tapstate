@@ -4,6 +4,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
@@ -27,6 +28,11 @@ import java.util.function.Supplier;
  * <p>The per-event source position is threaded at this seam: the event envelope carries no position slot,
  * so each change is stamped with the next {@link CdcChain#watermark() watermark} position — at L1 a mock
  * monotonic generator standing in for the connector-defined position order.
+ *
+ * <p>Every tail here starts at the source's present moment, and says so rather than leaving it unsaid.
+ * Nothing yet reads a recorded position back out of the durable meta to start from, so there is no other
+ * start to ask for; when there is, this is the one line that changes, and until then the run that begins
+ * at now does it because a caller asked, not because a null decayed into it inside a connector.
  */
 public final class CdcPhase {
 
@@ -62,7 +68,8 @@ public final class CdcPhase {
         Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
         Objects.requireNonNull(consumers, "consumers");
         Objects.requireNonNull(health, "health");
-        return port.cdc(config, health.recording(event -> writeChange(chain, event, minConsumerReadSeq, consumers)));
+        return port.cdc(config, CaptureStart.present(),
+                health.recording(event -> writeChange(chain, event, minConsumerReadSeq, consumers)));
     }
 
     /** Starts one connector subscription and routes each event to the ring for its source table. */
@@ -76,7 +83,7 @@ public final class CdcPhase {
         Objects.requireNonNull(routes, "routes");
         Objects.requireNonNull(health, "health");
         Map<String, TableRoute> routeSnapshot = Map.copyOf(routes);
-        return port.cdc(config, health.recording(event -> {
+        return port.cdc(config, CaptureStart.present(), health.recording(event -> {
             TableRoute route = routeSnapshot.get(event.src());
             if (route == null) {
                 throw new TapstateException(

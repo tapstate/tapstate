@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConnectionConfig;
@@ -197,6 +198,9 @@ public final class PdkDataBrowser implements DataBrowser {
         try {
             Subscription stream = capture.cdc(
                     new CaptureConfig(config.connectorId(), config.settings(), List.of(request.collection())),
+                    // Somebody is watching a view of rows right now, so the follow starts where they
+                    // are looking. It keeps no position and resumes nothing: closing the view ends it.
+                    CaptureStart.present(),
                     new CaptureListener() {
                         @Override
                         public void onEvent(Envelope event) {
