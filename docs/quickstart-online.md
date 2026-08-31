@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/quickstart-online
+---
+
 # Quick start: the online runtime (preview)
 
 > **Preview / POC.** Tapstate's runtime is an early slice: a single-node, in-memory
