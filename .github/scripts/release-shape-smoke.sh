@@ -124,6 +124,15 @@ has "and it writes the board only once the release is out" roadmap 'needs: \[ver
 # other case here passing, and the failure arriving as a version number nobody can explain.
 has "the write-back only opens for the newest line" write-back "if: needs.version.outputs.is_latest == 'true'"
 
+# --- the connector lane is judged the same way as every other required check --------------------
+# It is the sixth gate, and the only one that judges a lane no merge gate covers, so the shape it is
+# read with is the whole of it. Reading it any other way -- a count of failures, `gh pr checks`, a
+# grep of the run list -- puts back exactly what the shared reader exists to refuse: a lane that never
+# started on this commit produces no check-run at all, and every way of counting failures reports that
+# as nothing wrong.
+has "the connector lane is judged by the same reader as every other check" \
+    gates 'checks-on-commit\.sh --sha .* --required real-connectors'
+
 # --- every needs.<job>.outputs.<name> is one the job actually declares --------------------------
 # An undeclared output is not an error anywhere: the expression resolves to the empty string, the
 # step runs with a missing argument, and what fails is whatever the argument was for -- somewhere
