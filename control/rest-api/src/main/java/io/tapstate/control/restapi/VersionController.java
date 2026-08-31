@@ -36,6 +36,11 @@ class VersionController {
 
     private static final String VERSION = readVersion();
 
+    // The projection marker, on a handler that stays outside /api. What this annotation records is
+    // which registered operation the endpoint answers for, not where it is mounted -- so the one
+    // anonymous endpoint serves the CLI, a model over MCP, and a plain curl alike, and there is no
+    // second place that reports a version.
+    @Verb("system.version")
     @GetMapping("/version")
     ResponseEntity<Map<String, Object>> version() {
         // LinkedHashMap rather than Map.of: the reserved fields are reported as present-and-empty, and

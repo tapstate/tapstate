@@ -27,7 +27,7 @@ import java.util.function.Supplier;
 @Command(name = "tapstate", mixinStandardHelpOptions = true, version = Cli.VERSION,
         subcommands = {
                 ValidateCmd.class, NewCmd.class, DemoCmd.class, ExplainCmd.class, LsCmd.class,
-                DescCmd.class, McpCmd.class, AliasCmd.class},
+                DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class},
         // the second line is indented by hand under the "Usage: " heading picocli prints before the first
         customSynopsis = {
                 "tapstate [LAUNCH]                   open a session (interactive)",
@@ -103,7 +103,7 @@ public final class Cli implements Runnable {
      * so the declared list can never drift from the verbs actually wired up.
      */
     static final List<String> OFFLINE_VERBS =
-            List.of("validate", "new", "demo", "explain", "ls", "desc");
+            List.of("validate", "new", "demo", "explain", "ls", "desc", "version");
 
     /**
      * How this face spells each operation it projects: operation id → verb name. The spelling is not
@@ -127,6 +127,7 @@ public final class Cli implements Runnable {
             Map.entry("data-browser.collections", DATA_BROWSER_VERB),
             Map.entry("data-browser.find", DATA_BROWSER_VERB),
             Map.entry("data-browser.stats", DATA_BROWSER_VERB),
+            Map.entry("system.version", "version"),
             Map.entry("artifact.apply", "apply"),
             Map.entry("artifact.validate", "validate"),
             Map.entry("artifact.get", "get"),

@@ -116,6 +116,18 @@ class CliTest {
         assertThat(r.err()).isEmpty();
     }
 
+    @Test
+    void theVersionVerbNamesBothHalvesAndSaysWhenThereIsNoServer() {
+        // Offline it still prints two lines. A reader told to paste this output has no way to know the
+        // CLI and the server are separate builds, so the pair is the answer and a missing half is said
+        // out loud -- a blank where the second number belongs reads as "there is only one".
+        Run r = run("version");
+
+        assertThat(r.code()).isZero();
+        assertThat(r.out()).contains("cli").contains(Cli.VERSION_NUMBER);
+        assertThat(r.out()).contains("server").contains("not connected");
+    }
+
     @ParameterizedTest
     @MethodSource("offlineVerbs")
     void everyVerbThatAdvertisesVersionPrintsOne(String verb) {

@@ -357,6 +357,10 @@ final class Repl {
             lastExitCode = changeDir(words);
             return true;
         }
+        if (words.get(0).equals("version")) {
+            lastExitCode = version();
+            return true;
+        }
         if (words.get(0).equals("connect")) {
             lastExitCode = connect(words);
             return true;
@@ -2964,6 +2968,25 @@ final class Repl {
         }
         reportConnectFailed(seeds);
         return Cli.EXIT_DIAGNOSTIC;
+    }
+
+    /**
+     * Reports both versions in one place, which is the whole point of the verb: a reader pastes this
+     * into a report without having to know that the CLI and the server are separate builds. Asked fresh
+     * rather than remembered from the connect banner, so a server replaced under a held session answers
+     * for what is running now. Not knowing is printed as not knowing, never as agreement.
+     */
+    private int version() {
+        String serverLine;
+        if (!session.isConnected()) {
+            serverLine = "not connected";
+        } else {
+            String reported = controlPlane.serverVersion(session.landingNode());
+            serverLine = (reported == null ? "not reported" : reported)
+                    + " (" + hostPort(session.landingNode()) + ")";
+        }
+        VersionCmd.render(commandLine.getOut(), serverLine);
+        return Cli.EXIT_OK;
     }
 
     /** Clears the connection back to offline; a benign line either way, never an error. */

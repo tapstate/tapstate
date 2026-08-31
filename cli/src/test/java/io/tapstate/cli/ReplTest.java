@@ -660,6 +660,32 @@ class ReplTest {
         assertThat(machineReadable).doesNotContain(buildVersion()).doesNotContain("9.9.9");
     }
 
+    @Test
+    void theVersionVerbAnswersWithBothNumbersOnceConnected() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out).contains(buildVersion()).contains("9.9.9").contains("node1:7900");
+    }
+
+    @Test
+    void theVersionVerbSaysThereIsNoServerRatherThanLeavingTheHalfBlank() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = harness(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("version")).isTrue();
+
+        String out = h.sink().toString();
+        assertThat(out).contains(buildVersion()).contains("not connected");
+        // Never a version number it did not get: an unconnected session has no server to report.
+        assertThat(out).doesNotContain("9.9.9");
+    }
+
     /** The version the build was run at -- handed in by surefire, so it is not read back off the code. */
     private static String buildVersion() {
         String projectVersion = System.getProperty("tapstate.project.version");
