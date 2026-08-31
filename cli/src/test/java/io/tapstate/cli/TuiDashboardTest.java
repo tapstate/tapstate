@@ -1,0 +1,40 @@
+package io.tapstate.cli;
+
+import org.jline.utils.AttributedString;
+import org.junit.jupiter.api.Test;
+
+import java.nio.file.Path;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class TuiDashboardTest {
+
+    private final TuiDashboard dashboard = new TuiDashboard();
+
+    @Test
+    void rendersTheOrientationAndCommandSurfacesAtAStableHeight() {
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", "alice@example.com",
+                        TuiDashboard.Connection.ONLINE, null), 72, 14);
+
+        assertThat(lines).hasSize(14);
+        assertThat(lines.getFirst().toString()).contains("tapstate  dev / alice@example.com  ● online");
+        assertThat(lines.get(1).toString()).contains("workspace:");
+        assertThat(lines.get(12).toString()).startsWith("[COMMAND] >");
+        assertThat(lines.getLast().toString()).contains("Ctrl-P commands");
+        assertThat(lines).allSatisfy(line -> assertThat(line.toString()).hasSize(72));
+    }
+
+    @Test
+    void fallsBackToAPlainCompactSurfaceWhenTheTerminalIsTooNarrow() {
+        List<AttributedString> lines = dashboard.render(
+                TuiDashboard.State.offline(Path.of("orders"), null), 30, 8);
+
+        assertThat(lines).hasSize(3);
+        assertThat(lines.getFirst().toString()).startsWith("tapstate offline");
+        assertThat(lines.get(1).toString()).startsWith("workspace:");
+        assertThat(lines.getLast().toString()).startsWith("terminal is too narrow");
+        assertThat(lines).allSatisfy(line -> assertThat(line.toString()).hasSize(30));
+    }
+}
