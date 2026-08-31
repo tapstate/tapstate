@@ -181,11 +181,34 @@ if missing:
 PY
 }
 
+assert_terminal_cleanup() {
+  local output=$1
+  python3 - "$output" <<'PY'
+import pathlib
+import re
+import sys
+
+value = pathlib.Path(sys.argv[1]).read_bytes()
+cursor_visible = any(
+    b"25" in match.group(1).split(b";")
+    for match in re.finditer(rb"\x1b\[\?([0-9;]+)h", value)
+)
+missing = []
+if not cursor_visible:
+    missing.append(b"CSI ? ... 25 h")
+if b"\x1b[?1049l" not in value:
+    missing.append(b"\x1b[?1049l")
+if missing:
+    print("missing TUI terminal cleanup:", ", ".join(repr(item) for item in missing), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 context_output="$work_dir/context.pty"
 context_name="tui-smoke"
 context_input=$'context\n\x1e\n\x1e'"$context_name"$'\n\x1ehttp://127.0.0.1:8081\n\x1en\n\x1e\n\x1e'
 set +e
-TAPSTATE_PTY_CHUNK_DELAY=1.0 TAPSTATE_PTY_FOLLOWUP=q TAPSTATE_PTY_FOLLOWUP_DELAY=5 \
+TAPSTATE_PTY_CHUNK_DELAY=1.0 TAPSTATE_PTY_FOLLOWUP=$'\004' TAPSTATE_PTY_FOLLOWUP_DELAY=5 \
   run_pty "$context_input" "$context_output" env HOME="$home_dir" TAPSTATE_WORKDIR="$workspace" \
   java -Duser.home="$home_dir" -jar "$jar" tui
 context_rc=$?
@@ -196,13 +219,14 @@ set -e
   exit 1
 }
 assert_output "$context_output" "bound $context_name"
+assert_terminal_cleanup "$context_output"
 test -f "$home_dir/.tapstate/config.yaml"
 grep -q "$context_name" "$home_dir/.tapstate/config.yaml"
 
 palette_output="$work_dir/palette.pty"
 palette_input=$'\x10\x1e\e[B\x1e\n\x1e\n'
 set +e
-TAPSTATE_PTY_CHUNK_DELAY=0.4 TAPSTATE_PTY_FOLLOWUP=q TAPSTATE_PTY_FOLLOWUP_DELAY=1 \
+TAPSTATE_PTY_CHUNK_DELAY=0.4 TAPSTATE_PTY_FOLLOWUP=$'\004' TAPSTATE_PTY_FOLLOWUP_DELAY=1 \
   run_pty "$palette_input" "$palette_output" env HOME="$home_dir" TAPSTATE_WORKDIR="$workspace" \
   java -Duser.home="$home_dir" -jar "$jar" tui
 palette_rc=$?
@@ -213,5 +237,6 @@ set -e
   exit 1
 }
 assert_output "$palette_output" "selected: pwd" "$workspace_path"
+assert_terminal_cleanup "$palette_output"
 
 echo 'TUI smoke: alternate-screen, context prompts, palette selection, and command execution passed'

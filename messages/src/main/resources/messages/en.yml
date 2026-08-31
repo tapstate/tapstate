@@ -123,6 +123,9 @@ cli.mcp-unavailable:
 cli.watch-needs-a-terminal:
   message: "`watch` redraws one row in place, which needs a terminal; here its output is a pipe or a file."
   solution: "Use `tail <source>.<collection>` for a stream you can pipe, or `<source>.<collection>.find(...)` for a one-shot look."
+cli.tui-requires-tty:
+  message: "`tui` needs an interactive terminal because it enters raw mode and redraws a full screen."
+  solution: "Run `tapstate tui` from a terminal, or use a one-shot command or the regular REPL in a pipe."
 cli.version-mismatch:
   message: "This CLI is {cli} and the server it connected to is {server}."
   solution: "Install the CLI that matches the server, or connect to a server on {cli}; where the two disagree, the server decides."

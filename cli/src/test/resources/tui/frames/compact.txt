@@ -1,0 +1,36 @@
+[signed out]
+tapstate signed out · dev / alice@example.com
+workspace: /work/orders
+status: sign in to run online commands
+[COMMAND] >
+compact terminal · Ctrl-P commands · Ctrl-D quit
+[connecting]
+tapstate connecting · dev / alice@example.com
+workspace: /work/orders
+status: resolving context
+[COMMAND] >
+compact terminal · Ctrl-P commands · Ctrl-D quit
+[online]
+tapstate online · dev / alice@example.com
+workspace: /work/orders
+status: authenticated
+[COMMAND] >
+compact terminal · Ctrl-P commands · Ctrl-D quit
+[offline]
+tapstate offline · dev / alice@example.com
+workspace: /work/orders
+status: not connected
+[COMMAND] >
+compact terminal · Ctrl-P commands · Ctrl-D quit
+[session expired]
+tapstate session expired · dev / alice@example.com
+workspace: /work/orders
+status: sign in again to renew the session
+[COMMAND] >
+compact terminal · Ctrl-P commands · Ctrl-D quit
+[issuer mismatch]
+tapstate issuer mismatch · dev / alice@example.com
+workspace: /work/orders
+status: select a matching context or server
+[COMMAND] >
+compact terminal · Ctrl-P commands · Ctrl-D quit

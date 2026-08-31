@@ -103,6 +103,9 @@ enum CliError implements TapstateErrorCode {
      */
     WATCH_NEEDS_A_TERMINAL("cli.watch-needs-a-terminal", Set.of()),
 
+    /** The full-screen workbench was requested without an interactive terminal. */
+    TUI_REQUIRES_TTY("cli.tui-requires-tty", Set.of()),
+
     /**
      * A version precondition was offered for a batch holding more than one resource; {@code count} is how
      * many it holds. One hash names one version, so there is no resource it could be describing.

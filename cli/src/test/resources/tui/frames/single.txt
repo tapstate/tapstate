@@ -1,0 +1,78 @@
+[signed out]
+tapstate  dev / alice@example.com  · signed out
+workspace: /work/orders
+
+  Server       http://127.0.0.1:8081
+  Auth         sign in to run online commands
+  Resources
+    no local resources
+  Activity
+  ✓ resumed session
+{blank*13}
+[COMMAND] >
+Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  Ctrl-D quit
+[connecting]
+tapstate  dev / alice@example.com  ○ connecting
+workspace: /work/orders
+
+  Server       http://127.0.0.1:8081
+  Auth         resolving context
+  Resources
+    no local resources
+  Activity
+  ✓ resumed session
+{blank*13}
+[COMMAND] >
+Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  Ctrl-D quit
+[online]
+tapstate  dev / alice@example.com  ● online
+workspace: /work/orders
+
+  Server       http://127.0.0.1:8081
+  Auth         authenticated
+  Resources
+    no local resources
+  Activity
+  ✓ resumed session
+{blank*13}
+[COMMAND] >
+Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  Ctrl-D quit
+[offline]
+tapstate  dev / alice@example.com  · offline
+workspace: /work/orders
+
+  Server       http://127.0.0.1:8081
+  Auth         not connected
+  Resources
+    no local resources
+  Activity
+  ✓ resumed session
+{blank*13}
+[COMMAND] >
+Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  Ctrl-D quit
+[session expired]
+tapstate  dev / alice@example.com  · session expired
+workspace: /work/orders
+
+  Server       http://127.0.0.1:8081
+  Auth         sign in again to renew the session
+  Resources
+    no local resources
+  Activity
+  ✓ resumed session
+{blank*13}
+[COMMAND] >
+Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  Ctrl-D quit
+[issuer mismatch]
+tapstate  dev / alice@example.com  · issuer mismatch
+workspace: /work/orders
+
+  Server       http://127.0.0.1:8081
+  Auth         select a matching context or server
+  Resources
+    no local resources
+  Activity
+  ✓ resumed session
+{blank*13}
+[COMMAND] >
+Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  Ctrl-D quit

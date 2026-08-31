@@ -457,7 +457,7 @@ public final class Cli implements Runnable {
      * direct seed or saved context makes it ask the running server for the second half of the report.
      */
     static boolean bypassesSessionResolution(LaunchOptions launch) {
-        if (!launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {
+        if (launch.isTui() || !launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {
             return false;
         }
         return !launch.command().getFirst().equals("version") || !launch.targetsServer();
@@ -503,6 +503,11 @@ public final class Cli implements Runnable {
         commandLine.setErr(new PrintWriter(err, true));
         Prompter oneShotPrompter = null;
         try {
+            int terminal = TuiApp.requireInteractiveTerminal(TuiApp::hasInteractiveTerminal,
+                    newCommandLine().getErr());
+            if (terminal != EXIT_OK) {
+                return terminal;
+            }
             if (launch.connects() && launch.signsIn() && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }

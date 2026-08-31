@@ -92,6 +92,11 @@ class CliTest {
     }
 
     @Test
+    void tuiDoesNotTakeTheOneShotBypassBeforeTheTerminalEntryPoint() {
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("tui"))).isFalse();
+    }
+
+    @Test
     void connectedVerbsAreRegisteredNotMissing() {
         // connect is a REPL builtin (session-scoped), not a one-shot subcommand
         assertThat(Cli.newCommandLine().getSubcommands().keySet())

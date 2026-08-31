@@ -17,13 +17,17 @@ class TuiCommandBarTest {
     }
 
     @Test
-    void separatesSubmitPaletteAndQuitFromTextInput() {
+    void separatesSubmitPaletteCancelAndEofQuitFromTextInput() {
         assertThat(TuiCommandBar.accept("ls", TuiCommandBar.ENTER).event())
                 .isEqualTo(TuiCommandBar.Event.SUBMIT);
         assertThat(TuiCommandBar.accept("ls", TuiCommandBar.CTRL_P).event())
                 .isEqualTo(TuiCommandBar.Event.PALETTE);
         assertThat(TuiCommandBar.accept("ls", TuiCommandBar.CTRL_C).event())
+                .isEqualTo(TuiCommandBar.Event.CANCEL);
+        assertThat(TuiCommandBar.accept("", TuiCommandBar.CTRL_D).event())
                 .isEqualTo(TuiCommandBar.Event.QUIT);
+        assertThat(TuiCommandBar.accept("ls", TuiCommandBar.CTRL_D).event())
+                .isEqualTo(TuiCommandBar.Event.NONE);
     }
 
     @Test

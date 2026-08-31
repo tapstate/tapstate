@@ -20,6 +20,10 @@ final class TuiDashboard {
     static final int MIN_HEIGHT = 8;
 
     enum Connection {
+        ONBOARDING("no context"),
+        SIGNED_OUT("signed out"),
+        SESSION_EXPIRED("session expired"),
+        ISSUER_MISMATCH("issuer mismatch"),
         ONLINE("online"),
         CONNECTING("connecting"),
         OFFLINE("offline");
@@ -28,6 +32,10 @@ final class TuiDashboard {
 
         Connection(String label) {
             this.label = label;
+        }
+
+        String label() {
+            return label;
         }
     }
 
@@ -64,6 +72,14 @@ final class TuiDashboard {
 
         static Prompt lines(String question, List<String> lines, String input) {
             return new Prompt(question, input, "end with a single '.'", false, List.of(), 0, lines);
+        }
+
+        static Prompt confirmWrite(String command, String target, String issuer) {
+            String safeCommand = command == null || command.isBlank() ? "write command" : command;
+            String safeTarget = target == null || target.isBlank() ? "selected target" : target;
+            String safeIssuer = issuer == null || issuer.isBlank() ? "unknown issuer" : issuer;
+            return choice("Run " + safeCommand + " on " + safeTarget + " (issuer " + safeIssuer + ")?",
+                    List.of("Cancel", "Run"), 0);
         }
     }
 
@@ -119,6 +135,10 @@ final class TuiDashboard {
         static State offline(Path workspace, String context) {
             return new State(workspace, context, null, Connection.OFFLINE, null);
         }
+
+        static State onboarding(Path workspace) {
+            return new State(workspace, null, null, Connection.ONBOARDING, null);
+        }
     }
 
     List<AttributedString> render(State state, int width, int height) {
@@ -167,6 +187,10 @@ final class TuiDashboard {
                     body.add("  | " + prompt.lines().get(index));
                 }
             }
+        } else if (state.connection() == Connection.ONBOARDING) {
+            body.add("  No context is bound to this workspace.");
+            body.add("  [Enter] Create or choose context");
+            body.add("  [o] Stay offline");
         } else if (width >= SPLIT_WIDTH) {
             appendSplitBody(rows, state.resources(), state.activity(), bodyRows, width);
             body = null;
@@ -181,7 +205,7 @@ final class TuiDashboard {
             rows.add(row("", width));
         }
         String notice = state.notice() == null || state.notice().isBlank()
-                ? "Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  q quit"
+                ? defaultNotice(state)
                 : state.notice();
         if (state.prompt() == null) {
             rows.add(row("[COMMAND] > " + state.command(), width));
@@ -300,10 +324,10 @@ final class TuiDashboard {
         // the workspace path or principal has to be clipped.
         String identity = state.connection().label + " · " + identity(state);
         String notice = state.notice() == null || state.notice().isBlank()
-                ? "compact terminal · Ctrl-P commands · q quit"
+                ? compactNotice(state)
                 : state.notice();
         List<String> lines = List.of(
-                "tapstate " + identity,
+                "tapstate " + middleClip(identity, Math.max(1, safeWidth - "tapstate ".length())),
                 "workspace: " + state.workspace().toAbsolutePath().normalize(),
                 "status: " + authLabel(state),
                 "[COMMAND] > " + state.command(),
@@ -322,6 +346,32 @@ final class TuiDashboard {
         return identity;
     }
 
+    private static String defaultNotice(State state) {
+        if (state.connection() == Connection.ONBOARDING) {
+            return "Enter create or choose context · o stay offline";
+        }
+        return "Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  Ctrl-D quit";
+    }
+
+    private static String compactNotice(State state) {
+        if (state.connection() == Connection.ONBOARDING) {
+            return "Enter create or choose context · o stay offline";
+        }
+        return "compact terminal · Ctrl-P commands · Ctrl-D quit";
+    }
+
+    private static String middleClip(String value, int width) {
+        if (value == null || value.length() <= width) {
+            return value == null ? "" : value;
+        }
+        if (width <= 1) {
+            return value.substring(0, width);
+        }
+        int leading = (width - 1) / 2;
+        int trailing = width - 1 - leading;
+        return value.substring(0, leading) + "…" + value.substring(value.length() - trailing);
+    }
+
     private static String fit(String value, int width) {
         if (value == null || value.isEmpty()) {
             return " ".repeat(Math.max(0, width));
@@ -338,13 +388,16 @@ final class TuiDashboard {
         if (state.authStatus() != null && !state.authStatus().isBlank()) {
             return state.authStatus();
         }
-        if (state.connection() == Connection.CONNECTING) {
-            return "resolving context";
-        }
-        if (state.principal() != null && !state.principal().isBlank()) {
-            return "authenticated";
-        }
-        return state.connection() == Connection.OFFLINE ? "not connected" : "not authenticated";
+        return switch (state.connection()) {
+            case ONBOARDING -> "no context bound";
+            case SIGNED_OUT -> "sign in to run online commands";
+            case SESSION_EXPIRED -> "sign in again to renew the session";
+            case ISSUER_MISMATCH -> "select a matching context or server";
+            case CONNECTING -> "resolving context";
+            case OFFLINE -> "not connected";
+            case ONLINE -> state.principal() != null && !state.principal().isBlank()
+                    ? "authenticated" : "not authenticated";
+        };
     }
 
     private static AttributedString row(String text, int width) {

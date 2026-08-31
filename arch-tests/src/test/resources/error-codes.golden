@@ -67,6 +67,7 @@ cli.remote-plaintext
 cli.repl-builtin-only
 cli.request-timed-out
 cli.resource-not-found
+cli.tui-requires-tty
 cli.unknown-connector
 cli.verb-not-implemented
 cli.version-mismatch

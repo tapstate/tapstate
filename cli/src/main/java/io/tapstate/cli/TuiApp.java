@@ -8,13 +8,16 @@ import org.jline.utils.InfoCmp;
 import org.jline.utils.NonBlockingReader;
 
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.io.UncheckedIOException;
-import java.util.ArrayList;
-import java.util.List;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 
 /**
  * Runtime for the first TUI surface. It owns the terminal lifecycle and delegates command semantics to
@@ -88,14 +91,32 @@ final class TuiApp {
         }
     }
 
+    static int requireInteractiveTerminal(BooleanSupplier terminalCheck, PrintWriter err) {
+        if (terminalCheck != null && terminalCheck.getAsBoolean()) {
+            return Cli.EXIT_OK;
+        }
+        Diagnostics.printText(err, CliError.TUI_REQUIRES_TTY, Map.of());
+        return Cli.EXIT_USAGE;
+    }
+
+    static boolean hasInteractiveTerminal() {
+        try (Terminal candidate = TerminalBuilder.builder().system(true).dumb(true).build()) {
+            return !"dumb".equalsIgnoreCase(candidate.getType());
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
     private int eventLoop(Display display, Terminal terminal) throws IOException {
         this.reader = terminal.reader();
         int lastWidth = -1;
         int lastHeight = -1;
         long nextDashboardRefresh = 0L;
         while (true) {
-            if (interrupted.get()) {
-                return Cli.EXIT_OK;
+            if (interrupted.getAndSet(false)) {
+                cancelCurrentOperation();
+                draw(display, terminal);
+                continue;
             }
             int width = dimension(terminal.getWidth(), DEFAULT_WIDTH);
             int height = dimension(terminal.getHeight(), DEFAULT_HEIGHT);
@@ -114,9 +135,6 @@ final class TuiApp {
                 continue;
             }
             if (code < 0) {
-                return Cli.EXIT_OK;
-            }
-            if (!uiState.paletteOpen() && uiState.command().isEmpty() && (code == 'q' || code == 'Q')) {
                 return Cli.EXIT_OK;
             }
             if (code == TuiCommandBar.ESCAPE) {
@@ -148,6 +166,7 @@ final class TuiApp {
             TuiCommandBar.Update update = TuiCommandBar.accept(uiState.command(), code);
             uiState = TuiReducer.reduce(uiState, new TuiAction.SetCommand(update.value()));
             switch (update.event()) {
+                case CANCEL -> cancelCurrentOperation();
                 case QUIT -> {
                     return Cli.EXIT_OK;
                 }
@@ -164,6 +183,13 @@ final class TuiApp {
             draw(display, terminal);
             nextDashboardRefresh = System.nanoTime() + Duration.ofMillis(DASHBOARD_REFRESH_MILLIS).toNanos();
         }
+    }
+
+    private void cancelCurrentOperation() {
+        repl.cancelStream();
+        uiState = TuiReducer.reduce(uiState, new TuiAction.ClearCommand());
+        uiState = TuiReducer.reduce(uiState,
+                new TuiAction.SetNotice(commandRunning ? "cancellation requested" : "command cleared"));
     }
 
     private boolean submit() {

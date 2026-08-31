@@ -12,10 +12,11 @@ final class TuiCommandBar {
     static final int DELETE = 127;
     static final int ESCAPE = 27;
     static final int CTRL_C = 3;
+    static final int CTRL_D = 4;
     static final int CTRL_P = 16;
 
     enum Event {
-        NONE, SUBMIT, QUIT, PALETTE
+        NONE, SUBMIT, CANCEL, QUIT, PALETTE
     }
 
     record Update(String value, Event event) {
@@ -33,7 +34,10 @@ final class TuiCommandBar {
     static Update accept(String current, int code) {
         String value = current == null ? "" : current;
         if (code == CTRL_C) {
-            return new Update(value, Event.QUIT);
+            return new Update(value, Event.CANCEL);
+        }
+        if (code == CTRL_D) {
+            return new Update(value, value.isEmpty() ? Event.QUIT : Event.NONE);
         }
         if (code == CTRL_P) {
             return new Update(value, Event.PALETTE);
