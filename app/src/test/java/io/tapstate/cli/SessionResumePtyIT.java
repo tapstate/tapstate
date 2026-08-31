@@ -54,6 +54,7 @@ class SessionResumePtyIT {
             "error: cli.not-authenticated",
             "  The `connectors` command needs you to sign in first.",
             "  Run `login <username>`, or start with `tapstate -c <host:port> -u <user>`.",
+            "  (cli " + Cli.VERSION_NUMBER + ", server " + Cli.VERSION_NUMBER + ")",
             "");
     private static final String PTY_DRIVER = """
             import os, pty, select, signal, sys, termios, time
