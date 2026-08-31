@@ -30,8 +30,33 @@ final class TuiDashboard {
         }
     }
 
+    record Prompt(String question, String input, String hint, boolean secret, List<String> options,
+                  int selectedIndex, List<String> lines) {
+        Prompt {
+            question = question == null ? "" : question;
+            input = input == null ? "" : input;
+            hint = hint == null ? "" : hint;
+            options = options == null ? List.of() : List.copyOf(options);
+            selectedIndex = options.isEmpty() ? 0 : Math.max(0, Math.min(selectedIndex, options.size() - 1));
+            lines = lines == null ? List.of() : List.copyOf(lines);
+        }
+
+        static Prompt text(String question, String input, String hint, boolean secret) {
+            return new Prompt(question, input, hint, secret, List.of(), 0, List.of());
+        }
+
+        static Prompt choice(String question, List<String> options, int selectedIndex) {
+            return new Prompt(question, "", "↑/↓ choose · Enter select · Esc cancel", false,
+                    options, selectedIndex, List.of());
+        }
+
+        static Prompt lines(String question, List<String> lines, String input) {
+            return new Prompt(question, input, "end with a single '.'", false, List.of(), 0, lines);
+        }
+    }
+
     record State(Path workspace, String context, String principal, Connection connection, String notice,
-                 String command, List<String> palette, int paletteIndex) {
+                 String command, List<String> palette, int paletteIndex, Prompt prompt) {
         State {
             if (workspace == null || connection == null) {
                 throw new IllegalArgumentException("workspace and connection are required");
@@ -42,12 +67,17 @@ final class TuiDashboard {
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice) {
-            this(workspace, context, principal, connection, notice, "", List.of(), 0);
+            this(workspace, context, principal, connection, notice, "", List.of(), 0, null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command) {
-            this(workspace, context, principal, connection, notice, command, List.of(), 0);
+            this(workspace, context, principal, connection, notice, command, List.of(), 0, null);
+        }
+
+        State(Path workspace, String context, String principal, Connection connection, String notice,
+              String command, List<String> palette, int paletteIndex) {
+            this(workspace, context, principal, connection, notice, command, palette, paletteIndex, null);
         }
 
         static State offline(Path workspace, String context) {
@@ -81,14 +111,41 @@ final class TuiDashboard {
                 rows.add(row("  " + marker + state.palette().get(index), width));
             }
         }
+        if (state.prompt() != null && bodyRows > 0) {
+            Prompt prompt = state.prompt();
+            int remaining = Math.max(0, height - 2 - rows.size());
+            if (!prompt.options().isEmpty()) {
+                int visible = Math.min(remaining, prompt.options().size());
+                int start = Math.min(Math.max(0, prompt.selectedIndex() - visible + 1),
+                        prompt.options().size() - visible);
+                for (int index = start; index < start + visible; index++) {
+                    String marker = index == prompt.selectedIndex() ? "› " : "  ";
+                    rows.add(row("  " + marker + prompt.options().get(index), width));
+                }
+            } else if (!prompt.lines().isEmpty()) {
+                int visible = Math.min(remaining, prompt.lines().size());
+                int start = prompt.lines().size() - visible;
+                for (int index = start; index < prompt.lines().size(); index++) {
+                    rows.add(row("  | " + prompt.lines().get(index), width));
+                }
+            }
+        }
         while (rows.size() < height - 2) {
             rows.add(row("", width));
         }
         String notice = state.notice() == null || state.notice().isBlank()
                 ? "Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  q quit"
                 : state.notice();
-        rows.add(row("[COMMAND] > " + state.command(), width));
-        rows.add(row(notice, width));
+        if (state.prompt() == null) {
+            rows.add(row("[COMMAND] > " + state.command(), width));
+            rows.add(row(notice, width));
+        } else {
+            Prompt prompt = state.prompt();
+            String promptInput = prompt.secret() ? "•".repeat(prompt.input().codePointCount(0, prompt.input().length()))
+                    : prompt.input();
+            rows.add(row("[PROMPT] " + prompt.question(), width));
+            rows.add(row("> " + promptInput + (prompt.hint().isBlank() ? "" : "  " + prompt.hint()), width));
+        }
         return List.copyOf(rows);
     }
 

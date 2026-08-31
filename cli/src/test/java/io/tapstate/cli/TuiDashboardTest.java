@@ -58,4 +58,29 @@ class TuiDashboardTest {
                 .anyMatch(line -> line.contains("› pwd"));
         assertThat(lines.get(12).toString()).startsWith("[COMMAND] >");
     }
+
+    @Test
+    void rendersASecretPromptWithoutEchoingItsValue() {
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", "alice",
+                        TuiDashboard.Connection.ONLINE, "ready", "", List.of(), 0,
+                        TuiDashboard.Prompt.text("Password", "hunter2", "Enter submit", true)), 72, 14);
+
+        assertThat(lines.stream().map(AttributedString::toString).toList())
+                .anyMatch(line -> line.contains("[PROMPT] Password"))
+                .noneMatch(line -> line.contains("hunter2"))
+                .anyMatch(line -> line.contains("•••••••"));
+    }
+
+    @Test
+    void rendersPromptChoicesAndKeepsTheSelectedOptionVisible() {
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", null,
+                        TuiDashboard.Connection.OFFLINE, "ready", "", List.of(), 0,
+                        TuiDashboard.Prompt.choice("Context action", List.of("Create", "Quit"), 1)), 72, 14);
+
+        assertThat(lines.stream().map(AttributedString::toString).toList())
+                .anyMatch(line -> line.contains("› Quit"))
+                .anyMatch(line -> line.contains("[PROMPT] Context action"));
+    }
 }

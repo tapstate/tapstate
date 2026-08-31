@@ -35,6 +35,11 @@ final class TuiApp {
     private final String initialContext;
     private final AtomicBoolean interrupted = new AtomicBoolean();
 
+    private NonBlockingReader reader;
+    private Display display;
+    private Terminal terminal;
+    private TuiDashboard.Prompt prompt;
+
     private String command = "";
     private String notice;
     private final TuiCommandHistory history = new TuiCommandHistory();
@@ -47,12 +52,14 @@ final class TuiApp {
         this.err = err;
         this.initialContext = initialContext;
         this.notice = consumeOutput();
+        repl.prompter(new TuiPrompter(this::promptText, this::promptChoice, this::promptLines));
     }
 
     int run() {
         try (Terminal terminal = TerminalBuilder.builder().system(true).build()) {
+            this.terminal = terminal;
             Attributes original = terminal.enterRawMode();
-            Display display = new Display(terminal, true);
+            this.display = new Display(terminal, true);
             terminal.handle(Terminal.Signal.INT, signal -> {
                 interrupted.set(true);
                 repl.cancelStream();
@@ -70,6 +77,10 @@ final class TuiApp {
                 terminal.puts(InfoCmp.Capability.exit_ca_mode);
                 terminal.setAttributes(original);
                 terminal.flush();
+                this.prompt = null;
+                this.reader = null;
+                this.display = null;
+                this.terminal = null;
             }
         } catch (IOException failure) {
             throw new UncheckedIOException(failure);
@@ -77,7 +88,7 @@ final class TuiApp {
     }
 
     private int eventLoop(Display display, Terminal terminal) throws IOException {
-        NonBlockingReader reader = terminal.reader();
+        this.reader = terminal.reader();
         int lastWidth = -1;
         int lastHeight = -1;
         while (true) {
@@ -171,11 +182,185 @@ final class TuiApp {
         return keepGoing;
     }
 
+    /** Reads a single TUI-owned answer while keeping the dashboard and raw terminal active. */
+    private String promptText(String question, String defaultValue, boolean secret) {
+        if (reader == null || display == null || terminal == null) {
+            return "";
+        }
+        String hint = defaultValue == null || defaultValue.isBlank()
+                ? "Enter submit · Esc close"
+                : "default: " + defaultValue + " · Enter accept · Esc close";
+        StringBuilder input = new StringBuilder();
+        prompt = TuiDashboard.Prompt.text(question, "", hint, secret);
+        draw(display, terminal);
+        try {
+            while (true) {
+                int code = readPromptCode();
+                if (code < 0 || code == TuiCommandBar.CTRL_C || code == TuiCommandBar.ESCAPE) {
+                    return "";
+                }
+                if (code == TuiCommandBar.ENTER || code == TuiCommandBar.CARRIAGE_RETURN) {
+                    return input.toString();
+                }
+                if (code == TuiCommandBar.BACKSPACE || code == TuiCommandBar.DELETE) {
+                    deleteLastCodePoint(input);
+                } else if (isPrintable(code)) {
+                    appendCodePoint(input, code);
+                } else {
+                    continue;
+                }
+                prompt = TuiDashboard.Prompt.text(question, input.toString(), hint, secret);
+                draw(display, terminal);
+            }
+        } finally {
+            prompt = null;
+            draw(display, terminal);
+        }
+    }
+
+    /** Reads a menu answer with arrow navigation and the same numbered choices shown by the plain REPL. */
+    private String promptChoice(String question, List<String> options) {
+        if (reader == null || display == null || terminal == null || options == null || options.isEmpty()) {
+            return "";
+        }
+        int selected = 0;
+        prompt = TuiDashboard.Prompt.choice(question, options, selected);
+        draw(display, terminal);
+        try {
+            while (true) {
+                int code = readPromptCode();
+                if (code < 0 || code == TuiCommandBar.CTRL_C) {
+                    return options.getLast();
+                }
+                if (code == TuiCommandBar.ESCAPE) {
+                    return options.getLast();
+                }
+                if (code == TuiCommandBar.ENTER || code == TuiCommandBar.CARRIAGE_RETURN) {
+                    return options.get(selected);
+                }
+                if (code == '1' && options.size() >= 1) {
+                    return options.getFirst();
+                }
+                if (code >= '2' && code <= '9' && code - '1' < options.size()) {
+                    return options.get(code - '1');
+                }
+                EscapeKey key = escapeKeyFrom(code);
+                if (key == EscapeKey.UP) {
+                    selected = Math.max(0, selected - 1);
+                } else if (key == EscapeKey.DOWN) {
+                    selected = Math.min(options.size() - 1, selected + 1);
+                } else {
+                    continue;
+                }
+                prompt = TuiDashboard.Prompt.choice(question, options, selected);
+                draw(display, terminal);
+            }
+        } finally {
+            prompt = null;
+            draw(display, terminal);
+        }
+    }
+
+    /** Captures a block in-place, terminating on a line containing only a dot. */
+    private String promptLines(String question) {
+        if (reader == null || display == null || terminal == null) {
+            return "";
+        }
+        List<String> lines = new ArrayList<>();
+        StringBuilder input = new StringBuilder();
+        prompt = TuiDashboard.Prompt.lines(question, lines, "");
+        draw(display, terminal);
+        try {
+            while (true) {
+                int code = readPromptCode();
+                if (code < 0 || code == TuiCommandBar.CTRL_C || code == TuiCommandBar.ESCAPE) {
+                    return String.join("\n", lines);
+                }
+                if (code == TuiCommandBar.ENTER || code == TuiCommandBar.CARRIAGE_RETURN) {
+                    String line = input.toString();
+                    if (line.strip().equals(".")) {
+                        return String.join("\n", lines);
+                    }
+                    lines.add(line);
+                    input.setLength(0);
+                } else if (code == TuiCommandBar.BACKSPACE || code == TuiCommandBar.DELETE) {
+                    deleteLastCodePoint(input);
+                } else if (isPrintable(code)) {
+                    appendCodePoint(input, code);
+                } else {
+                    continue;
+                }
+                prompt = TuiDashboard.Prompt.lines(question, lines, input.toString());
+                draw(display, terminal);
+            }
+        } finally {
+            prompt = null;
+            draw(display, terminal);
+        }
+    }
+
+    private int readPromptCode() {
+        try {
+            while (true) {
+                int code = reader.read(READ_TIMEOUT_MILLIS);
+                if (code != NonBlockingReader.READ_EXPIRED) {
+                    if (code == TuiCommandBar.ESCAPE) {
+                        EscapeKey key = readEscapeKey(reader);
+                        if (key == EscapeKey.UP) {
+                            return EscapeCodes.UP;
+                        }
+                        if (key == EscapeKey.DOWN) {
+                            return EscapeCodes.DOWN;
+                        }
+                        return TuiCommandBar.ESCAPE;
+                    }
+                    return code;
+                }
+                if (interrupted.get()) {
+                    return TuiCommandBar.CTRL_C;
+                }
+            }
+        } catch (IOException failure) {
+            notice = "prompt failed: " + failure.getMessage();
+            return -1;
+        }
+    }
+
+    private static EscapeKey escapeKeyFrom(int code) {
+        if (code == EscapeCodes.UP) {
+            return EscapeKey.UP;
+        }
+        if (code == EscapeCodes.DOWN) {
+            return EscapeKey.DOWN;
+        }
+        return EscapeKey.ESCAPE;
+    }
+
+    private static boolean isPrintable(int code) {
+        return code >= 32 && code != 127 && !Character.isISOControl(code);
+    }
+
+    private static void appendCodePoint(StringBuilder value, int code) {
+        if (Character.isValidCodePoint(code)) {
+            value.appendCodePoint(code);
+        } else {
+            value.append((char) code);
+        }
+    }
+
+    private static void deleteLastCodePoint(StringBuilder value) {
+        if (value.length() > 0) {
+            value.delete(value.offsetByCodePoints(value.length(), -1), value.length());
+        }
+    }
+
     private void draw(Display display, Terminal terminal) {
         int width = dimension(terminal.getWidth(), DEFAULT_WIDTH);
         int height = dimension(terminal.getHeight(), DEFAULT_HEIGHT);
         display.resize(width, height);
-        display.update(dashboard.render(state(), width, height), -1);
+        // JLine's Display mutates the frame while reconciling rows. Keep the pure renderer's
+        // immutable result at the boundary and hand JLine its own mutable frame.
+        display.update(new ArrayList<>(dashboard.render(state(), width, height)), -1);
         terminal.flush();
     }
 
@@ -189,7 +374,7 @@ final class TuiApp {
             context = initialContext;
         }
         return new TuiDashboard.State(repl.workdir(), context, session.principal(), connection, notice, command,
-                paletteOpen ? PALETTE_COMMANDS : List.of(), paletteIndex);
+                paletteOpen ? PALETTE_COMMANDS : List.of(), paletteIndex, prompt);
     }
 
     private String consumeOutput() {
@@ -265,7 +450,16 @@ final class TuiApp {
         ESCAPE, UP, DOWN, LEFT, RIGHT
     }
 
+    private static final class EscapeCodes {
+        private static final int UP = -1001;
+        private static final int DOWN = -1002;
+
+        private EscapeCodes() {
+        }
+    }
+
     private static int dimension(int value, int fallback) {
         return value > 0 ? value : fallback;
     }
+
 }

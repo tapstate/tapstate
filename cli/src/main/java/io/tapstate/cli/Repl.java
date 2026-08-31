@@ -250,6 +250,11 @@ final class Repl {
         return session;
     }
 
+    /** Replaces the prompt adapter when a presentation surface owns its own input loop. */
+    void prompter(Prompter replacement) {
+        this.prompter = replacement;
+    }
+
     /** The durable context currently selected by a resolved online session, if any. */
     String contextName() {
         return namedContext == null ? null : namedContext.name();
