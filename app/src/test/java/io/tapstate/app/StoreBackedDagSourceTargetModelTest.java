@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.SupplierEx;
@@ -34,8 +35,8 @@ import org.junit.jupiter.api.Test;
 /**
  * Coverage for how the store-backed DAG source feeds a sink's resolved target models: the write-side target
  * tables resolved from the pipeline sources' discovered models reach the sink binder, so the sink creates
- * each target by that model and keys an upsert on its primary key. When no model has been discovered the
- * sink falls back to a bare table id.
+ * each target by that model and keys an upsert on its primary key. A sync start refuses any reaching source
+ * whose model has not been discovered, while view-only materialization retains its pre-discovery path.
  */
 class StoreBackedDagSourceTargetModelTest {
 
@@ -103,16 +104,6 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
-    void binds_a_null_target_when_the_source_schema_was_never_discovered() {
-        InMemoryStorePort store = seededPipeline();
-        List<TargetTable> bound = new ArrayList<>();
-
-        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
-
-        assertThat(bound).containsExactly((TargetTable) null);
-    }
-
-    @Test
     void refuses_a_sync_start_when_the_source_schema_was_never_discovered() {
         InMemoryStorePort store = seededPipeline();
 
@@ -120,6 +111,57 @@ class StoreBackedDagSourceTargetModelTest {
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .hasMessageContaining("actuation.source-schema-not-discovered")
                 .hasMessageContaining("orders_src");
+    }
+
+    @Test
+    void requires_discovery_only_for_the_source_that_reaches_sync() {
+        InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("address_src"));
+        store.schemas().save(discovered("address_src", "mysql", new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
+
+        assertThatCode(() -> new StoreBackedDagSource(store).validateStart("p"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void follows_a_transform_chain_to_the_source_that_reaches_sync() {
+        InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("keep_recent"),
+                Step.inline("keep_recent", FromClause.list(FromRef.literal("address_src")),
+                        new TransformBody.Filter("true"), null, null));
+        store.schemas().save(discovered("address_src", "mysql", new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
+
+        assertThatCode(() -> new StoreBackedDagSource(store).validateStart("p"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void still_requires_every_source_that_reaches_sync_through_a_union() {
+        InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("merged"),
+                Step.inline("merged", FromClause.list(FromRef.literal("orders"), FromRef.literal("PlayerAddress")),
+                        new TransformBody.Union(), null, null));
+        store.schemas().save(discovered("address_src", "mysql", new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("orders_src");
+    }
+
+    @Test
+    void does_not_require_an_undiscovered_view_source_when_sync_reads_another_source() {
+        InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("address_src"));
+        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src", "address_src"), null,
+                new ViewBlock.Inline("orders_view", FromRef.literal("orders_src"), "id", null, null),
+                new ServeBlock.Inline(null, FromRef.literal("address_src"), List.of(new SyncElement(
+                        "sync_1", "orders_dest", null, null, null, null)), null, null),
+                null, null));
+        store.schemas().save(discovered("address_src", "mysql", new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
+
+        assertThatCode(() -> new StoreBackedDagSource(store).validateStart("p"))
+                .doesNotThrowAnyException();
     }
 
     @Test
@@ -134,18 +176,6 @@ class StoreBackedDagSourceTargetModelTest {
                 null, null, null));
 
         new StoreBackedDagSource(store).validateStart("p");
-    }
-
-    @Test
-    void applies_explicit_rename_without_a_discovered_model() {
-        InMemoryStorePort store = seededPipeline(new SyncElement(
-                "sync_1", "orders_dest", null,
-                new RenameSpec(Map.of("orders", "player_address"), null, null, null), null, null));
-        List<TargetTable> bound = new ArrayList<>();
-
-        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
-
-        assertThat(bound).containsExactly(new TargetTable("player_address", List.of()));
     }
 
     @Test
@@ -199,21 +229,27 @@ class StoreBackedDagSourceTargetModelTest {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("keep_recent"),
                 Step.inline("keep_recent", FromClause.list(FromRef.literal("address_src")),
                         new TransformBody.Filter("true"), null, null));
+        store.schemas().save(discovered("address_src", "mysql", new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
         Map<String, TargetTable> bound = new LinkedHashMap<>();
 
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
-        assertThat(bound).containsEntry("PlayerAddress", new TargetTable("player_address", List.of()));
+        assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
+                "player_address", List.of(new TargetField("id", "INT", true))));
     }
 
     @Test
     void renames_with_the_table_a_serve_block_names_directly() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("PlayerAddress"));
+        store.schemas().save(discovered("address_src", "mysql", new SourceTable(
+                "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
         Map<String, TargetTable> bound = new LinkedHashMap<>();
 
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
-        assertThat(bound).containsEntry("PlayerAddress", new TargetTable("player_address", List.of()));
+        assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
+                "player_address", List.of(new TargetField("id", "INT", true))));
     }
 
     @Test

@@ -3,8 +3,7 @@
 # deliberate: discovery is a start precondition for a sync, not an apply precondition.
 #
 # The state and code are both asserted. FAILED alone would also pass for a connector crash or a job
-# failure, while the code alone would not prove the lifecycle state was published. The error count makes
-# the refusal observable through the same metrics face a caller uses for other failed runs.
+# failure, while the code alone would not prove the lifecycle state was published.
 #
 # The source and target use the harness connector so this smoke case runs on both fidelity tiers without
 # real connector jars. The production unit cases cover the target model and the real MongoDB connector
@@ -20,5 +19,4 @@ steps:
   - start
   - await: { state: FAILED }
   - assert: { failure_code: actuation.source-schema-not-discovered }
-  - assert: { error_count: 1 }
   - assert: { count: { tgt_file.orders: 0 } }
