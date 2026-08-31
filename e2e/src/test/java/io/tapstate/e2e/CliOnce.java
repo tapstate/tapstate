@@ -37,6 +37,11 @@ final class CliOnce {
 
     /** Launches the CLI on the classpath the build recorded, and waits for it. */
     static Run run(String... args) {
+        return runWithPassword(null, args);
+    }
+
+    /** Launches the CLI with its password supplied outside the command line. */
+    static Run runWithPassword(String password, String... args) {
         List<String> command = new ArrayList<>(List.of(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-cp", classpath(),
@@ -50,10 +55,13 @@ final class CliOnce {
             // Redirected to files rather than drained one after the other. Reading stdout to EOF
             // blocks until the process exits, so a CLI that fills the stderr pipe buffer deadlocks
             // before the timeout below is ever reached -- on exactly the noisy failures it is for.
-            Process process = new ProcessBuilder(command)
+            ProcessBuilder builder = new ProcessBuilder(command)
                     .redirectOutput(outFile.toFile())
-                    .redirectError(errFile.toFile())
-                    .start();
+                    .redirectError(errFile.toFile());
+            if (password != null) {
+                builder.environment().put("TAPSTATE_PASSWORD", password);
+            }
+            Process process = builder.start();
             if (!process.waitFor(2, TimeUnit.MINUTES)) {
                 process.destroyForcibly();
                 throw new AssertionError("the CLI did not exit; output so far:\n"

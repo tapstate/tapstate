@@ -40,7 +40,7 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD, "ls");
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER, "ls");
 
             // `ls` is a credentialed read: reaching an answer at all proves the connection was made and
             // the credential exchanged, both from the arguments, with no session ever opened
@@ -63,7 +63,7 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD,
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER,
                     "get", "no-such-artifact");
 
             // running one command from a script is only worth anything if its outcome is the process's
@@ -77,7 +77,7 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", "wrong", "ls");
+            CliOnce.Run run = CliOnce.runWithPassword("wrong", "-c", server.baseUrl().toString(), "-u", USER, "ls");
 
             assertThat(run.exitCode()).isNotZero();
             // the reason reported is the sign-in, not a missing connection reported by the verb that
