@@ -65,7 +65,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 numbers="$(git log --format='%s' "${base}..${sha}" 2>/dev/null \
   | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)"
 
-entries=""
+news=""; fixes=""; other=""
 for n in $numbers; do
   # A number in a subject is not always a pull request in this repository: it can be an issue, or
   # another repository's. Asking and being refused is the answer, not a failure.
@@ -73,12 +73,35 @@ for n in $numbers; do
   [ -n "$body" ] || continue
   note="$(section_body "Release note" "###")"
   [ -n "$note" ] || continue
+  # The classification comes off first. It is a field inside the section, and the section is carried
+  # whole into a bullet, so leaving it in glues "**Kind:** fix" onto the front of the sentence it was
+  # only meant to file.
+  kind="$(printf '%s' "$(field_value Kind "$note")" | tr '[:upper:]' '[:lower:]')"
+  note="$(without_field Kind "$note")"
+  [ -n "$note" ] || continue
   # "none" is a conclusion the author reached, with or without a reason after it, and it produces no
   # entry. Left as a bullet with nothing in it, it would read as a change nobody could describe.
   is_none "$note" && continue
-  entries="${entries}* $(printf '%s' "$note" | tr '\n' ' ' | sed 's/[ \t]*$//')
+  line="* $(printf '%s' "$note" | tr '\n' ' ' | sed 's/[ \t]*$//')
 "
+  case "$kind" in
+    fix*) fixes="${fixes}${line}" ;;
+    new*) news="${news}${line}" ;;
+    # No classification at all: every pull request merged before the field existed, and any later
+    # one whose author deleted it. Carried, and filed as neither -- reading an unclassified change
+    # as a new capability is the one outcome worth refusing, because it is the half a reader
+    # scanning for what broke would never think to check.
+    *)    other="${other}${line}" ;;
+  esac
 done
+
+# A heading only where there is something under it. An empty "Fixes" reads as a claim that this
+# release fixed nothing, which is a different statement from not having said.
+group() {   # <heading> <entries>
+  [ -n "$2" ] || return 0
+  printf '## %s\n\n%s\n' "$1" "$2"
+}
+grouped="$(group "What's new" "$news"; group "Fixes" "$fixes"; group "Other changes" "$other")"
 
 cat <<EOF
 Preview build — single-node, in-memory runtime, not for production.
@@ -112,9 +135,7 @@ is a change the connector never reads at all, which no delivery guarantee can co
      generated list at the bottom, rewrite it from the reader's seat, and leave that list
      alone — shortening it puts back the omissions this whole arrangement exists to prevent. -->
 
-## What's new
-
-${entries}
+${grouped}
 <!-- Known issues: paste the user-visible defects this release is knowingly shipping with, and
      delete this section if there are none. The list of them is not fetched for you and must not
      be: it lives outside this repository, and anything copied from it would name records that

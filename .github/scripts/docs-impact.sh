@@ -50,23 +50,10 @@ fi
 
 answers="$(section_body "$section")"
 
-# Whatever the author wrote after one field's colon: nothing (the prompt was left alone, or the line
-# was deleted), the word "none", or a value.
-field_value() {
-  printf '%s\n' "$answers" | awk -v want="$1" '
-    index($0, "**" want ":**") {
-      sub(/^.*\*\*[^*]*:\*\*/, "")
-      gsub(/^[ \t]+|[ \t]+$/, "")
-      print
-      exit
-    }
-  '
-}
-
 unanswered=()
 declared=0        # at least one field names something, so follow-up exists
 for name in "${fields[@]}"; do
-  value="$(field_value "$name")"
+  value="$(field_value "$name" "$answers")"
   if [ -z "$value" ]; then
     unanswered+=("$name")
   elif ! is_none "$value"; then

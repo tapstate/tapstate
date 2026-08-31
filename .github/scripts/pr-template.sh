@@ -6,6 +6,11 @@
 #                                  is: the planning that produced internal work is not public.
 #   Live verification scenario  -> how to watch it work by hand. CI proves the assertions still
 #                                  hold; it does not prove anyone has seen the thing run.
+#   Release note                -> the one sentence a release is assembled from. `none` is a real
+#                                  answer here and passes; what does not pass is the section left
+#                                  as the template shipped it. Until the template stopped ending
+#                                  that section with the literal word `none`, those two were the
+#                                  same body, and the change simply never reached a release note.
 #
 # This is a weak gate and is meant to stay one. It checks that the two sections are present and that
 # something was written under them — not that what was written is any good, which is the reviewer's
@@ -16,30 +21,58 @@
 set -uo pipefail
 
 body="${PR_BODY:-}"
-required=("Linked issue" "Live verification scenario")
+# Heading level and name together. The release note is a SUBSECTION, and a loop that assumed
+# one level would look for it under a heading that is not there and pass every body forever.
+required=("## Linked issue" "## Live verification scenario" "### Release note")
 
 here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=.github/scripts/_pr-section.sh
 . "$here/_pr-section.sh"
 fail=0
-for name in "${required[@]}"; do
+for entry in "${required[@]}"; do
+  marker="${entry%% *}"
+  name="${entry#* }"
   # Not piped into `grep -q`: it closes the pipe on its first match, the writer behind it dies of
   # that, and under `pipefail` the pipeline reports the signal rather than the match.
-  if ! grep -qE "^## ${name}[[:space:]]*$" <<<"$body"; then
-    echo "::error::the pull request body has no \"## ${name}\" section — it is in the template, and removing it does not answer it"
+  if ! grep -qE "^${marker} ${name}[[:space:]]*$" <<<"$body"; then
+    echo "::error::the pull request body has no \"${entry}\" section — it is in the template, and removing it does not answer it"
     fail=1
     continue
   fi
-  if [ -z "$(section_body "$name")" ]; then
-    echo "::error::\"## ${name}\" is still the template's prompt, with nothing written under it"
+  if [ -z "$(section_body "$name" "$marker")" ]; then
+    echo "::error::\"${entry}\" is still the template's prompt, with nothing written under it"
     fail=1
   fi
 done
 
+# The release note also says which kind of change it is -- and only when it says anything, because
+# `none` has nothing to file. Without it a release's notes are one flat list in which a reader
+# looking for what broke has to read every line to learn that none of them is about that. Asked
+# here, beside the sentence the author is already writing, rather than taken from a label: a label
+# is a second place to keep the same fact, and across the sixteen pull requests of the first
+# release not one carried `bug` or `enhancement`, so grouping on labels would have put everything
+# in one bucket while reporting itself grouped.
+note="$(section_body "Release note" "###")"
+if [ -n "$note" ] && ! is_none "$(without_field Kind "$note")"; then
+  kind="$(printf '%s' "$(field_value Kind "$note")" | tr '[:upper:]' '[:lower:]')"
+  case "$kind" in
+    new|fix) ;;
+    "")
+      echo "::error::\"### Release note\" says something, but carries no \"**Kind:**\" — a sentence with no kind is filed under neither heading in the release"
+      echo "Write \`**Kind:** new\` for a capability or \`**Kind:** fix\` for a fix, on its own line above the sentence."
+      fail=1
+      ;;
+    *)
+      echo "::error::\"**Kind:** ${kind}\" is not one of new or fix"
+      fail=1
+      ;;
+  esac
+fi
+
 if [ "$fail" -ne 0 ]; then
-  echo "Both sections are short to answer and expensive to leave out. See .github/PULL_REQUEST_TEMPLATE.md,"
+  echo "All three are short to answer and expensive to leave out. See .github/PULL_REQUEST_TEMPLATE.md,"
   echo "and CONTRIBUTING.md -> External contributions for what a linked issue is expected to carry."
   exit 1
 fi
 
-echo "clean: the linked issue and the live verification scenario are both answered."
+echo "clean: the linked issue, the live verification scenario and the release note are answered."
