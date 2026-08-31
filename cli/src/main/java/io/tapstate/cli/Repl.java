@@ -3313,7 +3313,7 @@ final class Repl {
                 (node, credential) -> controlPlane.login(node, username, credential))) {
             case LoginOutcome.Success success -> {
                 session.reland(verified.seed());
-                session.authenticate(success.token(), username, null, session.seeds());
+                session.authenticate(success.token(), username, null, session.seeds(), null, null);
                 confirm("logged in as " + username);
                 yield Cli.EXIT_OK;
             }
@@ -3363,7 +3363,8 @@ final class Repl {
 
     private void activate(AuthService.ActiveSession active) {
         session.reland(active.seed());
-        session.authenticate(active.accessToken(), active.record().principal(), null, session.seeds());
+        session.authenticate(active.accessToken(), active.record().principal(), null, session.seeds(),
+                active.record().idleExpiresAt(), active.record().absoluteExpiresAt());
     }
 
     /**

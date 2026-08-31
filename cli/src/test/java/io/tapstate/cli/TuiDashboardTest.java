@@ -83,4 +83,36 @@ class TuiDashboardTest {
                 .anyMatch(line -> line.contains("› Quit"))
                 .anyMatch(line -> line.contains("[PROMPT] Context action"));
     }
+
+    @Test
+    void rendersConnectionDetailsWithoutExposingCredentials() {
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", "alice@example.com",
+                        TuiDashboard.Connection.ONLINE, null, "", List.of(), 0, null,
+                        "http://127.0.0.1:8081", "tapstate-prod",
+                        "persistent session · refresh on demand · expires 1h 20m"), 96, 16);
+
+        assertThat(lines.stream().map(AttributedString::toString).toList())
+                .anyMatch(line -> line.contains("Server       http://127.0.0.1:8081"))
+                .anyMatch(line -> line.contains("Cluster      tapstate-prod"))
+                .anyMatch(line -> line.contains("Auth         persistent session · refresh on demand · expires 1h 20m"))
+                .noneMatch(line -> line.contains("token") || line.contains("secret"));
+    }
+
+    @Test
+    void rendersMachineAndUnauthenticatedStatesExplicitly() {
+        List<String> machine = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", "machine",
+                        TuiDashboard.Connection.ONLINE, null, "", List.of(), 0, null,
+                        "http://127.0.0.1:8081", null, "machine token"), 72, 14)
+                .stream().map(AttributedString::toString).toList();
+        List<String> unauthenticated = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", null,
+                        TuiDashboard.Connection.ONLINE, null, "", List.of(), 0, null,
+                        "http://127.0.0.1:8081", null, "not authenticated"), 72, 14)
+                .stream().map(AttributedString::toString).toList();
+
+        assertThat(machine).anyMatch(line -> line.contains("Auth         machine token"));
+        assertThat(unauthenticated).anyMatch(line -> line.contains("Auth         not authenticated"));
+    }
 }

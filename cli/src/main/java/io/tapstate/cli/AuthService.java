@@ -73,7 +73,7 @@ final class AuthService {
         }
         sessionState.remember(record, success.token(), success.accessExpiresAt());
         return new LoginResult.Success(
-                new ActiveSession(verified.seed(), success.token(), record), saved);
+                new ActiveSession(verified.seed(), success.token(), success.accessExpiresAt(), record), saved);
     }
 
     Optional<ActiveSession> resume(ResolvedContext.Named context) {
@@ -84,7 +84,7 @@ final class AuthService {
         AuthSessionRecord record = cached.orElseThrow();
         IssuerBinding.Verified verified = new IssuerBinding(client).verify(context.definition(), record.issuer());
         return Optional.of(new ActiveSession(
-                verified.seed(), sessionState.accessToken(verified.seed(), record), record));
+                verified.seed(), sessionState.accessToken(verified.seed(), record), null, record));
     }
 
     Status status(ResolvedContext.Named context) {
@@ -140,7 +140,11 @@ final class AuthService {
         return "control.auth-failed".equals(code) ? code : "unknown";
     }
 
-    record ActiveSession(URI seed, String accessToken, AuthSessionRecord record) {
+    record ActiveSession(URI seed, String accessToken, java.time.Instant accessExpiresAt, AuthSessionRecord record) {
+
+        ActiveSession(URI seed, String accessToken, AuthSessionRecord record) {
+            this(seed, accessToken, null, record);
+        }
 
         @Override
         public String toString() {

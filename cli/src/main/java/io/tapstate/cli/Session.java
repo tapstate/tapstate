@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import java.net.URI;
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -40,6 +41,12 @@ final class Session {
 
     /** What the landing node reported as its version when this connection was made; null if it did not. */
     private String serverVersion;
+
+    /** The cached human session's absolute expiry, when this process resumed a persistent session. */
+    private Instant sessionAbsoluteExpiresAt;
+
+    /** The cached human session's initial idle expiry, when this process resumed a persistent session. */
+    private Instant sessionIdleExpiresAt;
 
     /** The member base URLs to fail over across; the seeds until discovery refines them. */
     private List<URI> members = List.of();
@@ -104,6 +111,16 @@ final class Session {
         return clusterName;
     }
 
+    /** The absolute expiry of the persisted session, or {@code null} for transient credentials. */
+    Instant sessionAbsoluteExpiresAt() {
+        return sessionAbsoluteExpiresAt;
+    }
+
+    /** The last idle expiry returned by the server, or {@code null} for transient credentials. */
+    Instant sessionIdleExpiresAt() {
+        return sessionIdleExpiresAt;
+    }
+
     /** Records a successful connection: the seeds tried, the landing node, and the seeds as the member set. */
     void connect(List<URI> seeds, URI landingNode) {
         this.seeds = List.copyOf(seeds);
@@ -118,6 +135,8 @@ final class Session {
         // Reset with the rest: a version carried over from the node this session used to be on would be
         // reported as the new one's, which is worse than not knowing it.
         this.serverVersion = null;
+        this.sessionIdleExpiresAt = null;
+        this.sessionAbsoluteExpiresAt = null;
     }
 
     /** The same, plus what that node answered when asked its version ({@code null} = it did not say). */
@@ -128,11 +147,19 @@ final class Session {
 
     /** Records an authenticated session: the credential, the principal, an optional cluster name, and members. */
     void authenticate(String credential, String principal, String clusterName, List<URI> members) {
+        authenticate(credential, principal, clusterName, members, null, null);
+    }
+
+    /** Records a human credential plus the durable session expiry metadata safe for presentation. */
+    void authenticate(String credential, String principal, String clusterName, List<URI> members,
+                      Instant sessionIdleExpiresAt, Instant sessionAbsoluteExpiresAt) {
         this.credential = credential;
         this.credentialKind = CredentialKind.HUMAN_ACCESS;
         this.principal = principal;
         this.clusterName = clusterName;
         this.members = List.copyOf(members);
+        this.sessionIdleExpiresAt = sessionIdleExpiresAt;
+        this.sessionAbsoluteExpiresAt = sessionAbsoluteExpiresAt;
     }
 
     /** Records a verified machine bearer without associating it with a persisted human principal. */
@@ -142,6 +169,8 @@ final class Session {
         this.principal = "machine";
         this.clusterName = null;
         this.members = List.copyOf(members);
+        this.sessionIdleExpiresAt = null;
+        this.sessionAbsoluteExpiresAt = null;
     }
 
     /** Moves the landing node to another member (failover), keeping the credential and member set. */
@@ -156,6 +185,8 @@ final class Session {
         this.principal = null;
         this.clusterName = null;
         this.members = this.seeds;
+        this.sessionIdleExpiresAt = null;
+        this.sessionAbsoluteExpiresAt = null;
     }
 
     /** Clears the session back to offline, dropping any credential. */
@@ -169,5 +200,7 @@ final class Session {
         this.clusterName = null;
         this.serverVersion = null;
         this.members = List.of();
+        this.sessionIdleExpiresAt = null;
+        this.sessionAbsoluteExpiresAt = null;
     }
 }

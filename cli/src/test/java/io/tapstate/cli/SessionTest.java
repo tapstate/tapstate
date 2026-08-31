@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -31,6 +32,8 @@ class SessionTest {
         assertThat(session.credential()).isNull();
         assertThat(session.principal()).isNull();
         assertThat(session.clusterName()).isNull();
+        assertThat(session.sessionIdleExpiresAt()).isNull();
+        assertThat(session.sessionAbsoluteExpiresAt()).isNull();
         assertThat(session.seeds()).isEmpty();
         assertThat(session.members()).isEmpty();
     }
@@ -65,6 +68,38 @@ class SessionTest {
         assertThat(session.principal()).isEqualTo("alice");
         assertThat(session.clusterName()).isNull();
         assertThat(session.members()).containsExactly(NODE1);
+    }
+
+    @Test
+    void authenticateStoresExpiryMetadataAndLogoutClearsIt() {
+        Session session = new Session();
+        session.connect(List.of(NODE1), NODE1);
+        Instant idle = Instant.parse("2026-09-30T10:00:00Z");
+        Instant absolute = Instant.parse("2026-11-30T10:00:00Z");
+
+        session.authenticate("jwt", "alice", null, List.of(NODE1), idle, absolute);
+
+        assertThat(session.sessionIdleExpiresAt()).isEqualTo(idle);
+        assertThat(session.sessionAbsoluteExpiresAt()).isEqualTo(absolute);
+        session.logout();
+        assertThat(session.sessionIdleExpiresAt()).isNull();
+        assertThat(session.sessionAbsoluteExpiresAt()).isNull();
+    }
+
+    @Test
+    void reconnectAndMachineAuthenticationDoNotRetainHumanExpiryMetadata() {
+        Session session = new Session();
+        session.connect(List.of(NODE1), NODE1);
+        session.authenticate("jwt", "alice", null, List.of(NODE1),
+                Instant.parse("2026-09-30T10:00:00Z"), Instant.parse("2026-11-30T10:00:00Z"));
+
+        session.connect(List.of(NODE2), NODE2);
+        assertThat(session.sessionIdleExpiresAt()).isNull();
+        assertThat(session.sessionAbsoluteExpiresAt()).isNull();
+
+        session.authenticateMachine("machine-token", List.of(NODE2));
+        assertThat(session.sessionIdleExpiresAt()).isNull();
+        assertThat(session.sessionAbsoluteExpiresAt()).isNull();
     }
 
     @Test

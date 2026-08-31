@@ -56,7 +56,8 @@ final class TuiDashboard {
     }
 
     record State(Path workspace, String context, String principal, Connection connection, String notice,
-                 String command, List<String> palette, int paletteIndex, Prompt prompt) {
+                 String command, List<String> palette, int paletteIndex, Prompt prompt,
+                 String endpoint, String clusterName, String authStatus) {
         State {
             if (workspace == null || connection == null) {
                 throw new IllegalArgumentException("workspace and connection are required");
@@ -64,6 +65,12 @@ final class TuiDashboard {
             command = command == null ? "" : command;
             palette = palette == null ? List.of() : List.copyOf(palette);
             paletteIndex = palette.isEmpty() ? 0 : Math.max(0, Math.min(paletteIndex, palette.size() - 1));
+        }
+
+        State(Path workspace, String context, String principal, Connection connection, String notice,
+              String command, List<String> palette, int paletteIndex, Prompt prompt) {
+            this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
+                    null, null, null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice) {
@@ -98,6 +105,11 @@ final class TuiDashboard {
                 + state.connection().label, width));
         rows.add(row("workspace: " + state.workspace().toAbsolutePath().normalize(), width));
         rows.add(row("", width));
+        rows.add(row("  Server       " + (state.endpoint() == null ? "not connected" : state.endpoint()), width));
+        if (state.clusterName() != null && !state.clusterName().isBlank()) {
+            rows.add(row("  Cluster      " + state.clusterName(), width));
+        }
+        rows.add(row("  Auth         " + authLabel(state), width));
         rows.add(row("  Pipelines     use start, stop, status, logs", width));
         rows.add(row("  Sources       use ls and discover-schema", width));
         rows.add(row("  Connectors    use connectors and test", width));
@@ -159,6 +171,16 @@ final class TuiDashboard {
 
     private static String marker(Connection connection) {
         return connection == Connection.ONLINE ? "●" : connection == Connection.CONNECTING ? "○" : "·";
+    }
+
+    private static String authLabel(State state) {
+        if (state.authStatus() != null && !state.authStatus().isBlank()) {
+            return state.authStatus();
+        }
+        if (state.principal() != null && !state.principal().isBlank()) {
+            return "authenticated";
+        }
+        return state.connection() == Connection.OFFLINE ? "not connected" : "not authenticated";
     }
 
     private static AttributedString row(String text, int width) {

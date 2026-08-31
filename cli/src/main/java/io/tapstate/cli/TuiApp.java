@@ -12,6 +12,8 @@ import java.io.StringWriter;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -23,6 +25,7 @@ final class TuiApp {
     private static final int DEFAULT_WIDTH = 100;
     private static final int DEFAULT_HEIGHT = 24;
     private static final int READ_TIMEOUT_MILLIS = 250;
+    private static final long DASHBOARD_REFRESH_MILLIS = 1000L;
     private static final String PALETTE_NOTICE =
             "commands: ↑/↓ choose · Enter select · Esc close";
     private static final List<String> PALETTE_COMMANDS = List.of(
@@ -86,6 +89,7 @@ final class TuiApp {
         this.reader = terminal.reader();
         int lastWidth = -1;
         int lastHeight = -1;
+        long nextDashboardRefresh = 0L;
         while (true) {
             if (interrupted.get()) {
                 return Cli.EXIT_OK;
@@ -96,9 +100,14 @@ final class TuiApp {
                 draw(display, terminal);
                 lastWidth = width;
                 lastHeight = height;
+                nextDashboardRefresh = System.nanoTime() + Duration.ofMillis(DASHBOARD_REFRESH_MILLIS).toNanos();
             }
             int code = reader.read(READ_TIMEOUT_MILLIS);
             if (code == NonBlockingReader.READ_EXPIRED) {
+                if (System.nanoTime() >= nextDashboardRefresh) {
+                    draw(display, terminal);
+                    nextDashboardRefresh = System.nanoTime() + Duration.ofMillis(DASHBOARD_REFRESH_MILLIS).toNanos();
+                }
                 continue;
             }
             if (code < 0) {
@@ -150,6 +159,7 @@ final class TuiApp {
                 }
             }
             draw(display, terminal);
+            nextDashboardRefresh = System.nanoTime() + Duration.ofMillis(DASHBOARD_REFRESH_MILLIS).toNanos();
         }
     }
 
@@ -377,7 +387,43 @@ final class TuiApp {
             context = initialContext;
         }
         return new TuiDashboard.State(repl.workdir(), context, session.principal(), connection, uiState.notice(),
-                uiState.command(), uiState.palette(), uiState.paletteIndex(), uiState.prompt());
+                uiState.command(), uiState.palette(), uiState.paletteIndex(), uiState.prompt(),
+                session.landingNode() == null ? null : session.landingNode().toString(),
+                session.clusterName(), authStatus(session));
+    }
+
+    private static String authStatus(Session session) {
+        if (!session.isConnected()) {
+            return "not connected";
+        }
+        if (!session.isAuthenticated()) {
+            return "not authenticated";
+        }
+        if (session.hasMachineCredential()) {
+            return "machine token";
+        }
+        Instant absolute = session.sessionAbsoluteExpiresAt();
+        if (absolute == null) {
+            return "process session · access refresh unavailable";
+        }
+        return "persistent session · refresh on demand · expires " + remaining(absolute);
+    }
+
+    private static String remaining(Instant expiry) {
+        long seconds = Duration.between(Instant.now(), expiry).toSeconds();
+        if (seconds <= 0) {
+            return "expired";
+        }
+        if (seconds < 60) {
+            return "<1m";
+        }
+        long minutes = seconds / 60;
+        if (minutes < 60) {
+            return minutes + "m";
+        }
+        long hours = minutes / 60;
+        long remainder = minutes % 60;
+        return remainder == 0 ? hours + "h" : hours + "h " + remainder + "m";
     }
 
     private String consumeOutput() {
