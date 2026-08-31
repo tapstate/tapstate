@@ -48,4 +48,23 @@ class TuiReducerTest {
         assertThat(withPrompt.paletteOpen()).isTrue();
         assertThat(withPrompt.prompt()).isSameAs(prompt);
     }
+
+    @Test
+    void appendsRecentActivityAndKeepsOnlyTheNewestEntries() {
+        TuiAppState state = TuiAppState.initial("ready");
+        for (int index = 1; index <= TuiAppState.MAX_ACTIVITY + 2; index++) {
+            state = TuiReducer.reduce(state, new TuiAction.AppendActivity("entry-" + index));
+        }
+
+        assertThat(state.activity()).containsExactly(
+                "entry-3", "entry-4", "entry-5", "entry-6", "entry-7", "entry-8", "entry-9", "entry-10");
+    }
+
+    @Test
+    void activityRedactsCredentialShapedValues() {
+        TuiAppState state = TuiReducer.reduce(TuiAppState.initial("ready"),
+                new TuiAction.AppendActivity("token: tok_live password=hunter2"));
+
+        assertThat(state.activity()).containsExactly("token: [redacted] password=[redacted]");
+    }
 }

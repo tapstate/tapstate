@@ -115,4 +115,19 @@ class TuiDashboardTest {
         assertThat(machine).anyMatch(line -> line.contains("Auth         machine token"));
         assertThat(unauthenticated).anyMatch(line -> line.contains("Auth         not authenticated"));
     }
+
+    @Test
+    void rendersRecentActivityInTheNormalBodyWithoutEchoingSecrets() {
+        List<String> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", "alice@example.com",
+                        TuiDashboard.Connection.ONLINE, "ready", "", List.of(), 0, null,
+                        "http://127.0.0.1:8081", "tapstate-prod", "authenticated",
+                        List.of("> ls", "✓ 2 collections", "✕ token: [redacted]")), 96, 16)
+                .stream().map(AttributedString::toString).toList();
+
+        assertThat(lines).anyMatch(line -> line.contains("Activity"));
+        assertThat(lines).anyMatch(line -> line.contains("> ls"));
+        assertThat(lines).anyMatch(line -> line.contains("✓ 2 collections"));
+        assertThat(lines).noneMatch(line -> line.contains("tok_live") || line.contains("hunter2"));
+    }
 }

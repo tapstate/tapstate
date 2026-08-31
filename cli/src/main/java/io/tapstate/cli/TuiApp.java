@@ -174,16 +174,23 @@ final class TuiApp {
         }
         history.record(line);
         clearOutput();
-        uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice("running: " + line));
+        String safeCommand = TuiActivity.command(line);
+        uiState = TuiReducer.reduce(uiState, new TuiAction.AppendActivity("> " + safeCommand));
+        uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice("running: " + safeCommand));
         boolean keepGoing = repl.dispatch(line);
         String result = consumeOutput();
         if (!result.isBlank()) {
+            String marker = repl.lastExitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";
+            uiState = TuiReducer.reduce(uiState, new TuiAction.AppendActivity(marker + result));
             uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice(result));
         } else if (repl.lastExitCode() == Cli.EXIT_OK) {
+            uiState = TuiReducer.reduce(uiState, new TuiAction.AppendActivity("✓ ready"));
             uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice("ready"));
         } else {
+            String failure = "command failed (exit " + repl.lastExitCode() + ")";
+            uiState = TuiReducer.reduce(uiState, new TuiAction.AppendActivity("✕ " + failure));
             uiState = TuiReducer.reduce(uiState,
-                    new TuiAction.SetNotice("command failed (exit " + repl.lastExitCode() + ")"));
+                    new TuiAction.SetNotice(failure));
         }
         return keepGoing;
     }
@@ -389,7 +396,7 @@ final class TuiApp {
         return new TuiDashboard.State(repl.workdir(), context, session.principal(), connection, uiState.notice(),
                 uiState.command(), uiState.palette(), uiState.paletteIndex(), uiState.prompt(),
                 session.landingNode() == null ? null : session.landingNode().toString(),
-                session.clusterName(), authStatus(session));
+                session.clusterName(), authStatus(session), uiState.activity());
     }
 
     private static String authStatus(Session session) {
@@ -436,7 +443,7 @@ final class TuiApp {
         if (lines.isEmpty()) {
             return "";
         }
-        return lines.getLast().replaceAll("\\s+", " ").trim();
+        return TuiActivity.result(lines.getLast());
     }
 
     private void clearOutput() {

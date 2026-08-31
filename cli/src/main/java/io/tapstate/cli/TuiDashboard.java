@@ -57,20 +57,28 @@ final class TuiDashboard {
 
     record State(Path workspace, String context, String principal, Connection connection, String notice,
                  String command, List<String> palette, int paletteIndex, Prompt prompt,
-                 String endpoint, String clusterName, String authStatus) {
+                 String endpoint, String clusterName, String authStatus, List<String> activity) {
         State {
             if (workspace == null || connection == null) {
                 throw new IllegalArgumentException("workspace and connection are required");
             }
             command = command == null ? "" : command;
             palette = palette == null ? List.of() : List.copyOf(palette);
+            activity = activity == null ? List.of() : List.copyOf(activity);
             paletteIndex = palette.isEmpty() ? 0 : Math.max(0, Math.min(paletteIndex, palette.size() - 1));
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    null, null, null);
+                    null, null, null, List.of());
+        }
+
+        State(Path workspace, String context, String principal, Connection connection, String notice,
+              String command, List<String> palette, int paletteIndex, Prompt prompt,
+              String endpoint, String clusterName, String authStatus) {
+            this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
+                    endpoint, clusterName, authStatus, List.of());
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice) {
@@ -139,6 +147,18 @@ final class TuiDashboard {
                 int start = prompt.lines().size() - visible;
                 for (int index = start; index < prompt.lines().size(); index++) {
                     rows.add(row("  | " + prompt.lines().get(index), width));
+                }
+            }
+        } else if (state.palette().isEmpty()) {
+            rows.add(row("  Activity", width));
+            if (state.activity().isEmpty()) {
+                rows.add(row("  none yet", width));
+            } else {
+                int remaining = Math.max(0, height - 2 - rows.size());
+                int visible = Math.min(remaining, state.activity().size());
+                int start = state.activity().size() - visible;
+                for (int index = start; index < state.activity().size(); index++) {
+                    rows.add(row("  " + state.activity().get(index), width));
                 }
             }
         }

@@ -4,7 +4,8 @@ package io.tapstate.cli;
 sealed interface TuiAction
         permits TuiAction.SetCommand, TuiAction.ClearCommand, TuiAction.SetNotice,
         TuiAction.OpenPalette, TuiAction.ClosePalette, TuiAction.MovePalette,
-        TuiAction.SelectPaletteCommand, TuiAction.SetPrompt, TuiAction.ClearPrompt {
+        TuiAction.SelectPaletteCommand, TuiAction.SetPrompt, TuiAction.ClearPrompt,
+        TuiAction.AppendActivity {
 
     record SetCommand(String value) implements TuiAction {
     }
@@ -31,5 +32,8 @@ sealed interface TuiAction
     }
 
     record ClearPrompt() implements TuiAction {
+    }
+
+    record AppendActivity(String value) implements TuiAction {
     }
 }
