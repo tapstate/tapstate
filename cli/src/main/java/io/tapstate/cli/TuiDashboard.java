@@ -30,11 +30,24 @@ final class TuiDashboard {
         }
     }
 
-    record State(Path workspace, String context, String principal, Connection connection, String notice) {
+    record State(Path workspace, String context, String principal, Connection connection, String notice,
+                 String command, List<String> palette, int paletteIndex) {
         State {
             if (workspace == null || connection == null) {
                 throw new IllegalArgumentException("workspace and connection are required");
             }
+            command = command == null ? "" : command;
+            palette = palette == null ? List.of() : List.copyOf(palette);
+            paletteIndex = palette.isEmpty() ? 0 : Math.max(0, Math.min(paletteIndex, palette.size() - 1));
+        }
+
+        State(Path workspace, String context, String principal, Connection connection, String notice) {
+            this(workspace, context, principal, connection, notice, "", List.of(), 0);
+        }
+
+        State(Path workspace, String context, String principal, Connection connection, String notice,
+              String command) {
+            this(workspace, context, principal, connection, notice, command, List.of(), 0);
         }
 
         static State offline(Path workspace, String context) {
@@ -58,13 +71,23 @@ final class TuiDashboard {
         rows.add(row("  Pipelines     use start, stop, status, logs", width));
         rows.add(row("  Sources       use ls and discover-schema", width));
         rows.add(row("  Connectors    use connectors and test", width));
+        int bodyRows = Math.max(0, height - 2 - rows.size());
+        if (!state.palette().isEmpty() && bodyRows > 0) {
+            int visible = Math.min(bodyRows, state.palette().size());
+            int start = Math.min(Math.max(0, state.paletteIndex() - visible + 1),
+                    state.palette().size() - visible);
+            for (int index = start; index < start + visible; index++) {
+                String marker = index == state.paletteIndex() ? "› " : "  ";
+                rows.add(row("  " + marker + state.palette().get(index), width));
+            }
+        }
         while (rows.size() < height - 2) {
             rows.add(row("", width));
         }
         String notice = state.notice() == null || state.notice().isBlank()
                 ? "Tab complete  ·  Enter run  ·  Ctrl-P commands  ·  q quit"
                 : state.notice();
-        rows.add(row("[COMMAND] >", width));
+        rows.add(row("[COMMAND] > " + state.command(), width));
         rows.add(row(notice, width));
         return List.copyOf(rows);
     }

@@ -7,6 +7,8 @@ import picocli.CommandLine.Model.UsageMessageSpec;
 import picocli.CommandLine.Spec;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -27,7 +29,7 @@ import java.util.function.Supplier;
 @Command(name = "tapstate", mixinStandardHelpOptions = true, version = Cli.VERSION,
         subcommands = {
                 ValidateCmd.class, NewCmd.class, DemoCmd.class, ExplainCmd.class, LsCmd.class,
-                DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class},
+                DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class, TuiCmd.class},
         // the second line is indented by hand under the "Usage: " heading picocli prints before the first
         customSynopsis = {
                 "tapstate [LAUNCH]                   open a session (interactive)",
@@ -274,7 +276,7 @@ public final class Cli implements Runnable {
      * so appear on the table, but they project no operation and belong to no whitelist — the guard that
      * pins registered verbs to the offline whitelist reads this to tell "meta" from "undeclared".
      */
-    static final List<String> META_VERBS = List.of("help", "mcp", "alias", "auth", "context");
+    static final List<String> META_VERBS = List.of("help", "mcp", "alias", "auth", "context", "tui");
 
     /**
      * Help for the words the REPL handles itself. They are deliberately not subcommands — a connection
@@ -436,6 +438,16 @@ public final class Cli implements Runnable {
             System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
+        if (launch.isTui()) {
+            // `tui` itself is the interactive surface. Extra words stay with picocli so `--help`,
+            // `--version`, and malformed options retain the normal command-line diagnostics.
+            if (launch.command().size() != 1) {
+                System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
+                return;
+            }
+            System.exit(runTui(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
+            return;
+        }
         System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
     }
 
@@ -475,6 +487,49 @@ public final class Cli implements Runnable {
         AuthService authService = new AuthService(
                 controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
         return runSession(launch, controlPlane, prompter, resolver, authService);
+    }
+
+    /** Runs the full-screen TUI with the same resolver, auth service, and REPL dispatch as the plain face. */
+    static int runTui(LaunchOptions launch, ControlPlaneClient controlPlane,
+                      Supplier<Prompter> prompter) {
+        Path home = Path.of(System.getProperty("user.home"));
+        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
+        AuthService authService = new AuthService(
+                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        StringWriter out = new StringWriter();
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = newCommandLine();
+        commandLine.setOut(new PrintWriter(out, true));
+        commandLine.setErr(new PrintWriter(err, true));
+        Prompter oneShotPrompter = null;
+        try {
+            if (launch.connects() && launch.signsIn() && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
+            Repl repl = new Repl(commandLine, launch.root(), controlPlane,
+                    oneShotPrompter == null ? TuiPrompter.INSTANCE : oneShotPrompter,
+                    launch::environment, resolver, launch.context(), authService,
+                    new ContextManager(ContextConfigStore.underHome(home)));
+            String machineToken = launch.machineToken();
+            if (machineToken != null) {
+                repl.installMachineToken(machineToken);
+            }
+            if (launch.connects()) {
+                int established = machineToken == null
+                        ? repl.signIn(launch.connect(), launch.user(),
+                                () -> launch.resolvePassword(prompter), false)
+                        : repl.connectForLaunch(launch.connect(), false);
+                if (established != EXIT_OK) {
+                    return established;
+                }
+            }
+            return new TuiApp(repl, out, err, launch.context()).run();
+        } finally {
+            if (oneShotPrompter instanceof JLinePrompter jline) {
+                jline.close();
+            }
+            controlPlane.close();
+        }
     }
 
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,

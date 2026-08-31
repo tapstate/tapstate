@@ -37,4 +37,25 @@ class TuiDashboardTest {
         assertThat(lines.getLast().toString()).startsWith("terminal is too narrow");
         assertThat(lines).allSatisfy(line -> assertThat(line.toString()).hasSize(30));
     }
+
+    @Test
+    void rendersTheCurrentCommandBufferInTheCommandBar() {
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", null,
+                        TuiDashboard.Connection.OFFLINE, "ready", "connect http://127.0.0.1:8081"), 72, 14);
+
+        assertThat(lines.get(12).toString()).startsWith("[COMMAND] > connect http://127.0.0.1:8081");
+    }
+
+    @Test
+    void rendersTheSelectedCommandPaletteInTheBody() {
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", null,
+                        TuiDashboard.Connection.OFFLINE, "commands: ↑/↓ choose", "",
+                        List.of("ls", "pwd", "context"), 1), 72, 14);
+
+        assertThat(lines.stream().map(AttributedString::toString).toList())
+                .anyMatch(line -> line.contains("› pwd"));
+        assertThat(lines.get(12).toString()).startsWith("[COMMAND] >");
+    }
 }

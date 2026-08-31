@@ -88,6 +88,11 @@ final class LaunchOptions {
         return command;
     }
 
+    /** Whether the explicit command asks for the full-screen terminal dashboard. */
+    boolean isTui() {
+        return !command.isEmpty() && command.getFirst().equals("tui");
+    }
+
     /** Replaces the launch environment; for tests. */
     LaunchOptions withEnv(UnaryOperator<String> replacement) {
         this.env = replacement;

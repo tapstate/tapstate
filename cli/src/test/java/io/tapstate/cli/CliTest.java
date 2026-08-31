@@ -70,6 +70,28 @@ class CliTest {
     }
 
     @Test
+    void tuiIsRegisteredAndKeepsTheSharedHelpAndVersionContract() {
+        assertThat(Cli.newCommandLine().getSubcommands()).containsKey("tui");
+
+        Run help = run("tui", "--help");
+        Run version = run("tui", "--version");
+
+        assertThat(help.code()).isZero();
+        assertThat(help.out()).contains("Usage: tapstate tui").contains("full-screen terminal dashboard");
+        assertThat(version.code()).isZero();
+        assertThat(version.out()).contains(Cli.VERSION);
+    }
+
+    @Test
+    void launchOptionsRecognizeTheExplicitTuiEntryPoint() {
+        LaunchOptions launch = LaunchOptions.parse("--context", "dev", "tui");
+
+        assertThat(launch.isTui()).isTrue();
+        assertThat(launch.command()).containsExactly("tui");
+        assertThat(launch.context()).isEqualTo("dev");
+    }
+
+    @Test
     void connectedVerbsAreRegisteredNotMissing() {
         // connect is a REPL builtin (session-scoped), not a one-shot subcommand
         assertThat(Cli.newCommandLine().getSubcommands().keySet())

@@ -1,0 +1,271 @@
+package io.tapstate.cli;
+
+import org.jline.terminal.Attributes;
+import org.jline.terminal.Terminal;
+import org.jline.terminal.TerminalBuilder;
+import org.jline.utils.Display;
+import org.jline.utils.InfoCmp;
+import org.jline.utils.NonBlockingReader;
+
+import java.io.IOException;
+import java.io.StringWriter;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Runtime for the first TUI surface. It owns the terminal lifecycle and delegates command semantics to
+ * the existing REPL, so the full-screen face cannot drift from the tested CLI command language.
+ */
+final class TuiApp {
+
+    private static final int DEFAULT_WIDTH = 100;
+    private static final int DEFAULT_HEIGHT = 24;
+    private static final int READ_TIMEOUT_MILLIS = 250;
+    private static final String PALETTE_NOTICE =
+            "commands: ↑/↓ choose · Enter select · Esc close";
+    private static final List<String> PALETTE_COMMANDS = List.of(
+            "ls", "pwd", "help", "context", "auth status", "connect", "disconnect", "exit");
+
+    private final Repl repl;
+    private final StringWriter out;
+    private final StringWriter err;
+    private final TuiDashboard dashboard = new TuiDashboard();
+    private final String initialContext;
+    private final AtomicBoolean interrupted = new AtomicBoolean();
+
+    private String command = "";
+    private String notice;
+    private final TuiCommandHistory history = new TuiCommandHistory();
+    private boolean paletteOpen;
+    private int paletteIndex;
+
+    TuiApp(Repl repl, StringWriter out, StringWriter err, String initialContext) {
+        this.repl = repl;
+        this.out = out;
+        this.err = err;
+        this.initialContext = initialContext;
+        this.notice = consumeOutput();
+    }
+
+    int run() {
+        try (Terminal terminal = TerminalBuilder.builder().system(true).build()) {
+            Attributes original = terminal.enterRawMode();
+            Display display = new Display(terminal, true);
+            terminal.handle(Terminal.Signal.INT, signal -> {
+                interrupted.set(true);
+                repl.cancelStream();
+            });
+            terminal.puts(InfoCmp.Capability.enter_ca_mode);
+            terminal.puts(InfoCmp.Capability.clear_screen);
+            terminal.puts(InfoCmp.Capability.cursor_invisible);
+            terminal.flush();
+            try {
+                draw(display, terminal);
+                return eventLoop(display, terminal);
+            } finally {
+                display.reset();
+                terminal.puts(InfoCmp.Capability.cursor_visible);
+                terminal.puts(InfoCmp.Capability.exit_ca_mode);
+                terminal.setAttributes(original);
+                terminal.flush();
+            }
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
+        }
+    }
+
+    private int eventLoop(Display display, Terminal terminal) throws IOException {
+        NonBlockingReader reader = terminal.reader();
+        int lastWidth = -1;
+        int lastHeight = -1;
+        while (true) {
+            if (interrupted.get()) {
+                return Cli.EXIT_OK;
+            }
+            int width = dimension(terminal.getWidth(), DEFAULT_WIDTH);
+            int height = dimension(terminal.getHeight(), DEFAULT_HEIGHT);
+            if (width != lastWidth || height != lastHeight) {
+                draw(display, terminal);
+                lastWidth = width;
+                lastHeight = height;
+            }
+            int code = reader.read(READ_TIMEOUT_MILLIS);
+            if (code == NonBlockingReader.READ_EXPIRED) {
+                continue;
+            }
+            if (code < 0) {
+                return Cli.EXIT_OK;
+            }
+            if (!paletteOpen && command.isEmpty() && (code == 'q' || code == 'Q')) {
+                return Cli.EXIT_OK;
+            }
+            if (code == TuiCommandBar.ESCAPE) {
+                EscapeKey key = readEscapeKey(reader);
+                if (key == EscapeKey.UP || key == EscapeKey.DOWN) {
+                    navigate(key);
+                } else {
+                    closePaletteOrClearCommand();
+                }
+                draw(display, terminal);
+                continue;
+            }
+            if (paletteOpen && code == TuiCommandBar.CTRL_P) {
+                paletteOpen = false;
+                draw(display, terminal);
+                continue;
+            }
+            if (paletteOpen && code == TuiCommandBar.ENTER) {
+                command = PALETTE_COMMANDS.get(paletteIndex);
+                paletteOpen = false;
+                notice = "selected: " + command + " · Enter run";
+                draw(display, terminal);
+                continue;
+            }
+            if (paletteOpen && (code == TuiCommandBar.BACKSPACE || code == TuiCommandBar.DELETE
+                    || (code >= 32 && !Character.isISOControl(code)))) {
+                paletteOpen = false;
+            }
+            TuiCommandBar.Update update = TuiCommandBar.accept(command, code);
+            command = update.value();
+            switch (update.event()) {
+                case QUIT -> {
+                    return Cli.EXIT_OK;
+                }
+                case PALETTE -> togglePalette();
+                case SUBMIT -> {
+                    if (!submit()) {
+                        return Cli.EXIT_OK;
+                    }
+                }
+                case NONE -> {
+                    // The changed command buffer is rendered below.
+                }
+            }
+            draw(display, terminal);
+        }
+    }
+
+    private boolean submit() {
+        String line = command.trim();
+        command = "";
+        paletteOpen = false;
+        if (line.isEmpty()) {
+            history.reset();
+            notice = "ready";
+            return true;
+        }
+        history.record(line);
+        clearOutput();
+        notice = "running: " + line;
+        boolean keepGoing = repl.dispatch(line);
+        String result = consumeOutput();
+        if (!result.isBlank()) {
+            notice = result;
+        } else if (repl.lastExitCode() == Cli.EXIT_OK) {
+            notice = "ready";
+        } else {
+            notice = "command failed (exit " + repl.lastExitCode() + ")";
+        }
+        return keepGoing;
+    }
+
+    private void draw(Display display, Terminal terminal) {
+        int width = dimension(terminal.getWidth(), DEFAULT_WIDTH);
+        int height = dimension(terminal.getHeight(), DEFAULT_HEIGHT);
+        display.resize(width, height);
+        display.update(dashboard.render(state(), width, height), -1);
+        terminal.flush();
+    }
+
+    private TuiDashboard.State state() {
+        Session session = repl.session();
+        TuiDashboard.Connection connection = session.isConnected()
+                ? TuiDashboard.Connection.ONLINE
+                : TuiDashboard.Connection.OFFLINE;
+        String context = repl.contextName();
+        if (context == null || context.isBlank()) {
+            context = initialContext;
+        }
+        return new TuiDashboard.State(repl.workdir(), context, session.principal(), connection, notice, command,
+                paletteOpen ? PALETTE_COMMANDS : List.of(), paletteIndex);
+    }
+
+    private String consumeOutput() {
+        String stdout = out.toString();
+        String stderr = err.toString();
+        clearOutput();
+        List<String> lines = new ArrayList<>();
+        addNonBlank(lines, stdout);
+        addNonBlank(lines, stderr);
+        if (lines.isEmpty()) {
+            return "";
+        }
+        return lines.getLast().replaceAll("\\s+", " ").trim();
+    }
+
+    private void clearOutput() {
+        out.getBuffer().setLength(0);
+        err.getBuffer().setLength(0);
+    }
+
+    private static void addNonBlank(List<String> lines, String value) {
+        for (String line : value.split("\\R")) {
+            if (!line.isBlank()) {
+                lines.add(line);
+            }
+        }
+    }
+
+    private void togglePalette() {
+        paletteOpen = !paletteOpen;
+        if (paletteOpen) {
+            paletteIndex = 0;
+            notice = PALETTE_NOTICE;
+        }
+    }
+
+    private void navigate(EscapeKey key) {
+        if (paletteOpen) {
+            paletteIndex = key == EscapeKey.UP
+                    ? Math.max(0, paletteIndex - 1)
+                    : Math.min(PALETTE_COMMANDS.size() - 1, paletteIndex + 1);
+            notice = PALETTE_NOTICE;
+            return;
+        }
+        command = key == EscapeKey.UP ? history.previous(command) : history.next();
+    }
+
+    private void closePaletteOrClearCommand() {
+        if (paletteOpen) {
+            paletteOpen = false;
+            notice = "ready";
+        } else {
+            TuiCommandBar.Update update = TuiCommandBar.accept(command, TuiCommandBar.ESCAPE);
+            command = update.value();
+        }
+    }
+
+    private static EscapeKey readEscapeKey(NonBlockingReader reader) throws IOException {
+        int next = reader.read(15);
+        if (next != '[' && next != 'O') {
+            return EscapeKey.ESCAPE;
+        }
+        return switch (reader.read(15)) {
+            case 'A' -> EscapeKey.UP;
+            case 'B' -> EscapeKey.DOWN;
+            case 'C' -> EscapeKey.RIGHT;
+            case 'D' -> EscapeKey.LEFT;
+            default -> EscapeKey.ESCAPE;
+        };
+    }
+
+    private enum EscapeKey {
+        ESCAPE, UP, DOWN, LEFT, RIGHT
+    }
+
+    private static int dimension(int value, int fallback) {
+        return value > 0 ? value : fallback;
+    }
+}

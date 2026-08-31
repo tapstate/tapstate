@@ -250,6 +250,11 @@ final class Repl {
         return session;
     }
 
+    /** The durable context currently selected by a resolved online session, if any. */
+    String contextName() {
+        return namedContext == null ? null : namedContext.name();
+    }
+
     /** Installs a process-only machine token; issuer discovery runs before the bearer is attached or sent. */
     void installMachineToken(String token) {
         if (token == null || token.isBlank()) {
