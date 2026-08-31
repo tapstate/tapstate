@@ -117,6 +117,18 @@ class TuiDashboardTest {
     }
 
     @Test
+    void rendersConnectingAsASeparateTransitionState() {
+        List<String> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", null,
+                        TuiDashboard.Connection.CONNECTING, "running: ls pipeline", "", List.of(), 0, null,
+                        null, null, null), 72, 14)
+                .stream().map(AttributedString::toString).toList();
+
+        assertThat(lines.getFirst()).contains("○ connecting");
+        assertThat(lines).anyMatch(line -> line.contains("Auth         resolving context"));
+    }
+
+    @Test
     void rendersRecentActivityInTheNormalBodyWithoutEchoingSecrets() {
         List<String> lines = dashboard.render(
                 new TuiDashboard.State(Path.of("orders"), "dev", "alice@example.com",

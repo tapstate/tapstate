@@ -29,7 +29,8 @@ final class TuiApp {
     private static final String PALETTE_NOTICE =
             "commands: ↑/↓ choose · Enter select · Esc close";
     private static final List<String> PALETTE_COMMANDS = List.of(
-            "ls", "pwd", "help", "context", "auth status", "connect", "disconnect", "exit");
+            "ls", "pwd", "help", "context", "auth status", "connect", "disconnect", "exit",
+            "auth login", "auth logout", ":ctx", "logout");
 
     private final Repl repl;
     private final StringWriter out;
@@ -43,6 +44,8 @@ final class TuiApp {
     private Terminal terminal;
     private TuiAppState uiState;
     private final TuiCommandHistory history = new TuiCommandHistory();
+    /** True while a command is resolving a target or waiting on the control plane. */
+    private boolean commandRunning;
 
     TuiApp(Repl repl, StringWriter out, StringWriter err, String initialContext) {
         this.repl = repl;
@@ -177,7 +180,16 @@ final class TuiApp {
         String safeCommand = TuiActivity.command(line);
         uiState = TuiReducer.reduce(uiState, new TuiAction.AppendActivity("> " + safeCommand));
         uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice("running: " + safeCommand));
-        boolean keepGoing = repl.dispatch(line);
+        commandRunning = true;
+        // Give the user one frame that reflects the network transition before a lazy context
+        // resolution or control-plane request blocks this event-loop thread.
+        draw(display, terminal);
+        boolean keepGoing;
+        try {
+            keepGoing = repl.dispatch(line);
+        } finally {
+            commandRunning = false;
+        }
         String result = consumeOutput();
         if (!result.isBlank()) {
             String marker = repl.lastExitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";
@@ -388,7 +400,7 @@ final class TuiApp {
         Session session = repl.session();
         TuiDashboard.Connection connection = session.isConnected()
                 ? TuiDashboard.Connection.ONLINE
-                : TuiDashboard.Connection.OFFLINE;
+                : commandRunning ? TuiDashboard.Connection.CONNECTING : TuiDashboard.Connection.OFFLINE;
         String context = repl.contextName();
         if (context == null || context.isBlank()) {
             context = initialContext;

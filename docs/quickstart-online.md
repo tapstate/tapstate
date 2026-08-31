@@ -402,13 +402,15 @@ $ ./tapstate-cli/bin/tapstate -w work tui
 ```
 
 The dashboard may start as `offline`; run an online command such as `ls pipeline` to resolve the
-workspace binding and resume the cached session. Its header shows the workspace, server, cluster,
+workspace binding and resume the cached session. While that first command is waiting on the server,
+the header changes to `connecting`; after it finishes, the header shows the workspace, server, cluster,
 connection state, authenticated principal, and a short-lived expiry summary. The Activity area keeps
 the newest command/result pairs for the current process only. Passwords, bearer values, access tokens,
 refresh tokens, and session tokens are masked before they reach the screen.
 
 Use `Ctrl-P` to open the command palette, `↑/↓` to select a command, and `Enter` to put it in the
-command bar. `Enter` in the command bar runs the command; `↑/↓` recalls command history when the
+command bar. The palette includes common context and auth actions (`:ctx`, `auth status`, `auth login`,
+and `auth logout`) as well as transport actions. `Enter` in the command bar runs the command; `↑/↓` recalls command history when the
 palette is closed; `Esc` closes the palette or clears the draft; and `q` quits when the command bar is
 empty. Context actions (`:ctx` or `context`) and password/menu prompts stay in the dashboard and
 never echo secret input. A narrow terminal falls back to a compact status view.

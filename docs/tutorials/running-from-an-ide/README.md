@@ -279,11 +279,13 @@ java -jar cli/target/cli-0.3.0.jar -w ./work tui
 
 It shares the existing REPL dispatcher, `:ctx` context manager, and file-backed session cache. The
 initial screen can therefore say `offline`; the first online command (for example `ls pipeline`)
-resolves the workspace binding and resumes the saved session. The dashboard exposes connection and
+resolves the workspace binding and resumes the saved session. While that command is waiting on the
+server, the header shows `connecting`; afterward the dashboard exposes connection and
 authentication state, server/cluster details, and a bounded Activity feed. It never displays password,
 bearer, access-token, refresh-token, or session-token values; secret prompts are rendered as bullets.
 
-`Ctrl-P` opens the command palette, `↑/↓` navigates it, and `Enter` selects a command. Press `Enter`
+`Ctrl-P` opens the command palette, `↑/↓` navigates it, and `Enter` selects a command. It includes
+common context/auth actions such as `:ctx`, `auth status`, `auth login`, and `auth logout`. Press `Enter`
 again in the command bar to execute; `↑/↓` recalls history outside the palette, `Esc` closes the
 palette or clears the draft, and `q` exits when the draft is empty. The same prompts used by `:ctx`
 and `auth login` remain interactive inside the TUI. Run it from a real terminal (or enable the IDE

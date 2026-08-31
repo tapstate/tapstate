@@ -197,6 +197,9 @@ final class TuiDashboard {
         if (state.authStatus() != null && !state.authStatus().isBlank()) {
             return state.authStatus();
         }
+        if (state.connection() == Connection.CONNECTING) {
+            return "resolving context";
+        }
         if (state.principal() != null && !state.principal().isBlank()) {
             return "authenticated";
         }
