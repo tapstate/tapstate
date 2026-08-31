@@ -405,6 +405,13 @@ is not simply left blank — a blank and a decision must not look the same. A
 performance change that cannot say what got faster from where the user sits does not
 belong in the notes either.
 
+A check refuses a pull request whose `### Release note` section is missing, or left as
+the template's prompt with nothing written under it. `none` passes it — the point is
+not to extract a sentence from every change, it is that the section cannot be skipped
+by scrolling. The template used to ship with `none` already written in, which made a
+considered answer and an unread one the same body; it no longer does, so the section
+arrives empty and waits for you.
+
 One consistency check runs as a bot comment, never a gate: a pull request labelled
 `docs-needed` whose release note says `none` is contradicting itself, since both
 sections are asking the same question — can a user see this? One of the two is

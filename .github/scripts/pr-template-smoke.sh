@@ -45,7 +45,7 @@ refute() {
   fi
 }
 
-answered=$'## Linked issue\n\nRefs #12. The design is in the issue body, under "Design".\n\n## Live verification scenario\n\nStart the demo workspace, apply the pipeline, insert a row, watch it land in the sink.\n'
+answered=$'## Linked issue\n\nRefs #12. The design is in the issue body, under "Design".\n\n## Live verification scenario\n\nStart the demo workspace, apply the pipeline, insert a row, watch it land in the sink.\n\n\n### Release note\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
 
 untouched=$'## Linked issue\n\n<!--\nWhich issue, and where its design is written.\n-->\n\n## Live verification scenario\n\n<!-- How a maintainer sees this work by hand. -->\n'
 
@@ -53,9 +53,17 @@ half=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\n<!-- How
 
 deleted=$'## What changed\n\nA fix.\n\n## Live verification scenario\n\nRun the CLI against the sample workspace.\n'
 
-inline=$'## Linked issue\n\nRefs #12 <!-- not Fixes, on purpose -->\n\n## Live verification scenario\n\nRun it <!-- see below --> against the demo workspace.\n'
+inline=$'## Linked issue\n\nRefs #12 <!-- not Fixes, on purpose -->\n\n## Live verification scenario\n\nRun it <!-- see below --> against the demo workspace.\n\n\n### Release note\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
 
-other_sections=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n## Checks\n\n<!-- unfilled, and none of this gate\x27s business -->\n'
+other_sections=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n## Checks\n\n<!-- unfilled, and none of this gate\x27s business -->\n\n\n### Release note\n\nas an operator, I can see which build I am running, so that a bug report names it without asking.\n'
+
+# The section the gate is being taught. `none` is an answer and must pass -- a release-tooling
+# change has no user-visible effect, and a sentence invented for it travels all the way to a user.
+relnote_missing=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n'
+
+relnote_unfilled=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n### Release note\n\n<!--\nOne sentence, as a user story.\n-->\n'
+
+relnote_none=$'## Linked issue\n\nRefs #12.\n\n## Live verification scenario\n\nRun it by hand.\n\n### Release note\n\nnone -- release tooling only, nothing a user sees.\n'
 
 expect "an answered body passes"                0 "clean:"            "$answered"
 expect "the template left untouched is refused" 1 "Linked issue"      "$untouched"
@@ -66,6 +74,19 @@ expect "a deleted heading is refused by name"   1 "has no \"## Linked issue\"" "
 expect "an empty body is refused"               1 "has no"            ""
 expect "an answer beside a comment passes"      0 "clean:"            "$inline"
 expect "other unfilled sections are not ours"   0 "clean:"            "$other_sections"
+
+expect "a missing release note is refused by name" 1 'has no "### Release note"' "$relnote_missing"
+expect "a release note left as the prompt refused" 1 "### Release note" "$relnote_unfilled"
+# The control, and the reason `none` stays legal: without it, "refuse anything that is not a
+# sentence" passes both cases above. It does NOT discriminate this change on its own -- it passed
+# before the gate existed too -- and that is said here rather than left to be assumed.
+expect "a written none is an answer and passes"    0 "clean:" "$relnote_none"
+
+# The gate above is driven by fixtures, so nothing in it looks at the template this repository
+# actually ships. That file is where the failure came from: while it ended the section with the
+# literal word `none`, an untouched body and a considered one were the same body, and the gate
+# would pass every pull request while reporting itself clean. So the template is a case.
+expect "the shipped template does not pre-answer" 1 '"### Release note" is still' "$(cat "$here/../PULL_REQUEST_TEMPLATE.md")"
 
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

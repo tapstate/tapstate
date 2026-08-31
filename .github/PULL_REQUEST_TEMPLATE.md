@@ -80,8 +80,6 @@ This sentence is collected into the release notes, unedited, when a release is c
 CONTRIBUTING.md, "Release notes".
 -->
 
-none
-
 ## Checks
 
 - [ ] `mvn verify` is green locally
