@@ -49,27 +49,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: No NUL bytes in tracked files
+      - name: The gate still decides the way it is supposed to
         run: |
-          set -euo pipefail
+          shellcheck .github/scripts/no-binary-bytes.sh .github/scripts/no-binary-bytes-smoke.sh
+          bash .github/scripts/no-binary-bytes-smoke.sh
 
-          # Build pathspec exclusions from the allowlist; ignore comments / blanks.
-          pathspec=(':(top)')
-          if [ -f .binary-allowlist ]; then
-            while IFS= read -r line; do
-              line="${line%%#*}"
-              line="$(printf '%s' "$line" | tr -d '[:space:]')"
-              [ -z "$line" ] && continue
-              pathspec+=(":(top,exclude)$line")
-            done < .binary-allowlist
-          fi
-
-          # -a forces every file to be read as text; see the note at the top.
-          if git grep -anP '\x00' -- "${pathspec[@]}"; then
-            echo "::error::NUL byte(s) found in a text-only repo (matches above; the NUL itself prints as a blank)."
-            echo "A NUL byte makes the whole file read as binary, so grep -I skips it silently and exits 0."
-            echo "Write the character as an escape instead (for example '\\0' in Java, rather than a raw 0x00)."
-            echo "If a file is legitimately binary, add its path to .binary-allowlist."
-            exit 1
-          fi
-          echo "clean: no NUL bytes in tracked files."
+      - name: No NUL bytes in tracked files
+        run: bash .github/scripts/no-binary-bytes.sh
