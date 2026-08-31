@@ -269,6 +269,26 @@ server session and remove the local cache. `Verify TLS` should stay enabled for 
 for a deliberately local HTTP endpoint such as the example above. The temporary `-c/-u` launch remains
 available, but it changes only that process and does not update the saved context.
 
+### Open the same session in the full-screen TUI
+
+Once the context and session work from the terminal, the full-screen dashboard can use them directly:
+
+```sh
+java -jar cli/target/cli-0.3.0.jar -w ./work tui
+```
+
+It shares the existing REPL dispatcher, `:ctx` context manager, and file-backed session cache. The
+initial screen can therefore say `offline`; the first online command (for example `ls pipeline`)
+resolves the workspace binding and resumes the saved session. The dashboard exposes connection and
+authentication state, server/cluster details, and a bounded Activity feed. It never displays password,
+bearer, access-token, refresh-token, or session-token values; secret prompts are rendered as bullets.
+
+`Ctrl-P` opens the command palette, `↑/↓` navigates it, and `Enter` selects a command. Press `Enter`
+again in the command bar to execute; `↑/↓` recalls history outside the palette, `Esc` closes the
+palette or clears the draft, and `q` exits when the draft is empty. The same prompts used by `:ctx`
+and `auth login` remain interactive inside the TUI. Run it from a real terminal (or enable the IDE
+console's terminal emulation); a non-TTY console cannot provide raw keyboard handling.
+
 ### There are three rules for giving a workspace, and `--help` describes one
 
 The arguments above carry no subcommand, so that is the session form and `-w` is accepted. Add a

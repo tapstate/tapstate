@@ -392,6 +392,27 @@ it off only for a deliberately local HTTP endpoint such as the loopback example 
 configuration path or file is group/world-readable, the CLI refuses to read or overwrite it until
 you restore owner-only permissions.
 
+### Optional: use the full-screen TUI
+
+The same session can be opened as a full-screen terminal dashboard. It uses the existing REPL command
+language and the same context/session cache, so it does not create a second login flow:
+
+```console
+$ ./tapstate-cli/bin/tapstate -w work tui
+```
+
+The dashboard may start as `offline`; run an online command such as `ls pipeline` to resolve the
+workspace binding and resume the cached session. Its header shows the workspace, server, cluster,
+connection state, authenticated principal, and a short-lived expiry summary. The Activity area keeps
+the newest command/result pairs for the current process only. Passwords, bearer values, access tokens,
+refresh tokens, and session tokens are masked before they reach the screen.
+
+Use `Ctrl-P` to open the command palette, `↑/↓` to select a command, and `Enter` to put it in the
+command bar. `Enter` in the command bar runs the command; `↑/↓` recalls command history when the
+palette is closed; `Esc` closes the palette or clears the draft; and `q` quits when the command bar is
+empty. Context actions (`:ctx` or `context`) and password/menu prompts stay in the dashboard and
+never echo secret input. A narrow terminal falls back to a compact status view.
+
 For automation, pass a machine token at launch with `--token TOKEN` or
 `TAPSTATE_TOKEN`. It wins over a cached human session for this process, is never read
 from or written to the human-session cache, and is not printed by CLI diagnostics. The
