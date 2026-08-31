@@ -11,9 +11,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * The CLI reaching a running product from its arguments alone.
  *
  * <p>Everything else here drives the product over HTTP, which is the right shape for a specification
- * about data crossing a pipeline. This one is about the front end itself: {@code -c} / {@code -u} /
- * {@code -p} connect and sign in before any command runs, so that a whole session's work fits on one
- * line and can be put in a script. Nothing in the declarative vocabulary reaches that — its words
+ * about data crossing a pipeline. This one is about the front end itself: {@code -c} / {@code -u} and
+ * {@code TAPSTATE_PASSWORD} connect and sign in before any command runs, so that a whole session's
+ * work fits on one line and can be put in a script. Nothing in the declarative vocabulary reaches
+ * that — its words
  * ({@code count}, {@code state}, {@code error_count}) are all about what a pipeline did, and there is
  * no word for invoking the CLI and reading what the process returned — so this is written in Java, as
  * the admission rule provides for.
@@ -39,7 +40,7 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD, "ls");
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER, "ls");
 
             // `ls` is a credentialed read: reaching an answer at all proves the connection was made and
             // the credential exchanged, both from the arguments, with no session ever opened
@@ -62,7 +63,7 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD,
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER,
                     "get", "no-such-artifact");
 
             // running one command from a script is only worth anything if its outcome is the process's
@@ -76,7 +77,7 @@ class CliOneLineLaunchIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", "wrong", "ls");
+            CliOnce.Run run = CliOnce.runWithPassword("wrong", "-c", server.baseUrl().toString(), "-u", USER, "ls");
 
             assertThat(run.exitCode()).isNotZero();
             // the reason reported is the sign-in, not a missing connection reported by the verb that

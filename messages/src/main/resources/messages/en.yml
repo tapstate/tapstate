@@ -129,6 +129,63 @@ cli.version-mismatch:
 cli.if-match-needs-one-resource:
   message: "`--if-match` names one version, but this apply covers {count} resources."
   solution: "Apply the single file you are editing, or drop `--if-match` and let the batch apply unconditionally."
+cli.context-config-invalid:
+  message: "The context configuration at `{path}` is unsafe or invalid: {reason}"
+  solution: "Fix or remove the configuration file, then run the context manager again. The invalid file was not overwritten."
+cli.context-config-version:
+  message: "The context configuration at `{path}` uses unsupported schema version `{version}`."
+  solution: "Use a compatible tapstate release or migrate the configuration with a release that supports this version."
+cli.context-config-permissions:
+  message: "The context configuration path `{path}` is not owner-only: {reason}"
+  solution: "Restore ownership and owner-only permissions, then retry. Tapstate will not read or overwrite an unsafe file."
+cli.auth-cache-invalid:
+  message: "The auth cache at `{path}` is unsafe or invalid: {reason}"
+  solution: "Sign in again after checking the context target. The invalid auth file was not overwritten."
+cli.auth-cache-version:
+  message: "The auth cache at `{path}` uses unsupported schema version `{version}`."
+  solution: "Use a compatible tapstate release or sign in again with this release."
+cli.auth-cache-permissions:
+  message: "The auth cache path `{path}` is not owner-only: {reason}"
+  solution: "Restore ownership and owner-only permissions, then retry. Tapstate will not read or overwrite an unsafe auth file."
+cli.auth-session-rejected:
+  message: "The cached session for `{principal}` was rejected by the server: {code}."
+  solution: "Run `tapstate auth login` again for this context."
+cli.auth-session-unreachable:
+  message: "The cached session for `{principal}` could not be exchanged because the server was unreachable."
+  solution: "Check the server connection and retry, or run `tapstate auth login` again."
+cli.auth-login-unreachable:
+  message: "Login for context `{context}` did not return a usable persistent session."
+  solution: "Check the server connection and compatibility, then run `tapstate auth login` again."
+cli.auth-login-rejected:
+  message: "Login for `{principal}` was rejected by the server: {code}."
+  solution: "Check the username and password, then run `tapstate auth login` again."
+cli.auth-logout-unreachable:
+  message: "The remote session for context `{context}` could not be revoked; the local cache was kept."
+  solution: "Retry when the server is reachable, or use `tapstate auth logout --local-only` to remove only the local cache."
+cli.auth-logout-cache-changed:
+  message: "The session for context `{context}` changed while logout was in progress; the newer local session was kept."
+  solution: "Run `tapstate auth status` to inspect the current session, then retry logout if needed."
+cli.auth-usage:
+  message: "Invalid auth command: {reason}."
+  solution: "Use `tapstate auth login [username]`, `tapstate auth status`, or `tapstate auth logout [--local-only]`."
+cli.context-usage:
+  message: "Invalid context manager input: {reason}."
+  solution: "Run `tapstate context` in an interactive terminal and choose one of the offered actions."
+cli.context-invalid:
+  message: "Context `{name}` is invalid: {reason}"
+  solution: "Use a non-empty name, at least one absolute HTTP(S) seed, and valid context settings."
+cli.context-not-found:
+  message: "No context named `{name}` exists."
+  solution: "Open the context manager and choose an existing context or create this one."
+cli.context-already-exists:
+  message: "A context named `{name}` already exists."
+  solution: "Edit the existing context or choose another name."
+cli.context-source-conflict:
+  message: "`--connect` and `--context` select different kinds of target and cannot be used together."
+  solution: "Keep `--connect` for a temporary target, or keep `--context` for a saved context."
+cli.context-required:
+  message: "The `{verb}` command needs a server context, but no target was selected."
+  solution: "Use `--context`, set `TAPSTATE_CONTEXT`, bind this exact workspace, or use `--connect` for a temporary target."
 dsl.unknown-field:
   message: "Unknown field '{field}' at {path}."
   solution: "Remove it, or run `tapstate explain` to see the fields allowed here."
@@ -540,3 +597,15 @@ pdk.testitem.time.consistent.fail:
   message: "The clock comparison did not pass."
 pdk.testitem.stream.read.fail:
   message: "The change stream could not be started."
+cli.remote-plaintext:
+  message: "Server seed {seed} uses plaintext HTTP outside loopback."
+  solution: "Use HTTPS for remote servers; HTTP is allowed only for a loopback development server."
+cli.issuer-discovery-failed:
+  message: "Server seed {seed} did not return its anonymous cluster identity."
+  solution: "Check that the seed is reachable and serves /.well-known/tapstate, then try again."
+cli.issuer-discovery-invalid:
+  message: "Server seed {seed} returned an invalid cluster identity ({reason})."
+  solution: "Check that the URL targets a compatible Tapstate server and has not been replaced by another service."
+cli.auth-issuer-mismatch:
+  message: "Server seed {seed} reports issuer {actual}, but {expected} was required."
+  solution: "Check the context seeds and sign in again only after confirming that this is the intended cluster."

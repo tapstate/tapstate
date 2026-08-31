@@ -144,11 +144,57 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
-    public LoginOutcome login(URI baseUrl, String username, String password) {
+    public DiscoveryOutcome discover(URI baseUrl) {
         try {
-            Map<String, String> payload = new LinkedHashMap<>();
+            HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/.well-known/tapstate"))
+                    .timeout(probeTimeout)
+                    .GET()
+                    .build();
+            HttpResponse<String> response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                Object parsed;
+                try {
+                    parsed = JsonReader.parse(response.body());
+                } catch (RuntimeException malformed) {
+                    return new DiscoveryOutcome.Invalid("response-body");
+                }
+                if (!(parsed instanceof Map<?, ?> fields)) {
+                    return new DiscoveryOutcome.Invalid("response-shape");
+                }
+                try {
+                    return new DiscoveryOutcome.Discovered(
+                            stringOrNull(fields.get("issuer")),
+                            stringOrNull(fields.get("clusterId")),
+                            stringOrNull(fields.get("apiVersion")),
+                            requiredStringList(fields.get("authModes")));
+                } catch (IllegalArgumentException invalid) {
+                    return new DiscoveryOutcome.Invalid("response-contract");
+                }
+            }
+            Rejection rejected = rejection(response.body(), "Issuer discovery was refused by the server.");
+            return new DiscoveryOutcome.Rejected(rejected.code(), rejected.message());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new DiscoveryOutcome.Unreachable();
+        } catch (IOException | RuntimeException failure) {
+            return new DiscoveryOutcome.Unreachable();
+        }
+    }
+
+    @Override
+    public LoginOutcome login(URI baseUrl, String username, String password) {
+        return login(baseUrl, username, password, false);
+    }
+
+    @Override
+    public LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
+        try {
+            Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("username", username);
             payload.put("password", password);
+            if (createSession) {
+                payload.put("createSession", true);
+            }
             HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/auth/login"))
                     .timeout(probeTimeout)
                     .header("Content-Type", "application/json")
@@ -157,18 +203,73 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
-                String token = stringField(response.body(), "token");
-                return token == null || token.isBlank()
-                        ? new LoginOutcome.Unreachable()   // a 200 with no token is not a usable success
-                        : new LoginOutcome.Success(token);
+                LoginOutcome.Success success = loginSuccess(response.body(), createSession, password);
+                return success == null ? new LoginOutcome.Unreachable() : success;
             }
-            Rejection r = rejection(response.body(), "Login was refused by the server.");
-            return new LoginOutcome.Rejected(r.code(), r.message());
+            if (response.statusCode() == 401 || response.statusCode() == 403) {
+                Rejection r = rejection(response.body(), "Login was refused by the server.");
+                return new LoginOutcome.Rejected(r.code(), r.message());
+            }
+            return new LoginOutcome.Unreachable();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new LoginOutcome.Unreachable();
         } catch (IOException | RuntimeException e) {
             return new LoginOutcome.Unreachable();
+        }
+    }
+
+    @Override
+    public SessionLogoutOutcome logoutSession(URI baseUrl, String sessionToken) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/auth/logout"))
+                    .timeout(probeTimeout)
+                    .header("Authorization", "TapstateSession " + sessionToken)
+                    .POST(HttpRequest.BodyPublishers.noBody())
+                    .build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200 || response.statusCode() == 204) {
+                return new SessionLogoutOutcome.Success();
+            }
+            if (response.statusCode() == 401 || response.statusCode() == 403) {
+                Rejection rejected = rejection(response.body(), "Session logout was refused by the server.");
+                return new SessionLogoutOutcome.Rejected(rejected.code(), rejected.message());
+            }
+            return new SessionLogoutOutcome.Unreachable();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new SessionLogoutOutcome.Unreachable();
+        } catch (IOException | RuntimeException failure) {
+            return new SessionLogoutOutcome.Unreachable();
+        }
+    }
+
+    @Override
+    public SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/auth/session"))
+                    .timeout(probeTimeout)
+                    .header("Authorization", "TapstateSession " + sessionToken)
+                    .header("Accept", "application/json")
+                    .POST(HttpRequest.BodyPublishers.noBody())
+                    .build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                SessionExchangeOutcome.Success exchanged = sessionExchange(response.body());
+                return exchanged == null ? new SessionExchangeOutcome.Unreachable() : exchanged;
+            }
+            if (response.statusCode() == 401 || response.statusCode() == 403) {
+                Rejection rejected = rejection(response.body(), "Session exchange was refused by the server.");
+                return new SessionExchangeOutcome.Rejected(rejected.code(), rejected.message());
+            }
+            return new SessionExchangeOutcome.Unreachable();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new SessionExchangeOutcome.Unreachable();
+        } catch (IOException | RuntimeException failure) {
+            return new SessionExchangeOutcome.Unreachable();
         }
     }
 
@@ -186,6 +287,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new DataBrowserOutcome.Collections.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new DataBrowserOutcome.Collections.Unreachable();
+            default -> new DataBrowserOutcome.Collections.Unreachable();
         };
     }
 
@@ -207,6 +309,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new DataBrowserOutcome.Stats.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new DataBrowserOutcome.Stats.Unreachable();
+            default -> new DataBrowserOutcome.Stats.Unreachable();
         };
     }
 
@@ -240,6 +343,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new DataBrowserOutcome.Find.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new DataBrowserOutcome.Find.Unreachable();
+            default -> new DataBrowserOutcome.Find.Unreachable();
         };
     }
 
@@ -305,6 +409,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new TokenCreateOutcome.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new TokenCreateOutcome.Unreachable();
+            default -> new TokenCreateOutcome.Unreachable();
         };
     }
 
@@ -316,6 +421,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new TokenListOutcome.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new TokenListOutcome.Unreachable();
+            default -> new TokenListOutcome.Unreachable();
         };
     }
 
@@ -328,6 +434,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new TokenRevokeOutcome.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new TokenRevokeOutcome.Unreachable();
+            default -> new TokenRevokeOutcome.Unreachable();
         };
     }
 
@@ -706,6 +813,21 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     strings.add(string);
                 }
             }
+        }
+        return strings;
+    }
+
+    /** A discovery auth-mode array must contain strings only; malformed entries cannot be ignored. */
+    private static List<String> requiredStringList(Object value) {
+        if (!(value instanceof List<?> list)) {
+            throw new IllegalArgumentException("authModes must be an array");
+        }
+        List<String> strings = new ArrayList<>(list.size());
+        for (Object element : list) {
+            if (!(element instanceof String string)) {
+                throw new IllegalArgumentException("authModes must contain strings only");
+            }
+            strings.add(string);
         }
         return strings;
     }
@@ -1304,10 +1426,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return named;
     }
 
-    /** One stored artifact decoded from a 200 body, or {@code null} if the body is not a usable artifact. */
+    /** One strictly readable artifact decoded from a 200 body, or {@code null} if it is not usable. */
     private static RemoteArtifact remoteArtifact(String body) {
         if (JsonReader.parse(body) instanceof Map<?, ?> m) {
-            return artifactOf(m);
+            return readableArtifactOf(m);
         }
         return null;
     }
@@ -1328,11 +1450,22 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return artifacts;
     }
 
-    /** One artifact from a decoded JSON object, or {@code null} unless it carries all three string fields. */
+    /** One artifact from a decoded JSON object, or {@code null} unless it carries its id and kind. */
     private static RemoteArtifact artifactOf(Map<?, ?> m) {
+        if (m.get("id") instanceof String id && m.get("kind") instanceof String kind) {
+            String canonical = m.get("canonicalForm") instanceof String s ? s : null;
+            boolean readable = !(m.get("readable") instanceof Boolean b) || b;
+            return new RemoteArtifact(id, kind, canonical, readable);
+        }
+        return null;
+    }
+
+    /** One strictly readable artifact from a single-artifact response. */
+    private static RemoteArtifact readableArtifactOf(Map<?, ?> m) {
         if (m.get("id") instanceof String id
                 && m.get("kind") instanceof String kind
-                && m.get("canonicalForm") instanceof String canonical) {
+                && m.get("canonicalForm") instanceof String canonical
+                && (!(m.get("readable") instanceof Boolean readable) || readable)) {
             return new RemoteArtifact(id, kind, canonical);
         }
         return null;
@@ -1348,6 +1481,70 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // a malformed body has no usable field
         }
         return null;
+    }
+
+    /** The successful {@code /auth/session} response, or null when the body cannot be trusted. */
+    private static SessionExchangeOutcome.Success sessionExchange(String body) {
+        try {
+            if (JsonReader.parse(body) instanceof Map<?, ?> map
+                    && map.get("token") instanceof String token
+                    && map.get("accessExpiresAt") instanceof String accessExpiresAt
+                    && map.get("issuer") instanceof String issuer
+                    && map.get("principal") instanceof String principal
+                    && map.get("scopes") instanceof List<?> rawScopes
+                    && !token.isBlank()
+                    && !issuer.isBlank()
+                    && !principal.isBlank()) {
+                List<String> scopes = new ArrayList<>();
+                for (Object scope : rawScopes) {
+                    if (!(scope instanceof String text) || text.isBlank()) {
+                        return null;
+                    }
+                    scopes.add(text);
+                }
+                return new SessionExchangeOutcome.Success(
+                        token, Instant.parse(accessExpiresAt), issuer, principal, scopes);
+            }
+        } catch (RuntimeException malformed) {
+            // A malformed 200 body is not a usable exchange and must not authenticate the process.
+        }
+        return null;
+    }
+
+    /** A successful login response, with the incremental session contract when requested. */
+    private static LoginOutcome.Success loginSuccess(String body, boolean requireSession, String password) {
+        try {
+            if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                    || !(map.get("token") instanceof String token) || token.isBlank()) {
+                return null;
+            }
+            if (!requireSession) {
+                return new LoginOutcome.Success(token);
+            }
+            if (!(map.get("accessExpiresAt") instanceof String accessExpiresAt)
+                    || !(map.get("issuer") instanceof String issuer) || issuer.isBlank()
+                    || !(map.get("principal") instanceof String principal) || principal.isBlank()
+                    || !(map.get("scopes") instanceof List<?> rawScopes)
+                    || !(map.get("sessionToken") instanceof String sessionToken)
+                    || !LoginOutcome.isValidSessionToken(sessionToken)
+                    || sessionToken.equals(token)
+                    || sessionToken.equals(password)
+                    || !(map.get("sessionIdleExpiresAt") instanceof String idleExpiresAt)
+                    || !(map.get("sessionAbsoluteExpiresAt") instanceof String absoluteExpiresAt)) {
+                return null;
+            }
+            List<String> scopes = new ArrayList<>();
+            for (Object scope : rawScopes) {
+                if (!(scope instanceof String text) || text.isBlank()) {
+                    return null;
+                }
+                scopes.add(text);
+            }
+            return new LoginOutcome.Success(token, Instant.parse(accessExpiresAt), issuer, principal, scopes,
+                    sessionToken, Instant.parse(idleExpiresAt), Instant.parse(absoluteExpiresAt));
+        } catch (RuntimeException malformed) {
+            return null;
+        }
     }
 
     /** A parsed coded refusal: the server's code and message, or a fixed generic message if not coded. */

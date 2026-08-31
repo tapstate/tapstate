@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
@@ -63,7 +64,7 @@ final class Repl {
 
     /** REPL-only words handled here rather than by the command table; completed alongside the verbs. */
     static final List<String> BUILTINS =
-            List.of("help", "exit", "quit", "cd", "pwd", "connect", "disconnect", "login", "logout");
+            List.of("help", "exit", "quit", "cd", "pwd", "connect", "disconnect", "login", "logout", ":ctx");
 
     /**
      * Registry verbs a connected session routes to the server instead of the offline command table. The
@@ -106,6 +107,21 @@ final class Repl {
     /** The transport seam to a server; a network-free fake is injected in tests. */
     private final ControlPlaneClient controlPlane;
 
+    /** The one shared lazy target resolver; absent only in legacy unit seams that exercise no contexts. */
+    private final ContextResolver contextResolver;
+
+    /** The durable target selected at process launch, or null when resolution may use lower sources. */
+    private final String explicitContext;
+
+    /** Shared persistent human-auth service; absent only from legacy network-free unit seams. */
+    private final AuthService authService;
+
+    /** Shared interactive context manager; absent only from legacy seams that exercise no contexts. */
+    private final ContextManager contextManager;
+
+    /** The named context that established the current transport, if this is not a temporary connect. */
+    private ResolvedContext.Named namedContext;
+
     /** Reads the login password masked; a scripted fake is injected in tests, a JLine one bound in {@link #run}. */
     private Prompter prompter;
 
@@ -125,6 +141,9 @@ final class Repl {
 
     /** The connection state, carried across read-loop iterations (offline until {@code connect}). */
     private final Session session = new Session();
+
+    /** The launch-scoped machine bearer, retained only in this process until logout or exit. */
+    private String machineToken;
 
     /** The session workspace: the current {@code cd} directory, injected into workspace-aware verbs. */
     private Path workdir;
@@ -166,11 +185,39 @@ final class Repl {
 
     Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
          UnaryOperator<String> env) {
+        this(commandLine, workdir, controlPlane, prompter, env, null, null);
+    }
+
+    Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
+         UnaryOperator<String> env, ContextResolver contextResolver, String explicitContext) {
+        this(commandLine, workdir, controlPlane, prompter, env, contextResolver, explicitContext, null);
+    }
+
+    Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
+         UnaryOperator<String> env, ContextResolver contextResolver, String explicitContext,
+         AuthService authService) {
+        this(commandLine, workdir, controlPlane, prompter, env, contextResolver, explicitContext,
+                authService, null);
+    }
+
+    Repl(CommandLine commandLine, Path workdir, ControlPlaneClient controlPlane, Prompter prompter,
+         UnaryOperator<String> env, ContextResolver contextResolver, String explicitContext,
+         AuthService authService, ContextManager contextManager) {
         this.commandLine = commandLine;
         this.workdir = workdir;
         this.controlPlane = controlPlane;
         this.prompter = prompter;
         this.env = env;
+        this.contextResolver = contextResolver;
+        this.explicitContext = explicitContext;
+        this.authService = authService;
+        this.contextManager = contextManager;
+    }
+
+    /** Whether this verb can be routed to the control plane when a context resolves. */
+    static boolean isOnlineVerb(String verb) {
+        return ONLINE_VERBS.contains(verb) || Cli.LIVE_VIEW_VERBS.contains(verb)
+                || verb.equals("auth") || verb.equals("context");
     }
 
     /** The live-view verb this line opens with, or null when it opens with something else. */
@@ -201,6 +248,14 @@ final class Repl {
     /** The current connection state. */
     Session session() {
         return session;
+    }
+
+    /** Installs a process-only machine token; issuer discovery runs before the bearer is attached or sent. */
+    void installMachineToken(String token) {
+        if (token == null || token.isBlank()) {
+            throw new IllegalArgumentException("machine token must not be blank");
+        }
+        machineToken = token;
     }
 
     /**
@@ -256,7 +311,17 @@ final class Repl {
             if (connected != Cli.EXIT_OK || username == null || username.isBlank()) {
                 return connected;
             }
-            return login(username, password.get());
+            return login(username, password);
+        } finally {
+            this.quiet = false;
+        }
+    }
+
+    /** Establishes a quiet launch connection without invoking the human-password flow. */
+    int connectForLaunch(String seeds, boolean quiet) {
+        this.quiet = quiet;
+        try {
+            return connect(List.of("connect", seeds));
         } finally {
             this.quiet = false;
         }
@@ -296,6 +361,17 @@ final class Repl {
         return dispatchWords(words);
     }
 
+    /** Dispatches a scripted command without letting lazy target setup contaminate its stdout. */
+    boolean dispatch(List<String> words, boolean quiet) {
+        boolean previous = this.quiet;
+        this.quiet = quiet;
+        try {
+            return dispatchWords(words);
+        } finally {
+            this.quiet = previous;
+        }
+    }
+
     private boolean dispatchLine(String trimmed) {
         if (trimmed.isEmpty()) {
             lastExitCode = Cli.EXIT_OK;
@@ -315,6 +391,10 @@ final class Repl {
             commandLine.getOut().println(workdir.toString());
             commandLine.getOut().flush();
             lastExitCode = Cli.EXIT_OK;
+            return true;
+        }
+        if (trimmed.equals(":ctx")) {
+            lastExitCode = context();
             return true;
         }
         // The read shell is matched on the whole line rather than on its first word, because what it names
@@ -362,6 +442,7 @@ final class Repl {
             return true;
         }
         if (words.get(0).equals("connect")) {
+            namedContext = null;
             lastExitCode = connect(words);
             return true;
         }
@@ -375,6 +456,39 @@ final class Repl {
         }
         if (words.get(0).equals("logout")) {
             lastExitCode = logout();
+            return true;
+        }
+        if (words.get(0).equals("context")
+                && words.stream().anyMatch(word -> word.equals("-h") || word.equals("--help")
+                        || word.equals("-V") || word.equals("--version"))) {
+            lastExitCode = commandLine.execute(words.toArray(new String[0]));
+            return true;
+        }
+        if (words.get(0).equals("context")) {
+            lastExitCode = context();
+            return true;
+        }
+        if (words.get(0).equals("auth")
+                && words.stream().anyMatch(word -> word.equals("-h") || word.equals("--help")
+                        || word.equals("-V") || word.equals("--version"))) {
+            lastExitCode = commandLine.execute(words.toArray(new String[0]));
+            return true;
+        }
+        if (words.get(0).equals("auth")) {
+            if (machineToken != null && isMachineTokenLocalAuth(words)) {
+                lastExitCode = auth(words);
+                return true;
+            }
+            if (!session.isConnected()) {
+                int resolved = isLocalOnlyLogout(words)
+                        ? resolveNamedContextWithoutConnect(words)
+                        : resolveTarget(words);
+                if (resolved != Cli.EXIT_OK) {
+                    lastExitCode = resolved;
+                    return true;
+                }
+            }
+            lastExitCode = auth(words);
             return true;
         }
         // `data-browser <call>` is the same shell reached as a verb, which is how a one-shot invocation
@@ -392,6 +506,13 @@ final class Repl {
                     DataBrowserCall.parseLive(verb, String.join(" ", words.subList(1, words.size()))), verb);
             return true;
         }
+        if (!session.isConnected() && ONLINE_VERBS.contains(words.get(0)) && contextResolver != null) {
+            int resolved = resolveTarget(words);
+            if (resolved != Cli.EXIT_OK) {
+                lastExitCode = resolved;
+                return true;
+            }
+        }
         if (session.isConnected() && ONLINE_VERBS.contains(words.get(0))) {
             lastExitCode = onlineVerb(words);
             return true;
@@ -401,6 +522,74 @@ final class Repl {
         return true;
     }
 
+    private static boolean isMachineTokenLocalAuth(List<String> words) {
+        return words.size() >= 2 && (words.get(1).equals("status") || words.get(1).equals("logout"));
+    }
+
+    private static boolean isLocalOnlyLogout(List<String> words) {
+        return words.equals(List.of("auth", "logout", "--local-only"));
+    }
+
+    /** Resolves durable local state for local-only logout without probing or discovering a server. */
+    private int resolveNamedContextWithoutConnect(List<String> words) {
+        try {
+            Optional<ResolvedContext> resolution = contextResolver.resolve(
+                    null, explicitContext, workspaceFor(words));
+            if (resolution.orElse(null) instanceof ResolvedContext.Named named) {
+                namedContext = named;
+                return Cli.EXIT_OK;
+            }
+            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED,
+                    Map.of("verb", "auth"));
+            return Cli.EXIT_VERB_UNAVAILABLE;
+        } catch (io.tapstate.core.common.TapstateException error) {
+            Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    /** Resolves and reaches a target only after dispatch has established that the verb is online. */
+    private int resolveTarget(List<String> words) {
+        String verb = words.get(0);
+        try {
+            Optional<ResolvedContext> resolution = contextResolver.resolve(null, explicitContext,
+                    workspaceFor(words));
+            if (resolution.isEmpty()) {
+                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
+                return Cli.EXIT_VERB_UNAVAILABLE;
+            }
+            ResolvedContext target = resolution.orElseThrow();
+            String seeds = switch (target) {
+                case ResolvedContext.Temporary temporary -> temporary.seedExpression();
+                case ResolvedContext.Named named -> named.definition().seeds().stream()
+                        .map(URI::toString)
+                        .collect(Collectors.joining(","));
+            };
+            int connected = connect(List.of("connect", seeds));
+            if (connected == Cli.EXIT_OK) {
+                namedContext = target instanceof ResolvedContext.Named named ? named : null;
+            }
+            return connected;
+        } catch (io.tapstate.core.common.TapstateException error) {
+            Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    /** The exact workspace root named on this line, otherwise the session's current root. */
+    private Path workspaceFor(List<String> words) {
+        for (int i = 1; i < words.size(); i++) {
+            String word = words.get(i);
+            if ((word.equals("-w") || word.equals("--workdir")) && i + 1 < words.size()) {
+                return Path.of(words.get(i + 1));
+            }
+            if (word.startsWith("-w=") || word.startsWith("--workdir=")) {
+                return Path.of(word.substring(word.indexOf('=') + 1));
+            }
+        }
+        return workdir;
+    }
+
     /**
      * Routes a connected-session verb (apply / get / ls) to the server. Every {@code /api} verb requires a
      * credential, so an unauthenticated session short-circuits with a benign "run login" line rather than
@@ -408,6 +597,10 @@ final class Repl {
      * another member and the verb is retried once against the new node.
      */
     private int onlineVerb(List<String> words) {
+        int prepared = prepareCredential();
+        if (prepared != Cli.EXIT_OK) {
+            return prepared;
+        }
         PrintWriter err = commandLine.getErr();
         if (!session.isAuthenticated()) {
             Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
@@ -479,6 +672,51 @@ final class Repl {
             case "logs" -> logsOnline(words);
             default -> throw new IllegalStateException("not an online verb: " + words.get(0));
         };
+    }
+
+    /** Restores a named context's cached session after issuer verification and before an API call. */
+    private int resumeNamedSession() {
+        if (namedContext == null || authService == null) {
+            return Cli.EXIT_OK;
+        }
+        try {
+            boolean wasAuthenticated = session.isAuthenticated();
+            authService.resume(namedContext).ifPresent(active -> {
+                activate(active);
+                if (!wasAuthenticated) {
+                    confirm("resumed " + active.record().principal() + "@" + namedContext.name());
+                }
+            });
+            return Cli.EXIT_OK;
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    /** Prepares the only credential source allowed for this process before an API request. */
+    private int prepareCredential() {
+        return machineToken == null ? resumeNamedSession() : activateMachineToken();
+    }
+
+    /**
+     * Runs anonymous issuer discovery before putting a machine token into the transport session. This
+     * deliberately does not involve the human-session cache or session-exchange endpoint.
+     */
+    private int activateMachineToken() {
+        if (session.hasMachineCredential()) {
+            return Cli.EXIT_OK;
+        }
+        try {
+            List<URI> seeds = namedContext == null ? session.seeds() : namedContext.definition().seeds();
+            IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(seeds, null);
+            session.reland(verified.seed());
+            session.authenticateMachine(machineToken, session.seeds());
+            return Cli.EXIT_OK;
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
     }
 
     /** Dispatches machine-token administration while keeping bearer creation a one-time output. */
@@ -698,10 +936,20 @@ final class Repl {
             err.flush();
             return Cli.EXIT_USAGE;
         }
+        if (!session.isConnected() && contextResolver != null) {
+            int resolved = resolveTarget(List.of(verb));
+            if (resolved != Cli.EXIT_OK) {
+                return resolved;
+            }
+        }
         if (!session.isConnected()) {
             Diagnostics.printText(err, CliError.NOT_CONNECTED,
  Map.of("verb", verb), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
+        }
+        int prepared = prepareCredential();
+        if (prepared != Cli.EXIT_OK) {
+            return prepared;
         }
         if (!session.isAuthenticated()) {
             Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
@@ -1394,7 +1642,8 @@ final class Repl {
                     out.println("no resources");
                 } else {
                     for (RemoteArtifact artifact : listed.artifacts()) {
-                        out.println(artifact.kind() + "  " + artifact.id());
+                        out.println(artifact.kind() + "  " + artifact.id()
+                                + (artifact.readable() ? "" : "  (unreadable)"));
                     }
                 }
                 out.flush();
@@ -3018,6 +3267,9 @@ final class Repl {
     private int login(List<String> words) {
         PrintWriter out = commandLine.getOut();
         PrintWriter err = commandLine.getErr();
+        if (machineToken != null) {
+            return machineTokenUsage("login cannot be combined with --token");
+        }
         if (!session.isConnected()) {
             Diagnostics.printText(err, CliError.NOT_CONNECTED,
  Map.of("verb", "login"), session.versions());
@@ -3028,31 +3280,80 @@ final class Repl {
             err.flush();
             return Cli.EXIT_USAGE;
         }
-        return login(words.get(1), prompter.secret("Password"));
+        return login(words.get(1), () -> prompter.secret("Password"));
     }
 
     /**
-     * Signs in with a password already in hand. Split from the typed {@code login} so the password can
-     * come from somewhere other than the prompt — a one-line launch supplies its own — without either
-     * path having to know where the other got it.
+     * Signs in only after the connected seeds pass anonymous issuer discovery. The password supplier
+     * keeps an interactive prompt behind that preflight while allowing one-line launches to provide it.
      */
-    private int login(String username, String password) {
-        PrintWriter out = commandLine.getOut();
+    private int login(String username, Supplier<String> password) {
+        if (namedContext != null && authService != null) {
+            return persistentLogin(username, password);
+        }
         PrintWriter err = commandLine.getErr();
-        URI node = session.landingNode();
-        return switch (controlPlane.login(node, username, password)) {
+        IssuerBinding.Verified verified;
+        try {
+            verified = new IssuerBinding(controlPlane).verify(session.seeds(), null);
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(err, failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+        return switch (verified.withCredential(password.get(),
+                (node, credential) -> controlPlane.login(node, username, credential))) {
             case LoginOutcome.Success success -> {
+                session.reland(verified.seed());
                 session.authenticate(success.token(), username, null, session.seeds());
                 confirm("logged in as " + username);
                 yield Cli.EXIT_OK;
             }
             case LoginOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case LoginOutcome.Unreachable ignored -> {
-                err.println("login: cannot reach " + hostPort(node));
+                err.println("login: cannot reach " + hostPort(verified.seed()));
                 err.flush();
                 yield Cli.EXIT_DIAGNOSTIC;
             }
         };
+    }
+
+    private int persistentLogin(String username, Supplier<String> password) {
+        PrintWriter out = commandLine.getOut();
+        PrintWriter err = commandLine.getErr();
+        try {
+            return switch (authService.login(namedContext, username, password.get(), terminal.getAsBoolean())) {
+                case AuthService.LoginResult.Success success -> {
+                    activate(success.session());
+                    if (success.storage() == AuthFileStore.SaveResult.PERSISTED) {
+                        PrintWriter confirmation = quiet ? err : out;
+                        confirmation.println("signed in as " + success.session().record().principal()
+                                + "; session saved");
+                        confirmation.flush();
+                    } else {
+                        err.println("signed in for this process only; owner-only session storage is unavailable");
+                        err.flush();
+                    }
+                    yield Cli.EXIT_OK;
+                }
+                case AuthService.LoginResult.Rejected rejected -> {
+                    Diagnostics.printText(err, CliError.AUTH_LOGIN_REJECTED,
+                            Map.of("code", rejected.code(), "principal", rejected.principal()));
+                    yield Cli.EXIT_DIAGNOSTIC;
+                }
+                case AuthService.LoginResult.Unreachable ignored -> {
+                    Diagnostics.printText(err, CliError.AUTH_LOGIN_UNREACHABLE,
+                            Map.of("context", namedContext.name()));
+                    yield Cli.EXIT_DIAGNOSTIC;
+                }
+            };
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(err, failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    private void activate(AuthService.ActiveSession active) {
+        session.reland(active.seed());
+        session.authenticate(active.accessToken(), active.record().principal(), null, session.seeds());
     }
 
     /**
@@ -3085,6 +3386,15 @@ final class Repl {
 
     /** Drops the credential while keeping the transport connection; a benign line either way. */
     private int logout() {
+        if (machineToken != null) {
+            clearMachineToken();
+            commandLine.getOut().println("machine token cleared");
+            commandLine.getOut().flush();
+            return Cli.EXIT_OK;
+        }
+        if (namedContext != null && authService != null) {
+            return authLogout(false);
+        }
         PrintWriter out = commandLine.getOut();
         if (session.isAuthenticated()) {
             session.logout();
@@ -3095,6 +3405,184 @@ final class Repl {
         out.flush();
         // dropping a credential that was not held leaves the session where asked, so it is not a failure
         return Cli.EXIT_OK;
+    }
+
+    /** Dispatches the persistent auth namespace while keeping connect/disconnect transport-only. */
+    private int auth(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        if (machineToken != null) {
+            return machineTokenAuth(words);
+        }
+        if (namedContext == null || authService == null) {
+            Diagnostics.printText(err, CliError.CONTEXT_REQUIRED, Map.of("verb", "auth"));
+            return Cli.EXIT_VERB_UNAVAILABLE;
+        }
+        if (words.size() < 2) {
+            return authUsage("missing action");
+        }
+        return switch (words.get(1)) {
+            case "login" -> authLogin(words);
+            case "status" -> words.size() == 2 ? authStatus() : authUsage("status takes no arguments");
+            case "logout" -> authLogoutWords(words);
+            default -> authUsage("unknown action '" + words.get(1) + "'");
+        };
+    }
+
+    private int authLogin(List<String> words) {
+        if (words.size() > 3) {
+            return authUsage("login takes at most one username");
+        }
+        String username = words.size() == 3 ? words.get(2) : null;
+        if (username == null || username.isBlank()) {
+            if (!terminal.getAsBoolean()) {
+                return authUsage("login needs a username outside a terminal");
+            }
+            username = prompter.ask("Username", "");
+        }
+        if (username == null || username.isBlank()) {
+            return authUsage("login needs a non-empty username");
+        }
+        String environmentPassword = env.apply("TAPSTATE_PASSWORD");
+        if (!terminal.getAsBoolean() && (environmentPassword == null || environmentPassword.isEmpty())) {
+            return authUsage("login needs TAPSTATE_PASSWORD outside a terminal");
+        }
+        Supplier<String> password = environmentPassword != null && !environmentPassword.isEmpty()
+                ? () -> environmentPassword
+                : () -> prompter.secret("Password");
+        return persistentLogin(username, password);
+    }
+
+    /** Keeps persistent human-auth commands from operating on a launch-scoped machine bearer. */
+    private int machineTokenAuth(List<String> words) {
+        if (words.size() < 2) {
+            return authUsage("missing action");
+        }
+        return switch (words.get(1)) {
+            case "status" -> {
+                if (words.size() != 2) {
+                    yield authUsage("status takes no arguments");
+                }
+                commandLine.getOut().println("machine token selected for this process");
+                commandLine.getOut().flush();
+                yield Cli.EXIT_OK;
+            }
+            case "logout" -> {
+                if (words.size() > 3 || (words.size() == 3 && !words.get(2).equals("--local-only"))) {
+                    yield authUsage("logout accepts only --local-only");
+                }
+                clearMachineToken();
+                commandLine.getOut().println("machine token cleared");
+                commandLine.getOut().flush();
+                yield Cli.EXIT_OK;
+            }
+            case "login" -> machineTokenUsage("auth login cannot be combined with --token");
+            default -> authUsage("unknown action '" + words.get(1) + "'");
+        };
+    }
+
+    /** Removes only the process credential; it never invokes persistent human-session logout. */
+    private void clearMachineToken() {
+        machineToken = null;
+        session.logout();
+    }
+
+    private int machineTokenUsage(String reason) {
+        commandLine.getErr().println("login: " + reason);
+        commandLine.getErr().flush();
+        return Cli.EXIT_USAGE;
+    }
+
+    private int authStatus() {
+        PrintWriter out = commandLine.getOut();
+        PrintWriter err = commandLine.getErr();
+        try {
+            return switch (authService.status(namedContext)) {
+                case AuthService.Status.SignedIn signedIn -> {
+                    activate(signedIn.session());
+                    out.println("signed in as " + signedIn.session().record().principal()
+                            + " (" + String.join(", ", signedIn.session().record().scopes()) + ")");
+                    out.flush();
+                    yield Cli.EXIT_OK;
+                }
+                case AuthService.Status.SignedOut ignored -> {
+                    out.println("not signed in");
+                    out.flush();
+                    yield Cli.EXIT_OK;
+                }
+            };
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(err, failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    private int authLogoutWords(List<String> words) {
+        if (words.size() == 2) {
+            return authLogout(false);
+        }
+        if (words.size() == 3 && words.get(2).equals("--local-only")) {
+            return authLogout(true);
+        }
+        return authUsage("logout accepts only --local-only");
+    }
+
+    private int authLogout(boolean localOnly) {
+        PrintWriter out = commandLine.getOut();
+        PrintWriter err = commandLine.getErr();
+        try {
+            return switch (authService.logout(namedContext, localOnly)) {
+                case AuthService.LogoutResult.Removed removed -> {
+                    session.logout();
+                    if (removed.localOnly()) {
+                        err.println("local session removed; the remote session remains valid until expiry");
+                        err.flush();
+                    } else {
+                        out.println("session revoked and local cache removed");
+                        out.flush();
+                    }
+                    yield Cli.EXIT_OK;
+                }
+                case AuthService.LogoutResult.SignedOut ignored -> {
+                    session.logout();
+                    out.println("not signed in");
+                    out.flush();
+                    yield Cli.EXIT_OK;
+                }
+                case AuthService.LogoutResult.Rejected rejected -> {
+                    Diagnostics.printText(err, CliError.AUTH_SESSION_REJECTED,
+                            Map.of("code", rejected.code(), "principal", rejected.principal()));
+                    yield Cli.EXIT_DIAGNOSTIC;
+                }
+                case AuthService.LogoutResult.Unreachable ignored -> {
+                    Diagnostics.printText(err, CliError.AUTH_LOGOUT_UNREACHABLE,
+                            Map.of("context", namedContext.name()));
+                    yield Cli.EXIT_DIAGNOSTIC;
+                }
+                case AuthService.LogoutResult.CacheChanged ignored -> {
+                    Diagnostics.printText(err, CliError.AUTH_LOGOUT_CACHE_CHANGED,
+                            Map.of("context", namedContext.name()));
+                    yield Cli.EXIT_DIAGNOSTIC;
+                }
+            };
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            Diagnostics.printText(err, failure.code(), failure.args());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    private int authUsage(String reason) {
+        Diagnostics.printText(commandLine.getErr(), CliError.AUTH_USAGE, Map.of("reason", reason));
+        return Cli.EXIT_USAGE;
+    }
+
+    private int context() {
+        if (contextManager == null) {
+            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_USAGE,
+                    Map.of("reason", "context manager is unavailable in this session"));
+            return Cli.EXIT_USAGE;
+        }
+        return new ContextConsole(contextManager, prompter, workdir,
+                commandLine.getOut(), commandLine.getErr()).run();
     }
 
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */
@@ -3256,6 +3744,7 @@ final class Repl {
         // system(true) for a real terminal; dumb(true) degrades silently to a dumb terminal when
         // there is no TTY (piped / redirected input) instead of printing a JLine warning.
         try (Terminal terminal = TerminalBuilder.builder().system(true).dumb(true).build()) {
+            this.terminal = () -> !"dumb".equalsIgnoreCase(terminal.getType());
             if (prompter == null) {
                 // bind the masked-input reader to the REPL's own terminal (which this try owns and closes)
                 prompter = new JLinePrompter(terminal, false);

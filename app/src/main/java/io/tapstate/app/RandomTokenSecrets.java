@@ -36,7 +36,15 @@ public final class RandomTokenSecrets implements TokenSecrets {
     public GeneratedSecret generate() {
         String tokenId = randomBase64Url(ID_BYTES);
         String secret = randomBase64Url(SECRET_BYTES);
-        return new GeneratedSecret(tokenId, secret, B64_URL.encodeToString(sha256(secret)));
+        return new GeneratedSecret(tokenId, secret, hash(secret));
+    }
+
+    @Override
+    public String hash(String presentedSecret) {
+        if (presentedSecret == null) {
+            throw new IllegalArgumentException("presented secret must not be null");
+        }
+        return B64_URL.encodeToString(sha256(presentedSecret));
     }
 
     @Override

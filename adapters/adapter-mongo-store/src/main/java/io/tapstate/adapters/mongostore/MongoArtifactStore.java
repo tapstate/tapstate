@@ -15,6 +15,7 @@ import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
 
 import java.util.ArrayList;
@@ -203,6 +204,22 @@ public final class MongoArtifactStore implements ArtifactStore {
         });
     }
 
+    @Override
+    public List<StoredArtifactRecord> listStored() {
+        // The browse projection reads document metadata and tests the body one row at a time. A body
+        // that this build cannot reconstruct is retained as an unreadable row instead of aborting the
+        // whole inventory; get() and the strict resource list above still surface the coded IO error.
+        return StoreIo.call(() -> {
+            List<StoredArtifactRecord> rows = new ArrayList<>();
+            try (MongoCursor<Document> cursor = collection.find().iterator()) {
+                while (cursor.hasNext()) {
+                    rows.add(toStoredArtifactRecord(cursor.next()));
+                }
+            }
+            return rows;
+        });
+    }
+
     /** Maps a resource to its stored id, kind, canonical text, and canonical-content hash. */
     static Document toDocument(Resource artifact) {
         String canonical = WRITER.write(artifact);
@@ -230,5 +247,31 @@ public final class MongoArtifactStore implements ArtifactStore {
             // failures are the same storage-integrity signal.
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), e);
         }
+    }
+
+    /** Maps one stored document to the tolerant browse projection without losing its raw body. */
+    static StoredArtifactRecord toStoredArtifactRecord(Document document) {
+        String id = String.valueOf(document.get("_id"));
+        String kind = text(document, "kind");
+        if (kind == null) {
+            kind = "unknown";
+        }
+        String canonical = text(document, "canonical");
+        String contentHash = text(document, "contentHash");
+        boolean readable = false;
+        if (canonical != null) {
+            try {
+                PARSER.parse(canonical);
+                readable = true;
+            } catch (RuntimeException ignored) {
+                // The raw canonical body is deliberately retained for diagnostics and repair.
+            }
+        }
+        return new StoredArtifactRecord(id, kind, canonical, contentHash, readable);
+    }
+
+    private static String text(Document document, String field) {
+        Object value = document.get(field);
+        return value instanceof String s ? s : null;
     }
 }

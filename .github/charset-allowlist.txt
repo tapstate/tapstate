@@ -34,6 +34,7 @@ U+2461  CIRCLED DIGIT TWO                        Enumerated clause of a spec, ci
 U+00E8  LATIN SMALL LETTER E WITH GRAVE          Non-English fixture for the intake translator's tests.
 U+00E9  LATIN SMALL LETTER E WITH ACUTE          Non-ASCII escaping fixture for the JSON reader/writer.
 U+00EF  LATIN SMALL LETTER I WITH DIAERESIS      Table-rename fixture exercising a non-ASCII identifier.
+U+00FC  LATIN SMALL LETTER U WITH DIAERESIS      Malformed-token fixture exercising non-ASCII rejection.
 
 # --- Mathematical and technical symbols ---
 U+00D7  MULTIPLICATION SIGN                      Dimensions and matrix-shaped tables.

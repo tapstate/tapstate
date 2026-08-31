@@ -52,7 +52,7 @@ class BothVersionsInPlayAreReportedIT {
                     .as("the server has to report a version at all before the CLI can relay one")
                     .isNotBlank();
 
-            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD, "version");
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER, "version");
 
             assertThat(run.exitCode()).isZero();
             // The line a reader pastes into a report. Both halves of one build, so both numbers are the

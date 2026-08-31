@@ -47,7 +47,7 @@ class WatchRefusesNonTtyIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
 
-            CliOnce.Run run = CliOnce.run("-c", server.baseUrl().toString(), "-u", USER, "-p", PASSWORD,
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER,
                     "watch", NAMESPACE);
 
             // Refused, not degraded. An implementation that warned and redrew anyway would leave cursor

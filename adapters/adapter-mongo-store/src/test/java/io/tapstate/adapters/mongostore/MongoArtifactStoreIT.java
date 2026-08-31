@@ -11,6 +11,7 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -278,6 +279,31 @@ class MongoArtifactStoreIT {
             assertThat(thrown).isInstanceOf(TapstateException.class);
             assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
             assertThat(((TapstateException) thrown).args()).containsEntry("id", "corrupt");
+        });
+    }
+
+    @Test
+    void listStoredKeepsAnUnreadableStoredDocumentWithoutBlockingItsReadableSiblings() {
+        withStore((store, collection) -> {
+            store.save(PARSER.parse(ORDERS));
+            String malformed = "not: [valid";
+            collection.insertOne(new Document("_id", "corrupt")
+                    .append("kind", "pipeline")
+                    .append("canonical", malformed)
+                    .append("contentHash", "stale-hash"));
+
+            List<StoredArtifactRecord> rows = store.listStored();
+
+            assertThat(rows).hasSize(2);
+            assertThat(rows).filteredOn(row -> row.id().equals("orders")).singleElement()
+                    .satisfies(row -> assertThat(row.readable()).isTrue());
+            assertThat(rows).filteredOn(row -> row.id().equals("corrupt")).singleElement()
+                    .satisfies(row -> {
+                        assertThat(row.kind()).isEqualTo("pipeline");
+                        assertThat(row.canonicalForm()).isEqualTo(malformed);
+                        assertThat(row.contentHash()).isEqualTo("stale-hash");
+                        assertThat(row.readable()).isFalse();
+                    });
         });
     }
 

@@ -8,11 +8,14 @@ import java.util.Objects;
  * the server's JSON. The CLI carries no shared control type (rule R6: it reaches the server over HTTP
  * only), so this mirrors the server's stored-artifact shape independently.
  */
-record RemoteArtifact(String id, String kind, String canonicalForm) {
+record RemoteArtifact(String id, String kind, String canonicalForm, boolean readable) {
+
+    RemoteArtifact(String id, String kind, String canonicalForm) {
+        this(id, kind, canonicalForm, true);
+    }
 
     RemoteArtifact {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(kind, "kind");
-        Objects.requireNonNull(canonicalForm, "canonicalForm");
     }
 }

@@ -17,12 +17,20 @@ import java.util.List;
  */
 final class Session {
 
+    enum CredentialKind {
+        HUMAN_ACCESS,
+        MACHINE
+    }
+
     private List<URI> seeds = List.of();
     private URI landingNode;
     private boolean connected;
 
     /** The bearer credential presented on authenticated requests (opaque; {@code null} while unauthenticated). */
     private String credential;
+
+    /** The provenance of the bearer credential, or {@code null} while unauthenticated. */
+    private CredentialKind credentialKind;
 
     /** The principal to display in the prompt (a username; {@code null} while unauthenticated). */
     private String principal;
@@ -44,6 +52,11 @@ final class Session {
     /** Whether the session currently carries a credential. */
     boolean isAuthenticated() {
         return credential != null;
+    }
+
+    /** Whether the process currently carries a machine bearer rather than a human access token. */
+    boolean hasMachineCredential() {
+        return credentialKind == CredentialKind.MACHINE;
     }
 
     /** The base URL that answered the probe, or {@code null} while offline. */
@@ -99,6 +112,7 @@ final class Session {
         this.members = this.seeds;   // members = seeds until discovery refines them
         // a fresh connect is a new transport target: never carry a credential the previous node issued
         this.credential = null;
+        this.credentialKind = null;
         this.principal = null;
         this.clusterName = null;
         // Reset with the rest: a version carried over from the node this session used to be on would be
@@ -115,8 +129,18 @@ final class Session {
     /** Records an authenticated session: the credential, the principal, an optional cluster name, and members. */
     void authenticate(String credential, String principal, String clusterName, List<URI> members) {
         this.credential = credential;
+        this.credentialKind = CredentialKind.HUMAN_ACCESS;
         this.principal = principal;
         this.clusterName = clusterName;
+        this.members = List.copyOf(members);
+    }
+
+    /** Records a verified machine bearer without associating it with a persisted human principal. */
+    void authenticateMachine(String credential, List<URI> members) {
+        this.credential = credential;
+        this.credentialKind = CredentialKind.MACHINE;
+        this.principal = "machine";
+        this.clusterName = null;
         this.members = List.copyOf(members);
     }
 
@@ -128,6 +152,7 @@ final class Session {
     /** Drops the credential while keeping the transport connection; members fall back to the seeds. */
     void logout() {
         this.credential = null;
+        this.credentialKind = null;
         this.principal = null;
         this.clusterName = null;
         this.members = this.seeds;
@@ -139,6 +164,7 @@ final class Session {
         this.landingNode = null;
         this.connected = false;
         this.credential = null;
+        this.credentialKind = null;
         this.principal = null;
         this.clusterName = null;
         this.serverVersion = null;

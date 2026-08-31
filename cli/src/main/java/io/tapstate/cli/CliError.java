@@ -109,6 +109,75 @@ enum CliError implements TapstateErrorCode {
      */
     IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count")),
 
+    /** The context configuration is not a valid, unambiguous versioned document. */
+    CONTEXT_CONFIG_INVALID("cli.context-config-invalid", Set.of("path", "reason")),
+
+    /** No registered migration can safely interpret the context configuration version. */
+    CONTEXT_CONFIG_VERSION("cli.context-config-version", Set.of("path", "version")),
+
+    /** The context configuration path cannot prove that only its owner may change it. */
+    CONTEXT_CONFIG_PERMISSIONS("cli.context-config-permissions", Set.of("path", "reason")),
+
+    /** The auth cache is not a valid, unambiguous versioned session document. */
+    AUTH_CACHE_INVALID("cli.auth-cache-invalid", Set.of("path", "reason")),
+
+    /** No registered CLI release can safely interpret the auth cache version. */
+    AUTH_CACHE_VERSION("cli.auth-cache-version", Set.of("path", "version")),
+
+    /** The auth cache path cannot prove that only its owner may read or change it. */
+    AUTH_CACHE_PERMISSIONS("cli.auth-cache-permissions", Set.of("path", "reason")),
+
+    /** A cached session could not be exchanged because the server rejected it. */
+    AUTH_SESSION_REJECTED("cli.auth-session-rejected", Set.of("code", "principal")),
+
+    /** A cached session could not be exchanged because no server answered safely. */
+    AUTH_SESSION_UNREACHABLE("cli.auth-session-unreachable", Set.of("principal")),
+
+    /** Persistent login could not obtain the complete access-and-session response safely. */
+    AUTH_LOGIN_UNREACHABLE("cli.auth-login-unreachable", Set.of("context")),
+
+    /** Persistent login was rejected without rendering an untrusted server response body. */
+    AUTH_LOGIN_REJECTED("cli.auth-login-rejected", Set.of("code", "principal")),
+
+    /** Remote session revocation could not be confirmed, so the local cache was retained. */
+    AUTH_LOGOUT_UNREACHABLE("cli.auth-logout-unreachable", Set.of("context")),
+
+    /** Logout revoked an older session while a newer local session replaced its cache entry. */
+    AUTH_LOGOUT_CACHE_CHANGED("cli.auth-logout-cache-changed", Set.of("context")),
+
+    /** The persistent auth namespace was invoked with an invalid action or operand shape. */
+    AUTH_USAGE("cli.auth-usage", Set.of("reason")),
+
+    /** The interactive context manager could not continue with the current input or terminal state. */
+    CONTEXT_USAGE("cli.context-usage", Set.of("reason")),
+
+    /** A context definition supplied to the manager violates the persisted schema. */
+    CONTEXT_INVALID("cli.context-invalid", Set.of("name", "reason")),
+
+    /** A context manager operation named a context that does not exist. */
+    CONTEXT_NOT_FOUND("cli.context-not-found", Set.of("name")),
+
+    /** A context manager create operation tried to reuse an existing name. */
+    CONTEXT_ALREADY_EXISTS("cli.context-already-exists", Set.of("name")),
+
+    /** Mutually exclusive temporary and durable context sources were supplied together. */
+    CONTEXT_SOURCE_CONFLICT("cli.context-source-conflict", Set.of()),
+
+    /** An online verb has no explicit, environment, or exact workspace target. */
+    CONTEXT_REQUIRED("cli.context-required", Set.of("verb")),
+
+    /** A non-loopback seed would expose authentication traffic over plaintext HTTP. */
+    REMOTE_PLAINTEXT("cli.remote-plaintext", Set.of("seed")),
+
+    /** A configured seed did not answer anonymous issuer discovery. */
+    ISSUER_DISCOVERY_FAILED("cli.issuer-discovery-failed", Set.of("seed")),
+
+    /** A seed answered discovery with fields that cannot identify a Tapstate cluster. */
+    ISSUER_DISCOVERY_INVALID("cli.issuer-discovery-invalid", Set.of("seed", "reason")),
+
+    /** A cached issuer or another seed differs from the anonymously discovered issuer. */
+    AUTH_ISSUER_MISMATCH("cli.auth-issuer-mismatch", Set.of("expected", "actual", "seed")),
+
     /**
      * This CLI and the server it just connected to are different versions; {@code cli} and
      * {@code server} are the two numbers. A warning, not a refusal: the connection is good and every

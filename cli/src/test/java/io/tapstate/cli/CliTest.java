@@ -78,6 +78,86 @@ class CliTest {
     }
 
     @Test
+    void authHelpIsUsefulThroughBothSupportedHelpForms() {
+        Run direct = run("auth", "--help");
+        Run helpCommand = run("help", "auth");
+
+        assertThat(direct.code()).isZero();
+        assertThat(helpCommand.code()).isZero();
+        assertThat(direct.out()).contains("tapstate auth <login|status|logout>").contains("--local-only");
+        assertThat(helpCommand.out()).contains("tapstate auth <login|status|logout>").contains("--local-only");
+    }
+
+    @Test
+    void rootHelpDocumentsProcessOnlyMachineTokenSelection() {
+        Run help = run("--help");
+
+        assertThat(help.code()).isZero();
+        assertThat(help.out()).contains("--token TOKEN")
+                .contains("TAPSTATE_TOKEN")
+                .contains("process only");
+        assertThat(help.err()).isEmpty();
+    }
+
+    @Test
+    void authMaySelectItsContextAfterTheAction() {
+        LaunchOptions login = LaunchOptions.parse("auth", "login", "alice", "--context", "dev");
+        LaunchOptions status = LaunchOptions.parse("auth", "status", "--context=dev");
+        LaunchOptions logout = LaunchOptions.parse("auth", "logout", "--context", "dev", "--local-only");
+        LaunchOptions unrelated = LaunchOptions.parse("connectors", "--context", "dev");
+
+        assertThat(login.context()).isEqualTo("dev");
+        assertThat(login.command()).containsExactly("auth", "login", "alice");
+        assertThat(status.context()).isEqualTo("dev");
+        assertThat(status.command()).containsExactly("auth", "status");
+        assertThat(logout.context()).isEqualTo("dev");
+        assertThat(logout.command()).containsExactly("auth", "logout", "--local-only");
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "--context", "dev", "status"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(unrelated.context()).isNull();
+        assertThat(unrelated.command()).containsExactly("connectors", "--context", "dev");
+    }
+
+    @Test
+    void authRejectsMalformedOrDuplicateTrailingContextsBeforeSessionDispatch() {
+        assertThatThrownBy(() -> LaunchOptions.parse("--context=", "auth", "status"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("--context", "", "auth", "logout"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "status", "--context"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "status", "--context="))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "login", "alice",
+                "--context", "dev", "--context", "production"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("--context", "production",
+                "auth", "status", "--context", "dev"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void contextHelpIsAUsefulNarrowInteractiveSurface() {
+        Run direct = run("context", "--help");
+        Run helpCommand = run("help", "context");
+
+        assertThat(direct.code()).isZero();
+        assertThat(helpCommand.code()).isZero();
+        assertThat(direct.out()).contains("tapstate context")
+                .contains("Create, choose, edit, bind, unbind, or delete saved contexts.");
+        assertThat(helpCommand.out()).contains("tapstate context")
+                .contains("Create, choose, edit, bind, unbind, or delete saved contexts.");
+        assertThat(Cli.newCommandLine().getSubcommands().get("context").getSubcommands())
+                .doesNotContainKeys("add", "use", "list", "show", "bind", "unbind", "remove");
+    }
+
+    @Test
+    void liveViewVerbsAreOnlineLaunchesEvenThoughTheyProjectNoOperation() {
+        assertThat(Cli.LIVE_VIEW_VERBS).allSatisfy(verb ->
+                assertThat(Repl.isOnlineVerb(verb)).as(verb).isTrue());
+    }
+
+    @Test
     void mcpLauncherIsAOneShotMetaCommand() {
         Run help = run("mcp", "--help");
 
@@ -126,6 +206,18 @@ class CliTest {
         assertThat(r.code()).isZero();
         assertThat(r.out()).contains("cli").contains(Cli.VERSION_NUMBER);
         assertThat(r.out()).contains("server").contains("not connected");
+    }
+
+    @Test
+    void versionKeepsItsOfflineFormButUsesASpecifiedServerTarget() {
+        // `version` has a useful offline answer, but it is also the one report that needs to reach a
+        // selected server. Keeping the choice at the process boundary ensures -c/-u is not silently
+        // discarded before session setup (the regression covered by the E2E version check).
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("version"))).isTrue();
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("-c", "http://node:8080",
+                "version"))).isFalse();
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("--context", "dev",
+                "version"))).isFalse();
     }
 
     @ParameterizedTest
@@ -786,6 +878,49 @@ class CliTest {
         // the seed honours the flag with the option's own precedence
         assertThat(LaunchOptions.parse("-w", "foo").root()).isEqualTo(Path.of("foo"));
         assertThat(LaunchOptions.parse("--workdir=bar").root()).isEqualTo(Path.of("bar"));
+    }
+
+    @Test
+    void contextIsARootLaunchOptionAndConflictsWithTemporaryConnect() {
+        LaunchOptions selected = LaunchOptions.parse("--context", "dev", "ls");
+
+        assertThat(selected.context()).isEqualTo("dev");
+        assertThat(selected.command()).containsExactly("ls");
+        assertThat(selected.hasConflictingTargets()).isFalse();
+        assertThat(LaunchOptions.parse("--connect", "node:8080", "--context", "dev", "ls")
+                .hasConflictingTargets()).isTrue();
+    }
+
+    @Test
+    void machineTokenFallsBackToTheEnvironmentWithoutChangingTheCommand() {
+        LaunchOptions fromEnvironment = LaunchOptions.parse("ls")
+                .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
+
+        assertThat(fromEnvironment.machineToken()).isEqualTo("machine-from-env");
+        assertThat(fromEnvironment.command()).containsExactly("ls");
+        assertThat(LaunchOptions.parse("ls").withEnv(name -> null).machineToken()).isNull();
+        assertThat(LaunchOptions.parse("ls").withEnv(name -> "   ").machineToken()).isNull();
+    }
+
+    @Test
+    void explicitMachineTokenTakesPrecedenceOverTheEnvironment() {
+        LaunchOptions explicit = LaunchOptions.parse("--token", "machine-from-flag", "ls")
+                .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
+
+        assertThat(explicit.machineToken()).isEqualTo("machine-from-flag");
+        assertThat(explicit.command()).containsExactly("ls");
+        assertThatThrownBy(() -> LaunchOptions.parse("--token=", "ls"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void passwordAndTheLegacyShortFormAreRejectedAsLaunchOptions() {
+        assertThatThrownBy(() -> LaunchOptions.parse(
+                "--connect", "localhost:8080", "--user", "admin", "--password", "pw", "ls"))
+                .isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse(
+                "--connect", "localhost:8080", "--user", "admin", "-p", "pw", "ls"))
+                .isInstanceOf(RuntimeException.class);
     }
 
     @Test

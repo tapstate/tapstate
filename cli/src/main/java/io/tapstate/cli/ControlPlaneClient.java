@@ -15,6 +15,11 @@ import java.util.function.BooleanSupplier;
  */
 interface ControlPlaneClient extends AutoCloseable {
 
+    /** Reads anonymous stable cluster identity from the well-known endpoint. */
+    default DiscoveryOutcome discover(URI baseUrl) {
+        return new DiscoveryOutcome.Unreachable();
+    }
+
     /** Whether {@code GET {baseUrl}/healthz} answers 200; any I/O failure counts as not healthy. */
     boolean isHealthy(URI baseUrl);
 
@@ -32,6 +37,24 @@ interface ControlPlaneClient extends AutoCloseable {
      * failure. Never throws.
      */
     LoginOutcome login(URI baseUrl, String username, String password);
+
+    /** Requests an opaque persistent user session in addition to the short-lived access token. */
+    default LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
+        return createSession ? new LoginOutcome.Unreachable() : login(baseUrl, username, password);
+    }
+
+    /**
+     * Exchanges an opaque cached user session via {@code POST {baseUrl}/auth/session}; the presented
+     * credential uses the {@code TapstateSession} auth scheme and returns a short-lived bearer token.
+     */
+    default SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
+        return new SessionExchangeOutcome.Unreachable();
+    }
+
+    /** Revokes an opaque cached user session. */
+    default SessionLogoutOutcome logoutSession(URI baseUrl, String sessionToken) {
+        return new SessionLogoutOutcome.Unreachable();
+    }
 
     /**
      * Applies a batch of authored drafts via {@code POST {baseUrl}/api/artifacts:apply}, authenticated by

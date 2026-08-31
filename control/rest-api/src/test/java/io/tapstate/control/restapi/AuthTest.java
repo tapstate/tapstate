@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.ArtifactQueryService;
@@ -8,6 +9,7 @@ import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
+import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.ConnectorSpecStore;
@@ -30,6 +32,7 @@ import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
+import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
@@ -49,10 +52,14 @@ import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResultStore;
+import io.tapstate.spi.store.ClusterIdentity;
+import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SessionRecord;
+import io.tapstate.spi.store.SessionStore;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.messages.MessageCatalog;
 import io.tapstate.spi.store.ArtifactStore;
@@ -134,6 +141,8 @@ class AuthTest {
     void resetStores() {
         context.getBean(FakeUserStore.class).clear();
         context.getBean(FakeTokenStore.class).clear();
+        context.getBean(FakeSessionStore.class).clear();
+        context.getBean(FakeTokenSecrets.class).clear();
         context.getBean(InMemoryArtifactStore.class).clear();
     }
 
@@ -172,6 +181,19 @@ class AuthTest {
                 });
 
         assertThat(body.code()).isEqualTo("control.unauthenticated");
+    }
+
+    @Test
+    void aUserSessionSchemeCanNeverAuthenticateTheApiBearerSurface() {
+        ApiError body = client().get().uri("/api/artifacts")
+                .header("Authorization", "TapstateSession tss_s01.session-secret")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.params()).isEmpty();
     }
 
     // ---- the grade check refuses an under-scoped caller but admits a sufficient one ----
@@ -354,6 +376,141 @@ class AuthTest {
     }
 
     @Test
+    void legacyAndAccessOnlyLoginDoNotCreateAPersistentSession() {
+        seedUser("alice", "s3cret", "admin");
+
+        LoginResponse legacy = client().post().uri("/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new LoginRequest("alice", "s3cret"))
+                .retrieve().toEntity(LoginResponse.class).getBody();
+        LoginResponse accessOnly = client().post().uri("/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new LoginRequest("alice", "s3cret", false))
+                .retrieve().toEntity(LoginResponse.class).getBody();
+
+        assertThat(legacy.token()).isNotBlank();
+        assertThat(accessOnly.token()).isNotBlank();
+        assertThat(legacy.accessExpiresAt()).isEqualTo("2026-07-08T12:15:00Z");
+        assertThat(accessOnly.accessExpiresAt()).isEqualTo("2026-07-08T12:15:00Z");
+        assertThat(legacy.sessionToken()).isNull();
+        assertThat(legacy.sessionIdleExpiresAt()).isNull();
+        assertThat(legacy.sessionAbsoluteExpiresAt()).isNull();
+        assertThat(accessOnly.sessionToken()).isNull();
+        assertThat(accessOnly.sessionIdleExpiresAt()).isNull();
+        assertThat(accessOnly.sessionAbsoluteExpiresAt()).isNull();
+    }
+
+    @Test
+    void persistentLoginCreatesAnOpaqueSessionThatCanMintAndRevokeAccessTokens() {
+        seedUser("alice", "s3cret", "admin");
+
+        LoginResponse login = client().post().uri("/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new LoginRequest("alice", "s3cret", true))
+                .retrieve().toEntity(LoginResponse.class).getBody();
+
+        assertThat(login.token()).isEqualTo("alice|ADMIN");
+        assertThat(login.accessExpiresAt()).isEqualTo("2026-07-08T12:15:00Z");
+        assertThat(login.issuer()).isEqualTo("urn:tapstate:cluster:01J5AUTHFIXTURE");
+        assertThat(login.principal()).isEqualTo("alice");
+        assertThat(login.scopes()).containsExactly("read", "write", "admin");
+        assertThat(login.sessionToken()).isEqualTo("tss_tok-1.sec-1");
+        assertThat(login.sessionIdleExpiresAt()).isEqualTo("2026-08-07T12:00:00Z");
+        assertThat(login.sessionAbsoluteExpiresAt()).isEqualTo("2026-10-06T12:00:00Z");
+
+        SessionExchangeResponse exchanged = client().post().uri(AuthWire.SESSION_PATH)
+                .header(HttpHeaders.AUTHORIZATION, AuthWire.sessionAuthorization(login.sessionToken()))
+                .retrieve().toEntity(SessionExchangeResponse.class).getBody();
+        assertThat(exchanged.token()).isEqualTo("alice|ADMIN");
+        assertThat(exchanged.accessExpiresAt()).isEqualTo("2026-07-08T12:15:00Z");
+        assertThat(exchanged.issuer()).isEqualTo("urn:tapstate:cluster:01J5AUTHFIXTURE");
+        assertThat(exchanged.principal()).isEqualTo("alice");
+        assertThat(exchanged.scopes()).containsExactly("read", "write", "admin");
+
+        HttpStatusCode logout = client().post().uri(AuthWire.LOGOUT_PATH)
+                .header(HttpHeaders.AUTHORIZATION, AuthWire.sessionAuthorization(login.sessionToken()))
+                .exchange((request, response) -> response.getStatusCode());
+        HttpStatusCode logoutAgain = client().post().uri(AuthWire.LOGOUT_PATH)
+                .header(HttpHeaders.AUTHORIZATION, AuthWire.sessionAuthorization(login.sessionToken()))
+                .exchange((request, response) -> response.getStatusCode());
+        ApiError afterLogout = client().post().uri(AuthWire.SESSION_PATH)
+                .header(HttpHeaders.AUTHORIZATION, AuthWire.sessionAuthorization(login.sessionToken()))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(logout).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(logoutAgain).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(afterLogout.code()).isEqualTo("control.unauthenticated");
+    }
+
+    @Test
+    void sessionExchangeAcceptsOnlyTheTapstateSessionScheme() {
+        seedUser("alice", "s3cret", "admin");
+        LoginResponse login = client().post().uri("/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new LoginRequest("alice", "s3cret", true))
+                .retrieve().toEntity(LoginResponse.class).getBody();
+
+        ApiError bearer = client().post().uri(AuthWire.SESSION_PATH)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + login.sessionToken())
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(bearer.code()).isEqualTo("control.unauthenticated");
+
+        ApiError sessionAsApiBearer = client().get().uri("/api/artifacts")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + login.sessionToken())
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(sessionAsApiBearer.code()).isEqualTo("control.unauthenticated");
+    }
+
+    @Test
+    void sessionEndpointsRejectMalformedDuplicateUnknownAndIssuerMismatchedCredentials() {
+        seedUser("alice", "s3cret", "admin");
+        LoginResponse login = client().post().uri("/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new LoginRequest("alice", "s3cret", true))
+                .retrieve().toEntity(LoginResponse.class).getBody();
+
+        assertSessionUnauthorized(AuthWire.SESSION_PATH, "TapstateSession  " + login.sessionToken());
+        SessionExchangeResponse differentlyCasedScheme = client().post().uri(AuthWire.SESSION_PATH)
+                .header(HttpHeaders.AUTHORIZATION, "tapstatesession " + login.sessionToken())
+                .retrieve().toEntity(SessionExchangeResponse.class).getBody();
+        assertThat(differentlyCasedScheme.token()).isNotBlank();
+        assertSessionUnauthorized(AuthWire.SESSION_PATH, "TapstateSession missing.secret");
+        ApiError duplicate = client().post().uri(AuthWire.SESSION_PATH)
+                .header(HttpHeaders.AUTHORIZATION,
+                        AuthWire.sessionAuthorization(login.sessionToken()),
+                        AuthWire.sessionAuthorization(login.sessionToken()))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(duplicate.code()).isEqualTo("control.unauthenticated");
+
+        context.getBean(FakeSessionStore.class).replaceIssuer("tok-1", "urn:other");
+        assertSessionUnauthorized(AuthWire.SESSION_PATH, AuthWire.sessionAuthorization(login.sessionToken()));
+        assertSessionUnauthorized(AuthWire.LOGOUT_PATH, AuthWire.sessionAuthorization(login.sessionToken()));
+    }
+
+    private void assertSessionUnauthorized(String path, String authorization) {
+        ApiError error = client().post().uri(path)
+                .header(HttpHeaders.AUTHORIZATION, authorization)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(error.code()).isEqualTo("control.unauthenticated");
+    }
+
+    @Test
     void aHumanJwtCarriesItsPrincipalIntoAnAuditedWriteWithoutCreatingAServletSession() {
         seedUser("alice", "s3cret", "admin");
         LoginResponse login = client().post().uri("/auth/login")
@@ -457,12 +614,27 @@ class AuthTest {
         assertThat(body.params()).containsKey("reason");
     }
 
-    // ---- the liveness probe stays anonymous; topology does not ----
+    // ---- the liveness probe and discovery stay anonymous; topology does not ----
 
     @Test
     void theLivenessProbeStaysAnonymous() {
         String probe = client().get().uri("/healthz").retrieve().body(String.class);
         assertThat(probe).isEqualTo("ok");
+    }
+
+    @Test
+    void issuerDiscoveryStaysAnonymous() {
+        IssuerDiscoveryResponse discovery = client().get().uri(AuthWire.DISCOVERY_PATH)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    return response.bodyTo(IssuerDiscoveryResponse.class);
+                });
+
+        assertThat(discovery).isEqualTo(new IssuerDiscoveryResponse(
+                "urn:tapstate:cluster:01J5AUTHFIXTURE",
+                "01J5AUTHFIXTURE",
+                "tapstate/v1",
+                List.of("password", "machine_token")));
     }
 
     @Test
@@ -484,12 +656,13 @@ class AuthTest {
     @Test
     void theOnlyEndpointsOutsideTheApiPrefixAreTheProbeAndThePreAuthEntryPoints() {
         // /api is the authenticated boundary (the API security chain guards /api/**). Everything reachable
-        // anonymously must therefore be an intentional carve-out: the liveness probe, the two pre-auth
-        // entry points, and the framework's own error endpoint (which renders only the current request's
-        // error, no application data). A future plain @Controller added at the root would escape both the
-        // verb-derivation gate and the interceptor — this pins the anonymous surface to exactly that set.
-        Set<String> allowedRootPaths =
-                Set.of("/healthz", "/version", "/auth/login", "/auth/bootstrap", "/error");
+        // anonymously must therefore be an intentional carve-out: the liveness probe, version and issuer
+        // discovery, the two pre-auth entry points, and the framework's own error endpoint (which renders only the
+        // current request's error, no application data). A future plain @Controller added at the root would
+        // escape both the verb-derivation gate and the interceptor — this pins the anonymous surface to
+        // exactly that set.
+        Set<String> allowedRootPaths = Set.of("/healthz", "/version", AuthWire.DISCOVERY_PATH, "/auth/login",
+                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, "/auth/bootstrap", "/error");
 
         RequestMappingHandlerMapping mapping =
                 context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
@@ -511,7 +684,7 @@ class AuthTest {
         });
 
         assertThat(unexpectedRootEndpoints)
-                .as("only the liveness probe and the pre-auth entry points may live outside /api; every "
+                .as("only the liveness probe, issuer discovery, and the pre-auth entry points may live outside /api; every "
                         + "other endpoint is a registry verb under the authenticated /api prefix")
                 .isEmpty();
     }
@@ -563,6 +736,11 @@ class AuthTest {
         }
 
         @Bean
+        FakeSessionStore sessionStore() {
+            return new FakeSessionStore();
+        }
+
+        @Bean
         AuditStore auditStore() {
             // A no-op is enough here; the "no audit, no execute" gate contract is proven in control-core.
             return entry -> {
@@ -580,7 +758,7 @@ class AuthTest {
         }
 
         @Bean
-        TokenSecrets tokenSecrets() {
+        FakeTokenSecrets tokenSecrets() {
             return new FakeTokenSecrets();
         }
 
@@ -590,13 +768,41 @@ class AuthTest {
         }
 
         @Bean
+        ClusterIdentityService clusterIdentityService() {
+            ClusterIdentity identity = new ClusterIdentity("01J5AUTHFIXTURE");
+            ClusterIdentityStore store = new ClusterIdentityStore() {
+                @Override
+                public Optional<ClusterIdentity> find() {
+                    return Optional.of(identity);
+                }
+
+                @Override
+                public ClusterIdentity createIfAbsent(ClusterIdentity proposed) {
+                    return identity;
+                }
+            };
+            return new ClusterIdentityService(store, () -> "unused");
+        }
+
+        @Bean
         TokenService tokenService(TokenStore store, TokenSecrets secrets, Clock clock) {
             return new TokenService(store, secrets, clock);
         }
 
         @Bean
-        LoginService loginService(UserStore users, PasswordHasher hasher, TokenSigner signer) {
-            return new LoginService(users, hasher, signer);
+        AccessTokenService accessTokenService(TokenSigner signer, Clock clock) {
+            return new AccessTokenService(signer, clock);
+        }
+
+        @Bean
+        SessionService sessionService(
+                SessionStore store, TokenSecrets secrets, AccessTokenService accessTokens, Clock clock) {
+            return new SessionService(store, secrets, accessTokens, clock);
+        }
+
+        @Bean
+        LoginService loginService(UserStore users, PasswordHasher hasher, AccessTokenService accessTokens) {
+            return new LoginService(users, hasher, accessTokens);
         }
 
         @Bean
@@ -900,6 +1106,63 @@ class AuthTest {
         }
     }
 
+    private static final class FakeSessionStore implements SessionStore {
+        private final Map<String, SessionRecord> byId = new LinkedHashMap<>();
+
+        synchronized void clear() {
+            byId.clear();
+        }
+
+        synchronized void replaceIssuer(String id, String issuer) {
+            SessionRecord record = byId.get(id);
+            byId.put(id, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
+                    record.scope(), issuer, record.revoked(), record.createdAt(), record.lastUsedAt(),
+                    record.idleExpiresAt(), record.absoluteExpiresAt()));
+        }
+
+        @Override
+        public synchronized void save(SessionRecord record) {
+            byId.put(record.sessionId(), record);
+        }
+
+        @Override
+        public synchronized Optional<SessionRecord> find(String sessionId) {
+            return Optional.ofNullable(byId.get(sessionId));
+        }
+
+        @Override
+        public synchronized Optional<SessionRecord> exchange(
+                String sessionId, String secretHash, String issuer, Instant now, Instant idleExpiresAt) {
+            SessionRecord record = byId.get(sessionId);
+            if (!valid(record, secretHash, issuer, now) || record.revoked()) {
+                return Optional.empty();
+            }
+            SessionRecord touched = new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
+                    record.scope(), record.issuer(), false, record.createdAt(), now,
+                    idleExpiresAt.isBefore(record.absoluteExpiresAt()) ? idleExpiresAt : record.absoluteExpiresAt(),
+                    record.absoluteExpiresAt());
+            byId.put(sessionId, touched);
+            return Optional.of(touched);
+        }
+
+        @Override
+        public synchronized boolean revoke(String sessionId, String secretHash, String issuer, Instant now) {
+            SessionRecord record = byId.get(sessionId);
+            if (!valid(record, secretHash, issuer, now)) {
+                return false;
+            }
+            byId.put(sessionId, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
+                    record.scope(), record.issuer(), true, record.createdAt(), record.lastUsedAt(),
+                    record.idleExpiresAt(), record.absoluteExpiresAt()));
+            return true;
+        }
+
+        private static boolean valid(SessionRecord record, String secretHash, String issuer, Instant now) {
+            return record != null && record.secretHash().equals(secretHash) && record.issuer().equals(issuer)
+                    && record.idleExpiresAt().isAfter(now) && record.absoluteExpiresAt().isAfter(now);
+        }
+    }
+
     /** A deterministic password hasher (hash:raw). */
     private static final class FakeHasher implements PasswordHasher {
         @Override
@@ -917,10 +1180,19 @@ class AuthTest {
     private static final class FakeTokenSecrets implements TokenSecrets {
         private int counter;
 
+        void clear() {
+            counter = 0;
+        }
+
         @Override
         public GeneratedSecret generate() {
             counter++;
             return new GeneratedSecret("tok-" + counter, "sec-" + counter, "hash:sec-" + counter);
+        }
+
+        @Override
+        public String hash(String presentedSecret) {
+            return "hash:" + presentedSecret;
         }
 
         @Override
