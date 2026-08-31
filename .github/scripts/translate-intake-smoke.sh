@@ -104,10 +104,10 @@ check() { # check <name> <0 = must hold> ; caller supplies the condition via `if
 has()     { printf '%s' "$1" | grep -qiF -- "$2"; }
 in_file() { [ -f "$1" ] && grep -qiF -- "$2" "$1"; }
 
-# A report that reads as foreign to the check this script drives: it carries a character that is not
-# on the repository's allow-list. `\xC3\xA0` is the French a-grave (U+00E0), which nothing in this
-# repository has ever had a reason to allow. The accented letters left in plain text - e-acute,
-# e-grave - ARE on that list, which is exactly why they cannot carry this fixture.
+# A report that reads as foreign, and doubly so: `\xC3\xA0` is the French a-grave (U+00E0), which is
+# on no list here, and it is a letter. Either half alone is now enough - the accented letters left
+# in plain text are on the allow-list and are translated anyway, which is what the letter section
+# below is about - so this fixture no longer rests on the distinction it was written to avoid.
 fr="Le connecteur échoue $(printf '\xC3\xA0') démarrer, voici la trace."
 
 echo "translate-intake cases"
@@ -285,6 +285,46 @@ stage "The connector fails at startup."
 out="$(run "$zh")"
 check "a body outside the allow-list: is still sent to the engine" "$([ -f "$scratch/curl-stdin" ] && echo 0 || echo 1)"
 check "a body outside the allow-list: is translated" "$(in_file "$scratch/gh-log" "--method POST" && echo 0 || echo 1)"
+
+# --- a letter is not typesetting -----------------------------------------------------------------
+# The allow-list holds three accented letters, and the line above them in that file says why they
+# are there: "Present as test data, not as prose". A JSON escaping fixture and a table-rename case
+# in this repository use them. Subtracting them from THIS question hands a bug report the exemption
+# those fixtures were given - measured 2026-08-30 on a real report, French written with only
+# e-acute and e-grave was read as English and never translated, and the reporter got nothing.
+#
+# So this question is deliberately narrower than the character check's: any letter outside ASCII
+# means the text was not written in English, whatever the list says about that letter. The list
+# still decides the other half, and punctuation and symbols are untouched by this - an em dash is
+# not a letter, and neither is an arrow or a box-drawing rule.
+ea="$(printf '\xC3\xA9')"   # e-acute, ON the allow-list
+eg="$(printf '\xC3\xA8')"   # e-grave, ON the allow-list
+
+stage "The connector fails after the first step, here is the trace."
+out="$(run "Le connecteur ${ea}choue apr${eg}s la premi${ea}re ${ea}tape, voici la trace.")"
+check "French written with only allow-listed accents: reaches the engine" "$([ -f "$scratch/curl-stdin" ] && echo 0 || echo 1)"
+check "French written with only allow-listed accents: is translated" "$(in_file "$scratch/gh-log" "--method POST" && echo 0 || echo 1)"
+check "French written with only allow-listed accents: is not called English" "$(has "$out" "English typesetting" && echo 1 || echo 0)"
+
+# The control that keeps the three above from being satisfied by "translate anything non-ASCII" -
+# the criterion this whole section replaced. Every character here is on the allow-list, and not one
+# of them is a letter.
+sym="$(printf '\xC2\xA7 \xC3\x97 \xC3\xB7 \xE2\x89\xA4 \xE2\x86\x92 \xE2\x94\x82\xE2\x94\x80 \xE2\x80\xA6')"
+stage "should not be used"
+out="$(run "Section ${sym} the tree renderer lays the rows out and the bound holds.")"
+check "allow-listed symbols with no letter among them: never reaches the engine" "$([ ! -f "$scratch/curl-stdin" ] && echo 0 || echo 1)"
+check "allow-listed symbols with no letter among them: is read as English" "$(has "$out" "English typesetting" && echo 0 || echo 1)"
+
+# The cost of the line above, named here rather than discovered later: an English report that quotes
+# an accented identifier - and this repository has one, the `naive_orders` rename case spells it
+# with an i-diaeresis - now carries a letter outside ASCII, so it is sent. The engine's sentinel is
+# what stops it there. This is the case that says the cost is one extra call and not a comment
+# posted under somebody's English report.
+ii="$(printf '\xC3\xAF')"   # i-diaeresis, ON the allow-list
+stage "ALREADY_ENGLISH"
+out="$(run "The rename case uses na${ii}ve_orders and the sink drops that column.")"
+check "an English report quoting an accented identifier: is sent to the engine" "$([ -f "$scratch/curl-stdin" ] && echo 0 || echo 1)"
+check "an English report quoting an accented identifier: gets no comment posted" "$(in_file "$scratch/gh-log" "--method POST" && echo 1 || echo 0)"
 
 # The list lives in one file, and a file that could not be read is its own answer. "Nothing in this
 # text is unknown" and "nobody was able to look" are the same empty report, and only one of them

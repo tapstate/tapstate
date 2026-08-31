@@ -71,9 +71,9 @@ better as an attachment than as a report body."
 # fires leave the same evidence until somebody goes and looks.
 #
 # Three answers, not two. Every character is one we use -> English. Something here is not on the
-# list -> translate it. The list could not be read -> neither of those, and it says so: an
-# unreadable list would otherwise read as a report written entirely in some other language, which
-# is the one wrong answer that looks exactly like a right one.
+# list, or a letter outside ASCII is -> translate it. The list could not be read -> neither of
+# those, and it says so: an unreadable list would otherwise read as a report written entirely in
+# some other language, which is the one wrong answer that looks exactly like a right one.
 #
 # KNOWN LIMIT, written down rather than discovered later: a language that is written in plain ASCII
 # - Indonesian, Dutch, Portuguese with the accents dropped - is skipped here as though it were
@@ -88,9 +88,25 @@ English is unknown. Nothing was sent to the translation engine.
 
 $unknown"
 fi
-if [ -z "$unknown" ]; then
+# A letter is not typesetting, and this is the one place the two questions come apart. The
+# allow-list holds three accented letters because fixtures in this repository use them, which the
+# list says on the line above them: "Present as test data, not as prose". Subtracting them from
+# THIS question hands a bug report the exemption a JSON escaping fixture was given - measured
+# 2026-08-30, French written with only e-acute and e-grave was read as English and the person who
+# filed it got nothing back. So a letter outside ASCII means "not English" whatever the list says
+# about that letter, while punctuation and symbols remain entirely the list's call: an em dash is
+# not a letter, and neither is an arrow, a box-drawing rule or a division sign.
+#
+# Perl is asked for the property by name rather than given a pattern of ours, so this enumerates no
+# code point and there is nothing here to drift out of step with the list. The whole body is one
+# record, so at most one marker is printed and nothing closes the pipe early.
+foreign_letter="$(printf '%s' "$body" |
+  perl -CSD -0777 -ne 'for (split //) { if (ord($_) > 127 && /\p{L}/) { print "y"; last } }')"
+
+if [ -z "$unknown" ] && [ -z "$foreign_letter" ]; then
   say "Not translated: every character in the report is one this repository's English typesetting
-uses, which this reads as already in English. Nothing was sent to the translation engine."
+uses and none of them is a letter from another script, which this reads as already in English.
+Nothing was sent to the translation engine."
 fi
 [ -n "${TRANSLATE_API_KEY:-}" ] || say \
   "Skipped: no engine is configured. This run reached the step and found no API key, so the key is
