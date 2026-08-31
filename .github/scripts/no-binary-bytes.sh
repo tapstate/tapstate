@@ -21,6 +21,43 @@ export LC_ALL=C
 
 BINARY_ALLOWLIST="${BINARY_ALLOWLIST:-.binary-allowlist}"
 
+# ---- liveness control -------------------------------------------------------------
+#
+# `git grep` answers "found nothing" and "could not run" with the same exit status, so a
+# clean repository and a detector that has stopped working print the same `clean:` line.
+# That is not hypothetical here: the pattern needs git's PCRE support, and a git built
+# without it fails with a message and a non-zero status that this script would read as
+# "no match". Measured while writing this: a pathspec typo produced `fatal: ... outside
+# the directory tree`, and read exactly like a clean answer.
+#
+# So before deciding anything about this repository, decide a case whose answer is known:
+# one file that MUST match and one that MUST NOT. Both halves, because a detector that
+# matches everything passes the first on its own. --no-index runs the same git matcher
+# against files that are not in any repository.
+# Written with `if !` rather than `cmd; rc=$?`: under `set -e` a bare subshell that exits
+# non-zero kills the script before the next line runs, and the negative control's whole job
+# is to exit non-zero. The first draft of this function did exactly that and the script died
+# with no output at all -- a liveness check that fails silently is worse than none.
+detector_alive() {
+  local d; d="$(mktemp -d)"
+  printf 'before\000after\n' > "$d/has-nul"
+  printf 'beforeafter\n'      > "$d/no-nul"
+  if ! ( cd "$d" && git grep --no-index -aqP '\x00' -- has-nul ); then
+    rm -rf "$d"
+    echo "::error::the NUL detector did not match a control file that contains one."
+    echo "Nothing this step says about the repository can be trusted, so it is a failure rather than a pass."
+    exit 1
+  fi
+  if ( cd "$d" && git grep --no-index -aqP '\x00' -- no-nul ); then
+    rm -rf "$d"
+    echo "::error::the NUL detector matched a control file that contains none, so it matches more than it should."
+    echo "Nothing this step says about the repository can be trusted, so it is a failure rather than a pass."
+    exit 1
+  fi
+  rm -rf "$d"
+}
+detector_alive
+
 # Build pathspec exclusions from the allowlist; ignore comments / blanks.
 pathspec=(':(top)')
 if [ -f "$BINARY_ALLOWLIST" ]; then

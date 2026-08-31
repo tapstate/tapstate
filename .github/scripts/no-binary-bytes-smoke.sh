@@ -105,5 +105,23 @@ else
   failed=$((failed + 1))
 fi
 
+# --- the liveness control fires when the matcher cannot run at all.
+# Shadowed with a real executable that fails, not by trimming PATH: a PATH entry that does
+# not exist makes the shell fall through to the real binary, so the test would quietly
+# measure nothing. This is the failure the control exists for -- a git without PCRE support
+# exits non-zero with a message, which the scan alone would read as "no match, all clean".
+fresh_repo
+shadow="$scratch/shadow"; mkdir -p "$shadow"
+printf '#!/bin/sh\necho "git: simulated failure" >&2\nexit 1\n' > "$shadow/git"
+chmod +x "$shadow/git"
+PATH="$shadow:$PATH" bash "$gate" > "$scratch/out" 2>&1; code=$?
+out="$(tr -d '\000' < "$scratch/out")"
+if [ "$code" != 0 ] && printf '%s' "$out" | grep -qF "did not match a control file"; then
+  printf '  ok    %s\n' "a matcher that cannot run reddens instead of reporting clean"; passed=$((passed + 1))
+else
+  printf '  FAIL  %s\n        got exit %s: %s\n' \
+    "a matcher that cannot run reddens instead of reporting clean" "$code" "$out"; failed=$((failed + 1))
+fi
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

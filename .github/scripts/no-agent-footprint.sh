@@ -18,11 +18,65 @@ set -euo pipefail
 
 MODE="${1:-}"
 
+# Common agent footers; case-insensitive. At the top because the liveness control below
+# has to run this exact string -- a control with its own copy of the pattern proves the
+# copy works and says nothing about the one that decides.
+pattern='Generated with \[?Claude Code|🤖 Generated with|Co-[Aa]uthored-[Bb]y:.*(Claude|GPT|Codex|Copilot|Gemini)|noreply@anthropic\.com'
+
+find_instruction_files() { # <root>
+  find "$1" -path "$1/.git" -prune -o -type f \
+    \( -iname 'CLAUDE.md' -o -iname 'AGENTS.md' -o -iname 'GEMINI.md' \
+       -o -iname 'CODEX.md' -o -iname 'COPILOT.md' \) -print
+}
+
+find_claude_dirs() { # <root>
+  find "$1" -path "$1/.git" -prune -o -type d -name '.claude' -print
+}
+
+# ---- liveness controls ------------------------------------------------------------
+#
+# Every mode here reports a clean repository by printing nothing and exiting 0, which is
+# also exactly what it does when the detector itself has stopped working -- a mistyped
+# pattern, a `find` predicate that silently matches nothing, a grep without the flag it
+# needs. The sibling character check shipped for two years with a broken commit-message
+# scan for that reason: the step said `clean:` on every commit and a person reading a
+# diff is what caught it.
+#
+# So before each mode decides anything about this repository, it decides something about
+# a case it already knows the answer to: one value that MUST match and one that MUST NOT.
+# Both halves are needed. A detector that matches everything passes the first.
+die_detector() { echo "::error::$1"; echo "Nothing this step says about the repository can be trusted, so it is a failure rather than a pass."; exit 1; }
+
+detector_alive_files() {
+  local d hit; d="$(mktemp -d)"
+  : > "$d/CLAUDE.md"; : > "$d/README.md"
+  hit="$(find_instruction_files "$d")"
+  rm -rf "$d"
+  case "$hit" in *CLAUDE.md*) : ;; *) die_detector "the instruction-file detector did not match a control CLAUDE.md." ;; esac
+  case "$hit" in *README.md*) die_detector "the instruction-file detector matched a control README.md, so it matches more than it should." ;; esac
+}
+
+detector_alive_dir() {
+  local d hit; d="$(mktemp -d)"
+  mkdir -p "$d/.claude" "$d/docs"
+  hit="$(find_claude_dirs "$d")"
+  rm -rf "$d"
+  case "$hit" in *.claude*) : ;; *) die_detector "the .claude detector did not match a control .claude directory." ;; esac
+  case "$hit" in *docs*) die_detector "the .claude detector matched a control docs directory, so it matches more than it should." ;; esac
+}
+
+detector_alive_messages() {
+  printf '%s' 'Co-authored-by: Claude <noreply@anthropic.com>' | grep -qEi "$pattern" \
+    || die_detector "the footer pattern did not match a control footer."
+  if printf '%s' 'Tapstate is a data integration product.' | grep -qEi "$pattern"; then
+    die_detector "the footer pattern matched a control sentence with no footer in it, so it matches more than it should."
+  fi
+}
+
 case "$MODE" in
   files)
-    hits="$(find . -path ./.git -prune -o -type f \
-      \( -iname 'CLAUDE.md' -o -iname 'AGENTS.md' -o -iname 'GEMINI.md' \
-         -o -iname 'CODEX.md' -o -iname 'COPILOT.md' \) -print)"
+    detector_alive_files
+    hits="$(find_instruction_files .)"
     if [ -n "$hits" ]; then
       echo "::error::agent instruction file(s) found in a zero-footprint repo:"
       echo "$hits"
@@ -32,7 +86,8 @@ case "$MODE" in
     ;;
 
   dir)
-    hits="$(find . -path ./.git -prune -o -type d -name '.claude' -print)"
+    detector_alive_dir
+    hits="$(find_claude_dirs .)"
     if [ -n "$hits" ]; then
       echo "::error::.claude directory found in a zero-footprint repo:"
       echo "$hits"
@@ -42,8 +97,7 @@ case "$MODE" in
     ;;
 
   messages)
-    # Common agent footers; case-insensitive.
-    pattern='Generated with \[?Claude Code|🤖 Generated with|Co-[Aa]uthored-[Bb]y:.*(Claude|GPT|Codex|Copilot|Gemini)|noreply@anthropic\.com'
+    detector_alive_messages
     fail=0
 
     if [ "${EVENT_NAME:-}" = "pull_request" ]; then

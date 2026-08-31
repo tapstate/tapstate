@@ -148,6 +148,24 @@ else
     "KNOWN DEFECT: a first push scans nothing and reports clean" "$code"; failed=$((failed + 1))
 fi
 
+echo "-- liveness controls"
+# Same idea, same reason: shadow `find` with a real executable that finds nothing. Without
+# the control, both modes would print `clean:` and exit 0 -- which is what a repository with
+# no agent files looks like, and is why the two are indistinguishable without this.
+fresh_repo
+shadow="$scratch/shadow"; mkdir -p "$shadow"
+printf '#!/bin/sh\nexit 0\n' > "$shadow/find"
+chmod +x "$shadow/find"
+for mode in files dir; do
+  PATH="$shadow:$PATH" bash "$gate" "$mode" > "$scratch/out" 2>&1; code=$?
+  if [ "$code" != 0 ] && grep -qF "did not match a control" "$scratch/out"; then
+    printf '  ok    a %s detector that finds nothing at all reddens\n' "$mode"; passed=$((passed + 1))
+  else
+    printf '  FAIL  a %s detector that finds nothing at all reddens\n        got exit %s: %s\n' \
+      "$mode" "$code" "$(cat "$scratch/out")"; failed=$((failed + 1))
+  fi
+done
+
 echo "-- dispatch"
 expect "an unknown mode is a usage error" bogus 2 "usage:"
 
