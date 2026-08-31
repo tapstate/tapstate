@@ -384,6 +384,14 @@ remove the local cache. `connect` remains a temporary diagnostic connection: a l
 `connect` and `login` change only the current REPL process and do not update a context or
 save a session.
 
+The context definition is kept in `~/.tapstate/config.yaml`; its session cache is separate under
+`~/.tapstate/auth/` and is owner-only. Enter `:ctx` again to choose or edit a context, bind or
+unbind the current workspace, or delete a context. Deleting a context can leave its server-side
+session active, so run `auth logout` when you also want to revoke that session. Keep `Verify TLS` enabled for HTTPS endpoints; turn
+it off only for a deliberately local HTTP endpoint such as the loopback example above. If the
+configuration path or file is group/world-readable, the CLI refuses to read or overwrite it until
+you restore owner-only permissions.
+
 For automation, pass a machine token at launch with `--token TOKEN` or
 `TAPSTATE_TOKEN`. It wins over a cached human session for this process, is never read
 from or written to the human-session cache, and is not printed by CLI diagnostics. The

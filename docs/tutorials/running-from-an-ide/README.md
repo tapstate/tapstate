@@ -232,6 +232,43 @@ offered** - it is not present on every configuration type or IDE version, and it
 for: if it is not there, run the CLI in a terminal and keep the IDE for the server. Nothing else about
 the CLI behaves differently between the two.
 
+### Use a saved context when you work on the same checkout repeatedly
+
+The launch above uses a temporary target and login. That is useful for a one-off debugging session,
+but it does not save the server or a session. To keep this workspace associated with the server, start
+the REPL with only its workspace and create a context from `:ctx`:
+
+```console
+$ java -jar cli/target/cli-0.2.1.jar -w ./work
+tapstate(offline:work)> :ctx
+Context action: Create a context
+Context name: ide
+Server URL: http://127.0.0.1:8080
+Verify TLS [Y]: n
+Bind ide to /.../work [Y]:
+created context ide
+bound ide to /.../work
+tapstate(offline:work)> auth login admin
+Password:                       # masked; TAPSTATE_PASSWORD also works for scripts
+signed in as admin; session saved
+```
+
+The context stores the server URL and workspace binding in `~/.tapstate/config.yaml`. The login stores
+an owner-only, revocable session file under `~/.tapstate/auth/`; it never stores the password or the
+short-lived access token. Start the same command again and the first online verb resumes that session:
+
+```console
+$ java -jar cli/target/cli-0.2.1.jar -w ./work
+tapstate(offline:work)> ls pipeline
+resumed admin@ide
+```
+
+Run `:ctx` again to choose, edit, bind, unbind, or delete a saved context. Use
+`auth status --context ide` to inspect its cached session and `auth logout --context ide` to revoke the
+server session and remove the local cache. `Verify TLS` should stay enabled for HTTPS; disable it only
+for a deliberately local HTTP endpoint such as the example above. The temporary `-c/-u` launch remains
+available, but it changes only that process and does not update the saved context.
+
 ### There are three rules for giving a workspace, and `--help` describes one
 
 The arguments above carry no subcommand, so that is the session form and `-w` is accepted. Add a
