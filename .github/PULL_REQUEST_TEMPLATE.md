@@ -76,11 +76,13 @@ One sentence, as a user story: as <who>, I can <do what>, so that <what I am spa
   from the diff produces "reordered the initialisation of X"; starting from the issue produces
   "you no longer have to register it first".
 
+`**Kind:** new` for a capability somebody gains, `**Kind:** fix` for something that stopped
+being wrong. It decides which heading the sentence lands under in the release. Writing `none`
+needs no Kind -- there is nothing to file.
+
 This sentence is collected into the release notes, unedited, when a release is cut. See
 CONTRIBUTING.md, "Release notes".
 -->
-
-none
 
 ## Checks
 

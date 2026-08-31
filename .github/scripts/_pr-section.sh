@@ -52,6 +52,26 @@ strip_comments() {
   '
 }
 
+# The value written after a bolded `**Name:**` field, or empty when the field is absent. Two callers
+# ask it -- the documentation-impact gate and the release-note collector -- and they must agree, for
+# the same reason `section_body` is shared: a field one reads as answered and the other as blank
+# refuses a pull request that is correct.
+field_value() {   # <name> <text>
+  printf '%s\n' "$2" | awk -v want="$1" '
+    index($0, "**" want ":**") {
+      sub(/^.*\*\*[^*]*:\*\*/, "")
+      gsub(/^[ \t]+|[ \t]+$/, "")
+      print
+      exit
+    }'
+}
+
+# The same text with that field's line taken out. The release note section is carried WHOLE into a
+# release body, so a field left in it rides into the entry it was only meant to classify.
+without_field() {   # <name> <text>
+  printf '%s\n' "$2" | awk -v want="$1" '!index($0, "**" want ":**")'
+}
+
 # Whether what an author wrote amounts to "none". Shared because two gates ask it -- the check on a
 # pull request, and the collection of release notes -- and they must not answer differently: a field
 # read as an answer by one and as a value by the other refuses a pull request that is correct, and

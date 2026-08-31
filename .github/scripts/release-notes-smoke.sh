@@ -55,19 +55,32 @@ seed() {   # a commit whose subject carries a pull-request reference the way eac
 echo base > "$repo/f"; git -C "$repo" add f; git -C "$repo" commit -q -m "base"
 git -C "$repo" tag v0.3.0
 
-note() { printf '## What changed\n\nx\n\n### Release note\n\n%s\n\n## Checks\n\n- [ ] x\n' "$1"; }
+# The section as it is written now: a Kind line, then the sentence. Called with one argument it
+# writes a section with no Kind at all, which is every pull request merged before the field existed
+# -- those must still be carried, and must not be filed as though somebody had classified them.
+note() {
+  if [ $# -ge 2 ]; then
+    printf '## What changed\n\nx\n\n### Release note\n\n**Kind:** %s\n\n%s\n\n## Checks\n\n- [ ] x\n' "$2" "$1"
+  else
+    printf '## What changed\n\nx\n\n### Release note\n\n%s\n\n## Checks\n\n- [ ] x\n' "$1"
+  fi
+}
 
-body 11 "$(note 'You can assemble tables from MySQL and PostgreSQL into one object, without creating a view.')"
+body 11 "$(note 'You can assemble tables from MySQL and PostgreSQL into one object, without creating a view.' new)"
 body 12 "$(note 'none')"
 body 13 "$(printf '## What changed\n\nInternal only.\n\n## Checks\n\n- [ ] x\n')"
 body 14 "$(note 'none -- build configuration only.')"
-body 15 "$(note 'You can read a task write-back position from the CLI, so that a stalled task can be told apart from a slow one.')"
+body 15 "$(note 'You can read a task write-back position from the CLI, so that a stalled task can be told apart from a slow one.' new)"
+body 16 "$(note 'Rows deleted at the source while a task was down no longer survive a reload, so that a purge is not needed by hand.' fix)"
+body 17 "$(note 'You can pass a workspace directory to the CLI, so that a demo need not run from the current directory.')"
 
 seed "Assemble across sources (#11)"
 seed "Refactor the registry (#12)"
 seed "Bump a dependency (#13)"
 seed "CI: cache maven (#14)"
 seed "Merge pull request #15 from contributor/write-back-position"
+seed "Delete-during-downtime survives a reload (#16)"
+seed "Take a workspace directory (#17)"
 
 out="$(cd "$repo" && bash "$script" --version 0.4.0 --base v0.3.0 --sha HEAD \
   --macos-req 'Recommended macOS: 15.0 or newer.' --glibc-req 'Recommended glibc: 2.34 or newer.' 2>&1)"
@@ -112,7 +125,7 @@ hasnt "the section's next heading is not swallowed" "## Checks"
 # checked by looking for their text -- a pull request that contributes no entry contributes no text
 # at all, so "the body does not contain it" is true before the script has done anything. Two entries
 # from five pull requests is the assertion; anything that leaks one of the three makes it three.
-whats_new="$(printf '%s\n' "$out" | awk '/^## What.s new$/ { inside = 1; next } /^<!--/ { inside = 0 } inside')"
+whats_new="$(printf '%s\n' "$out" | awk '/^## What.s new$/ { inside = 1; next } /^## / { inside = 0 } /^<!--/ { inside = 0 } inside')"
 bullets="$(printf '%s\n' "$whats_new" | grep -c '^\* ')"
 if [ "$bullets" = 2 ]; then
   printf '  ok    %s\n' "the three that say nothing produce no entries (2 bullets from 5 pull requests)"
@@ -128,6 +141,32 @@ if grep -qE '^\*[[:space:]]*$' <<<"$whats_new"; then
 else
   printf '  ok    %s\n' "and none of them leaves an empty bullet"; passed=$((passed + 1))
 fi
+
+# --- the grouping. A flat list mixes a new capability with a fix, and a reader looking for what
+# broke has to read every line to find out none of them is about that. The category comes from the
+# author, beside the sentence they are already writing -- not from a label, because a label is a
+# second place to keep it and, measured across the sixteen pull requests of the first release, not
+# one of them carried `bug` or `enhancement`. Grouping on that would have put everything in one
+# bucket while reporting itself grouped.
+bucket() {   # the bullets under one heading
+  printf '%s\n' "$out" | awk -v h="## $1" '$0 == h { inside = 1; next } /^## / { inside = 0 } inside' | grep -c '^\* '
+}
+ck_bucket() {
+  local name="$1" heading="$2" want="$3" got
+  got="$(bucket "$heading")"
+  if [ "$got" = "$want" ]; then printf '  ok    %s\n' "$name"; passed=$((passed + 1))
+  else printf '  FAIL  %s\n        wanted %s bullet(s) under "## %s", got %s\n' "$name" "$want" "$heading" "$got"; failed=$((failed + 1)); fi
+}
+ck_bucket "the two new capabilities are under What's new" "What's new" 2
+ck_bucket "the fix is under its own heading"              "Fixes"      1
+ck_bucket "an unclassified note is filed as neither"      "Other changes" 1
+has  "the fix's sentence is carried"      "* Rows deleted at the source while a task was down"
+has  "the unclassified one is carried"    "* You can pass a workspace directory to the CLI"
+# The pollution guard, and the reason the field could not simply be another line in the section:
+# the whole section used to become one bullet, so a Kind line would have ridden into every entry.
+hasnt "the Kind line never reaches a bullet" "* **Kind:**"
+hasnt "and it is not glued onto a sentence" "fix You can"
+hasnt "nor onto the one before it"          "new You can assemble"
 
 # The slots the approver fills. A prompt, never material.
 has  "there is a breaking-changes slot"    "Breaking changes"
