@@ -15,7 +15,8 @@ import java.util.List;
  */
 final class TuiDashboard {
 
-    static final int MIN_WIDTH = 44;
+    static final int COMPACT_WIDTH = 60;
+    static final int SPLIT_WIDTH = 100;
     static final int MIN_HEIGHT = 8;
 
     enum Connection {
@@ -121,8 +122,8 @@ final class TuiDashboard {
     }
 
     List<AttributedString> render(State state, int width, int height) {
-        if (width < MIN_WIDTH || height < MIN_HEIGHT) {
-            return compact(state, width);
+        if (width < COMPACT_WIDTH || height < MIN_HEIGHT) {
+            return compact(state, width, height);
         }
         List<AttributedString> rows = new ArrayList<>();
         String identity = state.context() == null ? "no environment" : state.context();
@@ -166,16 +167,16 @@ final class TuiDashboard {
                     body.add("  | " + prompt.lines().get(index));
                 }
             }
+        } else if (width >= SPLIT_WIDTH) {
+            appendSplitBody(rows, state.resources(), state.activity(), bodyRows, width);
+            body = null;
         } else {
             body.addAll(resourceRows(state.resources()));
-            body.add("  Activity");
-            if (state.activity().isEmpty()) {
-                body.add("  none yet");
-            } else {
-                body.addAll(state.activity().stream().map(line -> "  " + line).toList());
-            }
+            body.addAll(activityRows(state.activity()));
         }
-        appendBody(rows, body, bodyRows, width);
+        if (body != null) {
+            appendBody(rows, body, bodyRows, width);
+        }
         while (rows.size() < height - 2) {
             rows.add(row("", width));
         }
@@ -227,6 +228,45 @@ final class TuiDashboard {
         return rows;
     }
 
+    private static List<String> activityRows(List<String> activity) {
+        List<String> rows = new ArrayList<>();
+        rows.add("  Activity");
+        if (activity == null || activity.isEmpty()) {
+            rows.add("  none yet");
+        } else {
+            activity.stream().map(line -> "  " + line).forEach(rows::add);
+        }
+        return rows;
+    }
+
+    private static void appendSplitBody(List<AttributedString> rows, List<ResourceSummary> resources,
+                                        List<String> activity, int capacity, int width) {
+        if (capacity <= 0) {
+            return;
+        }
+        List<String> left = resourceRows(resources);
+        List<String> right = activityRows(activity);
+        int gap = 3;
+        // Keep enough room for resource details (especially misplaced-artifact hints) while
+        // leaving a useful activity pane on the right.
+        int leftWidth = Math.max(32, Math.min(48, (width - gap) / 2));
+        int rightWidth = Math.max(1, width - leftWidth - gap);
+        int total = Math.max(left.size(), right.size());
+        int visible = Math.min(total, capacity);
+        boolean truncated = total > capacity;
+        if (truncated) {
+            visible = Math.max(1, capacity - 1);
+        }
+        for (int index = 0; index < visible; index++) {
+            String leftValue = index < left.size() ? left.get(index) : "";
+            String rightValue = index < right.size() ? right.get(index) : "";
+            rows.add(row(fit(leftValue, leftWidth) + " ".repeat(gap) + fit(rightValue, rightWidth), width));
+        }
+        if (truncated) {
+            rows.add(row("  +" + (total - visible) + " more", width));
+        }
+    }
+
     private static void addResourceGroup(List<String> rows, String label, List<ResourceSummary> resources) {
         rows.add("    " + label + " (" + resources.size() + ")");
         for (ResourceSummary resource : resources) {
@@ -254,12 +294,40 @@ final class TuiDashboard {
         rows.add(row("  +" + (body.size() - shown) + " more", width));
     }
 
-    private static List<AttributedString> compact(State state, int width) {
+    private static List<AttributedString> compact(State state, int width, int height) {
         int safeWidth = Math.max(width, 1);
-        return List.of(
-                row("tapstate " + state.connection().label, safeWidth),
-                row("workspace: " + state.workspace().toAbsolutePath().normalize(), safeWidth),
-                row("terminal is too narrow for the dashboard", safeWidth));
+        // Put the connection state first on narrow terminals so it remains visible even when
+        // the workspace path or principal has to be clipped.
+        String identity = state.connection().label + " · " + identity(state);
+        String notice = state.notice() == null || state.notice().isBlank()
+                ? "compact terminal · Ctrl-P commands · q quit"
+                : state.notice();
+        List<String> lines = List.of(
+                "tapstate " + identity,
+                "workspace: " + state.workspace().toAbsolutePath().normalize(),
+                "status: " + authLabel(state),
+                "[COMMAND] > " + state.command(),
+                notice);
+        int visible = Math.max(1, Math.min(height, lines.size()));
+        return lines.subList(0, visible).stream()
+                .map(line -> row(line, safeWidth))
+                .toList();
+    }
+
+    private static String identity(State state) {
+        String identity = state.context() == null ? "no environment" : state.context();
+        if (state.principal() != null && !state.principal().isBlank()) {
+            identity += " / " + state.principal();
+        }
+        return identity;
+    }
+
+    private static String fit(String value, int width) {
+        if (value == null || value.isEmpty()) {
+            return " ".repeat(Math.max(0, width));
+        }
+        String clipped = value.length() <= width ? value : value.substring(0, Math.max(0, width));
+        return clipped + " ".repeat(Math.max(0, width - clipped.length()));
     }
 
     private static String marker(Connection connection) {

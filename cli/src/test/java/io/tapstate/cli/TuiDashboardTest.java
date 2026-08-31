@@ -31,10 +31,12 @@ class TuiDashboardTest {
         List<AttributedString> lines = dashboard.render(
                 TuiDashboard.State.offline(Path.of("orders"), null), 30, 8);
 
-        assertThat(lines).hasSize(3);
+        assertThat(lines).hasSize(5);
         assertThat(lines.getFirst().toString()).startsWith("tapstate offline");
         assertThat(lines.get(1).toString()).startsWith("workspace:");
-        assertThat(lines.getLast().toString()).startsWith("terminal is too narrow");
+        assertThat(lines).anyMatch(line -> line.toString().startsWith("status:"));
+        assertThat(lines).anyMatch(line -> line.toString().startsWith("[COMMAND] >"));
+        assertThat(lines.getLast().toString()).contains("compact terminal");
         assertThat(lines).allSatisfy(line -> assertThat(line.toString()).hasSize(30));
     }
 
@@ -190,9 +192,26 @@ class TuiDashboardTest {
         List<AttributedString> lines = dashboard.render(
                 new TuiDashboard.State(Path.of("orders"), "dev", null,
                         TuiDashboard.Connection.OFFLINE, null, "", List.of(), 0, null,
-                        null, null, null, List.of(), resources), 44, 10);
+                        null, null, null, List.of(), resources), 64, 10);
 
-        assertThat(lines).hasSize(10).allSatisfy(line -> assertThat(line.toString()).hasSize(44));
+        assertThat(lines).hasSize(10).allSatisfy(line -> assertThat(line.toString()).hasSize(64));
         assertThat(lines).anyMatch(line -> line.toString().contains("+"));
+    }
+
+    @Test
+    void rendersWideWorkspacesAsResourceAndActivityPanes() {
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", "alice@example.com",
+                        TuiDashboard.Connection.ONLINE, null, "", List.of(), 0, null,
+                        "http://127.0.0.1:8081", "tapstate-prod", "authenticated",
+                        List.of("> ls pipeline", "✓ 2 pipelines"), List.of(
+                                new TuiDashboard.ResourceSummary("pipeline", "orders", "1 source", null, true, false))),
+                120, 24);
+
+        assertThat(lines).anyMatch(line -> line.toString().contains("Resources")
+                && line.toString().contains("Activity"));
+        assertThat(lines).anyMatch(line -> line.toString().contains("orders  1 source"));
+        assertThat(lines).anyMatch(line -> line.toString().contains("> ls pipeline"));
+        assertThat(lines).allSatisfy(line -> assertThat(line.toString()).hasSize(120));
     }
 }
