@@ -43,14 +43,26 @@ final class CliOnce {
                 "io.tapstate.cli.Cli"));
         command.addAll(List.of(args));
         try {
-            Process process = new ProcessBuilder(command).start();
-            String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            String err = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+            Path outFile = Files.createTempFile("cli-out", ".txt");
+            Path errFile = Files.createTempFile("cli-err", ".txt");
+            outFile.toFile().deleteOnExit();
+            errFile.toFile().deleteOnExit();
+            // Redirected to files rather than drained one after the other. Reading stdout to EOF
+            // blocks until the process exits, so a CLI that fills the stderr pipe buffer deadlocks
+            // before the timeout below is ever reached -- on exactly the noisy failures it is for.
+            Process process = new ProcessBuilder(command)
+                    .redirectOutput(outFile.toFile())
+                    .redirectError(errFile.toFile())
+                    .start();
             if (!process.waitFor(2, TimeUnit.MINUTES)) {
                 process.destroyForcibly();
-                throw new AssertionError("the CLI did not exit; output so far:\n" + out + err);
+                throw new AssertionError("the CLI did not exit; output so far:\n"
+                        + Files.readString(outFile, StandardCharsets.UTF_8)
+                        + Files.readString(errFile, StandardCharsets.UTF_8));
             }
-            return new Run(process.exitValue(), out, err);
+            return new Run(process.exitValue(),
+                    Files.readString(outFile, StandardCharsets.UTF_8),
+                    Files.readString(errFile, StandardCharsets.UTF_8));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         } catch (InterruptedException e) {

@@ -641,6 +641,10 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
+          # pipefail is on under `shell: bash`, so this pipeline would trip errexit and skip the
+          # summary that exists to name which of the board, the field, the option or the credential
+          # was the problem. Off for this one pipeline; PIPESTATUS still carries the script's status.
+          set +o pipefail
           .github/scripts/roadmap-shipped.sh \
             --version "${{ needs.version.outputs.version }}" \
             --base "${{ needs.version.outputs.base }}" \
@@ -737,5 +741,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Only ever a draft. Publish creates the tag and makes the release public one step before
+          # its last, and `always()` fires on cancellation too, so a half-finished publish can leave a
+          # real release here -- deleting that one keeps the tag and spends the version for good.
+          if [ "$(gh release view "${{ needs.version.outputs.tag }}" --json isDraft --jq '.isDraft' 2>/dev/null)" != true ]; then
+            echo "${{ needs.version.outputs.tag }} is not an unpublished draft; leaving it alone." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           gh release delete "${{ needs.version.outputs.tag }}" --yes
           echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. No tag was created, no image was pushed." >> "$GITHUB_STEP_SUMMARY"

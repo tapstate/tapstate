@@ -121,7 +121,11 @@ jobs:
           tag="$TAG"
           git fetch --quiet origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null || true
           site="$(mktemp -d)"
-          echo "publishing the entry points pinned to $(.github/scripts/site-from-tag.sh "$tag" "$site")"
+          # Assigned before it is printed. Inside `echo "... $(...)"` the exit status is echo's, so a
+          # refusal here would be swallowed by `set -e` and the empty directory below would be
+          # deployed to the domain the README tells people to pipe into sh.
+          pinned="$(.github/scripts/site-from-tag.sh "$tag" "$site")"
+          echo "publishing the entry points pinned to $pinned"
           if git show "$tag:deploy/install-site/vercel.json" > "$site/vercel.json" 2>/dev/null; then
             echo "routing: from $tag"
           else

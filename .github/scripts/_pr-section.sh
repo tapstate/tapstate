@@ -31,12 +31,20 @@ strip_comments() {
   awk '
     {
       line = $0
+      # Index-based rather than a regex: awk has no lazy quantifier, and a greedy <!--.*--> spans
+      # from the first opener to the last closer, taking whatever the author wrote between two
+      # comments with it. The same applies to closing an open comment on a line that opens another.
       if (comment) {
-        if (index(line, "-->")) { sub(/.*-->/, "", line); comment = 0 } else { line = "" }
+        e = index(line, "-->")
+        if (e) { line = substr(line, e + 3); comment = 0 } else { line = "" }
       }
       if (!comment) {
-        while (match(line, /<!--.*-->/)) { sub(/<!--.*-->/, "", line) }
-        if (index(line, "<!--")) { sub(/<!--.*/, "", line); comment = 1 }
+        while ((s = index(line, "<!--")) > 0) {
+          rest = substr(line, s + 4)
+          e = index(rest, "-->")
+          if (e == 0) { line = substr(line, 1, s - 1); comment = 1; break }
+          line = substr(line, 1, s - 1) substr(rest, e + 3)
+        }
       }
       gsub(/^[ \t\r]+|[ \t\r]+$/, "", line)
       if (line != "") print line
