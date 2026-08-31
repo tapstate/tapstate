@@ -45,6 +45,7 @@ cli.auth-session-rejected
 cli.auth-session-unreachable
 cli.auth-usage
 cli.connect-failed
+cli.connector-not-official
 cli.context-already-exists
 cli.context-config-invalid
 cli.context-config-permissions
@@ -54,7 +55,6 @@ cli.context-not-found
 cli.context-required
 cli.context-source-conflict
 cli.context-usage
-cli.connector-not-official
 cli.demo-workspace-exists
 cli.if-match-needs-one-resource
 cli.issuer-discovery-failed
