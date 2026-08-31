@@ -206,6 +206,8 @@ final class ContextConfigStore {
                 }
             } catch (TapstateException coded) {
                 throw coded;
+            } catch (IllegalArgumentException invalid) {
+                throw invalid;
             } catch (IOException | RuntimeException failure) {
                 throw permissions(lockPath, safeReason(failure), failure);
             }

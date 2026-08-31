@@ -160,7 +160,38 @@ class ContextConfigStoreTest {
         assertThat(ContextConfigStore.underHome(home, List.of(migration)).load()).isEqualTo(migrated);
         assertThatThrownBy(ContextConfigStore.underHome(home)::load)
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-config-version"));
+                error -> assertThat(error.code().code()).isEqualTo("cli.context-config-version"));
+    }
+
+    @Test
+    void rejectsInvalidMigrationResultsAndInvalidLockedMutations(@TempDir Path home) throws IOException {
+        Path root = Files.createDirectory(home.resolve(".tapstate"));
+        ownerOnlyDirectory(root);
+        Path config = root.resolve("config.yaml");
+        Files.writeString(config, "version: 0\n", StandardCharsets.UTF_8);
+        ownerOnlyFile(config);
+
+        ContextConfigMigration wrongVersion = new ContextConfigMigration() {
+            @Override
+            public int sourceVersion() {
+                return 0;
+            }
+
+            @Override
+            public ContextConfig migrate(Map<String, Object> document) {
+                return new ContextConfig(0, null, Map.of(), Map.of());
+            }
+        };
+        assertThatThrownBy(() -> ContextConfigStore.underHome(home, List.of(wrongVersion)).load())
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code().code()).isEqualTo("cli.context-config-invalid"));
+
+        ContextConfigStore store = ContextConfigStore.underHome(Files.createDirectory(home.resolve("updates")));
+        assertThatThrownBy(() -> store.update(null)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.update(current -> null)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.update(current -> new ContextConfigStore.Mutation<>(
+                new ContextConfig(0, null, Map.of(), Map.of()), null)))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

@@ -260,6 +260,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new DataBrowserOutcome.Collections.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new DataBrowserOutcome.Collections.Unreachable();
+            default -> new DataBrowserOutcome.Collections.Unreachable();
         };
     }
 
@@ -281,6 +282,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new DataBrowserOutcome.Stats.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new DataBrowserOutcome.Stats.Unreachable();
+            default -> new DataBrowserOutcome.Stats.Unreachable();
         };
     }
 
@@ -314,6 +316,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new DataBrowserOutcome.Find.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new DataBrowserOutcome.Find.Unreachable();
+            default -> new DataBrowserOutcome.Find.Unreachable();
         };
     }
 
@@ -379,6 +382,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new TokenCreateOutcome.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new TokenCreateOutcome.Unreachable();
+            default -> new TokenCreateOutcome.Unreachable();
         };
     }
 
@@ -390,6 +394,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new TokenListOutcome.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new TokenListOutcome.Unreachable();
+            default -> new TokenListOutcome.Unreachable();
         };
     }
 
@@ -402,6 +407,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Rejected rejected ->
                     new TokenRevokeOutcome.Rejected(rejected.code(), rejected.message());
             case ControlResponse.Unreachable ignored -> new TokenRevokeOutcome.Unreachable();
+            default -> new TokenRevokeOutcome.Unreachable();
         };
     }
 
