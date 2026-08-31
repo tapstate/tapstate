@@ -61,6 +61,16 @@ fresh_repo
 echo x > claude.md; git add -A && git commit -qm lower
 expect "the match is case-insensitive"             files 1 "agent instruction file"
 
+# --- an IGNORED file is not something this repository carries. Paired with the tracked case
+# --- above, which must stay red: the pair is what keeps this narrowing from becoming a hole.
+fresh_repo
+printf 'CLAUDE.md\n' > .gitignore
+git add -A && git commit -qm ignore
+echo "personal notes" > CLAUDE.md          # never added: git considers the tree clean
+expect "an ignored CLAUDE.md is not carried by the repository" files 0 "clean:"
+git add -f CLAUDE.md && git commit -qm forced
+expect "but the same file tracked is still refused"          files 1 "agent instruction file"
+
 echo "-- mode: dir"
 fresh_repo
 expect "no .claude directory passes"               dir 0 "clean:"
@@ -171,22 +181,46 @@ else
 fi
 
 echo "-- liveness controls"
-# Same idea, same reason: shadow `find` with a real executable that finds nothing. Without
-# the control, both modes would print `clean:` and exit 0 -- which is what a repository with
-# no agent files looks like, and is why the two are indistinguishable without this.
+# Same idea, same reason: shadow the tool the detector actually uses with a real executable
+# that fails. It is `git` since these modes read tracked files -- the earlier version of this
+# case shadowed `find`, and kept passing after the detector stopped calling it, which is the
+# case testing the wrong binary rather than the gate being right.
+#
+# Without the control both modes would print `clean:` and exit 0, which is exactly what a
+# repository with no agent files looks like.
 fresh_repo
 shadow="$scratch/shadow"; mkdir -p "$shadow"
-printf '#!/bin/sh\nexit 0\n' > "$shadow/find"
-chmod +x "$shadow/find"
+printf '#!/bin/sh\necho "git: simulated failure" >&2\nexit 1\n' > "$shadow/git"
+chmod +x "$shadow/git"
 for mode in files dir; do
   PATH="$shadow:$PATH" bash "$gate" "$mode" > "$scratch/out" 2>&1; code=$?
-  if [ "$code" != 0 ] && grep -qF "did not match a control" "$scratch/out"; then
-    printf '  ok    a %s detector that finds nothing at all reddens\n' "$mode"; passed=$((passed + 1))
+  # Either cause is a pass -- what must never happen is exit 0 with `clean:`. Both messages
+  # name the real problem; asserting on one of them specifically would make this case depend
+  # on which guard happens to fire first.
+  if [ "$code" != 0 ] && grep -qE 'cannot list the tracked files|did not match a control|could not build the control repository' "$scratch/out"; then
+    printf '  ok    a %s detector whose tool cannot run reddens\n' "$mode"; passed=$((passed + 1))
   else
-    printf '  FAIL  a %s detector that finds nothing at all reddens\n        got exit %s: %s\n' \
+    printf '  FAIL  a %s detector whose tool cannot run reddens\n        got exit %s: %s\n' \
       "$mode" "$code" "$(cat "$scratch/out")"; failed=$((failed + 1))
   fi
 done
+
+# A git that can list but cannot init. Two guards can produce a red here -- the control
+# repository failing to build, and the tracked listing failing -- and with git broken outright
+# only the second one is ever reached, so removing the first changes nothing observable. This
+# stub separates them: `ls-files` works, `init` does not, so only the first guard can speak.
+fresh_repo
+shadow2="$scratch/shadow2"; mkdir -p "$shadow2"
+real_git="$(command -v git)"
+printf '#!/bin/sh\ncase " $* " in *" init "*) exit 1 ;; esac\nexec %s "$@"\n' "$real_git" > "$shadow2/git"
+chmod +x "$shadow2/git"
+PATH="$shadow2:$PATH" bash "$gate" files > "$scratch/out" 2>&1; code=$?
+if [ "$code" != 0 ] && grep -qF "could not build the control repository" "$scratch/out"; then
+  printf '  ok    a control repository that cannot be built reddens, and says so\n'; passed=$((passed + 1))
+else
+  printf '  FAIL  a control repository that cannot be built reddens, and says so\n        got exit %s: %s\n' \
+    "$code" "$(cat "$scratch/out")"; failed=$((failed + 1))
+fi
 
 echo "-- dispatch"
 expect "an unknown mode is a usage error" bogus 2 "usage:"
