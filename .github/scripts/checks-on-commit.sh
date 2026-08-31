@@ -59,14 +59,14 @@ if [ -n "$branch" ]; then
     echo "::error::could not read the branch rules for ${branch}: ${ruleset}" >&2
     exit 1
   fi
-  names="$(printf '%s\n' "$ruleset" | sed 's/^[ \t]*//; s/[ \t]*$//' | grep -v '^$' || true)"
+  names="$(printf '%s\n' "$ruleset" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true)"
   if [ -z "$names" ]; then
     echo "::error::the rules on '${branch}' name no required status checks, so there is nothing to verify" >&2
     echo "That reads identically to a green release. Either the ruleset lost its checks, or this is asking the wrong branch." >&2
     exit 1
   fi
 else
-  names="$(printf '%s' "$required" | tr ',' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//' | grep -v '^$' || true)"
+  names="$(printf '%s' "$required" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true)"
 fi
 
 if ! observed="$(gh api --paginate "repos/${repo}/commits/${sha}/check-runs" \
@@ -75,23 +75,79 @@ if ! observed="$(gh api --paginate "repos/${repo}/commits/${sha}/check-runs" \
   exit 1
 fi
 
+# Two of the contexts a branch ruleset requires are `pull_request`-only workflows, so they cannot
+# produce a check-run on a commit that sits on the default branch at all, and a release cut from one
+# would refuse for ever. Where the answer is, when it is anywhere: on the pull request this commit is
+# the merge of.
+#
+# Only when that pull request's head carries the SAME TREE. That condition is the whole guard, and it
+# is not a formality -- it is what makes the head's verdict a verdict about this code. A merge that
+# combined the pull request with anything else produces a tree the head never had, the head was never
+# checked in that combination, and this refuses exactly as it did before. Resolved once and reused:
+# every name that is absent here is absent for the same structural reason.
+fallback_head=""
+fallback_runs=""
+fallback_declined=""
+fallback_tried=0
+resolve_fallback() {
+  [ "$fallback_tried" = 0 ] || return 0
+  fallback_tried=1
+  local head tree head_tree
+  head="$(gh api "repos/${repo}/commits/${sha}/pulls" --jq '.[0].head.sha // empty' 2>/dev/null)"
+  # Kept although no case witnesses it, and that is worth saying rather than leaving to be found:
+  # the same input is caught downstream by the empty-runs check, so deleting this line reddens
+  # nothing. It earns its place anyway -- an empty sha here would build `commits/`, which is the
+  # list-commits endpoint and answers 200 with an array, and the only thing standing between that
+  # and a borrowed answer would be jq failing to find a field in it.
+  [ -n "$head" ] || return 0
+  tree="$(gh api "repos/${repo}/commits/${sha}" --jq '.commit.tree.sha // empty' 2>/dev/null)"
+  head_tree="$(gh api "repos/${repo}/commits/${head}" --jq '.commit.tree.sha // empty' 2>/dev/null)"
+  if [ -z "$tree" ] || [ "$tree" != "$head_tree" ]; then
+    # Recorded rather than dropped. Refusing here is right, but it is a different refusal from a
+    # lane that never started: the answer exists and is about different code, and what fixes it is
+    # releasing a different commit, not re-running anything.
+    fallback_declined="$head"
+    return 0
+  fi
+  fallback_runs="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" \
+      --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv' 2>/dev/null)"
+  [ -n "$fallback_runs" ] || return 0
+  fallback_head="$head"
+}
+
 fail=0
 unsettled=0
+borrowed=""
 while IFS= read -r name; do
   [ -n "$name" ] || continue
   line="$(printf '%s\n' "$observed" | awk -F'\t' -v want="$name" '$1 == want { print; exit }')"
+  answered_on="$sha"
   if [ -z "$line" ]; then
-    echo "::error::'${name}' never ran on ${sha} — a check that was not dispatched leaves no record, so this cannot be read off the failures"
+    resolve_fallback
+    if [ -n "$fallback_head" ]; then
+      line="$(printf '%s\n' "$fallback_runs" | awk -F'\t' -v want="$name" '$1 == want { print; exit }')"
+      if [ -n "$line" ]; then
+        answered_on="$fallback_head"
+        borrowed="${borrowed}${borrowed:+, }${name}"
+      fi
+    fi
+  fi
+  if [ -z "$line" ]; then
+    if [ -n "$fallback_declined" ]; then
+      echo "::error::'${name}' did not run on ${sha}, and ${fallback_declined} — the head of the pull request it came from — carries a different tree, so what ran there is not an answer about this commit"
+    else
+      echo "::error::'${name}' never ran on ${sha} — a check that was not dispatched leaves no record, so this cannot be read off the failures"
+    fi
     unsettled=1
     continue
   fi
   status="$(printf '%s' "$line" | cut -f2)"
   conclusion="$(printf '%s' "$line" | cut -f3)"
   if [ "$status" != "completed" ]; then
-    echo "::error::'${name}' is still running on ${sha} (${status}) — this is not a failure to fix, it is a result to wait for"
+    echo "::error::'${name}' is still running on ${answered_on} (${status}) — this is not a failure to fix, it is a result to wait for"
     unsettled=1
   elif [ "$conclusion" != "success" ]; then
-    echo "::error::'${name}' concluded ${conclusion} on ${sha}"
+    echo "::error::'${name}' concluded ${conclusion} on ${answered_on}"
     fail=1
   fi
 done <<EOF
@@ -108,3 +164,8 @@ if [ "$unsettled" -ne 0 ]; then
 fi
 
 echo "clean: $(printf '%s\n' "$names" | wc -l | tr -d ' ') named check(s) ran on ${sha} and are green."
+if [ -n "$borrowed" ]; then
+  # Said rather than left to be noticed. A borrowed answer is a weaker statement than a check that
+  # ran here, and a reader has to be able to tell which one they are being given.
+  echo "${borrowed} cannot run on a commit outside a pull request; answered on ${fallback_head}, whose tree is identical to ${sha}."
+fi
