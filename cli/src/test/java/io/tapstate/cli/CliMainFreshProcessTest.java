@@ -44,6 +44,7 @@ class CliMainFreshProcessTest {
     private static final UUID AUTH_REF = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
     private static final UUID CONTEXT_ID = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
     private static final String HUMAN_SESSION = "tss_s01.human-session-secret";
+    private static final String HUMAN_ACCESS_TOKEN = "human-access-token";
     private static final String MACHINE_TOKEN = "machine-token-secret";
     private static final String ISSUER = "urn:tapstate:cluster:TEST";
 
@@ -167,6 +168,98 @@ class CliMainFreshProcessTest {
         }
     }
 
+    @Test
+    void cachedHumanSessionIsExchangedForAnAccessTokenInANewCliProcess(@TempDir Path home) throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        List<Request> requests = new CopyOnWriteArrayList<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> respondToHumanSessionScenario(exchange, requests));
+        server.start();
+        try {
+            URI seed = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            awaitServerReady(seed);
+            requests.clear();
+            persistContextAndHumanSession(home, workspace, seed);
+            Path authDirectory = home.resolve(".tapstate/auth");
+            Path authFile = authDirectory.resolve(AUTH_REF + ".json");
+            AuthCacheSnapshot before = snapshot(authFile, authDirectory);
+
+            ProcessResult result = runCli(home, workspace, Map.of(), "--context", "dev", "connectors", "-o", "json");
+
+            assertThat(result.exitCode())
+                    .withFailMessage("cached-session process failed: stdout=%s stderr=%s requests=%s",
+                            redacted(result.stdout()), redacted(result.stderr()), requestSummary(requests))
+                    .isZero();
+            assertNoSensitiveOutput(result);
+            assertThat(JsonReader.parse(redacted(result.stdout()))).isEqualTo(Map.of("connectors", List.of()));
+            assertThat(requests).containsExactly(
+                    new Request("/healthz", AuthorizationKind.ABSENT),
+                    new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
+                    new Request("/auth/session", AuthorizationKind.EXPECTED_HUMAN_SESSION),
+                    new Request("/api/connectors", AuthorizationKind.EXPECTED_HUMAN_ACCESS));
+            assertCacheUnchanged(before, authFile, authDirectory);
+            assertNoAuthTransientArtifacts(authDirectory);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void localOnlyLogoutRemovesTheSelectedCachedSessionWithoutContactingTheServer(@TempDir Path home)
+            throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI unreachableSeed = URI.create("http://127.0.0.1:1");
+        persistContextAndHumanSession(home, workspace, unreachableSeed);
+        Path authDirectory = home.resolve(".tapstate/auth");
+        Path authFile = authDirectory.resolve(AUTH_REF + ".json");
+
+        ProcessResult result = runCli(
+                home, workspace, Map.of(), "--context", "dev", "auth", "logout", "--local-only");
+
+        assertThat(result.exitCode())
+                .withFailMessage("local-only logout failed: stdout=%s stderr=%s",
+                        redacted(result.stdout()), redacted(result.stderr()))
+                .isZero();
+        assertThat(result.stdout()).isEmpty();
+        assertThat(result.stderr()).contains("local session removed");
+        assertThat(authFile).doesNotExist();
+        assertNoAuthTransientArtifacts(authDirectory);
+    }
+
+    @Test
+    void remoteLogoutRevokesTheSelectedCachedSessionInANewCliProcess(@TempDir Path home) throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        List<Request> requests = new CopyOnWriteArrayList<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> respondToHumanSessionScenario(exchange, requests));
+        server.start();
+        try {
+            URI seed = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            awaitServerReady(seed);
+            requests.clear();
+            persistContextAndHumanSession(home, workspace, seed);
+            Path authDirectory = home.resolve(".tapstate/auth");
+            Path authFile = authDirectory.resolve(AUTH_REF + ".json");
+
+            ProcessResult result = runCli(home, workspace, Map.of(), "--context", "dev", "auth", "logout");
+
+            assertThat(result.exitCode())
+                    .withFailMessage("remote logout failed: stdout=%s stderr=%s requests=%s",
+                            redacted(result.stdout()), redacted(result.stderr()), requestSummary(requests))
+                    .isZero();
+            assertThat(result.stdout()).contains("session revoked and local cache removed");
+            assertThat(result.stderr()).isEmpty();
+            assertThat(requests).containsExactly(
+                    new Request("/healthz", AuthorizationKind.ABSENT),
+                    new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
+                    new Request("/auth/logout", AuthorizationKind.EXPECTED_HUMAN_SESSION));
+            assertThat(authFile).doesNotExist();
+            assertNoAuthTransientArtifacts(authDirectory);
+        } finally {
+            server.stop(0);
+        }
+    }
+
     private static void persistContextAndHumanSession(Path home, Path workspace, URI seed) throws IOException {
         ContextDefinition definition = new ContextDefinition(CONTEXT_ID, List.of(seed), new ContextTls(true), AUTH_REF);
         ContextConfig config = new ContextConfig(ContextConfig.CURRENT_VERSION, "dev", Map.of("dev", definition),
@@ -202,6 +295,41 @@ class CliMainFreshProcessTest {
         };
         int status = path.equals("/healthz") || path.equals("/.well-known/tapstate")
                 || path.equals("/api/connectors") ? 200 : 404;
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(status, bytes.length);
+        try (OutputStream output = exchange.getResponseBody()) {
+            output.write(bytes);
+        }
+    }
+
+    private static void respondToHumanSessionScenario(HttpExchange exchange, List<Request> requests) throws IOException {
+        String authorization = exchange.getRequestHeaders().getFirst("Authorization");
+        String path = exchange.getRequestURI().getPath();
+        requests.add(new Request(path, AuthorizationKind.of(authorization)));
+        String body = switch (path) {
+            case "/healthz" -> "ok";
+            case "/.well-known/tapstate" -> """
+                    {"issuer":"urn:tapstate:cluster:TEST","clusterId":"TEST",
+                    "apiVersion":"tapstate/v1","authModes":["password","machine_token"]}
+                    """;
+            case "/auth/session" -> """
+                    {"token":"human-access-token","accessExpiresAt":"2030-01-01T00:00:00Z",
+                    "issuer":"urn:tapstate:cluster:TEST","principal":"admin","scopes":["read"]}
+                    """;
+            case "/auth/logout" -> "";
+            case "/api/connectors" -> "{\"connectors\":[]}";
+            default -> "not found";
+        };
+        int status = switch (path) {
+            case "/healthz", "/.well-known/tapstate", "/auth/session", "/api/connectors" -> 200;
+            case "/auth/logout" -> 204;
+            default -> 404;
+        };
+        if (status == 204) {
+            exchange.sendResponseHeaders(status, -1);
+            exchange.close();
+            return;
+        }
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         exchange.sendResponseHeaders(status, bytes.length);
         try (OutputStream output = exchange.getResponseBody()) {
@@ -382,12 +510,20 @@ class CliMainFreshProcessTest {
 
     private enum AuthorizationKind {
         ABSENT,
+        EXPECTED_HUMAN_SESSION,
+        EXPECTED_HUMAN_ACCESS,
         EXPECTED_MACHINE,
         OTHER_PRESENT;
 
         private static AuthorizationKind of(String authorization) {
             if (authorization == null) {
                 return ABSENT;
+            }
+            if (authorization.equals("TapstateSession " + HUMAN_SESSION)) {
+                return EXPECTED_HUMAN_SESSION;
+            }
+            if (authorization.equals("Bearer " + HUMAN_ACCESS_TOKEN)) {
+                return EXPECTED_HUMAN_ACCESS;
             }
             return authorization.equals("Bearer " + MACHINE_TOKEN) ? EXPECTED_MACHINE : OTHER_PRESENT;
         }
