@@ -35,6 +35,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 /** Owner-only, atomic persistence for the non-secret context configuration. */
 final class ContextConfigStore {
@@ -133,7 +134,29 @@ final class ContextConfigStore {
             throw new IllegalArgumentException("only the current context configuration can be saved");
         }
         ensureDirectory();
-        withConfigLock(() -> saveStrict(config));
+        withConfigLock(() -> {
+            saveStrict(config);
+            return null;
+        });
+    }
+
+    /** Applies one context-config mutation while holding the cross-process file lock. */
+    synchronized <T> T update(Function<ContextConfig, Mutation<T>> mutation) {
+        if (mutation == null) {
+            throw new IllegalArgumentException("mutation must not be null");
+        }
+        ensureDirectory();
+        return withConfigLock(() -> {
+            Mutation<T> updated = mutation.apply(load());
+            if (updated == null || updated.config() == null) {
+                throw new IllegalArgumentException("mutation must return a configuration");
+            }
+            if (updated.config().version() != ContextConfig.CURRENT_VERSION) {
+                throw new IllegalArgumentException("only the current context configuration can be saved");
+            }
+            saveStrict(updated.config());
+            return updated.result();
+        });
     }
 
     private void saveStrict(ContextConfig config) {
@@ -164,7 +187,7 @@ final class ContextConfigStore {
         }
     }
 
-    private void withConfigLock(LockedOperation operation) {
+    private <T> T withConfigLock(LockedOperation<T> operation) {
         Path lockPath = root.resolve(".config.lock");
         Object jvmLock = JVM_LOCKS.computeIfAbsent(lockPath, ignored -> new Object());
         synchronized (jvmLock) {
@@ -179,7 +202,7 @@ final class ContextConfigStore {
                 }
                 verifyFile(lockPath);
                 try (FileLock ignored = channel.lock()) {
-                    operation.run();
+                    return operation.run();
                 }
             } catch (TapstateException coded) {
                 throw coded;
@@ -369,9 +392,12 @@ final class ContextConfigStore {
     }
 
     @FunctionalInterface
-    private interface LockedOperation {
+    private interface LockedOperation<T> {
 
-        void run();
+        T run();
+    }
+
+    record Mutation<T>(ContextConfig config, T result) {
     }
 
     private ContextConfig decodeCurrent(Map<String, Object> document) {
@@ -414,7 +440,7 @@ final class ContextConfigStore {
                 yaml.append("  ").append(quote(name)).append(":\n");
                 yaml.append("    id: ").append(context.id()).append('\n');
                 yaml.append("    seeds:\n");
-                context.seeds().forEach(seed -> yaml.append("      - ").append(seed).append('\n'));
+                context.seeds().forEach(seed -> yaml.append("      - ").append(quote(seed.toString())).append('\n'));
                 yaml.append("    tls:\n");
                 yaml.append("      verify: ").append(context.tls().verify()).append('\n');
                 yaml.append("    authRef: ").append(context.authRef()).append('\n');

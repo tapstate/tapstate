@@ -23,7 +23,7 @@ class NativeImageMetadataTest {
                     .contains("\"name\" : \"connect\"")
                     .contains("\"name\" : \"context\"")
                     .contains("\"name\" : \"user\"")
-                    .contains("\"name\" : \"password\"")
+                    .contains("\"name\" : \"token\"")
                     .contains("\"name\" : \"workdir\"")
                     .contains("\"name\" : \"command\"");
         }

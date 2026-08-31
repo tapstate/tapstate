@@ -31,27 +31,27 @@ final class ContextManager {
 
     synchronized ContextDefinition create(String name, List<URI> seeds, boolean verifyTls) {
         validateName(name);
-        ContextConfig current = store.load();
-        if (current.contexts().containsKey(name)) {
-            throw new TapstateException(CliError.CONTEXT_ALREADY_EXISTS, Map.of("name", name), null);
-        }
         ContextDefinition definition = definition(name, ids.get(), seeds, verifyTls, ids.get());
-        Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
-        contexts.put(name, definition);
-        store.save(new ContextConfig(current.version(), current.lastContext(), contexts,
-                current.workspaceBindings()));
-        return definition;
+        return store.update(current -> {
+            if (current.contexts().containsKey(name)) {
+                throw new TapstateException(CliError.CONTEXT_ALREADY_EXISTS, Map.of("name", name), null);
+            }
+            Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
+            contexts.put(name, definition);
+            return new ContextConfigStore.Mutation<>(new ContextConfig(
+                    current.version(), current.lastContext(), contexts, current.workspaceBindings()), definition);
+        });
     }
 
     synchronized ContextDefinition edit(String name, List<URI> seeds, boolean verifyTls) {
-        ContextConfig current = store.load();
-        ContextDefinition previous = required(current, name);
-        ContextDefinition replacement = definition(name, previous.id(), seeds, verifyTls, previous.authRef());
-        Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
-        contexts.put(name, replacement);
-        store.save(new ContextConfig(current.version(), current.lastContext(), contexts,
-                current.workspaceBindings()));
-        return replacement;
+        return store.update(current -> {
+            ContextDefinition previous = required(current, name);
+            ContextDefinition replacement = definition(name, previous.id(), seeds, verifyTls, previous.authRef());
+            Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
+            contexts.put(name, replacement);
+            return new ContextConfigStore.Mutation<>(new ContextConfig(
+                    current.version(), current.lastContext(), contexts, current.workspaceBindings()), replacement);
+        });
     }
 
     synchronized List<ContextChoice> suggestions() {
@@ -65,30 +65,34 @@ final class ContextManager {
     }
 
     synchronized void choose(String name) {
-        ContextConfig current = store.load();
-        required(current, name);
         // This is picker ordering only. Target resolution never consults lastContext.
-        store.save(new ContextConfig(current.version(), name, current.contexts(), current.workspaceBindings()));
+        store.update(current -> {
+            required(current, name);
+            return new ContextConfigStore.Mutation<>(
+                    new ContextConfig(current.version(), name, current.contexts(), current.workspaceBindings()), null);
+        });
     }
 
     synchronized void bind(Path workspaceRoot, String name) {
-        ContextConfig current = store.load();
-        required(current, name);
         Path canonical = canonical(workspaceRoot);
-        Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
-        bindings.put(canonical.toString(), name);
-        store.save(new ContextConfig(current.version(), current.lastContext(), current.contexts(), bindings));
+        store.update(current -> {
+            required(current, name);
+            Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
+            bindings.put(canonical.toString(), name);
+            return new ContextConfigStore.Mutation<>(
+                    new ContextConfig(current.version(), current.lastContext(), current.contexts(), bindings), null);
+        });
     }
 
     synchronized Optional<String> unbind(Path workspaceRoot) {
-        ContextConfig current = store.load();
         Path canonical = canonical(workspaceRoot);
-        Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
-        String removed = bindings.remove(canonical.toString());
-        if (removed != null) {
-            store.save(new ContextConfig(current.version(), current.lastContext(), current.contexts(), bindings));
-        }
-        return Optional.ofNullable(removed);
+        return store.update(current -> {
+            Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
+            String removed = bindings.remove(canonical.toString());
+            ContextConfig updated = removed == null ? current
+                    : new ContextConfig(current.version(), current.lastContext(), current.contexts(), bindings);
+            return new ContextConfigStore.Mutation<>(updated, Optional.ofNullable(removed));
+        });
     }
 
     synchronized Optional<String> contextBoundExactlyTo(Path workspaceRoot) {
@@ -109,14 +113,16 @@ final class ContextManager {
     }
 
     synchronized void delete(String name) {
-        ContextConfig current = store.load();
-        required(current, name);
-        Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
-        contexts.remove(name);
-        Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
-        bindings.entrySet().removeIf(entry -> entry.getValue().equals(name));
-        String last = name.equals(current.lastContext()) ? null : current.lastContext();
-        store.save(new ContextConfig(current.version(), last, contexts, bindings));
+        store.update(current -> {
+            required(current, name);
+            Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
+            contexts.remove(name);
+            Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
+            bindings.entrySet().removeIf(entry -> entry.getValue().equals(name));
+            String last = name.equals(current.lastContext()) ? null : current.lastContext();
+            return new ContextConfigStore.Mutation<>(
+                    new ContextConfig(current.version(), last, contexts, bindings), null);
+        });
     }
 
     private static ContextDefinition required(ContextConfig config, String name) {

@@ -51,6 +51,20 @@ class IssuerBindingTest {
     }
 
     @Test
+    void ignoresUnreachableSeedsWhenAnotherSeedEstablishesTheExpectedIssuer() {
+        URI unavailable = URI.create("https://unavailable.example.com");
+        URI healthy = URI.create("https://healthy.example.com");
+        RecordingDiscovery client = new RecordingDiscovery(Map.of(
+                unavailable, new DiscoveryOutcome.Unreachable(), healthy, discovered(ISSUER)));
+
+        IssuerBinding.Verified verified = new IssuerBinding(client).verify(context(unavailable, healthy), ISSUER);
+
+        assertThat(verified.seed()).isEqualTo(healthy);
+        assertThat(verified.issuer()).isEqualTo(ISSUER);
+        assertThat(client.authorizationHeaders).containsExactly(null, null);
+    }
+
+    @Test
     void aReplacementSeedWithAnotherIssuerFailsBeforeAnyCredentialByteIsExposed() {
         URI first = URI.create("https://one.example.com");
         URI replacement = URI.create("https://replacement.example.com");

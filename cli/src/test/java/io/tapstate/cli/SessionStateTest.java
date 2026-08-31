@@ -155,16 +155,14 @@ class SessionStateTest {
     }
 
     @Test
-    void doesNotPresentAnIdleExpiredSessionToTheServer() {
+    void letsTheServerDecideWhetherAnIdleWindowHasBeenRefreshed() {
         AuthSessionRecord idleExpired = new AuthSessionRecord(
                 CACHED.version(), CACHED.authRef(), CACHED.contextId(), CACHED.issuer(), CACHED.principal(),
                 CACHED.scopes(), CACHED.sessionToken(), CACHED.createdAt(), NOW, CACHED.absoluteExpiresAt());
         FakeClient client = new FakeClient();
 
-        assertThatThrownBy(() -> new SessionState(client, fixed(NOW)).accessToken(BASE, idleExpired))
-                .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-session-rejected"));
-        assertThat(client.calls()).isZero();
+        assertThat(new SessionState(client, fixed(NOW)).accessToken(BASE, idleExpired)).isEqualTo("jwt-access-1");
+        assertThat(client.calls()).isEqualTo(1);
     }
 
     @Test

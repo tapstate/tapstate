@@ -48,7 +48,7 @@ class ContextConfigStoreTest {
                 "version: 1",
                 "lastContext: \"dev\"",
                 "id: 018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2",
-                "- https://tapstate.example.com",
+                "- \"https://tapstate.example.com\"",
                 "verify: true",
                 "authRef: 5c199643-04da-4f72-9831-3a77e3590eed",
                 "\"" + workspace + "\": \"dev\"");
@@ -87,6 +87,23 @@ class ContextConfigStoreTest {
         assertThat(store.load()).isEqualTo(expected);
         String yaml = Files.readString(home.resolve(".tapstate/config.yaml"));
         assertThat(yaml).contains("  \"1\":", "\"" + workspace + "\": \"1\"");
+    }
+
+    @Test
+    void quotesSeedUrisSoLegalYamlCharactersRoundTrip(@TempDir Path home) throws IOException {
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+        URI seed = URI.create("https://tapstate.example.com/api'v1");
+        ContextConfig expected = new ContextConfig(
+                ContextConfig.CURRENT_VERSION,
+                "dev",
+                Map.of("dev", new ContextDefinition(CONTEXT_ID, List.of(seed), new ContextTls(true), AUTH_REF)),
+                Map.of());
+
+        store.save(expected);
+
+        assertThat(store.load()).isEqualTo(expected);
+        assertThat(Files.readString(home.resolve(".tapstate/config.yaml")))
+                .contains("- \"https://tapstate.example.com/api'v1\"");
     }
 
     @Test

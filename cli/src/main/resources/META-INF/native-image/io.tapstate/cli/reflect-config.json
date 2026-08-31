@@ -9,7 +9,7 @@
       { "name" : "connect" },
       { "name" : "context" },
       { "name" : "user" },
-      { "name" : "password" },
+      { "name" : "token" },
       { "name" : "workdir" },
       { "name" : "command" }
     ]

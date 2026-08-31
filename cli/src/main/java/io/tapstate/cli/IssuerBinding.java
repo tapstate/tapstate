@@ -40,9 +40,10 @@ final class IssuerBinding {
                 throw failure(CliError.ISSUER_DISCOVERY_INVALID,
                         Map.of("seed", seed.toString(), "reason", invalid.reason()));
             }
-            if (!(outcome instanceof DiscoveryOutcome.Discovered discovered)) {
-                throw failure(CliError.ISSUER_DISCOVERY_FAILED, Map.of("seed", seed.toString()));
+            if (outcome instanceof DiscoveryOutcome.Unreachable) {
+                continue;
             }
+            DiscoveryOutcome.Discovered discovered = (DiscoveryOutcome.Discovered) outcome;
             validate(seed, discovered);
             if (agreed == null) {
                 agreed = discovered;
@@ -53,6 +54,9 @@ final class IssuerBinding {
             if (expectedIssuer != null && !expectedIssuer.equals(discovered.issuer())) {
                 throw mismatch(expectedIssuer, discovered.issuer(), seed);
             }
+        }
+        if (agreed == null) {
+            throw failure(CliError.ISSUER_DISCOVERY_FAILED, Map.of("seed", seeds.get(0).toString()));
         }
         return new Verified(selected, agreed);
     }

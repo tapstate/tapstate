@@ -10,6 +10,8 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -80,5 +82,29 @@ class ContextManagerTest {
         assertThat(remaining.contexts()).containsOnlyKeys("alpha");
         assertThat(remaining.workspaceBindings()).isEmpty();
         assertThat(remaining.lastContext()).isNull();
+    }
+
+    @Test
+    void concurrentManagersDoNotLoseIndependentContextCreations(@TempDir Path home) throws Exception {
+        ContextConfigStore.underHome(home).save(ContextConfig.empty());
+        ContextManager alpha = new ContextManager(ContextConfigStore.underHome(home));
+        ContextManager beta = new ContextManager(ContextConfigStore.underHome(home));
+        CountDownLatch start = new CountDownLatch(1);
+
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            var first = pool.submit(() -> {
+                start.await();
+                return alpha.create("alpha", List.of(URI.create("https://alpha.example.com")), true);
+            });
+            var second = pool.submit(() -> {
+                start.await();
+                return beta.create("beta", List.of(URI.create("https://beta.example.com")), true);
+            });
+            start.countDown();
+            first.get();
+            second.get();
+        }
+
+        assertThat(ContextConfigStore.underHome(home).load().contexts()).containsOnlyKeys("alpha", "beta");
     }
 }

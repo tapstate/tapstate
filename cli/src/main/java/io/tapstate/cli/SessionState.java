@@ -42,7 +42,9 @@ final class SessionState {
 
     synchronized String accessToken(URI baseUrl, AuthSessionRecord cached) {
         Instant now = clock.instant();
-        if (!cached.idleExpiresAt().isAfter(now) || !cached.absoluteExpiresAt().isAfter(now)) {
+        // Idle expiry slides on every successful server-side exchange. The local cache only records the
+        // value returned at login, so treating it as authoritative would reject an otherwise live session.
+        if (!cached.absoluteExpiresAt().isAfter(now)) {
             throw rejected(cached, "control.auth-session-expired");
         }
         AccessGrant current = grants.get(cached);
