@@ -83,6 +83,20 @@ final class ControlPlane {
     }
 
     /**
+     * The version the running server says it is, read the way a client reads it: unauthenticated,
+     * because a client asks what it is talking to before it has a credential.
+     */
+    String version() {
+        HttpResponse<String> response = send(get("/version"));
+        expect(response, 200, "read the version the server reports");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                || !(map.get("version") instanceof String version)) {
+            throw new AssertionError("a version answer carried no version: " + response.body());
+        }
+        return version;
+    }
+
+    /**
      * Creates the first admin and holds its token for every later call. Bootstrap is refused off
      * loopback, which is why both tiers run the server on this machine rather than in a container.
      */

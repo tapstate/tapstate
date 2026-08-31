@@ -357,6 +357,10 @@ final class Repl {
             lastExitCode = changeDir(words);
             return true;
         }
+        if (words.get(0).equals("version")) {
+            lastExitCode = version();
+            return true;
+        }
         if (words.get(0).equals("connect")) {
             lastExitCode = connect(words);
             return true;
@@ -406,7 +410,8 @@ final class Repl {
     private int onlineVerb(List<String> words) {
         PrintWriter err = commandLine.getErr();
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", words.get(0)));
+            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
+ Map.of("verb", words.get(0)), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         // `test` and its read-back `test-result` return a structured report that is worth machine-reading, so
@@ -694,11 +699,13 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         if (!session.isConnected()) {
-            Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", verb));
+            Diagnostics.printText(err, CliError.NOT_CONNECTED,
+ Map.of("verb", verb), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", verb));
+            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
+ Map.of("verb", verb), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         return switch (call) {
@@ -723,7 +730,8 @@ final class Repl {
     private int watchLive(DataBrowserCall.Live live) {
         PrintWriter out = commandLine.getOut();
         if (!terminal.getAsBoolean()) {
-            Diagnostics.printText(commandLine.getErr(), CliError.WATCH_NEEDS_A_TERMINAL, Map.of());
+            Diagnostics.printText(commandLine.getErr(), CliError.WATCH_NEEDS_A_TERMINAL,
+ Map.of(), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         String namespace = live.sourceId() + "." + live.collection();
@@ -2802,15 +2810,26 @@ final class Repl {
         if (warnings.isEmpty()) {
             return;
         }
-        PrintWriter err = commandLine.getErr();
-        MessageCatalog catalog = MessageCatalog.bundled();
         for (ApplyOutcome.Warning warning : warnings) {
-            MessageCatalog.Rendered rendered = catalog.render(warning.code(), warning.params());
-            err.println(Ansi.AUTO.string("@|bold,yellow warning:|@") + " " + warning.code());
-            err.println("  " + rendered.message());
-            if (rendered.solution() != null) {
-                err.println("  " + rendered.solution());
-            }
+            renderWarning(warning.code(), warning.params());
+        }
+    }
+
+    /**
+     * Renders one coded advisory: a yellow {@code warning:} header, then the catalog message and, where
+     * there is one, the remedy. Deliberately the same shape a coded error renders in and deliberately a
+     * different colour and word, because the difference a reader has to see at a glance is not which
+     * subsystem spoke but whether anything was refused. It goes to err so it survives a redirected
+     * stdout, and it is not suppressed by quiet: an advisory nobody asked for is exactly the one worth
+     * keeping.
+     */
+    private void renderWarning(String code, Map<String, Object> params) {
+        PrintWriter err = commandLine.getErr();
+        MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(code, params);
+        err.println(Ansi.AUTO.string("@|bold,yellow warning:|@") + " " + code);
+        err.println("  " + rendered.message());
+        if (rendered.solution() != null) {
+            err.println("  " + rendered.solution());
         }
         err.flush();
     }
@@ -2907,7 +2926,7 @@ final class Repl {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
         Diagnostics.printText(commandLine.getErr(), CliError.REQUEST_TIMED_OUT,
-                Map.of("server", hostPort(session.landingNode())));
+                Map.of("server", hostPort(session.landingNode())), session.versions());
         return Cli.EXIT_DIAGNOSTIC;
     }
 
@@ -2937,13 +2956,40 @@ final class Repl {
         }
         for (URI seed : seeds) {
             if (controlPlane.isHealthy(seed)) {
-                session.connect(seeds, seed);
-                confirm("connected to " + hostPort(seed));
+                // Both versions, every time. The CLI is installed by one path and the server pulled by
+                // another, so the pair is what a reader needs and neither half implies the other. A
+                // server that does not answer is reported as not answering rather than as agreeing.
+                String serverVersion = controlPlane.serverVersion(seed);
+                session.connect(seeds, seed, serverVersion);
+                confirm("connected to " + hostPort(seed) + " (" + session.versions() + ")");
+                if (serverVersion != null && !serverVersion.equals(Cli.VERSION_NUMBER)) {
+                    renderWarning(CliError.VERSION_MISMATCH.code(),
+                            Map.of("cli", Cli.VERSION_NUMBER, "server", serverVersion));
+                }
                 return Cli.EXIT_OK;
             }
         }
         reportConnectFailed(seeds);
         return Cli.EXIT_DIAGNOSTIC;
+    }
+
+    /**
+     * Reports both versions in one place, which is the whole point of the verb: a reader pastes this
+     * into a report without having to know that the CLI and the server are separate builds. Asked fresh
+     * rather than remembered from the connect banner, so a server replaced under a held session answers
+     * for what is running now. Not knowing is printed as not knowing, never as agreement.
+     */
+    private int version() {
+        String serverLine;
+        if (!session.isConnected()) {
+            serverLine = "not connected";
+        } else {
+            String reported = controlPlane.serverVersion(session.landingNode());
+            serverLine = (reported == null ? "not reported" : reported)
+                    + " (" + hostPort(session.landingNode()) + ")";
+        }
+        VersionCmd.render(commandLine.getOut(), serverLine);
+        return Cli.EXIT_OK;
     }
 
     /** Clears the connection back to offline; a benign line either way, never an error. */
@@ -2973,7 +3019,8 @@ final class Repl {
         PrintWriter out = commandLine.getOut();
         PrintWriter err = commandLine.getErr();
         if (!session.isConnected()) {
-            Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", "login"));
+            Diagnostics.printText(err, CliError.NOT_CONNECTED,
+ Map.of("verb", "login"), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (words.size() < 2 || words.get(1).isBlank()) {
@@ -3053,7 +3100,8 @@ final class Repl {
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */
     private void reportConnectFailed(List<URI> seeds) {
         String display = seeds.stream().map(URI::toString).collect(Collectors.joining(", "));
-        Diagnostics.printText(commandLine.getErr(), CliError.CONNECT_FAILED, Map.of("seeds", display));
+        Diagnostics.printText(commandLine.getErr(), CliError.CONNECT_FAILED,
+ Map.of("seeds", display), session.versions());
     }
 
     /**

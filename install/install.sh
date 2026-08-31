@@ -33,6 +33,15 @@ die() {
     exit 1
 }
 
+# The platforms this installer can serve, one <os>-<arch> per line. Everything else derives from it:
+# detect_platform checks membership here, and --print-platforms hands the list to the release manifest
+# check, which fails a release whose assets do not match it. A platform added here without a matching
+# release asset is caught there rather than by a user finding a 404.
+SUPPORTED_PLATFORMS='darwin-arm64
+darwin-x64
+linux-arm64
+linux-x64'
+
 # True when this Linux uses musl (Alpine and similar): the binaries are glibc-linked, so musl is refused.
 # musl ships its own dynamic loader, and its ldd banner names it; either signal alone is conclusive.
 is_musl() {
@@ -69,6 +78,17 @@ detect_platform() {
             die "unsupported CPU architecture '$arch'. Supported: arm64/aarch64, x86_64/amd64. Build from source for others." ;;
     esac
     platform="${os_label}-${arch_label}"
+    # Membership against the one declaration, rather than a second list of pairs written out here. The
+    # two cases above map uname onto labels; whether that combination is actually built is a different
+    # question, and this is the only place it is answered.
+    case "
+$SUPPORTED_PLATFORMS
+" in
+        *"
+$platform
+"*) ;;
+        *) die "no build is published for $platform. Supported: $(echo "$SUPPORTED_PLATFORMS" | tr '\n' ' ')" ;;
+    esac
 }
 
 # Download $1 to the file $2 with whichever of curl / wget is present.
@@ -289,6 +309,12 @@ main() {
     base_url="${TAPSTATE_BASE_URL:-https://github.com/tapstate/tapstate/releases}"
     install_dir="${TAPSTATE_INSTALL_DIR:-$HOME/.tapstate/bin}"
 
+    # Before detect_platform: listing what is published is a question about the release, not about the
+    # machine asking, and it has to be answerable from a machine no build is published for.
+    if [ "${1:-}" = --print-platforms ]; then
+        printf '%s\n' "$SUPPORTED_PLATFORMS"
+        return
+    fi
     detect_platform
     # Detect-only mode: print the <os>-<arch> tuple and stop. detect_platform has already refused any
     # unsupported platform above, so this doubles as a zero-side-effect platform gate -- the demo

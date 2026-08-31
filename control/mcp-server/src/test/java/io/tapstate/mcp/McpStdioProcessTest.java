@@ -37,6 +37,16 @@ class McpStdioProcessTest {
             assertThat(initialize.get("id")).isEqualTo(1L);
             assertThat(((Map<?, ?>) initialize.get("result")).get("protocolVersion"))
                     .isEqualTo("2025-06-18");
+            // The version this sidecar announces to whatever drives it. It is configured, not compiled,
+            // so nothing but this could notice it being left behind by a release -- and the number is
+            // read by a model that will report it. Note whose version it is: the sidecar ships with the
+            // CLI, so this is that half of the pair, never the server's.
+            String projectVersion = System.getProperty("tapstate.project.version");
+            assertThat(projectVersion)
+                    .as("the build must pass -Dtapstate.project.version so this guard can run at all")
+                    .isNotBlank();
+            assertThat(((Map<?, ?>) ((Map<?, ?>) initialize.get("result")).get("serverInfo")).get("version"))
+                    .isEqualTo(projectVersion);
 
             send(input, """
                     {"jsonrpc":"2.0","method":"notifications/initialized"}
@@ -47,7 +57,7 @@ class McpStdioProcessTest {
             Map<?, ?> listed = readResponse(output, Duration.ofSeconds(10));
             assertThat(listed.get("id")).isEqualTo(2L);
             List<?> tools = (List<?>) ((Map<?, ?>) listed.get("result")).get("tools");
-            assertThat(tools).hasSize(14);
+            assertThat(tools).hasSize(15);
             assertThat(tools.stream()
                     .map(tool -> String.valueOf(((Map<?, ?>) tool).get("name")))
                     .toList())
