@@ -286,6 +286,72 @@ class ContextConfigStoreTest {
         assertThat(Files.readString(config)).isEqualTo(yaml);
     }
 
+    @Test
+    void rejectsTypedSchemaViolationsAndContainsMigrationFailures(@TempDir Path home) throws IOException {
+        Path root = Files.createDirectory(home.resolve(".tapstate"));
+        ownerOnlyDirectory(root);
+        Path config = root.resolve("config.yaml");
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+
+        assertRejectedAndUnchanged(store, config, """
+                version: "1"
+                contexts: {}
+                workspaceBindings: {}
+                """, "cli.context-config-invalid");
+        assertRejectedAndUnchanged(store, config, """
+                version: 1
+                lastContext: true
+                contexts: {}
+                workspaceBindings: {}
+                """, "cli.context-config-invalid");
+        assertRejectedAndUnchanged(store, config, """
+                version: 1
+                contexts: []
+                workspaceBindings: {}
+                """, "cli.context-config-invalid");
+        assertRejectedAndUnchanged(store, config, """
+                version: 1
+                contexts:
+                  dev:
+                    id: 018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2
+                    seeds: https://tapstate.example.com
+                    tls:
+                      verify: true
+                    authRef: 5c199643-04da-4f72-9831-3a77e3590eed
+                workspaceBindings: {}
+                """, "cli.context-config-invalid");
+        assertRejectedAndUnchanged(store, config, """
+                version: 1
+                contexts:
+                  dev:
+                    id: 018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2
+                    seeds:
+                      - https://tapstate.example.com
+                    tls:
+                      verify: "true"
+                    authRef: 5c199643-04da-4f72-9831-3a77e3590eed
+                workspaceBindings: {}
+                """, "cli.context-config-invalid");
+
+        Files.writeString(config, "version: 0\n", StandardCharsets.UTF_8);
+        ownerOnlyFile(config);
+        ContextConfigMigration broken = new ContextConfigMigration() {
+            @Override
+            public int sourceVersion() {
+                return 0;
+            }
+
+            @Override
+            public ContextConfig migrate(Map<String, Object> document) {
+                throw new IllegalStateException("legacy migration broke");
+            }
+        };
+        assertThatThrownBy(() -> ContextConfigStore.underHome(home, List.of(broken)).load())
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code().code()).isEqualTo("cli.context-config-invalid"));
+        assertThat(Files.readString(config)).isEqualTo("version: 0\n");
+    }
+
     private static ContextConfig configNamed(String name, UUID id) {
         return new ContextConfig(1, name,
                 Map.of(name, new ContextDefinition(id, List.of(URI.create("https://" + name + ".example.com")),

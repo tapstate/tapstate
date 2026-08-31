@@ -12,6 +12,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Clock;
 import java.time.Instant;
@@ -26,6 +27,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -34,6 +36,31 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * The JLine read loop itself is not unit-tested; {@link Repl#dispatch} is the testable seam.
  */
 class ReplTest {
+
+    private static final UUID TEST_CONTEXT_ID =
+            UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+    private static final UUID TEST_AUTH_REF =
+            UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+
+    private static ResolvedContext.Named namedContext(URI seed) {
+        return new ResolvedContext.Named(
+                "dev",
+                new ContextDefinition(TEST_CONTEXT_ID, List.of(seed), new ContextTls(true), TEST_AUTH_REF),
+                ResolvedContext.Source.EXPLICIT);
+    }
+
+    private static LoginOutcome.Success persistentLogin(
+            Instant now, String issuer, String principal, String sessionToken) {
+        return new LoginOutcome.Success(
+                "jwt-" + principal,
+                now.plusSeconds(900),
+                issuer,
+                principal,
+                List.of("read"),
+                sessionToken,
+                now.plusSeconds(3600),
+                now.plusSeconds(7200));
+    }
 
     private record Harness(Repl repl, StringWriter sink) {
     }
@@ -4083,6 +4110,131 @@ class ReplTest {
                 "logout tss_s01.session-secret@http://127.0.0.1:7900");
         assertThat(resumedOutput.toString()).contains("signed in as alice").contains("session revoked");
         assertThat(store.load(authRef, contextId)).isEmpty();
+    }
+
+    @Test
+    void authServiceRendersRejectedAndUnreachableLoginOutcomes(@TempDir Path home) {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ResolvedContext.Named context = namedContext(seed);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        AuthService service = new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(Instant.parse("2026-08-17T10:00:00Z"), ZoneOffset.UTC));
+
+        client.loginOutcome = new LoginOutcome.Rejected("control.auth-failed", "bad credential");
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Rejected("control.auth-failed", "alice"));
+
+        client.loginOutcome = new LoginOutcome.Rejected("control.rate-limited", "try later");
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Rejected("unknown", "alice"));
+
+        client.loginOutcome = new LoginOutcome.Unreachable();
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Unreachable());
+    }
+
+    @Test
+    void authServiceFailsClosedForNonPersistentOrInvalidLoginSuccess(@TempDir Path home) {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ResolvedContext.Named context = namedContext(seed);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthService service = new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(now, ZoneOffset.UTC));
+
+        client.loginOutcome = new LoginOutcome.Success("jwt");
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Unreachable());
+
+        client.loginOutcome = persistentLogin(now, "urn:tapstate:cluster:other", "alice",
+                "tss_alice.other");
+        assertThatThrownBy(() -> service.login(context, "alice", "pw", false))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-issuer-mismatch"));
+
+        client.loginOutcome = new LoginOutcome.Success("jwt-alice", now.minusSeconds(1),
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_alice.expired", now.plusSeconds(3600), now.plusSeconds(7200));
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Unreachable());
+
+        client.loginOutcome = new LoginOutcome.Success("jwt-alice", now.plusSeconds(900),
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_alice.idle", now.minusSeconds(1), now.plusSeconds(7200));
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Unreachable());
+    }
+
+    @Test
+    void authServiceUsesProcessMemoryWhenInteractiveCachePersistenceIsUnsafe(@TempDir Path home)
+            throws IOException {
+        assumeTrue(Files.getFileStore(home).supportsFileAttributeView("posix"));
+        Path root = Files.createDirectory(home.resolve(".tapstate"));
+        Files.setPosixFilePermissions(root, Set.of(PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE,
+                PosixFilePermission.GROUP_READ));
+
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ResolvedContext.Named context = namedContext(seed);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        client.loginOutcome = persistentLogin(now,"urn:tapstate:cluster:test-cluster", "alice",
+                "tss_alice.memory");
+        AuthService service = new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(now, ZoneOffset.UTC));
+
+        AuthService.LoginResult result = service.login(context, "alice", "pw", true);
+
+        assertThat(result).isInstanceOfSatisfying(AuthService.LoginResult.Success.class,
+                success -> assertThat(success.storage()).isEqualTo(AuthFileStore.SaveResult.MEMORY_ONLY));
+        assertThat(service.resume(context)).isPresent();
+        assertThat(service.status(context)).isInstanceOf(AuthService.Status.SignedIn.class);
+        assertThat(service.logout(context, true)).isEqualTo(new AuthService.LogoutResult.Removed(true));
+        assertThat(service.status(context)).isEqualTo(new AuthService.Status.SignedOut());
+    }
+
+    @Test
+    void authServiceKeepsCachesForRejectedOrUnreachableRemoteLogoutAndDetectsMemoryReplacement(
+            @TempDir Path home) throws IOException {
+        assumeTrue(Files.getFileStore(home).supportsFileAttributeView("posix"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ResolvedContext.Named context = namedContext(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+
+        AuthFileStore store = AuthFileStore.underHome(home);
+        AuthSessionRecord cached = new AuthSessionRecord(1, context.definition().authRef(),
+                context.definition().id(), "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_alice.persisted", now, now.plusSeconds(3600), now.plusSeconds(7200));
+        store.save(cached, false);
+
+        FakeControlPlane client = new FakeControlPlane(seed);
+        AuthService service = new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC));
+        client.logoutOutcome = new SessionLogoutOutcome.Rejected("control.auth-failed", "bad session");
+        assertThat(service.logout(context, false))
+                .isEqualTo(new AuthService.LogoutResult.Rejected("unknown", "alice"));
+        assertThat(store.load(context.definition().authRef(), context.definition().id())).contains(cached);
+
+        client.logoutOutcome = new SessionLogoutOutcome.Unreachable();
+        assertThat(service.logout(context, false)).isEqualTo(new AuthService.LogoutResult.Unreachable());
+        assertThat(store.load(context.definition().authRef(), context.definition().id())).contains(cached);
+
+        Path root = home.resolve(".tapstate");
+        Files.setPosixFilePermissions(root, Set.of(PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE,
+                PosixFilePermission.GROUP_READ));
+        AuthService memoryService = new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(now, ZoneOffset.UTC));
+        client.loginOutcome = persistentLogin(now, "urn:tapstate:cluster:test-cluster", "alice",
+                "tss_alice.old");
+        memoryService.login(context, "alice", "pw", true);
+        client.logoutOutcome = new SessionLogoutOutcome.Success();
+        client.beforeLogoutResult = () -> {
+            client.loginOutcome = persistentLogin(now, "urn:tapstate:cluster:test-cluster", "bob",
+                    "tss_bob.new");
+            memoryService.login(context, "bob", "pw", true);
+        };
+        assertThat(memoryService.logout(context, false))
+                .isEqualTo(new AuthService.LogoutResult.CacheChanged());
     }
 
     @Test
