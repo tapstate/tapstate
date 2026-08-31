@@ -2802,15 +2802,26 @@ final class Repl {
         if (warnings.isEmpty()) {
             return;
         }
-        PrintWriter err = commandLine.getErr();
-        MessageCatalog catalog = MessageCatalog.bundled();
         for (ApplyOutcome.Warning warning : warnings) {
-            MessageCatalog.Rendered rendered = catalog.render(warning.code(), warning.params());
-            err.println(Ansi.AUTO.string("@|bold,yellow warning:|@") + " " + warning.code());
-            err.println("  " + rendered.message());
-            if (rendered.solution() != null) {
-                err.println("  " + rendered.solution());
-            }
+            renderWarning(warning.code(), warning.params());
+        }
+    }
+
+    /**
+     * Renders one coded advisory: a yellow {@code warning:} header, then the catalog message and, where
+     * there is one, the remedy. Deliberately the same shape a coded error renders in and deliberately a
+     * different colour and word, because the difference a reader has to see at a glance is not which
+     * subsystem spoke but whether anything was refused. It goes to err so it survives a redirected
+     * stdout, and it is not suppressed by quiet: an advisory nobody asked for is exactly the one worth
+     * keeping.
+     */
+    private void renderWarning(String code, Map<String, Object> params) {
+        PrintWriter err = commandLine.getErr();
+        MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(code, params);
+        err.println(Ansi.AUTO.string("@|bold,yellow warning:|@") + " " + code);
+        err.println("  " + rendered.message());
+        if (rendered.solution() != null) {
+            err.println("  " + rendered.solution());
         }
         err.flush();
     }
@@ -2938,7 +2949,16 @@ final class Repl {
         for (URI seed : seeds) {
             if (controlPlane.isHealthy(seed)) {
                 session.connect(seeds, seed);
-                confirm("connected to " + hostPort(seed));
+                // Both versions, every time. The CLI is installed by one path and the server pulled by
+                // another, so the pair is what a reader needs and neither half implies the other. A
+                // server that does not answer is reported as not answering rather than as agreeing.
+                String serverVersion = controlPlane.serverVersion(seed);
+                confirm("connected to " + hostPort(seed) + " (cli " + Cli.VERSION_NUMBER + ", server "
+                        + (serverVersion == null ? "not reported" : serverVersion) + ")");
+                if (serverVersion != null && !serverVersion.equals(Cli.VERSION_NUMBER)) {
+                    renderWarning(CliError.VERSION_MISMATCH.code(),
+                            Map.of("cli", Cli.VERSION_NUMBER, "server", serverVersion));
+                }
                 return Cli.EXIT_OK;
             }
         }

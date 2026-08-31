@@ -83,6 +83,8 @@ class ReplTest {
     private static final class FakeControlPlane implements ControlPlaneClient {
         private final Set<URI> healthy;
         final List<URI> probed = new ArrayList<>();
+        /** What the server answers when asked its version; null is a server that does not say. */
+        String serverVersion;
         /** The canned login outcome and a log of the login calls made ({@code user:pass@base}). */
         LoginOutcome loginOutcome = new LoginOutcome.Unreachable();
         final List<String> loginCalls = new ArrayList<>();
@@ -175,6 +177,11 @@ class ReplTest {
         void setHealthy(URI... urls) {
             healthy.clear();
             healthy.addAll(List.of(urls));
+        }
+
+        @Override
+        public String serverVersion(URI baseUrl) {
+            return healthy.contains(baseUrl) ? serverVersion : null;
         }
 
         @Override
@@ -592,6 +599,74 @@ class ReplTest {
         assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://node1:7900"));
         assertThat(h.repl().prompt()).isEqualTo("tapstate(node1:7900)> ");
         assertThat(h.sink().toString()).contains("connected").contains("node1:7900");
+    }
+
+    /**
+     * C14. A CLI is installed by one path and a server pulled by another, so the two can be different
+     * builds; a reader who can only see one number states it with confidence when reporting what the
+     * other one did. Connecting is where both are known at once, so it is where both are said.
+     */
+    @Test
+    void connectingReportsBothVersionsAndStaysQuietWhenTheyAgree() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = buildVersion();
+        Harness h = harness(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("connect node1:7900")).isTrue();
+
+        String out = h.sink().toString();
+        assertThat(out).contains(buildVersion());
+        // The control group. Without a matched pair, an implementation that warns unconditionally
+        // passes the mismatch test just as well, and the warning would then mean nothing.
+        assertThat(out).doesNotContain("cli.version-mismatch");
+    }
+
+    @Test
+    void connectingToAServerOnAnotherVersionWarnsAndNamesBothNumbers() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = harness(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("connect node1:7900")).isTrue();
+        // A warning, not a refusal: the connection is good and every verb still works. Refusing here
+        // would make the CLI unusable against exactly the servers a reader most needs to inspect.
+        assertThat(h.repl().session().isConnected()).isTrue();
+
+        String out = h.sink().toString();
+        assertThat(out).contains("cli.version-mismatch");
+        // Both numbers, because "they differ" without saying how is a sentence nobody can act on.
+        assertThat(out).contains(buildVersion()).contains("9.9.9");
+    }
+
+    /**
+     * The boundary of C14: a version belongs on the human surface, never in output something else
+     * parses. This is a regression guard rather than a live defect -- today the banner is printed by
+     * connect alone, and connect has no {@code -o} -- so it is green the day it is written. What it
+     * exists to catch is the easiest future shortcut, printing the pair on every command, which fails
+     * nothing and no one notices until a caller's parser meets a line it has no grammar for.
+     */
+    @Test
+    void noVerbsMachineReadableOutputCarriesAVersionNumber() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.listOutcome = new ListOutcome.Listed(List.of(
+                new RemoteArtifact("src_kfk", "source", "kind: source\n")));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("ls -o json")).isTrue();
+        String machineReadable = h.sink().toString().substring(mark);
+
+        assertThat(machineReadable).doesNotContain(buildVersion()).doesNotContain("9.9.9");
+    }
+
+    /** The version the build was run at -- handed in by surefire, so it is not read back off the code. */
+    private static String buildVersion() {
+        String projectVersion = System.getProperty("tapstate.project.version");
+        assertThat(projectVersion)
+                .as("the build must pass -Dtapstate.project.version so these guards can run at all")
+                .isNotBlank();
+        return projectVersion;
     }
 
     @Test

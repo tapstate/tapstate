@@ -78,6 +78,13 @@ public final class Cli implements Runnable {
      */
     static final String VERSION = "tapstate 0.3.0";
 
+    /**
+     * Just the number out of {@link #VERSION}, for the places that print it beside another version and
+     * would read as nonsense with the product name repeated in both halves. Derived rather than written
+     * twice: a second literal is a second thing a release can leave behind.
+     */
+    static final String VERSION_NUMBER = VERSION.substring(VERSION.indexOf(' ') + 1);
+
     /** Exit code for a verb that ran and did what was asked. */
     static final int EXIT_OK = 0;
 

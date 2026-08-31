@@ -107,14 +107,28 @@ enum CliError implements TapstateErrorCode {
      * A version precondition was offered for a batch holding more than one resource; {@code count} is how
      * many it holds. One hash names one version, so there is no resource it could be describing.
      */
-    IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count"));
+    IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count")),
+
+    /**
+     * This CLI and the server it just connected to are different versions; {@code cli} and
+     * {@code server} are the two numbers. A warning, not a refusal: the connection is good and every
+     * verb still works. It is said at all because the two halves are installed by different paths, so
+     * they drift silently, and a reader who can see only one number reports it as though it were both.
+     */
+    VERSION_MISMATCH("cli.version-mismatch", Set.of("cli", "server"), Severity.WARNING);
 
     private final String code;
     private final Set<String> placeholders;
+    private final Severity severity;
 
     CliError(String code, Set<String> placeholders) {
+        this(code, placeholders, Severity.ERROR);
+    }
+
+    CliError(String code, Set<String> placeholders, Severity severity) {
         this.code = code;
         this.placeholders = placeholders;
+        this.severity = severity;
     }
 
     @Override
@@ -124,7 +138,7 @@ enum CliError implements TapstateErrorCode {
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return severity;
     }
 
     @Override

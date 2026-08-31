@@ -117,6 +117,33 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public String serverVersion(URI baseUrl) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/version"))
+                    .timeout(probeTimeout)
+                    .GET()
+                    .build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() != 200) {
+                return null;
+            }
+            return JsonReader.parse(response.body()) instanceof Map<?, ?> map
+                    && map.get("version") instanceof String version && !version.isBlank()
+                    ? version
+                    : null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (IOException | RuntimeException e) {
+            // Every way of not getting an answer is the same answer here: a server that cannot say
+            // which version it is. A malformed base URL throws while the request is built, exactly as
+            // in the probe above, and is no more a failure of the caller's command than a timeout is.
+            return null;
+        }
+    }
+
+    @Override
     public LoginOutcome login(URI baseUrl, String username, String password) {
         try {
             Map<String, String> payload = new LinkedHashMap<>();
