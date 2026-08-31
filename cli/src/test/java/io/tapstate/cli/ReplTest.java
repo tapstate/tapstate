@@ -686,6 +686,25 @@ class ReplTest {
         assertThat(out).doesNotContain("9.9.9");
     }
 
+    @Test
+    void aReportedProblemCarriesTheServersVersionOnceThereIsOne() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = harness(Path.of("tap-work"), client);
+        assertThat(h.repl().dispatch("connect node1:7900")).isTrue();
+
+        int mark = h.sink().toString().length();
+        // any verb that needs a credential this session does not hold -- the diagnostic is the subject,
+        // not the verb
+        assertThat(h.repl().dispatch("ls")).isTrue();
+        String diagnostic = h.sink().toString().substring(mark);
+
+        assertThat(diagnostic).contains("cli.not-authenticated");
+        // The pair the session is actually running, not the offline default: a stamp that said "not
+        // connected" from inside a live session would be worse than none, because it reads as fact.
+        assertThat(diagnostic).contains("cli " + buildVersion()).contains("server 9.9.9");
+    }
+
     /** The version the build was run at -- handed in by surefire, so it is not read back off the code. */
     private static String buildVersion() {
         String projectVersion = System.getProperty("tapstate.project.version");

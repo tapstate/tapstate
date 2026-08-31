@@ -208,6 +208,18 @@ class CliTest {
     }
 
     @Test
+    void aReportedProblemSaysWhichBuildsProducedIt() {
+        // The point of the stamp: pasting the error is enough. A reporter does not have to know the CLI
+        // and the server are separate installs, and nobody has to ask "which version are you on" -- the
+        // answer arrived with the complaint. Offline it says so rather than leaving the half blank.
+        Run r = run("validate", resource("ws-invalid").toString());
+
+        assertThat(r.code()).isEqualTo(1);
+        assertThat(r.all()).contains("cli " + Cli.VERSION_NUMBER);
+        assertThat(r.all()).contains("server not connected");
+    }
+
+    @Test
     void validateHumanOutputRendersTheCatalogMessageNotJustTheCode() {
         Run r = run("validate", resource("ws-invalid").toString());
         assertThat(r.code()).isEqualTo(1);

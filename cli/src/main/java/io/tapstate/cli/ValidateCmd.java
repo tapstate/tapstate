@@ -158,6 +158,10 @@ final class ValidateCmd implements Callable<Integer> {
                 if (rendered.solution() != null) {
                     err.println("  " + rendered.solution());
                 }
+                // Stamped like every other reported problem. This surface is its own shape because it
+                // carries a source position, but what a reader pastes has to say which build produced
+                // it whichever surface it came from -- and this is the one they paste most.
+                err.println("  (" + Diagnostics.OFFLINE_VERSIONS + ")");
                 err.flush();
             }
         }

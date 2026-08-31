@@ -410,7 +410,8 @@ final class Repl {
     private int onlineVerb(List<String> words) {
         PrintWriter err = commandLine.getErr();
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", words.get(0)));
+            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
+ Map.of("verb", words.get(0)), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         // `test` and its read-back `test-result` return a structured report that is worth machine-reading, so
@@ -698,11 +699,13 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         if (!session.isConnected()) {
-            Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", verb));
+            Diagnostics.printText(err, CliError.NOT_CONNECTED,
+ Map.of("verb", verb), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", verb));
+            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
+ Map.of("verb", verb), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         return switch (call) {
@@ -727,7 +730,8 @@ final class Repl {
     private int watchLive(DataBrowserCall.Live live) {
         PrintWriter out = commandLine.getOut();
         if (!terminal.getAsBoolean()) {
-            Diagnostics.printText(commandLine.getErr(), CliError.WATCH_NEEDS_A_TERMINAL, Map.of());
+            Diagnostics.printText(commandLine.getErr(), CliError.WATCH_NEEDS_A_TERMINAL,
+ Map.of(), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         String namespace = live.sourceId() + "." + live.collection();
@@ -2922,7 +2926,7 @@ final class Repl {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
         Diagnostics.printText(commandLine.getErr(), CliError.REQUEST_TIMED_OUT,
-                Map.of("server", hostPort(session.landingNode())));
+                Map.of("server", hostPort(session.landingNode())), session.versions());
         return Cli.EXIT_DIAGNOSTIC;
     }
 
@@ -2952,13 +2956,12 @@ final class Repl {
         }
         for (URI seed : seeds) {
             if (controlPlane.isHealthy(seed)) {
-                session.connect(seeds, seed);
                 // Both versions, every time. The CLI is installed by one path and the server pulled by
                 // another, so the pair is what a reader needs and neither half implies the other. A
                 // server that does not answer is reported as not answering rather than as agreeing.
                 String serverVersion = controlPlane.serverVersion(seed);
-                confirm("connected to " + hostPort(seed) + " (cli " + Cli.VERSION_NUMBER + ", server "
-                        + (serverVersion == null ? "not reported" : serverVersion) + ")");
+                session.connect(seeds, seed, serverVersion);
+                confirm("connected to " + hostPort(seed) + " (" + session.versions() + ")");
                 if (serverVersion != null && !serverVersion.equals(Cli.VERSION_NUMBER)) {
                     renderWarning(CliError.VERSION_MISMATCH.code(),
                             Map.of("cli", Cli.VERSION_NUMBER, "server", serverVersion));
@@ -3016,7 +3019,8 @@ final class Repl {
         PrintWriter out = commandLine.getOut();
         PrintWriter err = commandLine.getErr();
         if (!session.isConnected()) {
-            Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", "login"));
+            Diagnostics.printText(err, CliError.NOT_CONNECTED,
+ Map.of("verb", "login"), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (words.size() < 2 || words.get(1).isBlank()) {
@@ -3096,7 +3100,8 @@ final class Repl {
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */
     private void reportConnectFailed(List<URI> seeds) {
         String display = seeds.stream().map(URI::toString).collect(Collectors.joining(", "));
-        Diagnostics.printText(commandLine.getErr(), CliError.CONNECT_FAILED, Map.of("seeds", display));
+        Diagnostics.printText(commandLine.getErr(), CliError.CONNECT_FAILED,
+ Map.of("seeds", display), session.versions());
     }
 
     /**
