@@ -38,20 +38,15 @@ final class TuiApp {
     private NonBlockingReader reader;
     private Display display;
     private Terminal terminal;
-    private TuiDashboard.Prompt prompt;
-
-    private String command = "";
-    private String notice;
+    private TuiAppState uiState;
     private final TuiCommandHistory history = new TuiCommandHistory();
-    private boolean paletteOpen;
-    private int paletteIndex;
 
     TuiApp(Repl repl, StringWriter out, StringWriter err, String initialContext) {
         this.repl = repl;
         this.out = out;
         this.err = err;
         this.initialContext = initialContext;
-        this.notice = consumeOutput();
+        this.uiState = TuiAppState.initial(consumeOutput());
         repl.prompter(new TuiPrompter(this::promptText, this::promptChoice, this::promptLines));
     }
 
@@ -77,7 +72,7 @@ final class TuiApp {
                 terminal.puts(InfoCmp.Capability.exit_ca_mode);
                 terminal.setAttributes(original);
                 terminal.flush();
-                this.prompt = null;
+                this.uiState = TuiReducer.reduce(this.uiState, new TuiAction.ClearPrompt());
                 this.reader = null;
                 this.display = null;
                 this.terminal = null;
@@ -109,7 +104,7 @@ final class TuiApp {
             if (code < 0) {
                 return Cli.EXIT_OK;
             }
-            if (!paletteOpen && command.isEmpty() && (code == 'q' || code == 'Q')) {
+            if (!uiState.paletteOpen() && uiState.command().isEmpty() && (code == 'q' || code == 'Q')) {
                 return Cli.EXIT_OK;
             }
             if (code == TuiCommandBar.ESCAPE) {
@@ -122,24 +117,24 @@ final class TuiApp {
                 draw(display, terminal);
                 continue;
             }
-            if (paletteOpen && code == TuiCommandBar.CTRL_P) {
-                paletteOpen = false;
+            if (uiState.paletteOpen() && code == TuiCommandBar.CTRL_P) {
+                uiState = TuiReducer.reduce(uiState, new TuiAction.ClosePalette(uiState.notice()));
                 draw(display, terminal);
                 continue;
             }
-            if (paletteOpen && code == TuiCommandBar.ENTER) {
-                command = PALETTE_COMMANDS.get(paletteIndex);
-                paletteOpen = false;
-                notice = "selected: " + command + " · Enter run";
+            if (uiState.paletteOpen() && code == TuiCommandBar.ENTER) {
+                String selected = uiState.palette().get(uiState.paletteIndex());
+                uiState = TuiReducer.reduce(uiState,
+                        new TuiAction.SelectPaletteCommand(selected, "selected: " + selected + " · Enter run"));
                 draw(display, terminal);
                 continue;
             }
-            if (paletteOpen && (code == TuiCommandBar.BACKSPACE || code == TuiCommandBar.DELETE
+            if (uiState.paletteOpen() && (code == TuiCommandBar.BACKSPACE || code == TuiCommandBar.DELETE
                     || (code >= 32 && !Character.isISOControl(code)))) {
-                paletteOpen = false;
+                uiState = TuiReducer.reduce(uiState, new TuiAction.ClosePalette(uiState.notice()));
             }
-            TuiCommandBar.Update update = TuiCommandBar.accept(command, code);
-            command = update.value();
+            TuiCommandBar.Update update = TuiCommandBar.accept(uiState.command(), code);
+            uiState = TuiReducer.reduce(uiState, new TuiAction.SetCommand(update.value()));
             switch (update.event()) {
                 case QUIT -> {
                     return Cli.EXIT_OK;
@@ -159,25 +154,26 @@ final class TuiApp {
     }
 
     private boolean submit() {
-        String line = command.trim();
-        command = "";
-        paletteOpen = false;
+        String line = uiState.command().trim();
+        uiState = TuiReducer.reduce(uiState, new TuiAction.ClearCommand());
+        uiState = TuiReducer.reduce(uiState, new TuiAction.ClosePalette(uiState.notice()));
         if (line.isEmpty()) {
             history.reset();
-            notice = "ready";
+            uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice("ready"));
             return true;
         }
         history.record(line);
         clearOutput();
-        notice = "running: " + line;
+        uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice("running: " + line));
         boolean keepGoing = repl.dispatch(line);
         String result = consumeOutput();
         if (!result.isBlank()) {
-            notice = result;
+            uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice(result));
         } else if (repl.lastExitCode() == Cli.EXIT_OK) {
-            notice = "ready";
+            uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice("ready"));
         } else {
-            notice = "command failed (exit " + repl.lastExitCode() + ")";
+            uiState = TuiReducer.reduce(uiState,
+                    new TuiAction.SetNotice("command failed (exit " + repl.lastExitCode() + ")"));
         }
         return keepGoing;
     }
@@ -191,7 +187,8 @@ final class TuiApp {
                 ? "Enter submit · Esc close"
                 : "default: " + defaultValue + " · Enter accept · Esc close";
         StringBuilder input = new StringBuilder();
-        prompt = TuiDashboard.Prompt.text(question, "", hint, secret);
+        uiState = TuiReducer.reduce(uiState, new TuiAction.SetPrompt(
+                TuiDashboard.Prompt.text(question, "", hint, secret)));
         draw(display, terminal);
         try {
             while (true) {
@@ -209,11 +206,12 @@ final class TuiApp {
                 } else {
                     continue;
                 }
-                prompt = TuiDashboard.Prompt.text(question, input.toString(), hint, secret);
+                uiState = TuiReducer.reduce(uiState, new TuiAction.SetPrompt(
+                        TuiDashboard.Prompt.text(question, input.toString(), hint, secret)));
                 draw(display, terminal);
             }
         } finally {
-            prompt = null;
+            uiState = TuiReducer.reduce(uiState, new TuiAction.ClearPrompt());
             draw(display, terminal);
         }
     }
@@ -224,7 +222,8 @@ final class TuiApp {
             return "";
         }
         int selected = 0;
-        prompt = TuiDashboard.Prompt.choice(question, options, selected);
+        uiState = TuiReducer.reduce(uiState, new TuiAction.SetPrompt(
+                TuiDashboard.Prompt.choice(question, options, selected)));
         draw(display, terminal);
         try {
             while (true) {
@@ -252,11 +251,12 @@ final class TuiApp {
                 } else {
                     continue;
                 }
-                prompt = TuiDashboard.Prompt.choice(question, options, selected);
+                uiState = TuiReducer.reduce(uiState, new TuiAction.SetPrompt(
+                        TuiDashboard.Prompt.choice(question, options, selected)));
                 draw(display, terminal);
             }
         } finally {
-            prompt = null;
+            uiState = TuiReducer.reduce(uiState, new TuiAction.ClearPrompt());
             draw(display, terminal);
         }
     }
@@ -268,7 +268,8 @@ final class TuiApp {
         }
         List<String> lines = new ArrayList<>();
         StringBuilder input = new StringBuilder();
-        prompt = TuiDashboard.Prompt.lines(question, lines, "");
+        uiState = TuiReducer.reduce(uiState, new TuiAction.SetPrompt(
+                TuiDashboard.Prompt.lines(question, lines, "")));
         draw(display, terminal);
         try {
             while (true) {
@@ -290,11 +291,12 @@ final class TuiApp {
                 } else {
                     continue;
                 }
-                prompt = TuiDashboard.Prompt.lines(question, lines, input.toString());
+                uiState = TuiReducer.reduce(uiState, new TuiAction.SetPrompt(
+                        TuiDashboard.Prompt.lines(question, lines, input.toString())));
                 draw(display, terminal);
             }
         } finally {
-            prompt = null;
+            uiState = TuiReducer.reduce(uiState, new TuiAction.ClearPrompt());
             draw(display, terminal);
         }
     }
@@ -321,7 +323,8 @@ final class TuiApp {
                 }
             }
         } catch (IOException failure) {
-            notice = "prompt failed: " + failure.getMessage();
+            uiState = TuiReducer.reduce(uiState,
+                    new TuiAction.SetNotice("prompt failed: " + failure.getMessage()));
             return -1;
         }
     }
@@ -373,8 +376,8 @@ final class TuiApp {
         if (context == null || context.isBlank()) {
             context = initialContext;
         }
-        return new TuiDashboard.State(repl.workdir(), context, session.principal(), connection, notice, command,
-                paletteOpen ? PALETTE_COMMANDS : List.of(), paletteIndex, prompt);
+        return new TuiDashboard.State(repl.workdir(), context, session.principal(), connection, uiState.notice(),
+                uiState.command(), uiState.palette(), uiState.paletteIndex(), uiState.prompt());
     }
 
     private String consumeOutput() {
@@ -404,31 +407,31 @@ final class TuiApp {
     }
 
     private void togglePalette() {
-        paletteOpen = !paletteOpen;
-        if (paletteOpen) {
-            paletteIndex = 0;
-            notice = PALETTE_NOTICE;
+        if (uiState.paletteOpen()) {
+            uiState = TuiReducer.reduce(uiState, new TuiAction.ClosePalette(uiState.notice()));
+        } else {
+            uiState = TuiReducer.reduce(uiState,
+                    new TuiAction.OpenPalette(PALETTE_COMMANDS, PALETTE_NOTICE));
         }
     }
 
     private void navigate(EscapeKey key) {
-        if (paletteOpen) {
-            paletteIndex = key == EscapeKey.UP
-                    ? Math.max(0, paletteIndex - 1)
-                    : Math.min(PALETTE_COMMANDS.size() - 1, paletteIndex + 1);
-            notice = PALETTE_NOTICE;
+        if (uiState.paletteOpen()) {
+            uiState = TuiReducer.reduce(uiState,
+                    new TuiAction.MovePalette(key == EscapeKey.UP ? -1 : 1));
+            uiState = TuiReducer.reduce(uiState, new TuiAction.SetNotice(PALETTE_NOTICE));
             return;
         }
-        command = key == EscapeKey.UP ? history.previous(command) : history.next();
+        String next = key == EscapeKey.UP ? history.previous(uiState.command()) : history.next();
+        uiState = TuiReducer.reduce(uiState, new TuiAction.SetCommand(next));
     }
 
     private void closePaletteOrClearCommand() {
-        if (paletteOpen) {
-            paletteOpen = false;
-            notice = "ready";
+        if (uiState.paletteOpen()) {
+            uiState = TuiReducer.reduce(uiState, new TuiAction.ClosePalette("ready"));
         } else {
-            TuiCommandBar.Update update = TuiCommandBar.accept(command, TuiCommandBar.ESCAPE);
-            command = update.value();
+            TuiCommandBar.Update update = TuiCommandBar.accept(uiState.command(), TuiCommandBar.ESCAPE);
+            uiState = TuiReducer.reduce(uiState, new TuiAction.SetCommand(update.value()));
         }
     }
 
