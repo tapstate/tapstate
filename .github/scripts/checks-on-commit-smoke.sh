@@ -198,7 +198,12 @@ runs $'build\tcompleted\tsuccess'
 runs_head $'build\tcompleted\tsuccess' $'dco\tcompleted\tsuccess'
 pulls "$head_sha"
 trees deadbeef 0ther777
-expect "a head carrying a different tree does not answer"        3 "never ran" --sha "$sha" --required build,dco
+expect "a head carrying a different tree does not answer"        3 "different tree" --sha "$sha" --required build,dco
+expect "and it names the head it declined to read"               3 "$head_sha" --sha "$sha" --required build,dco
+# The two refusals must not read alike. "was not dispatched" is a statement about a lane that never
+# started; this one is about an answer that exists and is about different code, and the repair is
+# not the same -- one is re-run something, the other is release a different commit.
+refute "and it is not called a check that was not dispatched"      "was not dispatched" --sha "$sha" --required build,dco
 
 reset
 runs $'build\tcompleted\tsuccess'

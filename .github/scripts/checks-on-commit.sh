@@ -87,6 +87,7 @@ fi
 # every name that is absent here is absent for the same structural reason.
 fallback_head=""
 fallback_runs=""
+fallback_declined=""
 fallback_tried=0
 resolve_fallback() {
   [ "$fallback_tried" = 0 ] || return 0
@@ -101,7 +102,13 @@ resolve_fallback() {
   [ -n "$head" ] || return 0
   tree="$(gh api "repos/${repo}/commits/${sha}" --jq '.commit.tree.sha // empty' 2>/dev/null)"
   head_tree="$(gh api "repos/${repo}/commits/${head}" --jq '.commit.tree.sha // empty' 2>/dev/null)"
-  [ -n "$tree" ] && [ "$tree" = "$head_tree" ] || return 0
+  if [ -z "$tree" ] || [ "$tree" != "$head_tree" ]; then
+    # Recorded rather than dropped. Refusing here is right, but it is a different refusal from a
+    # lane that never started: the answer exists and is about different code, and what fixes it is
+    # releasing a different commit, not re-running anything.
+    fallback_declined="$head"
+    return 0
+  fi
   fallback_runs="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" \
       --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv' 2>/dev/null)"
   [ -n "$fallback_runs" ] || return 0
@@ -126,7 +133,11 @@ while IFS= read -r name; do
     fi
   fi
   if [ -z "$line" ]; then
-    echo "::error::'${name}' never ran on ${sha} — a check that was not dispatched leaves no record, so this cannot be read off the failures"
+    if [ -n "$fallback_declined" ]; then
+      echo "::error::'${name}' did not run on ${sha}, and ${fallback_declined} — the head of the pull request it came from — carries a different tree, so what ran there is not an answer about this commit"
+    else
+      echo "::error::'${name}' never ran on ${sha} — a check that was not dispatched leaves no record, so this cannot be read off the failures"
+    fi
     unsettled=1
     continue
   fi
