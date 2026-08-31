@@ -108,6 +108,7 @@ class CliMainFreshProcessTest {
             assertThat(JsonReader.parse(redacted(result.stdout()))).isEqualTo(Map.of("connectors", List.of()));
             assertThat(requests).containsExactly(
                     new Request("/healthz", AuthorizationKind.ABSENT),
+                    new Request("/version", AuthorizationKind.ABSENT),
                     new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
                     new Request("/api/connectors", AuthorizationKind.EXPECTED_MACHINE));
             assertCacheUnchanged(before, authFile, authDirectory);
@@ -129,6 +130,7 @@ class CliMainFreshProcessTest {
                     .isEqualTo(Map.of("connectors", List.of()));
             assertThat(requests).containsExactly(
                     new Request("/healthz", AuthorizationKind.ABSENT),
+                    new Request("/version", AuthorizationKind.ABSENT),
                     new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
                     new Request("/api/connectors", AuthorizationKind.EXPECTED_MACHINE));
             assertCacheUnchanged(poisoned, authFile, authDirectory);
@@ -194,6 +196,7 @@ class CliMainFreshProcessTest {
             assertThat(JsonReader.parse(redacted(result.stdout()))).isEqualTo(Map.of("connectors", List.of()));
             assertThat(requests).containsExactly(
                     new Request("/healthz", AuthorizationKind.ABSENT),
+                    new Request("/version", AuthorizationKind.ABSENT),
                     new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
                     new Request("/auth/session", AuthorizationKind.EXPECTED_HUMAN_SESSION),
                     new Request("/api/connectors", AuthorizationKind.EXPECTED_HUMAN_ACCESS));
@@ -251,6 +254,7 @@ class CliMainFreshProcessTest {
             assertThat(result.stderr()).isEmpty();
             assertThat(requests).containsExactly(
                     new Request("/healthz", AuthorizationKind.ABSENT),
+                    new Request("/version", AuthorizationKind.ABSENT),
                     new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
                     new Request("/auth/logout", AuthorizationKind.EXPECTED_HUMAN_SESSION));
             assertThat(authFile).doesNotExist();
@@ -469,6 +473,7 @@ class CliMainFreshProcessTest {
         assertThat(JsonReader.parse(redacted(result.stdout()))).isEqualTo(Map.of("connectors", List.of()));
         assertThat(requests).containsExactly(
                 new Request("/healthz", AuthorizationKind.ABSENT),
+                new Request("/version", AuthorizationKind.ABSENT),
                 new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
                 new Request("/api/connectors", AuthorizationKind.EXPECTED_MACHINE));
     }
