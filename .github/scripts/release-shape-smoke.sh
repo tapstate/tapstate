@@ -133,6 +133,18 @@ has "the write-back only opens for the newest line" write-back "if: needs.versio
 has "the connector lane is judged by the same reader as every other check" \
     gates 'checks-on-commit\.sh --sha .* --required real-connectors'
 
+# --- everything is built from the commit the version job resolved -------------------------------
+# The `commit` input is what makes a release from an older line possible at all, and it defaults to
+# the ref the dispatch ran on. So a job that checked out `github.ref` instead is indistinguishable
+# from a correct one on every dispatch from `main`: same tree, same artifacts, same green run. It
+# diverges only on the case the input exists for, and there it builds the wrong line's code under the
+# right line's version number and publishes it -- with nothing red anywhere.
+for j in cli-native server-image connectors gates draft publish; do
+  has "$j builds the commit the version job resolved" "$j" 'ref: \$\{\{ needs\.version\.outputs\.sha \}\}'
+done
+# And the release that comes out says so, which is the half a reader can check afterwards.
+has "the draft is attached to that commit" draft 'target_commitish: \$\{\{ needs\.version\.outputs\.sha \}\}'
+
 # --- every needs.<job>.outputs.<name> is one the job actually declares --------------------------
 # An undeclared output is not an error anywhere: the expression resolves to the empty string, the
 # step runs with a missing argument, and what fails is whatever the argument was for -- somewhere
