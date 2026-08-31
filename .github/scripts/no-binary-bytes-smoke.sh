@@ -84,12 +84,18 @@ printf '\n' > .binary-allowlist
 git add -A && git commit -qm empty-allowlist >/dev/null 2>&1
 expect "removing the allowlist line reddens it again" 1 "NUL byte(s) found"
 
-# --- comments and blank lines are stripped rather than turned into pathspecs. A `#`
-# --- comment that survived would become a literal path that excludes nothing, and the
-# --- symptom is a red nobody can explain -- so assert the parse, not just the outcome.
+# --- a padded path still excludes. What this case actually pins is the WHITESPACE
+# --- trimming: removing `tr -d '[:space:]'` reddens it, measured.
+# ---
+# --- What it does NOT pin, said out loud rather than left to look covered: the `#`
+# --- comment stripping. Removing that line changes no answer this gate can give, because
+# --- the whitespace trim immediately after turns any surviving comment into
+# --- `#assetsareallowed` -- a pathspec that excludes nothing either way. A mutation of it
+# --- survives the whole suite, and no input was found that would discriminate. The line
+# --- stays because it came over verbatim and is harmless; it is defensive, not load-bearing.
 printf '# assets are allowed\n\n   assets/logo.bin   \n' > .binary-allowlist
 git add -A && git commit -qm commented-allowlist >/dev/null 2>&1
-expect "comments and whitespace in the allowlist are ignored" 0 "clean:"
+expect "a padded allowlist path still excludes (whitespace is trimmed)" 0 "clean:"
 
 # --- the allowlist path is a parameter, so a vendored copy can point elsewhere.
 fresh_repo

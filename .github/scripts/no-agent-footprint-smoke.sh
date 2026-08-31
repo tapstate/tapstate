@@ -129,23 +129,45 @@ else
   printf '  FAIL  %s: rc=%s %s\n' "an ordinary PR body passes" "$code" "$(cat "$scratch/out")"; failed=$((failed + 1))
 fi
 
-# --- THE DEFECT, pinned as it behaves TODAY so that changing it has to change this case.
-# On a first push to a branch, github.event.before is the all-zero SHA. The range built from it
-# does not resolve, `git log` fails, the failure is discarded, `msgs` is empty, and the step
-# reports clean having scanned nothing. This is the same shape that was fixed in the sibling
-# character check; here it is still live. The case asserts the CURRENT answer, green, and the
-# commit that fixes it must flip this assertion -- which is the point of writing it now.
-fresh_repo >/dev/null
-n=0; commit_msg "subject
+# --- THE RANGE, which used to be the hole in this mode.
+# On a first push to a branch github.event.before is the all-zero SHA. The range built from
+# it resolved to nothing, `git log` failed, the failure was discarded, and the step reported
+# clean having read no commit at all -- a required check that went green precisely when it
+# could not look. Both cases below were green before the fix; each is the reason the guard
+# has the shape it has.
+range_case() { # range_case <name> <before>
+  local name="$1" before="$2" code
+  fresh_repo >/dev/null
+  n=0
+  commit_msg "subject
 
 Co-authored-by: Claude <noreply@anthropic.com>" >/dev/null
-EVENT_BEFORE="0000000000000000000000000000000000000000" EVENT_SHA="$(git rev-parse HEAD)" \
+  EVENT_BEFORE="$before" EVENT_SHA="$(git rev-parse HEAD)" \
+    bash "$gate" messages > "$scratch/out" 2>&1; code=$?
+  if [ "$code" != 0 ] && grep -qF "agent footer found in commit message" "$scratch/out"; then
+    printf '  ok    %s\n' "$name"; passed=$((passed + 1))
+  else
+    printf '  FAIL  %s\n        got exit %s: %s\n' "$name" "$code" "$(cat "$scratch/out")"; failed=$((failed + 1))
+  fi
+}
+range_case "a first push (all-zero before) is still scanned" \
+           "0000000000000000000000000000000000000000"
+# The same guard, reached the other way: a previous commit this clone does not have. It is
+# not a hypothetical -- a force-push leaves `before` naming a commit that no longer exists.
+range_case "a before this clone does not have is still scanned" \
+           "1234567890123456789012345678901234567890"
+
+# And the failure that must NOT be silent: a range naming a ref that cannot resolve at all
+# has to red saying nothing was checked, rather than print clean.
+fresh_repo >/dev/null
+n=0; commit_msg "plain" >/dev/null
+EVENT_NAME=pull_request BASE_REF=no-such-branch \
   bash "$gate" messages > "$scratch/out" 2>&1; code=$?
-if [ "$code" = 0 ]; then
-  printf '  ok    %s\n' "KNOWN DEFECT: a first push scans nothing and reports clean"; passed=$((passed + 1))
+if [ "$code" != 0 ] && grep -qF "so no commit message was checked" "$scratch/out"; then
+  printf '  ok    %s\n' "an unresolvable range reds instead of reporting clean"; passed=$((passed + 1))
 else
-  printf '  FAIL  %s\n        this case pins today behaviour; if it just changed, flip it: rc=%s\n' \
-    "KNOWN DEFECT: a first push scans nothing and reports clean" "$code"; failed=$((failed + 1))
+  printf '  FAIL  %s\n        got exit %s: %s\n' \
+    "an unresolvable range reds instead of reporting clean" "$code" "$(cat "$scratch/out")"; failed=$((failed + 1))
 fi
 
 echo "-- liveness controls"

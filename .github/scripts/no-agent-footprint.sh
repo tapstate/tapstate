@@ -100,16 +100,36 @@ case "$MODE" in
     detector_alive_messages
     fail=0
 
+    # The range is resolved, never assumed. On a first push to a branch the previous commit
+    # is the all-zero SHA; the range built from it resolves to nothing, `git log` fails, and
+    # the failure used to be discarded -- so the scan covered no commit at all and the step
+    # said it was clean. Every failure below is fatal instead: a scan that could not look is
+    # not a scan that found nothing. Same shape as the sibling character check, deliberately,
+    # because a second spelling of this is how the two drift apart again.
+    fetch_err=""
     if [ "${EVENT_NAME:-}" = "pull_request" ]; then
       base="origin/${BASE_REF:-main}"
-      git rev-parse --verify --quiet "$base" >/dev/null 2>&1 \
-        || git fetch --quiet --no-tags origin "${BASE_REF:-main}" || true
+      # Fetching is best-effort and its failure is not fatal here -- but only because the
+      # range is resolved for real below, and that failure is. The old form swallowed both.
+      if ! git rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
+        fetch_err="$(git fetch --quiet --no-tags origin "${BASE_REF:-main}" 2>&1)" || true
+      fi
       range="$base..HEAD"
+    elif [ -n "${EVENT_BEFORE:-}" ] && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+      range="${EVENT_BEFORE}..${EVENT_SHA:-HEAD}"
     else
-      range="${EVENT_BEFORE:-}..${EVENT_SHA:-HEAD}"
+      # First push, or a previous commit this clone does not have: the pushed commit itself.
+      range="${EVENT_SHA:-HEAD}"
+      range="${range}~1..${range}"
+      git rev-parse --verify --quiet "${range%%~*}~1" >/dev/null 2>&1 || range="${EVENT_SHA:-HEAD}"
     fi
 
-    msgs="$(git log --format='%H %B' "$range" 2>/dev/null || true)"
+    if ! msgs="$(git log --format='%H %B' "$range" 2>&1)"; then
+      echo "::error::cannot list the commits in ${range}, so no commit message was checked: ${msgs}"
+      [ -n "$fetch_err" ] && echo "fetching the base branch had already failed: ${fetch_err}"
+      exit 1
+    fi
+
     if [ -n "$msgs" ] && printf '%s' "$msgs" | grep -qEi "$pattern"; then
       echo "::error::agent footer found in commit message(s):"
       printf '%s' "$msgs" | grep -Ei "$pattern" || true
