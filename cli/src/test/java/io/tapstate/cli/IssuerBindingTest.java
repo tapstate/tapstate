@@ -132,6 +132,22 @@ class IssuerBindingTest {
                         assertThat(error.code().code()).isEqualTo("cli.issuer-discovery-invalid"));
     }
 
+    @Test
+    void sessionDefaultsFailClosedUntilAClientImplementsThem() {
+        URI seed = URI.create("https://node.example.com");
+        RecordingDiscovery client = new RecordingDiscovery(Map.of(), true);
+
+        assertThat(client.discover(seed)).isInstanceOf(DiscoveryOutcome.Unreachable.class);
+        assertThat(client.login(seed, "alice", "secret", false))
+                .isInstanceOf(LoginOutcome.Unreachable.class);
+        assertThat(client.login(seed, "alice", "secret", true))
+                .isInstanceOf(LoginOutcome.Unreachable.class);
+        assertThat(client.exchangeSession(seed, "opaque-session"))
+                .isInstanceOf(SessionExchangeOutcome.Unreachable.class);
+        assertThat(client.logoutSession(seed, "opaque-session"))
+                .isInstanceOf(SessionLogoutOutcome.Unreachable.class);
+    }
+
     private static DiscoveryOutcome.Discovered discovered(String issuer) {
         String clusterId = issuer.substring(issuer.lastIndexOf(':') + 1);
         return new DiscoveryOutcome.Discovered(
@@ -146,13 +162,22 @@ class IssuerBindingTest {
         private final Map<URI, DiscoveryOutcome> outcomes;
         private final List<String> authorizationHeaders = new java.util.ArrayList<>();
         private final AtomicInteger requests = new AtomicInteger();
+        private final boolean useDefaultDiscovery;
 
         private RecordingDiscovery(Map<URI, DiscoveryOutcome> outcomes) {
+            this(outcomes, false);
+        }
+
+        private RecordingDiscovery(Map<URI, DiscoveryOutcome> outcomes, boolean useDefaultDiscovery) {
             this.outcomes = new LinkedHashMap<>(outcomes);
+            this.useDefaultDiscovery = useDefaultDiscovery;
         }
 
         @Override
         public DiscoveryOutcome discover(URI baseUrl) {
+            if (useDefaultDiscovery) {
+                return ControlPlaneClient.super.discover(baseUrl);
+            }
             requests.incrementAndGet();
             authorizationHeaders.add(null);
             return outcomes.getOrDefault(baseUrl, new DiscoveryOutcome.Unreachable());
@@ -160,7 +185,7 @@ class IssuerBindingTest {
 
         @Override public boolean isHealthy(URI baseUrl) { return false; }
         @Override public String serverVersion(URI baseUrl) { return null; }
-        @Override public LoginOutcome login(URI baseUrl, String username, String password) { throw new AssertionError(); }
+        @Override public LoginOutcome login(URI baseUrl, String username, String password) { return new LoginOutcome.Unreachable(); }
         @Override public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) { throw new AssertionError(); }
         @Override public GetOutcome get(URI baseUrl, String credential, String id) { throw new AssertionError(); }
         @Override public DeleteOutcome delete(URI baseUrl, String credential, String id, String hash) { throw new AssertionError(); }
