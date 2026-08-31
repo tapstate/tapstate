@@ -196,6 +196,11 @@ otherwise have the right to submit it under this project's license. The full tex
 [Developer Certificate of Origin](https://developercertificate.org/) — one paragraph, worth the
 minute it takes to read. It is not a copyright assignment and it does not ask you to sign anything.
 
+**Your name goes on that line however you write it.** The commit-message check this repository
+runs asks for English prose, and your name is not prose: sign-off and co-author lines carry any
+script at all, and so does the AUTHORS file. Nobody has to transliterate themselves to contribute
+here.
+
 Git writes the line for you:
 
 ```sh

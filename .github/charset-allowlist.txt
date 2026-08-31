@@ -1,0 +1,61 @@
+# Character allow-list for this repository's English-only checks.
+#
+# ASCII is always allowed and is not listed here. Every line below names one
+# non-ASCII code point that English typesetting in this repository may use.
+# A character that is not on this list is unknown: the check that reads this
+# file names it and fails, rather than passing over a range nobody enumerated.
+#
+# Format: the first whitespace-separated token on a line is the code point,
+# written U+XXXX with 4 to 6 uppercase hex digits. Everything after it is for
+# humans and is never parsed, so a note may hold any ASCII text. Blank lines
+# and lines beginning with # are ignored. Entries are grouped by what they are
+# for and sorted by code point inside a group; a code point appears at most once.
+#
+# Adding a line is a reviewed decision, like adding a path to .cjk-allowlist:
+# an unknown character is meant to stop a merge and be looked at. Removing a
+# line reddens the repository the moment any tracked file still uses that
+# character, because every tracked file is scanned on every run.
+#
+# This file is the only place these characters are enumerated. A copy in
+# another repository is vendored from this one and verified against it byte for
+# byte; editing the copy instead of this file is what that verification is for.
+
+# --- Punctuation used in English prose ---
+U+00A7  SECTION SIGN                             Cross-references to numbered sections of a spec.
+U+00B7  MIDDLE DOT                               Separator between fields on one line of CLI output.
+U+2013  EN DASH                                  Numeric and date ranges.
+U+2014  EM DASH                                  Parenthetical break in English prose.
+U+2026  HORIZONTAL ELLIPSIS                      Elision, and truncation markers in CLI output.
+U+2461  CIRCLED DIGIT TWO                        Enumerated clause of a spec, cited as written there.
+
+# --- Latin letters with diacritics ---
+# Present as test data, not as prose. Author and sign-off lines are exempt by
+# line shape, so a contributor's name needs no entry here.
+U+00E8  LATIN SMALL LETTER E WITH GRAVE          Non-English fixture for the intake translator's tests.
+U+00E9  LATIN SMALL LETTER E WITH ACUTE          Non-ASCII escaping fixture for the JSON reader/writer.
+U+00EF  LATIN SMALL LETTER I WITH DIAERESIS      Table-rename fixture exercising a non-ASCII identifier.
+
+# --- Mathematical and technical symbols ---
+U+00D7  MULTIPLICATION SIGN                      Dimensions and matrix-shaped tables.
+U+00F7  DIVISION SIGN                            Ratios in prose, beside the multiplication sign.
+U+20AC  EURO SIGN                                Currency fixture in serialization tests.
+U+2192  RIGHTWARDS ARROW                         "maps to" in prose, tables and diagnostics.
+U+2194  LEFT RIGHT ARROW                         Round-trip relation between two encodings.
+U+2218  RING OPERATOR                            Function composition in a parser test's naming.
+U+222A  UNION                                    Set union in capability and workspace rules.
+U+2264  LESS-THAN OR EQUAL TO                    Bounds stated in scripts and diagnostics.
+
+# --- Box drawing, for tables and trees rendered by the CLI ---
+U+2500  BOX DRAWINGS LIGHT HORIZONTAL
+U+2502  BOX DRAWINGS LIGHT VERTICAL
+U+250C  BOX DRAWINGS LIGHT DOWN AND RIGHT
+U+2510  BOX DRAWINGS LIGHT DOWN AND LEFT
+U+2514  BOX DRAWINGS LIGHT UP AND RIGHT
+U+2518  BOX DRAWINGS LIGHT UP AND LEFT
+U+251C  BOX DRAWINGS LIGHT VERTICAL AND RIGHT
+U+2524  BOX DRAWINGS LIGHT VERTICAL AND LEFT
+U+2534  BOX DRAWINGS LIGHT UP AND HORIZONTAL
+U+253C  BOX DRAWINGS LIGHT VERTICAL AND HORIZONTAL
+
+# --- Emoji ---
+U+1F916 ROBOT FACE                               Appears only inside the pattern that rejects agent footers; the check has to name the character it forbids.
