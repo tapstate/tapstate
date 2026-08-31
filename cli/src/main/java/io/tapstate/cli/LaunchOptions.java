@@ -126,6 +126,11 @@ final class LaunchOptions {
         return connects() && user != null && !user.isBlank();
     }
 
+    /** Whether this launch names a server directly or through a saved context. */
+    boolean targetsServer() {
+        return connects() || context != null;
+    }
+
     /** Whether a command was given, meaning run it once and exit rather than open a session. */
     boolean isOneShot() {
         return !command.isEmpty();

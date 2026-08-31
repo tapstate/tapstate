@@ -430,13 +430,25 @@ public final class Cli implements Runnable {
             System.exit(EXIT_USAGE);
             return;
         }
-        if (launch.isOneShot() && !Repl.isOnlineVerb(launch.command().get(0))) {
+        if (bypassesSessionResolution(launch)) {
             // Offline verbs finish before context resolution. Launch-only target flags are intentionally
             // discarded here, so even a configured or temporary seed cannot cause DNS or a socket.
             System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
         System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
+    }
+
+    /**
+     * Whether a one-shot can run without constructing a session. {@code version} is deliberately a
+     * hybrid: without a target it reports the local binary and says no server is connected, while a
+     * direct seed or saved context makes it ask the running server for the second half of the report.
+     */
+    static boolean bypassesSessionResolution(LaunchOptions launch) {
+        if (!launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {
+            return false;
+        }
+        return !launch.command().getFirst().equals("version") || !launch.targetsServer();
     }
 
     /** The production password reader: a JLine prompter over the terminal, opened only if one is needed. */

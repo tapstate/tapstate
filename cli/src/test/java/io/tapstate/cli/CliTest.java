@@ -208,6 +208,18 @@ class CliTest {
         assertThat(r.out()).contains("server").contains("not connected");
     }
 
+    @Test
+    void versionKeepsItsOfflineFormButUsesASpecifiedServerTarget() {
+        // `version` has a useful offline answer, but it is also the one report that needs to reach a
+        // selected server. Keeping the choice at the process boundary ensures -c/-u is not silently
+        // discarded before session setup (the regression covered by the E2E version check).
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("version"))).isTrue();
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("-c", "http://node:8080",
+                "version"))).isFalse();
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("--context", "dev",
+                "version"))).isFalse();
+    }
+
     @ParameterizedTest
     @MethodSource("offlineVerbs")
     void everyVerbThatAdvertisesVersionPrintsOne(String verb) {
