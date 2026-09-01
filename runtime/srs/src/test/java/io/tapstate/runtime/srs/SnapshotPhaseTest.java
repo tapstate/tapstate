@@ -45,8 +45,17 @@ class SnapshotPhaseTest {
         return new CaptureConfig("mysql", Map.of(), List.of("orders", "customers"));
     }
 
+    /** A read whose source selects three streams. */
+    private static CaptureConfig threeTableConfig() {
+        return new CaptureConfig("mysql", Map.of(), List.of("orders", "customers", "invoices"));
+    }
+
     private static Envelope row(int id) {
-        return Envelope.read(id, "orders", Map.of("id", id), Map.of());
+        return row("orders", id);
+    }
+
+    private static Envelope row(String src, int id) {
+        return Envelope.read(id, src, Map.of("id", id), Map.of());
     }
 
     @Test
@@ -263,17 +272,63 @@ class SnapshotPhaseTest {
     }
 
     @Test
-    void marksEveryTableOfTheSelectionCompleteBecauseOneDrainReadsThemAll() {
+    void marksEachTableOfTheSelectionAsItsOwnReadFinishes() {
         RecordingMeta meta = new RecordingMeta(new ArrayList<>());
 
         SnapshotPhase.run(
                 new FakePort(new FakeBatch(List.of(row(1)), "p0")), multiTableConfig(), "chain",
                 List.of("orders", "customers"), 1L, meta, e -> { });
 
-        // One bounded read covers every selected stream, so when it returns to exhaustion each of them has
-        // been read to exhaustion. Marking only the first would leave the rest looking un-drained -- which a
-        // reader answers "no" to "has this table's snapshot finished?" with, about a table that has.
+        // Every selected table is read, and each is marked as its own read returns to exhaustion. Marking
+        // only the first would leave the rest looking un-drained -- which a reader answers "no" to "has this
+        // table's snapshot finished?" with, about a table that has.
         assertThat(meta.completed).containsExactlyInAnyOrder("chain/orders", "chain/customers");
+    }
+
+    @Test
+    void readsEachSelectedTableOnItsOwnSoAnInterruptionKeepsWhatAlreadyFinished() {
+        FakePort port = new FakePort(Map.of(
+                "orders", new FakeBatch(List.of(row("orders", 1)), "p0"),
+                "customers", new FakeBatch(List.of(row("customers", 1)), "p0"),
+                "invoices", new FakeBatch(List.of(row("invoices", 1)), "p0")));
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>());
+        Consumer<Envelope> failingOnCustomers = event -> {
+            if ("customers".equals(event.src())) {
+                throw new IllegalStateException("sink down");
+            }
+        };
+
+        assertThatThrownBy(() -> SnapshotPhase.run(
+                port, threeTableConfig(), "chain", List.of("orders", "customers", "invoices"),
+                1L, meta, failingOnCustomers))
+                .isInstanceOf(IllegalStateException.class);
+
+        // One bounded read per table is what lets an interrupted load keep what it finished: the tables that
+        // did drain are marked, so a resume re-reads only what it still owes. A single read over the whole
+        // selection cannot say that -- it fails as a unit and marks nothing, so a load interrupted at the
+        // fifty-first table of a hundred resumes by reading all hundred again.
+        assertThat(meta.completed).containsExactly("chain/orders");
+        assertThat(port.asked).containsExactly(List.of("orders"), List.of("customers"));
+    }
+
+    @Test
+    void recordsTheSeamOfTheRoundOnceRatherThanTheOneEachTableSamples() {
+        List<String> trace = new ArrayList<>();
+        FakePort port = new FakePort(Map.of(
+                "orders", new FakeBatch(List.of(row("orders", 1)), "binlog.000042:1024"),
+                "customers", new FakeBatch(List.of(row("customers", 1)), "binlog.000042:9999")));
+        RecordingMeta meta = new RecordingMeta(trace);
+
+        SnapshotPhase.run(port, multiTableConfig(), "chain", List.of("orders", "customers"),
+                1L, meta, e -> { });
+
+        // Every table of one round joins the tail at the same seam. Each bounded read samples one of its
+        // own, later than the last, and letting a later table's seam move where the tail begins would leave
+        // the span between the two covered by nothing: the earlier tables were read before it and the tail
+        // starts after it, so a row deleted in between is in neither, and it stays in the target for good.
+        assertThat(port.asked).containsExactly(List.of("orders"), List.of("customers"));
+        assertThat(meta.cdcStart).isEqualTo("binlog.000042:1024");
+        assertThat(trace).containsExactly("cdc-start", "snapshot-complete", "snapshot-complete");
     }
 
     @Test
@@ -388,17 +443,30 @@ class SnapshotPhaseTest {
         }
     }
 
-    /** A capture port that yields one fixed snapshot batch; the streaming and discovery reads are unused here. */
+    /**
+     * A capture port that yields a snapshot batch per read, and records the stream selection of every read
+     * it was asked for. Either one fixed batch whatever the selection, or one batch per stream name; the
+     * streaming and discovery reads are unused here.
+     */
     private static final class FakePort implements CapturePort {
         private final FakeBatch batch;
+        private final Map<String, FakeBatch> byTable;
+        final List<List<String>> asked = new ArrayList<>();
 
         FakePort(FakeBatch batch) {
             this.batch = batch;
+            this.byTable = null;
+        }
+
+        FakePort(Map<String, FakeBatch> byTable) {
+            this.batch = null;
+            this.byTable = byTable;
         }
 
         @Override
         public CaptureBatch snapshot(CaptureConfig config) {
-            return batch;
+            asked.add(config.streams());
+            return byTable == null ? batch : byTable.get(config.streams().getFirst());
         }
 
         @Override

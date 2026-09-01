@@ -29,9 +29,14 @@ public final class SnapshotPhase {
 
     /**
      * Runs the snapshot phase over the chain's selected {@code tables}: records the cdc-start position for
-     * the chain, drains the bounded snapshot read straight to {@code sink} with every row stamped with the
-     * generation this snapshot belongs to, then marks each of those tables' snapshot complete. Returns the
-     * number of events passed through.
+     * the chain, then reads each table with a bounded read of its own, straight to {@code sink} with every
+     * row stamped with the generation this snapshot belongs to, marking each table's snapshot complete as
+     * its own read finishes. Returns the number of events passed through.
+     *
+     * <p>A table at a time is what lets an interrupted load keep what it finished. One read over the whole
+     * selection succeeds or fails as a unit, so it marks either everything or nothing, and a load stopped
+     * at the fifty-first table of a hundred marks nothing at all -- the next run then reads all hundred
+     * again. Read one at a time, the fifty that finished are marked and only the rest are still owed.
      *
      * <p>The rows are ordered even though they have no position in the change stream: they carry the
      * reserved snapshot sequence, which places all of them before every change of the same generation, so
@@ -43,15 +48,21 @@ public final class SnapshotPhase {
      *
      * <p>The two marks bracket the drain and answer different questions. The cdc-start position — the
      * seam this snapshot began at, sampled at the source before its first row — is recorded before the
-     * batch drains, so the cdc tail that follows resumes from before the snapshot and the idempotent sink
-     * absorbs the overlap; no change made while the snapshot runs is missed. A batch that reports no seam
-     * stops the run with a code rather than letting the caller pick a start of its own.
+     * first table drains, so the cdc tail that follows resumes from before the snapshot and the idempotent
+     * sink absorbs the overlap; no change made while the snapshot runs is missed. A batch that reports no
+     * seam stops the run with a code rather than letting the caller pick a start of its own.
      * Its presence therefore means the snapshot has <em>started</em>.
-     * The completion mark is written only after the drain returns, so its presence means the table has been
-     * read to exhaustion. A drain that fails partway marks nothing: an aborted snapshot is not a completed
-     * one, and a reader treating a partial drain as exhausted would conclude rows are absent from the source
-     * that were merely never read. Events are passed through one by one, never buffered in the change ring,
-     * and the batch is always closed.
+     * A table's completion mark is written only after that table's own read returns, so its presence means
+     * that table has been read to exhaustion. A read that fails partway marks the table it was on and no
+     * table after it: an aborted read is not a completed one, and a reader treating a partial read as
+     * exhausted would conclude rows are absent from the source that were merely never read. Events are
+     * passed through one by one, never buffered in the change ring, and every batch is always closed.
+     *
+     * <p>One seam covers the whole round, taken from the first read of it and never replaced. Each bounded
+     * read samples a seam of its own, later than the one before, and letting a later table's seam move
+     * where the tail begins would leave the span between the two covered by nothing: the tables already
+     * read were read before it, and the tail starts after it, so a row deleted in between is in neither and
+     * stays in the target for good — nothing thrown, nothing logged.
      *
      * <p>Seeding the chain's meta record is a separate lifecycle step; recording the cdc-start position on
      * an unseeded chain is a caller ordering error surfaced by the store.
@@ -77,30 +88,42 @@ public final class SnapshotPhase {
         Optional<SrsMeta> resumed = resumedSnapshot(meta, miningChainId, tables);
         long epoch = resumed.map(SrsMeta::snapshotEpoch).orElse(ringEpoch);
         SourceOrder order = SourceOrder.snapshotRow(epoch);
+        // A resume rewrites the pair it read back, unchanged. Both halves come from the same record and the
+        // same question, so one of them moving on its own is the state that has no meaning: rows pinned to
+        // a generation whose seam is somewhere else.
+        String resumedStart = resumed.map(SrsMeta::cdcStartPosition).orElse(null);
+        boolean seamRecorded = false;
         long count = 0;
-        try (CaptureBatch batch = port.snapshot(config)) {
-            // The seam comes from the batch, which sampled it at the source before reading its first row.
-            // A source that reports none leaves the tail nothing to join to, and the run stops here rather
-            // than proceeding: a snapshot whose tail then begins wherever it likes drops every change made
-            // while the snapshot ran, with nothing thrown and nothing logged.
-            SourcePosition seam = batch.seam().orElseThrow(() -> new TapstateException(
-                    CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
-            // A resume rewrites the pair it read back, unchanged. Both halves come from the same record and
-            // the same question, so one of them moving on its own is the state that has no meaning: rows
-            // pinned to a generation whose seam is somewhere else.
-            String start = resumed.map(SrsMeta::cdcStartPosition).orElse(seam.token());
-            meta.setCdcStart(miningChainId, start, epoch);
-            while (batch.hasNext()) {
-                sink.accept(batch.next().withOrder(order));
-                count++;
-            }
-        }
-        // One drain reads every selected table to exhaustion, so each of them is marked - marking only the
-        // first would leave the rest looking un-drained and pin a later re-mine to this run's generation.
         for (String table : tables) {
+            try (CaptureBatch batch = port.snapshot(readOf(config, table))) {
+                // The seam comes from the batch, which sampled it at the source before reading its first
+                // row. A source that reports none leaves the tail nothing to join to, and the run stops
+                // here rather than proceeding: a snapshot whose tail then begins wherever it likes drops
+                // every change made while the snapshot ran, with nothing thrown and nothing logged.
+                SourcePosition seam = batch.seam().orElseThrow(() -> new TapstateException(
+                        CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
+                if (!seamRecorded) {
+                    meta.setCdcStart(miningChainId, resumedStart != null ? resumedStart : seam.token(),
+                            epoch);
+                    seamRecorded = true;
+                }
+                while (batch.hasNext()) {
+                    sink.accept(batch.next().withOrder(order));
+                    count++;
+                }
+            }
             meta.markSnapshotComplete(miningChainId, table);
         }
         return count;
+    }
+
+    /**
+     * The bounded read that covers {@code table} alone, on the connection the whole capture runs on. The
+     * selection is the only thing that narrows: everything a connector needs to open the source is what the
+     * capture was configured with, and a read that changed any of it would be reading somewhere else.
+     */
+    private static CaptureConfig readOf(CaptureConfig config, String table) {
+        return new CaptureConfig(config.connectorId(), config.settings(), List.of(table));
     }
 
     /**

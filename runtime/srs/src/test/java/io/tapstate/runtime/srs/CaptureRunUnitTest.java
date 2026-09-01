@@ -422,7 +422,12 @@ class CaptureRunUnitTest {
 
         @Override
         public CaptureBatch snapshot(CaptureConfig config) {
-            return new FakeBatch(snapshotRows);
+            // A bounded read yields the rows of the streams it selected and no others; an empty selection
+            // is every stream the source exposes. The snapshot phase reads one table at a time, so a double
+            // that ignored the selection would answer each of those reads with the whole source.
+            List<String> selected = config.streams();
+            return new FakeBatch(selected.isEmpty() ? snapshotRows
+                    : snapshotRows.stream().filter(row -> selected.contains(row.src())).toList());
         }
 
         @Override
