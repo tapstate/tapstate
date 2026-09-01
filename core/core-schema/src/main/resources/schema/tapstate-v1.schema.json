@@ -308,14 +308,14 @@
     },
     "QueryElement": {
       "type": "object",
-      "description": "One query exposed by a serve resource, either parallel egress from the view store or an API served on a sink.",
+      "description": "One query exposed by a serve resource. Today only parallel egress from the view store is served.",
       "properties": {
         "type": {
           "description": "The kind of query this element exposes.",
           "$ref": "#/$defs/QueryType"
         },
         "backend": {
-          "description": "The sync id whose sink serves this query as an API; omit for parallel egress from the view store.",
+          "description": "Reserved: the sync id whose sink would serve this query as an API. Nothing reads it yet — it is accepted, stored and written back unchanged, and naming a sync that does not exist is not refused. Omit it for parallel egress from the view store.",
           "type": "string"
         }
       },
@@ -853,7 +853,7 @@
       "description": "One serve.sync element — a table-model write of pipeline output to an external store.",
       "properties": {
         "id": {
-          "description": "Optional id for this sync element; required only when referenced by a query backend.",
+          "description": "Optional id for this sync element; generated from its position when omitted.",
           "type": "string"
         },
         "source": {
