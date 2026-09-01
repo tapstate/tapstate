@@ -20,6 +20,10 @@ public record Embed(
         EmbedAs as,
         @Doc(value = "Target field path under the parent where the embedded child is placed.", required = true)
         String path,
+        @Doc(value = "Which side of this join carries the other's identity. Absent means the embedded rows do, "
+                + "which is what every embed written before this field existed means.",
+                key = "ref")
+        EmbedRef ref,
         @Doc(value = "Fields that uniquely identify an element within an embedded array.",
                 key = "arrayKey")
         List<String> arrayKey,
@@ -34,6 +38,17 @@ public record Embed(
         Boolean trackKeyChanges,
         @Doc("Further children embedded beneath this one, forming a nested tree.")
         List<Embed> embed) {
+
+    /**
+     * An embed that names no direction, which is what every embed written before the direction existed
+     * is. It means the same thing as writing {@code child} and is not the same as having written it:
+     * what was not written stays out of the canonical form, where it would otherwise change the identity
+     * of artifacts nobody edited.
+     */
+    public Embed(String from, Map<String, String> on, EmbedAs as, String path, List<String> arrayKey,
+            Boolean ignoreUpdates, Boolean trackKeyChanges, List<Embed> embed) {
+        this(from, on, as, path, null, arrayKey, ignoreUpdates, trackKeyChanges, embed);
+    }
 
     public Embed {
         Objects.requireNonNull(from, "from");

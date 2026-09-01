@@ -4,6 +4,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -104,10 +105,10 @@ class TransformWizardTest {
                 "c360_shape", "nest",
                 "customer", "customer_id",            // root: from, key
                 "embed",                              // add a child embed
-                "policy", "CUST_ID", "customer_id", "", // policy: from, on(child,parent), end on
+                "policy", "CUST_ID", "customer_id", "", "child", // policy: from, on(child,parent), end on, direction
                 "array", "policies", "POLICY_ID",     // as, path, arrayKey
                 "embed",                              // nested embed under policy
-                "claim", "POLICY_ID", "POLICY_ID", "", // claim: from, on, end on
+                "claim", "POLICY_ID", "POLICY_ID", "", "child", // claim: from, on, end on, direction
                 "array", "claims", "CLAIM_ID",        // as, path, arrayKey
                 "(done)",                             // claim has no children
                 "(done)");                            // root has no more children
@@ -144,7 +145,7 @@ class TransformWizardTest {
                 "addr_shape", "nest",
                 "customer", "",                       // root: from, no key
                 "embed",
-                "address", "CUST_ID", "id", "",       // address: from, on, end on
+                "address", "CUST_ID", "id", "", "child", // address: from, on, end on, direction
                 "object", "address",                  // as object, path (no arrayKey asked)
                 "(done)",                             // address has no children
                 "(done)");                            // root has no more children
@@ -163,6 +164,42 @@ class TransformWizardTest {
                       as: object
                       path: address
                 """);
+    }
+
+    @Test
+    void writesTheDirectionOnlyWhenItIsNotTheOneEveryEmbedAlreadyMeant() {
+        // The wizard asks which side carries the other's identity because the two directions are written
+        // with the same pair of field names. Answering "parent" is the only answer that reaches the file:
+        // "child" is what every embed already meant, and writing it would change the canonical form of
+        // artifacts whose author chose nothing new.
+        ScriptedPrompter parent = new ScriptedPrompter(
+                "ref_shape", "nest",
+                "order", "id",                        // root: from, key
+                "embed",
+                "customer", "customer_id", "customer_id", "", "parent", // on, end on, direction
+                "object", "customer",                 // as object, path
+                "(done)", "(done)");
+        assertThat(yaml(new TransformWizard(parent).run())).isEqualTo(
+                """
+                version: tapstate/v1
+                kind: transform
+                id: ref_shape
+                type: nest
+                root:
+                  from: order
+                  key: [id]
+                  embed:
+                    - from: customer
+                      on:
+                        customer_id: customer_id
+                      as: object
+                      path: customer
+                      ref: parent
+                """);
+
+        assertThat(parent.offered)
+                .describedAs("both directions are offered, named as they are written")
+                .contains(List.of("child", "parent"));
     }
 
     @Test
@@ -197,7 +234,7 @@ class TransformWizardTest {
                 "comp", "nest",
                 "customer", "customer_id",
                 "embed",
-                "policy", "POLICY_ID", "p_id", "BRANCH_ID", "b_id", "",
+                "policy", "POLICY_ID", "p_id", "BRANCH_ID", "b_id", "", "child",
                 "array", "policies", "POLICY_ID",
                 "(done)", "(done)");
         assertThat(yaml(new TransformWizard(p).run())).isEqualTo(
@@ -226,8 +263,8 @@ class TransformWizardTest {
         ScriptedPrompter p = new ScriptedPrompter(
                 "multi", "nest",
                 "customer", "customer_id",
-                "embed", "policy", "CUST_ID", "customer_id", "", "array", "policies", "POLICY_ID", "(done)",
-                "embed", "address", "CUST_ID", "customer_id", "", "object", "address", "(done)",
+                "embed", "policy", "CUST_ID", "customer_id", "", "child", "array", "policies", "POLICY_ID", "(done)",
+                "embed", "address", "CUST_ID", "customer_id", "", "child", "object", "address", "(done)",
                 "(done)");
         assertThat(yaml(new TransformWizard(p).run())).isEqualTo(
                 """
@@ -302,14 +339,14 @@ class TransformWizardTest {
         // a deep tree (root -> policy -> claim) round-trips, exercising recursive embed serialization
         assertFixedPoint(new ScriptedPrompter(
                 "c360_shape", "nest", "customer", "customer_id",
-                "embed", "policy", "CUST_ID", "customer_id", "", "array", "policies", "POLICY_ID",
-                "embed", "claim", "POLICY_ID", "POLICY_ID", "", "array", "claims", "CLAIM_ID",
+                "embed", "policy", "CUST_ID", "customer_id", "", "child", "array", "policies", "POLICY_ID",
+                "embed", "claim", "POLICY_ID", "POLICY_ID", "", "child", "array", "claims", "CLAIM_ID",
                 "(done)", "(done)"));
         // a wide tree (two sibling embeds) round-trips, exercising the sibling loop + object embed
         assertFixedPoint(new ScriptedPrompter(
                 "multi", "nest", "customer", "customer_id",
-                "embed", "policy", "CUST_ID", "customer_id", "", "array", "policies", "POLICY_ID", "(done)",
-                "embed", "address", "CUST_ID", "customer_id", "", "object", "address", "(done)",
+                "embed", "policy", "CUST_ID", "customer_id", "", "child", "array", "policies", "POLICY_ID", "(done)",
+                "embed", "address", "CUST_ID", "customer_id", "", "child", "object", "address", "(done)",
                 "(done)"));
     }
 

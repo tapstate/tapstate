@@ -476,7 +476,10 @@ nest.sibling-embeds-target-different-parent-keys:
   solution: "Have every embed under one parent join on the same parent field; that field is the parent's identity."
 nest.embed-target-not-parent-key:
   message: "The embeds under {embedPath} join on {fields}, which does not identify its rows; its key is {parentKey}."
-  solution: "Join on the parent's key. A field that merely refers to another table makes every row sharing a value one identity, so a nest embeds rows that belong to a parent rather than rows a parent refers to."
+  solution: "Join on the parent's key, or write ref: parent on the embed if the row above is the one pointing at it. Without that, a field that merely refers to another table makes every row sharing a value one identity."
+nest.embed-reference-not-own-key:
+  message: "Embed {embedPath} says the row above points at it, but joins on {fields}, which does not identify its own rows; its key is {referencedKey}."
+  solution: "Point at the embedded table's key, or drop ref: parent if these rows hang under the row above rather than being pointed at by it. A column that is not that table's key names a set of its rows, not the one to embed."
 nest.embed-path-conflict:
   message: "Embeds {embedPathA} and {embedPathB} both target the path {path}."
   solution: "Give each embed a path of its own, or one silently overwrites the other in the document."

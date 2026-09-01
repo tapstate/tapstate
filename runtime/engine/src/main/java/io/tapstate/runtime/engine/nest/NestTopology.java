@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.EmbedRef;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.WriteMode;
@@ -97,10 +98,21 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         for (Node node : all) {
             checkPaths(node.children());
         }
-        List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, top);
+        List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, claimants(top));
+        for (Node node : all) {
+            if (node.embed().ref() == EmbedRef.PARENT) {
+                checkReferenceIdentifiesItsOwnRows(node, tables);
+            }
+        }
         for (Node node : all) {
             if (!node.children().isEmpty()) {
-                List<String> identity = identityOf(render(node.pathId()), null, node.children());
+                List<Node> claiming = claimants(node.children());
+                // A level every child points at is identified by what those children agree on. A level
+                // none of them points at is identified by what identifies one of its own rows: it is
+                // still a level, it just has nobody naming it from below.
+                List<String> identity = claiming.isEmpty()
+                        ? resolveArrayKey(node, tables)
+                        : identityOf(render(node.pathId()), null, claiming);
                 checkIdentifiesItsOwnRows(node, identity, tables);
                 node.identity(identity);
             }
@@ -253,6 +265,13 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         edges.add(new NestInbound(0, ownAlias, ownPathId, identity, ownElementKey, ownTracksKeyChanges,
                 tableBehind(ownAlias, ownTracksKeyChanges, tables)));
         for (Node child : children) {
+            if (child.embed().ref() == EmbedRef.PARENT) {
+                // A child the level points at does not arrive here. Its rows are not grouped under this
+                // level - one of them can sit under thousands of levels at once - so there is no field
+                // pairing to key an edge by, and routing the document to it would be routing it to every
+                // holder of the same reference. It is read by key where the document is rendered.
+                continue;
+            }
             boolean tracked = Boolean.TRUE.equals(child.embed().trackKeyChanges());
             edges.add(child.children().isEmpty()
                     ? new NestInbound(edges.size(), child.embed().from(), child.pathId(),
@@ -346,6 +365,45 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * is why the level's own key has to be asked. Only a declared key can say whether a column identifies a
      * row, so a level whose table declares none is left alone rather than guessed at.
      */
+    /**
+     * The children that say something about the identity of the level they hang under. A child the level
+     * points at says nothing about it: the column is a reference the level's rows carry, and reading it as
+     * the level's identity would regroup those rows by whatever they happen to refer to.
+     */
+    private static List<Node> claimants(List<Node> children) {
+        List<Node> claiming = new ArrayList<>();
+        for (Node child : children) {
+            if (child.embed().ref() != EmbedRef.PARENT) {
+                claiming.add(child);
+            }
+        }
+        return claiming;
+    }
+
+    /**
+     * Refuses an embed the row above points at whose join column does not identify its own rows. It is the
+     * mirror of the check below and neither replaces the other: the same pair of column names is a child
+     * carrying its parent's identity read one way and a parent carrying its child's read the other, so
+     * whichever side the author declared is the side that gets asked.
+     *
+     * <p>The same pass applies as below, for the same reason. Only a declared key can say whether a column
+     * identifies a row, so a table that declares none, or was never discovered, is left alone.
+     */
+    private static void checkReferenceIdentifiesItsOwnRows(Node node, Function<String, NestTable> tables) {
+        NestTable table = tables.apply(node.embed().from());
+        if (table == null || table.primaryKey().isEmpty()) {
+            return;
+        }
+        Set<String> named = new LinkedHashSet<>(node.embed().on().keySet());
+        if (named.equals(new LinkedHashSet<>(table.primaryKey()))) {
+            return;
+        }
+        throw new TapstateException(NestError.EMBED_REFERENCE_NOT_OWN_KEY,
+                Map.of("embedPath", render(node.pathId()),
+                        "fields", String.join(", ", named),
+                        "referencedKey", String.join(", ", table.primaryKey())), null);
+    }
+
     private static void checkIdentifiesItsOwnRows(Node node, List<String> identity,
             Function<String, NestTable> tables) {
         NestTable table = tables.apply(node.embed().from());

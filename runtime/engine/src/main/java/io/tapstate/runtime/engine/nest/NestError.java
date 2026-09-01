@@ -35,6 +35,15 @@ public enum NestError implements TapstateErrorCode {
     EMBED_TARGET_NOT_PARENT_KEY(
             "nest.embed-target-not-parent-key", Set.of("embedPath", "fields", "parentKey")),
 
+    /**
+     * Checking the tree: an embed declared as the row above pointing at it joins on a column that does not
+     * identify its own rows, so the column names a set of rows rather than the one to embed. It is the
+     * mirror of the check above and cannot replace it - the same pair of column names is correct in one
+     * direction and wrong in the other, which is why the direction is declared rather than inferred.
+     */
+    EMBED_REFERENCE_NOT_OWN_KEY(
+            "nest.embed-reference-not-own-key", Set.of("embedPath", "fields", "referencedKey")),
+
     /** Checking the tree: two embeds under one parent claim the same path, where one would overwrite the other. */
     EMBED_PATH_CONFLICT("nest.embed-path-conflict", Set.of("path", "embedPathA", "embedPathB")),
 
