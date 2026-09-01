@@ -418,6 +418,16 @@ jobs:
             platform-minimums.txt
           if-no-files-found: error
 
+      # Before the tag exists, deliberately. Publishing is irreversible, and a token that turns out not
+      # to reach one of the satellites afterwards leaves a released tapstate whose documentation
+      # repository never got the tag -- and there the tag is not bookkeeping, it is what makes the
+      # documentation public. This is the only gate here about a credential rather than about the code.
+      - name: 7. the satellite token reaches every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/satellites.sh reach
+
       - name: what the gate decided
         run: |
           {
@@ -431,6 +441,7 @@ jobs:
             echo "| 4 | documentation for the range has landed | this job |"
             echo "| 5 | release notes assemble | this job |"
             echo "| 6 | real-connector lane green on that commit | this job |"
+            echo "| 7 | satellite token reaches every satellite | this job |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   draft:
@@ -606,6 +617,49 @@ jobs:
             echo "* image: \`ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}\`"
             echo "* floating \`latest\` marker moved here: ${{ needs.version.outputs.is_latest }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  satellites:
+    # Tagged only after tapstate's own release is published, never alongside it. A satellite release
+    # points at the tapstate release, so one tagged first would link to a page that does not exist yet;
+    # and for the documentation repository the tag is not bookkeeping but the thing that makes the
+    # documentation public, which must not happen ahead of the release it documents.
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # deleting tapstate's own release branch at the end
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: tag and release every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/satellites.sh release "${{ needs.version.outputs.version }}" \
+            --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      # Only once every satellite has been released. A failure above stops the job here and the
+      # branches survive for a retry -- which is why this is a later step and not a later job with
+      # always(): a cleanup that runs whatever happened would delete the evidence of what went wrong
+      # along with the pin somebody still needs.
+      - name: retire the satellite release branches
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/satellites.sh unbranch "${{ needs.version.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: retire tapstate's own release branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="ws/release-${{ needs.version.outputs.version }}"
+          # The tag is the anchor from here on, and unlike a branch it cannot be moved. A patch for this
+          # line later starts from the tag, so deleting this loses nothing.
+          if gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$branch" >/dev/null 2>&1; then
+            echo "${{ github.repository }}  $branch deleted" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "${{ github.repository }}  $branch was already gone" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   roadmap:
     # The board says what shipped, and in which release. Nothing else does: the execution issue for a

@@ -2,7 +2,8 @@
 # The release workflow's shape, checked as a text.
 #
 # What this holds down is the one property the whole arrangement rests on and that nothing else can
-# see: the three acts that cannot be taken back -- creating the tag, publishing, pushing the image --
+# see: the acts that cannot be taken back -- creating the tag, publishing, pushing the image, and
+# tagging the satellite repositories --
 # are all downstream of the pause a person approves, and none of them happens before it. Every one of
 # them is one line away from moving. A `push: true` on the image build, a second release action after
 # the approval, a job that stops needing `approve`: each is a small, plausible edit, each leaves the
@@ -48,15 +49,25 @@ hasnt()  { if grep -qE -- "$3" <<<"$(job "$2")"; then bad "$1" "job '$2' still m
 # --- the approval is upstream of everything irreversible -------------------------------------------
 has "the publish job waits on the approval" publish 'needs:.*approve'
 
+# Tagging three other repositories is the fourth act that cannot be taken back, and the one furthest
+# from the approval -- it happens in repositories this workflow cannot see the inside of, so nothing
+# on this side would notice it having gone out early. It is allowed to do that only downstream of the
+# publish it announces: a satellite tagged first links to a release page that does not exist, and for
+# the documentation repository the tag is what makes the documentation public.
+has "the satellite job waits on the publish it announces" satellites 'needs:.*publish'
+# And the branches are retired inside that same job rather than by anything that runs regardless. A
+# cleanup under always() deletes the pin while the failure that needed it is still being read.
+hasnt "nothing retires a release branch unconditionally" satellites 'always()'
+
 # Anything that pushes an image, publishes a release, or moves the floating pointer, in a job that
 # does not need the approval, is the failure this file exists for. Checked over every job there is,
 # so a new one is covered without this list being edited.
 for j in $jobs_list; do
-  case "$j" in publish) continue ;; esac
+  case "$j" in publish|satellites) continue ;; esac
   body="$(job "$j")"
-  if grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest=' <<<"$body"; then
+  if grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest=|satellites[.]sh release' <<<"$body"; then
     bad "no irreversible act in '$j'" \
-        "$(grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=' <<<"$body" | head -1)"
+        "$(grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=|satellites[.]sh release' <<<"$body" | head -1)"
   else
     ok "no irreversible act in '$j'"
   fi
