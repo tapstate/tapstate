@@ -59,6 +59,13 @@ public enum NestError implements TapstateErrorCode {
      */
     ARRAY_KEY_UNRESOLVABLE("nest.array-key-unresolvable", Set.of("embedPath", "table")),
 
+    /**
+     * Checking the tree: a level declares no key and its table offers no primary key but more than one
+     * unique index. Each identifies a row equally well, so taking either would settle the identity of the
+     * level on catalog order rather than on anything the author said.
+     */
+    KEY_AMBIGUOUS("nest.key-ambiguous", Set.of("embedPath", "table", "candidates")),
+
     /** Checking the tree: it compiles to more resolver vertices than the limit allows, each taking a thread. */
     RESOLVER_VERTEX_LIMIT_EXCEEDED("nest.resolver-vertex-limit-exceeded", Set.of("vertices", "limit")),
 

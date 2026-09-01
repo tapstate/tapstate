@@ -446,20 +446,50 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * bare-throws; a table that resolves but declares no key is the author's to fix.
      */
     private static List<String> resolveArrayKey(Node node, Function<String, NestTable> tables) {
-        List<String> declared = node.embed().arrayKey();
+        return keyOf(node.embed().from(), node.embed().arrayKey(), render(node.pathId()), tables);
+    }
+
+    /**
+     * What identifies one row of a level, asked of four places in order: the key the level declares, the
+     * table's primary key, its one unique index, and then nothing - which refuses the tree rather than
+     * carrying an unknown identity into the assembly.
+     *
+     * <p>A declared key is taken as written and the schema is never consulted to second-guess it. A
+     * business identity and a physical primary key are allowed to differ, and only the author knows
+     * whether they do here; a check would have to call one of them wrong without being able to tell.
+     *
+     * <p>Two unique indexes are refused rather than resolved. Both identify a row equally well, so any
+     * rule for choosing settles the identity of a whole level on which index the source reported first -
+     * silently, and differently on a catalog that changes. The refusal names both and the level, because
+     * the rung that settles it is the first one and it is one line to write.
+     */
+    private static List<String> keyOf(String alias, List<String> declared, String owner,
+            Function<String, NestTable> tables) {
         if (declared != null && !declared.isEmpty()) {
             return declared;
         }
-        String alias = node.embed().from();
         NestTable table = tables.apply(alias);
         if (table == null) {
             throw new IllegalStateException("nest alias '" + alias + "' resolves to no table");
         }
-        if (table.primaryKey().isEmpty()) {
-            throw new TapstateException(NestError.ARRAY_KEY_UNRESOLVABLE,
-                    Map.of("embedPath", render(node.pathId()), "table", table.name()), null);
+        if (!table.primaryKey().isEmpty()) {
+            return table.primaryKey();
         }
-        return table.primaryKey();
+        List<List<String>> unique = table.uniqueIndexes();
+        if (unique.size() == 1) {
+            return unique.get(0);
+        }
+        if (unique.size() > 1) {
+            List<String> candidates = new ArrayList<>(unique.size());
+            for (List<String> index : unique) {
+                candidates.add("(" + String.join(", ", index) + ")");
+            }
+            throw new TapstateException(NestError.KEY_AMBIGUOUS,
+                    Map.of("embedPath", owner, "table", table.name(),
+                            "candidates", String.join(", ", candidates)), null);
+        }
+        throw new TapstateException(NestError.ARRAY_KEY_UNRESOLVABLE,
+                Map.of("embedPath", owner, "table", table.name()), null);
     }
 
     /**

@@ -76,6 +76,12 @@ final class NestTreeFixtures {
         known.put("item", new NestTable("items", List.of("item_id")));
         known.put("profile", new NestTable("profiles", List.of("customer_id")));
         known.put("keyless", new NestTable("keyless_rows", List.of()));
+        // No primary key, so the identity has to come from an index. One of them is an answer; two of
+        // them is a choice nothing here is entitled to make.
+        known.put("uniquelyIndexed",
+                new NestTable("uniquely_indexed", List.of(), List.of(List.of("serial_no"))));
+        known.put("twiceIndexed",
+                new NestTable("twice_indexed", List.of(), List.of(List.of("serial_no"), List.of("batch_no"))));
         return known::get;
     }
 }
