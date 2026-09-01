@@ -76,4 +76,64 @@ echo "$gaps" | grep -q "2026-08-21" || fail "case 3: expected the gap report to 
 grep -q '"date":"2026-08-20"' "$store/daily/clones.jsonl" && fail "case 3: missing days were zero-filled into the series"
 pass "case 3: gap is named, not zero-filled"
 
+# --- the weekly report -----------------------------------------------------------------------------
+report="$here/funnel-report.sh"
+[ -x "$report" ] || fail "funnel-report.sh is missing or not executable at $report"
+
+store="$work/store4"; fx="$work/fx4"; mkdir -p "$fx" "$store/events"
+window > "$fx/clones.json"
+printf '[{"assets":[{"name":"cli","download_count":100}]}]\n' > "$fx/releases.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" --observed-at 2026-08-18T00:00:00Z >/dev/null
+printf '[{"assets":[{"name":"cli","download_count":130}]}]\n' > "$fx/releases.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" --observed-at 2026-08-20T00:00:00Z >/dev/null
+
+# Four events, three installations: one id repeats, which is what a reinstall in place looks like.
+cat > "$store/events/installs.jsonl" <<'JSON'
+{"installation_id":"aaa","version":"0.3.0","os":"darwin","arch":"arm64","entrypoint":"cli","timestamp":"2026-08-18T01:00:00Z"}
+{"installation_id":"aaa","version":"0.3.0","os":"darwin","arch":"arm64","entrypoint":"cli","timestamp":"2026-08-19T01:00:00Z"}
+{"installation_id":"bbb","version":"0.3.0","os":"linux","arch":"x64","entrypoint":"quickstart","timestamp":"2026-08-19T02:00:00Z"}
+{"installation_id":"ccc","version":"0.2.9","os":"linux","arch":"x64","entrypoint":"cli","timestamp":"2026-08-20T02:00:00Z"}
+JSON
+out="$(sh "$report" --store "$store" --week 2026-08-18)"
+
+# L1 counts installations, not events. An implementation counting rows reports 4 here, and on real
+# data -- where reinstalls are common -- that inflates the denominator silently.
+echo "$out" | grep -qE 'installs completed.*: *3' \
+  || fail "case 4: expected L1 = 3 unique installations, report said: $(echo "$out" | grep -i 'installs completed')"
+echo "$out" | grep -qE '0\.3\.0 +2' || fail "case 4: expected 0.3.0 -> 2 in the per-version split"
+echo "$out" | grep -qE '0\.2\.9 +1' || fail "case 4: expected 0.2.9 -> 1 in the per-version split"
+pass "case 4: L1 counts unique installations and splits by version"
+
+# The snapshot pair must surface as its difference. 130 appearing as the week's figure is the defect.
+echo "$out" | grep -qE 'release asset downloads +30\b' \
+  || fail "case 5: expected the release delta 30, report said: $(echo "$out" | grep -i 'release asset')"
+echo "$out" | grep -qE 'release asset downloads +130\b' \
+  && fail "case 5: the report presented the running total as the week's figure"
+pass "case 5: cumulative counter appears as a delta, not the running total"
+
+# Distribution signals stay separate. A single summed figure is the specific thing that must not
+# exist, so the report is checked for the sum it would print if someone added them up.
+# `grep -c` exits 1 on zero matches, which under set -e would kill the run before the remaining
+# cases ever execute -- silently, and looking exactly like a pass.
+sum_line="$(echo "$out" | grep -icE 'total distribution|distribution total|all signals' || true)"
+[ "$sum_line" = "0" ] || fail "case 6: the report printed a summed distribution figure"
+echo "$out" | grep -qi 'never summed' || fail "case 6: the report does not warn that signals are not summed"
+echo "$out" | grep -qi 'community' || fail "case 6: the report does not say it covers the community funnel only"
+pass "case 6: distribution signals are listed separately, with the warning kept"
+
+# A hole is named. Zero-filling produces a good-looking, wrong number.
+store="$work/store5"; fx="$work/fx5"; mkdir -p "$fx" "$store/events"
+cat > "$fx/clones.json" <<'JSON'
+{"count":20,"uniques":2,"clones":[
+{"timestamp":"2026-08-18T00:00:00Z","count":10,"uniques":1},
+{"timestamp":"2026-08-20T00:00:00Z","count":10,"uniques":1}
+]}
+JSON
+: > "$fx/releases.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+out2="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out2" | grep -q "2026-08-19" || fail "case 7: the report did not name the missing day"
+echo "$out2" | grep -qi 'gaps: *none' && fail "case 7: the report claimed no gaps while a day was missing"
+pass "case 7: the report names the gap rather than filling it"
+
 printf 'funnel-capture-smoke: all cases passed\n'
