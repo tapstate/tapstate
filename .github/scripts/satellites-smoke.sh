@@ -42,7 +42,7 @@ LIST
 : > "$tmp/empty.txt"
 printf '# comment only\n\n' > "$tmp/comments.txt"
 
-plan() { GH_TOKEN=t sh "$script" "$@" --list "$list" --plan 2>&1; }
+plan() { GH_TOKEN=t bash "$script" "$@" --list "$list" --plan 2>&1; }
 
 contains() {
     local name="$1" needle="$2" haystack="$3"
@@ -70,28 +70,28 @@ refuses() {
 # --- refusals -------------------------------------------------------------------------------
 
 refuses "an empty token is refused, not skipped" \
-    env GH_TOKEN= sh "$script" reach --list "$list"
+    env GH_TOKEN= bash "$script" reach --list "$list"
 
 refuses "an empty satellite list is refused" \
-    env GH_TOKEN=t sh "$script" branch 0.4.0 --list "$tmp/empty.txt"
+    env GH_TOKEN=t bash "$script" branch 0.4.0 --list "$tmp/empty.txt"
 
 refuses "a list file that does not exist is refused" \
-    env GH_TOKEN=t sh "$script" branch 0.4.0 --list "$tmp/nope.txt"
+    env GH_TOKEN=t bash "$script" branch 0.4.0 --list "$tmp/nope.txt"
 
 refuses "a version that is not x.y.z is refused" \
-    env GH_TOKEN=t sh "$script" branch v0.4.0 --list "$list" --plan
+    env GH_TOKEN=t bash "$script" branch v0.4.0 --list "$list" --plan
 
 refuses "a missing version is refused" \
-    env GH_TOKEN=t sh "$script" branch --list "$list" --plan
+    env GH_TOKEN=t bash "$script" branch --list "$list" --plan
 
 refuses "an unknown verb is refused" \
-    env GH_TOKEN=t sh "$script" frobnicate --list "$list"
+    env GH_TOKEN=t bash "$script" frobnicate --list "$list"
 
 refuses "release without --notes-url is refused" \
-    env GH_TOKEN=t sh "$script" release 0.4.0 --list "$list" --plan
+    env GH_TOKEN=t bash "$script" release 0.4.0 --list "$list" --plan
 
 refuses "a list of only comments is refused" \
-    env GH_TOKEN=t sh "$script" branch 0.4.0 --list "$tmp/comments.txt" --plan
+    env GH_TOKEN=t bash "$script" branch 0.4.0 --list "$tmp/comments.txt" --plan
 
 # --- what each verb would touch -------------------------------------------------------------
 
@@ -112,7 +112,7 @@ contains "release tags the release branch, not the default branch" "ws/release-0
 
 # A satellite dropped from the list is the silent failure this file exists to catch.
 one="$tmp/one.txt"; echo "tapstate/docs" > "$one"
-out="$(GH_TOKEN=t sh "$script" branch 0.4.0 --list "$one" --plan 2>&1)"
+out="$(GH_TOKEN=t bash "$script" branch 0.4.0 --list "$one" --plan 2>&1)"
 case "$out" in
     *tapstate-skills*) fail "the list is what decides, not a built-in default" "skills appeared for a one-line list" ;;
     *) pass "the list is what decides, not a built-in default" ;;
