@@ -45,9 +45,11 @@ class CorpusSmokeTest {
     private static final Set<String> RULES = Set.of(
             "unknown-field",        // §11.5 strict rejection of fields outside the schema
             "forbidden-field",      // field known to the schema but banned in this position (X18/X19)
+            "missing-field",        // required field the parser cannot supply, left out of the document
             "missing-reference",    // batch-closure reference to a nonexistent id / table / step
             "ambiguous-reference",  // bare table name colliding across sources, no id prefix (§4)
             "mode-mismatch",        // option / block illegal for the source mode or boundedness (§4/X7/X10)
+            "mode-required-for-read", // a source a pipeline reads declares no mode (X18)
             "illegal-value",        // enum / format constraint violation (§2 id charset, §8 enums)
             "illegal-expression",   // CEL expression field fails to compile or type-check (§12)
             "composition",          // structural rule on resource composition (X17 minimal pipeline)

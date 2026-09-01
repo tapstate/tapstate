@@ -1,0 +1,4 @@
+rule: mode-required-for-read
+adr: "ADR-0016 §4 (X18)"
+path: mode
+note: "a source a pipeline reads declares no mode; the write target in the same batch correctly declares none"

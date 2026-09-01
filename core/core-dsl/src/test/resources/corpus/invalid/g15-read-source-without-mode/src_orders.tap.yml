@@ -1,0 +1,9 @@
+# Invalid: this source is read by a pipeline, so how it is read has to be written down. Every rule
+# that judges the read — whether a schedule or a start_from is legal — resolves it through this
+# field, and an absent one is not a third answer they can act on.
+version: tapstate/v1
+kind: source
+id: src_orders
+connector: mysql
+config: { host: 10.0.0.1, username: reader, password: Db_2026 }
+tables: [ orders ]

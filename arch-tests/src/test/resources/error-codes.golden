@@ -122,8 +122,10 @@ dsl.illegal-value
 dsl.invalid-config-value
 dsl.malformed-interpolation
 dsl.malformed-yaml
+dsl.missing-field
 dsl.missing-reference
 dsl.mode-mismatch
+dsl.mode-required-for-read
 dsl.row-expression-needs-discovery
 dsl.row-expression-type-unknown
 dsl.row-expression-type-unsupported

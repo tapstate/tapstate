@@ -113,6 +113,28 @@ public final class DslParser {
     private static final Set<String> SERVE_DEF_KEYS = Set.of(
             "version", "kind", "id", "metadata", "sync", "query", "push", "experimental");
 
+    /*
+     * What each position must carry, checked against the map right after its keys are closed.
+     *
+     * These are the model's required components minus the ones the parser supplies itself - a
+     * generated id, a from: taken from natural order - so they are a subset of the record's non-null
+     * contract rather than a reading of it. StructuralKeyDerivationTest re-derives each from its
+     * record and names the parser-supplied exceptions, so a component that becomes required without
+     * reaching this list turns red there instead of becoming a NullPointerException at the boundary.
+     */
+    static final Set<String> REQUIRED_SOURCE_KEYS = Set.of("id", "connector");
+    static final Set<String> REQUIRED_PIPELINE_KEYS = Set.of("id", "source");
+    /** Every definition body: the rest of what they require is supplied or checked by shape. */
+    static final Set<String> REQUIRED_DEFINITION_KEYS = Set.of("id");
+    static final Set<String> REQUIRED_TABLE_SPEC_KEYS = Set.of("name");
+    static final Set<String> REQUIRED_SYNC_KEYS = Set.of("source");
+    static final Set<String> REQUIRED_PUSH_KEYS = Set.of("source");
+    static final Set<String> REQUIRED_QUERY_KEYS = Set.of("type");
+    static final Set<String> REQUIRED_HOT_KEYS = Set.of("ttl");
+    static final Set<String> REQUIRED_WARM_KEYS = Set.of("collection");
+    static final Set<String> REQUIRED_NEST_ROOT_KEYS = Set.of("from");
+    static final Set<String> REQUIRED_EMBED_KEYS = Set.of("from", "on", "as", "path");
+
     /** Parses one YAML document into its {@link Resource} model. */
     public Resource parse(String yaml) {
         Node root = compose(yaml);
@@ -158,6 +180,7 @@ public final class DslParser {
 
     private SourceResource source(YamlMap m) {
         m.requireOnly(SOURCE_KEYS);
+        m.requirePresent(REQUIRED_SOURCE_KEYS);
         requireKnownOptions(m, NO_ENGINE_OPTIONS);
         return new SourceResource(
                 idOf(m),
@@ -192,8 +215,9 @@ public final class DslParser {
                 String t = sc.getValue();
                 refs.add(isRegex(t) ? TableRef.regex(unslash(t)) : TableRef.literal(t));
             } else {
-                YamlMap ts = YamlMap.requireMapping(n, "tables");
+                YamlMap ts = YamlMap.requireMapping(n, "tables[" + refs.size() + "]");
                 ts.requireOnly(TABLE_SPEC_KEYS);
+                ts.requirePresent(REQUIRED_TABLE_SPEC_KEYS);
                 requireKnownOptions(ts, NO_ENGINE_OPTIONS);
                 // tables[].filter is a source-row CEL predicate bound to source columns (§12),
                 // not the event envelope. Its type environment is the source schema, unknown
@@ -221,6 +245,7 @@ public final class DslParser {
 
     private PipelineResource pipeline(YamlMap m) {
         m.requireOnly(PIPELINE_KEYS);
+        m.requirePresent(REQUIRED_PIPELINE_KEYS);
         List<Step> transforms = transforms(m.seq("transforms"));
         String lastTransform = lastId(transforms);
         ViewBlock view = view(m, lastTransform);
@@ -284,6 +309,7 @@ public final class DslParser {
         Set<String> allowed = new HashSet<>(STEP_BASE_KEYS);
         allowed.addAll(payloadKeys(type));
         s.requireOnly(allowed);
+        s.requirePresent(requiredPayloadKeys(type));
         String id = idOf(s);
         if (id == null) {
             id = type + "_" + index;
@@ -302,6 +328,22 @@ public final class DslParser {
             case "union" -> Set.of();
             case "nest" -> Set.of(
                     "primary_key", "order", "entries_in_memory", "max_elements_per_document", "root");
+            case "join" -> Set.of("engine", "sql");
+            default -> Set.of();
+        };
+    }
+
+    /**
+     * The payload keys a body of this type must carry, a subset of {@link #payloadKeys}. A union has
+     * none — it is wiring alone — and an unknown type gets none because {@link #body} refuses it by
+     * name a moment later, which is the diagnostic its author needs.
+     */
+    static Set<String> requiredPayloadKeys(String type) {
+        return switch (type) {
+            case "js" -> Set.of("script");
+            case "map" -> Set.of("fields");
+            case "filter" -> Set.of("expr");
+            case "nest" -> Set.of("root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
         };
@@ -358,6 +400,7 @@ public final class DslParser {
 
     private NestRoot nestRoot(YamlMap r) {
         r.requireOnly(NEST_ROOT_KEYS);
+        r.requirePresent(REQUIRED_NEST_ROOT_KEYS);
         return new NestRoot(
                 r.string("from"),
                 scalarList(r.seq("key"), "key"),
@@ -372,8 +415,9 @@ public final class DslParser {
         }
         List<Embed> out = new ArrayList<>();
         for (Node n : items) {
-            YamlMap e = YamlMap.requireMapping(n, "embed");
+            YamlMap e = YamlMap.requireMapping(n, "embed[" + out.size() + "]");
             e.requireOnly(EMBED_KEYS);
+            e.requirePresent(REQUIRED_EMBED_KEYS);
             out.add(new Embed(
                     e.string("from"),
                     stringMap(e, "on"),
@@ -421,12 +465,14 @@ public final class DslParser {
         if (st.has("hot")) {
             YamlMap h = st.mapping("hot");
             h.requireOnly(HOT_KEYS);
+            h.requirePresent(REQUIRED_HOT_KEYS);
             hot = new Storage.Hot(h.string("ttl"));
         }
         Storage.Warm warm = null;
         if (st.has("warm")) {
             YamlMap w = st.mapping("warm");
             w.requireOnly(WARM_KEYS);
+            w.requirePresent(REQUIRED_WARM_KEYS);
             warm = new Storage.Warm(w.string("collection"), scalarList(w.seq("indexes"), "indexes"));
         }
         Storage.Cold cold = null;
@@ -477,6 +523,7 @@ public final class DslParser {
         for (int i = 0; i < items.size(); i++) {
             YamlMap s = YamlMap.requireMapping(items.get(i), pathPrefix + "sync[" + i + "]");
             s.requireOnly(SYNC_KEYS);
+            s.requirePresent(REQUIRED_SYNC_KEYS);
             requireKnownOptions(s, NO_ENGINE_OPTIONS);
             String id = s.string("id");
             out.add(new SyncElement(
@@ -510,6 +557,7 @@ public final class DslParser {
         for (Node n : items) {
             YamlMap q = YamlMap.requireMapping(n, pathPrefix + "query[" + i++ + "]");
             q.requireOnly(QUERY_KEYS);
+            q.requirePresent(REQUIRED_QUERY_KEYS);
             out.add(new QueryElement(enumByYaml(QueryType.values(), QueryType::yaml, q, "type"), q.string("backend")));
         }
         return out;
@@ -523,6 +571,7 @@ public final class DslParser {
         for (int i = 0; i < items.size(); i++) {
             YamlMap p = YamlMap.requireMapping(items.get(i), pathPrefix + "push[" + i + "]");
             p.requireOnly(PUSH_KEYS);
+            p.requirePresent(REQUIRED_PUSH_KEYS);
             requireKnownOptions(p, NO_ENGINE_OPTIONS);
             String id = p.string("id");
             out.add(new PushElement(
@@ -584,6 +633,8 @@ public final class DslParser {
         Set<String> allowed = new HashSet<>(TRANSFORM_DEF_KEYS);
         allowed.addAll(payloadKeys(type));
         m.requireOnly(allowed);
+        m.requirePresent(REQUIRED_DEFINITION_KEYS);
+        m.requirePresent(requiredPayloadKeys(type));
         requireKnownOptions(m, NO_ENGINE_OPTIONS);
         return new TransformResource(
                 idOf(m), metadata(m), body(type, m), m.freeMap("experimental"));
@@ -593,6 +644,7 @@ public final class DslParser {
     private ViewResource viewDefinition(YamlMap m) {
         forbidFrom(m);
         m.requireOnly(VIEW_DEF_KEYS);
+        m.requirePresent(REQUIRED_DEFINITION_KEYS);
         return new ViewResource(
                 idOf(m), metadata(m), m.string("primary_key"),
                 storage(m.mapping("storage")), viewSchema(m.mapping("schema")), m.freeMap("experimental"));
@@ -602,6 +654,7 @@ public final class DslParser {
     private ServeResource serveDefinition(YamlMap m) {
         forbidFrom(m);
         m.requireOnly(SERVE_DEF_KEYS);
+        m.requirePresent(REQUIRED_DEFINITION_KEYS);
         return new ServeResource(
                 idOf(m), metadata(m),
                 syncList(m.seq("sync"), ""), queryList(m.seq("query"), ""), pushList(m.seq("push"), ""),

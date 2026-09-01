@@ -1,15 +1,27 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.model.Doc;
+import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.Metadata;
+import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
+import io.tapstate.core.model.QueryElement;
+import io.tapstate.core.model.RenameSpec;
+import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.ServeResource;
+import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.Step;
+import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
+import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.ViewResource;
+import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.YamlFlatten;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -118,6 +130,124 @@ class StructuralKeyDerivationTest {
         return all;
     }
 
+    // ---- what a document must carry, against what the model declares required ------------
+
+    /** The YAML keys of a record's {@code @Doc(required = true)} components. */
+    private static Set<String> deriveRequired(Class<?> record) {
+        Set<String> keys = new LinkedHashSet<>();
+        for (RecordComponent component : record.getRecordComponents()) {
+            Doc doc = component.getAnnotation(Doc.class);
+            if (doc != null && doc.required() && !component.isAnnotationPresent(YamlFlatten.class)) {
+                keys.add(yamlKey(component));
+            }
+        }
+        return keys;
+    }
+
+    private static void assertRequired(Set<String> demanded, Class<?> record) {
+        assertThat(new TreeSet<>(demanded))
+                .as("%s: what the parser demands of a document must be what the model declares "
+                        + "required — a component that becomes required without reaching this list is "
+                        + "a NullPointerException at the boundary rather than a coded refusal",
+                        record.getSimpleName())
+                .isEqualTo(new TreeSet<>(deriveRequired(record)));
+    }
+
+    @Test
+    @DisplayName("the required derivation reads the annotation at all (positive control)")
+    void requiredDerivationFindsRequiredComponents() {
+        // Symmetrical to the control above and needed for the same reason: a deriveRequired() that
+        // always answered nothing would agree with any list that happened to be empty, and most of
+        // the records below have exactly one entry.
+        assertThat(deriveRequired(SourceResource.class)).containsExactlyInAnyOrder("id", "connector");
+        assertThat(deriveRequired(SourceResource.class)).doesNotContain("mode", "config");
+    }
+
+    @Test
+    void whatTheParserDemandsMatchesWhatTheModelRequires() {
+        assertRequired(DslParser.REQUIRED_SOURCE_KEYS, SourceResource.class);
+        assertRequired(DslParser.REQUIRED_PIPELINE_KEYS, PipelineResource.class);
+        assertRequired(DslParser.REQUIRED_TABLE_SPEC_KEYS, TableRef.Spec.class);
+        assertRequired(DslParser.REQUIRED_SYNC_KEYS, SyncElement.class);
+        assertRequired(DslParser.REQUIRED_PUSH_KEYS, PushElement.class);
+        assertRequired(DslParser.REQUIRED_QUERY_KEYS, QueryElement.class);
+        assertRequired(DslParser.REQUIRED_HOT_KEYS, Storage.Hot.class);
+        assertRequired(DslParser.REQUIRED_WARM_KEYS, Storage.Warm.class);
+        assertRequired(DslParser.REQUIRED_NEST_ROOT_KEYS, NestRoot.class);
+        assertRequired(DslParser.REQUIRED_EMBED_KEYS, Embed.class);
+        // The three definition bodies each require an id and nothing else of their own, so one set
+        // serves all three; TransformResource's other required component is its flattened body.
+        assertRequired(DslParser.REQUIRED_DEFINITION_KEYS, ViewResource.class);
+        assertRequired(DslParser.REQUIRED_DEFINITION_KEYS, ServeResource.class);
+        assertRequired(DslParser.REQUIRED_DEFINITION_KEYS, TransformResource.class);
+    }
+
+    @Test
+    void whatTheParserDemandsOfABodyMatchesItsVariant() {
+        assertRequired(DslParser.requiredPayloadKeys("js"), TransformBody.Js.class);
+        assertRequired(DslParser.requiredPayloadKeys("map"), TransformBody.MapProjection.class);
+        assertRequired(DslParser.requiredPayloadKeys("filter"), TransformBody.Filter.class);
+        assertRequired(DslParser.requiredPayloadKeys("nest"), TransformBody.Nest.class);
+        assertRequired(DslParser.requiredPayloadKeys("join"), TransformBody.Join.class);
+        assertRequired(DslParser.requiredPayloadKeys("union"), TransformBody.Union.class);
+    }
+
+    /** The records checked one by one above, named by the class whose requirement each covers. */
+    private static final Set<Class<?>> DEMANDED_OF_THE_DOCUMENT = Set.of(
+            SourceResource.class, PipelineResource.class, TableRef.Spec.class, SyncElement.class,
+            PushElement.class, QueryElement.class, Storage.Hot.class, Storage.Warm.class,
+            NestRoot.class, Embed.class, ViewResource.class, ServeResource.class,
+            TransformResource.class, TransformBody.Js.class, TransformBody.MapProjection.class,
+            TransformBody.Filter.class, TransformBody.Nest.class, TransformBody.Join.class);
+
+    /**
+     * Records with a required component that the parser answers for rather than demanding of the
+     * document. Named so that arriving here is a decision — the alternative is a required field
+     * nothing checks, which is the state this whole test exists to end.
+     *
+     * <ul>
+     *   <li>{@link Step.Inline} / {@link ViewBlock.Inline} / {@link ServeBlock.Inline} — the id is
+     *       generated when omitted, and {@code from} comes from natural order, whose own absence the
+     *       parser refuses separately when there is no predecessor to take it from;</li>
+     *   <li>{@link Step.Use} / {@link ViewBlock.Use} / {@link ServeBlock.Use} — reached only through
+     *       a branch guarded on {@code use:} being present, so the key is there by construction.</li>
+     * </ul>
+     */
+    private static final Set<Class<?>> ANSWERED_BY_THE_PARSER = Set.of(
+            Step.Inline.class, Step.Use.class, ViewBlock.Inline.class, ViewBlock.Use.class,
+            ServeBlock.Inline.class, ServeBlock.Use.class);
+
+    /** Every record the grammar is made of — the population the account below is taken over. */
+    private static final Set<Class<?>> MODEL_RECORDS = Set.of(
+            SourceResource.class, PipelineResource.class, TransformResource.class, ViewResource.class,
+            ServeResource.class, Metadata.class, Srs.class, Settings.class, Storage.Hot.class,
+            Storage.Warm.class, Storage.Cold.class, ViewSchema.class, RenameSpec.class,
+            TableRef.Literal.class, TableRef.Regex.class, TableRef.Spec.class, SyncElement.class,
+            PushElement.class, QueryElement.class, NestRoot.class, Embed.class, Step.Inline.class,
+            Step.Use.class, ViewBlock.Inline.class, ViewBlock.Use.class, ServeBlock.Inline.class,
+            ServeBlock.Use.class, TransformBody.Js.class, TransformBody.MapProjection.class,
+            TransformBody.Filter.class, TransformBody.Union.class, TransformBody.Nest.class,
+            TransformBody.Join.class);
+
+    @Test
+    @DisplayName("every record with a required component is demanded of the document or named as answered")
+    void everyRequiredComponentIsAccountedFor() {
+        Set<String> withARequirement = new TreeSet<>();
+        for (Class<?> record : MODEL_RECORDS) {
+            if (!deriveRequired(record).isEmpty()) {
+                withARequirement.add(record.getSimpleName());
+            }
+        }
+        Set<String> accountedFor = new TreeSet<>();
+        DEMANDED_OF_THE_DOCUMENT.forEach(c -> accountedFor.add(c.getSimpleName()));
+        ANSWERED_BY_THE_PARSER.forEach(c -> accountedFor.add(c.getSimpleName()));
+
+        assertThat(withARequirement)
+                .as("a model record declaring a required component must either be demanded of the "
+                        + "document or be named as one the parser answers for")
+                .isEqualTo(accountedFor);
+    }
+
     /**
      * Whitelists guarding something that is not a record, so nothing can be derived for them: YAML
      * shapes the model expresses another way (a sealed hierarchy, an enum, a nested block the parser
@@ -133,6 +263,13 @@ class StructuralKeyDerivationTest {
     private static final Set<String> DERIVED = Set.of(
             "SOURCE_KEYS", "PIPELINE_KEYS", "TRANSFORM_DEF_KEYS", "METADATA_KEYS", "SRS_KEYS",
             "TABLE_SPEC_KEYS", "SYNC_KEYS", "PUSH_KEYS", "STEP_BASE_KEYS", "STEP_USE_KEYS");
+
+    /** The required-key sets, re-derived above from their record's {@code @Doc(required = true)}. */
+    private static final Set<String> REQUIRED_DERIVED = Set.of(
+            "REQUIRED_SOURCE_KEYS", "REQUIRED_PIPELINE_KEYS", "REQUIRED_DEFINITION_KEYS",
+            "REQUIRED_TABLE_SPEC_KEYS", "REQUIRED_SYNC_KEYS", "REQUIRED_PUSH_KEYS",
+            "REQUIRED_QUERY_KEYS", "REQUIRED_HOT_KEYS", "REQUIRED_WARM_KEYS",
+            "REQUIRED_NEST_ROOT_KEYS", "REQUIRED_EMBED_KEYS");
 
     @Test
     @DisplayName("every key set in the parser is either derived here or named as not record-backed")
@@ -151,6 +288,6 @@ class StructuralKeyDerivationTest {
         assertThat(declared)
                 .as("a key set in the parser that is neither derived from a record nor listed as "
                         + "not record-backed: decide which it is")
-                .isEqualTo(new TreeSet<>(union(DERIVED, NOT_RECORD_BACKED)));
+                .isEqualTo(new TreeSet<>(union(union(DERIVED, REQUIRED_DERIVED), NOT_RECORD_BACKED)));
     }
 }
