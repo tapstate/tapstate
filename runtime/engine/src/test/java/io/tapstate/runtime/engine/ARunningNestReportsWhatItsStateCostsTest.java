@@ -68,6 +68,9 @@ class ARunningNestReportsWhatItsStateCostsTest {
     /** The assembler's namespace, as the compiled tree names it. */
     private static final String ROOT_NAMESPACE = "nest." + PIPELINE + "." + STEP + ".$root";
 
+    /** The namespace holding the rows the documents point at, as the compiled tree names it. */
+    private static final String REFERENCE_NAMESPACE = "nest." + PIPELINE + "." + STEP + ".customer";
+
     /** The cold layer, shared by every store the member builds. Static because they are built there. */
     private static final Map<String, byte[]> COLD = new ConcurrentHashMap<>();
 
@@ -134,6 +137,27 @@ class ARunningNestReportsWhatItsStateCostsTest {
     }
 
     @Test
+    @DisplayName("the rows the documents point at are reported as a namespace of their own")
+    void whatTheDocumentsPointAtIsVisibleFromOutsideTheRun() {
+        Engine engine = new Engine(member);
+        engine.submit(PIPELINE, ordersWithCustomers());
+        try {
+            NestStateReading reading = awaitReading(REFERENCE_NAMESPACE, 1);
+
+            assertThat(reading.entries())
+                    .describedAs("one entry per customer, not one per order that names one - four orders "
+                            + "point at these two, and a namespace holding four would be the whole design "
+                            + "undone while every document still rendered correctly")
+                    .isEqualTo(2);
+            assertThat(reading.accesses())
+                    .describedAs("filing a row reaches for the state, so the reaches are counted here too")
+                    .isPositive();
+        } finally {
+            engine.cancel(PIPELINE);
+        }
+    }
+
+    @Test
     void aPipelineWithNoLiveJobReportsNothingRatherThanAnEmptyState() {
         // Absence and zero call for opposite responses: a state layer that has stopped being reported and
         // one that has emptied look the same to a reader given zeroes for both.
@@ -144,16 +168,20 @@ class ARunningNestReportsWhatItsStateCostsTest {
 
     /** Waits for a collection carrying the assembler's readings; fails the test rather than returning none. */
     private NestStateReading awaitReading() {
+        return awaitReading(ROOT_NAMESPACE, 3);
+    }
+
+    private NestStateReading awaitReading(String namespace, long minimumAccesses) {
         Engine engine = new Engine(member);
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         while (System.nanoTime() < deadline) {
-            NestStateReading reading = engine.nestStateReadings(PIPELINE).get(ROOT_NAMESPACE);
-            if (reading != null && reading.accesses() >= 3) {
+            NestStateReading reading = engine.nestStateReadings(PIPELINE).get(namespace);
+            if (reading != null && reading.accesses() >= minimumAccesses) {
                 return reading;
             }
             sleep();
         }
-        throw new AssertionError("no reading for " + ROOT_NAMESPACE + " arrived within budget");
+        throw new AssertionError("no reading for " + namespace + " arrived within budget");
     }
 
     private static void sleep() {
@@ -194,6 +222,47 @@ class ARunningNestReportsWhatItsStateCostsTest {
         Map<String, NestTable> tables = new LinkedHashMap<>();
         tables.put("order", new NestTable("orders", List.of("order_id")));
         tables.put("item", new NestTable("order_items", List.of("item_id")));
+
+        DagBindings bindings = new DagBindings(
+                sources::get,
+                s -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
+                syncElement -> (SupplierEx<SinkWriter>) DiscardingSinkWriter::new,
+                ref -> List.of(((FromRef.Literal) ref).ref()),
+                new NestBinding(tables::get, NestBinding.onMap(), (from, released) -> { }));
+
+        return PipelineDagBuilder.build(pipeline, bindings);
+    }
+
+    /** orders as the root with the customer each one points at, over the same map-backed state. */
+    private static DAG ordersWithCustomers() {
+        Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
+                "customer", null, null, null, null);
+        TransformBody.Nest body = new TransformBody.Nest(null, null,
+                new NestRoot("order", List.of("order_id"), null, null, List.of(customer)));
+
+        Map<String, FromRef> aliases = new LinkedHashMap<>();
+        aliases.put("order", FromRef.literal("orders"));
+        aliases.put("customer", FromRef.literal("customers"));
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+
+        PipelineResource pipeline = new PipelineResource(PIPELINE, null,
+                List.of("orders", "customers"), List.of(step), null,
+                new ServeBlock.Inline("serve", FromRef.literal(STEP),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                null, null);
+
+        Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
+        // Four orders across two customers: the count is what tells "one entry per row" apart from
+        // "one entry per document that names it", and only the second grows with the orders.
+        sources.put("orders", rowsSource("orders",
+                List.of(row("order_id", 1, "cust_ref", 100), row("order_id", 2, "cust_ref", 100),
+                        row("order_id", 3, "cust_ref", 200), row("order_id", 4, "cust_ref", 200))));
+        sources.put("customers", rowsSource("customers",
+                List.of(row("customer_id", 100, "name", "Ada"), row("customer_id", 200, "name", "Grace"))));
+
+        Map<String, NestTable> tables = new LinkedHashMap<>();
+        tables.put("order", new NestTable("orders", List.of("order_id")));
+        tables.put("customer", new NestTable("customers", List.of("customer_id")));
 
         DagBindings bindings = new DagBindings(
                 sources::get,
