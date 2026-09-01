@@ -152,6 +152,24 @@ class LevelBoundsTest {
     }
 
     @Test
+    void countsAChangeSittingExactlyOnTheBoundAsOneTheFrontierHasAlreadyPassed() {
+        LevelBounds bounds = bounds(Map.of(0, List.of(ORDERS)));
+        bounds.observe(0, AXES.axisOf(ORDERS), packed(1, 50));
+
+        assertThat(bounds.hasPassed(ORDERS, new SourceOrder(1, 50)))
+                .describedAs("a bound is what has gone, not what is next: the change sitting on it is "
+                        + "inside the promise, and reading the edge as still to come leaves exactly one "
+                        + "change held under a bound that already covered it")
+                .isTrue();
+        assertThat(bounds.hasPassed(ORDERS, new SourceOrder(1, 51)))
+                .describedAs("the one above it has not been promised and may still be held")
+                .isFalse();
+        assertThat(bounds.hasPassed(ITEMS, new SourceOrder(1, 1)))
+                .describedAs("a chain nothing has been promised on has passed nothing")
+                .isFalse();
+    }
+
+    @Test
     void crashesWhenAChainArrivesOnAnEdgeTheCompiledTopologyDoesNotRouteItOver() {
         LevelBounds bounds = bounds(Map.of(0, List.of(ORDERS), 1, List.of(ITEMS)));
 
