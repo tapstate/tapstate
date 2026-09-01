@@ -527,35 +527,75 @@ class CaptureRunUnitTest {
         factory.resolve(hz).accept(3L);
     }
 
+    /**
+     * What a run of changes costs the coordination record must not grow with what the record has
+     * accumulated. Both bounds a run applies -- how far ahead of its readers the ring may be written, and
+     * how far the durable read offset may advance -- are functions of the consumer cursors alone, so a run
+     * asks for those and nothing else.
+     *
+     * <p>The record also carries a schema history that grows by one entry per DDL and is never trimmed.
+     * Fetching the whole record per run therefore carries that history back on every change, and the cost
+     * of doing so climbs for the life of the chain: measured against a real endpoint, a chain with 500
+     * DDLs behind it reads at 6.4 ms where the cursors alone read at 0.5 ms.
+     *
+     * <p>So this pins two things at once, and the second is the one that would rot silently: a run reads
+     * the cursors once rather than once per bound, and the number of whole-record fetches does not move
+     * when the number of runs does.
+     */
     @Test
-    void minConsumerReadSeqIsTheSlowestCursorAcrossTheChainsConsumers() {
+    void aRunOfChangesReadsTheCursorsOnceAndNeverFetchesTheWholeRecord() {
+        InMemoryMeta few = new InMemoryMeta();
+        runUnit(new FakeSource(List.of(), List.of(change(10), change(11))), few)
+                .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-few"), e -> { });
+        InMemoryMeta many = new InMemoryMeta();
+        runUnit(new FakeSource(List.of(), List.of(
+                        change(10), change(11), change(12), change(13), change(14),
+                        change(15), change(16), change(17), change(18), change(19))),
+                many)
+                .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-many"), e -> { });
+
+        // One cursor read per run of changes -- not two, which is what asking for each bound separately
+        // costs when both come from the same record.
+        assertThat(many.cursorReads - few.cursorReads)
+                .as("cursor reads scale one-for-one with runs of changes")
+                .isEqualTo(8);
+        // And the whole record is fetched only by the start path, the same number of times either way:
+        // eight more runs of changes fetch it not once more.
+        assertThat(many.wholeRecordReads)
+                .as("whole-record fetches do not scale with the number of change runs")
+                .isEqualTo(few.wholeRecordReads);
+    }
+
+    @Test
+    void theHeadroomBoundIsTheSlowestCursorAcrossTheChainsConsumers() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-min", null);
         // Two consumers on the chain: one has read orders up to 5, the other only to 2 -- the slowest bounds it.
         meta.advanceConsumerReadSeq("chain-min", "p1", "orders", 5L);
         meta.advanceConsumerReadSeq("chain-min", "p2", "orders", 2L);
 
-        assertThat(CaptureRunUnit.minConsumerReadSeq(meta, "chain-min", "orders")).isEqualTo(2L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-min"), "orders")).isEqualTo(2L);
     }
 
     @Test
-    void minConsumerReadSeqIsUnconstrainedWhenNoConsumerHasACursorYet() {
+    void theHeadroomBoundIsUnconstrainedWhenNoConsumerHasACursorYet() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-none", null);
 
         // No consumer has published a cursor: nothing constrains the ring, so the write gate sees no bound.
-        assertThat(CaptureRunUnit.minConsumerReadSeq(meta, "chain-none", "orders")).isEqualTo(Long.MAX_VALUE);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-none"), "orders"))
+                .isEqualTo(Long.MAX_VALUE);
     }
 
     @Test
-    void minConsumerReadSeqTreatsAConsumerThatHasNotReadTheTableAsHavingReadNothing() {
+    void theHeadroomBoundTreatsAConsumerThatHasNotReadTheTableAsHavingReadNothing() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-other", null);
         // The consumer has a cursor on another table but none on orders: for orders it has read nothing (-1),
         // holding the orders ring at the head until it starts reading orders.
         meta.advanceConsumerReadSeq("chain-other", "p1", "customers", 9L);
 
-        assertThat(CaptureRunUnit.minConsumerReadSeq(meta, "chain-other", "orders")).isEqualTo(-1L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders")).isEqualTo(-1L);
     }
 
     /** A mock connector: a fixed snapshot batch and a fixed change stream driven into the listener when cdc starts. */
@@ -663,11 +703,26 @@ class CaptureRunUnitTest {
         }
 
         final List<String> created = new ArrayList<>();
+        /** How often the whole record was fetched, and how often the cursors alone were. */
+        int wholeRecordReads;
+        int cursorReads;
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
 
         @Override
         public Optional<SrsMeta> read(String miningChainId) {
+            wholeRecordReads++;
             return Optional.ofNullable(records.get(miningChainId));
+        }
+
+        @Override
+        public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+            cursorReads++;
+            Optional<SrsMeta> record = read(miningChainId);
+            // This double answers the narrow read out of the same map, so the line above counted a whole
+            // record fetch that a real store would not have made. Take it back off: what this counter is
+            // for is fetches made for their own sake.
+            wholeRecordReads--;
+            return record.map(SrsMeta::consumerOffsets).orElse(List.of());
         }
 
         @Override

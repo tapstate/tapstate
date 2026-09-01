@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import java.util.function.LongConsumer;
@@ -144,8 +145,9 @@ public final class CaptureRunUnit {
                 long ringEpoch = epoch;
                 coordinator.attachConsumer(chainId, spec.pipelineId());
                 consumerAttached = true;
-                Supplier<Collection<ConsumerOffset>> consumers =
-                        () -> meta.read(cid).map(SrsMeta::consumerOffsets).orElse(List.of());
+                // The cursors alone, not the whole record: this is read on every run of changes, and the
+                // record also carries a schema history that grows per DDL and is never read here.
+                Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
                 // What the acked position can be attributed to decides whether this chain's log can be
                 // cut at all. A chain records one acked position for the whole chain, and the sequence in
                 // it came from whichever table's ring held that change -- on a chain of one table there is
@@ -166,8 +168,7 @@ public final class CaptureRunUnit {
                     // same provisioning.
                     CdcChain chain = new CdcChain(gate, meta, cid, ringEpoch, spec.schemaVer());
                     LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
-                    routes.put(table, new CdcPhase.TableRoute(
-                            chain, () -> minConsumerReadSeq(meta, cid, table), consumers, trim));
+                    routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
                 }
                 subscription = Optional.of(
                         CdcPhase.run(port, spec.config(), tailStart(meta, cid), routes, health));
@@ -188,13 +189,13 @@ public final class CaptureRunUnit {
                 consumerAttached = true;
                 String directChain = chainId.value();
                 long directEpoch = epoch;
-                Supplier<Collection<ConsumerOffset>> directConsumers =
-                        () -> meta.read(directChain).map(SrsMeta::consumerOffsets).orElse(List.of());
+                Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
                 AtomicLong forwarded = new AtomicLong();
+                AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
                 subscription = Optional.of(port.cdc(spec.config(), tailStart(meta, directChain),
                         health.recording((events, position) -> forwardDirect(
                                 events, position, directChain, directEpoch, forwarded,
-                                directConsumers, passthrough))));
+                                directConsumers, directLastWritten, passthrough))));
             }
 
             return new CaptureRun(
@@ -241,6 +242,7 @@ public final class CaptureRunUnit {
             long epoch,
             AtomicLong forwarded,
             Supplier<Collection<ConsumerOffset>> consumers,
+            AtomicReference<ChainPosition> lastWritten,
             Consumer<Envelope> passthrough) {
         if (events.isEmpty()) {
             // The source handed over only events carrying no change -- a heartbeat and its like. There is
@@ -256,8 +258,17 @@ public final class CaptureRunUnit {
                     new ChainPosition(new SourceOrder(epoch, closingSeq), i == last ? token : null)));
         }
         ChainPosition read = new ChainPosition(new SourceOrder(epoch, closingSeq), token);
-        SrsDurableFrontier.safeAdvance(read, consumers.get())
-                .ifPresent(safe -> meta.advanceSourceReadOffset(miningChainId, safe));
+        SrsDurableFrontier.safeAdvance(read, consumers.get()).ifPresent(safe -> {
+            // Unchanged from the run before means the slowest sink has landed nothing since, so this would
+            // write the record the value it already holds -- a synchronous round trip, on the thread the
+            // source reads on, to say nothing. The pair is compared, not the token alone: a token that
+            // repeats across generations is a different position, and comparing halves would skip it.
+            if (safe.equals(lastWritten.get())) {
+                return;
+            }
+            meta.advanceSourceReadOffset(miningChainId, safe);
+            lastWritten.set(safe);
+        });
     }
 
     private RuntimeException rollbackStartFailure(
@@ -318,20 +329,6 @@ public final class CaptureRunUnit {
                             : CaptureStart.resume(new SourcePosition(record.cdcStartPosition()));
                 })
                 .orElseGet(CaptureStart::present);
-    }
-
-    /**
-     * The slowest consumer's read cursor into one table's ring — the headroom bound the cdc write gate reads
-     * back from the durable consumer offsets. {@link Long#MAX_VALUE} when no consumer constrains the ring
-     * (none has a durable cursor yet), and {@code -1} for a consumer that has read nothing of the table.
-     */
-    static long minConsumerReadSeq(SrsMetaStore meta, String miningChainId, String table) {
-        return meta.read(miningChainId)
-                .map(m -> m.consumerOffsets().stream()
-                        .mapToLong(c -> c.perTableSeq().getOrDefault(table, -1L))
-                        .min()
-                        .orElse(Long.MAX_VALUE))
-                .orElse(Long.MAX_VALUE);
     }
 
     /**

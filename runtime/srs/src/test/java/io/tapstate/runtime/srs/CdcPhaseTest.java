@@ -134,7 +134,7 @@ class CdcPhaseTest {
                 Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 1, "n", 9), Map.of()),
                 Envelope.delete(3, "orders", Map.of("id", 1), Map.of())));
 
-        CdcPhase.run(port, config(), chain, () -> Long.MAX_VALUE, List::of, new CaptureHealth());
+        CdcPhase.run(port, config(), chain, List::of, new CaptureHealth());
 
         assertThat(ring.tailSequence()).isEqualTo(2L);
         SrsItem first = ring.readOne(0);
@@ -163,11 +163,13 @@ class CdcPhaseTest {
                 Envelope.insert(2, "orders", Map.of("id", 2), Map.of()),
                 Envelope.insert(3, "orders", Map.of("id", 3), Map.of())));
 
-        CdcPhase.run(port, config(), chain, () -> Long.MAX_VALUE, () -> consumers, new CaptureHealth());
+        CdcPhase.run(port, config(), chain, () -> consumers, new CaptureHealth());
 
-        // Written at w1, w2, w3; each advance is clamped to the slowest sink-acked position w2, so the
-        // persisted offset never passes a change no consumer has durably landed.
-        assertThat(meta.advances).containsExactly("w1", "w2", "w2");
+        // Written at w1, then clamped to the slowest sink-acked position w2 -- the persisted offset never
+        // passes a change no consumer has durably landed. The third change resolves that same clamped
+        // position again, and writing it a second time would tell the record what it already holds, so
+        // nothing is written for it: three changes, two writes.
+        assertThat(meta.advances).containsExactly("w1", "w2");
     }
 
     @Test
@@ -180,7 +182,7 @@ class CdcPhaseTest {
         CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
         List<Long> cuts = new ArrayList<>();
         Map<String, CdcPhase.TableRoute> routes = Map.of("orders", new CdcPhase.TableRoute(
-                chain, () -> Long.MAX_VALUE, () -> consumers, cuts::add));
+                chain, () -> consumers, cuts::add));
         FakeCdcPort port = new FakeCdcPort(List.of(
                 Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
                 Envelope.insert(2, "orders", Map.of("id", 2), Map.of()),
@@ -192,8 +194,8 @@ class CdcPhaseTest {
         // still behind the ack, then the ack itself once it is not. A log that is never cut grows without
         // bound, and a cut that ran ahead of this would delete a change a consumer has not landed.
         assertThat(cuts)
-                .as("the cut rides the frontier, so it is asked for on every advance and never passes it")
-                .containsExactly(0L, 1L, 1L);
+                .as("the cut rides the frontier, so it is asked for whenever that moves and never passes it")
+                .containsExactly(0L, 1L);
     }
 
     @Test
@@ -207,11 +209,15 @@ class CdcPhaseTest {
         // The slowest consumer has read nothing on the first poll (the write is refused), then advances to
         // seq 0 on the next -- modeling the source read pausing until a consumer frees a slot.
         AtomicLong polls = new AtomicLong();
-        LongSupplier minRead = () -> polls.getAndIncrement() == 0 ? -1L : 0L;
+        // The bound is read off the consumer cursors, so this is a consumer that has read nothing of orders
+        // on the first poll and has reached seq 0 by the next. It has acked nothing, which is why no offset
+        // is written here: this case is about the refused write being retried, not about the frontier.
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
+                "p1", polls.getAndIncrement() == 0 ? Map.of() : Map.of("orders", 0L), null));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
-        CdcPhase.run(port, config(), chain, minRead, List::of, new CaptureHealth());
+        CdcPhase.run(port, config(), chain, minRead, new CaptureHealth());
 
         // The change is not dropped: it lands at seq 8 once headroom frees, and the write was retried
         // (polled more than once) rather than silently overwriting the still-unread seq 0.
@@ -230,11 +236,12 @@ class CdcPhaseTest {
         }
         // The slowest consumer reads nothing until the test frees a slot: the write stays backpressured.
         AtomicBoolean freed = new AtomicBoolean(false);
-        LongSupplier minRead = () -> freed.get() ? 0L : -1L;
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
+                "p1", freed.get() ? Map.of("orders", 0L) : Map.of(), null));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
-        Thread writer = new Thread(() -> CdcPhase.run(port, config(), chain, minRead, List::of, new CaptureHealth()), "cdc-writer");
+        Thread writer = new Thread(() -> CdcPhase.run(port, config(), chain, minRead, new CaptureHealth()), "cdc-writer");
         writer.setDaemon(true);
         try {
             writer.start();
@@ -260,7 +267,7 @@ class CdcPhaseTest {
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of());
 
-        Subscription sub = CdcPhase.run(port, config(), chain, () -> Long.MAX_VALUE, List::of, new CaptureHealth());
+        Subscription sub = CdcPhase.run(port, config(), chain, List::of, new CaptureHealth());
         sub.close();
 
         // The phase hands back the port's own subscription; closing it stops the stream.
@@ -273,7 +280,7 @@ class CdcPhaseTest {
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
 
-        assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, null, List::of, new CaptureHealth()))
+        assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, null, new CaptureHealth()))
                 .isInstanceOf(NullPointerException.class);
 
         // Args are validated up front: the stream is never started when the wiring is incomplete.
@@ -287,7 +294,7 @@ class CdcPhaseTest {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.fail")));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
 
-        CdcPhase.run(FakeCdcPort.failing(boom), config(), chain, () -> Long.MAX_VALUE, List::of, health);
+        CdcPhase.run(FakeCdcPort.failing(boom), config(), chain, List::of, health);
 
         // The stream reported a failure rather than a change; the phase records it on the health so the run
         // can surface a dead tail that the change ring merely going quiet would otherwise hide.

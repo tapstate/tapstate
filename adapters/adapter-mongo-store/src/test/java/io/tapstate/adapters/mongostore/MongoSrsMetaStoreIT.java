@@ -53,6 +53,37 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * The narrow read answers exactly what the whole record says, on a chain carrying the two things that
+     * make the two reads differ: several consumers, and a schema history behind them.
+     *
+     * <p>The narrow read exists to leave that history on the endpoint -- it is what the cdc write path
+     * takes on every run of changes, and it never looks at the history. What must not come with the saving
+     * is a different answer, and it is a real risk here rather than a theoretical one: the projection names
+     * the field it keeps, so a rename that misses it would return no cursors at all, and a hot path told
+     * there are no consumers writes an offset bounded by nothing.
+     */
+    @Test
+    void theCursorReadAnswersTheSameAsTheWholeRecordOnAChainWithHistoryBehindIt() {
+        withStore(store -> {
+            store.create(CHAIN, "7d");
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("pipe-a", Map.of("orders", 7L),
+                    new ChainPosition(new SourceOrder(1L, 3L), "tok-a")));
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("pipe-b", Map.of("orders", 4L, "items", 9L),
+                    new ChainPosition(new SourceOrder(1L, 1L), "tok-b")));
+            store.appendSchemaVersion(CHAIN, new SchemaVersion(1L, Map.of("id", "int"), 1L));
+            store.appendSchemaVersion(CHAIN, new SchemaVersion(2L, Map.of("id", "int", "name", "varchar"), 2L));
+
+            assertThat(store.consumerOffsets(CHAIN))
+                    .containsExactlyInAnyOrderElementsOf(store.read(CHAIN).orElseThrow().consumerOffsets());
+        });
+    }
+
+    @Test
+    void theCursorReadIsEmptyForAnUnminedChain() {
+        withStore(store -> assertThat(store.consumerOffsets("never-mined")).isEmpty());
+    }
+
     @Test
     void readReturnsEmptyForAnUnminedChain() {
         withStore(store -> assertThat(store.read("never-mined")).isEmpty());

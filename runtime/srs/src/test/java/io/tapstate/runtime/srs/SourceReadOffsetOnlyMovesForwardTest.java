@@ -141,7 +141,7 @@ class SourceReadOffsetOnlyMovesForwardTest {
             events.add(Envelope.insert(i, "orders", Map.of("id", i), Map.of()));
         }
         CdcPhase.run(new FakeCdcPort(events), new CaptureConfig("mysql", Map.of(), List.of("orders")), chain,
-                () -> Long.MAX_VALUE, () -> consumers, new CaptureHealth());
+                () -> consumers, new CaptureHealth());
     }
 
     /** One consumer whose sink has durably landed everything up to the given position. */

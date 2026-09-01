@@ -28,6 +28,21 @@ public interface SrsMetaStore {
     Optional<SrsMeta> read(String miningChainId);
 
     /**
+     * The chain's consumer cursors alone, empty when the chain has not been seeded — what the cdc write
+     * path needs, and all of it. Both bounds that path applies are functions of these cursors: the
+     * headroom the ring has left, and how far the durable read offset may advance.
+     *
+     * <p>Separate from {@link #read} because the record also carries a schema history that grows by one
+     * entry per DDL and is never trimmed, and this path never looks at it. Fetching the whole record on
+     * every run of changes therefore carries that history back across the wire each time, and the cost of
+     * doing so grows for the life of the chain. A store that can answer this without the history stops
+     * paying for it; one that cannot is still correct, which is why this has a default at all.
+     */
+    default List<ConsumerOffset> consumerOffsets(String miningChainId) {
+        return read(miningChainId).map(SrsMeta::consumerOffsets).orElse(List.of());
+    }
+
+    /**
      * Seeds a mining chain's first record — no offsets, no consumers, no schema history, carrying only
      * the pass-through {@code retention} config (which may be absent). Insert-only: it must not overwrite
      * an existing record (which would discard the chain's accumulated offset / cursor / schema truth).

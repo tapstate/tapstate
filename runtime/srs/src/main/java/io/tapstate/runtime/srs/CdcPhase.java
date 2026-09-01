@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -58,23 +59,21 @@ public final class CdcPhase {
      * a ring item carrying the position the source reported for it and appended through the headroom gate, which
      * refuses a write that would overwrite a change the slowest consumer has not read.
      *
-     * @param minConsumerReadSeq the slowest consumer's read cursor into the ring, the headroom bound
-     * @param consumers          the chain's consumer cursors, the durable-frontier bound on the read offset
+     * @param consumers the chain's consumer cursors, which bound both how far the ring may be written
+     *                  ahead of its slowest reader and how far the durable read offset may advance
      */
     public static Subscription run(
             CapturePort port,
             CaptureConfig config,
             CdcChain chain,
-            LongSupplier minConsumerReadSeq,
             Supplier<Collection<ConsumerOffset>> consumers,
             CaptureHealth health) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(chain, "chain");
-        Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
         Objects.requireNonNull(consumers, "consumers");
         Objects.requireNonNull(health, "health");
-        return run(port, config, CaptureStart.present(), chain, minConsumerReadSeq, consumers, health);
+        return run(port, config, CaptureStart.present(), chain, consumers, health);
     }
 
     /** As above, beginning where {@code start} says rather than always at the source's present moment. */
@@ -83,23 +82,22 @@ public final class CdcPhase {
             CaptureConfig config,
             CaptureStart start,
             CdcChain chain,
-            LongSupplier minConsumerReadSeq,
             Supplier<Collection<ConsumerOffset>> consumers,
             CaptureHealth health) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(start, "start");
         Objects.requireNonNull(chain, "chain");
-        Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
         Objects.requireNonNull(consumers, "consumers");
         Objects.requireNonNull(health, "health");
         // One chain serves every table this subscription sees, so the route resolves to it whatever the
         // change names -- the same run-writing path the multi-table entry point takes.
         // No ring name and no log reach this entry point, so there is nothing here that could name what
         // to cut. The caller that owns both wires a real cut through the other entry point.
-        TableRoute route = new TableRoute(chain, minConsumerReadSeq, consumers, seq -> { });
+        TableRoute route = new TableRoute(chain, consumers, seq -> { });
+        AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
         return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, table -> route)));
+                (events, position) -> writeBatch(events, position, table -> route, lastWritten)));
     }
 
     /** Starts one connector subscription and routes each event to the ring for its source table. */
@@ -127,8 +125,11 @@ public final class CdcPhase {
         Objects.requireNonNull(routes, "routes");
         Objects.requireNonNull(health, "health");
         Map<String, TableRoute> routeSnapshot = Map.copyOf(routes);
+        // The last position actually persisted, for the life of this subscription. It is what lets a run
+        // that resolves the same frontier as the one before it write nothing: see writeBatch.
+        AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
         return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, routeSnapshot::get)));
+                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)));
     }
 
     /**
@@ -144,16 +145,33 @@ public final class CdcPhase {
      */
     public record TableRoute(
             CdcChain chain,
-            LongSupplier minConsumerReadSeq,
             Supplier<Collection<ConsumerOffset>> consumers,
             LongConsumer trimThrough) {
 
         public TableRoute {
             Objects.requireNonNull(chain, "chain");
-            Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
             Objects.requireNonNull(consumers, "consumers");
             Objects.requireNonNull(trimThrough, "trimThrough");
         }
+    }
+
+    /**
+     * The slowest consumer's read cursor into one table's ring — how far ahead of its readers the ring may
+     * be written. {@link Long#MAX_VALUE} when nothing constrains it (no consumer has a durable cursor yet),
+     * and {@code -1} for a consumer that has read nothing of the table.
+     *
+     * <p>Derived here rather than fetched separately because it is a function of the same cursors the
+     * durable frontier is: asking a store for it on its own means reading one record twice per run.
+     */
+    static long headroomBound(Collection<ConsumerOffset> offsets, String table) {
+        return offsets.stream()
+                .mapToLong(offset -> offset.perTableSeq().getOrDefault(table, -1L))
+                .min()
+                .orElse(Long.MAX_VALUE);
+    }
+
+    /** One table's admitted share: the sequence its last change took, and the cursors that let it in. */
+    private record Admitted(long lastSeq, Collection<ConsumerOffset> offsets) {
     }
 
     /**
@@ -169,7 +187,8 @@ public final class CdcPhase {
     private static void writeBatch(
             List<Envelope> events,
             Optional<SourcePosition> position,
-            Function<String, TableRoute> routes) {
+            Function<String, TableRoute> routes,
+            AtomicReference<ChainPosition> lastWritten) {
         if (events.isEmpty()) {
             // The source handed over only events that carry no change -- a heartbeat and its like. There is
             // nothing to write, and nothing has been read past, so the offset does not move either.
@@ -193,10 +212,15 @@ public final class CdcPhase {
         }
         String closingTable = events.get(last).src();
         long closingSeq = -1;
+        Collection<ConsumerOffset> closingOffsets = List.of();
         for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
-            long lastSeq = admit(routes.apply(entry.getKey()), entry.getValue());
+            Admitted admitted = admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue());
             if (entry.getKey().equals(closingTable)) {
-                closingSeq = lastSeq;
+                closingSeq = admitted.lastSeq();
+                // The cursors the admission read, rather than a second reading of them. They are the same
+                // record, and a reading taken a moment earlier can only be behind -- which clamps the
+                // advance shorter, never further, so the bound it enforces still holds.
+                closingOffsets = admitted.offsets();
             }
         }
         // The run is in the rings; advance the durable read offset to the position that closes it, clamped
@@ -208,8 +232,17 @@ public final class CdcPhase {
         CdcChain chain = closing.chain();
         ChainPosition read = new ChainPosition(new SourceOrder(chain.epoch(), closingSeq),
                 position.map(SourcePosition::token).orElse(null));
-        SrsDurableFrontier.safeAdvance(read, closing.consumers().get()).ifPresent(safe -> {
+        SrsDurableFrontier.safeAdvance(read, closingOffsets).ifPresent(safe -> {
+            // A backpressured or idle chain resolves the same frontier run after run: the advance is
+            // clamped to the slowest sink's acked position, and that does not move while the sink is not
+            // landing anything. Persisting it again writes the value the record already holds, and cutting
+            // to it again cuts what is already gone. Neither is wrong, and on a real endpoint both are a
+            // synchronous round trip on the thread the source reads on, so the run pays to say nothing.
+            if (safe.equals(lastWritten.get())) {
+                return;
+            }
             chain.meta().advanceSourceReadOffset(chain.miningChainId(), safe);
+            lastWritten.set(safe);
             // The same frontier bounds what the log still has to keep: every consumer has durably landed
             // the change at that sequence, so nothing will ever replay it or anything before it. The cut
             // rides the frontier rather than running on its own clock because this is the only moment the
@@ -231,14 +264,19 @@ public final class CdcPhase {
      * whole capture would stop with nothing thrown -- the source asks for a bounded batch, but what a
      * connector hands over is the connector's to decide.
      */
-    private static long admit(TableRoute route, List<SrsItem> items) {
+    private static Admitted admit(TableRoute route, String table, List<SrsItem> items) {
         int capacity = (int) Math.min(route.chain().gate().capacity(), Integer.MAX_VALUE);
         long lastSeq = -1;
+        Collection<ConsumerOffset> offsets = List.of();
         for (int from = 0; from < items.size(); from += capacity) {
             List<SrsItem> piece = items.subList(from, Math.min(from + capacity, items.size()));
             while (true) {
+                // Re-read on every attempt, not once for the run: this is the only thing that can tell a
+                // parked write that a consumer has moved, so a bound hoisted out of the loop would park
+                // for ever waiting for room it could no longer see being freed.
+                offsets = route.consumers().get();
                 OptionalLong appended = route.chain().gate()
-                        .appendAll(piece, route.minConsumerReadSeq().getAsLong());
+                        .appendAll(piece, headroomBound(offsets, table));
                 if (appended.isPresent()) {
                     lastSeq = appended.getAsLong();
                     break;
@@ -246,6 +284,6 @@ public final class CdcPhase {
                 LockSupport.parkNanos(BACKPRESSURE_PARK_NANOS);
             }
         }
-        return lastSeq;
+        return new Admitted(lastSeq, offsets);
     }
 }
