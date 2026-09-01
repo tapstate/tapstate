@@ -1,0 +1,84 @@
+# Keep the public distribution counters that expire.
+#
+# GitHub's traffic API serves only the trailing 14 days. A day not captured inside that window is
+# gone permanently, which is why this runs on a schedule rather than when someone remembers.
+#
+# The open question this workflow exists to answer first: /traffic/* requires push access on the
+# repository, and `administration` is not among the permissions GITHUB_TOKEN can be granted. So the
+# default token is expected to be refused here. The probe step below establishes that as a fact
+# rather than an assumption, and names the fallback in its own output -- an unreadable counter and a
+# counter that reads zero look identical downstream, so this must fail loudly.
+name: funnel capture
+
+on:
+  # Temporary, for validating this workflow on its own branch: workflow_dispatch is only offered for
+  # workflows already on the default branch, so there is no other way to exercise it before merge.
+  # Remove this trigger in the same change that turns the schedule on.
+  push:
+    branches: ['ws/activation-funnel-distribution']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: probe -- can this job's token read the traffic API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          printf '::group::traffic probe with the default GITHUB_TOKEN\n'
+          if gh api "repos/${GITHUB_REPOSITORY}/traffic/clones" >/dev/null 2>probe.err; then
+            echo "RESULT: GITHUB_TOKEN CAN read /traffic/clones"
+            echo "traffic_token=github_token" >> "$GITHUB_ENV"
+          else
+            echo "RESULT: GITHUB_TOKEN CANNOT read /traffic/clones"
+            sed 's/^/  /' probe.err || true
+            echo "traffic_token=none" >> "$GITHUB_ENV"
+          fi
+          printf '::endgroup::\n'
+
+      - name: probe -- the dedicated secret, when one exists
+        if: env.traffic_token == 'none'
+        env:
+          GH_TOKEN: ${{ secrets.FUNNEL_TRAFFIC_TOKEN }}
+        run: |
+          set -u
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "RESULT: no FUNNEL_TRAFFIC_TOKEN secret is configured"
+            echo "NEXT: create a token with push access on this repository and set it as"
+            echo "      FUNNEL_TRAFFIC_TOKEN, or the schedule cannot capture anything."
+            exit 0
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/traffic/clones" >/dev/null 2>probe.err; then
+            echo "RESULT: FUNNEL_TRAFFIC_TOKEN CAN read /traffic/clones"
+            echo "traffic_token=secret" >> "$GITHUB_ENV"
+          else
+            echo "RESULT: FUNNEL_TRAFFIC_TOKEN CANNOT read /traffic/clones"
+            sed 's/^/  /' probe.err || true
+          fi
+
+      - name: capture
+        if: env.traffic_token != 'none'
+        env:
+          GH_TOKEN: ${{ env.traffic_token == 'secret' && secrets.FUNNEL_TRAFFIC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          sh scripts/funnel-capture.sh --store "$RUNNER_TEMP/store"
+          sh scripts/funnel-capture.sh --store "$RUNNER_TEMP/store" --gaps
+
+      # An artifact is not the durable store -- it expires, and the whole point of this line is that
+      # things expire. It is the interim that stops the loss while the durable store is built, and it
+      # is deliberately labelled so nobody mistakes it for the real one.
+      - name: upload interim series
+        if: env.traffic_token != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: funnel-series-interim-${{ github.run_id }}
+          path: ${{ runner.temp }}/store
+          retention-days: 90
