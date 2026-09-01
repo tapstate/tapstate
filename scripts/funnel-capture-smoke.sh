@@ -136,4 +136,42 @@ echo "$out2" | grep -q "2026-08-19" || fail "case 7: the report did not name the
 echo "$out2" | grep -qi 'gaps: *none' && fail "case 7: the report claimed no gaps while a day was missing"
 pass "case 7: the report names the gap rather than filling it"
 
+# --- publishing the series into a git repository ----------------------------------------------------
+publish="$here/funnel-publish.sh"
+[ -x "$publish" ] || fail "funnel-publish.sh is missing or not executable at $publish"
+
+# a bare origin plus a working clone, so push is exercised rather than mocked
+origin="$work/origin.git"; git init -q --bare "$origin"
+clone="$work/clone"; git clone -q "$origin" "$clone"
+git -C "$clone" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+git -C "$clone" push -q origin HEAD:main
+base_commits="$(git -C "$clone" rev-list --count HEAD)"
+
+store="$clone/funnel"; fx="$work/fx6"; mkdir -p "$fx"
+window > "$fx/clones.json"
+: > "$fx/releases.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+sh "$publish" --repo-dir "$clone" >/dev/null
+after_first="$(git -C "$clone" rev-list --count HEAD)"
+[ "$after_first" -gt "$base_commits" ] || fail "case 8: publishing new data added no commit"
+pass "case 8: new data lands as a commit"
+
+# Re-running with nothing new must not manufacture a commit. The job runs weekly forever, so an
+# unconditional commit turns the history into one empty commit per week and buries the real ones --
+# and `git commit` with nothing staged also exits non-zero, which would fail the job every quiet week.
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+# The exit code is half the assertion. Dropping the no-change guard makes `git commit` fail on an
+# empty index, which also produces no commit -- so a count-only check passes while every quiet week
+# turns into a failed job. Both halves have to be asserted for this case to mean anything.
+if sh "$publish" --repo-dir "$clone" >/dev/null 2>&1; then pub_rc=0; else pub_rc=$?; fi
+after_second="$(git -C "$clone" rev-list --count HEAD)"
+[ "$pub_rc" = "0" ] || fail "case 9: a quiet run exited $pub_rc; every week with no new data would fail the job"
+[ "$after_second" = "$after_first" ] || fail "case 9: an unchanged run still produced a commit"
+pass "case 9: an unchanged run commits nothing and still succeeds"
+
+# and the push actually reached the origin, rather than only committing locally
+git -C "$origin" show HEAD:funnel/daily/clones.jsonl >/dev/null 2>&1 \
+  || fail "case 10: the series is not present on the origin -- it was committed but never pushed"
+pass "case 10: the series reaches the origin"
+
 printf 'funnel-capture-smoke: all cases passed\n'
