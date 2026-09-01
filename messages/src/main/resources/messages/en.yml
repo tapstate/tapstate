@@ -229,8 +229,8 @@ dsl.missing-field:
   message: "Required field '{field}' is missing at {path}."
   solution: "Add '{field}' to that block. It has no default, and nothing else in the document implies it."
 dsl.mode-required-for-read:
-  message: "Source '{source}' is read by pipeline '{pipeline}' but declares no mode."
-  solution: "Add 'mode:' to '{source}', saying how it is read. A source named only as a sync or push target supplies a connection rather than rows, and correctly declares none."
+  message: "Source '{source}' is read by pipeline '{pipeline}' but declares no {path}."
+  solution: "Add '{path}:' to '{source}', saying how it is read. A source named only as a sync or push target supplies a connection rather than rows, and correctly declares none."
 dsl.unsupported-version:
   message: "This document declares version '{got}', which this build cannot read."
   solution: "Write one of the supported versions: {supported}. A version is supported for two further minor releases after its successor ships."

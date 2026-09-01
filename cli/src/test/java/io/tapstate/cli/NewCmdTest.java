@@ -364,8 +364,14 @@ class NewCmdTest {
     void aScaffoldedPipelineAndItsSourcesValidateAsAWorkspace(@TempDir Path dir) {
         // the new -> validate round-trip: scaffold the two sources then the pipeline that wires them,
         // and the whole directory loads clean (references resolve, X17 satisfied)
+        //
+        // The two sources are scaffolded differently on purpose, and the difference is the point:
+        // src_a is read by the pipeline so it says how (--mode), while tgt_b is only synced to,
+        // supplies a connection rather than rows, and correctly carries none. The wizard has always
+        // asked this question - its mode prompt offers "no read mode" for exactly the tgt_b case -
+        // and these fixtures answered it neither way, producing a read source nothing could judge.
         assertThat(run("new", "--non-interactive", "--kind", "source",
-                "--connector", "mysql", "--id", "src_a", "--out", dir.toString()).code()).isZero();
+                "--connector", "mysql", "--id", "src_a", "--mode", "cdc", "--out", dir.toString()).code()).isZero();
         assertThat(run("new", "--non-interactive", "--kind", "source",
                 "--connector", "mysql", "--id", "tgt_b", "--out", dir.toString()).code()).isZero();
         assertThat(run("new", "--non-interactive", "--kind", "pipeline",
@@ -380,7 +386,7 @@ class NewCmdTest {
         // the combined output shape: the interactive wizard builds a pipeline carrying BOTH a view and
         // a serve (serve reads from the view); with its sources scaffolded, the workspace loads clean
         assertThat(run("new", "--non-interactive", "--kind", "source",
-                "--connector", "mysql", "--id", "src_a", "--out", dir.toString()).code()).isZero();
+                "--connector", "mysql", "--id", "src_a", "--mode", "cdc", "--out", dir.toString()).code()).isZero();
         assertThat(run("new", "--non-interactive", "--kind", "source",
                 "--connector", "mysql", "--id", "tgt_b", "--out", dir.toString()).code()).isZero();
 
@@ -418,7 +424,7 @@ class NewCmdTest {
         // a user who names the inline view "serve" would collide with the inline serve block's id and
         // crash validate with a duplicate id; the wizard re-prompts, so the workspace still loads clean
         assertThat(run("new", "--non-interactive", "--kind", "source",
-                "--connector", "mysql", "--id", "src_a", "--out", dir.toString()).code()).isZero();
+                "--connector", "mysql", "--id", "src_a", "--mode", "cdc", "--out", dir.toString()).code()).isZero();
         assertThat(run("new", "--non-interactive", "--kind", "source",
                 "--connector", "mysql", "--id", "tgt_b", "--out", dir.toString()).code()).isZero();
 
@@ -439,7 +445,7 @@ class NewCmdTest {
         // the use-reference shape: the pipeline references a kind:view and a kind:serve definition by id.
         // With those definitions present, the whole workspace must resolve and load clean.
         assertThat(run("new", "--non-interactive", "--kind", "source",
-                "--connector", "mysql", "--id", "src_a", "--out", dir.toString()).code()).isZero();
+                "--connector", "mysql", "--id", "src_a", "--mode", "cdc", "--out", dir.toString()).code()).isZero();
         Files.writeString(dir.resolve("v_cust.tap.yml"),
                 """
                 version: tapstate/v1
@@ -477,7 +483,7 @@ class NewCmdTest {
         // the full reuse loop end to end: scaffold a standalone kind:transform, then let the pipeline
         // wizard discover it in the workspace and pick it via use:; the assembled workspace must load clean.
         assertThat(run("new", "--non-interactive", "--kind", "source",
-                "--connector", "mysql", "--id", "src_a", "--out", dir.toString()).code()).isZero();
+                "--connector", "mysql", "--id", "src_a", "--mode", "cdc", "--out", dir.toString()).code()).isZero();
         assertThat(run("new", "--non-interactive", "--kind", "source",
                 "--connector", "mysql", "--id", "tgt_b", "--out", dir.toString()).code()).isZero();
         assertThat(run("new", "--non-interactive", "--kind", "transform",
