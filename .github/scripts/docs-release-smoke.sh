@@ -91,6 +91,63 @@ else
     fail "the title has exactly one definition in the script" "found $defs"
 fi
 
+# --- retire: withdrawing a request for a version that is not coming ----------------------------
+
+# `retire` has to be an accepted verb before any case below means anything. Under `set -e` an
+# unknown one aborts this file at the first command substitution: no FAIL line, no summary, just a
+# run that stops -- red in CI, but red without saying what. Measured on a mutation that removed the
+# verb from the validation: exit 2, and the last line printed was an ok.
+if ! bash "$script" retire 0.4.0 --plan --assume-state open >/dev/null 2>&1; then
+    fail "retire is an accepted verb" "the script refuses it; every case below would abort silently"
+    echo
+    echo "docs-release-smoke: $failures case(s) failed"
+    exit 1
+fi
+pass "retire is an accepted verb"
+
+refuses "retire without a version is refused" bash "$script" retire --plan
+
+open_req="$(plan retire 0.4.0 --assume-state open)"
+contains "retire withdraws the open request" "withdraw" "$open_req"
+contains "and names the docs repository"     "tapstate/docs" "$open_req"
+
+done_req="$(plan retire 0.4.0 --assume-state closed)"
+contains "an already-closed request is left alone" "already closed" "$done_req"
+
+# It looks for the same title the other two use, so a request opened by `open` is the one withdrawn.
+# Without this, retire could withdraw nothing for ever and read exactly like a version whose request
+# somebody had already closed.
+contains "retire looks for the title open wrote" "$title" "$(plan retire 0.4.0 --assume-state open)"
+
+# retire needs no --notes-url: there is no release to link to, which is the whole reason it runs.
+if bash "$script" retire 0.4.0 --plan --assume-state open >/dev/null 2>&1; then
+    pass "retire needs no --notes-url"
+else
+    fail "retire needs no --notes-url" "refused without one"
+fi
+
+# The same rule the settle half lives by, for the same reason and a sharper one: this runs in the job
+# that cleans up after every ending, so a step that can go red here leaves the rest of the cleanup --
+# three branches in three repositories -- undone.
+# shellcheck disable=SC2016  # the anchor is the script's own literal text, searched unexpanded
+retire_half="$(sed -n '/^if \[ "\$verb" = retire \]; then$/,/^# settle$/p' "$script")"
+if [ -z "$retire_half" ]; then
+    fail "nothing in the retire half refuses" "could not find the retire half; the anchor moved"
+else
+    n="$(printf '%s' "$retire_half" | grep -cE 'exit [1-9]' || true)"
+    if [ "$n" = 0 ]; then pass "nothing in the retire half refuses"
+    else fail "nothing in the retire half refuses" "$n non-zero exit(s); the cleanup must not stop for this"; fi
+fi
+
+for st in closed open; do
+    set +e
+    bash "$script" retire 0.4.0 --plan --assume-state "$st" >/dev/null 2>&1
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then pass "retire exits 0 when the issue is $st"
+    else fail "retire exits 0 when the issue is $st" "exited $rc; the cleanup must not stop for this"; fi
+done
+
 # --- the whole point: it never blocks ---------------------------------------------------------
 
 # Three of these read the source rather than run it, and that is deliberate. What they cover cannot

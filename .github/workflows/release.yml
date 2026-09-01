@@ -47,7 +47,7 @@ on:
         options: [minor, patch, major]
         required: true
       commit:
-        description: "Which commit ships. Leave empty for the tip of the branch this is dispatched from."
+        description: "Which commit ships. Leave empty for the tip of the default branch."
         type: string
         required: false
 
@@ -56,7 +56,24 @@ permissions:
 
 jobs:
   version:
+    # The pin, and the whole of the freeze. Merging to the default branch stops when this is
+    # dispatched and may resume the moment this job goes green. That it is a job and not a step is the
+    # point: a person watching the run sees it finish, rather than having to find one step inside a
+    # long-running one to know the freeze is over.
+    #
+    # Everything here is a read plus four ref creations -- the conclusions already recorded on the
+    # commit, the version its ancestry implies, the documentation follow-ups for the range, whether
+    # the token reaches the satellites. No build, no test, no image. That is what keeps the freeze
+    # short, and it is why a commit whose checks are still running is refused rather than waited for.
+    #
+    # An attempt is atomic. What this pins is what the attempt releases or throws away; no branch
+    # outlives the attempt that made it, and nothing is carried by hand from one attempt to the next.
+    # A fix for a failed attempt goes to the default branch, and the next attempt picks it up by
+    # starting from there.
+    name: pin (the freeze lasts exactly this long)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # this repository's own release branch
     outputs:
       version: ${{ steps.next.outputs.version }}
       tag: ${{ steps.next.outputs.tag }}
@@ -74,7 +91,33 @@ jobs:
           ref: ${{ inputs.commit || github.ref }}
           fetch-depth: 0
       - id: sha
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          default='${{ github.event.repository.default_branch }}'
+          # Asked for by name rather than assumed to be present: checking out an explicit commit does
+          # not guarantee a remote-tracking ref for the default branch, and the ancestry test below
+          # would then fail for the wrong reason.
+          git fetch --no-tags origin "+refs/heads/$default:refs/remotes/origin/$default"
+          sha="$(git rev-parse HEAD)"
+          # A commit that is not on the default branch has not been through the merge-result build, so
+          # "its checks are green" would be answering about something else.
+          if ! git merge-base --is-ancestor "$sha" "origin/$default"; then
+            echo "$sha is not an ancestor of the default branch; it has not been built as a merge result." >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Let the script's own exit code fail the step. It explains its refusal in its own words --
+      # including the difference between a check still running and one that has concluded red, which
+      # need different answers from a person -- and a wrapper here would restate that less well.
+      - name: the required checks are green on that commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/checks-on-commit.sh \
+            --sha "${{ steps.sha.outputs.sha }}" \
+            --from-ruleset "${{ github.event.repository.default_branch }}"
+
       - id: next
         run: .github/scripts/next-version.sh "${{ inputs.bump }}" HEAD >> "$GITHUB_OUTPUT"
       # A patch is cherry-picked onto a line that has been overtaken, and a changeset riding along on
@@ -88,13 +131,85 @@ jobs:
       - name: a patch ships the same changesets as the release it patches
         if: inputs.bump == 'patch'
         run: .github/scripts/changeset-parity.sh "${{ steps.next.outputs.base }}" HEAD
+
+      # The pages for this release have to be written and merged before it starts. That is the same
+      # gate the release itself runs, asked here because here it is cheap to act on -- nothing has
+      # been created yet, so finishing the pages and dispatching again costs nothing. Asked later it
+      # is a release sitting at its first gate with three branches already cut.
+      #
+      # This is about the pages for what is shipping. Publishing the site is a separate thing, asked
+      # for below in an issue, and it deliberately does not gate anything.
+      - name: the documentation for this range has landed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/docs-gate.sh \
+            --base "${{ steps.next.outputs.base }}" \
+            --sha "${{ steps.sha.outputs.sha }}" \
+            --bump "${{ inputs.bump }}"
+
+      - name: the satellite token reaches every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Before any branch exists, not after. A token that cannot reach one of them is worth finding
+          # out about while nothing has been created, rather than with three of four repositories pinned.
+          bash .github/scripts/satellites.sh reach | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: pin this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="ws/release-${{ steps.next.outputs.version }}"
+          # An existing branch is refused rather than moved. Moving it is the one operation that would
+          # silently change what a release ships after somebody has already looked at it. Nothing
+          # legitimately leaves one behind any more -- the cleanup job retires them however an attempt
+          # ends -- so one standing here means an attempt is still running, or one died in a way worth
+          # looking at before starting another.
+          if gh api "repos/${{ github.repository }}/git/ref/heads/$branch" >/dev/null 2>&1; then
+            echo "$branch already exists. An attempt for this version is running, or one ended without cleaning up." >&2
+            exit 1
+          fi
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f "ref=refs/heads/$branch" -f "sha=${{ steps.sha.outputs.sha }}" >/dev/null
+          echo "${{ github.repository }}  $branch created at ${{ steps.sha.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: pin every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/satellites.sh branch "${{ steps.next.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The documentation site is not pinned and gets no branch: Netlify builds it from `next` as the
+      # preview and `main` as what the public sees, so a third branch across that pair would publish
+      # nothing or publish the wrong thing. What the release needs from it is a person merging `next`
+      # into `main`, so it is asked for in an issue. It gates nothing -- see the script for what
+      # happens when it is not done by the time the release publishes, and for what happens to the
+      # request when the attempt is abandoned instead.
+      - name: ask for the documentation site to be published
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          bash .github/scripts/docs-release.sh open "${{ steps.next.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: say what this run is about to make
         run: |
           {
-            echo "### Releasing ${{ steps.next.outputs.tag }}"
+            echo "### Releasing ${{ steps.next.outputs.tag }} -- start merging again"
             echo
             echo "* commit: \`${{ steps.sha.outputs.sha }}\`"
             echo "* newest line: ${{ steps.next.outputs.is_latest }} (decides whether the floating \`latest\` marker moves here)"
+            echo
+            echo "The freeze is over: the default branch is free to carry on, and nothing merged from here is in this release."
+            echo "The expensive half runs next, against \`ws/release-${{ steps.next.outputs.version }}\`, and the default branch is not part of it."
+            echo
+            echo "If this attempt does not publish, everything it created is retired and nothing is carried forward."
+            echo "A fix goes to the default branch, and the next attempt starts from there."
           } >> "$GITHUB_STEP_SUMMARY"
 
   cli-native:
@@ -650,28 +765,6 @@ jobs:
             --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # Only once every satellite has been released. A failure above stops the job here and the
-      # branches survive for a retry -- which is why this is a later step and not a later job with
-      # always(): a cleanup that runs whatever happened would delete the evidence of what went wrong
-      # along with the pin somebody still needs.
-      - name: retire the satellite release branches
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
-        run: |
-          .github/scripts/satellites.sh unbranch "${{ needs.version.outputs.version }}" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: retire tapstate's own release branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          branch="ws/release-${{ needs.version.outputs.version }}"
-          # The tag is the anchor from here on, and unlike a branch it cannot be moved. A patch for this
-          # line later starts from the tag, so deleting this loses nothing.
-          if gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$branch" >/dev/null 2>&1; then
-            echo "${{ github.repository }}  $branch deleted" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "${{ github.repository }}  $branch was already gone" >> "$GITHUB_STEP_SUMMARY"
-          fi
 
   roadmap:
     # The board says what shipped, and in which release. Nothing else does: the execution issue for a
@@ -792,18 +885,34 @@ jobs:
 
             none -- version pins only, no user-visible change.
 
-  discard:
-    # Rejected, timed out, or failed on the way. A draft left on the Releases page is the one thing a
-    # rejection can leave behind that still looks publishable -- one click and it goes out having gone
-    # round everything above.
-    needs: [version, draft, publish]
-    if: always() && needs.draft.result == 'success' && needs.publish.result != 'success'
+  cleanup:
+    # However the attempt ended. An attempt is atomic: what it pinned is either released or thrown
+    # away, and no branch outlives it -- a leftover one is not a pin anybody still needs, it is the
+    # thing that refuses the next attempt. Measured twice in one day: a run died in `cli-native`,
+    # before a draft existed, and the cleanup was conditional on a draft having been assembled, so it
+    # never started; three branches in three repositories were deleted by hand both times.
+    #
+    # The condition carries the one exception rather than leaving it to a reader. A release that
+    # published while its satellites were not finished being tagged still owes them those tags, and
+    # their branches are the only remaining record of what the tags were meant to point at. Deleting
+    # them there turns a half-finished release into one nobody can finish.
+    #
+    # Guarded on the version output rather than on the pin job's result: a pin that failed part way
+    # through creating four refs is exactly the case with orphans to clear, and its job result is
+    # `failure`. The output exists as soon as the version was computed, which is before any ref.
+    needs: [version, draft, publish, satellites, roadmap, write-back]
+    if: >-
+      always()
+      && needs.version.outputs.version != ''
+      && !(needs.publish.result == 'success' && needs.satellites.result != 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
       - name: delete the draft that was not published
+        if: needs.publish.result != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -816,23 +925,36 @@ jobs:
           fi
           gh release delete "${{ needs.version.outputs.tag }}" --yes
           echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. No tag was created, no image was pushed." >> "$GITHUB_STEP_SUMMARY"
-      # And the branches, on this path too. They are cheap to cut again -- the freeze that creates
-      # them is one dispatch long -- and leaving them behind is not neutral: release-start refuses a
-      # branch that already exists, so a rejected release would block its own retry until somebody
-      # went and deleted three refs by hand.
-      - name: retire the release branches this release did not use
+
+      # The documentation site was asked, in an issue, to publish a version that is now not coming.
+      # Nothing used to retire that request: two abandoned attempts at one version left two open
+      # issues asking for it, side by side, and the person they are assigned to had no way to tell
+      # either of them from a real one.
+      - name: tell the documentation site this version is not coming
+        if: needs.publish.result != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/docs-release.sh retire "${{ needs.version.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Unconditional within this job, which is what the `if` above is for. Both of these are
+      # idempotent: a branch that is already gone is reported and passes.
+      - name: retire the satellite release branches
         if: always()
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
         run: |
           .github/scripts/satellites.sh unbranch "${{ needs.version.outputs.version }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: retire tapstate's own release branch
+      - name: retire this repository's own release branch
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           branch="ws/release-${{ needs.version.outputs.version }}"
+          # On the published path the tag is the anchor from here on, and unlike a branch it cannot be
+          # moved: a later patch for this line starts from the tag, so deleting this loses nothing.
           if gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$branch" >/dev/null 2>&1; then
             echo "${{ github.repository }}  $branch deleted" >> "$GITHUB_STEP_SUMMARY"
           else
