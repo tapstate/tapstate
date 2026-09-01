@@ -1,0 +1,17 @@
+# Repositories tagged and released alongside a tapstate release.
+#
+# Read twice per release, by two different workflows: once to create the release branch in each, and
+# once -- after tapstate's own release is published -- to tag that branch and publish a release
+# pointing back at tapstate. Keeping the list here rather than in either workflow is what stops the
+# two from disagreeing; a repository present in one reader and absent from the other gets a branch
+# and never gets a tag, and nothing reports it.
+#
+# A satellite release carries no notes of its own. Its body links to the tapstate release, which is
+# where what changed is written.
+#
+# One owner/repo per line. Blank lines and # comments are ignored. An empty list is refused rather
+# than treated as "there are none".
+
+tapstate/tapstate-web
+tapstate/tapstate-skills
+tapstate/docs
