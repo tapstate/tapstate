@@ -28,6 +28,7 @@ import io.tapstate.runtime.engine.nest.NestDag;
 import io.tapstate.runtime.engine.nest.NestFrontier;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -296,15 +297,8 @@ class NestLetsTheFrontierPastWhatItHoldsDurablyTest {
         }
     }
 
-    private static void await(BooleanSupplier reached) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (System.nanoTime() < deadline) {
-            if (reached.getAsBoolean()) {
-                return;
-            }
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
-        }
-        // Timing out silently would leave the assertions below reading an empty list as agreement.
-        throw new AssertionError("the bounds waited for never arrived; what did: " + List.copyOf(SEEN));
+    /** Waits on the running job, so a job that dies is reported as that and not as a slow mechanism. */
+    private void await(BooleanSupplier reached) {
+        JobWatch.until(job, Duration.ofSeconds(30), reached, () -> String.valueOf(List.copyOf(SEEN)));
     }
 }
