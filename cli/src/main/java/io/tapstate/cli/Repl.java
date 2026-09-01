@@ -35,6 +35,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.function.IntSupplier;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -121,6 +122,9 @@ final class Repl {
 
     /** Shared interactive context manager; absent only from legacy seams that exercise no contexts. */
     private final ContextManager contextManager;
+
+    /** Receives durable context choices when a full-screen owner needs to update its session scope. */
+    private Consumer<String> tuiContextSelection = ignored -> { };
 
     /** The named context that established the current transport, if this is not a temporary connect. */
     private ResolvedContext.Named namedContext;
@@ -259,9 +263,35 @@ final class Repl {
         this.prompter = replacement;
     }
 
+    /** Installs the callback used by the TUI to consume a context selected in the shared console. */
+    void tuiContextSelection(Consumer<String> listener) {
+        this.tuiContextSelection = listener == null ? ignored -> { } : listener;
+    }
+
     /** The durable context currently selected by a resolved online session, if any. */
     String contextName() {
         return namedContext == null ? null : namedContext.name();
+    }
+
+    /** Selects a durable context for the workbench after its reducer has cleared the previous scope. */
+    void selectContextForTui(ResolvedContext.Named context) {
+        namedContext = java.util.Objects.requireNonNull(context, "context");
+        session.disconnect();
+    }
+
+    /** Clears the process-local target and session after the workspace binding is removed. */
+    void clearContextForTui() {
+        namedContext = null;
+        session.disconnect();
+    }
+
+    /** Installs a worker-recovered access grant only after the TUI accepted the matching generation. */
+    void installRecoveredSessionForTui(ResolvedContext.Named context, AuthService.ActiveSession active) {
+        if (!java.util.Objects.equals(namedContext, context)) {
+            return;
+        }
+        session.connect(context.definition().seeds(), active.seed());
+        activate(active);
     }
 
     /** Installs a process-only machine token; issuer discovery runs before the bearer is attached or sent. */
@@ -3607,7 +3637,7 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         return new ContextConsole(contextManager, prompter, workdir,
-                commandLine.getOut(), commandLine.getErr()).run();
+                commandLine.getOut(), commandLine.getErr(), tuiContextSelection).run();
     }
 
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */

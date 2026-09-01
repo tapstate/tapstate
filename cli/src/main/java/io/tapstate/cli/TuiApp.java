@@ -16,6 +16,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
@@ -40,6 +41,8 @@ final class TuiApp {
     private final StringWriter err;
     private final TuiDashboard dashboard = new TuiDashboard();
     private final String initialContext;
+    private final ContextResolver contextResolver;
+    private final TuiSessionRecovery sessionRecovery;
     private final AtomicBoolean interrupted = new AtomicBoolean();
 
     private NonBlockingReader reader;
@@ -50,14 +53,25 @@ final class TuiApp {
     private final TuiCommandHistory history = new TuiCommandHistory();
     /** True while a command is resolving a target or waiting on the control plane. */
     private boolean commandRunning;
+    private long recoveryScheduledGeneration = -1L;
+    private String pendingContextSelection;
 
     TuiApp(Repl repl, StringWriter out, StringWriter err, String initialContext) {
+        this(repl, out, err, initialContext, null, null);
+    }
+
+    TuiApp(Repl repl, StringWriter out, StringWriter err, String initialContext,
+           ContextResolver contextResolver, AuthService authService) {
         this.repl = repl;
         this.out = out;
         this.err = err;
         this.initialContext = initialContext;
+        this.contextResolver = contextResolver;
+        this.sessionRecovery = authService == null ? null : new TuiSessionRecovery(authService,
+                command -> Thread.startVirtualThread(command));
         this.uiState = TuiAppState.initial(consumeOutput());
         this.kernel = new TuiKernel(uiState);
+        repl.tuiContextSelection(name -> pendingContextSelection = name);
         repl.prompter(new TuiPrompter(this::promptText, this::promptChoice, this::promptLines));
     }
 
@@ -75,9 +89,14 @@ final class TuiApp {
             terminal.puts(InfoCmp.Capability.cursor_invisible);
             terminal.flush();
             try {
+                initializeContextSession();
                 draw(display, terminal);
+                startContextRecoveryIfNeeded();
                 return eventLoop(display, terminal);
             } finally {
+                if (sessionRecovery != null) {
+                    sessionRecovery.clear();
+                }
                 display.reset();
                 terminal.puts(InfoCmp.Capability.cursor_visible);
                 terminal.puts(InfoCmp.Capability.exit_ca_mode);
@@ -117,6 +136,8 @@ final class TuiApp {
         while (true) {
             if (kernel.drain()) {
                 uiState = kernel.state();
+                installRecoveredSessionIfPresent();
+                startContextRecoveryIfNeeded();
                 draw(display, terminal);
             }
             if (kernel.exitRequested()) {
@@ -221,6 +242,7 @@ final class TuiApp {
         uiState = reduce(new TuiAction.AppendActivity("> " + safeCommand));
         uiState = reduce(new TuiAction.SetNotice("running: " + safeCommand));
         commandRunning = true;
+        pendingContextSelection = null;
         // Give the user one frame that reflects the network transition before a lazy context
         // resolution or control-plane request blocks this event-loop thread.
         draw(display, terminal);
@@ -229,6 +251,13 @@ final class TuiApp {
             commandResult = repl.registry().dispatch(repl, repl.registry().invocation(line));
         } finally {
             commandRunning = false;
+        }
+        if (line.equals(":ctx")) {
+            if (pendingContextSelection != null) {
+                switchToSelectedContext(pendingContextSelection);
+            } else {
+                switchToCurrentWorkspaceBinding();
+            }
         }
         String result = consumeOutput();
         if (!result.isBlank()) {
@@ -441,23 +470,154 @@ final class TuiApp {
         return kernel.state();
     }
 
+    private void initializeContextSession() {
+        ResolvedContext.Named context = resolveInitialContext();
+        uiState = initializeContextSessionState(kernel, uiState, context, uiState.notice());
+        if (context != null) {
+            repl.selectContextForTui(context);
+        }
+    }
+
+    static TuiAppState initializeContextSessionState(TuiAppState state, ResolvedContext.Named context,
+                                                     String resolverNotice) {
+        TuiAppState initialized = TuiReducer.reduce(state,
+                new TuiAction.ContextSession(new TuiContextSessionAction.Initialize(context)));
+        if (resolverNotice == null || resolverNotice.isBlank()) {
+            return initialized;
+        }
+        return TuiReducer.reduce(initialized, new TuiAction.SetNotice(resolverNotice));
+    }
+
+    static TuiAppState initializeContextSessionState(TuiKernel kernel, TuiAppState state,
+                                                     ResolvedContext.Named context, String resolverNotice) {
+        Objects.requireNonNull(kernel, "kernel");
+        if (kernel.state() != state) {
+            throw new IllegalArgumentException("kernel must own the supplied state");
+        }
+        kernel.dispatch(new TuiEvent.ContextSessionPosted(new TuiContextSessionAction.Initialize(context)));
+        if (resolverNotice != null && !resolverNotice.isBlank()) {
+            kernel.dispatch(new TuiEvent.ActionPosted(new TuiAction.SetNotice(resolverNotice)));
+        }
+        return kernel.state();
+    }
+
+    private ResolvedContext.Named resolveInitialContext() {
+        if (contextResolver == null) {
+            return null;
+        }
+        try {
+            return contextResolver.resolve(null, initialContext, repl.workdir())
+                    .filter(ResolvedContext.Named.class::isInstance)
+                    .map(ResolvedContext.Named.class::cast)
+                    .orElse(null);
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            uiState = reduce(new TuiAction.SetNotice(failure.code().code()));
+            return null;
+        }
+    }
+
+    private void startContextRecoveryIfNeeded() {
+        TuiContextSessionState contextSession = uiState.contextSession();
+        if (sessionRecovery == null || !contextSession.recoveryRequested()
+                || contextSession.generation() == recoveryScheduledGeneration) {
+            return;
+        }
+        recoveryScheduledGeneration = contextSession.generation();
+        sessionRecovery.start(contextSession, kernel::post);
+    }
+
+    private void installRecoveredSessionIfPresent() {
+        if (sessionRecovery == null) {
+            return;
+        }
+        sessionRecovery.take(uiState.contextSession()).ifPresent(active ->
+                repl.installRecoveredSessionForTui(uiState.contextSession().context(), active));
+    }
+
+    /** Switches scope on the UI thread; recovery completion is generation-gated by the reducer. */
+    void switchContext(ResolvedContext.Named context) {
+        TuiContextSessionState before = uiState.contextSession();
+        uiState = reduce(new TuiAction.ContextSession(new TuiContextSessionAction.SwitchContext(context)));
+        if (uiState.contextSession().generation() != before.generation()) {
+            repl.selectContextForTui(context);
+            startContextRecoveryIfNeeded();
+        }
+    }
+
+    private void switchToCurrentWorkspaceBinding() {
+        if (contextResolver == null || uiState.contextSession().writeOperationId() != null) {
+            return;
+        }
+        try {
+            ResolvedContext.Named resolved = contextResolver.resolve(null, null, repl.workdir())
+                    .filter(ResolvedContext.Named.class::isInstance)
+                    .map(ResolvedContext.Named.class::cast)
+                    .orElse(null);
+            if (resolved == null) {
+                if (uiState.contextSession().context() != null) {
+                    clearContextSession();
+                }
+            } else if (!Objects.equals(resolved, uiState.contextSession().context())) {
+                switchContext(resolved);
+            }
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            uiState = reduce(new TuiAction.SetNotice(failure.code().code()));
+        }
+    }
+
+    private void switchToSelectedContext(String name) {
+        if (contextResolver == null || uiState.contextSession().writeOperationId() != null) {
+            return;
+        }
+        try {
+            ResolvedContext.Named resolved = contextResolver.resolve(null, name, repl.workdir())
+                    .filter(ResolvedContext.Named.class::isInstance)
+                    .map(ResolvedContext.Named.class::cast)
+                    .orElse(null);
+            if (resolved != null && !Objects.equals(resolved, uiState.contextSession().context())) {
+                switchContext(resolved);
+            }
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            uiState = reduce(new TuiAction.SetNotice(failure.code().code()));
+        }
+    }
+
+    private void clearContextSession() {
+        repl.clearContextForTui();
+        uiState = reduce(new TuiAction.ContextSession(new TuiContextSessionAction.Initialize(null)));
+        recoveryScheduledGeneration = -1L;
+    }
+
     private TuiDashboard.State state() {
         Session session = repl.session();
-        TuiDashboard.Connection connection = session.isConnected()
-                ? TuiDashboard.Connection.ONLINE
-                : commandRunning ? TuiDashboard.Connection.CONNECTING : TuiDashboard.Connection.OFFLINE;
-        String context = repl.contextName();
+        TuiContextSessionState contextSession = uiState.contextSession();
+        TuiDashboard.Connection connection = contextSession.connection();
+        if (connection == TuiDashboard.Connection.ONBOARDING && session.isConnected()) {
+            connection = TuiDashboard.Connection.ONLINE;
+        } else if (connection == TuiDashboard.Connection.ONBOARDING && commandRunning) {
+            connection = TuiDashboard.Connection.CONNECTING;
+        }
+        String context = contextSession.context() == null ? repl.contextName() : contextSession.context().name();
         if (context == null || context.isBlank()) {
             context = initialContext;
         }
-        return new TuiDashboard.State(repl.workdir(), context, session.principal(), connection, uiState.notice(),
+        String principal = contextSession.principal() == null ? session.principal() : contextSession.principal();
+        String notice = contextSession.notice().isBlank() ? uiState.notice() : contextSession.notice();
+        return new TuiDashboard.State(repl.workdir(), context, principal, connection, notice,
                 uiState.command(), uiState.palette(), uiState.paletteIndex(), uiState.prompt(),
                 session.landingNode() == null ? null : session.landingNode().toString(),
-                session.clusterName(), authStatus(session), uiState.activity(),
+                session.clusterName(), authStatus(contextSession, session), uiState.activity(),
                 TuiWorkspaceSnapshot.scan(repl.workdir()));
     }
 
-    private static String authStatus(Session session) {
+    private static String authStatus(TuiContextSessionState contextSession, Session session) {
+        if (contextSession.connection() == TuiDashboard.Connection.ONLINE) {
+            return "persistent session · refresh on demand";
+        }
+        if (contextSession.connection() == TuiDashboard.Connection.SIGNED_OUT
+                || contextSession.connection() == TuiDashboard.Connection.SESSION_EXPIRED) {
+            return "sign in required";
+        }
         if (!session.isConnected()) {
             return "not connected";
         }

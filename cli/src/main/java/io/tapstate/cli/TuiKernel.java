@@ -86,6 +86,7 @@ final class TuiKernel {
                         TuiCommandBar.accept(state.command(), key.code()).value()));
                 case TuiEvent.Tick ignored -> List.of(new TuiAction.Tick());
                 case TuiEvent.ActionPosted posted -> List.of(posted.action());
+                case TuiEvent.ContextSessionPosted posted -> List.of(new TuiAction.ContextSession(posted.action()));
                 case TuiEvent.Resize ignored -> List.of();
                 case TuiEvent.InputClosed ignored -> List.of();
             };

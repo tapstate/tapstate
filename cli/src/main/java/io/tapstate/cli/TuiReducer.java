@@ -56,12 +56,23 @@ final class TuiReducer {
             }
             case TuiAction.Tick ignored -> copy(state, state.command(), state.notice(), state.paletteOpen(),
                     state.paletteIndex(), state.palette(), state.prompt(), state.activity(), state.ticks() + 1);
+            case TuiAction.ContextSession contextSession -> copy(state, state.command(), state.notice(),
+                    state.paletteOpen(), state.paletteIndex(), state.palette(), state.prompt(), state.activity(),
+                    state.ticks(), TuiContextSessionReducer.reduce(state.contextSession(), contextSession.action()));
         };
     }
 
     private static TuiAppState copy(TuiAppState state, String command, String notice, boolean paletteOpen,
                                     int paletteIndex, List<String> palette, TuiDashboard.Prompt prompt,
                                     List<String> activity, long ticks) {
-        return new TuiAppState(command, notice, paletteOpen, paletteIndex, palette, prompt, activity, ticks);
+        return copy(state, command, notice, paletteOpen, paletteIndex, palette, prompt, activity, ticks,
+                state.contextSession());
+    }
+
+    private static TuiAppState copy(TuiAppState state, String command, String notice, boolean paletteOpen,
+                                    int paletteIndex, List<String> palette, TuiDashboard.Prompt prompt,
+                                    List<String> activity, long ticks, TuiContextSessionState contextSession) {
+        return new TuiAppState(command, notice, paletteOpen, paletteIndex, palette, prompt, activity, ticks,
+                contextSession);
     }
 }

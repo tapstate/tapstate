@@ -4275,6 +4275,29 @@ class ReplTest {
     }
 
     @Test
+    void tuiRecoveryInstallsTheRecoveredHumanCredentialBeforeDispatchingOnlineCommands() {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        Harness harness = harness(Path.of("tap-work"), client);
+        ResolvedContext.Named context = namedContext(seed);
+        Instant now = Instant.parse("2026-09-01T00:00:00Z");
+        AuthSessionRecord record = new AuthSessionRecord(AuthSessionRecord.CURRENT_VERSION,
+                TEST_AUTH_REF, TEST_CONTEXT_ID, "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.recovered-session", now, now.plusSeconds(3600), now.plusSeconds(7200));
+
+        harness.repl().selectContextForTui(context);
+        harness.repl().installRecoveredSessionForTui(context,
+                new AuthService.ActiveSession(seed, "jwt-recovered", record));
+        harness.repl().dispatch("ls");
+
+        assertThat(harness.repl().session().isConnected()).isTrue();
+        assertThat(harness.repl().session().isAuthenticated()).isTrue();
+        assertThat(harness.repl().session().credential()).isEqualTo("jwt-recovered");
+        assertThat(client.listCalls).containsExactly("jwt-recovered@http://127.0.0.1:7900?null");
+    }
+
+    @Test
     void authServiceRendersRejectedAndUnreachableLoginOutcomes(@TempDir Path home) {
         URI seed = URI.create("http://127.0.0.1:7900");
         ResolvedContext.Named context = namedContext(seed);

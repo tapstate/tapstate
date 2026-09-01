@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 /** The intentionally narrow interactive context manager shared by {@code tapstate context} and {@code :ctx}. */
 final class ContextConsole {
@@ -25,13 +26,20 @@ final class ContextConsole {
     private final Path workspace;
     private final PrintWriter out;
     private final PrintWriter err;
+    private final Consumer<String> chosenContext;
 
     ContextConsole(ContextManager manager, Prompter prompter, Path workspace, PrintWriter out, PrintWriter err) {
+        this(manager, prompter, workspace, out, err, ignored -> { });
+    }
+
+    ContextConsole(ContextManager manager, Prompter prompter, Path workspace, PrintWriter out, PrintWriter err,
+                   Consumer<String> chosenContext) {
         this.manager = manager;
         this.prompter = prompter;
         this.workspace = workspace;
         this.out = out;
         this.err = err;
+        this.chosenContext = chosenContext == null ? ignored -> { } : chosenContext;
     }
 
     int run() {
@@ -93,6 +101,7 @@ final class ContextConsole {
     private int choose() {
         String name = chooseContext();
         manager.choose(name);
+        chosenContext.accept(name);
         out.println("chose context " + name);
         out.flush();
         return Cli.EXIT_OK;

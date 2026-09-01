@@ -435,7 +435,7 @@ public final class Cli implements Runnable {
                     return established;
                 }
             }
-            return new TuiApp(repl, out, err, launch.context()).run();
+            return new TuiApp(repl, out, err, launch.context(), resolver, authService).run();
         } finally {
             if (oneShotPrompter instanceof JLinePrompter jline) {
                 jline.close();

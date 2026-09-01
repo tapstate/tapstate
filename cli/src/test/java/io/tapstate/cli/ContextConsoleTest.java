@@ -9,6 +9,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -71,6 +72,21 @@ class ContextConsoleTest {
         Output noBinding = new Output();
         assertThat(run(manager, workspace, noBinding, "Unbind this workspace")).isZero();
         assertThat(noBinding.outText()).contains("no context is bound to " + workspace.toRealPath());
+    }
+
+    @Test
+    void reportsTheChosenContextToTheOwningInteractiveSurface(@TempDir Path home) throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("workspace"));
+        ContextManager manager = manager(home);
+        manager.create("dev", List.of(URI.create("https://dev.example.com")), true);
+        AtomicReference<String> selected = new AtomicReference<>();
+
+        int code = new ContextConsole(manager, new ScriptedPrompter("Choose a context", "dev"),
+                workspace, new PrintWriter(new StringWriter()), new PrintWriter(new StringWriter()),
+                selected::set).run();
+
+        assertThat(code).isZero();
+        assertThat(selected).hasValue("dev");
     }
 
     @Test

@@ -87,6 +87,11 @@ final class AuthService {
                 verified.seed(), sessionState.accessToken(verified.seed(), record), null, record));
     }
 
+    /** Performs the anonymous issuer gate used by every human-session recovery path. */
+    IssuerBinding.Verified discover(ResolvedContext.Named context) {
+        return new IssuerBinding(client).verify(context.definition(), null);
+    }
+
     Status status(ResolvedContext.Named context) {
         return resume(context).<Status>map(Status.SignedIn::new).orElseGet(Status.SignedOut::new);
     }

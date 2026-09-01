@@ -2,6 +2,8 @@ package io.tapstate.cli;
 
 import org.junit.jupiter.api.Test;
 
+import java.net.URI;
+import java.util.UUID;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -69,5 +71,35 @@ class TuiKernelTest {
         kernel.dispatch(new TuiEvent.InputClosed());
 
         assertThat(kernel.exitRequested()).isTrue();
+    }
+
+    @Test
+    void queuesContextRecoveryOnTheWorkerBoundaryBeforeTheUiThreadReducesIt() {
+        TuiKernel kernel = new TuiKernel(TuiAppState.initial("boot"));
+        ResolvedContext.Named context = new ResolvedContext.Named("dev", new ContextDefinition(UUID.randomUUID(),
+                List.of(URI.create("http://127.0.0.1:8081")), new ContextTls(true), UUID.randomUUID()),
+                ResolvedContext.Source.WORKSPACE_BINDING);
+
+        kernel.post(new TuiEvent.ContextSessionPosted(new TuiContextSessionAction.Initialize(context)));
+
+        assertThat(kernel.state().contextSession().connection()).isEqualTo(TuiDashboard.Connection.ONBOARDING);
+        kernel.drain();
+        assertThat(kernel.state().contextSession().connection()).isEqualTo(TuiDashboard.Connection.CONNECTING);
+        assertThat(kernel.state().contextSession().context()).isEqualTo(context);
+    }
+
+    @Test
+    void keepsKernelStateInSyncWhenInitialContextSessionIsInstalled() {
+        TuiAppState initial = TuiAppState.initial("boot");
+        TuiKernel kernel = new TuiKernel(initial);
+        ResolvedContext.Named context = new ResolvedContext.Named("dev", new ContextDefinition(UUID.randomUUID(),
+                List.of(URI.create("http://127.0.0.1:8081")), new ContextTls(true), UUID.randomUUID()),
+                ResolvedContext.Source.WORKSPACE_BINDING);
+
+        TuiAppState installed = TuiApp.initializeContextSessionState(kernel, initial, context, "");
+
+        assertThat(installed).isSameAs(kernel.state());
+        assertThat(kernel.state().contextSession().context()).isEqualTo(context);
+        assertThat(kernel.state().contextSession().connection()).isEqualTo(TuiDashboard.Connection.CONNECTING);
     }
 }

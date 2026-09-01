@@ -7,18 +7,21 @@ import java.util.List;
  * Repl; this record contains only state that can be reduced without I/O.
  */
 record TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
-                   List<String> palette, TuiDashboard.Prompt prompt, List<String> activity, long ticks) {
+                   List<String> palette, TuiDashboard.Prompt prompt, List<String> activity, long ticks,
+                   TuiContextSessionState contextSession) {
 
     static final int MAX_ACTIVITY = 8;
 
     TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
                 List<String> palette, TuiDashboard.Prompt prompt) {
-        this(command, notice, paletteOpen, paletteIndex, palette, prompt, List.of(), 0L);
+        this(command, notice, paletteOpen, paletteIndex, palette, prompt, List.of(), 0L,
+                TuiContextSessionState.initial());
     }
 
     TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
                 List<String> palette, TuiDashboard.Prompt prompt, List<String> activity) {
-        this(command, notice, paletteOpen, paletteIndex, palette, prompt, activity, 0L);
+        this(command, notice, paletteOpen, paletteIndex, palette, prompt, activity, 0L,
+                TuiContextSessionState.initial());
     }
 
     TuiAppState {
@@ -26,6 +29,7 @@ record TuiAppState(String command, String notice, boolean paletteOpen, int palet
         notice = notice == null ? "" : notice;
         palette = palette == null ? List.of() : List.copyOf(palette);
         activity = activity == null ? List.of() : List.copyOf(activity);
+        contextSession = contextSession == null ? TuiContextSessionState.initial() : contextSession;
         if (activity.size() > MAX_ACTIVITY) {
             activity = activity.subList(activity.size() - MAX_ACTIVITY, activity.size());
         }
@@ -37,6 +41,7 @@ record TuiAppState(String command, String notice, boolean paletteOpen, int palet
     }
 
     static TuiAppState initial(String notice) {
-        return new TuiAppState("", notice, false, 0, List.of(), null, List.of(), 0L);
+        return new TuiAppState("", notice, false, 0, List.of(), null, List.of(), 0L,
+                TuiContextSessionState.initial());
     }
 }
