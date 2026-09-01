@@ -423,6 +423,13 @@ public final class ResolverProcessor extends AbstractProcessor {
     }
 
     private void handle(NestInbound edge, Object item, Map<Object, ResolverState> touched) {
+        // Asked of the item rather than of the edge: word of an edit reaches a level both on the edge from
+        // the vertex filing the rows that level points at, and on an ordinary cascade from a level below
+        // that points at something of its own. The ordinal tells the two levels apart, not the two kinds.
+        if (item instanceof NestTouch word) {
+            passOn(word, touched);
+            return;
+        }
         if (edge.isCascade()) {
             KeyedElement arrived = (KeyedElement) item;
             route(arrived.key(), arrived.element(), arrived.ts(), touched);
@@ -759,6 +766,24 @@ public final class ResolverProcessor extends AbstractProcessor {
             if (collectVacated(waited.getKey(), state, waited.getValue().ts())) {
                 store.save(waited.getKey(), state);
             }
+        }
+    }
+
+    /**
+     * Sends word that a row this level points at was edited on to the level above, addressed by the parent
+     * this one hangs from - the same climb this level's own rows make, which is what lets a level nested
+     * anywhere point at a row without a path of its own.
+     *
+     * <p><b>Word for a row whose parent is not known yet is dropped, and that loses nothing.</b> Nothing of
+     * this level is in a document until its parent turns up, and whatever puts it there draws the document
+     * then - reading the edited row as it now stands, because it was filed before this word was ever sent.
+     * Holding the word instead would mean queueing a wake-up for a document that does not exist, on a key
+     * that may never resolve.
+     */
+    private void passOn(NestTouch word, Map<Object, ResolverState> touched) {
+        ResolverState state = stateFor(word.key(), touched);
+        if (state.parentKey() != null) {
+            emit(word.routedBy(state.parentKey()));
         }
     }
 

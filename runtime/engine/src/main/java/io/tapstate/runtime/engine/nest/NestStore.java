@@ -66,6 +66,31 @@ public interface NestStore<S> extends Serializable {
         }
     }
 
+    /**
+     * Takes {@code element} out of the set held under {@code key}, dropping the entry once nothing is left
+     * in it. The other half of {@link #add}, and travelling the same way and for the same reasons: the one
+     * element goes, not the set.
+     *
+     * <p><b>An emptied entry is dropped rather than kept as an empty set.</b> Never writing an empty bucket
+     * is what makes a generous bucket count free at the small end, and a bucket emptied out is exactly as
+     * empty as one nothing ever landed in - keeping it would leave the cost of a row's busiest moment
+     * behind for the life of the job.
+     */
+    @SuppressWarnings("unchecked")
+    default void remove(Object key, Object element) {
+        Set<Object> held = (Set<Object>) load(key);
+        if (held == null || !held.contains(element)) {
+            return;
+        }
+        Set<Object> left = new LinkedHashSet<>(held);
+        left.remove(element);
+        if (left.isEmpty()) {
+            remove(key);
+        } else {
+            save(key, (S) left);
+        }
+    }
+
     /** Removes the entry under {@code key} entirely, if there is one. */
     void remove(Object key);
 

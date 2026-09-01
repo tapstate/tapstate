@@ -156,6 +156,30 @@ public final class RootAssembly implements Serializable {
     }
 
     /**
+     * Takes note of a change that alters what this document renders without altering anything it holds -
+     * an edit to a row it points at, which is read out of that row's own namespace when the document is
+     * drawn rather than kept here.
+     *
+     * <p>Held beside the root's own positions and released by the same send, because a send is what carries
+     * the edit downstream: nothing else does. Until then the frontier has to stay below it, or an edit that
+     * reached no sink would be neither delivered nor replayable, and every document pointing at that row
+     * would come back from a restart quietly stale.
+     *
+     * <p>Nothing is absorbed for a document that is not there. A word arriving for a root that has not
+     * turned up, or has been deleted, wakes nothing and covers nothing - and holding its position would pin
+     * the chain on a document that will never be drawn again. The edit is not lost by that: the row it
+     * changed is already filed, so a root arriving later renders from what the row says now.
+     */
+    public boolean absorb(Map<String, ChainPosition> positions) {
+        Objects.requireNonNull(positions, "positions");
+        if (!rootPresent) {
+            return false;
+        }
+        fromRoot.add(positions);
+        return true;
+    }
+
+    /**
      * Marks the root deleted at {@code order}, keeping every element attached for a root that returns.
      * Returns whether the assembly changed.
      */
@@ -620,6 +644,39 @@ public final class RootAssembly implements Serializable {
         return needed;
     }
 
+    /**
+     * Whether this document names a row nothing has been heard about yet, in which case it is not shown at
+     * all until that row turns up.
+     *
+     * <p>An order whose customer has not arrived renders as an order with no customer - a document the
+     * source never had. The version after it is right, so nothing stays wrong; what is wrong is that a sink
+     * has already passed the first one on, and two tables read at once routinely arrive in this order for
+     * no reason but one of them being slower to start.
+     *
+     * <p><b>Deleted is not "not heard about", and that is the whole of the distinction.</b> The row that was
+     * deleted left an empty entry behind, so it answers here as present and the document goes out without
+     * the field. Reading absence alone would hold such a document for ever, waiting on an arrival that has
+     * already happened.
+     *
+     * <p>Nothing here ends the wait on a clock. What ends it is the row arriving - which reaches this
+     * document because the row pointing at it was recorded against it when it came through, whether or not
+     * the row it named existed yet.
+     */
+    public boolean waitsForARowItPointsAt(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
+        Objects.requireNonNull(slots, "slots");
+        Objects.requireNonNull(resolved, "resolved");
+        for (Map.Entry<String, Set<List<Object>>> named : referencesNeeded(slots).entrySet()) {
+            Map<Object, Map<String, Object>> rows = resolved.getOrDefault(named.getKey(), Map.of());
+            for (List<Object> key : named.getValue()) {
+                if (!rows.containsKey(key)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private static void collectReferences(Map<String, Object> fields,
             Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
             Map<String, Set<List<Object>>> needed) {
@@ -948,7 +1005,10 @@ public final class RootAssembly implements Serializable {
                 // the row has anyway, so pointing at something costs the document no bytes of its own.
                 List<Object> key = NestKeys.valuesOf(document, slot.referenceFields());
                 Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
-                if (row != null) {
+                // An empty row is one that has been deleted, and it renders as no field at all - the same
+                // as an object embed with no live element. Frozen at its last value is the one thing it
+                // must not be: the source no longer has that row, so neither may the document.
+                if (row != null && !row.isEmpty()) {
                     document.put(slot.path(), new LinkedHashMap<>(row));
                 }
                 continue;

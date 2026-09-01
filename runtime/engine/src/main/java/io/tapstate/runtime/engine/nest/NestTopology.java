@@ -108,8 +108,16 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                 // A level every child points at is identified by what those children agree on. A level
                 // none of them points at is identified by what identifies one of its own rows: it is
                 // still a level, it just has nobody naming it from below.
+                //
+                // What identifies a row, and never what the author wrote to tell its elements apart inside
+                // one document. The two are different keys and the difference only shows when this level
+                // points at something: what is recorded about who points where is written against this
+                // identity, and a number that restarts at one in every parent is the same value in every
+                // document - so the record of two elements in two documents is one entry, and an edit to
+                // the row they both name reaches whichever of them wrote that entry last. Every document
+                // is right until the moment such a row is edited, and then one of them silently is not.
                 node.identity(claiming.isEmpty()
-                        ? resolveArrayKey(node, tables)
+                        ? rowKeyOf(node, tables)
                         : identityOf(render(node.pathId()), null, claiming));
             }
         }
@@ -245,10 +253,15 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                 // is one row shared by however many documents name it, so it enters the tree once and is
                 // read from there. It takes no hops - nothing cascades from it, and the read that finds it
                 // happens where the document is rendered rather than on the way in.
+                NestVertex pointing = vertexAt(vertices, node.parentPathId());
                 NestLookup lookup = new NestLookup(node.pathId(), node.embed().from(),
                         lookupName(nodeId, node.pathId()), mapName(pipelineId, nodeId, node.pathId()),
                         referenceIdentity(node.embed()), node.parentAlias(),
-                        referenceFields(node.embed()), identities.get(node.parentPathId()));
+                        referenceFields(node.embed()), identities.get(node.parentPathId()),
+                        node.parentPathId(), touchOrdinal(pointing, node),
+                        // Read off the edge that level's own rows arrive on rather than off the tree again:
+                        // it is the same switch, and asking it twice is how the two answers start to differ.
+                        pointing.inbound().get(0).tracksKeyChanges());
                 lookups.add(lookup);
                 streams.add(new NestStream(node.embed().from(), node.pathId(), 0, lookup.name(), null));
                 continue;
@@ -263,6 +276,32 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         }
         return new NestTopology(vertices, streams, slotsOf(pipelineId, nodeId, top), lookups,
                 !WriteMode.APPEND.yaml().equals(root.mode()));
+    }
+
+    /**
+     * Which inbound ordinal of the level doing the pointing carries word that {@code referenced} has been
+     * edited. Read back off the edge the compiler already built rather than counted again here: an ordinal
+     * worked out twice is an ordinal that can disagree with itself, and the disagreement would land the
+     * word on some other edge's handling with nothing to say so.
+     */
+    private static int touchOrdinal(NestVertex pointing, Node referenced) {
+        for (NestInbound edge : pointing.inbound()) {
+            if (edge.carriesTouches() && edge.pathId().equals(referenced.pathId())) {
+                return edge.ordinal();
+            }
+        }
+        throw new IllegalStateException("no edge into the level above " + referenced.pathId()
+                + " carries word that it was edited");
+    }
+
+    /** The compiled vertex serving {@code pathId}. Every level a reference hangs off has one. */
+    private static NestVertex vertexAt(List<NestVertex> vertices, List<String> pathId) {
+        for (NestVertex vertex : vertices) {
+            if (vertex.pathId().equals(pathId)) {
+                return vertex;
+            }
+        }
+        throw new IllegalStateException("no vertex was built for " + pathId);
     }
 
     /**
@@ -352,6 +391,16 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         for (NestInbound edge : List.copyOf(edges)) {
             if (edge.tracksKeyChanges()) {
                 edges.add(NestInbound.departuresOf(edges.size(), edge));
+            }
+        }
+        // Last of all, one per level this one points at: the edge it is told on that such a row has been
+        // edited. It is the pointed-at row's only way back to a document - the row belongs to no document,
+        // so a change to it routes itself nowhere - and it arrives from the vertex filing those rows rather
+        // than from a source, which is why it is drawn separately from every edge above.
+        for (Node child : children) {
+            if (child.referenced()) {
+                edges.add(NestInbound.touchesOf(edges.size(), child.embed().from(), child.pathId(),
+                        identity));
             }
         }
         return edges;

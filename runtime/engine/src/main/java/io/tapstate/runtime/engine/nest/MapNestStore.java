@@ -136,6 +136,18 @@ final class MapNestStore<S> implements NestStore<S> {
         publishReading();
     }
 
+    /**
+     * Shrinks the set at its own key, the mirror of {@link #add} and one reach like it. The default reads
+     * the set back to find out whether it holds the element - which is the read-then-write pair this whole
+     * namespace is shaped to avoid, and it carries every identity in the set to do it.
+     */
+    @Override
+    public void remove(Object key, Object element) {
+        countAccess();
+        map.executeOnKey(key, new Shrunk<>(element));
+        publishReading();
+    }
+
     @Override
     public void remove(Object key) {
         countAccess();
@@ -229,6 +241,40 @@ final class MapNestStore<S> implements NestStore<S> {
             if (grown.add(element)) {
                 entry.setValue((S) grown);
             }
+            return null;
+        }
+
+        @Override
+        public EntryProcessor<Object, S, Void> getBackupProcessor() {
+            return null;
+        }
+    }
+
+    /**
+     * Takes one element out of the set at a key, and takes the entry with it once it holds nothing. The
+     * same copy-then-replace as {@link Grown} and for the same reason, and it answers nothing and has no
+     * backup form for the reasons {@link Carried} does not.
+     */
+    private static final class Shrunk<S> implements EntryProcessor<Object, S, Void>, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final Object element;
+
+        Shrunk(Object element) {
+            this.element = element;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Void process(Map.Entry<Object, S> entry) {
+            Set<Object> held = (Set<Object>) entry.getValue();
+            if (held == null || !held.contains(element)) {
+                return null;
+            }
+            Set<Object> left = new LinkedHashSet<>(held);
+            left.remove(element);
+            entry.setValue(left.isEmpty() ? null : (S) left);
             return null;
         }
 

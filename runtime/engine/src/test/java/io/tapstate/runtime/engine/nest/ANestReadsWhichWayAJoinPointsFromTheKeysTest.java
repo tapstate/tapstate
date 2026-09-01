@@ -35,11 +35,29 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
         return NestTopology.compile(PIPELINE, NODE, tree, tables());
     }
 
-    /** The paths arriving on the vertex that assembles or resolves {@code pathId}. */
-    private static List<List<String>> edgesInto(NestTopology topology, List<String> pathId) {
+    /**
+     * The paths whose <em>rows</em> arrive on the vertex that assembles or resolves {@code pathId}.
+     *
+     * <p>Word that a pointed-at row was edited arrives on an edge of its own and is deliberately not
+     * counted here. That edge carries no row - it names an identity and nothing else - so it says nothing
+     * about which way the join was read, which is the only question these cases ask. Counting it would
+     * make every pointed-at level look like a gathered one.
+     */
+    private static List<List<String>> rowEdgesInto(NestTopology topology, List<String> pathId) {
         return topology.vertices().stream()
                 .filter(vertex -> vertex.pathId().equals(pathId))
                 .flatMap(vertex -> vertex.inbound().stream())
+                .filter(edge -> !edge.carriesTouches())
+                .map(NestInbound::pathId)
+                .toList();
+    }
+
+    /** The paths this vertex is told about edits to - the levels it points at rather than gathers. */
+    private static List<List<String>> touchEdgesInto(NestTopology topology, List<String> pathId) {
+        return topology.vertices().stream()
+                .filter(vertex -> vertex.pathId().equals(pathId))
+                .flatMap(vertex -> vertex.inbound().stream())
+                .filter(NestInbound::carriesTouches)
                 .map(NestInbound::pathId)
                 .toList();
     }
@@ -47,13 +65,20 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
     @Test
     void anOrderCarryingACustomersIdentityPointsAtThatCustomer() {
         // orders.customer_id is not what identifies an order; customers.customer_id is what identifies a
-        // customer. Only one reading survives that: the order names the customer, so the customer is
-        // fetched by key rather than routed to the order - it never arrives on an edge at all.
+        // customer. Only one reading survives that: the order names the customer, so the customer row is
+        // fetched by key rather than routed to the order, and no edge into the document carries it.
         NestTopology topology = compile(nest("order", List.of("order_id"),
                 embed("customer", "customer_id", "customer_id", EmbedAs.OBJECT, "customer", null)));
 
         assertThat(topology.isPassthrough()).isFalse();
-        assertThat(edgesInto(topology, List.of())).doesNotContain(List.of("customer"));
+        assertThat(rowEdgesInto(topology, List.of()))
+                .describedAs("no customer row is routed to a document: one customer sits behind thousands "
+                        + "of them, so there is no document to route it to")
+                .doesNotContain(List.of("customer"));
+        assertThat(touchEdgesInto(topology, List.of()))
+                .describedAs("what does arrive is word that such a row was edited, carrying an identity "
+                        + "and no fields. Without it the direction is read right and then never propagates")
+                .contains(List.of("customer"));
     }
 
     @Test
@@ -100,7 +125,7 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
         NestTopology topology = compile(nest("order", List.of("order_id"),
                 embed("item", "order_id", "order_id", EmbedAs.ARRAY, "items", List.of("item_id"))));
 
-        assertThat(edgesInto(topology, List.of())).contains(List.of("items"));
+        assertThat(rowEdgesInto(topology, List.of())).contains(List.of("items"));
     }
 
     @Test
@@ -111,7 +136,7 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
         NestTopology topology = compile(nest("customer", List.of("customer_id"),
                 embed("profile", "customer_id", "customer_id", EmbedAs.OBJECT, "profile", null)));
 
-        assertThat(edgesInto(topology, List.of())).contains(List.of("profile"));
+        assertThat(rowEdgesInto(topology, List.of())).contains(List.of("profile"));
     }
 
     @Test
@@ -141,7 +166,7 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
         NestTopology topology = compile(nest("order", List.of("order_id"),
                 embed("keyless", "order_id", "order_id", EmbedAs.ARRAY, "rows", List.of("some_id"))));
 
-        assertThat(edgesInto(topology, List.of())).contains(List.of("rows"));
+        assertThat(rowEdgesInto(topology, List.of())).contains(List.of("rows"));
     }
 
     @Test
@@ -153,6 +178,11 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
                 embed("item", "order_id", "order_id", EmbedAs.ARRAY, "items", List.of("item_id"), product)));
 
         assertThat(topology.isPassthrough()).isFalse();
-        assertThat(edgesInto(topology, List.of("items"))).doesNotContain(List.of("items", "owner"));
+        assertThat(rowEdgesInto(topology, List.of("items")))
+                .doesNotContain(List.of("items", "owner"));
+        assertThat(touchEdgesInto(topology, List.of("items")))
+                .describedAs("and the word of an edit lands on the level that points at it, whatever depth "
+                        + "that level sits at - the same edge the root case gets, one level down")
+                .contains(List.of("items", "owner"));
     }
 }

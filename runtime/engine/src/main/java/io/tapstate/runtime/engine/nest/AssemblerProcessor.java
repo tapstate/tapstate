@@ -617,6 +617,19 @@ public final class AssemblerProcessor extends AbstractProcessor {
     }
 
     private void handle(NestInbound edge, Object item, Map<Object, Touched> touched) {
+        // Asked of the item rather than of the edge, because two edges bring it. One is the edge from the
+        // vertex filing the rows this document itself points at; the other is an ordinary cascade, carrying
+        // word that a row some level beneath points at was edited, climbing with that level's own changes.
+        // The ordinal says which level it came from and says nothing about which of the two it is.
+        if (item instanceof NestTouch word) {
+            // Nothing here changes - what the document should now show is read out of that row's own
+            // namespace when it is drawn - so all this does is put the document in the drain, which is
+            // what gets it drawn and sent again.
+            Touched document = touched(word.key(), touched);
+            document.ts = Math.max(document.ts, word.ts());
+            document.assembly.absorb(word.positions());
+            return;
+        }
         if (edge.isCascade()) {
             KeyedElement arrived = (KeyedElement) item;
             Touched document = touched(arrived.key(), touched);
@@ -1002,6 +1015,9 @@ public final class AssemblerProcessor extends AbstractProcessor {
                         if (isOwedAHandOver(key)) {
                             return;
                         }
+                        if (document.assembly.waitsForARowItPointsAt(slots, resolved)) {
+                            return;
+                        }
                         if (mayGoOutNow(key)) {
                             outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
                                     .withPositions(document.assembly.covered()));
@@ -1142,11 +1158,19 @@ public final class AssemblerProcessor extends AbstractProcessor {
                 continue;
             }
             RootAssembly assembly = store.load(entry.getKey());
+            Map<String, Map<Object, Map<String, Object>>> references = assembly == null
+                    ? Map.of()
+                    : referencesFor(assembly);
             Optional<Map<String, Object>> rendered = assembly == null
                     ? Optional.empty()
-                    : assembly.render(slots, referencesFor(assembly));
+                    : assembly.render(slots, references);
             if (rendered.isEmpty()) {
                 open.remove();
+                continue;
+            }
+            // The same as the hold above, and for the same reason: a window running out is a clock, and a
+            // clock is exactly what must not release a document that is still missing a row it names.
+            if (assembly.waitsForARowItPointsAt(slots, references)) {
                 continue;
             }
             outgoing.add(Envelope.insert(window.ts, outputStream, rendered.get(), null)

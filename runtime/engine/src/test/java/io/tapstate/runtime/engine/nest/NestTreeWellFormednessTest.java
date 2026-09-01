@@ -106,12 +106,15 @@ class NestTreeWellFormednessTest {
 
         NestTopology topology = compile(tree);
 
-        // Pointed at rather than hanging under: it is fetched by key where the document is rendered, so
-        // it arrives on no edge into the level that names it.
+        // Pointed at rather than hanging under: it is fetched by key where the document is rendered, so no
+        // row of it is ever routed to the level that names it. The one edge that does mention it carries
+        // word of an edit and no row at all, which is how such a row reaches a document that is already out.
         assertThat(topology.vertices()).anySatisfy(vertex -> {
             assertThat(vertex.pathId()).isEqualTo(List.of("policies"));
-            assertThat(vertex.inbound()).noneSatisfy(edge ->
-                    assertThat(edge.pathId()).isEqualTo(List.of("policies", "author")));
+            assertThat(vertex.inbound()).noneSatisfy(edge -> {
+                assertThat(edge.pathId()).isEqualTo(List.of("policies", "author"));
+                assertThat(edge.carriesTouches()).isFalse();
+            });
         });
     }
 

@@ -3,7 +3,9 @@ package io.tapstate.runtime.engine.nest;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -20,12 +22,24 @@ import java.util.Objects;
  * embed's {@code on} map wrote them. The level pointing at it reads the matching columns of its own row in
  * that same order, so the two sides build the same key without either having to know the other's table.
  *
- * <p>The last three components describe the other side of the reference - the level doing the pointing -
+ * <p>The next three components describe the other side of the reference - the level doing the pointing -
  * and are here because that level's rows are delivered a second time, to record which of them point at
  * what. {@code referrerAlias} is the stream they arrive on, {@code referenceFields} the columns of their
  * own rows holding the reference, and {@code referrerIdentity} what identifies one of them. That second
  * delivery leaves from where the first one does and never passes through the vertex assembling documents,
  * which is what keeps the graph free of a cycle.
+ *
+ * <p>{@code referrerPathId} and {@code touchOrdinal} are the address word of an edit is sent to: the level
+ * doing the pointing, whose vertex is where that word lands, and which of its inbound edges carries it.
+ * Both are settled while the tree is compiled, so nothing on a member works out where to send to - a graph
+ * drawn from one answer and read with another would deliver every word to the wrong handling.
+ *
+ * <p>{@code referrerTracksKeyChanges} says whether that level's rows arrive carrying the row they replace,
+ * which decides whether a row re-pointed somewhere else can be taken out of what it left. Recording where a
+ * row points needs only the row; taking it back needs to know where it pointed before, and not every source
+ * sends that. Where it is off the record only ever grows - the row a document walked away from goes on
+ * believing it is pointed at - which is a known cost of that switch being off rather than something this
+ * works around.
  */
 public record NestLookup(
         List<String> pathId,
@@ -35,7 +49,10 @@ public record NestLookup(
         List<String> partitionKey,
         String referrerAlias,
         List<String> referenceFields,
-        List<String> referrerIdentity) implements Serializable {
+        List<String> referrerIdentity,
+        List<String> referrerPathId,
+        int touchOrdinal,
+        boolean referrerTracksKeyChanges) implements Serializable {
 
     /**
      * How many buckets the identities pointing at one row are spread over.
@@ -54,6 +71,25 @@ public record NestLookup(
      */
     public static final int BUCKETS = 64;
 
+    /**
+     * What a row that has been deleted is left filed as, rather than taking the entry out.
+     *
+     * <p><b>Absent and gone have to be different answers, because the document does different things with
+     * them.</b> Either way the field is not rendered - there is nothing to render - but a document pointing
+     * at a row that has not arrived waits, and one pointing at a row that has been deleted goes. Take the
+     * entry out and the two become one reading, and whichever meaning it is given is wrong for the other
+     * half: documents sent without a row that was merely late, or documents held for ever on a row whose
+     * arrival is in the past.
+     *
+     * <p>An empty row says it, needing no second kind of value in the namespace. Nothing else can be one: a
+     * row is filed under the columns identifying it, read off the row itself, so a live one always carries
+     * at least those - and a row whose identifying columns are all absent is filed under a key of nulls,
+     * which no document ever asks for.
+     */
+    public static Map<String, Object> gone() {
+        return new LinkedHashMap<>();
+    }
+
     public NestLookup {
         Objects.requireNonNull(alias, "alias");
         Objects.requireNonNull(name, "name");
@@ -63,6 +99,7 @@ public record NestLookup(
         partitionKey = List.copyOf(partitionKey);
         referenceFields = List.copyOf(referenceFields);
         referrerIdentity = List.copyOf(referrerIdentity);
+        referrerPathId = List.copyOf(referrerPathId);
         if (partitionKey.isEmpty()) {
             throw new IllegalArgumentException("lookup " + name + " has nothing to key rows by");
         }
