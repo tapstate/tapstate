@@ -5,10 +5,14 @@ import io.tapstate.core.common.TapstateErrorCode;
 
 import java.util.Set;
 
-/** Stable coded failures for structured Pipeline artifact reads. */
+/** Stable coded failures for structured Pipeline artifact reads and conditional edits. */
 public enum PipelineError implements TapstateErrorCode {
 
-    NOT_FOUND("pipeline.not-found", Set.of("id"));
+    ALREADY_EXISTS("pipeline.already-exists", Set.of("id")),
+    NOT_FOUND("pipeline.not-found", Set.of("id")),
+    ID_MISMATCH("pipeline.id-mismatch", Set.of("pathId", "bodyId")),
+    PRECONDITION_REQUIRED("pipeline.precondition-required", Set.of("id")),
+    VERSION_CONFLICT("pipeline.version-conflict", Set.of("id"));
 
     private final String code;
     private final Set<String> placeholders;

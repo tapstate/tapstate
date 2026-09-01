@@ -42,6 +42,8 @@ class ControlOperationsTest {
                         "pipeline.get",
                         "pipeline.layout.get",
                         "pipeline.layout.update",
+                        "pipeline.create",
+                        "pipeline.update",
                         "pipeline.start",
                         "pipeline.stop",
                         "pipeline.pause",
@@ -101,7 +103,7 @@ class ControlOperationsTest {
         assertThat(registry.resolve("cluster.members").scope()).isEqualTo(Scope.READ);
         // The layout update replaces editor metadata, while the lifecycle verbs write desired state.
         for (String id : List.of(
-                "pipeline.layout.update", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
+                "pipeline.layout.update", "pipeline.create", "pipeline.update", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.WRITE);
         }
         // The static Pipeline projection, layout read, and observation reads are all
@@ -132,6 +134,8 @@ class ControlOperationsTest {
                         "pipeline.stop",
                         "pipeline.pause",
                         "pipeline.resume",
+                        "pipeline.update",
+                        "pipeline.create",
                         "user.create",
                         "user.passwd",
                         "token.create",
@@ -174,7 +178,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(41);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(43);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }

@@ -8,6 +8,7 @@ import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.DiscoveredTable;
 import io.tapstate.core.dsl.RowExpressionTypeRules;
+import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.dsl.WriteKeyRules;
 import io.tapstate.core.model.PipelineResource;
@@ -24,7 +25,10 @@ import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
 
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -158,9 +162,10 @@ public final class ApplyService {
         }
         // Read once and handed to both: the gate judges the batch against it, then the advisory pass
         // advises on the same reading rather than paying a second round trip for a possibly different one.
-        Map<String, List<DiscoveredTable>> discovered = discoveredTables(candidate);
-        RowExpressionTypeRules.validate(candidate, discovered);
-        WriteKeyRules.validate(candidate, discovered);
+        List<Resource> semanticValidation = semanticValidationResources(candidate, submitted, validationScope);
+        Map<String, List<DiscoveredTable>> discovered = discoveredTables(semanticValidation);
+        RowExpressionTypeRules.validate(semanticValidation, discovered);
+        WriteKeyRules.validate(semanticValidation, discovered);
         List<Resource> validated = List.copyOf(workspace.resources());
         Map<String, Resource> validatedById = new LinkedHashMap<>();
         for (Resource resource : validated) {
@@ -173,6 +178,66 @@ public final class ApplyService {
             prepared.add(new PreparedArtifact(resource, canonicalForm, CanonicalHash.of(canonicalForm)));
         }
         return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions);
+    }
+
+    /**
+     * Selects the resources that need discovered-schema semantic gates for an online typed write.
+     *
+     * <p>Workspace validation above always runs over the complete post-write candidate. The
+     * discovered gates are different: a typed source edit should not re-validate an unrelated
+     * pipeline against stale schema observations. Pipelines are included when they are transitively
+     * reachable through references to the submitted source (including inline serve sinks and
+     * reusable serve definitions); all non-pipeline resources remain available for wiring lookup.
+     */
+    private static List<Resource> semanticValidationResources(
+            List<Resource> candidate, List<Resource> submitted, ValidationScope scope) {
+        if (scope != ValidationScope.ONLINE_SOURCE) {
+            return candidate;
+        }
+        Set<String> submittedSourceIds = new LinkedHashSet<>();
+        Set<String> submittedPipelineIds = new LinkedHashSet<>();
+        for (Resource resource : submitted) {
+            if (resource instanceof SourceResource) {
+                submittedSourceIds.add(resource.id());
+            } else if (resource instanceof PipelineResource) {
+                submittedPipelineIds.add(resource.id());
+            }
+        }
+        // A typed Pipeline write must be judged against its own discovered sources, but it must not
+        // re-run schema-dependent gates for every unrelated stored Pipeline. A stale keyless table in
+        // another pipeline would otherwise make creating an empty draft impossible (and would report
+        // an error for the wrong request). Non-pipeline resources remain available to resolve the
+        // submitted pipeline's source/serve definitions.
+        if (!submittedPipelineIds.isEmpty()) {
+            return candidate.stream()
+                    .filter(resource -> !(resource instanceof PipelineResource)
+                            || submittedPipelineIds.contains(resource.id()))
+                    .toList();
+        }
+        if (submittedSourceIds.isEmpty()) {
+            return candidate;
+        }
+
+        ReferenceGraph graph = ReferenceGraph.of(candidate);
+        Set<String> impacted = new HashSet<>();
+        ArrayDeque<String> pending = new ArrayDeque<>(submittedSourceIds);
+        while (!pending.isEmpty()) {
+            String id = pending.removeFirst();
+            if (!impacted.add(id)) {
+                continue;
+            }
+            for (ReferenceGraph.Edge referrer : graph.referencedBy(id)) {
+                pending.addLast(referrer.id());
+            }
+        }
+
+        List<Resource> selected = new ArrayList<>();
+        for (Resource resource : candidate) {
+            if (!(resource instanceof PipelineResource) || impacted.contains(resource.id())) {
+                selected.add(resource);
+            }
+        }
+        return selected;
     }
 
     /** Applies one typed resource only while its id is absent. */

@@ -60,6 +60,13 @@ final class ReferenceClosure {
     }
 
     private void validatePipeline(PipelineResource p) {
+        // The visual editor creates a persisted blank draft before any Source has been chosen.
+        // It is intentionally not runnable yet; the next typed save must supply the full
+        // source + view/serve composition before the normal closure checks apply.
+        if (p.sources().isEmpty() && (p.transforms() == null || p.transforms().isEmpty())
+                && p.view() == null && p.serve() == null) {
+            return;
+        }
         // X17 minimal composition: source (model guarantees non-empty) + an output surface.
         if (p.view() == null && p.serve() == null) {
             throw new DslException(DslError.COMPOSITION, "", 0, 0, null,

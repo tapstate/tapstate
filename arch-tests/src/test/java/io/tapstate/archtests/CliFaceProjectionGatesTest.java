@@ -82,7 +82,7 @@ class CliFaceProjectionGatesTest {
             "connector.icon",
             "cluster.members",
             "source.create", "source.delete", "source.draft", "source.get", "source.list", "source.update",
-            "pipeline.get", "pipeline.list", "pipeline.layout.get", "pipeline.layout.update",
+            "pipeline.get", "pipeline.list", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create", "pipeline.update",
             "user.create", "user.passwd", "user.list");
 
     @Test

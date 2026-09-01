@@ -161,9 +161,10 @@ public final class ControlOperations {
     // outside the registry. Reading topology mutates nothing, so it is read-scoped and unaudited.
     public static final Operation CLUSTER_MEMBERS = new Operation("cluster.members", Scope.READ, false, null, CLI_ONLY);
 
-    // pipeline domain: static projection reads and the four lifecycle verbs. Each lifecycle verb writes
-    // the pipeline's desired state (an intent the runtime later converges), so all four are write-scoped
-    // and audited. There is no rewind verb — a re-dig is stop then start composed at the surface.
+    // pipeline domain: static projection reads, conditional definition replacement, and the four lifecycle
+    // verbs. Definition replacement is audited as an artifact write; each lifecycle verb writes the
+    // pipeline's desired state (an intent the runtime later converges). There is no rewind verb — a re-dig
+    // is stop then start composed at the surface.
     public static final Operation PIPELINE_LIST = new Operation(
             "pipeline.list", Scope.READ, false, null,
             "List static Pipeline artifacts with resolved Source summaries.", CLI_ONLY);
@@ -176,6 +177,13 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LAYOUT_UPDATE = new Operation(
             "pipeline.layout.update", Scope.WRITE, false, null,
             "Replace editor-only node positions and viewport state for one Pipeline.", CLI_ONLY);
+    public static final Operation PIPELINE_CREATE = new Operation(
+            "pipeline.create", Scope.WRITE, true, null,
+            "Create one Pipeline definition after its referenced Sources and composition have been validated.",
+            CLI_ONLY);
+    public static final Operation PIPELINE_UPDATE = new Operation(
+            "pipeline.update", Scope.WRITE, true, null,
+            "Replace one Pipeline definition while its content hash precondition still matches.", CLI_ONLY);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
@@ -239,6 +247,8 @@ public final class ControlOperations {
             PIPELINE_GET,
             PIPELINE_LAYOUT_GET,
             PIPELINE_LAYOUT_UPDATE,
+            PIPELINE_CREATE,
+            PIPELINE_UPDATE,
             PIPELINE_START,
             PIPELINE_STOP,
             PIPELINE_PAUSE,
