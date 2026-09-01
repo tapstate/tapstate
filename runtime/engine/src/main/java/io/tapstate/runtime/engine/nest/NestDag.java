@@ -89,6 +89,14 @@ public final class NestDag {
      *
      * <p>It has no outbound edge, because a row arriving here reaches no document by arriving. Which
      * documents refer to it is not something the row says.
+     *
+     * <p>Two edges in, from two different streams. The rows themselves arrive on the first; the second
+     * carries the rows of the level doing the pointing, delivered a second time and keyed by the row they
+     * name rather than by their own identity, so that each of them is recorded here against what it points
+     * at. <b>That second delivery leaves from the same source vertex the assembly one does.</b> Having the
+     * vertex that assembles documents register them instead is the obvious reading and the one that cannot
+     * be built: the changes to a pointed-at row have to reach that vertex, so an edge back into this one
+     * closes a cycle, and Jet refuses the whole job at submission rather than the edge at drawing.
      */
     private static void attachLookup(DAG dag, NestLookup lookup, Function<String, List<Vertex>> upstream,
             NestBinding binding, ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
@@ -101,7 +109,18 @@ public final class NestDag {
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
-        draw(dag, source, vertex, 0, fieldKey(lookup.partitionKey()), nextOutbound);
+        draw(dag, source, vertex, LookupProcessor.ROWS, fieldKey(lookup.partitionKey()), nextOutbound);
+
+        List<Vertex> referrers = upstream.apply(lookup.referrerAlias());
+        if (referrers == null || referrers.isEmpty()) {
+            throw new IllegalStateException(
+                    "nest alias '" + lookup.referrerAlias() + "' resolved to no vertex");
+        }
+        Vertex referrer = referrers.size() == 1
+                ? referrers.get(0)
+                : gatheredInto(dag, vertex, lookup.referrerAlias(), referrers, nextOutbound, frontier);
+        draw(dag, referrer, vertex, LookupProcessor.REGISTRATIONS,
+                fieldKey(lookup.referenceFields()), nextOutbound);
     }
 
     /** One passthrough gathering several producers of an alias, so the vertex below sees a single edge. */
@@ -263,7 +282,8 @@ public final class NestDag {
         public Collection<? extends Processor> get(int count) {
             List<Processor> processors = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
-                processors.add(new LookupProcessor(lookup, bound.forLookup(lookup)));
+                processors.add(new LookupProcessor(lookup, bound.forLookup(lookup),
+                        bound.forReferences(lookup)));
             }
             return processors;
         }

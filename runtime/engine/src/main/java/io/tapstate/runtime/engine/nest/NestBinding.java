@@ -6,6 +6,7 @@ import io.tapstate.runtime.engine.ReplayFloorFactory;
 import java.io.Serializable;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -109,6 +110,22 @@ public record NestBinding(
         }
 
         /**
+         * The store for which identities point at each of the rows a level points at, spread over a fixed
+         * number of buckets per row so that no one entry grows with the fanout. Written by the same vertex
+         * that files the rows themselves, and by nothing else: both are partitioned by the identity of the
+         * row being pointed at, so one member owns everything ever said about that row.
+         *
+         * <p>Defaulted to a refusal for the same reason the one above is. A binding with nowhere to keep
+         * this cannot serve a tree that points at anything, and a store quietly keeping nothing would
+         * leave a row that nothing appeared to point at - so a change to it would reach no document, and
+         * every document would still look right until one of them was changed.
+         */
+        default NestStore<Set<Object>> forReferences(NestLookup lookup) {
+            throw new IllegalStateException("these nest stores have nowhere to keep what points at the rows "
+                    + lookup.name() + " holds");
+        }
+
+        /**
          * The store for subtrees between documents. Separate from the documents themselves because what is
          * kept there is not one: it belongs to no key of this vertex until the document gaining it takes it,
          * and mixing the two would put entries under keys the sweeps here walk.
@@ -204,6 +221,11 @@ public record NestBinding(
         @Override
         public NestStore<Map<String, Object>> forLookup(NestLookup lookup) {
             return metered(mapNamed(lookup.name(), lookup.mapName()));
+        }
+
+        @Override
+        public NestStore<Set<Object>> forReferences(NestLookup lookup) {
+            return metered(mapNamed(lookup.name(), lookup.referencesMapName()));
         }
 
         private <S> IMap<Object, S> mapOf(NestVertex vertex) {

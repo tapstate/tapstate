@@ -164,6 +164,10 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         // reachable from nothing.
         for (NestLookup lookup : lookups) {
             namespaces.add(lookup.mapName());
+            // And which rows point at each of them, which grows with the fanout where the rows themselves
+            // do not. It is the one namespace here on no functional path at all - nothing reads it to
+            // render a document - so it is also the one a set built from what a run touches would miss.
+            namespaces.add(lookup.referencesMapName());
         }
         for (NestVertex vertex : vertices) {
             namespaces.add(vertex.mapName());
@@ -243,7 +247,8 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                 // happens where the document is rendered rather than on the way in.
                 NestLookup lookup = new NestLookup(node.pathId(), node.embed().from(),
                         lookupName(nodeId, node.pathId()), mapName(pipelineId, nodeId, node.pathId()),
-                        referenceIdentity(node.embed()));
+                        referenceIdentity(node.embed()), node.parentAlias(),
+                        referenceFields(node.embed()), identities.get(node.parentPathId()));
                 lookups.add(lookup);
                 streams.add(new NestStream(node.embed().from(), node.pathId(), 0, lookup.name(), null));
                 continue;

@@ -3,7 +3,9 @@ package io.tapstate.runtime.engine.nest;
 import java.io.Serializable;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Where one nest vertex keeps its state between events, one entry per key the vertex is partitioned by.
@@ -42,6 +44,27 @@ public interface NestStore<S> extends Serializable {
 
     /** Stores {@code state} under {@code key}, replacing whatever was there. */
     void save(Object key, S state);
+
+    /**
+     * Adds {@code element} to the set held under {@code key}, creating the entry if there is none. Only a
+     * namespace whose entries are sets is ever asked this, which is why it is expressed over {@code S}
+     * rather than parameterised again - the one that is, is the record of which rows point at another.
+     *
+     * <p><b>The element travels, not the set.</b> A set grown by reading it, adding to it and writing it
+     * back costs two reaches and carries every identity already in it, both ways, on every single row that
+     * arrives - so the cost of registering one row would grow with how many had registered before it,
+     * which is the shape the buckets exist to prevent in the first place. The default below is exactly
+     * that shape, and is here only because it is free where the set is on the same heap; an implementation
+     * with anything remote behind it must override it, as with {@link #loadAll}.
+     */
+    @SuppressWarnings("unchecked")
+    default void add(Object key, Object element) {
+        Set<Object> held = (Set<Object>) load(key);
+        Set<Object> grown = held == null ? new LinkedHashSet<>() : new LinkedHashSet<>(held);
+        if (grown.add(element)) {
+            save(key, (S) grown);
+        }
+    }
 
     /** Removes the entry under {@code key} entirely, if there is one. */
     void remove(Object key);

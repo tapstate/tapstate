@@ -71,6 +71,11 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
         assertThat(topology.stateNamespaces())
                 .describedAs("its namespace is named, or a tree taken down leaves every row it held")
                 .contains(topology.lookups().get(0).mapName());
+        assertThat(topology.stateNamespaces())
+                .describedAs("and so is the record of what points at those rows, which no vertex is named "
+                        + "for and no rendering ever reads - so nothing else would ever go looking for it, "
+                        + "and a tree taken down without naming it leaves it standing for good")
+                .contains(topology.lookups().get(0).referencesMapName());
     }
 
     @Test

@@ -26,6 +26,7 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.nest.NestBinding;
+import io.tapstate.runtime.engine.nest.NestLookup;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
 import io.tapstate.runtime.engine.nest.NestTable;
@@ -70,6 +71,14 @@ class ARunningNestReportsWhatItsStateCostsTest {
 
     /** The namespace holding the rows the documents point at, as the compiled tree names it. */
     private static final String REFERENCE_NAMESPACE = "nest." + PIPELINE + "." + STEP + ".customer";
+
+    /**
+     * The namespace holding which documents point at those rows. It is the one namespace here that grows
+     * with how often a row is referred to rather than with how many rows there are, and nothing on any
+     * rendering path reads it - so it is the one that would be invisible to a reading assembled from what
+     * a run happens to touch, and the one whose growth nobody would ever see.
+     */
+    private static final String REFERENCE_INDEX_NAMESPACE = REFERENCE_NAMESPACE + ".refs";
 
     /** The cold layer, shared by every store the member builds. Static because they are built there. */
     private static final Map<String, byte[]> COLD = new ConcurrentHashMap<>();
@@ -151,6 +160,27 @@ class ARunningNestReportsWhatItsStateCostsTest {
                     .isEqualTo(2);
             assertThat(reading.accesses())
                     .describedAs("filing a row reaches for the state, so the reaches are counted here too")
+                    .isPositive();
+        } finally {
+            engine.cancel(PIPELINE);
+        }
+    }
+
+    @Test
+    @DisplayName("what points at those rows is reported as a namespace of its own too")
+    void whatPointsAtThoseRowsIsVisibleFromOutsideTheRun() {
+        Engine engine = new Engine(member);
+        engine.submit(PIPELINE, ordersWithCustomers());
+        try {
+            NestStateReading reading = awaitReading(REFERENCE_INDEX_NAMESPACE, 1);
+
+            assertThat(reading.entries())
+                    .describedAs("four orders point at two customers, spread over buckets - so there is "
+                            + "at least one entry and never more than one bucket per customer")
+                    .isBetween(1L, 2L * NestLookup.BUCKETS);
+            assertThat(reading.accesses())
+                    .describedAs("recording that a row points somewhere reaches for the state, and this is "
+                            + "the namespace where the reach is made")
                     .isPositive();
         } finally {
             engine.cancel(PIPELINE);

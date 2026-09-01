@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.core.HazelcastInstance;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -80,6 +81,12 @@ public final class HeapNestStores {
         @Override
         public NestStore<Map<String, Object>> forLookup(NestLookup lookup) {
             return shared("lookup|" + lookup.mapName());
+        }
+
+        /** Shared for the reason above, and written by the same vertex that writes the rows themselves. */
+        @Override
+        public NestStore<Set<Object>> forReferences(NestLookup lookup) {
+            return shared("refs|" + lookup.referencesMapName());
         }
 
         @SuppressWarnings("unchecked")

@@ -7,6 +7,7 @@ import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * A nest store over one distributed map - the map the vertex's own name resolves to.
@@ -123,6 +124,18 @@ final class MapNestStore<S> implements NestStore<S> {
         publishReading();
     }
 
+    /**
+     * Grows the set at its own key rather than across the map, the same way a state is written: what
+     * travels is the one element being added, so registering a row costs the same whether it is the first
+     * to point at that row or the thousandth. One reach, not the read-then-write pair the default is.
+     */
+    @Override
+    public void add(Object key, Object element) {
+        countAccess();
+        map.executeOnKey(key, new Grown<>(element));
+        publishReading();
+    }
+
     @Override
     public void remove(Object key) {
         countAccess();
@@ -180,6 +193,42 @@ final class MapNestStore<S> implements NestStore<S> {
         @Override
         public Void process(Map.Entry<Object, S> entry) {
             entry.setValue(state);
+            return null;
+        }
+
+        @Override
+        public EntryProcessor<Object, S, Void> getBackupProcessor() {
+            return null;
+        }
+    }
+
+    /**
+     * Adds one element to the set at a key, where the set already is. It answers nothing for the reason
+     * {@link Carried} does not, and it has no backup form for the same reason either.
+     *
+     * <p>The set is replaced rather than mutated in place. What an entry processor is handed on an
+     * object-format map is the stored instance itself, so adding to it directly would change what other
+     * readers hold without the entry ever being written back - correct only by accident, and only until
+     * the format or the layer behind the map changes underneath it.
+     */
+    private static final class Grown<S> implements EntryProcessor<Object, S, Void>, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final Object element;
+
+        Grown(Object element) {
+            this.element = element;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Void process(Map.Entry<Object, S> entry) {
+            Set<Object> held = (Set<Object>) entry.getValue();
+            Set<Object> grown = held == null ? new LinkedHashSet<>() : new LinkedHashSet<>(held);
+            if (grown.add(element)) {
+                entry.setValue((S) grown);
+            }
             return null;
         }
 
