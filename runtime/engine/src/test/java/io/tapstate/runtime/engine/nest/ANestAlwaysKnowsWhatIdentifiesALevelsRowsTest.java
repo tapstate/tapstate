@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.embed;
+import static io.tapstate.runtime.engine.nest.NestTreeFixtures.keyed;
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.nest;
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.tables;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -38,7 +39,7 @@ class ANestAlwaysKnowsWhatIdentifiesALevelsRowsTest {
     /** An embed of {@code alias} under an order, declaring {@code key} as what identifies its rows. */
     private static TransformBody.Nest treeEmbedding(String alias, List<String> key) {
         return nest("order", List.of("order_id"),
-                embed(alias, "order_id", "order_id", EmbedAs.ARRAY, "rows", key));
+                keyed(embed(alias, "order_id", "order_id", EmbedAs.ARRAY, "rows", null), key));
     }
 
     @Test

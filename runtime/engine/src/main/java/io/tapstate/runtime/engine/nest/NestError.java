@@ -35,15 +35,6 @@ public enum NestError implements TapstateErrorCode {
     EMBED_TARGET_NOT_PARENT_KEY(
             "nest.embed-target-not-parent-key", Set.of("embedPath", "fields", "parentKey")),
 
-    /**
-     * Checking the tree: an embed declared as the row above pointing at it joins on a column that does not
-     * identify its own rows, so the column names a set of rows rather than the one to embed. It is the
-     * mirror of the check above and cannot replace it - the same pair of column names is correct in one
-     * direction and wrong in the other, which is why the direction is declared rather than inferred.
-     */
-    EMBED_REFERENCE_NOT_OWN_KEY(
-            "nest.embed-reference-not-own-key", Set.of("embedPath", "fields", "referencedKey")),
-
     /** Checking the tree: two embeds under one parent claim the same path, where one would overwrite the other. */
     EMBED_PATH_CONFLICT("nest.embed-path-conflict", Set.of("path", "embedPathA", "embedPathB")),
 
@@ -54,8 +45,8 @@ public enum NestError implements TapstateErrorCode {
     ROOT_KEY_REQUIRED("nest.root-key-required", Set.of("rootAlias")),
 
     /**
-     * Checking the tree: an embed declares no array key and its table offers no primary key to take one
-     * from, leaving its elements with no identity — updates would pile up as duplicates.
+     * Checking the tree: a level declares no key and its stream offers neither a primary key nor a unique
+     * index to take one from, leaving its rows with no identity — updates would pile up as duplicates.
      */
     ARRAY_KEY_UNRESOLVABLE("nest.array-key-unresolvable", Set.of("embedPath", "table")),
 

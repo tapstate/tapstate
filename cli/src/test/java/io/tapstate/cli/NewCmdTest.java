@@ -746,7 +746,7 @@ class NewCmdTest {
         NewCmd cmd = cl.getSubcommands().get("new").getCommand();
         cmd.prompter = new ScriptedPrompter(
                 "c360_shape", "nest", "customer", "customer_id",
-                "embed", "policy", "CUST_ID", "customer_id", "", "child", "array", "policies", "POLICY_ID",
+                "embed", "policy", "CUST_ID", "customer_id", "", "array", "policies", "POLICY_ID",
                 "(done)", "(done)");
         cl.setOut(new PrintWriter(new StringWriter()));
         cl.setErr(new PrintWriter(new StringWriter()));

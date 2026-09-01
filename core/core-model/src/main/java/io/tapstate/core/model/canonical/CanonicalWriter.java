@@ -268,7 +268,7 @@ public final class CanonicalWriter {
             b.freeMap("on", new TreeMap<>(e.on()));
             b.scalar("as", e.as().yaml());
             b.scalar("path", e.path());
-            b.scalar("ref", e.ref() == null ? null : e.ref().yaml());
+            b.scalarSeq("key", e.key());
             b.scalarSeq("arrayKey", e.arrayKey());
             b.scalar("ignoreUpdates", e.ignoreUpdates());
             b.scalar("trackKeyChanges", e.trackKeyChanges());

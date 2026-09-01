@@ -477,9 +477,6 @@ nest.sibling-embeds-target-different-parent-keys:
 nest.embed-target-not-parent-key:
   message: "The embeds under {embedPath} join on {fields}, which does not identify its rows; its key is {parentKey}."
   solution: "Join on the parent's key, or write ref: parent on the embed if the row above is the one pointing at it. Without that, a field that merely refers to another table makes every row sharing a value one identity."
-nest.embed-reference-not-own-key:
-  message: "Embed {embedPath} says the row above points at it, but joins on {fields}, which does not identify its own rows; its key is {referencedKey}."
-  solution: "Point at the embedded table's key, or drop ref: parent if these rows hang under the row above rather than being pointed at by it. A column that is not that table's key names a set of its rows, not the one to embed."
 nest.embed-path-conflict:
   message: "Embeds {embedPathA} and {embedPathB} both target the path {path}."
   solution: "Give each embed a path of its own, or one silently overwrites the other in the document."
@@ -487,11 +484,11 @@ nest.root-key-required:
   message: "The nest rooted at {rootAlias} declares no key."
   solution: "Declare root.key: it is the identity children are grouped under, and the assembled document has none without it."
 nest.array-key-unresolvable:
-  message: "Embed {embedPath} declares no array key, and table {table} has no primary key to take one from."
-  solution: "Declare arrayKey on that embed; without an element identity, updates pile up as duplicates."
+  message: "Nothing identifies a row of {embedPath}: it declares no key, and table {table} has no primary key or unique index to take one from."
+  solution: "Declare key on that level, naming the columns that identify one of its rows. Without an identity, rows cannot be told apart and updates pile up as duplicates."
 nest.key-ambiguous:
-  message: "Embed {embedPath} declares no key, and table {table} has no primary key but several unique indexes: {candidates}."
-  solution: "Declare arrayKey on that embed to say which one identifies a row; picking for you would settle it on whichever index the source reported first."
+  message: "Nothing settles what identifies a row of {embedPath}: it declares no key, and table {table} has no primary key but several unique indexes: {candidates}."
+  solution: "Declare key on that level to say which columns identify a row; choosing for you would settle it on whichever index the source reported first."
 nest.resolver-vertex-limit-exceeded:
   message: "This nest compiles to {vertices} resolver vertices, past the limit of {limit}."
   solution: "Flatten the tree or split the pipeline: every vertex takes a thread of its own."

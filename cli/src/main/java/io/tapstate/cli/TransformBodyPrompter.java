@@ -2,7 +2,6 @@ package io.tapstate.cli;
 
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
-import io.tapstate.core.model.EmbedRef;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
@@ -108,26 +107,12 @@ final class TransformBodyPrompter {
     private Embed askEmbed() {
         String from = prompter.ask("Embed child alias", null);
         Map<String, String> on = askOn();
-        EmbedRef ref = askEmbedRef();
         EmbedAs as = askEmbedAs();
         String path = prompter.ask("Embed path (field under parent)", null);
         List<String> arrayKey = as == EmbedAs.ARRAY
                 ? askKeyList("Array key (comma-separated, blank for none)")
                 : null;
-        return new Embed(from, on, as, path, ref, arrayKey, null, null, askEmbeds());
-    }
-
-    /**
-     * Which side of the join carries the other's identity. Asked rather than inferred: the two directions
-     * are written with the same pair of field names, so nothing already answered says which one this is.
-     *
-     * <p>Taking the default writes nothing. It means what it always meant, and an artifact that carries the
-     * word only because a wizard offered it reads as a decision somebody made.
-     */
-    private EmbedRef askEmbedRef() {
-        String chosen = prompter.choose("Which side carries the other's identity?",
-                List.of(EmbedRef.CHILD.yaml(), EmbedRef.PARENT.yaml()));
-        return EmbedRef.PARENT.yaml().equals(chosen) ? EmbedRef.PARENT : null;
+        return new Embed(from, on, as, path, null, arrayKey, null, null, askEmbeds());
     }
 
     /** The child-to-parent join field map; a blank child field ends the list. */

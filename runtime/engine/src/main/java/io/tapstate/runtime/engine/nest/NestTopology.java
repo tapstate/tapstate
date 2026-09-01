@@ -2,7 +2,6 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Embed;
-import io.tapstate.core.model.EmbedRef;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.WriteMode;
@@ -83,38 +82,34 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             return new NestTopology(List.of(), List.of(), List.of(), true);
         }
 
+        // The root is a level like any other: what identifies one of its rows is asked of the same four
+        // places, so a root over a table that declares a key need not repeat it.
+        List<String> rootKey = keyOf(root.from(), root.key(), ROOT_NAMESPACE, tables);
         List<Node> top = new ArrayList<>();
         for (Embed embed : declared) {
-            top.add(node(embed, List.of()));
+            top.add(node(embed, List.of(), root.from(), rootKey));
         }
         List<Node> all = flatten(top);
 
-        List<String> rootKey = root.key() == null ? List.of() : root.key();
-        if (rootKey.isEmpty()) {
-            throw new TapstateException(NestError.ROOT_KEY_REQUIRED,
-                    Map.of("rootAlias", root.from()), null);
-        }
         checkPaths(top);
         for (Node node : all) {
             checkPaths(node.children());
         }
-        List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, claimants(top));
+        // Which way each embed points, before anything asks: the readers below all branch on it, and an
+        // embed the level points at is not one of the things naming that level's identity.
         for (Node node : all) {
-            if (node.embed().ref() == EmbedRef.PARENT) {
-                checkReferenceIdentifiesItsOwnRows(node, tables);
-            }
+            node.referenced(referenced(node, tables));
         }
+        List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, claimants(top));
         for (Node node : all) {
             if (!node.children().isEmpty()) {
                 List<Node> claiming = claimants(node.children());
                 // A level every child points at is identified by what those children agree on. A level
                 // none of them points at is identified by what identifies one of its own rows: it is
                 // still a level, it just has nobody naming it from below.
-                List<String> identity = claiming.isEmpty()
+                node.identity(claiming.isEmpty()
                         ? resolveArrayKey(node, tables)
-                        : identityOf(render(node.pathId()), null, claiming);
-                checkIdentifiesItsOwnRows(node, identity, tables);
-                node.identity(identity);
+                        : identityOf(render(node.pathId()), null, claiming));
             }
         }
         for (Node node : all) {
@@ -265,7 +260,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         edges.add(new NestInbound(0, ownAlias, ownPathId, identity, ownElementKey, ownTracksKeyChanges,
                 tableBehind(ownAlias, ownTracksKeyChanges, tables)));
         for (Node child : children) {
-            if (child.embed().ref() == EmbedRef.PARENT) {
+            if (child.referenced()) {
                 // A child the level points at does not arrive here. Its rows are not grouped under this
                 // level - one of them can sit under thousands of levels at once - so there is no field
                 // pairing to key an edge by, and routing the document to it would be routing it to every
@@ -373,7 +368,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     private static List<Node> claimants(List<Node> children) {
         List<Node> claiming = new ArrayList<>();
         for (Node child : children) {
-            if (child.embed().ref() != EmbedRef.PARENT) {
+            if (!child.referenced()) {
                 claiming.add(child);
             }
         }
@@ -381,42 +376,37 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     }
 
     /**
-     * Refuses an embed the row above points at whose join column does not identify its own rows. It is the
-     * mirror of the check below and neither replaces the other: the same pair of column names is a child
-     * carrying its parent's identity read one way and a parent carrying its child's read the other, so
-     * whichever side the author declared is the side that gets asked.
+     * Which side of an embed's join carries the other's identity, read off the keys rather than declared.
      *
-     * <p>The same pass applies as below, for the same reason. Only a declared key can say whether a column
-     * identifies a row, so a table that declares none, or was never discovered, is left alone.
+     * <p>The two directions are written identically - a pair of column names either way - so the question
+     * cannot be answered from the pair alone. It can be answered from what identifies a row: the side that
+     * names its own table's key is the side being pointed at, because a column that identifies a row names
+     * one row, and a column that does not names however many share it.
+     *
+     * <p>Both sides being keys is a one-to-one join read either way. It renders the same document both
+     * times, so the existing direction is taken and nothing about such a tree changes. Neither side being
+     * a key is the case with no answer at all, and it is refused: the tree would otherwise assemble
+     * documents grouped on a column many rows share, with every count where it should be and the contents
+     * wrong.
      */
-    private static void checkReferenceIdentifiesItsOwnRows(Node node, Function<String, NestTable> tables) {
-        NestTable table = tables.apply(node.embed().from());
-        if (table == null || table.primaryKey().isEmpty()) {
-            return;
+    private static boolean referenced(Node node, Function<String, NestTable> tables) {
+        Set<String> childSide = new LinkedHashSet<>(node.embed().on().keySet());
+        Set<String> parentSide = new LinkedHashSet<>(node.embed().on().values());
+        List<String> parentKey =
+                keyOf(node.parentAlias(), node.parentKey(), render(node.parentPathId()), tables);
+        // The parent side alone settles the existing direction, so the embed's own key is not asked for
+        // unless it has to be. Asking anyway would refuse a tree that is already answered - over a stream
+        // nothing discovered, say - for want of something the answer does not depend on.
+        if (parentSide.equals(new LinkedHashSet<>(parentKey))) {
+            return false;
         }
-        Set<String> named = new LinkedHashSet<>(node.embed().on().keySet());
-        if (named.equals(new LinkedHashSet<>(table.primaryKey()))) {
-            return;
-        }
-        throw new TapstateException(NestError.EMBED_REFERENCE_NOT_OWN_KEY,
-                Map.of("embedPath", render(node.pathId()),
-                        "fields", String.join(", ", named),
-                        "referencedKey", String.join(", ", table.primaryKey())), null);
-    }
-
-    private static void checkIdentifiesItsOwnRows(Node node, List<String> identity,
-            Function<String, NestTable> tables) {
-        NestTable table = tables.apply(node.embed().from());
-        if (table == null || table.primaryKey().isEmpty()) {
-            return;
-        }
-        if (new LinkedHashSet<>(identity).equals(new LinkedHashSet<>(table.primaryKey()))) {
-            return;
+        if (childSide.equals(new LinkedHashSet<>(rowKeyOf(node, tables)))) {
+            return true;
         }
         throw new TapstateException(NestError.EMBED_TARGET_NOT_PARENT_KEY,
                 Map.of("embedPath", render(node.pathId()),
-                        "fields", String.join(", ", identity),
-                        "parentKey", String.join(", ", table.primaryKey())), null);
+                        "fields", String.join(", ", parentSide),
+                        "parentKey", String.join(", ", parentKey)), null);
     }
 
     /**
@@ -445,8 +435,22 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * none. A table the caller cannot resolve at all is a wiring bug rather than an authoring error, and
      * bare-throws; a table that resolves but declares no key is the author's to fix.
      */
+    /**
+     * What tells one element of this embed apart from the others in the same array. It is allowed to be
+     * unique only within that array - an order's line numbers are the everyday case - so it is asked for
+     * separately from the row identity, and falls back to it when the author wrote nothing.
+     */
     private static List<String> resolveArrayKey(Node node, Function<String, NestTable> tables) {
-        return keyOf(node.embed().from(), node.embed().arrayKey(), render(node.pathId()), tables);
+        List<String> declared = node.embed().arrayKey();
+        if (declared != null && !declared.isEmpty()) {
+            return declared;
+        }
+        return rowKeyOf(node, tables);
+    }
+
+    /** What identifies one row of this embed's stream, wherever else that row may also appear. */
+    private static List<String> rowKeyOf(Node node, Function<String, NestTable> tables) {
+        return keyOf(node.embed().from(), node.embed().key(), render(node.pathId()), tables);
     }
 
     /**
@@ -564,14 +568,16 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         return embeds == null ? List.of() : embeds;
     }
 
-    private static Node node(Embed embed, List<String> parentPathId) {
+    private static Node node(Embed embed, List<String> parentPathId, String parentAlias,
+            List<String> parentKey) {
         List<String> pathId = new ArrayList<>(parentPathId);
         pathId.add(embed.path());
         List<Node> children = new ArrayList<>();
         for (Embed child : childrenOf(embed.embed())) {
-            children.add(node(child, pathId));
+            children.add(node(child, pathId, embed.from(), embed.key()));
         }
-        return new Node(embed, List.copyOf(pathId), parentPathId, List.copyOf(children));
+        return new Node(embed, List.copyOf(pathId), parentPathId, parentAlias, parentKey,
+                List.copyOf(children));
     }
 
     /** Every node of the tree, deepest first, so a vertex is built after everything that cascades into it. */
@@ -590,15 +596,40 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         private final Embed embed;
         private final List<String> pathId;
         private final List<String> parentPathId;
+        // The level this embed hangs under, named the way the compiler can ask about its key: the root is
+        // an alias and a declared key just as an enclosing embed is, so the deep case needs no second path.
+        private final String parentAlias;
+        private final List<String> parentKey;
         private final List<Node> children;
         private List<String> identity = List.of();
         private List<String> arrayKey;
+        private boolean referenced;
 
-        private Node(Embed embed, List<String> pathId, List<String> parentPathId, List<Node> children) {
+        private Node(Embed embed, List<String> pathId, List<String> parentPathId, String parentAlias,
+                List<String> parentKey, List<Node> children) {
             this.embed = embed;
             this.pathId = pathId;
             this.parentPathId = parentPathId;
+            this.parentAlias = parentAlias;
+            this.parentKey = parentKey;
             this.children = children;
+        }
+
+        private String parentAlias() {
+            return parentAlias;
+        }
+
+        private List<String> parentKey() {
+            return parentKey;
+        }
+
+        /** Whether the level above points at this embed's rows, rather than its rows naming that level. */
+        private boolean referenced() {
+            return referenced;
+        }
+
+        private void referenced(boolean settled) {
+            this.referenced = settled;
         }
 
         private Embed embed() {

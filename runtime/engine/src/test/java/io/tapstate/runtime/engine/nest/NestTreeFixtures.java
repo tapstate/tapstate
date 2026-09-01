@@ -2,7 +2,6 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
-import io.tapstate.core.model.EmbedRef;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 
@@ -47,12 +46,9 @@ final class NestTreeFixtures {
         return new Embed(alias, on, EmbedAs.ARRAY, path, arrayKey, null, null, null);
     }
 
-    /**
-     * The same embed declaring that the row it hangs under is the one carrying the identity, for the
-     * cases where the direction is the only thing that differs between two otherwise identical trees.
-     */
-    static Embed referencing(Embed embed) {
-        return new Embed(embed.from(), embed.on(), embed.as(), embed.path(), EmbedRef.PARENT,
+    /** The same embed declaring what identifies one of its rows, rather than taking the stream's own. */
+    static Embed keyed(Embed embed, List<String> key) {
+        return new Embed(embed.from(), embed.on(), embed.as(), embed.path(), key,
                 embed.arrayKey(), embed.ignoreUpdates(), embed.trackKeyChanges(), embed.embed());
     }
 

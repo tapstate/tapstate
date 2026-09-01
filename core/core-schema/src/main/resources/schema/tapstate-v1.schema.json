@@ -44,12 +44,15 @@
           "description": "Target field path under the parent where the embedded child is placed.",
           "type": "string"
         },
-        "ref": {
-          "description": "Which side of this join carries the other's identity. Absent means the embedded rows do, which is what every embed written before this field existed means.",
-          "$ref": "#/$defs/EmbedRef"
+        "key": {
+          "description": "Fields that identify one row of this embed's stream. Absent means the stream's own declared key is used, and a stream that declares none is refused.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "arrayKey": {
-          "description": "Fields that uniquely identify an element within an embedded array.",
+          "description": "Fields that tell one element apart from the others in the same array, which may be unique only within that array. Absent means the row identity above is used.",
           "type": "array",
           "items": {
             "type": "string"
@@ -90,20 +93,6 @@
         {
           "const": "object",
           "description": "One-to-one relationship: a single matching child row is embedded as an object."
-        }
-      ]
-    },
-    "EmbedRef": {
-      "type": "string",
-      "description": "Which side of the join carries the other's identity: the embedded rows, or the row they hang under.",
-      "oneOf": [
-        {
-          "const": "child",
-          "description": "The embedded rows carry the identity of the row they hang under."
-        },
-        {
-          "const": "parent",
-          "description": "The row they hang under carries the identity of the embedded row it points at."
         }
       ]
     },

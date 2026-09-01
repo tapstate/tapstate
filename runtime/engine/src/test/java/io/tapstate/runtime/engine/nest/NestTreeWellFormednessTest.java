@@ -36,54 +36,83 @@ class NestTreeWellFormednessTest {
     }
 
     @Test
-    void refusesARootThatDeclaresNoKey() {
+    void fillsInAMissingRootKeyFromTheTablesOwnKey() {
+        // The root is asked what identifies one of its rows exactly as any embed is, so a root over a
+        // table that declares a key does not have to repeat it.
         TransformBody.Nest tree = nest("customer", null,
+                embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies", List.of("policy_no")));
+
+        assertThat(compile(tree).isPassthrough()).isFalse();
+    }
+
+    @Test
+    void refusesARootWithNoDeclaredKeyAndNoTableKeyToTakeOneFrom() {
+        // Nothing identifies a root row, so its documents have no identity to be grouped under and
+        // nothing to partition the assembled documents by.
+        TransformBody.Nest tree = nest("keyless", null,
                 embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies", List.of("policy_no")));
 
         assertThatThrownBy(() -> compile(tree))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.root-key-required")
-                .hasMessageContaining("rootAlias=customer");
+                .hasMessageContaining("nest.array-key-unresolvable")
+                .hasMessageContaining("table=keyless_rows");
     }
 
     @Test
-    void refusesSiblingEmbedsPointingAtDifferentColumnsOfTheirParent() {
+    void refusesTheSiblingThatPointsAtSomethingWhichIdentifiesNeitherSide() {
+        // policy_no identifies neither a policy - policies are identified by policy_id - nor a document.
+        // Read either way this groups rows on a column that names a set, so there is nothing to embed by.
         TransformBody.Nest tree = nest("customer", List.of("customer_id"),
                 embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies", List.of("policy_no"),
                         embed("claim", "policy_id", "policy_id", EmbedAs.ARRAY, "claims", List.of("claim_id")),
                         embed("document", "policy_no", "policy_no", EmbedAs.ARRAY, "docs",
                                 List.of("document_id"))));
 
-        assertThat(codeOf(tree)).isEqualTo(NestError.SIBLING_EMBEDS_TARGET_DIFFERENT_PARENT_KEYS);
+        assertThatThrownBy(() -> compile(tree))
+                .describedAs("each embed answers for itself before anything compares it with a sibling,"
+                        + " so the one at fault is named rather than the level they disagree under")
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("nest.embed-target-not-parent-key")
+                .hasMessageContaining("embedPath=policies.docs")
+                .hasMessageContaining("fields=policy_no")
+                .hasMessageContaining("parentKey=policy_id");
     }
 
     @Test
     void refusesADepthOneEmbedJoiningOnAnythingButTheRootKey() {
+        // cust_ref does not identify a policy and legacy_id does not identify a customer, so neither
+        // reading names one row. The root is asked the same two questions as any other level.
         TransformBody.Nest tree = nest("customer", List.of("customer_id"),
                 embed("policy", "cust_ref", "legacy_id", EmbedAs.ARRAY, "policies", List.of("policy_no")));
 
         assertThatThrownBy(() -> compile(tree))
                 .describedAs("the assembler is keyed by the root key and can look up nothing else")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.sibling-embeds-target-different-parent-keys")
-                .hasMessageContaining("embedPath=$root")
-                .hasMessageContaining("customer_id, legacy_id");
+                .hasMessageContaining("nest.embed-target-not-parent-key")
+                .hasMessageContaining("embedPath=policies")
+                .hasMessageContaining("fields=legacy_id")
+                .hasMessageContaining("parentKey=customer_id");
     }
 
     @Test
-    void refusesAnOnlyChildEmbedJoiningOnAnythingButItsParentsKey() {
+    void anOnlyChildJoiningOnAColumnItsParentPointsAtIsThatOtherDirection() {
+        // This tree used to be refused for joining on a column that does not identify a policy - and the
+        // reason given was that an only child has nobody to disagree with, so a wrong column goes
+        // unchallenged. The column was never wrong: author_id identifies a document, so a policy carrying
+        // one names the single document it points at. Refusing it was the defect, not the tree.
         TransformBody.Nest tree = nest("customer", List.of("customer_id"),
                 embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies", List.of("policy_no"),
                         embed("document", "document_id", "author_id", EmbedAs.OBJECT, "author", null)));
 
-        assertThatThrownBy(() -> compile(tree))
-                .describedAs("a level with one child has nothing to disagree with, so the column it joins on"
-                        + " is taken as that level's identity however wrong it is")
-                .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.embed-target-not-parent-key")
-                .hasMessageContaining("embedPath=policies")
-                .hasMessageContaining("fields=author_id")
-                .hasMessageContaining("parentKey=policy_id");
+        NestTopology topology = compile(tree);
+
+        // Pointed at rather than hanging under: it is fetched by key where the document is rendered, so
+        // it arrives on no edge into the level that names it.
+        assertThat(topology.vertices()).anySatisfy(vertex -> {
+            assertThat(vertex.pathId()).isEqualTo(List.of("policies"));
+            assertThat(vertex.inbound()).noneSatisfy(edge ->
+                    assertThat(edge.pathId()).isEqualTo(List.of("policies", "author")));
+        });
     }
 
     @Test
