@@ -98,12 +98,13 @@ jobs:
           bash .github/scripts/next-version.sh "${{ inputs.bump }}" "${{ steps.sha.outputs.sha }}" \
             | tee -a "$GITHUB_OUTPUT"
 
-      # Pinning happens once the work for this release is done, documentation included, and the
-      # documentation repository is pinned at its default branch tip. Start a release before its
-      # pages are merged and that tip predates them: the release goes out, the documentation tag is
-      # cut from the pinned tip, and it publishes a version without the page the release was waiting
-      # for. Nothing about that is visible afterwards, which is why the order is refused here rather
-      # than written down somewhere as an instruction.
+      # The pages for this release have to be written and merged before it starts. That is the same
+      # gate the release itself runs, asked here because here it is cheap to act on -- nothing has
+      # been created yet, so finishing the pages and dispatching again costs nothing. Asked later it
+      # is a release sitting at its first gate with three branches already cut.
+      #
+      # This is about the pages for what is shipping. Publishing the site is a separate thing, asked
+      # for below in an issue, and it deliberately does not gate anything.
       - name: the documentation for this range has landed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -146,13 +147,26 @@ jobs:
           bash .github/scripts/satellites.sh branch "${{ steps.version.outputs.version }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # The documentation site is not pinned and gets no branch: Netlify builds it from `next` as the
+      # preview and `main` as what the public sees, so a third branch across that pair would publish
+      # nothing or publish the wrong thing. What the release needs from it is a person merging `next`
+      # into `main`, so it is asked for in an issue. It gates nothing -- see the script for what
+      # happens when it is not done by the time the release publishes.
+      - name: ask for the documentation site to be published
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          bash .github/scripts/docs-release.sh open "${{ steps.version.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: what happens next
         run: |
           {
             echo
             echo "### Pinned — start merging again"
             echo
-            echo "\`ws/release-${{ steps.version.outputs.version }}\` now exists in tapstate and in every satellite."
+            echo "\`ws/release-${{ steps.version.outputs.version }}\` now exists in tapstate, tapstate-skills and tapstate-web."
+            echo "The documentation site is not pinned and gets no branch; it was asked for in an issue, and it gates nothing."
             echo "The freeze is over: \`main\` is free to carry on, and nothing merged from here is in this release."
             echo "The expensive half runs next, against the branch, and the default branch is not part of it."
             echo
