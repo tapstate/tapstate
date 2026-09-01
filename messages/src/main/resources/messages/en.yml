@@ -225,6 +225,9 @@ dsl.composition:
 dsl.duplicate-id:
   message: "Duplicate id '{id}' at {path}."
   solution: "Ids must be unique within the workspace; rename one of them."
+dsl.unsupported-version:
+  message: "This document declares version '{got}', which this build cannot read."
+  solution: "Write one of the supported versions: {supported}. A version is supported for two further minor releases after its successor ships."
 dsl.unsupported-mode:
   message: "Connector '{connector}' does not support mode '{mode}' at {path}."
   solution: "Choose one of the connector's supported modes: {allowed}."

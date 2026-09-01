@@ -70,6 +70,92 @@ class DslParserTest {
     }
 
     @Test
+    void parsesADocumentDeclaringTheSupportedVersion() {
+        String yaml = """
+                version: tapstate/v1
+                kind: source
+                id: src_ora
+                connector: oracle
+                config: { host: 10.20.0.15 }
+                """;
+
+        assertThat(parser.parse(yaml)).isInstanceOf(SourceResource.class);
+    }
+
+    @Test
+    void refusesAVersionItDoesNotSupport() {
+        // version selects the grammar, so a version this build does not know cannot be parsed by
+        // guessing. Until now it was accepted and the document was rewritten as v1 on the way out.
+        String yaml = """
+                version: tapstate/v2
+                kind: source
+                id: src_ora
+                connector: oracle
+                config: { host: 10.20.0.15 }
+                """;
+
+        Throwable t = catchThrowable(() -> parser.parse(yaml));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.code()).isEqualTo(DslError.UNSUPPORTED_VERSION);
+        assertThat(ex.args()).containsEntry("got", "tapstate/v2").containsEntry("supported", "tapstate/v1");
+    }
+
+    @Test
+    void refusesADocumentWithNoVersionUnderTheSameCode() {
+        // Same code, different argument: to whoever wrote the document these are one situation --
+        // it does not say which grammar it is written in -- so they get one code to look up.
+        String yaml = """
+                kind: source
+                id: src_ora
+                connector: oracle
+                config: { host: 10.20.0.15 }
+                """;
+
+        Throwable t = catchThrowable(() -> parser.parse(yaml));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.code()).isEqualTo(DslError.UNSUPPORTED_VERSION);
+        assertThat(ex.args()).containsEntry("got", "(absent)");
+    }
+
+    @Test
+    void reportsAnUnknownKindAsAKindProblemWhenTheVersionIsFine() {
+        // A supported version and an unknown kind is a kind problem, not a version one. Worth its own
+        // case because the version check runs first: were it to report on anything it did not like,
+        // every malformed document would come back as a version error.
+        String yaml = """
+                version: tapstate/v1
+                kind: sink
+                id: x
+                """;
+
+        Throwable t = catchThrowable(() -> parser.parse(yaml));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.code()).isEqualTo(DslError.ILLEGAL_VALUE);
+        assertThat(ex.path()).isEqualTo("kind");
+    }
+
+    @Test
+    void reportsTheVersionFirstWhenBothTheVersionAndTheKindAreWrong() {
+        // The version decides which grammar reads the rest, so nothing downstream means anything
+        // until it is settled -- including what counts as a kind.
+        String yaml = """
+                version: tapstate/v2
+                kind: sink
+                id: x
+                """;
+
+        Throwable t = catchThrowable(() -> parser.parse(yaml));
+
+        assertThat(((DslException) t).code()).isEqualTo(DslError.UNSUPPORTED_VERSION);
+    }
+
+    @Test
     void rejectsEverySourceOptionKey() {
         // options is the engine's own configuration, so its keys are a closed vocabulary owned by
         // the product - not a free map like config, whose keys belong to the connector. No engine

@@ -26,6 +26,12 @@ import java.util.Set;
  */
 public enum DslError implements TapstateErrorCode {
 
+    /**
+     * The document declares a grammar version this build cannot read, or declares none. One code for
+     * both: to whoever wrote it they are the same situation -- the document does not say which grammar
+     * it is in -- and the argument says which of the two happened.
+     */
+    UNSUPPORTED_VERSION("dsl.unsupported-version", Set.of("got", "supported")),
     /** A field outside the tapstate/v1 schema (§11.5, strict rejection). */
     UNKNOWN_FIELD("dsl.unknown-field", Set.of("field", "path")),
     /** A field known to the schema but banned in this position (X18/X19). */

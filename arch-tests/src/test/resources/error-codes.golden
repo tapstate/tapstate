@@ -130,6 +130,7 @@ dsl.row-expression-type-unsupported
 dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode
+dsl.unsupported-version
 dsl.upsert-needs-key
 engine.frontier-order-not-encodable
 engine.frontier-pinned

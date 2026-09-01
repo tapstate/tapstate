@@ -723,7 +723,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.serverVersion = "9.9.9";
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n")));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n")));
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         int mark = h.sink().toString().length();
@@ -1534,7 +1534,7 @@ class ReplTest {
     void getWhileAuthenticatedFetchesTheArtifactFromTheServer() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "kind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();
@@ -1574,7 +1574,7 @@ class ReplTest {
      */
     @Test
     void deleteWithoutAPreconditionReadsTheArtifactAndRemovesThatExactVersion() {
-        String canonical = "kind: source\nid: src_kfk\n";
+        String canonical = "version: tapstate/v1\nkind: source\nid: src_kfk\n";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical));
         client.deleteOutcome = new DeleteOutcome.Removed("src_kfk");
@@ -1619,7 +1619,7 @@ class ReplTest {
         // A script removing resources needs to know what it removed, and "deleted source src_kfk" is a
         // sentence, not a result. The precondition actually used is part of it: without --if-match the
         // verb picks the version itself, and the caller has no other way to learn which one went.
-        String canonical = "kind: source\nid: src_kfk\n";
+        String canonical = "version: tapstate/v1\nkind: source\nid: src_kfk\n";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical));
         client.deleteOutcome = new DeleteOutcome.Removed("src_kfk");
@@ -1971,8 +1971,8 @@ class ReplTest {
     void lsWhileConnectedListsServerArtifactsNotTheLocalWorkspace() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n"),
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\n")));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"),
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\n")));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("ls")).isTrue();
@@ -1985,7 +1985,7 @@ class ReplTest {
     void lsWhileConnectedShowsUnreadableServerArtifactsWithoutFailingTheListing() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n"),
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"),
                 new RemoteArtifact("p1", "pipeline", "not: [valid", false)));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -2059,7 +2059,7 @@ class ReplTest {
     /** A stored source connection whose canonical form carries the connector id and its connection config. */
     private static GetOutcome.Found storedConnection() {
         return new GetOutcome.Found(new RemoteArtifact("my-mongo", "source",
-                "kind: source\nid: my-mongo\nconnector: mongodb\nconfig:\n  host: db.internal\n  username: cdc\n"));
+                "version: tapstate/v1\nkind: source\nid: my-mongo\nconnector: mongodb\nconfig:\n  host: db.internal\n  username: cdc\n"));
     }
 
     private static ConnectionTestOutcome.Tested passedReport() {
@@ -2362,7 +2362,7 @@ class ReplTest {
     void testOnANonSourceIdReportsNotATestableConnectionAndDoesNotProbe() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\nid: kfk2my\n"));
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\nid: kfk2my\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -2610,7 +2610,7 @@ class ReplTest {
     void discoverSchemaOnANonSourceIdReportsNotDiscoverableAndDoesNotDiscover() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\nid: kfk2my\n"));
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\nid: kfk2my\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -3280,7 +3280,7 @@ class ReplTest {
         copyWorkspace("/ws-valid", base);   // a real local source/src_kfk.tap.yml exists in the workspace
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact(
-                "src_kfk", "source", "kind: source\nid: src_kfk\nserver_marker: REMOTE\n"));
+                "src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\nserver_marker: REMOTE\n"));
         Harness h = onlineSession(base, client);
         int mark = h.sink().toString().length();
         h.repl().dispatch("get src_kfk");
@@ -3469,7 +3469,7 @@ class ReplTest {
         // a subdirectory that cannot be listed makes Files.walk raise UncheckedIOException mid-traversal;
         // apply must render a benign "cannot read" line, not let that escape and crash the REPL session
         Path locked = Files.createDirectory(base.resolve("source"));
-        Files.writeString(locked.resolve("s.tap.yml"), "kind: source\nid: x\n");
+        Files.writeString(locked.resolve("s.tap.yml"), "version: tapstate/v1\nkind: source\nid: x\n");
         assumeTrue(Files.getFileAttributeView(locked, PosixFileAttributeView.class) != null,
                 "POSIX permissions required to make a subdirectory unreadable");
         Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("---------"));
@@ -4034,7 +4034,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(
                 URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", "kind: source\n"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
         h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
@@ -4054,7 +4054,7 @@ class ReplTest {
     void anOnlineVerbWithNoReachableMemberLosesTheConnectionAndReportsItOnce() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("x", "source", "kind: source\n"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("x", "source", "version: tapstate/v1\nkind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
         h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
@@ -4074,7 +4074,7 @@ class ReplTest {
     void aSuccessfulOnlineVerbYieldsSuccess() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "kind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         h.repl().dispatch("get src_kfk");
         assertThat(h.repl().lastExitCode()).isZero();

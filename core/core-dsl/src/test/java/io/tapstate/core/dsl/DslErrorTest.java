@@ -21,6 +21,7 @@ class DslErrorTest {
     @Test
     void carriesTheCorpusVocabularyCodes() {
         assertThat(DslError.values()).extracting(DslError::code).containsExactlyInAnyOrder(
+                "dsl.unsupported-version",
                 "dsl.unknown-field",
                 "dsl.forbidden-field",
                 "dsl.missing-reference",

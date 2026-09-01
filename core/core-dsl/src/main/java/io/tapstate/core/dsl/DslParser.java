@@ -121,6 +121,7 @@ public final class DslParser {
                     Map.of("value", YamlMap.nodeTypeName(root), "expected", "a mapping"));
         }
         YamlMap doc = YamlMap.of(mapping, "");
+        requireSupportedVersion(doc, mapping);
         String kind = doc.string("kind");
         return switch (kind) {
             case "source" -> source(doc);
@@ -132,6 +133,25 @@ public final class DslParser {
                     Map.of("value", kind == null ? "(absent)" : kind,
                             "expected", "one of: source, pipeline, transform, view, serve"));
         };
+    }
+
+    /**
+     * Settles the declared grammar version before anything else is read. It decides which grammar
+     * reads the rest, so nothing downstream means anything until it holds -- including what counts as
+     * a kind. A document that declares nothing is refused under the same code as one declaring a
+     * version this build cannot read: to whoever wrote it those are one situation, and the argument
+     * says which happened.
+     *
+     * <p>One version exists today. When a successor ships, this becomes the set of versions still
+     * readable -- a version stays readable for two further minor releases after its successor.
+     */
+    private static void requireSupportedVersion(YamlMap doc, MappingNode at) {
+        String declared = doc.string("version");
+        if (!Resource.VERSION.equals(declared)) {
+            throw YamlMap.error(DslError.UNSUPPORTED_VERSION, "version", at,
+                    Map.of("got", declared == null ? "(absent)" : declared,
+                            "supported", Resource.VERSION));
+        }
     }
 
     // ---- source -------------------------------------------------------------------
