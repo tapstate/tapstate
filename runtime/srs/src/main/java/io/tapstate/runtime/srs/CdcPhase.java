@@ -21,6 +21,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
+import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -94,7 +95,9 @@ public final class CdcPhase {
         Objects.requireNonNull(health, "health");
         // One chain serves every table this subscription sees, so the route resolves to it whatever the
         // change names -- the same run-writing path the multi-table entry point takes.
-        TableRoute route = new TableRoute(chain, minConsumerReadSeq, consumers);
+        // No ring name and no log reach this entry point, so there is nothing here that could name what
+        // to cut. The caller that owns both wires a real cut through the other entry point.
+        TableRoute route = new TableRoute(chain, minConsumerReadSeq, consumers, seq -> { });
         return port.cdc(config, start, health.recording(
                 (events, position) -> writeBatch(events, position, table -> route)));
     }
@@ -128,15 +131,28 @@ public final class CdcPhase {
                 (events, position) -> writeBatch(events, position, routeSnapshot::get)));
     }
 
+    /**
+     * One table's wiring: its ring, the slowest consumer's cursor in it, the chain's consumer offsets, and
+     * a cut of the durable log behind it.
+     *
+     * <p>{@code trimThrough} is handed the sequence every consumer has durably landed, and drops the log
+     * at or below it -- a change every consumer has landed has no replay value left, and without the cut
+     * the log grows without bound. <strong>Whether that sequence can be attributed to this ring at all is
+     * the caller's to know</strong>, not this phase's: a chain carrying several tables records one acked
+     * position for the whole chain, and its sequence came from whichever ring held that change. A caller
+     * that cannot attribute it passes a cut that does nothing, and says why where it does so.
+     */
     public record TableRoute(
             CdcChain chain,
             LongSupplier minConsumerReadSeq,
-            Supplier<Collection<ConsumerOffset>> consumers) {
+            Supplier<Collection<ConsumerOffset>> consumers,
+            LongConsumer trimThrough) {
 
         public TableRoute {
             Objects.requireNonNull(chain, "chain");
             Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
             Objects.requireNonNull(consumers, "consumers");
+            Objects.requireNonNull(trimThrough, "trimThrough");
         }
     }
 
@@ -192,8 +208,15 @@ public final class CdcPhase {
         CdcChain chain = closing.chain();
         ChainPosition read = new ChainPosition(new SourceOrder(chain.epoch(), closingSeq),
                 position.map(SourcePosition::token).orElse(null));
-        SrsDurableFrontier.safeAdvance(read, closing.consumers().get())
-                .ifPresent(safe -> chain.meta().advanceSourceReadOffset(chain.miningChainId(), safe));
+        SrsDurableFrontier.safeAdvance(read, closing.consumers().get()).ifPresent(safe -> {
+            chain.meta().advanceSourceReadOffset(chain.miningChainId(), safe);
+            // The same frontier bounds what the log still has to keep: every consumer has durably landed
+            // the change at that sequence, so nothing will ever replay it or anything before it. The cut
+            // rides the frontier rather than running on its own clock because this is the only moment the
+            // frontier is known to have moved -- and it costs one more call on a path that already makes
+            // one, rather than one per change.
+            closing.trimThrough().accept(safe.order().seq());
+        });
     }
 
     /**

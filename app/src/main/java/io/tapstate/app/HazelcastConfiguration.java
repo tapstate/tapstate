@@ -68,6 +68,13 @@ class HazelcastConfiguration {
         if (srsMetaStore != null) {
             member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, srsMetaStore);
         }
+        // Bind the change log too, so the capture runtime can cut it back at the durable frontier. The
+        // rings already reach it through their own configuration; this is the same store, reached the way
+        // everything else the runtime resolves member-side is reached. A run with no store binds nothing,
+        // and nothing is cut -- because nothing was written down either.
+        if (srsLogStore != null) {
+            member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, srsLogStore);
+        }
         // Bind the connector provisioner onto the member so a sink-writer factory -- carried onto the Jet
         // sink vertex and resolved member-side -- can reach it and open its target connector. A run with no
         // provisioner (mongo disabled) binds nothing, and the member is then not sink-capable: a sink open

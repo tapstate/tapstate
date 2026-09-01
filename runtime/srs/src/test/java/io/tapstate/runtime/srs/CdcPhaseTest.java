@@ -171,6 +171,32 @@ class CdcPhaseTest {
     }
 
     @Test
+    void cutsTheDurableLogBackToWhatEveryConsumerHasLanded() {
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.trim")));
+        RecordingMeta meta = new RecordingMeta();
+        // One consumer, durably acked at ring sequence 1.
+        List<ConsumerOffset> consumers = List.of(new ConsumerOffset(
+                "p1", Map.of("orders", 9L), new ChainPosition(new SourceOrder(RING_GENERATION, 1), "w2")));
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+        List<Long> cuts = new ArrayList<>();
+        Map<String, CdcPhase.TableRoute> routes = Map.of("orders", new CdcPhase.TableRoute(
+                chain, () -> Long.MAX_VALUE, () -> consumers, cuts::add));
+        FakeCdcPort port = new FakeCdcPort(List.of(
+                Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
+                Envelope.insert(2, "orders", Map.of("id", 2), Map.of()),
+                Envelope.insert(3, "orders", Map.of("id", 3), Map.of())));
+
+        CdcPhase.run(port, config(), routes, new CaptureHealth());
+
+        // The cut is the same clamped frontier the offset advance uses: sequence 0 while the reader is
+        // still behind the ack, then the ack itself once it is not. A log that is never cut grows without
+        // bound, and a cut that ran ahead of this would delete a change a consumer has not landed.
+        assertThat(cuts)
+                .as("the cut rides the frontier, so it is asked for on every advance and never passes it")
+                .containsExactly(0L, 1L, 1L);
+    }
+
+    @Test
     void backpressuresARefusedWriteAndRetriesRatherThanDropIt() throws Exception {
         Ringbuffer<SrsItem> raw = hz.getRingbuffer("srs.chain.backpressure");
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(raw));

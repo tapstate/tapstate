@@ -10,6 +10,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 
 import java.util.Collection;
@@ -20,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
+import java.util.function.LongConsumer;
 import java.util.function.Supplier;
 
 /**
@@ -44,6 +46,14 @@ public final class CaptureRunUnit {
      * this key when it makes the member SRS-capable.
      */
     public static final String SRS_META_USER_CONTEXT_KEY = "tapstate.srs.meta";
+
+    /**
+     * The member user-context key under which the durable change log is bound. The log is reached through
+     * the member rather than through this class's constructor because the member is where it already lives
+     * -- the rings resolve it from their own configuration -- and a run without a store binds nothing,
+     * which reads here as "there is no log to cut".
+     */
+    public static final String SRS_LOG_USER_CONTEXT_KEY = "tapstate.srs.log";
 
     private final CapturePort port;
     private final SrsCoordinator coordinator;
@@ -127,6 +137,17 @@ public final class CaptureRunUnit {
                 consumerAttached = true;
                 Supplier<Collection<ConsumerOffset>> consumers =
                         () -> meta.read(cid).map(SrsMeta::consumerOffsets).orElse(List.of());
+                // What the acked position can be attributed to decides whether this chain's log can be
+                // cut at all. A chain records one acked position for the whole chain, and the sequence in
+                // it came from whichever table's ring held that change -- on a chain of one table there is
+                // only one ring it could be, so the frontier bounds that log exactly; on a chain of several
+                // there is no way to tell which, and cutting the wrong ring deletes changes that still have
+                // to be replayed. So a multi-table chain keeps everything, and will until an acked position
+                // is recorded per table. That is not a smaller version of this cut, it is a different
+                // record, and it belongs with the work that makes a table recoverable on its own.
+                SrsLogStore log = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY) instanceof SrsLogStore
+                        bound ? bound : null;
+                boolean cuttable = log != null && tables.size() == 1;
                 Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
                 for (String table : tables) {
                     String ringName = SrsRingbuffer.ringName(cid, table);
@@ -135,8 +156,9 @@ public final class CaptureRunUnit {
                     // one ring is comparable with a sequence of another exactly when both were opened by the
                     // same provisioning.
                     CdcChain chain = new CdcChain(gate, meta, cid, ringEpoch, spec.schemaVer());
+                    LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
                     routes.put(table, new CdcPhase.TableRoute(
-                            chain, () -> minConsumerReadSeq(meta, cid, table), consumers));
+                            chain, () -> minConsumerReadSeq(meta, cid, table), consumers, trim));
                 }
                 subscription = Optional.of(
                         CdcPhase.run(port, spec.config(), tailStart(meta, cid), routes, health));
