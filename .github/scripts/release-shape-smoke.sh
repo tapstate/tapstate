@@ -55,17 +55,22 @@ has "the publish job waits on the approval" publish 'needs:.*approve'
 # publish it announces: a satellite tagged first links to a release page that does not exist, and for
 # the documentation repository the tag is what makes the documentation public.
 has "the satellite job waits on the publish it announces" satellites 'needs:.*publish'
-# On the publish path the branches are retired inside that same job, after the tagging it depends on,
-# and not by anything that runs regardless: a cleanup under always() there would delete the pin while
-# the failure that needed it is still being read.
-hasnt "the publish path retires nothing unconditionally" satellites 'always()'
-# The rejected path is the opposite, and deliberately so. Leaving the branches behind is not neutral:
-# release-start refuses a branch that already exists, so a rejected release would block its own retry
-# until somebody deleted three refs by hand. They are cheap to cut again -- the freeze that creates
-# them is one dispatch long.
-has "a rejected release retires its branches too" discard 'satellites[.]sh unbranch'
+# One job retires the branches, and it runs however the attempt ended. An attempt is atomic: nothing
+# is carried from one to the next, so a branch left behind is never a pin somebody still needs -- it
+# is only something in the way of the next attempt, which refuses a branch of that name. Measured
+# twice in one day: a release died before a draft existed, the cleanup was conditional on a draft
+# having been assembled, and so it never ran; three refs in three repositories were deleted by hand.
+has "the branches are retired by one job whatever happened" cleanup 'satellites[.]sh unbranch'
 # shellcheck disable=SC2016  # the workflow's own text is `$branch`; expanding it here would search for ours
-has "including this repository's own"              discard 'refs/heads/\$branch'
+has "including this repository's own"                       cleanup 'refs/heads/\$branch'
+has "and it runs even when the run failed"                  cleanup 'always\('
+# The one state where the pin is still owed to somebody: the release published and the satellites did
+# not finish being tagged. Their branches are then the only record of what they were meant to point
+# at, and deleting them turns a half-finished release into one nobody can finish by hand.
+has "except while a published release still owes its satellites" cleanup 'needs[.]satellites[.]result'
+# Not in the satellite job any more, and not conditional on a draft. Those were the two shapes that
+# between them left every failed attempt's branches standing.
+hasnt "the publish path retires no branches of its own" satellites 'unbranch'
 
 # Anything that pushes an image, publishes a release, or moves the floating pointer, in a job that
 # does not need the approval, is the failure this file exists for. Checked over every job there is,
@@ -95,9 +100,21 @@ hasnt "and does not run the release action again"    publish 'action-gh-release'
 
 # C7. Rejected, timed out, or failed on the way: the draft is the one thing a rejection can leave
 # behind that still looks publishable.
-has "a rejected run deletes its draft"        discard 'gh release delete'
-has "and it runs even when the run failed"    discard 'always\(\)'
-has "and only when nothing was published"     discard "publish.result != 'success'"
+has "a rejected run deletes its draft"        cleanup 'gh release delete'
+has "and only when nothing was published"     cleanup "publish.result != 'success'"
+# The documentation site was asked, in an issue, to publish a version that is now not being released.
+# Nothing retired that request: two abandoned attempts at one version left two open issues asking for
+# it, and the person they are assigned to had no way to tell either from a real one.
+has "and retires the request it made of the documentation site" cleanup 'docs-release[.]sh retire'
+
+# --- one dispatch: the pin is this workflow's own first job ----------------------------------------
+# There is no separate workflow to dispatch first. The freeze lasts exactly as long as this job, which
+# is why it builds nothing; a person watching the run sees a job go green rather than having to watch
+# a step list inside a long one.
+has "the release pins its own commit"     version 'git/refs'
+has "and pins every satellite"            version 'satellites[.]sh branch'
+has "and asks the documentation site"     version 'docs-release[.]sh open'
+has "and refuses a branch that exists"    version 'already exists'
 
 # Gate 2 is the only one of the six with no step of its own: it is the smokes in `cli-native`, and it
 # blocks by being something the gate needs. Both halves are asserted, because either one going away
