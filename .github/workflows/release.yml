@@ -638,6 +638,18 @@ jobs:
           .github/scripts/satellites.sh release "${{ needs.version.outputs.version }}" \
             --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+      # Not pinned, not gated, and not allowed to stop this. The site is published by a person merging
+      # one branch into another, which was asked for when the release started; this either finds that
+      # done and creates the tag, or asks again in a new issue. It exits 0 either way -- a release
+      # that stopped here would be hostage to one person's morning.
+      - name: settle the documentation site
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/docs-release.sh settle "${{ needs.version.outputs.version }}" \
+            --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       # Only once every satellite has been released. A failure above stops the job here and the
       # branches survive for a retry -- which is why this is a later step and not a later job with
       # always(): a cleanup that runs whatever happened would delete the evidence of what went wrong
@@ -804,3 +816,25 @@ jobs:
           fi
           gh release delete "${{ needs.version.outputs.tag }}" --yes
           echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. No tag was created, no image was pushed." >> "$GITHUB_STEP_SUMMARY"
+      # And the branches, on this path too. They are cheap to cut again -- the freeze that creates
+      # them is one dispatch long -- and leaving them behind is not neutral: release-start refuses a
+      # branch that already exists, so a rejected release would block its own retry until somebody
+      # went and deleted three refs by hand.
+      - name: retire the release branches this release did not use
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/satellites.sh unbranch "${{ needs.version.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: retire tapstate's own release branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="ws/release-${{ needs.version.outputs.version }}"
+          if gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$branch" >/dev/null 2>&1; then
+            echo "${{ github.repository }}  $branch deleted" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "${{ github.repository }}  $branch was already gone" >> "$GITHUB_STEP_SUMMARY"
+          fi

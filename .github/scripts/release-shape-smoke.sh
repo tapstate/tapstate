@@ -55,9 +55,17 @@ has "the publish job waits on the approval" publish 'needs:.*approve'
 # publish it announces: a satellite tagged first links to a release page that does not exist, and for
 # the documentation repository the tag is what makes the documentation public.
 has "the satellite job waits on the publish it announces" satellites 'needs:.*publish'
-# And the branches are retired inside that same job rather than by anything that runs regardless. A
-# cleanup under always() deletes the pin while the failure that needed it is still being read.
-hasnt "nothing retires a release branch unconditionally" satellites 'always()'
+# On the publish path the branches are retired inside that same job, after the tagging it depends on,
+# and not by anything that runs regardless: a cleanup under always() there would delete the pin while
+# the failure that needed it is still being read.
+hasnt "the publish path retires nothing unconditionally" satellites 'always()'
+# The rejected path is the opposite, and deliberately so. Leaving the branches behind is not neutral:
+# release-start refuses a branch that already exists, so a rejected release would block its own retry
+# until somebody deleted three refs by hand. They are cheap to cut again -- the freeze that creates
+# them is one dispatch long.
+has "a rejected release retires its branches too" discard 'satellites[.]sh unbranch'
+# shellcheck disable=SC2016  # the workflow's own text is `$branch`; expanding it here would search for ours
+has "including this repository's own"              discard 'refs/heads/\$branch'
 
 # Anything that pushes an image, publishes a release, or moves the floating pointer, in a job that
 # does not need the approval, is the failure this file exists for. Checked over every job there is,
@@ -65,9 +73,9 @@ hasnt "nothing retires a release branch unconditionally" satellites 'always()'
 for j in $jobs_list; do
   case "$j" in publish|satellites) continue ;; esac
   body="$(job "$j")"
-  if grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest=|satellites[.]sh release' <<<"$body"; then
+  if grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest=|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
     bad "no irreversible act in '$j'" \
-        "$(grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=|satellites[.]sh release' <<<"$body" | head -1)"
+        "$(grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=|satellites[.]sh release|docs-release[.]sh settle' <<<"$body" | head -1)"
   else
     ok "no irreversible act in '$j'"
   fi
