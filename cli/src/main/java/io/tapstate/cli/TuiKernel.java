@@ -87,6 +87,8 @@ final class TuiKernel {
                 case TuiEvent.Tick ignored -> List.of(new TuiAction.Tick());
                 case TuiEvent.ActionPosted posted -> List.of(posted.action());
                 case TuiEvent.ContextSessionPosted posted -> List.of(new TuiAction.ContextSession(posted.action()));
+                case TuiEvent.ResourceRefreshCompleted completed -> List.of(
+                        new TuiAction.RefreshCompleted(completed.result()));
                 case TuiEvent.Resize ignored -> List.of();
                 case TuiEvent.InputClosed ignored -> List.of();
             };

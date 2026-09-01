@@ -50,6 +50,16 @@ final class TuiDashboard {
         }
     }
 
+    /** A redacted, render-ready summary of one remote pipeline. */
+    record PipelineSummary(String id, String state, String detail, String revision) {
+        PipelineSummary {
+            id = id == null || id.isBlank() ? "?" : id;
+            state = state == null || state.isBlank() ? "UNKNOWN" : state;
+            detail = detail == null ? "" : detail;
+            revision = revision == null || revision.isBlank() ? null : revision;
+        }
+    }
+
     record Prompt(String question, String input, String hint, boolean secret, List<String> options,
                   int selectedIndex, List<String> lines) {
         Prompt {
@@ -86,7 +96,7 @@ final class TuiDashboard {
     record State(Path workspace, String context, String principal, Connection connection, String notice,
                  String command, List<String> palette, int paletteIndex, Prompt prompt,
                  String endpoint, String clusterName, String authStatus, List<String> activity,
-                 List<ResourceSummary> resources) {
+                 List<ResourceSummary> resources, List<PipelineSummary> pipelines, String refreshedAt) {
         State {
             if (workspace == null || connection == null) {
                 throw new IllegalArgumentException("workspace and connection are required");
@@ -95,27 +105,37 @@ final class TuiDashboard {
             palette = palette == null ? List.of() : List.copyOf(palette);
             activity = activity == null ? List.of() : List.copyOf(activity);
             resources = resources == null ? List.of() : List.copyOf(resources);
+            pipelines = pipelines == null ? List.of() : List.copyOf(pipelines);
+            refreshedAt = refreshedAt == null || refreshedAt.isBlank() ? null : refreshedAt;
             paletteIndex = palette.isEmpty() ? 0 : Math.max(0, Math.min(paletteIndex, palette.size() - 1));
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    null, null, null, List.of(), List.of());
+                    null, null, null, List.of(), List.of(), List.of(), null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt,
               String endpoint, String clusterName, String authStatus) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    endpoint, clusterName, authStatus, List.of(), List.of());
+                    endpoint, clusterName, authStatus, List.of(), List.of(), List.of(), null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt,
               String endpoint, String clusterName, String authStatus, List<String> activity) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    endpoint, clusterName, authStatus, activity, List.of());
+                    endpoint, clusterName, authStatus, activity, List.of(), List.of(), null);
+        }
+
+        State(Path workspace, String context, String principal, Connection connection, String notice,
+              String command, List<String> palette, int paletteIndex, Prompt prompt,
+              String endpoint, String clusterName, String authStatus, List<String> activity,
+              List<ResourceSummary> resources) {
+            this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
+                    endpoint, clusterName, authStatus, activity, resources, List.of(), null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice) {
@@ -192,10 +212,14 @@ final class TuiDashboard {
             body.add("  [Enter] Create or choose context");
             body.add("  [o] Stay offline");
         } else if (width >= SPLIT_WIDTH) {
-            appendSplitBody(rows, state.resources(), state.activity(), bodyRows, width);
+            appendSplitBody(rows, state.resources(), state.pipelines(), state.refreshedAt(),
+                    state.activity(), bodyRows, width);
             body = null;
         } else {
             body.addAll(resourceRows(state.resources()));
+            if (!state.pipelines().isEmpty() || state.refreshedAt() != null) {
+                body.addAll(pipelineRows(state.pipelines(), state.refreshedAt()));
+            }
             body.addAll(activityRows(state.activity()));
         }
         if (body != null) {
@@ -263,13 +287,42 @@ final class TuiDashboard {
         return rows;
     }
 
+    private static List<String> pipelineRows(List<PipelineSummary> pipelines, String refreshedAt) {
+        List<String> rows = new ArrayList<>();
+        String suffix = refreshedAt == null ? "" : " · refreshed " + refreshedAt;
+        rows.add("  Pipelines (" + pipelines.size() + ")" + suffix);
+        if (pipelines.isEmpty()) {
+            rows.add(refreshedAt == null ? "    awaiting remote refresh" : "    no remote pipelines");
+            return rows;
+        }
+        for (PipelineSummary pipeline : pipelines) {
+            String revision = pipeline.revision() == null ? "" : "  rev " + pipeline.revision();
+            String detail = pipeline.detail().isBlank() ? "" : "  " + pipeline.detail();
+            rows.add("    " + pipeline.id() + "  " + pipeline.state() + revision + detail);
+        }
+        return rows;
+    }
+
     private static void appendSplitBody(List<AttributedString> rows, List<ResourceSummary> resources,
-                                        List<String> activity, int capacity, int width) {
+                                        List<PipelineSummary> pipelines, String refreshedAt, List<String> activity,
+                                        int capacity, int width) {
         if (capacity <= 0) {
             return;
         }
         List<String> left = resourceRows(resources);
-        List<String> right = activityRows(activity);
+        boolean hasRemoteSnapshot = !pipelines.isEmpty() || refreshedAt != null;
+        List<String> right = hasRemoteSnapshot
+                ? new ArrayList<>(pipelineRows(pipelines, refreshedAt))
+                : new ArrayList<>();
+        List<String> activityPane = activityRows(activity);
+        if (hasRemoteSnapshot) {
+            right.set(0, right.getFirst() + "  ·  Activity");
+            if (activityPane.size() > 1) {
+                right.addAll(activityPane.subList(1, activityPane.size()));
+            }
+        } else {
+            right.addAll(activityPane);
+        }
         int gap = 3;
         // Keep enough room for resource details (especially misplaced-artifact hints) while
         // leaving a useful activity pane on the right.

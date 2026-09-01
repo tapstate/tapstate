@@ -29,7 +29,7 @@ final class TuiApp {
     private static final int DEFAULT_WIDTH = 100;
     private static final int DEFAULT_HEIGHT = 24;
     private static final int READ_TIMEOUT_MILLIS = 250;
-    private static final long DASHBOARD_REFRESH_MILLIS = 1000L;
+    private static final long DASHBOARD_REFRESH_MILLIS = 5000L;
     private static final String PALETTE_NOTICE =
             "commands: ↑/↓ choose · Enter select · Esc close";
     private static final List<String> PALETTE_COMMANDS = List.of(
@@ -43,6 +43,7 @@ final class TuiApp {
     private final String initialContext;
     private final ContextResolver contextResolver;
     private final TuiSessionRecovery sessionRecovery;
+    private final TuiResourceRefresh resourceRefresh;
     private final AtomicBoolean interrupted = new AtomicBoolean();
 
     private NonBlockingReader reader;
@@ -54,6 +55,7 @@ final class TuiApp {
     /** True while a command is resolving a target or waiting on the control plane. */
     private boolean commandRunning;
     private long recoveryScheduledGeneration = -1L;
+    private long refreshSequence;
     private String pendingContextSelection;
 
     TuiApp(Repl repl, StringWriter out, StringWriter err, String initialContext) {
@@ -68,6 +70,8 @@ final class TuiApp {
         this.initialContext = initialContext;
         this.contextResolver = contextResolver;
         this.sessionRecovery = authService == null ? null : new TuiSessionRecovery(authService,
+                command -> Thread.startVirtualThread(command));
+        this.resourceRefresh = new TuiResourceRefresh(repl.controlPlane(),
                 command -> Thread.startVirtualThread(command));
         this.uiState = TuiAppState.initial(consumeOutput());
         this.kernel = new TuiKernel(uiState);
@@ -157,11 +161,16 @@ final class TuiApp {
                 lastHeight = height;
                 nextDashboardRefresh = System.nanoTime() + Duration.ofMillis(DASHBOARD_REFRESH_MILLIS).toNanos();
             }
+            if (System.nanoTime() >= nextDashboardRefresh) {
+                startDashboardRefreshIfNeeded(width);
+                nextDashboardRefresh = System.nanoTime() + Duration.ofMillis(DASHBOARD_REFRESH_MILLIS).toNanos();
+            }
             int code = reader.read(READ_TIMEOUT_MILLIS);
             if (code == NonBlockingReader.READ_EXPIRED) {
                 if (System.nanoTime() >= nextDashboardRefresh) {
                     kernel.dispatch(new TuiEvent.Tick());
                     uiState = kernel.state();
+                    startDashboardRefreshIfNeeded(width);
                     draw(display, terminal);
                     nextDashboardRefresh = System.nanoTime() + Duration.ofMillis(DASHBOARD_REFRESH_MILLIS).toNanos();
                 }
@@ -465,6 +474,21 @@ final class TuiApp {
         terminal.flush();
     }
 
+    private void startDashboardRefreshIfNeeded(int width) {
+        Session session = repl.session();
+        if (width < TuiDashboard.COMPACT_WIDTH || uiState.refreshInFlight()
+                || uiState.paletteOpen() || uiState.prompt() != null || commandRunning
+                || uiState.contextSession().connection() != TuiDashboard.Connection.ONLINE
+                || !session.isAuthenticated() || session.landingNode() == null || session.credential() == null) {
+            return;
+        }
+        long requestId = ++refreshSequence;
+        long generation = uiState.contextSession().generation();
+        kernel.dispatch(new TuiEvent.ActionPosted(new TuiAction.RefreshStarted(requestId, generation)));
+        uiState = kernel.state();
+        resourceRefresh.refresh(requestId, generation, session.landingNode(), session.credential(), kernel::post);
+    }
+
     private TuiAppState reduce(TuiAction action) {
         kernel.dispatch(new TuiEvent.ActionPosted(action));
         return kernel.state();
@@ -607,7 +631,9 @@ final class TuiApp {
                 uiState.command(), uiState.palette(), uiState.paletteIndex(), uiState.prompt(),
                 session.landingNode() == null ? null : session.landingNode().toString(),
                 session.clusterName(), authStatus(contextSession, session), uiState.activity(),
-                TuiWorkspaceSnapshot.scan(repl.workdir()));
+                uiState.resources().isEmpty() && uiState.lastRefreshAt() == null
+                        ? TuiWorkspaceSnapshot.scan(repl.workdir()) : uiState.resources(),
+                uiState.pipelines(), uiState.lastRefreshAt());
     }
 
     private static String authStatus(TuiContextSessionState contextSession, Session session) {

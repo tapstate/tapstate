@@ -258,6 +258,11 @@ final class Repl {
         return session;
     }
 
+    /** The shared control-plane client used by the REPL and TUI surfaces. */
+    ControlPlaneClient controlPlane() {
+        return controlPlane;
+    }
+
     /** Replaces the prompt adapter when a presentation surface owns its own input loop. */
     void prompter(Prompter replacement) {
         this.prompter = replacement;

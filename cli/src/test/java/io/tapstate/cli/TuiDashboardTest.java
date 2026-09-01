@@ -205,13 +205,31 @@ class TuiDashboardTest {
                         TuiDashboard.Connection.ONLINE, null, "", List.of(), 0, null,
                         "http://127.0.0.1:8081", "tapstate-prod", "authenticated",
                         List.of("> ls pipeline", "✓ 2 pipelines"), List.of(
-                                new TuiDashboard.ResourceSummary("pipeline", "orders", "1 source", null, true, false))),
+                                new TuiDashboard.ResourceSummary("pipeline", "orders", "1 source", null, true, false)),
+                        List.of(new TuiDashboard.PipelineSummary("orders", "RUNNING", "status refreshed", "17")),
+                        "2026-09-01T00:00:02Z"),
                 120, 24);
 
         assertThat(lines).anyMatch(line -> line.toString().contains("Resources")
                 && line.toString().contains("Activity"));
         assertThat(lines).anyMatch(line -> line.toString().contains("orders  1 source"));
+        assertThat(lines).anyMatch(line -> line.toString().contains("orders  RUNNING  rev 17"));
+        assertThat(lines).anyMatch(line -> line.toString().contains("refreshed 2026-09-01T00:00:02Z"));
         assertThat(lines).anyMatch(line -> line.toString().contains("> ls pipeline"));
         assertThat(lines).allSatisfy(line -> assertThat(line.toString()).hasSize(120));
+    }
+
+    @Test
+    void keepsRemotePipelinePaneOutOfCompactFrames() {
+        List<AttributedString> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", null,
+                        TuiDashboard.Connection.ONLINE, null, "", List.of(), 0, null,
+                        null, null, "authenticated", List.of(), List.of(),
+                        List.of(new TuiDashboard.PipelineSummary("orders", "RUNNING", "safe", null)),
+                        "2026-09-01T00:00:02Z"),
+                50, 12);
+
+        assertThat(lines).noneMatch(line -> line.toString().contains("Pipelines")
+                || line.toString().contains("safe"));
     }
 }

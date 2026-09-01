@@ -56,8 +56,9 @@ class TuiReducerTest {
             state = TuiReducer.reduce(state, new TuiAction.AppendActivity("entry-" + index));
         }
 
-        assertThat(state.activity()).containsExactly(
-                "entry-3", "entry-4", "entry-5", "entry-6", "entry-7", "entry-8", "entry-9", "entry-10");
+        assertThat(state.activity()).hasSize(TuiAppState.MAX_ACTIVITY);
+        assertThat(state.activity().getFirst()).isEqualTo("entry-" + 3);
+        assertThat(state.activity().getLast()).isEqualTo("entry-" + (TuiAppState.MAX_ACTIVITY + 2));
     }
 
     @Test
@@ -66,5 +67,48 @@ class TuiReducerTest {
                 new TuiAction.AppendActivity("token: tok_live password=hunter2"));
 
         assertThat(state.activity()).containsExactly("token: [redacted] password=[redacted]");
+    }
+
+    @Test
+    void acceptsOnlyTheCurrentResourceRefreshCompletion() {
+        TuiAppState state = TuiAppState.initial("ready");
+        state = TuiReducer.reduce(state, new TuiAction.RefreshStarted(7L, 0L));
+
+        TuiResourceRefreshResult stale = new TuiResourceRefreshResult(6L, 0L,
+                List.of(new TuiDashboard.ResourceSummary("pipeline", "old", "RUNNING", null, true, false)),
+                List.of(new TuiDashboard.PipelineSummary("old", "RUNNING", "old", null)),
+                "2026-09-01T00:00:00Z", "stale");
+        TuiAppState afterStale = TuiReducer.reduce(state, new TuiAction.RefreshCompleted(stale));
+
+        assertThat(afterStale.resources()).isEmpty();
+        assertThat(afterStale.refreshInFlight()).isTrue();
+
+        TuiResourceRefreshResult current = new TuiResourceRefreshResult(7L, 0L,
+                List.of(new TuiDashboard.ResourceSummary("pipeline", "new", "PAUSED", null, true, false)),
+                List.of(new TuiDashboard.PipelineSummary("new", "PAUSED", "new", null)),
+                "2026-09-01T00:00:01Z", "refreshed");
+        TuiAppState afterCurrent = TuiReducer.reduce(afterStale, new TuiAction.RefreshCompleted(current));
+
+        assertThat(afterCurrent.resources()).extracting(TuiDashboard.ResourceSummary::id)
+                .containsExactly("new");
+        assertThat(afterCurrent.pipelines()).extracting(TuiDashboard.PipelineSummary::state)
+                .containsExactly("PAUSED");
+        assertThat(afterCurrent.refreshInFlight()).isFalse();
+        assertThat(afterCurrent.lastRefreshAt()).isEqualTo("2026-09-01T00:00:01Z");
+    }
+
+    @Test
+    void dropsRefreshResultsFromAnOlderContext() {
+        TuiAppState state = TuiAppState.initial("ready");
+        state = TuiReducer.reduce(state, new TuiAction.ContextSession(
+                new TuiContextSessionAction.Initialize(null)));
+        state = TuiReducer.reduce(state, new TuiAction.RefreshStarted(1L,
+                state.contextSession().generation()));
+
+        TuiResourceRefreshResult result = new TuiResourceRefreshResult(1L,
+                state.contextSession().generation() - 1L, List.of(), List.of(), null, "old context");
+
+        assertThat(TuiReducer.reduce(state, new TuiAction.RefreshCompleted(result)))
+                .isSameAs(state);
     }
 }

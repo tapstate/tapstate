@@ -5,7 +5,8 @@ package io.tapstate.cli;
  * thread maps and reduces them into presentation state.
  */
 sealed interface TuiEvent permits TuiEvent.Key, TuiEvent.Resize, TuiEvent.Tick,
-        TuiEvent.InputClosed, TuiEvent.ActionPosted, TuiEvent.ContextSessionPosted {
+        TuiEvent.InputClosed, TuiEvent.ActionPosted, TuiEvent.ContextSessionPosted,
+        TuiEvent.ResourceRefreshCompleted {
 
     record Key(int code) implements TuiEvent {
     }
@@ -31,6 +32,14 @@ sealed interface TuiEvent permits TuiEvent.Key, TuiEvent.Resize, TuiEvent.Tick,
         public ContextSessionPosted {
             if (action == null) {
                 throw new IllegalArgumentException("context session action is required");
+            }
+        }
+    }
+
+    record ResourceRefreshCompleted(TuiResourceRefreshResult result) implements TuiEvent {
+        public ResourceRefreshCompleted {
+            if (result == null) {
+                throw new IllegalArgumentException("refresh result is required");
             }
         }
     }

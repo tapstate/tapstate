@@ -8,20 +8,22 @@ import java.util.List;
  */
 record TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
                    List<String> palette, TuiDashboard.Prompt prompt, List<String> activity, long ticks,
-                   TuiContextSessionState contextSession) {
+                   TuiContextSessionState contextSession, List<TuiDashboard.ResourceSummary> resources,
+                   List<TuiDashboard.PipelineSummary> pipelines, boolean refreshInFlight, long refreshRequestId,
+                   long refreshContextGeneration, String lastRefreshAt) {
 
-    static final int MAX_ACTIVITY = 8;
+    static final int MAX_ACTIVITY = 200;
 
     TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
                 List<String> palette, TuiDashboard.Prompt prompt) {
         this(command, notice, paletteOpen, paletteIndex, palette, prompt, List.of(), 0L,
-                TuiContextSessionState.initial());
+                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null);
     }
 
     TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
                 List<String> palette, TuiDashboard.Prompt prompt, List<String> activity) {
         this(command, notice, paletteOpen, paletteIndex, palette, prompt, activity, 0L,
-                TuiContextSessionState.initial());
+                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null);
     }
 
     TuiAppState {
@@ -30,6 +32,9 @@ record TuiAppState(String command, String notice, boolean paletteOpen, int palet
         palette = palette == null ? List.of() : List.copyOf(palette);
         activity = activity == null ? List.of() : List.copyOf(activity);
         contextSession = contextSession == null ? TuiContextSessionState.initial() : contextSession;
+        resources = resources == null ? List.of() : List.copyOf(resources);
+        pipelines = pipelines == null ? List.of() : List.copyOf(pipelines);
+        lastRefreshAt = lastRefreshAt == null || lastRefreshAt.isBlank() ? null : lastRefreshAt;
         if (activity.size() > MAX_ACTIVITY) {
             activity = activity.subList(activity.size() - MAX_ACTIVITY, activity.size());
         }
@@ -42,6 +47,6 @@ record TuiAppState(String command, String notice, boolean paletteOpen, int palet
 
     static TuiAppState initial(String notice) {
         return new TuiAppState("", notice, false, 0, List.of(), null, List.of(), 0L,
-                TuiContextSessionState.initial());
+                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null);
     }
 }
