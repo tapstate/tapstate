@@ -68,17 +68,14 @@ import java.util.function.Function;
  */
 public final class DslParser {
 
-    private static final Set<String> SOURCE_KEYS = Set.of(
+    static final Set<String> SOURCE_KEYS = Set.of(
             "version", "kind", "id", "metadata", "connector", "config", "mode",
             "tables", "options", "srs", "experimental");
-    private static final Set<String> PIPELINE_KEYS = Set.of(
+    static final Set<String> PIPELINE_KEYS = Set.of(
             "version", "kind", "id", "metadata", "source", "transforms", "view", "serve",
             "settings", "experimental");
-    private static final Set<String> METADATA_KEYS = Set.of("labels", "description");
-    private static final Set<String> SRS_KEYS = Set.of("key", "retention", "schema_evolution", "queryable", "enabled");
-    // snapshot_mode / start_from moved from source options to pipeline settings (read_mode / start_from).
-    // options is otherwise a free connector map, so these two names are rejected explicitly instead of
-    // being silently passed through to the connector as no-ops when a stale artifact still carries them.
+    static final Set<String> METADATA_KEYS = Set.of("labels", "description");
+    static final Set<String> SRS_KEYS = Set.of("key", "retention", "schema_evolution", "queryable", "enabled");
     /**
      * The engine options a source accepts. Options are the engine's own configuration, so the key
      * set is a closed vocabulary the product owns - unlike config, whose keys belong to the
@@ -87,9 +84,9 @@ public final class DslParser {
      * engine option means adding a typed component to the owning record and naming it here.
      */
     private static final Set<String> NO_ENGINE_OPTIONS = Set.of();
-    private static final Set<String> TABLE_SPEC_KEYS = Set.of("name", "filter", "pk", "options");
-    private static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", "options", "experimental");
-    private static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", "options");
+    static final Set<String> TABLE_SPEC_KEYS = Set.of("name", "filter", "pk", "options");
+    static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", "options", "experimental");
+    static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", "options");
     private static final Set<String> NEST_ROOT_KEYS =
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
     private static final Set<String> EMBED_KEYS = Set.of(
@@ -103,13 +100,13 @@ public final class DslParser {
     private static final Set<String> VIEW_SCHEMA_KEYS = Set.of("enforce", "evolution");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
-    private static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "options");
+    static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "options");
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
-    private static final Set<String> PUSH_KEYS = Set.of("id", "source", "topic", "format", "options");
+    static final Set<String> PUSH_KEYS = Set.of("id", "source", "topic", "format", "options");
     private static final Set<String> SETTINGS_KEYS = Set.of(
             "error_policy", "batch_size", "parallelism", "schedule", "read_mode", "start_from");
-    private static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
+    static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
             "version", "kind", "id", "metadata", "type", "options", "experimental");
     private static final Set<String> VIEW_DEF_KEYS = Set.of(
             "version", "kind", "id", "metadata", "primary_key", "storage", "schema", "experimental");
