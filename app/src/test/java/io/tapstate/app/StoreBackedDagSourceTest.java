@@ -36,6 +36,7 @@ import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
@@ -561,12 +562,18 @@ class StoreBackedDagSourceTest {
         }
 
         private final SrsMetaStore meta = new InMemorySrsMetaStore();
+        private final SrsLogStore srsLog = new InMemorySrsLogStore();
         private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
         private final InMemoryNestDeadLetterStore nestDeadLetters = new InMemoryNestDeadLetterStore();
 
         @Override
         public SrsMetaStore meta() {
             return meta;
+        }
+
+        @Override
+        public SrsLogStore srsLog() {
+            return srsLog;
         }
 
         @Override

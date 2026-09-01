@@ -434,7 +434,7 @@ class CaptureRunUnitTest {
                 return () -> cdcClosed = true;
             }
             for (Envelope e : changes) {
-                listener.onEvent(e, Optional.of(new SourcePosition("src-" + e.ts())));
+                listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
             return () -> cdcClosed = true;
         }

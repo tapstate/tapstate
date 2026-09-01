@@ -232,9 +232,9 @@ class PdkCapturePortTest {
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
         List<Envelope> got = new CopyOnWriteArrayList<>();
         CountDownLatch three = new CountDownLatch(3);
-        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), (e, pos) -> {
-            got.add(e);
-            three.countDown();
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), (events, pos) -> {
+            got.addAll(events);
+            events.forEach(event -> three.countDown());
         })) {
             assertThat(three.await(5, TimeUnit.SECONDS)).as("three change events delivered").isTrue();
         }
@@ -265,8 +265,8 @@ class PdkCapturePortTest {
         // the reading would be a timeout rather than the reason for it.
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event, Optional<SourcePosition> position) {
-                got.add(event);
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                got.addAll(events);
                 settled.countDown();
             }
 
@@ -297,7 +297,7 @@ class PdkCapturePortTest {
         CountDownLatch failed = new CountDownLatch(1);
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event, Optional<SourcePosition> position) {
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
             }
 
             @Override
@@ -337,7 +337,7 @@ class PdkCapturePortTest {
         CountDownLatch failed = new CountDownLatch(1);
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event, Optional<SourcePosition> position) {
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
             }
 
             @Override
@@ -395,9 +395,9 @@ class PdkCapturePortTest {
         List<Envelope> seen = new CopyOnWriteArrayList<>();
         CountDownLatch two = new CountDownLatch(2);
         try (Subscription sub = port.cdc(config("t1"),
-                CaptureStart.resume(new SourcePosition(token)), (event, position) -> {
-                    seen.add(event);
-                    two.countDown();
+                CaptureStart.resume(new SourcePosition(token)), (events, position) -> {
+                    seen.addAll(events);
+                    events.forEach(event -> two.countDown());
                 })) {
             assertThat(two.await(5, TimeUnit.SECONDS)).as("two change events delivered").isTrue();
         }
@@ -460,26 +460,34 @@ class PdkCapturePortTest {
     }
 
     @Test
-    void carriesTheBatchPositionOnTheChangeThatClosesTheBatchAndOnNoOther(@TempDir Path dir)
+    void handsOverTheSourceBatchWholeWithTheOnePositionItNamedForIt(@TempDir Path dir)
             throws Exception {
-        // One position stands for a run of changes and means "everything up to here has been handed
-        // over". On any change but the last that sentence is false, and a run interrupted between them
-        // would resume past changes it never delivered.
+        // The source reads a batch and names one position for it, meaning "everything up to here has
+        // been handed over" -- true of the batch and of no prefix of it. Taking the batch apart here
+        // would force that one position onto one of the changes and leave the others carrying none,
+        // which says of each of those that nothing had been read at it; and it would destroy the only
+        // grouping anything downstream could have used to pay a per-act cost once instead of N times.
         Path jar = Synthetic.positionedSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
 
+        List<List<Envelope>> runs = new CopyOnWriteArrayList<>();
         List<Optional<SourcePosition>> positions = new CopyOnWriteArrayList<>();
-        CountDownLatch two = new CountDownLatch(2);
+        CountDownLatch delivered = new CountDownLatch(1);
         try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(),
-                (event, position) -> {
+                (events, position) -> {
+                    runs.add(events);
                     positions.add(position);
-                    two.countDown();
+                    delivered.countDown();
                 })) {
-            assertThat(two.await(5, TimeUnit.SECONDS)).as("two change events delivered").isTrue();
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).as("the run was delivered").isTrue();
         }
 
-        assertThat(positions.get(0)).isEmpty();
-        assertThat(positions.get(1)).isPresent();
+        assertThat(runs.get(0))
+                .as("the two changes the source read together arrive together, in one call")
+                .hasSize(2);
+        assertThat(positions.get(0))
+                .as("the position the source named for that batch, carried once for the batch")
+                .isPresent();
     }
 
     // ---- testConnection / discoverSchema drive ---------------------------------------------------

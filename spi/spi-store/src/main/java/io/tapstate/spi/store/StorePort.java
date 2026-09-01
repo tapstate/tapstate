@@ -48,6 +48,12 @@ public interface StorePort {
     SrsMetaStore meta();
 
     /**
+     * The SRS change log: every change that entered a chain's per-table ring, so the changes outlive the
+     * process that read them and a ring can be rebuilt where it left off.
+     */
+    SrsLogStore srsLog();
+
+    /**
      * The cold layer under a stateful operator: one opaque state document per key, within a namespace.
      * Read and written on the data path as keys are handled, never enumerated.
      */

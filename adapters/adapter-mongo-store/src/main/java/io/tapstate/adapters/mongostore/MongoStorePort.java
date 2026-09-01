@@ -14,6 +14,7 @@ import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
@@ -57,6 +58,9 @@ public final class MongoStorePort implements StorePort {
     public static final String CONNECTION_TEST_RESULTS = "connection_test_results";
     /** The collection holding one SRS coordination record per mining chain. */
     public static final String SRS_META = "srs_meta";
+
+    /** The durable change log: one document per change that entered a chain's per-table ring. */
+    public static final String SRS_LOG = "srs_log";
     /** The collection holding one stateful-operator state document per key, per namespace. */
     public static final String OPERATOR_STATE = "operator_state";
 
@@ -109,6 +113,7 @@ public final class MongoStorePort implements StorePort {
     private final ConnectionTestResultStore connectionTestResults;
     private final ObservationStore observations;
     private final SrsMetaStore meta;
+    private final SrsLogStore srsLog;
     private final KeyedStateStore keyedState;
     private final NestDeadLetterStore nestDeadLetters;
 
@@ -133,6 +138,7 @@ public final class MongoStorePort implements StorePort {
                 new MongoConnectionTestResultStore(database.getCollection(CONNECTION_TEST_RESULTS));
         this.observations = new MongoObservationStore(database.getCollection(PIPELINE_OBSERVATION));
         this.meta = new MongoSrsMetaStore(database.getCollection(SRS_META));
+        this.srsLog = new MongoSrsLogStore(database.getCollection(SRS_LOG));
         // Operator state alone sits in its own database on the same client, for the reasons on the
         // constant. Same connection, same credentials, same lifecycle - a different database. What that
         // operator could not assemble goes in the same database, being produced by the same run.
@@ -190,6 +196,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public ObservationStore observations() {
         return observations;
+    }
+
+    @Override
+    public SrsLogStore srsLog() {
+        return srsLog;
     }
 
     @Override

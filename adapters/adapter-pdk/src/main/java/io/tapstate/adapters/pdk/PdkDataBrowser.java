@@ -205,14 +205,18 @@ public final class PdkDataBrowser implements DataBrowser {
                     CaptureStart.present(),
                     new CaptureListener() {
                         @Override
-                        public void onEvent(Envelope event, Optional<SourcePosition> position) {
+                        public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                             // The position is ignored on purpose: this follow records nothing and resumes
-                            // nothing, so there is no later run for a position to be of use to.
-                            DataBrowserChange change = project(event);
-                            // A stream also carries schema changes, which are not a row changing and
-                            // have nowhere to go in a view of rows.
-                            if (change != null) {
-                                listener.onChange(change);
+                            // nothing, so there is no later run for a position to be of use to. The run is
+                            // unrolled here because somebody is watching rows arrive, and a viewer has no
+                            // use for the grouping the source read them in.
+                            for (Envelope event : events) {
+                                DataBrowserChange change = project(event);
+                                // A stream also carries schema changes, which are not a row changing and
+                                // have nowhere to go in a view of rows.
+                                if (change != null) {
+                                    listener.onChange(change);
+                                }
                             }
                         }
 

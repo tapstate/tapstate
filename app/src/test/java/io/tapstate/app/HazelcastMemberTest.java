@@ -177,7 +177,7 @@ class HazelcastMemberTest {
     void hazelcastMemberBindsTheMetaStoreIntoTheUserContext() {
         SrsMetaStore meta = new SentinelMetaStore();
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), meta, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), meta, null, null, null, NestSettings.defaults(), null, null);
         try {
             // The read-cursor publisher factory resolves the store member-side from the user context, so the
             // assembly root binds it under the well-known key -- otherwise cursor publishing silently no-ops.
@@ -190,7 +190,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheUserContextUnboundWhenNoStoreIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no store (mongo disabled) binds nothing; the publisher then resolves no store and
             // cursor publishing is a documented no-op rather than a failure.
@@ -206,7 +206,7 @@ class HazelcastMemberTest {
             throw new UnsupportedOperationException("resolution is not exercised by this binding test");
         };
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, provisioner, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, provisioner, null, null, NestSettings.defaults(), null, null);
         try {
             // A sink-writer factory carried onto the Jet sink vertex resolves the provisioner member-side from
             // the user context, so the assembly root binds it under the well-known key -- otherwise the member
@@ -221,7 +221,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheProvisionerUnboundWhenNoneIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no provisioner (mongo disabled) binds nothing; the member is then not sink-capable and
             // a sink open fails loudly rather than silently dropping writes.
@@ -236,7 +236,7 @@ class HazelcastMemberTest {
     void hazelcastMemberBindsTheSnapshotBufferIntoTheUserContext() {
         SnapshotBuffer buffer = new SnapshotBuffer();
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, buffer, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, buffer, null, NestSettings.defaults(), null, null);
         try {
             // A source vertex resolves the buffer member-side from the user context to emit its ring's snapshot
             // rows ahead of the cdc tail, so the assembly root binds the same instance under the well-known key.
@@ -249,7 +249,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheSnapshotBufferUnboundWhenNoneIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no buffer (mongo disabled) binds nothing; a source then emits no snapshot ahead of the
             // tail rather than failing.
@@ -263,7 +263,7 @@ class HazelcastMemberTest {
     void hazelcastMemberBindsTheNestDeadLetterStoreIntoTheUserContext() {
         NestDeadLetterStore deadLetters = new InMemoryNestDeadLetterStore();
         HazelcastInstance member = new HazelcastConfiguration().hazelcastMember(
-                new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), deadLetters);
+                new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), deadLetters, null);
         try {
             // The channel carried onto a nest vertex resolves the store member-side from the user context,
             // so the assembly root binds it under the well-known key -- otherwise a vertex that cannot
@@ -278,7 +278,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheNestDeadLetterStoreUnboundWhenNoneIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no store (mongo disabled) binds nothing. Unlike the bindings above, the consequence
             // is a refusal rather than a quiet no-op: a nest vertex on such a member fails when it reaches

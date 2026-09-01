@@ -25,7 +25,9 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Optional;
+import java.util.TreeMap;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -49,7 +51,7 @@ class StorePortTest {
     // --- facade ---
 
     @Test
-    void facadeExposesTheElevenStores() {
+    void facadeExposesEveryStore() {
         StorePort store = new InMemoryStore();
 
         assertThat(store.artifacts()).isNotNull();
@@ -63,6 +65,9 @@ class StorePortTest {
         assertThat(store.connectionTestResults()).isNotNull();
         assertThat(store.observations()).isNotNull();
         assertThat(store.meta()).isNotNull();
+        assertThat(store.srsLog()).isNotNull();
+        assertThat(store.keyedState()).isNotNull();
+        assertThat(store.nestDeadLetters()).isNotNull();
     }
 
     // --- artifacts (the canonical truth layer) ---
@@ -790,6 +795,42 @@ class StorePortTest {
         private final Map<String, DesiredState> desired = new HashMap<>();
         private final Map<String, Observation> observations = new HashMap<>();
         private final Map<String, SrsMeta> srsMeta = new HashMap<>();
+        private final Map<String, NavigableMap<Long, SrsLogRecord>> srsLogRings = new HashMap<>();
+        private final SrsLogStore srsLog = new SrsLogStore() {
+
+            @Override
+            public void store(String ring, long seq, SrsLogRecord record) {
+                srsLogRings.computeIfAbsent(ring, name -> new TreeMap<>()).put(seq, record);
+            }
+
+            @Override
+            public void storeAll(String ring, long firstSeq, List<SrsLogRecord> records) {
+                long seq = firstSeq;
+                for (SrsLogRecord record : records) {
+                    store(ring, seq++, record);
+                }
+            }
+
+            @Override
+            public Optional<SrsLogRecord> load(String ring, long seq) {
+                NavigableMap<Long, SrsLogRecord> entries = srsLogRings.get(ring);
+                return entries == null ? Optional.empty() : Optional.ofNullable(entries.get(seq));
+            }
+
+            @Override
+            public long largestSequence(String ring) {
+                NavigableMap<Long, SrsLogRecord> entries = srsLogRings.get(ring);
+                return entries == null || entries.isEmpty() ? -1L : entries.lastKey();
+            }
+
+            @Override
+            public void trim(String ring, long throughSeq) {
+                NavigableMap<Long, SrsLogRecord> entries = srsLogRings.get(ring);
+                if (entries != null) {
+                    entries.headMap(throughSeq, true).clear();
+                }
+            }
+        };
         private final Map<String, byte[]> keyedState = new HashMap<>();
         private final Map<String, NestDeadLetterRecord> deadLetters = new LinkedHashMap<>();
 
@@ -1067,6 +1108,11 @@ class StorePortTest {
                     deadLetters.values().removeIf(held -> held.namespace().equals(namespace));
                 }
             };
+        }
+
+        @Override
+        public SrsLogStore srsLog() {
+            return srsLog;
         }
 
         @Override

@@ -243,7 +243,7 @@ class CaptureToSinkDataFlowTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             for (Envelope change : changes) {
-                listener.onEvent(change, java.util.Optional.of(new SourcePosition("src-" + change.ts())));
+                listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }
             return () -> cdcClosed = true;
         }

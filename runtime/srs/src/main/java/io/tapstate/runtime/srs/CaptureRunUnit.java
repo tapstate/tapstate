@@ -152,7 +152,7 @@ public final class CaptureRunUnit {
                 // start was left unsaid. Positions still arrive with the changes; nobody on this path has
                 // anywhere to put them yet.
                 subscription = Optional.of(port.cdc(spec.config(), CaptureStart.present(),
-                        health.recording((event, position) -> passthrough.accept(event))));
+                        health.recording((events, position) -> events.forEach(passthrough))));
             }
 
             return new CaptureRun(

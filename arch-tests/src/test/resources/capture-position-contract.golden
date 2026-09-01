@@ -2,23 +2,30 @@
 #
 # These five types are what every connector adapter implements and what the runtime calls, so a change
 # here reaches code that is not in this repository. The failure this file exists to catch is narrower
-# than "the contract changed": it is a position quietly ceasing to be threaded.
+# than "the contract changed": it is a position, or the run it belongs to, quietly ceasing to be
+# threaded.
 #
 #   - cdc losing its start, so the port decides where to begin for a caller who never said;
 #   - the snapshot seam narrowed, or removed, so a caller has to invent the position instead;
-#   - a delivered change losing the position the source stated for it, so the durable read offset has
-#     nothing to advance on and every run begins again from where the last one started.
+#   - a delivered run losing the position the source stated for it, so the durable read offset has
+#     nothing to advance on and every run begins again from where the last one started;
+#   - the delivered run narrowed back to a single change, so the grouping the source read in is gone
+#     before anyone downstream can see it. Nothing looks wrong afterwards -- the same changes arrive in
+#     the same order -- but every cost that is paid per act rather than per change is paid once per
+#     change again, a durable write of the change above all, and no later code can put the run back
+#     together because the only thing that knew where its edges were has already returned.
 #
-# All three compile. All three leave the rest of the build green. All three produce a pipeline that
-# runs, reports healthy, and silently drops or re-reads changes nobody is told about.
+# All four compile. All four leave the rest of the build green. All four produce a pipeline that runs
+# and reports healthy, while silently dropping changes, re-reading them, or paying N times over for
+# them.
 #
-# Updating this file is therefore a decision, not a formality: say which of the three above is not being
+# Updating this file is therefore a decision, not a formality: say which of the four above is not being
 # reintroduced, or say what replaces it.
 
 io.tapstate.spi.capture.CaptureBatch :: method :: close() -> void
 io.tapstate.spi.capture.CaptureBatch :: method :: seam() -> java.util.Optional<io.tapstate.spi.capture.SourcePosition>
+io.tapstate.spi.capture.CaptureListener :: method :: onBatch(java.util.List<io.tapstate.core.event.Envelope>, java.util.Optional<io.tapstate.spi.capture.SourcePosition>) -> void
 io.tapstate.spi.capture.CaptureListener :: method :: onError(java.lang.Throwable) -> void
-io.tapstate.spi.capture.CaptureListener :: method :: onEvent(io.tapstate.core.event.Envelope, java.util.Optional<io.tapstate.spi.capture.SourcePosition>) -> void
 io.tapstate.spi.capture.CapturePort :: method :: cdc(io.tapstate.spi.capture.CaptureConfig, io.tapstate.spi.capture.CaptureStart, io.tapstate.spi.capture.CaptureListener) -> io.tapstate.spi.capture.Subscription
 io.tapstate.spi.capture.CapturePort :: method :: discoverSchema(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.DiscoveredSchema
 io.tapstate.spi.capture.CapturePort :: method :: snapshot(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.CaptureBatch

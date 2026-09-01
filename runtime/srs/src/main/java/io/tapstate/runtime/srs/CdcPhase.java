@@ -12,11 +12,15 @@ import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 
 import java.util.Collection;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -88,8 +92,11 @@ public final class CdcPhase {
         Objects.requireNonNull(minConsumerReadSeq, "minConsumerReadSeq");
         Objects.requireNonNull(consumers, "consumers");
         Objects.requireNonNull(health, "health");
+        // One chain serves every table this subscription sees, so the route resolves to it whatever the
+        // change names -- the same run-writing path the multi-table entry point takes.
+        TableRoute route = new TableRoute(chain, minConsumerReadSeq, consumers);
         return port.cdc(config, start, health.recording(
-                (event, position) -> writeChange(chain, event, position, minConsumerReadSeq, consumers)));
+                (events, position) -> writeBatch(events, position, table -> route)));
     }
 
     /** Starts one connector subscription and routes each event to the ring for its source table. */
@@ -117,14 +124,8 @@ public final class CdcPhase {
         Objects.requireNonNull(routes, "routes");
         Objects.requireNonNull(health, "health");
         Map<String, TableRoute> routeSnapshot = Map.copyOf(routes);
-        return port.cdc(config, start, health.recording((event, position) -> {
-            TableRoute route = routeSnapshot.get(event.src());
-            if (route == null) {
-                throw new TapstateException(
-                        CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
-            }
-            writeChange(route.chain(), event, position, route.minConsumerReadSeq(), route.consumers());
-        }));
+        return port.cdc(config, start, health.recording(
+                (events, position) -> writeBatch(events, position, routeSnapshot::get)));
     }
 
     public record TableRoute(
@@ -140,39 +141,88 @@ public final class CdcPhase {
     }
 
     /**
-     * Projects one change event to a ring item carrying the position the source reported for it, admits it through
-     * the headroom gate, and advances the durable read offset to its position.
+     * Projects one run of changes to ring items, admits each table's share of the run into that table's
+     * ring in one act, and advances the durable read offset once, to the position the source named for the
+     * run.
+     *
+     * <p>The run is split by table because the rings are per table, and each table's share stays in the
+     * order the source read it. <strong>Every change is routed before any of them is written</strong>: a
+     * change naming a table this chain does not carry fails the whole run, and failing it after half of it
+     * is in the ring would leave the source read offset unable to describe what happened.
      */
-    private static void writeChange(
-            CdcChain chain,
-            Envelope event,
+    private static void writeBatch(
+            List<Envelope> events,
             Optional<SourcePosition> position,
-            LongSupplier minConsumerReadSeq,
-            Supplier<Collection<ConsumerOffset>> consumers) {
-        SourcePosition pos = position.orElse(null);
-        SrsItem item = new SrsItem(
-                pos, event.op(), event.ts(), event.before(), event.after(), chain.schemaVer());
-        long seq;
-        // Admit the change through the headroom gate. A refused write is backpressure, not a drop: park
-        // off-CPU and re-check against the live consumer cursor so this call -- and with it the source read --
-        // pauses until a consumer frees a slot, rather than overwriting a change no consumer has read or
-        // burning a core spinning while it waits.
-        while (true) {
-            OptionalLong appended = chain.gate().append(item, minConsumerReadSeq.getAsLong());
-            if (appended.isPresent()) {
-                seq = appended.getAsLong();
-                break;
-            }
-            LockSupport.parkNanos(BACKPRESSURE_PARK_NANOS);
+            Function<String, TableRoute> routes) {
+        if (events.isEmpty()) {
+            // The source handed over only events that carry no change -- a heartbeat and its like. There is
+            // nothing to write, and nothing has been read past, so the offset does not move either.
+            return;
         }
-        // The change is in the ring; advance the durable read offset to its position, clamped so it never
-        // passes the slowest consumer's sink-acked position -- a change only ever in the volatile ring must
-        // stay re-minable from the source until a sink has durably landed it.
+        int last = events.size() - 1;
+        Map<String, List<SrsItem>> byTable = new LinkedHashMap<>();
+        for (int i = 0; i < events.size(); i++) {
+            Envelope event = events.get(i);
+            TableRoute route = routes.apply(event.src());
+            if (route == null) {
+                throw new TapstateException(
+                        CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
+            }
+            // The position the source named for the run rides with the change that closes it and no other.
+            // Carried on the earlier ones it would say of each that the source had already read past the
+            // last, and a run interrupted between them would resume past changes never delivered.
+            SourcePosition pos = i == last ? position.orElse(null) : null;
+            byTable.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(new SrsItem(
+                    pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer()));
+        }
+        String closingTable = events.get(last).src();
+        long closingSeq = -1;
+        for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
+            long lastSeq = admit(routes.apply(entry.getKey()), entry.getValue());
+            if (entry.getKey().equals(closingTable)) {
+                closingSeq = lastSeq;
+            }
+        }
+        // The run is in the rings; advance the durable read offset to the position that closes it, clamped
+        // so it never passes the slowest consumer's sink-acked position -- a change only ever in the
+        // volatile ring must stay re-minable from the source until a sink has durably landed it.
         // The sequence the ring just assigned, paired with the generation it is running under, is what
         // ranks this position against the consumers' acked ones: a token says nothing about order.
-        ChainPosition read = new ChainPosition(
-                new SourceOrder(chain.epoch(), seq), pos == null ? null : pos.token());
-        SrsDurableFrontier.safeAdvance(read, consumers.get())
+        TableRoute closing = routes.apply(closingTable);
+        CdcChain chain = closing.chain();
+        ChainPosition read = new ChainPosition(new SourceOrder(chain.epoch(), closingSeq),
+                position.map(SourcePosition::token).orElse(null));
+        SrsDurableFrontier.safeAdvance(read, closing.consumers().get())
                 .ifPresent(safe -> chain.meta().advanceSourceReadOffset(chain.miningChainId(), safe));
+    }
+
+    /**
+     * Admits one table's share of a run and returns the sequence its last change took.
+     *
+     * <p>A refused write is backpressure, not a drop: park off-CPU and re-check against the live consumer
+     * cursor, so this call -- and with it the source read -- pauses until a consumer frees room, rather
+     * than overwriting a change no consumer has read or burning a core spinning while it waits.
+     *
+     * <p><strong>A share longer than the ring is admitted in ring-sized pieces.</strong> A run that can
+     * never fit at once would otherwise park forever waiting for room that no consumer can free, and the
+     * whole capture would stop with nothing thrown -- the source asks for a bounded batch, but what a
+     * connector hands over is the connector's to decide.
+     */
+    private static long admit(TableRoute route, List<SrsItem> items) {
+        int capacity = (int) Math.min(route.chain().gate().capacity(), Integer.MAX_VALUE);
+        long lastSeq = -1;
+        for (int from = 0; from < items.size(); from += capacity) {
+            List<SrsItem> piece = items.subList(from, Math.min(from + capacity, items.size()));
+            while (true) {
+                OptionalLong appended = route.chain().gate()
+                        .appendAll(piece, route.minConsumerReadSeq().getAsLong());
+                if (appended.isPresent()) {
+                    lastSeq = appended.getAsLong();
+                    break;
+                }
+                LockSupport.parkNanos(BACKPRESSURE_PARK_NANOS);
+            }
+        }
+        return lastSeq;
     }
 }

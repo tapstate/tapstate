@@ -392,7 +392,7 @@ class CaptureToSinkAckFrontierTest {
                     try {
                         Envelope change = pending.poll(25, TimeUnit.MILLISECONDS);
                         if (change != null) {
-                            listener.onEvent(change, java.util.Optional.of(new SourcePosition("src-" + change.ts())));
+                            listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
                         }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();

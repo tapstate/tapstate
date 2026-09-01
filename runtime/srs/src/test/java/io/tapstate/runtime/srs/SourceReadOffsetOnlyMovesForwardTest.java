@@ -240,7 +240,7 @@ class SourceReadOffsetOnlyMovesForwardTest {
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             int n = 0;
             for (Envelope e : events) {
-                listener.onEvent(e, Optional.of(new SourcePosition("s" + ++n)));
+                listener.onBatch(List.of(e), Optional.of(new SourcePosition("s" + ++n)));
             }
             return () -> {
             };

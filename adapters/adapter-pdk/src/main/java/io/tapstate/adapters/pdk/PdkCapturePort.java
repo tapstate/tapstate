@@ -281,15 +281,17 @@ public final class PdkCapturePort implements CapturePort {
                             changes.add(event);
                         }
                     }
-                    // The offset names where the source had read to once this whole batch was handed over,
-                    // so it rides out with the last change of the batch and no other. Put on every change,
-                    // it would say of the first one that the source had already read past the last -- and a
-                    // run interrupted between them would resume past changes it never delivered.
-                    for (int i = 0; i < changes.size(); i++) {
-                        boolean closesTheBatch = i == changes.size() - 1;
-                        listener.onEvent(TapEventCodec.decodeChange(changes.get(i)),
-                                closesTheBatch ? position(connector, offset) : Optional.empty());
+                    // The batch goes over whole, with the one offset the source named for it. The offset
+                    // means the source had read to here once this entire batch was handed over, so it
+                    // belongs to the batch and not to any change inside it; and the batch itself is worth
+                    // keeping, because everything downstream that costs per act rather than per change --
+                    // writing the changes down above all -- costs one act per batch only while the batch
+                    // still exists.
+                    List<Envelope> decoded = new ArrayList<>(changes.size());
+                    for (TapEvent change : changes) {
+                        decoded.add(TapEventCodec.decodeChange(change));
                     }
+                    listener.onBatch(decoded, position(connector, offset));
                 });
                 stream.streamRead(connector.context(), config.streams(), startOffset, BATCH_SIZE, consumer);
                 return null;

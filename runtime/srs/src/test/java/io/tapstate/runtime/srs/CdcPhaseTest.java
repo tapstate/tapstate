@@ -311,8 +311,10 @@ class CdcPhaseTest {
                 listener.onError(error);
                 return () -> closed = true;
             }
+            // Each change is handed over as a run of its own, each with its own position -- the shape a
+            // source that names a position per change produces.
             for (Envelope e : events) {
-                listener.onEvent(e, Optional.of(positions.get()));
+                listener.onBatch(List.of(e), Optional.of(positions.get()));
             }
             return () -> closed = true;
         }

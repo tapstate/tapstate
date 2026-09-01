@@ -86,7 +86,8 @@ class CapturePortTest {
         List<Op> delivered = new ArrayList<>();
 
         Subscription subscription =
-                capture.cdc(CONFIG, CaptureStart.present(), (event, position) -> delivered.add(event.op()));
+                capture.cdc(CONFIG, CaptureStart.present(),
+                        (events, position) -> events.forEach(event -> delivered.add(event.op())));
 
         assertThat(delivered).containsExactly(Op.INSERT, Op.UPDATE, Op.DELETE, Op.DDL);
 
@@ -129,29 +130,36 @@ class CapturePortTest {
     @Test
     void captureListenerIsAFunctionalInterface() {
         List<Envelope> collected = new ArrayList<>();
-        CaptureListener listener = (event, position) -> collected.add(event);
+        CaptureListener listener = (events, position) -> collected.addAll(events);
 
-        listener.onEvent(Envelope.insert(1L, "orders", Map.of("id", 1), null), Optional.empty());
+        listener.onBatch(List.of(Envelope.insert(1L, "orders", Map.of("id", 1), null)), Optional.empty());
 
         assertThat(collected).hasSize(1);
     }
 
     /**
-     * A change carries the position the source reported for it, and only the change the source named a
-     * position at carries one. The absence on the others is the contract, not a gap: one position stands
-     * for a run of changes and means "everything up to here has been handed over", which is untrue of
-     * every change but the last.
+     * The run the source read arrives whole, with the one position it named for that run. Both halves are
+     * the contract: the position stands for the whole run and means "everything up to here has been
+     * handed over", which is untrue of any prefix of it; and the grouping is the source\'s own, so
+     * splitting it here would destroy the only thing that lets a recipient pay a per-act cost once per
+     * batch instead of once per change.
      */
     @Test
-    void deliversTheSourcePositionWithTheChangeItWasReportedAt() {
+    void deliversTheRunWholeWithTheOnePositionTheSourceNamedForIt() {
         StubCapture capture = new StubCapture();
+        List<List<Op>> runs = new ArrayList<>();
         List<Optional<SourcePosition>> positions = new ArrayList<>();
 
-        capture.cdc(CONFIG, CaptureStart.present(), (event, position) -> positions.add(position));
+        capture.cdc(CONFIG, CaptureStart.present(), (events, position) -> {
+            runs.add(events.stream().map(Envelope::op).toList());
+            positions.add(position);
+        });
 
-        assertThat(positions).hasSize(4);
-        assertThat(positions.subList(0, 3)).allSatisfy(p -> assertThat(p).isEmpty());
-        assertThat(positions.get(3)).contains(new SourcePosition("binlog.000042:1400"));
+        assertThat(runs)
+                .as("one call per run the source handed over -- four calls would mean the batch was taken "
+                        + "apart on the way here, and nothing downstream could put it back together")
+                .containsExactly(List.of(Op.INSERT, Op.UPDATE, Op.DELETE, Op.DDL));
+        assertThat(positions).containsExactly(Optional.of(new SourcePosition("binlog.000042:1400")));
     }
 
     private static final DiscoveredSchema SCHEMA =
@@ -177,12 +185,12 @@ class CapturePortTest {
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             lastStart = start;
             // One batch: the source names where it had read to once the whole batch is handed over, so
-            // only its last change carries a position.
-            listener.onEvent(Envelope.insert(10L, "orders", Map.of("id", 1), null), Optional.empty());
-            listener.onEvent(Envelope.update(11L, "orders", Map.of("id", 1), Map.of("id", 1, "n", 2), null),
-                    Optional.empty());
-            listener.onEvent(Envelope.delete(12L, "orders", Map.of("id", 1), null), Optional.empty());
-            listener.onEvent(Envelope.ddl(13L, "orders", Map.of("added", "n")),
+            // the position belongs to the batch and to no change inside it.
+            listener.onBatch(List.of(
+                            Envelope.insert(10L, "orders", Map.of("id", 1), null),
+                            Envelope.update(11L, "orders", Map.of("id", 1), Map.of("id", 1, "n", 2), null),
+                            Envelope.delete(12L, "orders", Map.of("id", 1), null),
+                            Envelope.ddl(13L, "orders", Map.of("added", "n"))),
                     Optional.of(new SourcePosition("binlog.000042:1400")));
             lastSubscription = new RecordingSubscription();
             return lastSubscription;

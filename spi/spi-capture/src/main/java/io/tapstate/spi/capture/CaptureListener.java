@@ -2,6 +2,7 @@ package io.tapstate.spi.capture;
 
 import io.tapstate.core.event.Envelope;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -12,21 +13,26 @@ import java.util.Optional;
 public interface CaptureListener {
 
     /**
-     * Called once per captured change event, with the position the source reported for it.
+     * Called once per run of changes the source hands over, with the position it reported for that run.
      *
-     * <p>The position is present only on a change the source has stated a position <em>at or after</em> —
-     * in practice the last change of a batch the source closed by naming where it had read to. It is
-     * absent on the others, and that absence is load-bearing rather than a gap to fill in: a source names
-     * one position for a run of changes, meaning "everything up to here has been handed over", and that
-     * sentence is only true once the whole run has been. Stamping the earlier changes with it would say a
-     * change had been read that had not, and a run interrupted in the middle would resume past the ones it
-     * never delivered — losing them with nothing thrown and nothing logged.
+     * <p><strong>The run is the source's own, and it is delivered whole.</strong> A source reads a batch
+     * and names one position for it; splitting that batch into single changes on the way here throws away
+     * the only grouping anyone downstream could have recovered, and every cost that is paid per act rather
+     * than per change — a durable write above all — is then paid once per change instead of once per
+     * batch. An empty run is possible and means the source handed over only events that carry no change.
+     *
+     * <p><strong>The position belongs to the run, not to any one change in it.</strong> It means
+     * "everything up to here has been handed over", and that sentence is only true once the whole run has
+     * been. It is absent when the source named none, and that absence is load-bearing rather than a gap to
+     * fill in: inventing one would say changes had been read that had not, and a run interrupted in the
+     * middle would resume past the ones it never delivered — losing them with nothing thrown and nothing
+     * logged.
      *
      * <p>So a recipient records a position when one arrives and simply carries on when none does. What
      * ranks two changes against each other is never this: a token is opaque and only equality is defined
      * on it, so ordering is the runtime's own, assigned as it reads.
      */
-    void onEvent(Envelope event, Optional<SourcePosition> position);
+    void onBatch(List<Envelope> events, Optional<SourcePosition> position);
 
     /**
      * Called when the capture stream fails, so the failure a background stream cannot return to its
