@@ -56,6 +56,11 @@ public final class SinkProcessor extends AbstractProcessor {
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
+    // A bound that arrived while writes were still in flight, held until they settle. A bound proves what
+    // is still coming, never what is durable: every event it covers has been taken in by the time it
+    // arrives, but the ones sitting in an unsettled batch are not written yet. Handing it to the frontier
+    // then would let one settled batch of a fan-out stand for the whole of what its change produced.
+    private Watermark heldBound;
     private boolean closed;
 
     // Resolved at init from the running job, so a failed write can be recorded against this pipeline's id
@@ -192,10 +197,25 @@ public final class SinkProcessor extends AbstractProcessor {
     @Override
     public boolean tryProcessWatermark(Watermark watermark) {
         if (frontier != null) {
-            frontier.bound(watermark, sinkAck);
+            // The newest bound subsumes any older one held, so only the newest is kept.
+            heldBound = watermark;
+            releaseHeldBound();
             reportTrailing();
         }
         return true;
+    }
+
+    /**
+     * Hands the held bound to the frontier once nothing is in flight. That is the moment every event the
+     * bound covers is durable: the engine delivers a bound only after the events beneath it, and this
+     * processor takes those straight from the inbox into batches, so once no batch is in flight none of
+     * them is unwritten.
+     */
+    private void releaseHeldBound() {
+        if (heldBound != null && inFlight.isEmpty()) {
+            frontier.bound(heldBound, sinkAck);
+            heldBound = null;
+        }
     }
 
     /**
@@ -242,6 +262,7 @@ public final class SinkProcessor extends AbstractProcessor {
             return true;
         });
         if (frontier != null) {
+            releaseHeldBound();
             reportTrailing();
         }
     }

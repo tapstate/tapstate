@@ -108,14 +108,11 @@ public final class CaptureRunUnit {
 
             long snapshotCount = 0;
             Map<String, Long> snapshotCounts = new LinkedHashMap<>();
-            // A chain that has already read every selected table to exhaustion does not read them again:
-            // this run is resuming, and the whole point of resuming is not redoing the full load. The
-            // question is asked of the durable record, so it survives the process that answered it last.
-            // Which tables individually still owe a read is a finer question than this one asks.
-            boolean fullLoadAlreadyDone = chainId != null && meta.read(chainId.value())
-                    .map(record -> record.snapshotCompletedTables().containsAll(tables))
-                    .orElse(false);
-            if (plan.snapshot() && !fullLoadAlreadyDone) {
+            // Which tables a resuming run still owes is asked once, by the snapshot phase, of the durable
+            // record -- so it survives the process that answered it last, and a run that owes none reads
+            // nothing. Asking the coarser "is the whole load done" here as well put the same question to
+            // the same record twice, and two readings of one fact are two things that can disagree.
+            if (plan.snapshot()) {
                 Consumer<Envelope> snapshotPassthrough = event -> {
                     snapshotCounts.merge(event.src(), 1L, Long::sum);
                     passthrough.accept(event);

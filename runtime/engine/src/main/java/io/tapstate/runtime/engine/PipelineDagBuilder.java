@@ -308,7 +308,7 @@ public final class PipelineDagBuilder {
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
-                : ContiguousPrefix::new;
+                : () -> new ContiguousPrefix(axes);
         return SinkProcessor.metaSupplier(writerFactory, sinkAck, frontier);
     }
 

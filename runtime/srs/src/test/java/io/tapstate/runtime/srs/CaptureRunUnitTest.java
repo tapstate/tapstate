@@ -142,12 +142,19 @@ class CaptureRunUnitTest {
      *
      * <p>The two runs share a meta store and get separate coordinators, which is what a restart is: the
      * durable record survives, the in-memory chain state does not.
+     *
+     * <p>What makes a table done is the sink confirming it, and these runs have no sink: the confirmation
+     * is stood in for here. Reading a table is not writing it, so the read side records nothing -- a run
+     * that skipped a table on the strength of having read it would drop every row of it that has not
+     * changed since.
      */
     @Test
     void aSecondRunResumesFromTheRecordedPositionInsteadOfReReadingFromThePresent() {
         InMemoryMeta meta = new InMemoryMeta();
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(change(10)));
-        runUnit(first, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-resume"), e -> { });
+        CaptureRun firstRun =
+                runUnit(first, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-resume"), e -> { });
+        meta.markSnapshotComplete(firstRun.chainId().orElseThrow().value(), "orders");
 
         FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(change(11)));
         CaptureRun second = runUnit(restarted, meta)

@@ -29,14 +29,19 @@ public final class SnapshotPhase {
 
     /**
      * Runs the snapshot phase over the chain's selected {@code tables}: records the cdc-start position for
-     * the chain, then reads each table with a bounded read of its own, straight to {@code sink} with every
-     * row stamped with the generation this snapshot belongs to, marking each table's snapshot complete as
-     * its own read finishes. Returns the number of events passed through.
+     * the chain, then reads each table it still owes with a bounded read of its own, straight to
+     * {@code sink} with every row stamped with the generation this snapshot belongs to. Returns the number
+     * of events passed through.
      *
-     * <p>A table at a time is what lets an interrupted load keep what it finished. One read over the whole
-     * selection succeeds or fails as a unit, so it marks either everything or nothing, and a load stopped
-     * at the fifty-first table of a hundred marks nothing at all -- the next run then reads all hundred
-     * again. Read one at a time, the fifty that finished are marked and only the rest are still owed.
+     * <p>A table at a time, and only the tables still owed. Which those are is read from the record: a
+     * table is owed until the sink is recorded as having written it. That is a different question from
+     * whether it was read, and only the first is safe to skip on -- a table read and never written, skipped
+     * on the way back, leaves every one of its rows that has not changed since absent from the target for
+     * good, because the tail only replays what changed after the seam.
+     *
+     * <p>Nothing here marks a table written. That mark is the sink's to make, when its frontier confirms
+     * that table's rows; a reader that also made it would be a second voice on the one question this phase
+     * cannot answer, and the two would disagree in the direction that loses rows.
      *
      * <p>The rows are ordered even though they have no position in the change stream: they carry the
      * reserved snapshot sequence, which places all of them before every change of the same generation, so
@@ -46,17 +51,15 @@ public final class SnapshotPhase {
      * is resuming takes the generation and the seam already recorded, as a pair — see
      * {@link #resumedSnapshot}.
      *
-     * <p>The two marks bracket the drain and answer different questions. The cdc-start position — the
+     * <p>The cdc-start position is the one thing this phase writes. It — the
      * seam this snapshot began at, sampled at the source before its first row — is recorded before the
      * first table drains, so the cdc tail that follows resumes from before the snapshot and the idempotent
      * sink absorbs the overlap; no change made while the snapshot runs is missed. A batch that reports no
      * seam stops the run with a code rather than letting the caller pick a start of its own.
      * Its presence therefore means the snapshot has <em>started</em>.
-     * A table's completion mark is written only after that table's own read returns, so its presence means
-     * that table has been read to exhaustion. A read that fails partway marks the table it was on and no
-     * table after it: an aborted read is not a completed one, and a reader treating a partial read as
-     * exhausted would conclude rows are absent from the source that were merely never read. Events are
-     * passed through one by one, never buffered in the change ring, and every batch is always closed.
+     * A read that fails partway stops the run there: the tables after it are not read, and none of them --
+     * nor the one that failed -- is recorded as anything. Events are passed through one by one, never
+     * buffered in the change ring, and every batch is always closed.
      *
      * <p>One seam covers the whole round, taken from the first read of it and never replaced. Each bounded
      * read samples a seam of its own, later than the one before, and letting a later table's seam move
@@ -85,7 +88,9 @@ public final class SnapshotPhase {
             throw new IllegalArgumentException("a snapshot over a chain must name the tables it reads");
         }
 
-        Optional<SrsMeta> resumed = resumedSnapshot(meta, miningChainId, tables);
+        Optional<SrsMeta> record = meta.read(miningChainId);
+        List<String> owed = stillOwed(record, tables);
+        Optional<SrsMeta> resumed = resumedSnapshot(record, owed);
         long epoch = resumed.map(SrsMeta::snapshotEpoch).orElse(ringEpoch);
         SourceOrder order = SourceOrder.snapshotRow(epoch);
         // A resume rewrites the pair it read back, unchanged. Both halves come from the same record and the
@@ -94,7 +99,7 @@ public final class SnapshotPhase {
         String resumedStart = resumed.map(SrsMeta::cdcStartPosition).orElse(null);
         boolean seamRecorded = false;
         long count = 0;
-        for (String table : tables) {
+        for (String table : owed) {
             try (CaptureBatch batch = port.snapshot(readOf(config, table))) {
                 // The seam comes from the batch, which sampled it at the source before reading its first
                 // row. A source that reports none leaves the tail nothing to join to, and the run stops
@@ -112,9 +117,18 @@ public final class SnapshotPhase {
                     count++;
                 }
             }
-            meta.markSnapshotComplete(miningChainId, table);
         }
         return count;
+    }
+
+    /**
+     * The selected tables this run still owes a read: the ones the record does not show as written. A table
+     * is owed until the sink has confirmed it, however far its read got -- reading is not writing, and the
+     * only one of the two that is safe to skip a table on is the second.
+     */
+    private static List<String> stillOwed(Optional<SrsMeta> record, List<String> tables) {
+        List<String> written = record.map(SrsMeta::snapshotCompletedTables).orElse(List.of());
+        return tables.stream().filter(table -> !written.contains(table)).toList();
     }
 
     /**
@@ -149,19 +163,15 @@ public final class SnapshotPhase {
      * the delete, and it stays in the target for good — nothing thrown, nothing logged. Starting at the
      * recorded seam replays the span instead, which the idempotent sink absorbs.
      *
-     * <p>Resuming is "a seam was recorded and some selected table has not drained". A run whose tables are
-     * all marked drained means whatever runs now is a new snapshot — a re-mine — and a new baseline of truth
-     * is entitled to beat what came before, so it takes the current generation and the seam it sampled
-     * itself; reusing the recorded seam there would replay everything since that run on every re-mine, for
-     * ever. One table of the selection still un-drained keeps the whole run pinned: the rows of its drained
-     * siblings are re-read by the same drain, and letting those take the running generation is exactly the
-     * silent roll-back this pins against.
+     * <p>Resuming is "a seam was recorded and some selected table is still owed". A run that owes none
+     * means whatever runs now is a new snapshot — a re-mine — and a new baseline of truth is entitled to
+     * beat what came before, so it takes the current generation and the seam it sampled itself; reusing the
+     * recorded seam there would replay everything since that run on every re-mine, for ever.
      */
-    private static Optional<SrsMeta> resumedSnapshot(
-            SrsMetaStore meta, String miningChainId, List<String> tables) {
-        return meta.read(miningChainId)
-                .filter(record -> record.snapshotEpoch() != 0L)
-                .filter(record -> !record.snapshotCompletedTables().containsAll(tables));
+    private static Optional<SrsMeta> resumedSnapshot(Optional<SrsMeta> record, List<String> owed) {
+        return record
+                .filter(stored -> stored.snapshotEpoch() != 0L)
+                .filter(stored -> !owed.isEmpty());
     }
 
     /**

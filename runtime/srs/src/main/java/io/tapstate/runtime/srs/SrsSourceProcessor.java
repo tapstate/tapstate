@@ -46,7 +46,13 @@ public final class SrsSourceProcessor extends AbstractProcessor {
     private SrsRingReader reader;
     private SourceOrder read;
     private Watermark unannounced;
-    private long announced = Long.MIN_VALUE;
+    private long announced;
+    // Whether anything has been announced at all, kept apart from the value rather than encoded in it. The
+    // lowest long is a real bound - it is what the reserved snapshot position packs to under some stampings
+    // - and a sentinel that a real value can equal is a first bound silently swallowed.
+    private boolean announcedAny;
+    // Whether this source still owes the bound covering the snapshot rows it was seeded with.
+    private boolean snapshotBoundDue;
 
     private SrsSourceProcessor(String ringName, String src, StartFrom start, long epoch,
             SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp) {
@@ -73,6 +79,9 @@ public final class SrsSourceProcessor extends AbstractProcessor {
         if (bound instanceof SnapshotBuffer buffer) {
             pending.addAll(buffer.drain(ringName));
         }
+        // Rows to emit means a bound to promise once they have left. A source seeded with none owes nothing:
+        // there is no snapshot of this table in this run for a sink to be waiting on.
+        snapshotBoundDue = !pending.isEmpty();
         Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
         SrsRingbuffer ring = new SrsRingbuffer(rb);
         reader = SrsRingReader.from(ring, start, publisherFactory.resolve(context.hazelcastInstance()));
@@ -91,6 +100,18 @@ public final class SrsSourceProcessor extends AbstractProcessor {
         // already recorded as announced, so it has to leave rather than be worked out afresh.
         if (!emitPending() || !announce()) {
             return false;
+        }
+        // Every seeded snapshot row has left, so the bound covering them can be promised now. Waiting for a
+        // change to promise it with is waiting for something that does not exist while a load runs: every
+        // row of one snapshot carries the same reserved position, so downstream never sees a higher position
+        // of this table settle, and a sink with no bound to close them on never records the table as
+        // written -- which is a table read again from the start on every resume until the load ends.
+        if (snapshotBoundDue) {
+            snapshotBoundDue = false;
+            stampAt(SourceOrder.snapshotRow(epoch));
+            if (!announce()) {
+                return false;
+            }
         }
         // The ring's sequence pairs with the generation this reader runs under to give each change its
         // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
@@ -137,12 +158,24 @@ public final class SrsSourceProcessor extends AbstractProcessor {
      * nothing at all, and the levels behind it keep whatever they last promised.
      */
     private void stampWhatHasLeft() {
-        if (stamp == null || read == null) {
+        if (read == null) {
             return;
         }
-        Watermark bound = stamp.boundFor(read);
-        if (bound.timestamp() > announced) {
+        stampAt(read);
+    }
+
+    /**
+     * Holds the bound standing for {@code covered} to be offered, unless it is no advance on what has
+     * already been announced. A source with no stamp is one whose job wires no bounds at all.
+     */
+    private void stampAt(SourceOrder covered) {
+        if (stamp == null) {
+            return;
+        }
+        Watermark bound = stamp.boundFor(covered);
+        if (!announcedAny || bound.timestamp() > announced) {
             announced = bound.timestamp();
+            announcedAny = true;
             unannounced = bound;
         }
     }

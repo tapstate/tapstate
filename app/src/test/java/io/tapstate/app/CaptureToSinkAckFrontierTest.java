@@ -77,17 +77,19 @@ import org.junit.jupiter.api.Test;
  * transform runs, and the sink advances the durable watermark — over one embedded Jet + SRS member.
  *
  * <p>Changes are fed one at a time and each is awaited at the sink before the next, so a change lands in
- * its own sink batch. Two effects set how far the durable ack advances: the contiguous-acked-prefix always
- * holds the highest position open (a position acks only once a strictly higher one settles), and a live
- * streaming sink reaps a settled batch on the next input rather than on a completion call that never comes,
- * so the second-highest's ack is pending until one more input arrives. With positions {@code src-0..src-3} fed
- * one per batch the durable prefix therefore reaches {@code src-1}; {@code src-2} and {@code src-3} stay pending —
- * the most the algorithm guarantees here.
+ * its own sink batch. How far the durable ack advances is set by the two proofs a position can be closed
+ * on: a strictly higher position settling, and a bound covering it once nothing is left in flight. With
+ * positions {@code src-0..src-3} fed one per batch, the first proof carries the prefix to {@code src-2},
+ * and the source's own bound closes {@code src-3} behind it — so the durable prefix reaches the last change
+ * fed rather than trailing one behind it.
  *
- * <p>The same run is what pins the other half: a source announces how far it has read whether or not
- * anything downstream consumes it, so bounds travel this linear job too. The acked sequence asserted here
- * is therefore the witness that they change nothing about it - a job that started acking differently once
- * bounds began flowing would redden these assertions, which is the only way that regression is visible.
+ * <p>The value asserted here is what says the bound is being acted on at all, and it is deliberately not
+ * what it used to be. Until 2026-09-01 bounds were discarded on this shape and this assertion read
+ * {@code src-2}, one behind. That was safe and it was also not enough: a full load has no second change to
+ * close its snapshot rows with, every row of one snapshot carrying the same reserved position, so a
+ * frontier that could only close a position by settling a higher one left every table it had written
+ * unrecorded — and a resume read all of them again. A job that stopped acting on bounds would put this
+ * assertion back to {@code src-2}, which is the only way that regression is visible.
  *
  * <p>Scope: {@code cdc_only}, so the snapshot phase does not run.
  */
@@ -144,8 +146,8 @@ class CaptureToSinkAckFrontierTest {
             // Feed four cdc changes one at a time, each awaited at the sink so it lands in its own batch:
             // positions src-0, src-1, src-2, src-3 in feed order -- the source states each one. Every settled
             // batch is reaped, on the next input while they arrive and on the idle hook once the tail goes
-            // quiet, so the durable acked prefix settles at its lag-by-one frontier: src-0..src-2 are acked
-            // and only src-3 is held open, since nothing strictly higher has settled to close it.
+            // quiet. src-0..src-2 are closed by the change above each of them; src-3 has nothing above it and
+            // is closed by the source's bound instead, once no write is left in flight.
             gatedSource.feed(change(0));
             awaitSinkSize(1);
             gatedSource.feed(change(1));
@@ -155,14 +157,14 @@ class CaptureToSinkAckFrontierTest {
             gatedSource.feed(change(3));
             awaitSinkSize(4);
 
-            awaitSinkAck(meta, chainId, "src-2");
-            // src-3 is held open by the lag-by-one rule: nothing strictly higher has settled to close it.
-            assertThat(ackedPosition(meta, chainId)).isEqualTo("src-2");
+            awaitSinkAck(meta, chainId, "src-3");
+            // Closed by the bound rather than by a higher change: nothing higher was ever fed.
+            assertThat(ackedPosition(meta, chainId)).isEqualTo("src-3");
 
             // The observation position resolver reads back exactly that durable sink-acked position, keyed by
             // the source's table, so the read face projects what the real sink advanced -- not a stand-in.
             assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE))
-                    .containsExactly(entry(TABLE, "src-2"));
+                    .containsExactly(entry(TABLE, "src-3"));
         } finally {
             actuator.stop(PIPELINE);
         }

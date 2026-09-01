@@ -349,9 +349,105 @@ class SinkProcessorTest {
         processor.tryProcessWatermark(new Watermark(Long.MAX_VALUE - 1, (byte) 1));
         drain(processor);
 
-        // The source stamps bounds whatever the graph does with them, so they reach this sink too. Acting
-        // on one here would advance past p2, which is still open: the settled prefix is the whole answer.
+        // The source stamps bounds whatever the graph does with them, so they reach this sink too. This
+        // graph carries no chain numbering, so a bound cannot be attributed to a chain at all and none is
+        // taken in -- standing still, rather than acking one chain on a promise made about another.
         assertThat(ack.calls).containsExactly("orders=p1");
+    }
+
+    @Test
+    void a_snapshot_row_is_acked_once_a_bound_reaches_it() throws Exception {
+        RecordingAck ack = new RecordingAck();
+        SinkProcessor processor = init(new SinkProcessor(
+                new RecordingWriter(), ack, new ContiguousPrefix(AXES), 1, 1));
+
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(snapshotRow("orders"), snapshotRow("orders")));
+        pump(processor, inbox);
+
+        // Every snapshot row of a table carries the one reserved position, so while a load runs no higher
+        // position of that table ever settles. A settled batch on its own therefore proves nothing here and
+        // the frontier stands still -- which is what left a table read in full looking unconfirmed.
+        assertThat(ack.calls).isEmpty();
+
+        processor.tryProcessWatermark(snapshotBoundOn("orders"));
+        drain(processor);
+
+        // A bound is the other proof that a position is closed: the source says nothing at or below it is
+        // still to come, which is exactly what a strictly higher settled position would have said. What is
+        // acked is the position that settled, never the bound itself.
+        assertThat(ack.positions).extracting(ChainPosition::order)
+                .containsExactly(SourceOrder.snapshotRow(1));
+    }
+
+    @Test
+    void a_bound_that_arrives_before_the_write_settles_still_acks_once_it_does() throws Exception {
+        RecordingAck ack = new RecordingAck();
+        ManualWriter writer = new ManualWriter();
+        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1));
+
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(snapshotRow("orders")));
+        processor.process(0, inbox);
+        processor.tryProcessWatermark(snapshotBoundOn("orders"));
+
+        // Nothing yet: the write is still in flight, and a bound is a promise about what is coming, never a
+        // report of what is durable.
+        assertThat(ack.calls).isEmpty();
+
+        writer.completeAll();
+        drain(processor);
+
+        // A bound reaching the sink before the batch it covers has settled is the ordinary case rather than
+        // a rare one -- the source promises as soon as its rows have left it, while the write is still
+        // going. A frontier that only looked at the bound as it arrived would drop it, and on a full load no
+        // second bound ever comes: the table would sit written and unrecorded for good.
+        assertThat(ack.positions).extracting(ChainPosition::order)
+                .containsExactly(SourceOrder.snapshotRow(1));
+    }
+
+    @Test
+    void a_bound_waits_for_the_rest_of_a_fan_out_to_settle() throws Exception {
+        RecordingAck ack = new RecordingAck();
+        ManualWriter writer = new ManualWriter();
+        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1));
+
+        // A batch size of one puts two events of the same source position into two batches, which is what a
+        // fan-out looks like from here: one change of the source, several rows written.
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(at("orders", "p3"), at("orders", "p3")));
+
+        processor.process(0, inbox);
+        writer.completeAll();
+        processor.process(0, inbox);
+        processor.tryProcessWatermark(boundAt("orders", 3));
+
+        // The bound covers p3 and one batch of p3 has settled -- and the rest of it is still being written.
+        // Acking here would report a change durable while part of what it produced is not, and a restart
+        // resuming above it never writes that part at all.
+        assertThat(ack.calls).isEmpty();
+
+        writer.completeAll();
+        drain(processor);
+        assertThat(ack.calls).containsExactly("orders=p3");
+    }
+
+    @Test
+    void a_bound_beneath_what_settled_acks_nothing() throws Exception {
+        RecordingAck ack = new RecordingAck();
+        SinkProcessor processor = init(new SinkProcessor(
+                new RecordingWriter(), ack, new ContiguousPrefix(AXES), 1, 1));
+
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(at("orders", "p5")));
+        pump(processor, inbox);
+
+        processor.tryProcessWatermark(boundAt("orders", 2));
+        drain(processor);
+
+        // The bound is beneath the settled position, so it closes nothing. Acking on it would report a
+        // position durable on the strength of a promise made about lower ones.
+        assertThat(ack.calls).isEmpty();
     }
 
     @Test
@@ -516,6 +612,16 @@ class SinkProcessorTest {
         return new Watermark(FrontierOrders.pack(chain, new SourceOrder(1, seq)), AXES.axisOf(chain));
     }
 
+    /** A snapshot row of {@code src}: ordered by the reserved snapshot position, carrying no token. */
+    private static Envelope snapshotRow(String src) {
+        return Envelope.read(1L, src, Map.of("id", src), null).withOrder(SourceOrder.snapshotRow(1));
+    }
+
+    /** The bound a source stamps once it has emitted the whole of {@code chain}'s snapshot. */
+    private static Watermark snapshotBoundOn(String chain) {
+        return new Watermark(FrontierOrders.pack(chain, SourceOrder.snapshotRow(1)), AXES.axisOf(chain));
+    }
+
     /** Drives process() until the inbox drains (reaping and issuing one batch per call), then completes. */
     private static void pump(SinkProcessor processor, TestInbox inbox) {
         for (int i = 0; i < 10_000 && !inbox.isEmpty(); i++) {
@@ -597,10 +703,14 @@ class SinkProcessorTest {
     /** Records every {@code advance(chain, position)} call as {@code "chain=token"}, in order. */
     private static final class RecordingAck implements SinkAck {
         private final List<String> calls = new ArrayList<>();
+        // A snapshot row's token is absent by definition, so the token alone cannot tell one of those acks
+        // from another. What separates them is the order.
+        private final List<ChainPosition> positions = new ArrayList<>();
 
         @Override
         public void advance(String chain, ChainPosition position) {
             calls.add(chain + "=" + position.token());
+            positions.add(position);
         }
     }
 

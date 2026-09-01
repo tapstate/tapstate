@@ -60,6 +60,42 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
+    void marksTheTableSnapshotCompleteWhenTheFrontierConfirmsItsSnapshotRows() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "w0", 1L);
+        HazelcastInstance member = memberWith(store);
+
+        SinkAck ack = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders", "items", "mc-orders"), "pipe-1").resolve(member);
+
+        ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
+
+        // This is the only moment anyone learns a table's rows are in the target. The read side knows when
+        // it finished reading, which is a different question: a table read and never written looks done to
+        // it, and the next run skips it. What the tail then replays is only what changed after the snapshot
+        // began -- a row that never changed again is simply absent from the target, for good.
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables())
+                .containsExactly("orders");
+    }
+
+    @Test
+    void aChangeAckSaysNothingAboutWhetherASnapshotFinished() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+
+        ack.advance("orders", at(7, "w7"));
+
+        // A change acked at a spot in the stream proves the sink wrote that change, not that it wrote a
+        // snapshot. A cdc-only read has no snapshot at all, and marking one done here would let a later run
+        // skip a full load that never ran.
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables()).isEmpty();
+    }
+
+    @Test
     void aTokenlessPositionOnAChainWithNoRecordIsAnInvariantViolation() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         HazelcastInstance member = memberWith(store);
