@@ -45,6 +45,40 @@ class StartFromTest {
                 });
     }
 
+    /**
+     * An instant this build cannot address is refused here, where the value the author wrote is still in
+     * hand.
+     *
+     * <p>The year range {@link Instant} parses is far wider than the epoch milliseconds every consumer of
+     * a start addresses it by, and the gap is reachable from an ordinary setting: the value below parses
+     * cleanly and then overflows when the ring reader converts it. That arrives as a bare arithmetic
+     * failure on whichever member ran the read — no code, no setting named, nothing connecting it to the
+     * line of yaml that caused it. Refusing at the parse keeps the diagnosis attached to the input.
+     */
+    @Test
+    void rejectsAnInstantTooFarOutToAddressWithACode() {
+        for (String unusable : new String[] {"+999999999-01-01T00:00:00Z", "-1000000000-01-01T00:00:00Z"}) {
+            assertThatThrownBy(() -> StartFrom.parse(unusable))
+                    .as("start_from %s", unusable)
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(e -> {
+                        TapstateException ce = (TapstateException) e;
+                        assertThat(ce.code().code()).isEqualTo("capture.start-from-unparsable");
+                        assertThat(ce.args()).containsEntry("value", unusable);
+                    });
+        }
+    }
+
+    /**
+     * The control: an instant at the edge of what can be addressed is still accepted, so the refusal above
+     * is a boundary rather than a blanket rejection of anything unusual.
+     */
+    @Test
+    void anInstantAtTheEdgeOfTheAddressableRangeIsStillAccepted() {
+        assertThat(StartFrom.parse("+292278994-08-17T07:12:55Z"))
+                .isEqualTo(StartFrom.at(Instant.parse("+292278994-08-17T07:12:55Z")));
+    }
+
     @Test
     void rejectsNullAsAProgrammerErrorNotACode() {
         // A null start_from is an invariant violation (the setting defaults to a value); it stays a bare NPE
