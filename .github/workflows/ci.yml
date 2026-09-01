@@ -43,6 +43,18 @@ jobs:
       - name: Build and test
         run: mvn -B verify
 
+      # The MCP tool set is pinned by name inside mcp-smoke.sh, and until now the release run was the
+      # only lane that executed it. A tool added without that list following it therefore stayed
+      # invisible until a release was cut, which happened three times, most recently with
+      # system_version. The jar this needs is already produced by the verify above -- the boot
+      # repackage sits in the module's own build rather than behind a profile -- so this costs a
+      # process start and compiles nothing.
+      - name: MCP stdio smoke (Boot JAR sidecar)
+        run: |
+          jar="$(find control/mcp-server/target -maxdepth 1 -name 'mcp-server-*-boot.jar' -print -quit)"
+          test -n "$jar"
+          bash control/mcp-server/mcp-smoke.sh "$jar"
+
       # Coverage of the lines this pull request adds, written to the run summary.
       #
       # This is the only coverage figure an outside contribution can get. The new-code coverage
