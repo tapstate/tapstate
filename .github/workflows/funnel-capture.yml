@@ -55,6 +55,24 @@ jobs:
       # integration". The App carries it instead. This step fails the run loudly rather than storing
       # an empty series: a counter that cannot be read and a counter that reads zero are the same
       # bytes downstream, and only one of them is a fact.
+      # The minting error above is generic ("at least one repository ... not accessible"), and it is the
+      # first thing anyone meets when the app is not set up yet. Two settings changes are needed and
+      # neither is guessable from that sentence, so they are named here rather than in a document
+      # nobody reading a red run will open.
+      - name: What to do when the token could not be minted
+        if: failure() && steps.token.outcome == 'failure'
+        run: |
+          echo "The app token could not be minted for both repositories. Two things are needed:"
+          echo
+          echo "  1. install the app on tapstate/gtm as well as tapstate/tapstate"
+          echo "     (installation settings -> Repository access -> add gtm)"
+          echo "  2. grant it 'Administration: read', which /traffic/* requires and which"
+          echo "     GITHUB_TOKEN can never have"
+          echo
+          echo "A permission change does not take effect until an owner accepts it on the"
+          echo "installation page -- that acceptance is the step most often missed."
+          exit 1
+
       - name: Check the token can read the traffic API
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
