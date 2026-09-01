@@ -30,9 +30,14 @@ io.tapstate.spi.capture.CapturePort :: method :: cdc(io.tapstate.spi.capture.Cap
 io.tapstate.spi.capture.CapturePort :: method :: discoverSchema(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.DiscoveredSchema
 io.tapstate.spi.capture.CapturePort :: method :: snapshot(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.CaptureBatch
 io.tapstate.spi.capture.CapturePort :: method :: testConnection(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.ConnectionReport
+io.tapstate.spi.capture.CaptureStart :: method :: at(java.time.Instant) -> io.tapstate.spi.capture.CaptureStart
+io.tapstate.spi.capture.CaptureStart :: method :: earliest() -> io.tapstate.spi.capture.CaptureStart
 io.tapstate.spi.capture.CaptureStart :: method :: present() -> io.tapstate.spi.capture.CaptureStart
 io.tapstate.spi.capture.CaptureStart :: method :: resume(io.tapstate.spi.capture.SourcePosition) -> io.tapstate.spi.capture.CaptureStart
+io.tapstate.spi.capture.CaptureStart :: permits :: io.tapstate.spi.capture.CaptureStart$At
+io.tapstate.spi.capture.CaptureStart :: permits :: io.tapstate.spi.capture.CaptureStart$Earliest
 io.tapstate.spi.capture.CaptureStart :: permits :: io.tapstate.spi.capture.CaptureStart$Present
 io.tapstate.spi.capture.CaptureStart :: permits :: io.tapstate.spi.capture.CaptureStart$Resume
+io.tapstate.spi.capture.CaptureStart$At :: component :: instant :: java.time.Instant
 io.tapstate.spi.capture.CaptureStart$Resume :: component :: position :: io.tapstate.spi.capture.SourcePosition
 io.tapstate.spi.capture.SourcePosition :: component :: token :: java.lang.String

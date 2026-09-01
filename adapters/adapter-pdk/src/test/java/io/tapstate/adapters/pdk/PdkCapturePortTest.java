@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -225,6 +226,115 @@ class PdkCapturePortTest {
     }
 
     // ---- cdc drive: streamRead -> decodeChange ---------------------------------------------------
+
+    // ---- where the tail is told to begin ----------------------------------------------------------
+
+    /**
+     * The mark the echoing source stamps on the first row it emits: what it was asked to resolve, and so
+     * what actually reached the connector rather than what the caller believed it had said.
+     */
+    private static String startMarkFrom(Path jar, CaptureStart start) throws Exception {
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.TimestampEchoingSource", null));
+        List<Envelope> got = new CopyOnWriteArrayList<>();
+        CountDownLatch one = new CountDownLatch(1);
+        try (Subscription sub = port.cdc(config("t1"), start, (events, pos) -> {
+            got.addAll(events);
+            one.countDown();
+        })) {
+            assertThat(one.await(5, TimeUnit.SECONDS)).as("the tail delivered its first batch").isTrue();
+        }
+        return String.valueOf(got.get(0).after().get("id"));
+    }
+
+    /**
+     * A start named as an instant reaches the connector as that instant.
+     *
+     * <p>The failure this rules out is not a crash. A dropped instant leaves a tail that starts at the
+     * present, runs, reports healthy and delivers rows — so every assertion about rows arriving is green
+     * whether the instant was honoured or thrown away, and the span between the two is exactly the data
+     * the caller asked for and did not get. Only what the connector was handed tells them apart.
+     */
+    @Test
+    void cdcAtAnInstantHandsTheConnectorThatInstantRatherThanThePresent(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+
+        String mark = startMarkFrom(jar, CaptureStart.at(Instant.parse("2026-09-01T10:00:00Z")));
+
+        assertThat(mark).isEqualTo("at:1788256800000");
+    }
+
+    /**
+     * The same moment written in two zones is one start.
+     *
+     * <p>An offset is applied where the text is parsed, so nothing downstream of that ever holds a local
+     * reading — which is what keeps one pipeline from beginning at two different points depending on
+     * which machine's clock read it.
+     */
+    @Test
+    void theSameMomentWrittenInTwoZonesReachesTheConnectorAsOneInstant(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+
+        String utc = startMarkFrom(jar, CaptureStart.at(Instant.parse("2026-09-01T10:00:00Z")));
+        String shifted = startMarkFrom(jar, CaptureStart.at(Instant.parse("2026-09-01T18:00:00+08:00")));
+
+        assertThat(shifted).isEqualTo(utc).isEqualTo("at:1788256800000");
+    }
+
+    /** The oldest change a source still holds is asked for as an instant the source resolves, not guessed at. */
+    @Test
+    void cdcAtTheEarliestAsksTheSourceForTheOldestChangeItHolds(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+
+        String mark = startMarkFrom(jar, CaptureStart.earliest());
+
+        assertThat(mark).isEqualTo("at:0");
+    }
+
+    /**
+     * The control that makes the three above discriminate: asking for the present still hands the
+     * connector no instant at all.
+     *
+     * <p>Without it an implementation that resolved every start as the beginning of the source would
+     * satisfy the earliest case and quietly turn every ordinary tail into a full replay of the retained
+     * log — green on each positive assertion, and wrong on the case nobody wrote down.
+     */
+    @Test
+    void cdcAtThePresentStillHandsTheConnectorNoInstant(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+
+        String mark = startMarkFrom(jar, CaptureStart.present());
+
+        assertThat(mark).isEqualTo("present");
+    }
+
+    /**
+     * A source that cannot map an instant to one of its positions refuses the ask, with a code that names
+     * the capability it lacks.
+     *
+     * <p>The alternatives are the reason this is a refusal: starting at the present or at the beginning
+     * both produce a healthy tail reading a span the caller never asked for. The refusal is raised before
+     * the stream thread starts, so it reaches whoever asked rather than arriving later as "the source
+     * failed" on the error channel — a connector that cannot do this is not a source that broke.
+     */
+    @Test
+    void anInstantStartOnASourceThatCannotResolveOneIsACodedRefusal(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.offsetlessStreamSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.OffsetlessStream", null));
+
+        assertThatThrownBy(() -> port.cdc(config("t1"), CaptureStart.at(Instant.parse("2026-09-01T10:00:00Z")),
+                (events, pos) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> {
+                    TapstateException ce = (TapstateException) e;
+                    assertThat(ce.code()).isEqualTo(ConnectorError.CAPABILITY_MISSING);
+                    assertThat(ce.args()).containsEntry("connector", "demo")
+                            .containsEntry("capability", "timestamp-to-stream-offset");
+                });
+
+        // The same source started at the present is not refused: it never needed the missing function.
+        assertThatCode(() -> port.cdc(config("t1"), CaptureStart.present(), (events, pos) -> { }).close())
+                .doesNotThrowAnyException();
+    }
 
     @Test
     void cdcDrivesStreamReadAndDeliversDecodedChangeEnvelopes(@TempDir Path dir) throws Exception {

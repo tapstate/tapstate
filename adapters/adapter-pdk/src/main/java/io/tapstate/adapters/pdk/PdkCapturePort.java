@@ -98,6 +98,18 @@ public final class PdkCapturePort implements CapturePort {
         Object resumeAt;
         try {
             stream = requireFunction(connector.functions().getStreamReadFunction());
+            // A start named as an instant is one only the source can resolve, and whether it can at all is
+            // knowable here, from the functions it registered, before a connection is opened. Refusing now
+            // is the point: the two ways of carrying on without that function -- begin at the present, or
+            // begin at the source's oldest -- both yield a stream that runs, reports healthy and reads a
+            // different span than the caller asked for, which is the failure this whole start exists to
+            // make impossible. A connector that lacks it is not a source that broke, so this is a refusal
+            // to whoever asked rather than an error delivered later on the stream's channel.
+            if (startAt(start) != null && connector.functions().getTimestampToStreamOffsetFunction() == null) {
+                throw new TapstateException(ConnectorError.CAPABILITY_MISSING,
+                        Map.of("connector", connector.connectorId(),
+                                "capability", "timestamp-to-stream-offset"), null);
+            }
             // Read the recorded position back here, on the caller's thread, rather than inside the stream
             // loop: the loop's catch-all delivers everything it catches as a coded connector read failure,
             // which would report "the source failed" for what is really a position this build cannot read.
@@ -110,7 +122,8 @@ public final class PdkCapturePort implements CapturePort {
             connector.close();
             throw e;
         }
-        Thread thread = new Thread(() -> streamLoop(connector, config, resumeAt, listener, stream),
+        Long startAt = startAt(start);
+        Thread thread = new Thread(() -> streamLoop(connector, config, resumeAt, startAt, listener, stream),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
@@ -174,7 +187,7 @@ public final class PdkCapturePort implements CapturePort {
      */
     private SnapshotRead batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
         connector.connector().init(connector.context());
-        Object seam = startOffset(connector);
+        Object seam = startOffset(connector, null);
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
         Map<String, TapTable> discovered = byId(discoverTables(connector, config.streams()));
@@ -254,7 +267,7 @@ public final class PdkCapturePort implements CapturePort {
         return new Probe(tables, sample);
     }
 
-    private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt,
+    private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
             CaptureListener listener, StreamReadFunction stream) {
         try {
             connector.underLoader(() -> {
@@ -268,10 +281,11 @@ public final class PdkCapturePort implements CapturePort {
                 Map<String, TapTable> tables = byId(discoverTables(connector, config.streams()));
                 tables.values().forEach(connector::fillFieldTypes);
                 connector.context().setTableMap(tableMap(tables));
-                // Resuming uses the position the caller recorded; starting at the present samples the
-                // connector's current one, which also keeps a null offset out of the connector -- that
-                // drives a schema-only recovery with no stored offset to recover from.
-                Object startOffset = resumeAt != null ? resumeAt : startOffset(connector);
+                // Resuming uses the position the caller recorded; every other start asks the connector to
+                // name one, which also keeps a null offset out of the connector -- that drives a
+                // schema-only recovery with no stored offset to recover from. Which position it names is
+                // the instant it is handed: none for the present, the caller's for an instant start.
+                Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, startAt);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     // A change stream also carries control events (heartbeats and the like) that signal
                     // the tail is alive but carry no row; they are not decodable changes, so skip them.
@@ -370,12 +384,31 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     /**
-     * The connector's current stream position, so the tail resumes from now rather than driving a
-     * schema-only recovery that has no stored offset. Null when the connector declares no offset function.
+     * The stream position the connector names for {@code atEpochMilli}, or for its present moment when
+     * that is null — so the tail begins somewhere the source chose rather than driving a schema-only
+     * recovery that has no stored offset. Null when the connector declares no offset function, which only
+     * a present start reaches: an instant start is refused before this, where the caller can still hear it.
      */
-    private static Object startOffset(PdkConnector connector) throws Throwable {
+    private static Object startOffset(PdkConnector connector, Long atEpochMilli) throws Throwable {
         TimestampToStreamOffsetFunction offset = connector.functions().getTimestampToStreamOffsetFunction();
-        return offset == null ? null : offset.timestampToStreamOffset(connector.context(), null);
+        return offset == null ? null : offset.timestampToStreamOffset(connector.context(), atEpochMilli);
+    }
+
+    /**
+     * The instant a start asks the source to resolve, as the epoch milliseconds the frozen contract takes,
+     * or null when the start names no instant. The oldest change a source retains is asked for as the
+     * beginning of the timeline: the contract has one way to ask about a point in time and no separate way
+     * to ask for the earliest, so the two forms differ here only in which instant they name — while
+     * staying distinct above, where "as far back as you go" and "back to 1970" are different asks and
+     * fail differently.
+     */
+    private static Long startAt(CaptureStart start) {
+        return switch (start) {
+            case CaptureStart.At at -> at.instant().toEpochMilli();
+            case CaptureStart.Earliest ignored -> 0L;
+            case CaptureStart.Resume ignored -> null;
+            case CaptureStart.Present ignored -> null;
+        };
     }
 
     /**

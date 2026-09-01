@@ -135,6 +135,126 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.PositionedSource", source);
     }
 
+    /**
+     * A source that reports back which instant it was asked to resolve, rather than only which offset it
+     * ended up handing out.
+     *
+     * <p>Its {@code timestampToStreamOffset} encodes its argument into the offset it returns, and its
+     * stream read emits that offset's mark as the {@code id} of its first row. So the instant a caller
+     * asked to start at is observable from outside the connector, which is the only way to tell a start
+     * that was carried through from one that was dropped on the way: a dropped instant still produces a
+     * running stream reading from the present, and every assertion about rows arriving is green either
+     * way.
+     */
+    static Path timestampEchoingSource(Path dir) {
+        String source = ""
+                + "package synthetic;"
+                + "import io.tapdata.pdk.apis.TapConnector;"
+                + "import io.tapdata.pdk.apis.functions.ConnectorFunctions;"
+                + "import io.tapdata.entity.codec.TapCodecsRegistry;"
+                + "import io.tapdata.pdk.apis.context.TapConnectionContext;"
+                + "import io.tapdata.pdk.apis.entity.ConnectionOptions;"
+                + "import io.tapdata.pdk.apis.entity.TestItem;"
+                + "import io.tapdata.entity.schema.TapTable;"
+                + "import io.tapdata.entity.schema.TapField;"
+                + "import io.tapdata.entity.event.TapEvent;"
+                + "import io.tapdata.entity.event.dml.TapInsertRecordEvent;"
+                + "import java.util.ArrayList;"
+                + "import java.util.LinkedHashMap;"
+                + "import java.util.List;"
+                + "import java.util.Map;"
+                + "import java.util.function.Consumer;"
+                + "public class TimestampEchoingSource implements TapConnector {"
+                + "  public static class Offset implements java.io.Serializable {"
+                + "    public String mark;"
+                + "    public Offset() {}"
+                + "    public Offset(String mark) { this.mark = mark; }"
+                + "  }"
+                + "  public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {"
+                + "    functions.supportTimestampToStreamOffset((context, timestamp) ->"
+                + "        new Offset(timestamp == null ? \"present\" : (\"at:\" + timestamp)));"
+                + "    functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "      consumer.streamReadStarted();"
+                + "      String startedAt = (offset instanceof Offset) ? ((Offset) offset).mark : \"none\";"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Map<String,Object> a = new LinkedHashMap<>(); a.put(\"id\", startedAt);"
+                + "      batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "      consumer.accept(batch, new Offset(\"batch-9\"));"
+                + "      consumer.streamReadEnded();"
+                + "    });"
+                + "  }"
+                + "  public void init(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
+                + "    TapTable table = new TapTable(\"t1\");"
+                + "    table.add(new TapField(\"id\", \"int\"));"
+                + "    List<TapTable> tables = new ArrayList<>();"
+                + "    tables.add(table);"
+                + "    s.accept(tables);"
+                + "  }"
+                + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {"
+                + "    s.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY));"
+                + "    return ConnectionOptions.create();"
+                + "  }"
+                + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.TimestampEchoingSource", source);
+    }
+
+    /**
+     * A source with no {@code timestampToStreamOffset} at all, but a working stream read: the shape a
+     * connector has when it can follow changes yet cannot say which position an instant corresponds to.
+     * Asking such a source to start at an instant has no answer, and the only alternatives to refusing
+     * are to start at the present or at the beginning — both of which run, report healthy, and read a
+     * different span than the caller asked for.
+     */
+    static Path offsetlessStreamSource(Path dir) {
+        String source = ""
+                + "package synthetic;"
+                + "import io.tapdata.pdk.apis.TapConnector;"
+                + "import io.tapdata.pdk.apis.functions.ConnectorFunctions;"
+                + "import io.tapdata.entity.codec.TapCodecsRegistry;"
+                + "import io.tapdata.pdk.apis.context.TapConnectionContext;"
+                + "import io.tapdata.pdk.apis.entity.ConnectionOptions;"
+                + "import io.tapdata.pdk.apis.entity.TestItem;"
+                + "import io.tapdata.entity.schema.TapTable;"
+                + "import io.tapdata.entity.schema.TapField;"
+                + "import io.tapdata.entity.event.TapEvent;"
+                + "import io.tapdata.entity.event.dml.TapInsertRecordEvent;"
+                + "import java.util.ArrayList;"
+                + "import java.util.LinkedHashMap;"
+                + "import java.util.List;"
+                + "import java.util.Map;"
+                + "import java.util.function.Consumer;"
+                + "public class OffsetlessStream implements TapConnector {"
+                + "  public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {"
+                + "    functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "      consumer.streamReadStarted();"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Map<String,Object> a = new LinkedHashMap<>(); a.put(\"id\", \"only\");"
+                + "      batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "      consumer.accept(batch, null);"
+                + "      consumer.streamReadEnded();"
+                + "    });"
+                + "  }"
+                + "  public void init(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
+                + "    TapTable table = new TapTable(\"t1\");"
+                + "    table.add(new TapField(\"id\", \"int\"));"
+                + "    List<TapTable> tables = new ArrayList<>();"
+                + "    tables.add(table);"
+                + "    s.accept(tables);"
+                + "  }"
+                + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {"
+                + "    s.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY));"
+                + "    return ConnectionOptions.create();"
+                + "  }"
+                + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.OffsetlessStream", source);
+    }
+
     /** A row map {@code {id: value}} as a Java expression string. */
     private static String row(String var, int id) {
         return "Map<String,Object> " + var + " = new LinkedHashMap<>(); " + var + ".put(\"id\", " + id + ");";
