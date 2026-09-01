@@ -154,7 +154,7 @@ class NestAdvancesTheDurableFrontierTest {
         // reached, and neither is written anywhere a later reader could compare them. A sink assembled
         // without the gauge advances the frontier exactly as correctly as this one and publishes nothing,
         // so what is asserted is that the sink the builder really wires is the one taking readings.
-        Map<String, Long> published = publishedGapsWithin(TimeUnit.SECONDS.toNanos(30));
+        Map<String, Long> published = publishedGapsOnEveryChain();
 
         assertThat(published)
                 .describedAs("a reading per chain the sink advanced, named by that chain")
@@ -162,16 +162,12 @@ class NestAdvancesTheDurableFrontierTest {
                 .allSatisfy((chain, gap) -> assertThat(gap).isNotNegative());
     }
 
-    /** The readings once every chain the sink advanced has one, or the last seen when the budget runs out. */
-    private Map<String, Long> publishedGapsWithin(long budgetNanos) {
-        long deadline = System.nanoTime() + budgetNanos;
-        Map<String, Long> published = publishedGaps();
-        while (System.nanoTime() < deadline
-                && !published.keySet().containsAll(List.of(CUSTOMERS, POLICIES, CLAIMS))) {
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(50));
-            published = publishedGaps();
-        }
-        return published;
+    /** The readings once every chain the sink advanced has one; waits on the job, same as the bounds do. */
+    private Map<String, Long> publishedGapsOnEveryChain() {
+        JobWatch.until(job, Duration.ofSeconds(30),
+                () -> publishedGaps().keySet().containsAll(List.of(CUSTOMERS, POLICIES, CLAIMS)),
+                () -> String.valueOf(publishedGaps()));
+        return publishedGaps();
     }
 
     /** The frontier readings the running job has collected so far, keyed by chain. */

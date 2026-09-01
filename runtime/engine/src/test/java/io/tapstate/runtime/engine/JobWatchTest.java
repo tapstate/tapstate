@@ -90,6 +90,17 @@ class JobWatchTest {
     }
 
     @Test
+    void aJobAlreadyDeadIsStillCreditedWithWhatItDelivered() {
+        job = member.getJet().newJob(dagThat(true));
+        JobWatch.until(job, LONG_BUDGET, () -> job.getStatus().isTerminal(), () -> "nothing");
+
+        // The status is read before the condition is asked, so a job that ended having delivered returns
+        // rather than throwing. Asking the condition second is the whole of that: reversed, the wait would
+        // report a result it was handed as a death, and every case whose graph finishes would say so.
+        JobWatch.until(job, LONG_BUDGET, () -> true, () -> "nothing");
+    }
+
+    @Test
     void aRunningJobThatDeliversIsNotDisturbed() {
         AtomicBoolean arrived = new AtomicBoolean();
         job = member.getJet().newJob(dagThat(false));
