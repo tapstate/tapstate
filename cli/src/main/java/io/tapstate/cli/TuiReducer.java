@@ -54,10 +54,20 @@ final class TuiReducer {
                 yield copy(state, state.command(), state.notice(), state.paletteOpen(), state.paletteIndex(),
                         state.palette(), state.prompt(), activity, state.ticks());
             }
+            case TuiAction.SetResultPane set -> copy(state, state.command(), state.notice(), state.paletteOpen(),
+                    state.paletteIndex(), state.palette(), state.prompt(), state.activity(), state.ticks(),
+                    state.contextSession(), set.pane(), state.operation());
+            case TuiAction.SetOperation set -> copy(state, state.command(), state.notice(), state.paletteOpen(),
+                    state.paletteIndex(), state.palette(), state.prompt(), state.activity(), state.ticks(),
+                    state.contextSession(), state.resultPane(), set.operation());
+            case TuiAction.SetNavigation set -> copy(state, state.command(), state.notice(), state.paletteOpen(),
+                    state.paletteIndex(), state.palette(), state.prompt(), state.activity(), state.ticks(),
+                    state.contextSession(), state.resultPane(), state.operation(), set.navigation());
             case TuiAction.Tick ignored -> copy(state, state.command(), state.notice(), state.paletteOpen(),
                     state.paletteIndex(), state.palette(), state.prompt(), state.activity(), state.ticks() + 1);
             case TuiAction.ContextSession contextSession -> contextSession(state, contextSession.action());
             case TuiAction.RefreshStarted refresh -> startRefresh(state, refresh);
+            case TuiAction.RefreshCancelled refresh -> cancelRefresh(state, refresh.requestId());
             case TuiAction.RefreshCompleted refresh -> completeRefresh(state, refresh.result());
         };
     }
@@ -66,15 +76,33 @@ final class TuiReducer {
                                     int paletteIndex, List<String> palette, TuiDashboard.Prompt prompt,
                                     List<String> activity, long ticks) {
         return copy(state, command, notice, paletteOpen, paletteIndex, palette, prompt, activity, ticks,
-                state.contextSession());
+                state.contextSession(), state.resultPane(), state.operation());
     }
 
     private static TuiAppState copy(TuiAppState state, String command, String notice, boolean paletteOpen,
                                     int paletteIndex, List<String> palette, TuiDashboard.Prompt prompt,
                                     List<String> activity, long ticks, TuiContextSessionState contextSession) {
+        return copy(state, command, notice, paletteOpen, paletteIndex, palette, prompt, activity, ticks,
+                contextSession, state.resultPane(), state.operation());
+    }
+
+    private static TuiAppState copy(TuiAppState state, String command, String notice, boolean paletteOpen,
+                                    int paletteIndex, List<String> palette, TuiDashboard.Prompt prompt,
+                                    List<String> activity, long ticks, TuiContextSessionState contextSession,
+                                    TuiCommandBar.ResultPane resultPane, TuiOperation operation) {
+        return copy(state, command, notice, paletteOpen, paletteIndex, palette, prompt, activity, ticks,
+                contextSession, resultPane, operation, state.navigation());
+    }
+
+    private static TuiAppState copy(TuiAppState state, String command, String notice, boolean paletteOpen,
+                                    int paletteIndex, List<String> palette, TuiDashboard.Prompt prompt,
+                                    List<String> activity, long ticks, TuiContextSessionState contextSession,
+                                    TuiCommandBar.ResultPane resultPane, TuiOperation operation,
+                                    TuiNavigation navigation) {
         return new TuiAppState(command, notice, paletteOpen, paletteIndex, palette, prompt, activity, ticks,
                 contextSession, state.resources(), state.pipelines(), state.refreshInFlight(),
-                state.refreshRequestId(), state.refreshContextGeneration(), state.lastRefreshAt());
+                state.refreshRequestId(), state.refreshContextGeneration(), state.lastRefreshAt(), resultPane, operation,
+                navigation);
     }
 
     private static TuiAppState contextSession(TuiAppState state, TuiContextSessionAction action) {
@@ -85,7 +113,8 @@ final class TuiReducer {
         }
         return new TuiAppState(state.command(), state.notice(), state.paletteOpen(), state.paletteIndex(),
                 state.palette(), state.prompt(), state.activity(), state.ticks(), next, List.of(), List.of(),
-                false, state.refreshRequestId(), next.generation(), null);
+                false, state.refreshRequestId(), next.generation(), null, state.resultPane(), state.operation(),
+                TuiNavigation.initial(List.of()));
     }
 
     private static TuiAppState startRefresh(TuiAppState state, TuiAction.RefreshStarted refresh) {
@@ -107,11 +136,20 @@ final class TuiReducer {
                 result.contextGeneration(), result.refreshedAt(), result.notice());
     }
 
+    private static TuiAppState cancelRefresh(TuiAppState state, long requestId) {
+        if (!state.refreshInFlight() || state.refreshRequestId() != requestId) {
+            return state;
+        }
+        return refreshed(state, state.resources(), state.pipelines(), false, requestId,
+                state.refreshContextGeneration(), state.lastRefreshAt(), state.notice());
+    }
+
     private static TuiAppState refreshed(TuiAppState state, List<TuiDashboard.ResourceSummary> resources,
                                          List<TuiDashboard.PipelineSummary> pipelines, boolean inFlight,
                                          long requestId, long contextGeneration, String refreshedAt, String notice) {
         return new TuiAppState(state.command(), notice, state.paletteOpen(), state.paletteIndex(), state.palette(),
                 state.prompt(), state.activity(), state.ticks(), state.contextSession(), resources, pipelines,
-                inFlight, requestId, contextGeneration, refreshedAt);
+                inFlight, requestId, contextGeneration, refreshedAt, state.resultPane(), state.operation(),
+                TuiNavigation.initial(resources.stream().map(TuiDashboard.ResourceSummary::id).toList()));
     }
 }

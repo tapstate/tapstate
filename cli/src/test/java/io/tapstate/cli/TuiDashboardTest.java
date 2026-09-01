@@ -80,6 +80,24 @@ class TuiDashboardTest {
     }
 
     @Test
+    void canonicalizesSecretPromptInputBeforeStateAndToStringCanObserveIt() {
+        String password = "hunter🔐2";
+        TuiDashboard.Prompt prompt = new TuiDashboard.Prompt(
+                "Password", password, "Enter submit", true, List.of(), 0, List.of());
+
+        assertThat(prompt.input()).isEqualTo("••••••••");
+        assertThat(prompt.toString()).doesNotContain(password);
+
+        List<String> lines = dashboard.render(
+                new TuiDashboard.State(Path.of("orders"), "dev", "alice",
+                        TuiDashboard.Connection.ONLINE, "ready", "", List.of(), 0, prompt), 72, 14)
+                .stream().map(AttributedString::toString).toList();
+
+        assertThat(lines).noneMatch(line -> line.contains(password));
+        assertThat(lines).anyMatch(line -> line.contains("••••••••"));
+    }
+
+    @Test
     void rendersPromptChoicesAndKeepsTheSelectedOptionVisible() {
         List<AttributedString> lines = dashboard.render(
                 new TuiDashboard.State(Path.of("orders"), "dev", null,

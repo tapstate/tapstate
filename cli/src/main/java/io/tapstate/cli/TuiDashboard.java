@@ -45,8 +45,8 @@ final class TuiDashboard {
         ResourceSummary {
             kind = kind == null || kind.isBlank() ? "other" : kind;
             id = id == null || id.isBlank() ? "?" : id;
-            detail = detail == null ? "" : detail;
-            connector = connector == null || connector.isBlank() ? null : connector;
+            detail = TuiActivity.result(detail);
+            connector = connector == null || connector.isBlank() ? null : TuiActivity.result(connector);
         }
     }
 
@@ -55,7 +55,7 @@ final class TuiDashboard {
         PipelineSummary {
             id = id == null || id.isBlank() ? "?" : id;
             state = state == null || state.isBlank() ? "UNKNOWN" : state;
-            detail = detail == null ? "" : detail;
+            detail = TuiActivity.result(detail);
             revision = revision == null || revision.isBlank() ? null : revision;
         }
     }
@@ -63,20 +63,25 @@ final class TuiDashboard {
     record Prompt(String question, String input, String hint, boolean secret, List<String> options,
                   int selectedIndex, List<String> lines) {
         Prompt {
-            question = question == null ? "" : question;
-            input = input == null ? "" : input;
-            hint = hint == null ? "" : hint;
-            options = options == null ? List.of() : List.copyOf(options);
+            String rawInput = input == null ? "" : input;
+            question = TuiActivity.result(question);
+            input = rawInput;
+            if (secret) {
+                if (!rawInput.isBlank()) {
+                    question = question.replace(rawInput, "[redacted]");
+                }
+                input = "•".repeat(input.codePointCount(0, input.length()));
+            } else {
+                input = TuiActivity.result(input);
+            }
+            hint = TuiActivity.result(hint);
+            options = options == null ? List.of() : options.stream().map(TuiActivity::result).toList();
             selectedIndex = options.isEmpty() ? 0 : Math.max(0, Math.min(selectedIndex, options.size() - 1));
-            lines = lines == null ? List.of() : List.copyOf(lines);
+            lines = lines == null ? List.of() : lines.stream().map(TuiActivity::result).toList();
         }
 
         static Prompt text(String question, String input, String hint, boolean secret) {
-            String safeInput = input == null ? "" : input;
-            if (secret) {
-                safeInput = "•".repeat(safeInput.codePointCount(0, safeInput.length()));
-            }
-            return new Prompt(question, safeInput, hint, secret, List.of(), 0, List.of());
+            return new Prompt(question, input, hint, secret, List.of(), 0, List.of());
         }
 
         static Prompt choice(String question, List<String> options, int selectedIndex) {
@@ -100,38 +105,51 @@ final class TuiDashboard {
     record State(Path workspace, String context, String principal, Connection connection, String notice,
                  String command, List<String> palette, int paletteIndex, Prompt prompt,
                  String endpoint, String clusterName, String authStatus, List<String> activity,
-                 List<ResourceSummary> resources, List<PipelineSummary> pipelines, String refreshedAt) {
+                 List<ResourceSummary> resources, List<PipelineSummary> pipelines, String refreshedAt,
+                 TuiCommandBar.ResultPane resultPane) {
         State {
             if (workspace == null || connection == null) {
                 throw new IllegalArgumentException("workspace and connection are required");
             }
-            command = command == null ? "" : command;
+            command = TuiActivity.command(command);
+            notice = TuiActivity.result(notice);
             palette = palette == null ? List.of() : List.copyOf(palette);
-            activity = activity == null ? List.of() : List.copyOf(activity);
+            activity = activity == null ? List.of() : activity.stream().map(TuiActivity::result).toList();
             resources = resources == null ? List.of() : List.copyOf(resources);
             pipelines = pipelines == null ? List.of() : List.copyOf(pipelines);
             refreshedAt = refreshedAt == null || refreshedAt.isBlank() ? null : refreshedAt;
+            resultPane = resultPane == null ? null : TuiCommandBar.project(
+                    new CommandResult(resultPane.keepRunning(), resultPane.exitCode()),
+                    String.join("\n", resultPane.lines()));
             paletteIndex = palette.isEmpty() ? 0 : Math.max(0, Math.min(paletteIndex, palette.size() - 1));
+        }
+
+        State(Path workspace, String context, String principal, Connection connection, String notice,
+              String command, List<String> palette, int paletteIndex, Prompt prompt,
+              String endpoint, String clusterName, String authStatus, List<String> activity,
+              List<ResourceSummary> resources, List<PipelineSummary> pipelines, String refreshedAt) {
+            this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
+                    endpoint, clusterName, authStatus, activity, resources, pipelines, refreshedAt, null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    null, null, null, List.of(), List.of(), List.of(), null);
+                    null, null, null, List.of(), List.of(), List.of(), null, null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt,
               String endpoint, String clusterName, String authStatus) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    endpoint, clusterName, authStatus, List.of(), List.of(), List.of(), null);
+                    endpoint, clusterName, authStatus, List.of(), List.of(), List.of(), null, null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
               String command, List<String> palette, int paletteIndex, Prompt prompt,
               String endpoint, String clusterName, String authStatus, List<String> activity) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    endpoint, clusterName, authStatus, activity, List.of(), List.of(), null);
+                    endpoint, clusterName, authStatus, activity, List.of(), List.of(), null, null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice,
@@ -139,7 +157,7 @@ final class TuiDashboard {
               String endpoint, String clusterName, String authStatus, List<String> activity,
               List<ResourceSummary> resources) {
             this(workspace, context, principal, connection, notice, command, palette, paletteIndex, prompt,
-                    endpoint, clusterName, authStatus, activity, resources, List.of(), null);
+                    endpoint, clusterName, authStatus, activity, resources, List.of(), null, null);
         }
 
         State(Path workspace, String context, String principal, Connection connection, String notice) {
@@ -217,13 +235,14 @@ final class TuiDashboard {
             body.add("  [o] Stay offline");
         } else if (width >= SPLIT_WIDTH) {
             appendSplitBody(rows, state.resources(), state.pipelines(), state.refreshedAt(),
-                    state.activity(), bodyRows, width);
+                    state.activity(), state.resultPane(), bodyRows, width);
             body = null;
         } else {
             body.addAll(resourceRows(state.resources()));
             if (!state.pipelines().isEmpty() || state.refreshedAt() != null) {
                 body.addAll(pipelineRows(state.pipelines(), state.refreshedAt()));
             }
+            body.addAll(resultRows(state.resultPane()));
             body.addAll(activityRows(state.activity()));
         }
         if (body != null) {
@@ -290,6 +309,16 @@ final class TuiDashboard {
         return rows;
     }
 
+    private static List<String> resultRows(TuiCommandBar.ResultPane resultPane) {
+        if (resultPane == null || resultPane.lines().isEmpty()) {
+            return List.of();
+        }
+        List<String> rows = new ArrayList<>();
+        rows.add("  Result" + (resultPane.success() ? " · success" : " · failed"));
+        resultPane.lines().forEach(line -> rows.add("    " + line));
+        return rows;
+    }
+
     private static List<String> pipelineRows(List<PipelineSummary> pipelines, String refreshedAt) {
         List<String> rows = new ArrayList<>();
         String suffix = refreshedAt == null ? "" : " · refreshed " + refreshedAt;
@@ -308,7 +337,7 @@ final class TuiDashboard {
 
     private static void appendSplitBody(List<AttributedString> rows, List<ResourceSummary> resources,
                                         List<PipelineSummary> pipelines, String refreshedAt, List<String> activity,
-                                        int capacity, int width) {
+                                        TuiCommandBar.ResultPane resultPane, int capacity, int width) {
         if (capacity <= 0) {
             return;
         }
@@ -318,6 +347,11 @@ final class TuiDashboard {
                 ? new ArrayList<>(pipelineRows(pipelines, refreshedAt))
                 : new ArrayList<>();
         List<String> activityPane = activityRows(activity);
+        List<String> resultPaneRows = resultRows(resultPane);
+        if (!resultPaneRows.isEmpty()) {
+            resultPaneRows.addAll(activityPane);
+            activityPane = resultPaneRows;
+        }
         if (hasRemoteSnapshot) {
             right.set(0, right.getFirst() + "  ·  Activity");
             if (activityPane.size() > 1) {

@@ -6,6 +6,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.Consumer;
 
 /** Runs a bounded remote dashboard refresh and posts its safe result back to the UI mailbox. */
@@ -13,6 +15,8 @@ final class TuiResourceRefresh {
 
     private final ControlPlaneClient controlPlane;
     private final Executor executor;
+    private final ConcurrentMap<Long, Thread> workers = new ConcurrentHashMap<>();
+    private final java.util.Set<Long> cancelled = ConcurrentHashMap.newKeySet();
 
     TuiResourceRefresh(ControlPlaneClient controlPlane, Executor executor) {
         this.controlPlane = Objects.requireNonNull(controlPlane, "controlPlane");
@@ -24,15 +28,40 @@ final class TuiResourceRefresh {
             throw new IllegalArgumentException("refresh inputs are required");
         }
         executor.execute(() -> {
-            TuiResourceRefreshResult result;
+            Thread current = Thread.currentThread();
+            workers.put(requestId, current);
             try {
-                result = collect(requestId, contextGeneration, baseUrl, credential);
-            } catch (RuntimeException failure) {
-                result = result(requestId, contextGeneration, List.of(), List.of(),
-                        "refresh failed; retry when the control plane is available");
+                if (cancelled.contains(requestId)) {
+                    return;
+                }
+                TuiResourceRefreshResult result;
+                try {
+                    result = collect(requestId, contextGeneration, baseUrl, credential);
+                } catch (RuntimeException failure) {
+                    if (cancelled.contains(requestId) || current.isInterrupted()) {
+                        return;
+                    }
+                    result = result(requestId, contextGeneration, List.of(), List.of(),
+                            "refresh failed; retry when the control plane is available");
+                }
+                if (!cancelled.contains(requestId) && !current.isInterrupted()) {
+                    sink.accept(new TuiEvent.ResourceRefreshCompleted(result));
+                }
+            } finally {
+                workers.remove(requestId, current);
             }
-            sink.accept(new TuiEvent.ResourceRefreshCompleted(result));
         });
+    }
+
+    void cancel(long requestId) {
+        if (requestId <= 0) {
+            return;
+        }
+        cancelled.add(requestId);
+        Thread worker = workers.remove(requestId);
+        if (worker != null) {
+            worker.interrupt();
+        }
     }
 
     private TuiResourceRefreshResult collect(long requestId, long contextGeneration, URI baseUrl, String credential) {

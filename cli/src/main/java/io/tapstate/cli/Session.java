@@ -52,22 +52,22 @@ final class Session {
     private List<URI> members = List.of();
 
     /** Whether the session currently targets a reachable server. */
-    boolean isConnected() {
+    synchronized boolean isConnected() {
         return connected;
     }
 
     /** Whether the session currently carries a credential. */
-    boolean isAuthenticated() {
+    synchronized boolean isAuthenticated() {
         return credential != null;
     }
 
     /** Whether the process currently carries a machine bearer rather than a human access token. */
-    boolean hasMachineCredential() {
+    synchronized boolean hasMachineCredential() {
         return credentialKind == CredentialKind.MACHINE;
     }
 
     /** The base URL that answered the probe, or {@code null} while offline. */
-    URI landingNode() {
+    synchronized URI landingNode() {
         return landingNode;
     }
 
@@ -78,7 +78,7 @@ final class Session {
      * report. What the server said when the connection was made is what the session has been talking to
      * since.
      */
-    String versions() {
+    synchronized String versions() {
         if (!connected) {
             return "cli " + Cli.VERSION_NUMBER + ", server not connected";
         }
@@ -87,42 +87,42 @@ final class Session {
     }
 
     /** The ordered seed list used to connect (unmodifiable); empty while offline. */
-    List<URI> seeds() {
+    synchronized List<URI> seeds() {
         return seeds;
     }
 
     /** The member base URLs to fail over across (unmodifiable); empty while offline. */
-    List<URI> members() {
+    synchronized List<URI> members() {
         return members;
     }
 
     /** The bearer credential, or {@code null} while unauthenticated. */
-    String credential() {
+    synchronized String credential() {
         return credential;
     }
 
     /** The principal to display, or {@code null} while unauthenticated. */
-    String principal() {
+    synchronized String principal() {
         return principal;
     }
 
     /** The cluster name, or {@code null} until known. */
-    String clusterName() {
+    synchronized String clusterName() {
         return clusterName;
     }
 
     /** The absolute expiry of the persisted session, or {@code null} for transient credentials. */
-    Instant sessionAbsoluteExpiresAt() {
+    synchronized Instant sessionAbsoluteExpiresAt() {
         return sessionAbsoluteExpiresAt;
     }
 
     /** The last idle expiry returned by the server, or {@code null} for transient credentials. */
-    Instant sessionIdleExpiresAt() {
+    synchronized Instant sessionIdleExpiresAt() {
         return sessionIdleExpiresAt;
     }
 
     /** Records a successful connection: the seeds tried, the landing node, and the seeds as the member set. */
-    void connect(List<URI> seeds, URI landingNode) {
+    synchronized void connect(List<URI> seeds, URI landingNode) {
         this.seeds = List.copyOf(seeds);
         this.landingNode = landingNode;
         this.connected = true;
@@ -140,18 +140,18 @@ final class Session {
     }
 
     /** The same, plus what that node answered when asked its version ({@code null} = it did not say). */
-    void connect(List<URI> seeds, URI landingNode, String serverVersion) {
+    synchronized void connect(List<URI> seeds, URI landingNode, String serverVersion) {
         connect(seeds, landingNode);
         this.serverVersion = serverVersion;
     }
 
     /** Records an authenticated session: the credential, the principal, an optional cluster name, and members. */
-    void authenticate(String credential, String principal, String clusterName, List<URI> members) {
+    synchronized void authenticate(String credential, String principal, String clusterName, List<URI> members) {
         authenticate(credential, principal, clusterName, members, null, null);
     }
 
     /** Records a human credential plus the durable session expiry metadata safe for presentation. */
-    void authenticate(String credential, String principal, String clusterName, List<URI> members,
+    synchronized void authenticate(String credential, String principal, String clusterName, List<URI> members,
                       Instant sessionIdleExpiresAt, Instant sessionAbsoluteExpiresAt) {
         this.credential = credential;
         this.credentialKind = CredentialKind.HUMAN_ACCESS;
@@ -163,7 +163,7 @@ final class Session {
     }
 
     /** Records a verified machine bearer without associating it with a persisted human principal. */
-    void authenticateMachine(String credential, List<URI> members) {
+    synchronized void authenticateMachine(String credential, List<URI> members) {
         this.credential = credential;
         this.credentialKind = CredentialKind.MACHINE;
         this.principal = "machine";
@@ -174,12 +174,12 @@ final class Session {
     }
 
     /** Moves the landing node to another member (failover), keeping the credential and member set. */
-    void reland(URI landingNode) {
+    synchronized void reland(URI landingNode) {
         this.landingNode = landingNode;
     }
 
     /** Drops the credential while keeping the transport connection; members fall back to the seeds. */
-    void logout() {
+    synchronized void logout() {
         this.credential = null;
         this.credentialKind = null;
         this.principal = null;
@@ -190,7 +190,7 @@ final class Session {
     }
 
     /** Clears the session back to offline, dropping any credential. */
-    void disconnect() {
+    synchronized void disconnect() {
         this.seeds = List.of();
         this.landingNode = null;
         this.connected = false;

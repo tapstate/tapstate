@@ -14,9 +14,12 @@ import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
@@ -32,10 +35,6 @@ final class TuiApp {
     private static final long DASHBOARD_REFRESH_MILLIS = 5000L;
     private static final String PALETTE_NOTICE =
             "commands: ↑/↓ choose · Enter select · Esc close";
-    private static final List<String> PALETTE_COMMANDS = List.of(
-            "ls", "pwd", "help", "context", "auth status", "connect", "disconnect", "exit",
-            "auth login", "auth logout", ":ctx", "logout");
-
     private final Repl repl;
     private final StringWriter out;
     private final StringWriter err;
@@ -45,6 +44,9 @@ final class TuiApp {
     private final TuiSessionRecovery sessionRecovery;
     private final TuiResourceRefresh resourceRefresh;
     private final AtomicBoolean interrupted = new AtomicBoolean();
+    private final AtomicBoolean terminationRequested = new AtomicBoolean();
+    private final ConcurrentLinkedQueue<TuiCommandExecution.Completion> commandCompletions =
+            new ConcurrentLinkedQueue<>();
 
     private NonBlockingReader reader;
     private Display display;
@@ -54,9 +56,15 @@ final class TuiApp {
     private final TuiCommandHistory history = new TuiCommandHistory();
     /** True while a command is resolving a target or waiting on the control plane. */
     private boolean commandRunning;
+    private String activeCommandLine;
+    private String activeOperationId;
+    private String stoppedOperationId;
+    private boolean commandExitRequested;
+    private final TuiCommandExecution commandExecution;
     private long recoveryScheduledGeneration = -1L;
     private long refreshSequence;
     private String pendingContextSelection;
+    private String commandInput = "";
 
     TuiApp(Repl repl, StringWriter out, StringWriter err, String initialContext) {
         this(repl, out, err, initialContext, null, null);
@@ -73,6 +81,7 @@ final class TuiApp {
                 command -> Thread.startVirtualThread(command));
         this.resourceRefresh = new TuiResourceRefresh(repl.controlPlane(),
                 command -> Thread.startVirtualThread(command));
+        this.commandExecution = new TuiCommandExecution(commandCompletions::add);
         this.uiState = TuiAppState.initial(consumeOutput());
         this.kernel = new TuiKernel(uiState);
         repl.tuiContextSelection(name -> pendingContextSelection = name);
@@ -92,6 +101,9 @@ final class TuiApp {
             terminal.puts(InfoCmp.Capability.clear_screen);
             terminal.puts(InfoCmp.Capability.cursor_invisible);
             terminal.flush();
+            Thread shutdownHook = new Thread(() -> restoreTerminal(display, terminal, original),
+                    "tapstate-tui-terminal-restore");
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
             try {
                 initializeContextSession();
                 draw(display, terminal);
@@ -101,11 +113,9 @@ final class TuiApp {
                 if (sessionRecovery != null) {
                     sessionRecovery.clear();
                 }
-                display.reset();
-                terminal.puts(InfoCmp.Capability.cursor_visible);
-                terminal.puts(InfoCmp.Capability.exit_ca_mode);
-                terminal.setAttributes(original);
-                terminal.flush();
+                Runtime.getRuntime().removeShutdownHook(shutdownHook);
+                commandExecution.close();
+                restoreTerminal(display, terminal, original);
                 this.uiState = reduce(new TuiAction.ClearPrompt());
                 this.reader = null;
                 this.display = null;
@@ -114,6 +124,17 @@ final class TuiApp {
         } catch (IOException failure) {
             throw new UncheckedIOException(failure);
         }
+    }
+
+    private void restoreTerminal(Display display, Terminal terminal, Attributes original) {
+        if (!terminationRequested.compareAndSet(false, true)) {
+            return;
+        }
+        display.reset();
+        terminal.puts(InfoCmp.Capability.cursor_visible);
+        terminal.puts(InfoCmp.Capability.exit_ca_mode);
+        terminal.setAttributes(original);
+        terminal.flush();
     }
 
     static int requireInteractiveTerminal(BooleanSupplier terminalCheck, PrintWriter err) {
@@ -132,12 +153,45 @@ final class TuiApp {
         }
     }
 
+    static List<String> paletteCommands(CommandRegistry registry) {
+        return TuiCommandBar.paletteCommands(registry);
+    }
+
+    static TuiOperation operationFor(String line, int sequenceOrExitCode) {
+        return TuiCommandBar.operationFor(line, sequenceOrExitCode);
+    }
+
+    static String applyCompletion(String current, TuiCommandBar.Completion completion) {
+        String value = current == null ? "" : current;
+        if (completion == null || completion.selected().isEmpty()) {
+            return value;
+        }
+        int end = value.length();
+        int start = end;
+        while (start > 0 && !Character.isWhitespace(value.charAt(start - 1))) {
+            start--;
+        }
+        return value.substring(0, start) + completion.selected() + value.substring(end);
+    }
+
+    private static List<String> wordsForCompletion(String value) {
+        if (value == null || value.isBlank()) {
+            return List.of("");
+        }
+        List<String> words = new ArrayList<>(List.of(value.trim().split("\\s+")));
+        if (Character.isWhitespace(value.charAt(value.length() - 1))) {
+            words.add("");
+        }
+        return List.copyOf(words);
+    }
+
     private int eventLoop(Display display, Terminal terminal) throws IOException {
         this.reader = terminal.reader();
         int lastWidth = -1;
         int lastHeight = -1;
         long nextDashboardRefresh = 0L;
         while (true) {
+            drainCommandCompletions();
             if (kernel.drain()) {
                 uiState = kernel.state();
                 installRecoveredSessionIfPresent();
@@ -145,6 +199,12 @@ final class TuiApp {
                 draw(display, terminal);
             }
             if (kernel.exitRequested()) {
+                return Cli.EXIT_OK;
+            }
+            if (commandExitRequested) {
+                return Cli.EXIT_OK;
+            }
+            if (terminationRequested.get()) {
                 return Cli.EXIT_OK;
             }
             if (interrupted.getAndSet(false)) {
@@ -190,9 +250,24 @@ final class TuiApp {
                 draw(display, terminal);
                 continue;
             }
-            TuiCommandBar.Update update = TuiCommandBar.accept(uiState.command(), code);
+            if (code == 9) {
+                List<String> words = wordsForCompletion(commandInput);
+                int wordIndex = Math.max(0, words.size() - 1);
+                TuiCommandBar.Completion completion = TuiCommandBar.complete(
+                        repl.registry().completer(), history, words, wordIndex);
+                if (!completion.selected().isEmpty()) {
+                    commandInput = applyCompletion(commandInput, completion);
+                    uiState = reduce(new TuiAction.SetCommand(
+                            commandInput));
+                }
+                draw(display, terminal);
+                continue;
+            }
+            TuiCommandBar.Update update = TuiCommandBar.accept(commandInput, code);
+            commandInput = update.value();
             kernel.dispatch(new TuiEvent.Key(code));
             uiState = kernel.state();
+            uiState = reduce(new TuiAction.SetCommand(commandInput));
             if (uiState.paletteOpen() && code == TuiCommandBar.CTRL_P) {
                 uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
                 draw(display, terminal);
@@ -200,6 +275,7 @@ final class TuiApp {
             }
             if (uiState.paletteOpen() && code == TuiCommandBar.ENTER) {
                 String selected = uiState.palette().get(uiState.paletteIndex());
+                commandInput = selected;
                 uiState = reduce(
                         new TuiAction.SelectPaletteCommand(selected, "selected: " + selected + " · Enter run"));
                 draw(display, terminal);
@@ -230,17 +306,54 @@ final class TuiApp {
     }
 
     private void cancelCurrentOperation() {
-        repl.cancelStream();
+        TuiOperation operation = uiState.operation();
+        if (commandRunning && (operation == null || !operation.submittedWrite())) {
+            commandExecution.interrupt();
+        }
+        if (operation != null) {
+            TuiOperation.CtrlCResult result = operation.onCtrlC();
+            if (result.remoteCancellationRequested()) {
+                repl.cancelStream();
+            }
+            uiState = reduce(new TuiAction.SetOperation(result.operation()));
+            uiState = reduce(new TuiAction.SetNotice(result.message()));
+            if (result.action() == TuiOperation.CtrlCAction.STOP_WAITING) {
+                stoppedOperationId = operation.id();
+                commandRunning = false;
+                activeOperationId = null;
+                activeCommandLine = null;
+            }
+        }
         uiState = reduce(new TuiAction.ClearCommand());
-        uiState = reduce(
-                new TuiAction.SetNotice(commandRunning ? "cancellation requested" : "command cleared"));
+        commandInput = "";
+        if (operation == null) {
+            uiState = reduce(new TuiAction.AppendActivity("command cleared"));
+            uiState = reduce(new TuiAction.SetNotice("command cleared"));
+        }
     }
 
     private boolean submit() {
-        String line = uiState.command().trim();
+        if (commandRunning || commandExecution.isRunning()) {
+            uiState = reduce(new TuiAction.SetNotice("operation in flight; press Ctrl-C to cancel or wait"));
+            return true;
+        }
+        String line = commandInput.trim();
+        commandInput = "";
         uiState = reduce(new TuiAction.ClearCommand());
         uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
         if (line.isEmpty()) {
+            TuiNavigation navigation = navigation();
+            if (!navigation.selected().isEmpty()) {
+                TuiNavigation detail = navigation.open();
+                uiState = reduce(new TuiAction.SetNavigation(detail));
+                TuiDashboard.ResourceSummary resource = selectedResource(detail.selected());
+                String output = resource == null ? detail.selected()
+                        : resource.id() + "\n" + resource.kind() + "\n" + resource.detail();
+                uiState = reduce(new TuiAction.SetResultPane(TuiCommandBar.project(
+                        new CommandResult(true, Cli.EXIT_OK), output)));
+                uiState = reduce(new TuiAction.SetNotice("details: " + detail.selected()));
+                return true;
+            }
             history.reset();
             uiState = reduce(new TuiAction.SetNotice("ready"));
             return true;
@@ -248,41 +361,238 @@ final class TuiApp {
         history.record(line);
         clearOutput();
         String safeCommand = TuiActivity.command(line);
+        LoginInput loginInput = prepareInteractiveLogin(line);
+        if (isInteractiveLogin(line) && loginInput == null) {
+            uiState = reduce(new TuiAction.SetNotice("login cancelled"));
+            return true;
+        }
+        int operationSequence = (int) Math.min(Integer.MAX_VALUE, ++refreshSequence);
+        TuiOperation operation = operationFor(line, operationSequence);
+        if (isContextCommand(line) && uiState.contextSession().writeOperationId() != null) {
+            String message = "cannot switch context while write operation "
+                    + uiState.contextSession().writeOperationId() + " is in flight";
+            uiState = reduce(new TuiAction.SetNotice(message));
+            uiState = reduce(new TuiAction.AppendActivity(message));
+            return true;
+        }
+        if (operation.kind() == TuiOperation.Kind.WRITE) {
+            if (!writeConfirmationReady()) {
+                String message = "write unavailable until the selected context is ready";
+                uiState = reduce(new TuiAction.SetNotice(message));
+                uiState = reduce(new TuiAction.AppendActivity(message + ": " + safeCommand));
+                return true;
+            }
+            TuiWriteConfirmation confirmation = TuiWriteConfirmation.open(
+                    operation.description(), writeTarget(), writeIssuer());
+            if (!confirmWrite(confirmation)) {
+                uiState = reduce(new TuiAction.SetOperation(
+                        new TuiOperation(operation.id(), operation.description(), operation.kind(),
+                                TuiOperation.Status.CANCELLED)));
+                uiState = reduce(new TuiAction.AppendActivity("cancelled: " + safeCommand));
+                uiState = reduce(new TuiAction.SetNotice("write cancelled"));
+                return true;
+            }
+            operation = TuiOperation.submittedWrite(operation.id(), operation.description());
+            uiState = reduce(new TuiAction.ContextSession(
+                    new TuiContextSessionAction.SetWriteInFlight(operation.id())));
+        }
+        uiState = reduce(new TuiAction.SetOperation(operation));
         uiState = reduce(new TuiAction.AppendActivity("> " + safeCommand));
         uiState = reduce(new TuiAction.SetNotice("running: " + safeCommand));
-        commandRunning = true;
         pendingContextSelection = null;
-        // Give the user one frame that reflects the network transition before a lazy context
-        // resolution or control-plane request blocks this event-loop thread.
-        draw(display, terminal);
-        CommandResult commandResult;
-        try {
-            commandResult = repl.registry().dispatch(repl, repl.registry().invocation(line));
-        } finally {
-            commandRunning = false;
+        commandRunning = true;
+        activeCommandLine = line;
+        activeOperationId = operation.id();
+        commandExitRequested = false;
+        boolean async = loginInput != null || !(requiresUiThread(line) || isTuiBuiltin(line));
+        if (async) {
+            commandExecution.start(operation.id(),
+                    loginInput == null
+                            ? () -> repl.registry().dispatch(repl, repl.registry().invocation(line))
+                            : () -> new CommandResult(true,
+                                    repl.tuiLogin(loginInput.username(), loginInput.password())),
+                    this::consumeOutput);
+        } else {
+            completeCommand(operation.id(), dispatchOnUiThread(line), consumeOutput(), null);
         }
-        if (line.equals(":ctx")) {
+        return true;
+    }
+
+    private CommandResult dispatchOnUiThread(String line) {
+        try {
+            if (isTuiBuiltin(line)) {
+                boolean keepRunning = repl.dispatch(line);
+                return new CommandResult(keepRunning, repl.lastExitCode());
+            }
+            return repl.registry().dispatch(repl, repl.registry().invocation(line));
+        } catch (Throwable failure) {
+            return new CommandResult(true, Cli.EXIT_DIAGNOSTIC);
+        }
+    }
+
+    private void drainCommandCompletions() {
+        TuiCommandExecution.Completion completion;
+        while ((completion = commandCompletions.poll()) != null) {
+            if ((!commandRunning || !Objects.equals(activeOperationId, completion.operationId()))
+                    && !Objects.equals(stoppedOperationId, completion.operationId())) {
+                continue;
+            }
+            completeCommand(completion.operationId(), completion.result(), completion.output(), completion.failure());
+        }
+    }
+
+    private void completeCommand(String operationId, CommandResult commandResult, String result, Throwable failure) {
+        boolean stopped = Objects.equals(stoppedOperationId, operationId);
+        if ((!commandRunning || !Objects.equals(activeOperationId, operationId)) && !stopped) {
+            return;
+        }
+        if (stopped) {
+            // A submitted write has no reliable cancellation acknowledgement. Ignore its late completion
+            // so it cannot claim success, failure, or release the context write lock after Ctrl-C.
+            stoppedOperationId = null;
+            return;
+        }
+        commandRunning = false;
+        activeOperationId = null;
+        String line = activeCommandLine;
+        activeCommandLine = null;
+        TuiOperation operation = uiState.operation();
+        if (line != null && line.equals(":ctx")) {
             if (pendingContextSelection != null) {
                 switchToSelectedContext(pendingContextSelection);
             } else {
                 switchToCurrentWorkspaceBinding();
             }
         }
-        String result = consumeOutput();
+        if (operation != null && operation.id().equals(operationId)) {
+            uiState = reduce(new TuiAction.SetOperation(failure == null ? operation.complete() : operation.failed()));
+            if (operation.kind() == TuiOperation.Kind.WRITE) {
+                uiState = reduce(new TuiAction.ContextSession(
+                        new TuiContextSessionAction.ClearWriteInFlight()));
+            }
+        }
+        CommandResult safeResult = commandResult == null ? new CommandResult(true, Cli.EXIT_DIAGNOSTIC) : commandResult;
+        uiState = reduce(new TuiAction.SetResultPane(TuiCommandBar.project(safeResult, result)));
         if (!result.isBlank()) {
-            String marker = commandResult.exitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";
+            String marker = failure == null && safeResult.exitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";
             uiState = reduce(new TuiAction.AppendActivity(marker + result));
             uiState = reduce(new TuiAction.SetNotice(result));
-        } else if (commandResult.exitCode() == Cli.EXIT_OK) {
+        } else if (failure == null && safeResult.exitCode() == Cli.EXIT_OK) {
             uiState = reduce(new TuiAction.AppendActivity("✓ ready"));
             uiState = reduce(new TuiAction.SetNotice("ready"));
         } else {
-            String failure = "command failed (exit " + commandResult.exitCode() + ")";
-            uiState = reduce(new TuiAction.AppendActivity("✕ " + failure));
-            uiState = reduce(
-                    new TuiAction.SetNotice(failure));
+            String message = "command failed (exit " + safeResult.exitCode() + ")";
+            uiState = reduce(new TuiAction.AppendActivity("✕ " + message));
+            uiState = reduce(new TuiAction.SetNotice(message));
         }
-        return commandResult.keepRunning();
+        commandExitRequested = !safeResult.keepRunning();
+    }
+
+    static boolean requiresUiThread(String line) {
+        List<String> words = CommandInvocation.parse(line == null ? "" : line).words();
+        if (words.isEmpty()) {
+            return true;
+        }
+        String verb = words.getFirst();
+        return verb.equals("context") || verb.equals("new") || verb.equals(":ctx")
+                || verb.equals("connect") || verb.equals("disconnect") || verb.equals("logout")
+                || verb.equals("cd") || (verb.equals("auth") && words.size() > 1 && words.get(1).equals("logout"));
+    }
+
+    private static boolean isTuiBuiltin(String line) {
+        return Set.of(":ctx", ":help", ":logout", ":quit").contains(line);
+    }
+
+    private boolean isInteractiveLogin(String line) {
+        List<String> words = CommandInvocation.parse(line).words();
+        return line.equals(":login") || (!words.isEmpty() && (words.getFirst().equals("login")
+                || (words.getFirst().equals("auth") && words.size() > 1 && words.get(1).equals("login"))));
+    }
+
+    private LoginInput prepareInteractiveLogin(String line) {
+        if (!isInteractiveLogin(line)) {
+            return null;
+        }
+        List<String> words = CommandInvocation.parse(line).words();
+        String username = line.equals(":login") ? ""
+                : words.getFirst().equals("auth")
+                ? (words.size() > 2 ? words.get(2) : "")
+                : (words.size() > 1 ? words.get(1) : "");
+        if (username.isBlank()) {
+            username = promptText("Username", "", false);
+        }
+        if (username == null || username.isBlank()) {
+            return null;
+        }
+        String password = promptText("Password", "", true);
+        return password == null ? null : new LoginInput(username, password);
+    }
+
+    private record LoginInput(String username, String password) {
+    }
+
+    private static boolean isContextCommand(String line) {
+        return line.equals(":ctx") || line.equals("context") || line.startsWith("context ");
+    }
+
+    private boolean confirmWrite(TuiWriteConfirmation confirmation) {
+        uiState = reduce(new TuiAction.SetPrompt(
+                TuiDashboard.Prompt.confirmWrite(confirmation.command(), confirmation.target(),
+                        confirmation.issuer())));
+        draw(display, terminal);
+        try {
+            int selected = 0;
+            while (true) {
+                int code = readPromptCode();
+                if (code < 0 || code == TuiCommandBar.CTRL_C || code == TuiCommandBar.ESCAPE) {
+                    return false;
+                }
+                if (code == TuiCommandBar.ENTER || code == TuiCommandBar.CARRIAGE_RETURN) {
+                    return confirmation.options().get(selected).equals("Run");
+                }
+                EscapeKey key = escapeKeyFrom(code);
+                if (key == EscapeKey.UP) {
+                    selected = Math.max(0, selected - 1);
+                } else if (key == EscapeKey.DOWN) {
+                    selected = Math.min(confirmation.options().size() - 1, selected + 1);
+                } else if (code == '1') {
+                    return false;
+                } else if (code == '2') {
+                    return true;
+                } else {
+                    continue;
+                }
+                uiState = reduce(new TuiAction.SetPrompt(new TuiDashboard.Prompt(
+                        confirmation.question(), "", "↑/↓ choose · Enter select · Esc cancel", false,
+                        confirmation.options(), selected, List.of())));
+                draw(display, terminal);
+            }
+        } finally {
+            uiState = reduce(new TuiAction.ClearPrompt());
+            draw(display, terminal);
+        }
+    }
+
+    private String writeTarget() {
+        TuiContextSessionState contextSession = uiState.contextSession();
+        if (contextSession.context() != null && !contextSession.context().name().isBlank()) {
+            return contextSession.context().name();
+        }
+        String context = repl.contextName();
+        return context == null || context.isBlank() ? repl.workdir().toString() : context;
+    }
+
+    private String writeIssuer() {
+        String issuer = uiState.contextSession().issuer();
+        return issuer == null || issuer.isBlank() ? "" : issuer;
+    }
+
+    private boolean writeConfirmationReady() {
+        TuiContextSessionState contextSession = uiState.contextSession();
+        return contextSession.connection() == TuiDashboard.Connection.ONLINE
+                && contextSession.context() != null
+                && !writeTarget().isBlank()
+                && !writeIssuer().isBlank();
     }
 
     /** Reads a single TUI-owned answer while keeping the dashboard and raw terminal active. */
@@ -293,7 +603,8 @@ final class TuiApp {
         String hint = defaultValue == null || defaultValue.isBlank()
                 ? "Enter submit · Esc close"
                 : "default: " + defaultValue + " · Enter accept · Esc close";
-        StringBuilder input = new StringBuilder();
+        StringBuilder input = secret ? null : new StringBuilder();
+        TuiSecretInput secretInput = secret ? new TuiSecretInput() : null;
         uiState = reduce(new TuiAction.SetPrompt(
                 TuiDashboard.Prompt.text(question, "", hint, secret)));
         draw(display, terminal);
@@ -301,23 +612,34 @@ final class TuiApp {
             while (true) {
                 int code = readPromptCode();
                 if (code < 0 || code == TuiCommandBar.CTRL_C || code == TuiCommandBar.ESCAPE) {
-                    return "";
+                    return null;
                 }
                 if (code == TuiCommandBar.ENTER || code == TuiCommandBar.CARRIAGE_RETURN) {
-                    return input.toString();
+                    return secret ? secretInput.take() : input.toString();
                 }
                 if (code == TuiCommandBar.BACKSPACE || code == TuiCommandBar.DELETE) {
-                    deleteLastCodePoint(input);
+                    if (secret) {
+                        secretInput.deleteLastCodePoint();
+                    } else {
+                        deleteLastCodePoint(input);
+                    }
                 } else if (isPrintable(code)) {
-                    appendCodePoint(input, code);
+                    if (secret) {
+                        secretInput.appendCodePoint(code);
+                    } else {
+                        appendCodePoint(input, code);
+                    }
                 } else {
                     continue;
                 }
                 uiState = reduce(new TuiAction.SetPrompt(
-                        TuiDashboard.Prompt.text(question, input.toString(), hint, secret)));
+                        TuiDashboard.Prompt.text(question, secret ? secretInput.masked() : input.toString(), hint, secret)));
                 draw(display, terminal);
             }
         } finally {
+            if (secretInput != null) {
+                secretInput.close();
+            }
             uiState = reduce(new TuiAction.ClearPrompt());
             draw(display, terminal);
         }
@@ -561,8 +883,14 @@ final class TuiApp {
     /** Switches scope on the UI thread; recovery completion is generation-gated by the reducer. */
     void switchContext(ResolvedContext.Named context) {
         TuiContextSessionState before = uiState.contextSession();
+        long oldRefreshRequestId = uiState.refreshRequestId();
+        boolean refreshInFlight = uiState.refreshInFlight();
         uiState = reduce(new TuiAction.ContextSession(new TuiContextSessionAction.SwitchContext(context)));
         if (uiState.contextSession().generation() != before.generation()) {
+            if (refreshInFlight) {
+                resourceRefresh.cancel(oldRefreshRequestId);
+                uiState = reduce(new TuiAction.RefreshCancelled(oldRefreshRequestId));
+            }
             repl.selectContextForTui(context);
             startContextRecoveryIfNeeded();
         }
@@ -633,7 +961,7 @@ final class TuiApp {
                 session.clusterName(), authStatus(contextSession, session), uiState.activity(),
                 uiState.resources().isEmpty() && uiState.lastRefreshAt() == null
                         ? TuiWorkspaceSnapshot.scan(repl.workdir()) : uiState.resources(),
-                uiState.pipelines(), uiState.lastRefreshAt());
+                uiState.pipelines(), uiState.lastRefreshAt(), uiState.resultPane());
     }
 
     private static String authStatus(TuiContextSessionState contextSession, Session session) {
@@ -708,7 +1036,7 @@ final class TuiApp {
             uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
         } else {
             uiState = reduce(
-                    new TuiAction.OpenPalette(PALETTE_COMMANDS, PALETTE_NOTICE));
+                    new TuiAction.OpenPalette(paletteCommands(repl.registry()), PALETTE_NOTICE));
         }
     }
 
@@ -719,16 +1047,44 @@ final class TuiApp {
             uiState = reduce(new TuiAction.SetNotice(PALETTE_NOTICE));
             return;
         }
-        String next = key == EscapeKey.UP ? history.previous(uiState.command()) : history.next();
-        uiState = reduce(new TuiAction.SetCommand(next));
+        if (commandInput.isEmpty()) {
+            TuiNavigation navigation = navigation();
+            TuiNavigation next = navigation.move(key == EscapeKey.UP ? -1 : 1);
+            uiState = reduce(new TuiAction.SetNavigation(next));
+            if (!next.selected().isEmpty()) {
+                uiState = reduce(new TuiAction.SetNotice("selected: " + next.selected()));
+            }
+            return;
+        }
+        commandInput = key == EscapeKey.UP ? history.previous(commandInput) : history.next();
+        uiState = reduce(new TuiAction.SetCommand(commandInput));
+    }
+
+    private TuiNavigation navigation() {
+        List<String> items = uiState.resources().isEmpty() && uiState.lastRefreshAt() == null
+                ? TuiWorkspaceSnapshot.scan(repl.workdir()).stream().map(TuiDashboard.ResourceSummary::id).toList()
+                : uiState.resources().stream().map(TuiDashboard.ResourceSummary::id).toList();
+        TuiNavigation navigation = uiState.navigation();
+        return navigation.items().equals(items) ? navigation : TuiNavigation.initial(items);
+    }
+
+    private TuiDashboard.ResourceSummary selectedResource(String id) {
+        List<TuiDashboard.ResourceSummary> resources = uiState.resources().isEmpty() && uiState.lastRefreshAt() == null
+                ? TuiWorkspaceSnapshot.scan(repl.workdir()) : uiState.resources();
+        return resources.stream().filter(resource -> resource.id().equals(id)).findFirst().orElse(null);
     }
 
     private void closePaletteOrClearCommand() {
         if (uiState.paletteOpen()) {
             uiState = reduce(new TuiAction.ClosePalette("ready"));
+        } else if (navigation().detailOpen()) {
+            uiState = reduce(new TuiAction.SetNavigation(navigation().back()));
+            uiState = reduce(new TuiAction.SetResultPane(null));
+            uiState = reduce(new TuiAction.SetNotice("resources"));
         } else {
-            TuiCommandBar.Update update = TuiCommandBar.accept(uiState.command(), TuiCommandBar.ESCAPE);
-            uiState = reduce(new TuiAction.SetCommand(update.value()));
+            TuiCommandBar.Update update = TuiCommandBar.accept(commandInput, TuiCommandBar.ESCAPE);
+            commandInput = update.value();
+            uiState = reduce(new TuiAction.SetCommand(commandInput));
         }
     }
 

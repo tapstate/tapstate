@@ -5,8 +5,8 @@ sealed interface TuiAction
         permits TuiAction.SetCommand, TuiAction.ClearCommand, TuiAction.SetNotice,
         TuiAction.OpenPalette, TuiAction.ClosePalette, TuiAction.MovePalette,
         TuiAction.SelectPaletteCommand, TuiAction.SetPrompt, TuiAction.ClearPrompt,
-        TuiAction.AppendActivity, TuiAction.Tick, TuiAction.ContextSession,
-        TuiAction.RefreshStarted, TuiAction.RefreshCompleted {
+        TuiAction.AppendActivity, TuiAction.SetResultPane, TuiAction.SetOperation, TuiAction.SetNavigation, TuiAction.Tick, TuiAction.ContextSession,
+        TuiAction.RefreshStarted, TuiAction.RefreshCancelled, TuiAction.RefreshCompleted {
 
     record SetCommand(String value) implements TuiAction {
     }
@@ -38,6 +38,15 @@ sealed interface TuiAction
     record AppendActivity(String value) implements TuiAction {
     }
 
+    record SetResultPane(TuiCommandBar.ResultPane pane) implements TuiAction {
+    }
+
+    record SetOperation(TuiOperation operation) implements TuiAction {
+    }
+
+    record SetNavigation(TuiNavigation navigation) implements TuiAction {
+    }
+
     record Tick() implements TuiAction {
     }
 
@@ -53,6 +62,14 @@ sealed interface TuiAction
         public RefreshStarted {
             if (requestId <= 0 || contextGeneration < 0) {
                 throw new IllegalArgumentException("refresh request id and context generation are required");
+            }
+        }
+    }
+
+    record RefreshCancelled(long requestId) implements TuiAction {
+        public RefreshCancelled {
+            if (requestId <= 0) {
+                throw new IllegalArgumentException("refresh request id is required");
             }
         }
     }

@@ -30,7 +30,7 @@ final class TuiCommandHistory {
 
     /** Records a non-empty command, ignoring an immediate duplicate. */
     void record(String command) {
-        String normalized = command == null ? "" : command.trim();
+        String normalized = TuiActivity.command(command);
         if (normalized.isEmpty()) {
             reset();
             return;
@@ -76,5 +76,18 @@ final class TuiCommandHistory {
 
     List<String> entries() {
         return List.copyOf(entries);
+    }
+
+    /** Returns recent commands whose safe display text starts with the supplied prefix. */
+    List<String> matches(String prefix) {
+        String normalized = prefix == null ? "" : prefix.trim();
+        List<String> matches = new ArrayList<>();
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            String entry = entries.get(i);
+            if (entry.startsWith(normalized)) {
+                matches.add(entry);
+            }
+        }
+        return List.copyOf(matches);
     }
 }

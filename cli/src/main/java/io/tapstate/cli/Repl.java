@@ -366,6 +366,14 @@ final class Repl {
         }
     }
 
+    /** Executes a TUI-collected login after the terminal loop has returned to its background worker. */
+    int tuiLogin(String username, String password) {
+        if (username == null || username.isBlank() || password == null) {
+            return Cli.EXIT_USAGE;
+        }
+        return login(username, () -> password);
+    }
+
     /** Establishes a quiet launch connection without invoking the human-password flow. */
     int connectForLaunch(String seeds, boolean quiet) {
         this.quiet = quiet;
@@ -446,6 +454,12 @@ final class Repl {
             lastExitCode = Cli.EXIT_OK;
             return true;
         }
+        if (trimmed.equals(":help")) {
+            commandLine.usage(commandLine.getOut());
+            commandLine.getOut().flush();
+            lastExitCode = Cli.EXIT_OK;
+            return true;
+        }
         if (trimmed.equals("pwd")) {
             commandLine.getOut().println(workdir.toString());
             commandLine.getOut().flush();
@@ -455,6 +469,14 @@ final class Repl {
         if (trimmed.equals(":ctx")) {
             lastExitCode = context();
             return true;
+        }
+        if (trimmed.equals(":logout")) {
+            lastExitCode = logout();
+            return true;
+        }
+        if (trimmed.equals(":quit")) {
+            lastExitCode = Cli.EXIT_OK;
+            return false;
         }
         // The read shell is matched on the whole line rather than on its first word, because what it names
         // is a place in the data — `views.orders.find({...})` — and a filter written across several words

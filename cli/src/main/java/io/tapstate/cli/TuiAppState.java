@@ -10,31 +10,38 @@ record TuiAppState(String command, String notice, boolean paletteOpen, int palet
                    List<String> palette, TuiDashboard.Prompt prompt, List<String> activity, long ticks,
                    TuiContextSessionState contextSession, List<TuiDashboard.ResourceSummary> resources,
                    List<TuiDashboard.PipelineSummary> pipelines, boolean refreshInFlight, long refreshRequestId,
-                   long refreshContextGeneration, String lastRefreshAt) {
+                   long refreshContextGeneration, String lastRefreshAt,
+                   TuiCommandBar.ResultPane resultPane, TuiOperation operation, TuiNavigation navigation) {
 
     static final int MAX_ACTIVITY = 200;
 
     TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
                 List<String> palette, TuiDashboard.Prompt prompt) {
         this(command, notice, paletteOpen, paletteIndex, palette, prompt, List.of(), 0L,
-                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null);
+                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null, null, null,
+                TuiNavigation.initial(List.of()));
     }
 
     TuiAppState(String command, String notice, boolean paletteOpen, int paletteIndex,
                 List<String> palette, TuiDashboard.Prompt prompt, List<String> activity) {
         this(command, notice, paletteOpen, paletteIndex, palette, prompt, activity, 0L,
-                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null);
+                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null, null, null,
+                TuiNavigation.initial(List.of()));
     }
 
     TuiAppState {
-        command = command == null ? "" : command;
-        notice = notice == null ? "" : notice;
+        command = TuiActivity.command(command);
+        notice = TuiActivity.result(notice);
         palette = palette == null ? List.of() : List.copyOf(palette);
-        activity = activity == null ? List.of() : List.copyOf(activity);
+        activity = activity == null ? List.of() : activity.stream().map(TuiActivity::result).toList();
         contextSession = contextSession == null ? TuiContextSessionState.initial() : contextSession;
         resources = resources == null ? List.of() : List.copyOf(resources);
         pipelines = pipelines == null ? List.of() : List.copyOf(pipelines);
         lastRefreshAt = lastRefreshAt == null || lastRefreshAt.isBlank() ? null : lastRefreshAt;
+        resultPane = resultPane == null ? null : TuiCommandBar.project(
+                new CommandResult(resultPane.keepRunning(), resultPane.exitCode()),
+                String.join("\n", resultPane.lines()));
+        navigation = navigation == null ? TuiNavigation.initial(List.of()) : navigation;
         if (activity.size() > MAX_ACTIVITY) {
             activity = activity.subList(activity.size() - MAX_ACTIVITY, activity.size());
         }
@@ -47,6 +54,7 @@ record TuiAppState(String command, String notice, boolean paletteOpen, int palet
 
     static TuiAppState initial(String notice) {
         return new TuiAppState("", notice, false, 0, List.of(), null, List.of(), 0L,
-                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null);
+                TuiContextSessionState.initial(), List.of(), List.of(), false, 0L, 0L, null, null, null,
+                TuiNavigation.initial(List.of()));
     }
 }
