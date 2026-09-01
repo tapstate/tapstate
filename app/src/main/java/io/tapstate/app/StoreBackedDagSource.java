@@ -116,6 +116,21 @@ final class StoreBackedDagSource implements DagSource {
         return sinkWriterBinder;
     }
 
+    @Override
+    public void validateStart(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        if (pipeline.serve() instanceof ServeBlock.Inline serve
+                && serve.sync() != null && !serve.sync().isEmpty()) {
+            Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
+            Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+            Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+            targetModelResolver.requireAllDiscovered(sourceIdsReaching(
+                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices,
+                    stepIds(pipeline)));
+        }
+    }
+
     StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder) {
         this(storePort, sinkWriterBinder, NestSettings.defaults());
     }
@@ -143,8 +158,11 @@ final class StoreBackedDagSource implements DagSource {
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
         Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
-        // The linear builder does not expose a per-sink upstream table set. Binding every selected table keeps
-        // a non-first source table from losing its discovered model or rename when it reaches a serve sink.
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        // Resolve every selected table once. The terminal-specific stream sets below then narrow this map to
+        // what can actually reach each sink, so an unrelated source neither gains a discovery obligation nor
+        // a target binding.
         Map<String, TargetTable> bySourceTable = targetModelResolver.resolveAll(pipeline);
         // A nest emits under the id of the step that assembled it rather than under a table name, so the
         // resolution above - which answers per source table - says nothing about it. Registering it here is
@@ -153,14 +171,20 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, TargetTable> assembled = assembledTargets(pipeline, bySourceTable, sourceVertices);
         Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
         targets.putAll(assembled);
-        Set<String> servedTables = sourceTables(sourceVertices);
-        servedTables.addAll(assembled.keySet());
-        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> serveStreams = pipeline.serve() instanceof ServeBlock.Inline serve
+                && serve.sync() != null && !serve.sync().isEmpty()
+                ? streamsReaching(pipeline, serve.from(), sourceKeyByTable, sourceKeysById,
+                        sourceVertices, stepIds)
+                : Set.of();
+        Set<String> viewStreams = pipeline.view() instanceof ViewBlock.Inline view
+                ? streamsReaching(pipeline, view.from(), sourceKeyByTable, sourceKeysById,
+                        sourceVertices, stepIds)
+                : Set.of();
         FrontierBinding frontier = frontierBinding(sourceVertices);
         return PipelineDagBuilder.build(
                 pipeline,
-                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, servedTables,
-                        stepIds(pipeline), frontier),
+                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets,
+                        serveStreams, viewStreams, stepIds, frontier),
                 sinkAckFactory(pipeline, pipelineId), frontier);
     }
 
@@ -259,14 +283,6 @@ final class StoreBackedDagSource implements DagSource {
         return byTable;
     }
 
-    private static Set<String> sourceTables(Map<String, SourceVertex> sourceVertices) {
-        Set<String> tables = new LinkedHashSet<>();
-        for (SourceVertex vertex : sourceVertices.values()) {
-            tables.add(vertex.table());
-        }
-        return tables;
-    }
-
     /**
      * The write-side model for what each nest in this pipeline emits, keyed by the stream it emits under.
      *
@@ -355,17 +371,18 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, String> sourceKeyByTable,
             Map<String, List<String>> sourceKeysById,
             Map<String, TargetTable> targets,
-            Set<String> servedTables,
+            Set<String> serveStreams,
+            Set<String> viewStreams,
             Set<String> stepIds,
             FrontierBinding frontier) {
         ChainAxes axes = frontier.axes();
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes),
                 StoreBackedDagSource::transformPort,
-                element -> sinkWriter(element, targets, servedTables),
+                element -> sinkWriter(element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
-                view -> viewSink(pipeline, view, targets, servedTables, sourceKeysById),
+                view -> viewSink(pipeline, view, targets, viewStreams, sourceKeysById),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)));
     }
 
@@ -381,7 +398,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> viewSink(
             PipelineResource pipeline, ViewBlock view, Map<String, TargetTable> targets,
-            Set<String> servedTables, Map<String, List<String>> tablesBySourceId) {
+            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId) {
         if (!(view instanceof ViewBlock.Inline inline)) {
             throw new IllegalArgumentException(
                     "view block is a use-reference; resolve it to an inline view first");
@@ -417,7 +434,7 @@ final class StoreBackedDagSource implements DagSource {
         // name instead, every lookup misses and the rows land under the source table: the right rows,
         // silently in the wrong collection, which no topology assertion can see.
         Map<String, TargetTable> bySourceTable = new LinkedHashMap<>();
-        for (String sourceTable : servedTables) {
+        for (String sourceTable : viewStreams) {
             bySourceTable.put(sourceTable,
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
@@ -531,6 +548,117 @@ final class StoreBackedDagSource implements DagSource {
             return List.copyOf(aliases.aliases().values());
         }
         return List.of();
+    }
+
+    /** The source artifacts whose rows can reach one terminal reference. */
+    private static Set<String> sourceIdsReaching(
+            PipelineResource pipeline,
+            FromRef from,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> sourceVertices,
+            Set<String> stepIds) {
+        Set<String> sourceIds = new LinkedHashSet<>();
+        collectSourceIds(pipeline, from, sourceKeyByTable, sourceKeysById, sourceVertices,
+                stepIds, sourceIds, new HashSet<>());
+        return sourceIds;
+    }
+
+    /** Walks a terminal reference backwards through transforms and views to its source leaves. */
+    private static void collectSourceIds(
+            PipelineResource pipeline,
+            FromRef from,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> sourceVertices,
+            Set<String> stepIds,
+            Set<String> sourceIds,
+            Set<String> visiting) {
+        ViewBlock.Inline view = inlineViewNamed(pipeline, from);
+        if (view != null) {
+            collectSourceIds(pipeline, view.from(), sourceKeyByTable, sourceKeysById, sourceVertices,
+                    stepIds, sourceIds, visiting);
+            return;
+        }
+        for (String key : upstreams(
+                from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
+            SourceVertex source = sourceVertices.get(key);
+            if (source != null) {
+                sourceIds.add(source.sourceId());
+                continue;
+            }
+            Step step = stepOf(pipeline, key);
+            if (step != null && visiting.add(key)) {
+                for (FromRef upstream : refsOf(step.from())) {
+                    collectSourceIds(pipeline, upstream, sourceKeyByTable, sourceKeysById,
+                            sourceVertices, stepIds, sourceIds, visiting);
+                }
+            }
+        }
+    }
+
+    /** The stream ids a terminal sink can receive: source tables, or a nest step's assembled stream id. */
+    private static Set<String> streamsReaching(
+            PipelineResource pipeline,
+            FromRef from,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> sourceVertices,
+            Set<String> stepIds) {
+        Set<String> streams = new LinkedHashSet<>();
+        collectStreams(pipeline, from, sourceKeyByTable, sourceKeysById, sourceVertices,
+                stepIds, streams, new HashSet<>());
+        return streams;
+    }
+
+    /** Resolves the stream names preserved through stateless steps and replaced by a nest assembly. */
+    private static void collectStreams(
+            PipelineResource pipeline,
+            FromRef from,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> sourceVertices,
+            Set<String> stepIds,
+            Set<String> streams,
+            Set<String> visiting) {
+        ViewBlock.Inline view = inlineViewNamed(pipeline, from);
+        if (view != null) {
+            collectStreams(pipeline, view.from(), sourceKeyByTable, sourceKeysById, sourceVertices,
+                    stepIds, streams, visiting);
+            return;
+        }
+        for (String key : upstreams(
+                from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
+            SourceVertex source = sourceVertices.get(key);
+            if (source != null) {
+                streams.add(source.table());
+                continue;
+            }
+            Step step = stepOf(pipeline, key);
+            if (step == null) {
+                continue;
+            }
+            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest) {
+                streams.add(step.id());
+                continue;
+            }
+            if (visiting.add(key)) {
+                for (FromRef upstream : refsOf(step.from())) {
+                    collectStreams(pipeline, upstream, sourceKeyByTable, sourceKeysById,
+                            sourceVertices, stepIds, streams, visiting);
+                }
+            }
+        }
+    }
+
+    /** A declared view is a data alias for what it reads, not a producer vertex of its own. */
+    private static ViewBlock.Inline inlineViewNamed(PipelineResource pipeline, FromRef from) {
+        if (from instanceof FromRef.Literal literal
+                && pipeline.view() instanceof ViewBlock.Inline view
+                && view.id().equals(literal.ref())) {
+            return view;
+        }
+        return null;
     }
 
     /**
@@ -752,17 +880,17 @@ final class StoreBackedDagSource implements DagSource {
     /**
      * The sink-writer factory for one serve.sync element. The element names a source id as its target
      * connection supplier, so the connector and config come from that source; the write mode and ddl policy
-     * come from the element, defaulting to upsert and fail. The resolved target model - the table the sink
-     * creates and the key an upsert matches on, resolved from the pipeline source's discovered model - travels
-     * with the binding, or is null when no model was discovered. The bound factory carries only these
-     * serializable coordinates and opens the connector on the member that runs the sink.
+     * come from the element, defaulting to upsert and fail. The resolved target models are narrowed to the
+     * streams that can reach this serve block; the start precondition guarantees each has a discovered model.
+     * The bound factory carries only these serializable coordinates and opens the connector on the member
+     * that runs the sink.
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
-            SyncElement element, Map<String, TargetTable> targets, Set<String> servedTables) {
+            SyncElement element, Map<String, TargetTable> targets, Set<String> serveStreams) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
         return sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
-                TargetModelResolver.renameAll(targets, servedTables, element.rename()));
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename()));
     }
 
     /**

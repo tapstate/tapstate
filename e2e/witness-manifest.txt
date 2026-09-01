@@ -30,6 +30,8 @@ a-row-keeps-its-sequence-across-the-crossing on IN_PROCESS
 a-row-keeps-its-sequence-across-the-crossing on REAL_PROCESS
 a-sink-write-failure-is-observable on IN_PROCESS
 a-sink-write-failure-is-observable on REAL_PROCESS
+a-sync-start-before-source-discovery-is-refused on IN_PROCESS
+a-sync-start-before-source-discovery-is-refused on REAL_PROCESS
 a-view-and-a-serve-block-each-receive-the-rows on IN_PROCESS
 a-view-and-a-serve-block-each-receive-the-rows on REAL_PROCESS
 a-view-whose-store-cannot-be-reached-fails-with-a-named-code on IN_PROCESS

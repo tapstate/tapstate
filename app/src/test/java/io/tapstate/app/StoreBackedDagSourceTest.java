@@ -67,6 +67,7 @@ class StoreBackedDagSourceTest {
                 null,
                 serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
                 null, null));
+        discovered(store, "orders_src", "orders");
         OpenRingGenerations.forSources(store, "orders_src");
 
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
@@ -108,6 +109,7 @@ class StoreBackedDagSourceTest {
                 "p", null, List.of("orders_src"), null, null,
                 new ServeBlock.Use(null, "publish", FromRef.literal("orders_src")),
                 null, null));
+        discovered(store, "orders_src", "orders");
 
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
@@ -300,6 +302,7 @@ class StoreBackedDagSourceTest {
                 null,
                 serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")),
                 null, null));
+        discovered(store, "orders_src", "orders");
 
         // No chain record: only a read with an incremental tail through the shared ring opens one, so a
         // snapshot-only or srs-disabled read reaches here with none. Its rows come from the snapshot buffer
@@ -319,6 +322,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(new PipelineResource(
                 "multi", null, List.of("multi_src"), null, null,
                 serve(FromRef.literal("multi_src"), sync("sync_1", "orders_dest")), null, null));
+        discovered(store, "multi_src", "orders", "customers");
 
         DAG dag = new StoreBackedDagSource(store).dagFor("multi");
 
@@ -361,6 +365,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(new PipelineResource(
                 "players", null, List.of("players_src"), null, null,
                 serve(FromRef.regex("Player.*"), sync("sync_1", "players_dest")), null, null));
+        discovered(store, "players_src", "Player", "PlayerCard", "Orders");
 
         DAG dag = new StoreBackedDagSource(store).dagFor("players");
 
@@ -455,6 +460,16 @@ class StoreBackedDagSourceTest {
 
     private static Step filter(String id, String expr, FromRef... from) {
         return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null, null);
+    }
+
+    /** Persists the source model a production sync start requires before constructing its DAG. */
+    private static void discovered(FakeStorePort store, String sourceId, String... tables) {
+        List<SourceTable> discovered = new ArrayList<>();
+        for (String table : tables) {
+            discovered.add(new SourceTable(table, List.of(), List.of(), List.of()));
+        }
+        store.schemas.save(new DiscoveredSourceModel(
+                sourceId, "mysql", 1L, new SourceModel(discovered)));
     }
 
     private static List<String> vertexNames(DAG dag) {

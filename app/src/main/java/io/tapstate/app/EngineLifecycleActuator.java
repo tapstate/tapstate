@@ -14,9 +14,10 @@ import java.util.Optional;
  *
  * <p>Each verb composes the two sides in the order the data flow requires:
  * <ul>
- *   <li>{@code start} finishes any drop an earlier stop left outstanding, fills the change ring (capture),
- *       then submits the job that reads it (engine), so the topology never starts against an unfilled ring
- *       nor onto state that was half let go of.</li>
+ *   <li>{@code start} validates the pipeline before side effects, finishes any drop an earlier stop left
+ *       outstanding, fills the change ring (capture), then submits the job that reads it (engine), so the
+ *       topology never starts against an unmet prerequisite, an unfilled ring, nor state that was half let go
+ *       of.</li>
  *   <li>{@code stop} cancels the job first (engine) then stops the capture behind it (coordinator), so the
  *       capture daemon is torn down only once nothing reads its ring; the operator state the run kept is
  *       let go of last, once the job it belonged to is actually over.</li>
@@ -49,6 +50,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void start(String pipelineId) {
+        // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
+        // prerequisite must leave no data-plane component running and no start-side state mutation behind.
+        dagSource.validateStart(pipelineId);
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
         // what leaves a run that died without a stop with its state - and so with a shape to be held to.

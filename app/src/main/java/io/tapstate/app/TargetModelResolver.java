@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SourceResource;
@@ -7,6 +8,7 @@ import io.tapstate.core.model.TableRename;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
 import java.util.ArrayList;
@@ -24,7 +26,7 @@ import java.util.Optional;
  * the source the sink reads and mapping the discovered {@link SourceTable} onto a {@link TargetTable}.
  *
  * <p>A source may select several tables. When a table's schema has never been discovered, it is absent from
- * the resolved map and the sink falls back to a bare table id for that stream.
+ * the resolved map. View materialization tolerates that absence; a sync start refuses it before binding.
  */
 final class TargetModelResolver {
 
@@ -32,6 +34,25 @@ final class TargetModelResolver {
 
     TargetModelResolver(StorePort storePort) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
+    }
+
+    /**
+     * Requires every source model that reaches a sync to have been discovered. Literal table selectors can
+     * still resolve without discovery for legacy view/nest paths, but a sync target needs the discovered
+     * fields and primary key before capture or a sink can safely start.
+     */
+    void requireAllDiscovered(Iterable<String> sourceIds) {
+        for (String sourceId : sourceIds) {
+            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            if (discovered == null) {
+                throw new TapstateException(
+                        ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED, Map.of("source", source.id()), null);
+            }
+            // Preserve existing selector diagnostics for a discovered source whose literal/regex no longer
+            // names a table, instead of converting that distinct error into a missing-schema refusal.
+            SourceTableSelection.resolve(source, discovered);
+        }
     }
 
     /** Resolves one target model per selected source table across the pipeline, in source and discovery order. */
@@ -105,21 +126,16 @@ final class TargetModelResolver {
 
     /**
      * The target table one sync element writes: the resolved model under the name its rename gives the source
-     * table. A rename with no model behind it still names a table, so the sink is pointed at the renamed one
-     * rather than at whatever table id the first row happens to carry.
-     *
-     * <p>The name a rename is applied to is the model's own, falling back to the stream's key only when there
-     * is no model. For a source table the two are the same string. They part company for a stream whose key
-     * is not a table name at all - a nest emits under the id of the step that assembled it, while the table
-     * its documents land in is the root's - and renaming the key there would name the target after the step.
+     * table. The name a rename is applied to is the model's own rather than the stream key: a nest emits under
+     * the id of the step that assembled it, while the table its documents land in is the root's, and renaming
+     * the key there would name the target after the step.
      */
-    static TargetTable rename(TargetTable target, String sourceName, RenameSpec rename) {
+    static TargetTable rename(TargetTable target, RenameSpec rename) {
+        Objects.requireNonNull(target, "target");
         if (rename == null) {
             return target;
         }
-        List<TargetField> fields = target == null ? List.of() : target.fields();
-        String named = target == null ? sourceName : target.name();
-        return new TargetTable(TableRename.apply(named, rename), fields);
+        return new TargetTable(TableRename.apply(target.name(), rename), target.fields());
     }
 
     /**
@@ -156,12 +172,11 @@ final class TargetModelResolver {
     /** Applies one sync element's rename rules to every source table that can reach that sink. */
     static Map<String, TargetTable> renameAll(
             Map<String, TargetTable> targets, Iterable<String> sourceTables, RenameSpec rename) {
-        if (rename == null) {
-            return targets;
-        }
         Map<String, TargetTable> renamed = new LinkedHashMap<>();
         for (String sourceTable : sourceTables) {
-            renamed.put(sourceTable, rename(targets.get(sourceTable), sourceTable, rename));
+            TargetTable target = Objects.requireNonNull(
+                    targets.get(sourceTable), "no discovered target model for served stream '" + sourceTable + "'");
+            renamed.put(sourceTable, rename(target, rename));
         }
         return Collections.unmodifiableMap(renamed);
     }
