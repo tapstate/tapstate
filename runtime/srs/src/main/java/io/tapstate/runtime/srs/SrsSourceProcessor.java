@@ -7,6 +7,7 @@ import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.ringbuffer.Ringbuffer;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import java.util.ArrayDeque;
@@ -20,10 +21,16 @@ import java.util.Objects;
  * builder speaks in processor suppliers, and the source position must enter the envelope at the source, so
  * the projection lives here rather than in a later stage.
  *
- * <p>Snapshot rows and cdc changes flow through this one ordered source: the snapshot rows a member-side
- * {@link SnapshotBuffer} holds for this ring are drained once at init and emitted ahead of any cdc change, so
- * the older snapshot value can never land at the sink after a newer change of the same key. A member with no
- * buffer bound, or a ring with none buffered (a cdc-only read), is a pure ring tail.
+ * <p>Snapshot rows and cdc changes flow through this one ordered source: the rows a member-side
+ * {@link SnapshotBuffer} holds for this ring are emitted ahead of any cdc change off the ring, so the older
+ * snapshot value can never land at the sink after a newer change of the same key. A member with no buffer
+ * bound, or a ring with none buffered, is a pure ring tail.
+ *
+ * <p><strong>The buffer is looked at on every pass, not once at init.</strong> It is not only a snapshot
+ * seed: a tail running with the shared ring switched off has no ring anyone fills, so every change it
+ * captures reaches the sink through here, for as long as the pipeline runs. Draining once delivers whatever
+ * happened to be buffered when the job started and strands the rest in a member-local queue nothing reads
+ * again -- with the job still running, nothing thrown, and the tail reporting healthy.
  *
  * <p>Non-cooperative, exactly as Jet's own SourceBuilder-built source is: it runs on its own thread and backs
  * off between empty fills, so an idle ring never spins a shared cooperative thread. It is not fault-tolerant -
@@ -43,6 +50,7 @@ public final class SrsSourceProcessor extends AbstractProcessor {
     private final SrsReadCursorPublisherFactory publisherFactory;
     private final SourceBoundStamp stamp;
     private final ArrayDeque<Envelope> pending = new ArrayDeque<>();
+    private SnapshotBuffer buffered;
     private SrsRingReader reader;
     private SourceOrder read;
     private Watermark unannounced;
@@ -66,22 +74,20 @@ public final class SrsSourceProcessor extends AbstractProcessor {
 
     @Override
     protected void init(Context context) {
-        // Seed the emit buffer with this ring's snapshot rows before opening the ring reader, so the source
-        // emits every snapshot row (op r, no source position) ahead of the first cdc change -- the ordering
-        // that keeps a stale snapshot from landing at the sink after a newer change of the same key. A member
-        // with no snapshot buffer bound, or a ring with none buffered (a cdc-only read), seeds nothing and the
-        // source is a pure ring tail. The rows are drained once here, in buffered order, and preserved as-is:
-        // their null source position is what the sink-ack watermark skips, so only cdc positions advance it.
+        // Take what the capture side has already buffered for this ring before opening the ring reader, so
+        // the source emits every snapshot row (op r, no source position) ahead of the first cdc change -- the
+        // ordering that keeps a stale snapshot from landing at the sink after a newer change of the same key.
+        // A member with no buffer bound, or a ring with none buffered, takes nothing here and is a pure ring
+        // tail. Rows are preserved as-is: a null source position is what the sink-ack watermark skips.
         // This is a streaming source: it assumes a cdc tail follows the snapshot. A snapshot-only read (no
         // tail, a bounded source that emits the buffer then completes rather than tailing an empty ring) is a
         // later increment; it is not driven through this vertex yet.
+        //
+        // The reference is kept, not just read: the buffer is looked at again on every pass, because a tail
+        // with the shared ring switched off never stops appending to it.
         Object bound = context.hazelcastInstance().getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY);
-        if (bound instanceof SnapshotBuffer buffer) {
-            pending.addAll(buffer.drain(ringName));
-        }
-        // Rows to emit means a bound to promise once they have left. A source seeded with none owes nothing:
-        // there is no snapshot of this table in this run for a sink to be waiting on.
-        snapshotBoundDue = !pending.isEmpty();
+        buffered = bound instanceof SnapshotBuffer resolved ? resolved : null;
+        drainBuffered();
         Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
         SrsRingbuffer ring = new SrsRingbuffer(rb);
         reader = SrsRingReader.from(ring, start, publisherFactory.resolve(context.hazelcastInstance()));
@@ -113,6 +119,8 @@ public final class SrsSourceProcessor extends AbstractProcessor {
                 return false;
             }
         }
+        // Whatever the capture has handed over since the last pass, ahead of the ring as always.
+        drainBuffered();
         // The ring's sequence pairs with the generation this reader runs under to give each change its
         // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
         // again, so a change of the new ring would otherwise read as older than one of the ring before it.
@@ -128,6 +136,34 @@ public final class SrsSourceProcessor extends AbstractProcessor {
         // A streaming source never completes: on an empty ring it returns having emitted nothing and, being
         // non-cooperative, its worker backs off before the next call rather than spinning.
         return false;
+    }
+
+    /**
+     * Takes whatever the capture side has buffered for this ring since the last look, in buffered order.
+     *
+     * <p>What a drained item counts as depends on the position it carries, and the two cases are not
+     * interchangeable. A change carrying an order of its own counts as read, exactly as one off the ring
+     * does, so the bound this source promises comes to cover it -- without that, a tail running with the
+     * ring switched off emits changes no bound ever reaches, no sink ever confirms, and nothing ever
+     * records, which is the same silence seen one layer down. A snapshot row does not: every row of one
+     * snapshot carries the same reserved position, so the bound closing them is promised on its own once
+     * they have all left.
+     */
+    private void drainBuffered() {
+        if (buffered == null) {
+            return;
+        }
+        for (Envelope row : buffered.drain(ringName)) {
+            pending.add(row);
+            ChainPosition at = row.position();
+            if (at == null || at.order() == null || at.order().seq() == SourceOrder.SNAPSHOT_SEQ) {
+                // Rows to emit means a bound to promise once they have left. A source that took none owes
+                // nothing: there is no snapshot of this table in this run for a sink to be waiting on.
+                snapshotBoundDue = true;
+            } else {
+                read = at.order();
+            }
+        }
     }
 
     /**

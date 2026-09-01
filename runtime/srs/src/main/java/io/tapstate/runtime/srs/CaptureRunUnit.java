@@ -2,7 +2,9 @@ package io.tapstate.runtime.srs;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.pipeline.StreamSource;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
@@ -19,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import java.util.function.LongConsumer;
@@ -31,8 +34,13 @@ import java.util.function.Supplier;
  *
  * <p>The dispatch is driven entirely by the plan (read mode x {@code srs.enabled}): a snapshot phase drains
  * straight to the pass-through sink; a shared-ring tail provisions the mining chain, attaches the consumer,
- * writes the change ring and exposes a Jet source over it; an srs-disabled tail streams straight to the one
- * consumer with no ring or coordinator. See {@link #start} for the exact ordering.
+ * writes the change ring and exposes a Jet source over it; an srs-disabled tail provisions and attaches the
+ * same way and streams straight to the one consumer, with no ring. See {@link #start} for the exact ordering.
+ *
+ * <p><strong>{@code srs.enabled} decides the buffering and nothing else.</strong> Any tail opens the chain
+ * and keeps its durable record, so where a tail resumes from does not depend on the flag: a pipeline that
+ * turns the buffering off keeps the position it had, and one that turns it back on finds it still there.
+ * The alternative is a second account to move a position between, and the move is the step that loses one.
  *
  * <p>A shared-ring run reads every configured stream through one connector subscription and routes each
  * stream into its own per-table ring. Where the tail begins and what position each change carries are the
@@ -72,13 +80,14 @@ public final class CaptureRunUnit {
      * a handle on the assembled pieces. The steps run in a fixed order so the meta preconditions hold:
      *
      * <ol>
-     *   <li>a shared-ring tail provisions the mining chain first, seeding its meta — the precondition for
-     *       recording the cdc-start position;</li>
+     *   <li>a tail — buffered or direct — provisions the mining chain first, seeding its meta: the
+     *       precondition for recording the cdc-start position, and for resuming at one;</li>
      *   <li>the snapshot phase drains to the pass-through sink: on a shared-ring run it records the cdc-start
      *       position at the seam and marks each selected table's snapshot complete once drained, otherwise it
      *       is a pure drain with no chain to position or mark;</li>
      *   <li>a shared-ring tail then attaches the consumer, runs the cdc phase into the change ring, and
-     *       exposes the Jet source; an srs-disabled tail instead streams straight to the pass-through sink.</li>
+     *       exposes the Jet source; an srs-disabled tail attaches the same consumer and streams straight to
+     *       the pass-through sink. Both begin where the durable record says.</li>
      * </ol>
      */
     public CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough) {
@@ -97,7 +106,10 @@ public final class CaptureRunUnit {
             throw new IllegalArgumentException("capture config must select at least one stream");
         }
         try {
-            if (plan.sharedRing()) {
+            // Any tail opens the chain, buffered or not. The flag chooses whether changes go through the
+            // shared ring; it does not choose whether this source has a durable record, because that record
+            // is what the next run reads to know where to start -- a question the flag has no bearing on.
+            if (plan.tail()) {
                 chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
                 ProvisionOutcome provisioned = coordinator
                         .provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
@@ -164,14 +176,25 @@ public final class CaptureRunUnit {
                 ringSource = Optional.of(SrsRingSource.create(
                         firstRing, spec.startFrom(), readCursorPublisher(cid, spec.pipelineId(), firstTable)));
             } else if (plan.directTail()) {
-                // srs.enabled:false: the tail streams straight to the consumer, with no shared ring,
-                // no coordinator chain and no durable meta -- the lightweight direct path.
-                // This path keeps no durable record at all -- no chain, no meta -- so there is nothing here
-                // to resume from and the run says present() because that is the truth of it, not because a
-                // start was left unsaid. Positions still arrive with the changes; nobody on this path has
-                // anywhere to put them yet.
-                subscription = Optional.of(port.cdc(spec.config(), CaptureStart.present(),
-                        health.recording((events, position) -> events.forEach(passthrough))));
+                // srs.enabled:false: the tail streams straight to the consumer with no shared ring. The ring
+                // is the whole of what the flag decides -- the chain is open and its record is kept either
+                // way -- so this tail begins where that record says, exactly as a buffered one does. Taking
+                // the present here instead is a silent loss: the tail comes up healthy and every change
+                // between where it had reached and now is gone.
+                //
+                // It attaches as a consumer for the same reason a buffered tail does: it is using the chain,
+                // and a teardown that could not see it would tear the chain out from under a live reader.
+                coordinator.attachConsumer(chainId, spec.pipelineId());
+                consumerAttached = true;
+                String directChain = chainId.value();
+                long directEpoch = epoch;
+                Supplier<Collection<ConsumerOffset>> directConsumers =
+                        () -> meta.read(directChain).map(SrsMeta::consumerOffsets).orElse(List.of());
+                AtomicLong forwarded = new AtomicLong();
+                subscription = Optional.of(port.cdc(spec.config(), tailStart(meta, directChain),
+                        health.recording((events, position) -> forwardDirect(
+                                events, position, directChain, directEpoch, forwarded,
+                                directConsumers, passthrough))));
             }
 
             return new CaptureRun(
@@ -184,6 +207,57 @@ public final class CaptureRunUnit {
             }
             throw failure;
         }
+    }
+
+    /**
+     * Forwards one run of changes straight to the consumer and records how far the source has been read.
+     *
+     * <p>Each change is stamped with its order before it leaves. A direct tail has no ring, and a buffered
+     * change takes its order from the ring's sequence, so the count of changes this run has forwarded
+     * stands in for it: monotonic within the generation the chain opened, and taken afresh whenever a new
+     * one is. Leaving the order off is not the neutral choice it looks like -- every node that ranks
+     * positions drops one carrying none, so an unstamped tail is one nothing downstream can ever confirm,
+     * and an account nothing confirms never moves.
+     *
+     * <p><strong>A forwarded count and a ring sequence are not the same quantity.</strong> A chain read
+     * both ways at once therefore has two consumers counting differently, and the only thing ever done
+     * with the two is to take the lower: the chain reads as the slower of them, which re-mines more than
+     * it has to and can never skip. That direction is the one that cannot lose data, which is why the
+     * mismatch is affordable and worth saying out loud.
+     *
+     * <p>The position the source named for the run rides with the change that closes it and no other,
+     * exactly as it does through the ring. Carried on the earlier ones it would say of each that the source
+     * had already read past the last, and a run interrupted between them would resume past changes never
+     * delivered.
+     *
+     * <p>The offset then advances, clamped so it never passes what a consumer has durably landed. A direct
+     * tail buffers nothing, so a change it forwarded that no sink wrote is gone with the process; an offset
+     * that had passed it would step over it on the way back, and nothing would ever fetch it again.
+     */
+    private void forwardDirect(
+            List<Envelope> events,
+            Optional<SourcePosition> position,
+            String miningChainId,
+            long epoch,
+            AtomicLong forwarded,
+            Supplier<Collection<ConsumerOffset>> consumers,
+            Consumer<Envelope> passthrough) {
+        if (events.isEmpty()) {
+            // The source handed over only events carrying no change -- a heartbeat and its like. There is
+            // nothing to forward, and nothing has been read past, so the offset does not move either.
+            return;
+        }
+        int last = events.size() - 1;
+        String token = position.map(SourcePosition::token).orElse(null);
+        long closingSeq = -1;
+        for (int i = 0; i < events.size(); i++) {
+            closingSeq = forwarded.getAndIncrement();
+            passthrough.accept(events.get(i).withPosition(
+                    new ChainPosition(new SourceOrder(epoch, closingSeq), i == last ? token : null)));
+        }
+        ChainPosition read = new ChainPosition(new SourceOrder(epoch, closingSeq), token);
+        SrsDurableFrontier.safeAdvance(read, consumers.get())
+                .ifPresent(safe -> meta.advanceSourceReadOffset(miningChainId, safe));
     }
 
     private RuntimeException rollbackStartFailure(

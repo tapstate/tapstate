@@ -55,6 +55,24 @@ class SrsDurableFrontierTest {
         assertThat(SrsDurableFrontier.safeAdvance(at(10), consumers)).isEmpty();
     }
 
+    /**
+     * A consumer whose acked position carries no order is refused by name, not ranked.
+     *
+     * <p>An absent order cannot reach here from anything legitimate: every path that records one supplies
+     * it. So this is a wiring defect upstream, and the two ways it could pass quietly are both worse than
+     * a crash -- dereferenced, it dies two frames down naming nothing; treated as "acked nothing", it
+     * pins the whole chain's offset forever and looks exactly like a slow consumer.
+     */
+    @Test
+    void refusesAConsumerPositionCarryingNoOrderRatherThanRankingIt() {
+        List<ConsumerOffset> consumers = List.of(acked("p1", new ChainPosition(null, "w5")));
+
+        assertThatThrownBy(() -> SrsDurableFrontier.safeAdvance(at(10), consumers))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("p1")
+                .hasMessageContaining("cannot be ranked");
+    }
+
     @Test
     void refusesToAdvanceWhenThereAreNoConsumers() {
         // No consumer holds the data durably yet -> nothing is safe to advance past.

@@ -10,6 +10,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -261,21 +262,133 @@ class CaptureRunUnitTest {
     }
 
     @Test
-    void srsDisabledStreamsTheTailStraightToThePassthroughWithNoChainOrRing() {
+    void srsDisabledStreamsTheTailStraightToThePassthroughWithNoRingButKeepsTheRecord() {
         InMemoryMeta meta = new InMemoryMeta();
         FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
         List<Envelope> passthrough = new ArrayList<>();
 
         CaptureRun run = runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false), passthrough::add);
 
-        // srs.enabled:false is the lightweight direct path: the cdc tail streams straight to the single
-        // consumer with no shared ring, no coordinator chain, and no durable meta.
+        // srs.enabled:false is the direct path: the cdc tail streams straight to the single consumer with
+        // no shared ring. What the flag does not turn off is the account -- the chain is opened and its
+        // durable record seeded, because that record is what the run after this one starts from.
         assertThat(passthrough).extracting(e -> e.after().get("id")).containsExactly(10, 11);
-        assertThat(run.chainId()).isEmpty();
         assertThat(run.ringSource()).isEmpty();
         assertThat(run.cdcSubscription()).isPresent();
         assertThat(port.cdcStarted).isTrue();
-        assertThat(meta.created).isEmpty();
+        assertThat(run.chainId()).isPresent();
+        assertThat(meta.created).containsExactly(run.chainId().orElseThrow().value());
+    }
+
+    /**
+     * A direct tail -- {@code srs.enabled:false} -- begins where the durable record says, exactly as a
+     * shared-ring tail does.
+     *
+     * <p>{@code srs.enabled} chooses whether the tail is buffered through the shared replay ring. It does
+     * not choose whether the position is written down: the position never lived in the ring, so a pipeline
+     * that turns the buffering off keeps the position it had, and one that turns it back on finds it still
+     * there. That symmetry is the whole reason nothing has to be migrated when the flag changes -- there is
+     * no second account to move a position into, and a move is the step that loses one.
+     *
+     * <p>Taking the present here instead is the silent loss this exists to prevent: the tail comes up
+     * healthy, reports healthy, and every change between where it had reached and now is simply gone.
+     */
+    @Test
+    void aDirectTailBeginsWhereTheRecordSaysRatherThanAtThePresent() {
+        InMemoryMeta meta = new InMemoryMeta();
+        MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-resume");
+        meta.create(chainId.value(), null);
+        meta.advanceSourceReadOffset(chainId.value(), new ChainPosition(new SourceOrder(1L, 7L), "src-11"));
+
+        FakeSource port = new FakeSource(List.of(), List.of(change(12)));
+        CaptureRun run = runUnit(port, meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-resume"), e -> { });
+
+        assertThat(port.cdcStart)
+                .as("the direct tail picks up at the recorded position, not at the source's present moment")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
+        assertThat(run.chainId())
+                .as("the chain is there either way -- srs.enabled only decides the buffering")
+                .contains(chainId);
+        assertThat(run.ringSource())
+                .as("no ring: that half of it does follow the flag")
+                .isEmpty();
+    }
+
+    /**
+     * A direct tail writes down how far the source has been read, into the same account a buffered tail
+     * keeps. That account is the whole point of keeping the chain when the ring is off: without it the run
+     * after this one has nothing to start from and takes the present, losing everything in between.
+     *
+     * <p>The offset only ever moves to a position a consumer has durably landed. Reading is not writing,
+     * and an offset that ran ahead of the sink would skip, on the way back, changes no sink ever took. A
+     * sink confirmation is therefore stood in for here, high enough that the clamp is not what this case
+     * measures; the case below measures the clamp itself.
+     */
+    @Test
+    void aDirectTailRecordsHowFarTheSourceHasBeenReadOnceASinkHasLandedIt() {
+        InMemoryMeta meta = new InMemoryMeta();
+        MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-offset");
+        meta.create(chainId.value(), null);
+        meta.advanceSinkAcked(chainId.value(), "pipe-1",
+                new ChainPosition(new SourceOrder(Long.MAX_VALUE, Long.MAX_VALUE), "landed"));
+
+        FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
+        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-offset"), e -> { });
+
+        assertThat(meta.read(chainId.value()).orElseThrow().sourceReadOffset())
+                .as("the direct tail wrote down where it read to, in the account a buffered tail also keeps")
+                .isEqualTo("src-11");
+    }
+
+    /**
+     * The case above with its stand-in removed: no consumer has landed anything, so nothing is written down.
+     *
+     * <p>The two are one rule seen from both sides, and only together do they discriminate. An offset is a
+     * claim that everything below it is safely out of the source's reach -- true only once a sink has taken
+     * it, because the direct tail buffers nothing and a change it forwarded but nobody wrote is gone the
+     * moment the process is. An implementation that recorded the read unconditionally passes the case above
+     * and fails here, which is the only place that difference is visible.
+     */
+    @Test
+    void aDirectTailRecordsNothingWhileNoSinkHasLandedAnything() {
+        InMemoryMeta meta = new InMemoryMeta();
+        MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-unacked");
+
+        FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
+        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-unacked"), e -> { });
+
+        assertThat(meta.read(chainId.value()).orElseThrow().sourceReadOffset())
+                .as("read is not written: an offset ahead of the sink would skip changes on the way back")
+                .isNull();
+    }
+
+    /**
+     * A direct tail stamps each change with an order, so a sink downstream can rank and ack it.
+     *
+     * <p>A direct tail has no ring, and the ring's sequence is where a buffered change's order comes from.
+     * Leaving the order off is not the neutral choice it looks like: every downstream that ranks positions
+     * drops one that carries none, so an unstamped direct tail is one nothing can ever confirm, and an
+     * account nothing confirms never advances. The count of changes this run has forwarded is the sequence
+     * instead -- monotonic within the generation, exactly like the ring's, and taken afresh with each new
+     * generation the chain opens.
+     */
+    @Test
+    void aDirectTailStampsEachChangeWithAnOrderSoASinkCanRankIt() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
+        List<Envelope> passthrough = new ArrayList<>();
+
+        CaptureRun run = runUnit(port, meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-order"), passthrough::add);
+
+        long epoch = meta.read(run.chainId().orElseThrow().value()).orElseThrow().epoch();
+        assertThat(passthrough).extracting(e -> e.position().order())
+                .as("each change is ordered within the generation the chain opened for this run")
+                .containsExactly(new SourceOrder(epoch, 0L), new SourceOrder(epoch, 1L));
+        assertThat(passthrough).extracting(e -> e.position().token())
+                .as("the token the source named for a run rides with the change that closes it")
+                .containsExactly("src-10", "src-11");
     }
 
     @Test

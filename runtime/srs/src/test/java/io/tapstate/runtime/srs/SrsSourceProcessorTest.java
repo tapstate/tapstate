@@ -362,6 +362,37 @@ class SrsSourceProcessorTest {
      * Everything the recording vertex is handed, changes and bounds alike, lands in {@link #SEEN} in the
      * order it arrived - which is what "a bound never overtakes the changes it covers" is a claim about.
      */
+    /**
+     * The source keeps taking what the capture buffers for it, not only what was there when it started.
+     *
+     * <p>An srs-disabled tail has no ring anyone fills: this buffer is the only channel its changes travel
+     * on, and the capture keeps appending to it for as long as the pipeline runs. A source that looked at
+     * the buffer once, as it initialized, delivers whatever burst happened to be there and strands every
+     * change after it -- in a member-local queue nothing drains again, with the job still RUNNING, nothing
+     * thrown and the tail reporting healthy. Measured before this held: the row appended after start never
+     * arrived and was still sitting in the buffer.
+     *
+     * <p>The first row is awaited before the second is appended, so the second is known to have been added
+     * after the drain at init rather than racing it -- which is the whole of what this case is about.
+     */
+    @Test
+    void keeps_taking_what_the_capture_buffers_after_it_has_started() throws InterruptedException {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.append("srs.chain.late", snapshotRow(100));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        com.hazelcast.jet.Job job =
+                hz.getJet().newJob(recordingDag("srs.chain.late", "orders", "out-late", 1024));
+        try {
+            awaitSize(hz.getList("out-late"), 1);
+            buffer.append("srs.chain.late", snapshotRow(101));
+            awaitSize(hz.getList("out-late"), 2);
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-late").destroy();
+        }
+    }
+
     private static void runRecordingBounds(String ringName, String src, String sinkName, int size, int queueSize,
             String bound) throws InterruptedException {
         Job job = hz.getJet().newJob(recordingDag(ringName, src, sinkName, queueSize));
