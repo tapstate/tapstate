@@ -72,7 +72,11 @@ final class TuiDashboard {
         }
 
         static Prompt text(String question, String input, String hint, boolean secret) {
-            return new Prompt(question, input, hint, secret, List.of(), 0, List.of());
+            String safeInput = input == null ? "" : input;
+            if (secret) {
+                safeInput = "•".repeat(safeInput.codePointCount(0, safeInput.length()));
+            }
+            return new Prompt(question, safeInput, hint, secret, List.of(), 0, List.of());
         }
 
         static Prompt choice(String question, List<String> options, int selectedIndex) {
@@ -236,8 +240,7 @@ final class TuiDashboard {
             rows.add(row(notice, width));
         } else {
             Prompt prompt = state.prompt();
-            String promptInput = prompt.secret() ? "•".repeat(prompt.input().codePointCount(0, prompt.input().length()))
-                    : prompt.input();
+            String promptInput = prompt.input();
             rows.add(row("[PROMPT] " + prompt.question(), width));
             rows.add(row("> " + promptInput + (prompt.hint().isBlank() ? "" : "  " + prompt.hint()), width));
         }

@@ -63,10 +63,15 @@ class TuiDashboardTest {
 
     @Test
     void rendersASecretPromptWithoutEchoingItsValue() {
+        TuiDashboard.Prompt prompt = TuiDashboard.Prompt.text("Password", "hunter2", "Enter submit", true);
+
+        assertThat(prompt.input()).isEqualTo("•••••••");
+        assertThat(prompt.input()).doesNotContain("hunter2");
+
         List<AttributedString> lines = dashboard.render(
                 new TuiDashboard.State(Path.of("orders"), "dev", "alice",
                         TuiDashboard.Connection.ONLINE, "ready", "", List.of(), 0,
-                        TuiDashboard.Prompt.text("Password", "hunter2", "Enter submit", true)), 72, 14);
+                        prompt), 72, 14);
 
         assertThat(lines.stream().map(AttributedString::toString).toList())
                 .anyMatch(line -> line.contains("[PROMPT] Password"))

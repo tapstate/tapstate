@@ -20,4 +20,16 @@ class TuiPrompterTest {
         assertThat(prompter.choose("Mode", List.of("first", "last"))).isEqualTo("first");
         assertThat(prompter.lines("Body")).isEqualTo("line one\nline two");
     }
+
+    @Test
+    void supportsADedicatedSecretProviderWithoutChangingOtherPromptContracts() {
+        TuiPrompter prompter = new TuiPrompter(
+                (question, defaultValue, secret) -> "text",
+                question -> "password-from-sheet",
+                (question, options) -> options.getFirst(),
+                question -> "lines");
+
+        assertThat(prompter.ask("Username", null)).isEqualTo("text");
+        assertThat(prompter.secret("Password")).isEqualTo("password-from-sheet");
+    }
 }

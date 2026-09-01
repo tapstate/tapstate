@@ -18,6 +18,11 @@ final class TuiPrompter implements Prompter {
     }
 
     @FunctionalInterface
+    interface SecretPrompt {
+        String read(String question);
+    }
+
+    @FunctionalInterface
     interface ChoicePrompt {
         String choose(String question, List<String> options);
     }
@@ -28,6 +33,7 @@ final class TuiPrompter implements Prompter {
     }
 
     private final TextPrompt textPrompt;
+    private final SecretPrompt secretPrompt;
     private final ChoicePrompt choicePrompt;
     private final LinesPrompt linesPrompt;
 
@@ -38,7 +44,13 @@ final class TuiPrompter implements Prompter {
     }
 
     TuiPrompter(TextPrompt textPrompt, ChoicePrompt choicePrompt, LinesPrompt linesPrompt) {
+        this(textPrompt, question -> textPrompt.read(question, "", true), choicePrompt, linesPrompt);
+    }
+
+    TuiPrompter(TextPrompt textPrompt, SecretPrompt secretPrompt, ChoicePrompt choicePrompt,
+                LinesPrompt linesPrompt) {
         this.textPrompt = Objects.requireNonNull(textPrompt, "textPrompt");
+        this.secretPrompt = Objects.requireNonNull(secretPrompt, "secretPrompt");
         this.choicePrompt = Objects.requireNonNull(choicePrompt, "choicePrompt");
         this.linesPrompt = Objects.requireNonNull(linesPrompt, "linesPrompt");
     }
@@ -50,7 +62,7 @@ final class TuiPrompter implements Prompter {
 
     @Override
     public String secret(String question) {
-        return textPrompt.read(question, "", true);
+        return secretPrompt.read(question);
     }
 
     @Override
