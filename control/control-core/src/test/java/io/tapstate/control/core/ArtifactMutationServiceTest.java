@@ -621,7 +621,7 @@ class ArtifactMutationServiceTest {
         return new SourceResource(
                 id, null, "mysql",
                 Map.of("host", "localhost", "port", "3306", "database", "orders", "username", "app"),
-                SourceMode.SNAPSHOT, null, null, null, null);
+                SourceMode.SNAPSHOT, null, null, null);
     }
 
     private static PipelineResource pipeline(String id) {
@@ -633,7 +633,7 @@ class ArtifactMutationServiceTest {
     }
 
     private static TransformResource transform(String id) {
-        return new TransformResource(id, null, new TransformBody.Js("function process(r) { return r; }"), null, null);
+        return new TransformResource(id, null, new TransformBody.Js("function process(r) { return r; }"), null);
     }
 
     private static ViewResource view(String id) {

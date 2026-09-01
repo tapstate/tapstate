@@ -198,7 +198,6 @@ final class McpOperationExecutor {
                     config,
                     source.mode(),
                     source.tables(),
-                    source.options(),
                     source.srs(),
                     source.experimental());
             Map<String, Object> body = new LinkedHashMap<>(result.body());

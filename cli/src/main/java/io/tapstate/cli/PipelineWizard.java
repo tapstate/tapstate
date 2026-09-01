@@ -141,13 +141,13 @@ final class PipelineWizard {
 
     private List<SyncElement> askSync() {
         String sink = askSourceRef("Sync to (target source id)", false);
-        return List.of(new SyncElement("sync_1", sink, null, null, null, null));
+        return List.of(new SyncElement("sync_1", sink, null, null, null));
     }
 
     private List<PushElement> askPush() {
         String sink = askSourceRef("Push to (target source id)", false);
         String topic = WizardPrompts.blankToNull(prompter.ask("Topic (blank for none)", null));
-        return List.of(new PushElement("push_1", sink, topic, null, null));
+        return List.of(new PushElement("push_1", sink, topic, null));
     }
 
     private List<QueryElement> askQuery() {
@@ -228,13 +228,13 @@ final class PipelineWizard {
             String prevId = steps.isEmpty() ? null : steps.get(steps.size() - 1).id();
             if (USE.equals(type)) {
                 String def = prompter.choose("Reuse which transform?", reusableTransformIds);
-                steps.add(Step.use(null, def, askFlow(prevId), null));
+                steps.add(Step.use(null, def, askFlow(prevId)));
             } else {
                 String id = askId("Transform id", type + "_" + (steps.size() + 1));
                 FromClause from = askFlow(prevId);
                 TransformBody body = bodyPrompter.askBody(type);
                 if (body != null) {
-                    steps.add(Step.inline(id, from, body, null, null));
+                    steps.add(Step.inline(id, from, body, null));
                 }
             }
         }

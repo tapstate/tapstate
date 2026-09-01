@@ -207,7 +207,7 @@ final class NewCmd implements Callable<Integer> {
     private Resource buildPipelineFromFlags() {
         List<SyncElement> legs = new ArrayList<>();
         for (int i = 0; i < syncTo.size(); i++) {
-            legs.add(new SyncElement("sync_" + (i + 1), syncTo.get(i), null, null, null, null));
+            legs.add(new SyncElement("sync_" + (i + 1), syncTo.get(i), null, null, null));
         }
         ServeBlock serve = new ServeBlock.Inline("serve", FromRef.regex(".*"), legs, null, null);
         return new PipelineResource(id, null, List.copyOf(sources), null, null, serve, null, null);
@@ -255,7 +255,7 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private Resource buildTransformFromFlags() {
-        return new TransformResource(id, null, scaffoldTransformBody(type), null, null);
+        return new TransformResource(id, null, scaffoldTransformBody(type), null);
     }
 
     /**
@@ -378,7 +378,7 @@ final class NewCmd implements Callable<Integer> {
                     "path", "mode"), null);
         }
         Map<String, Object> cfg = new LinkedHashMap<>(config);
-        return new SourceResource(id, null, connector, cfg, mode, null, null, null, null);
+        return new SourceResource(id, null, connector, cfg, mode, null, null, null);
     }
 
     private int emit(Resource resource) throws IOException {

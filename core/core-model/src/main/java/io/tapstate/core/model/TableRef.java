@@ -21,8 +21,8 @@ public sealed interface TableRef {
         return new Regex(pattern);
     }
 
-    static Spec spec(String name, String filter, List<String> pk, Map<String, Object> options) {
-        return new Spec(name, filter, pk, options);
+    static Spec spec(String name, String filter, List<String> pk) {
+        return new Spec(name, filter, pk);
     }
 
     /** Bare table name — literal match, frozen link. */
@@ -52,15 +52,11 @@ public sealed interface TableRef {
             @Doc("CEL row expression that filters which rows of the table are included.")
             String filter,
             @Doc("Primary key column names used to identify rows when the source does not declare one.")
-            List<String> pk,
-            @Doc("Connector-owned extension options.")
-            Map<String, Object> options)
+            List<String> pk)
             implements TableRef {
         public Spec {
             Objects.requireNonNull(name, "name");
             pk = pk == null ? null : List.copyOf(pk);
-            options = options == null ? null
-                    : Collections.unmodifiableMap(new LinkedHashMap<>(options));
         }
     }
 }

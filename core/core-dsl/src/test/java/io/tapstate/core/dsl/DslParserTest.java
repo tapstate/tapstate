@@ -43,9 +43,6 @@ class DslParserTest {
                 .containsEntry("host", "10.20.0.15")
                 .containsEntry("port", 1521)
                 .containsEntry("service_name", "ORCL");
-        // config keys belong to the connector, so they survive verbatim; options are the
-        // engine's own and its vocabulary is empty today, so a source carries none.
-        assertThat(s.options()).isNull();
     }
 
     @Test

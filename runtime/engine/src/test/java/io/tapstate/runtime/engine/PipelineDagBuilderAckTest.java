@@ -85,7 +85,7 @@ class PipelineDagBuilderAckTest {
         PipelineResource pipeline = new PipelineResource(
                 "p", null, List.of("orders_src"), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("orders_src"),
-                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)), null, null),
                 null, null);
 
         DAG dag = PipelineDagBuilder.build(pipeline, bindings(), sinkAck);

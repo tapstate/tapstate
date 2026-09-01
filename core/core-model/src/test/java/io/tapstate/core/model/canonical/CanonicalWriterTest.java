@@ -73,8 +73,7 @@ class CanonicalWriterTest {
             SourceResource src = new SourceResource("src_ora", null, "oracle", config,
                     SourceMode.CDC,
                     List.of(TableRef.literal("ORDERS"), TableRef.literal("ORDER_ITEMS"),
-                            TableRef.literal("CUSTOMERS")),
-                    options, null, null);
+                            TableRef.literal("CUSTOMERS")), null, null);
 
             assertThat(writer.write(src)).isEqualTo("""
                     version: tapstate/v1
@@ -89,9 +88,6 @@ class CanonicalWriterTest {
                       username: cdc_user
                     mode: cdc
                     tables: [ORDERS, ORDER_ITEMS, CUSTOMERS]
-                    options:
-                      heartbeat_interval: 10s
-                      include_ddl: true
                     """);
         }
 
@@ -104,7 +100,7 @@ class CanonicalWriterTest {
             config.put("password", "My_2026");
 
             SourceResource tgt = new SourceResource("tgt_my", null, "mysql", config,
-                    null, null, null, null, null);
+                    null, null, null, null);
 
             assertThat(writer.write(tgt)).isEqualTo("""
                     version: tapstate/v1
@@ -125,7 +121,6 @@ class CanonicalWriterTest {
             SourceResource src = new SourceResource("src_ins", null, "oracle",
                     Map.of("host", "10.20.0.16"), SourceMode.CDC,
                     List.of(TableRef.literal("CUSTOMERS")),
-                    null,
                     new Srs(null, "30d", SrsSchemaEvolution.TRACK, true, null), null);
 
             assertThat(writer.write(src)).isEqualTo("""
@@ -149,8 +144,7 @@ class CanonicalWriterTest {
             // enabled: false is the SRS off switch (default true is omitted). It sits last, after queryable.
             SourceResource off = new SourceResource("src_lite", null, "mysql",
                     Map.of("host", "10.10.0.9"), SourceMode.CDC,
-                    List.of(TableRef.literal("orders")),
-                    null, new Srs(null, null, null, null, false), null);
+                    List.of(TableRef.literal("orders")), new Srs(null, null, null, null, false), null);
 
             assertThat(writer.write(off)).isEqualTo("""
                     version: tapstate/v1
@@ -173,9 +167,8 @@ class CanonicalWriterTest {
             SourceResource src = new SourceResource("src_gh", null, "quickapi",
                     Map.of("base_url", "https://api.github.com", "token", "ghp_a1b2c3d4"),
                     SourceMode.API,
-                    List.of(TableRef.spec("issues", null, List.of("id"), null),
-                            TableRef.spec("pulls", null, List.of("id"), null)),
-                    Map.of("poll_interval", "5m", "cursor", "updated_at"), null, null);
+                    List.of(TableRef.spec("issues", null, List.of("id")),
+                            TableRef.spec("pulls", null, List.of("id"))), null, null);
 
             assertThat(writer.write(src)).isEqualTo("""
                     version: tapstate/v1
@@ -191,9 +184,6 @@ class CanonicalWriterTest {
                         pk: [id]
                       - name: pulls
                         pk: [id]
-                    options:
-                      cursor: updated_at
-                      poll_interval: 5m
                     """);
         }
 
@@ -208,7 +198,7 @@ class CanonicalWriterTest {
             config.put("filter", "deleted == 0");
 
             SourceResource src = new SourceResource("tgt_x", null, "mysql", config,
-                    null, null, null, null, null);
+                    null, null, null, null);
 
             assertThat(writer.write(src)).isEqualTo("""
                     version: tapstate/v1
@@ -230,9 +220,8 @@ class CanonicalWriterTest {
             SourceResource src = new SourceResource("src_mix", null, "mysql",
                     Map.of("host", "10.0.0.1"), SourceMode.CDC,
                     List.of(TableRef.literal("orders"),
-                            TableRef.spec("order_items", "deleted == 0", List.of("id"), null),
-                            TableRef.regex("ORD_.*")),
-                    null, null, null);
+                            TableRef.spec("order_items", "deleted == 0", List.of("id")),
+                            TableRef.regex("ORD_.*")), null, null);
 
             assertThat(writer.write(src)).isEqualTo("""
                     version: tapstate/v1
@@ -259,7 +248,7 @@ class CanonicalWriterTest {
             labels.put("env", "prod");
 
             SourceResource src = new SourceResource("src_m", new Metadata(labels, "demo"),
-                    "mysql", Map.of("host", "10.0.0.1"), null, null, null, null,
+                    "mysql", Map.of("host", "10.0.0.1"), null, null, null,
                     Map.of("wasm_runtime", true));
 
             assertThat(writer.write(src)).isEqualTo("""
@@ -293,7 +282,7 @@ class CanonicalWriterTest {
                             List.of(new SyncElement("my_ods", "tgt_my", WriteMode.UPSERT,
                                     new RenameSpec(Map.of("ORDERS", "ods_orders"),
                                             RenameCase.LOWER, "ods_", null),
-                                    DdlPolicy.APPLY, Map.of("auto_create_table", true))),
+                                    DdlPolicy.APPLY)),
                             null, null),
                     null, null);
 
@@ -322,9 +311,9 @@ class CanonicalWriterTest {
             // explicit (auto-generated step id filter_1), id == use is omitted (§5).
             PipelineResource p = new PipelineResource("crm_pack", null, List.of("src_crm"),
                     List.of(Step.inline("filter_1", FromClause.list(FromRef.literal("customers")),
-                                    new TransformBody.Filter("op != 'd'"), null, null),
+                                    new TransformBody.Filter("op != 'd'"), null),
                             Step.use(null, "mask_pii",
-                                    FromClause.list(FromRef.literal("filter_1")), null)),
+                                    FromClause.list(FromRef.literal("filter_1")))),
                     new ViewBlock.Use(null, "v_cust", FromRef.literal("mask_pii")),
                     new ServeBlock.Use(null, "std_api", FromRef.literal("v_cust")),
                     null, null);
@@ -361,7 +350,7 @@ class CanonicalWriterTest {
 
             PipelineResource p = new PipelineResource("customer_360", null, List.of("src_ins"),
                     List.of(Step.inline("clean", FromClause.list(FromRef.literal("CUSTOMERS")),
-                                    new TransformBody.MapProjection(fields), null, null),
+                                    new TransformBody.MapProjection(fields), null),
                             Step.inline("c360",
                                     FromClause.aliases(Map.of(
                                             "customer", FromRef.literal("clean"),
@@ -377,8 +366,7 @@ class CanonicalWriterTest {
                                                                     Map.of("POLICY_ID", "POLICY_ID"),
                                                                     EmbedAs.ARRAY, "claims",
                                                                     List.of("CLAIM_ID"), null, null,
-                                                                    null)))))),
-                                    null, null)),
+                                                                    null)))))), null)),
                     new ViewBlock.Inline("customer_360", FromRef.literal("c360"), "customer_id",
                             new Storage(new Storage.Hot("1h"),
                                     new Storage.Warm("customer_360", List.of("customer_id")), null),
@@ -452,8 +440,7 @@ class CanonicalWriterTest {
                                     "o", FromRef.literal("orders"))),
                             new TransformBody.Join("duckdb",
                                     "SELECT c.id AS customer_id, count(*) AS order_cnt, sum(o.amount) AS total\n"
-                                            + "FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id\n"),
-                            null, null)),
+                                            + "FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id\n"), null)),
                     new ViewBlock.Inline("cust_stats", FromRef.literal("cust_orders"),
                             "customer_id",
                             new Storage(null, new Storage.Warm("cust_stats", null), null), null),
@@ -490,12 +477,10 @@ class CanonicalWriterTest {
             PipelineResource p = new PipelineResource("kfk2my", null, List.of("src_kfk"),
                     List.of(Step.inline("parse", FromClause.list(FromRef.literal("orders_topic")),
                             new TransformBody.Js(
-                                    "function process(record, ctx) { record.after = JSON.parse(record.after.value); return record; }\n"),
-                            null, null)),
+                                    "function process(record, ctx) { record.after = JSON.parse(record.after.value); return record; }\n"), null)),
                     null,
                     new ServeBlock.Inline(null, FromRef.literal("parse"),
-                            List.of(new SyncElement("my", "tgt_my", WriteMode.APPEND, null, null,
-                                    null)),
+                            List.of(new SyncElement("my", "tgt_my", WriteMode.APPEND, null, null)),
                             null, null),
                     null, null);
 
@@ -526,9 +511,9 @@ class CanonicalWriterTest {
             PipelineResource p = new PipelineResource("my2kfk", null, List.of("src_my"),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.literal("orders"), null, null,
-                            List.of(new PushElement(null, "tgt_kfk", "orders_events", null, null),
+                            List.of(new PushElement(null, "tgt_kfk", "orders_events", null),
                                     new PushElement(null, "tgt_hook", null,
-                                            PushFormat.cel("after"), null))),
+                                            PushFormat.cel("after")))),
                     null, null);
 
             assertThat(writer.write(p)).isEqualTo("""
@@ -553,7 +538,7 @@ class CanonicalWriterTest {
             PipelineResource p = new PipelineResource("p_min", null, List.of("src_a"),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.regex(".*"),
-                            List.of(new SyncElement(null, "tgt_b", null, null, null, null)),
+                            List.of(new SyncElement(null, "tgt_b", null, null, null)),
                             null, null),
                     new Settings(ErrorPolicy.FAIL, 1000, 1, null, ReadMode.SNAPSHOT_AND_CDC, "latest"), null);
 
@@ -574,7 +559,7 @@ class CanonicalWriterTest {
             PipelineResource p = new PipelineResource("p_set", null, List.of("src_a"),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.regex(".*"),
-                            List.of(new SyncElement(null, "tgt_b", null, null, null, null)),
+                            List.of(new SyncElement(null, "tgt_b", null, null, null)),
                             null, null),
                     new Settings(ErrorPolicy.DEAD_LETTER, 1000, 4, "0 2 * * *", null, null), null);
 
@@ -601,7 +586,7 @@ class CanonicalWriterTest {
             PipelineResource p = new PipelineResource("p_read", null, List.of("src_a"),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.regex(".*"),
-                            List.of(new SyncElement(null, "tgt_b", null, null, null, null)),
+                            List.of(new SyncElement(null, "tgt_b", null, null, null)),
                             null, null),
                     new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);
 
@@ -621,16 +606,17 @@ class CanonicalWriterTest {
         }
 
         @Test
-        void writesStepOptionsAfterBodyAndExperimentalLast() {
-            // §3: step key order id, type, from, <body>, options, experimental.
+        void writesStepExperimentalLast() {
+            // §3: step key order id, type, from, <body>, experimental. Options sat between the body
+            // and experimental until the engine's option vocabulary went empty; what the order has
+            // to pin now is that experimental comes last.
             PipelineResource p = new PipelineResource("p_opt", null, List.of("src_a"),
                     List.of(Step.inline("flt", FromClause.list(FromRef.literal("orders")),
                             new TransformBody.Filter("op != 'd'"),
-                            Map.of("error_policy", "dead_letter", "parallelism", 4),
                             Map.of("vectorized", true))),
                     null,
                     new ServeBlock.Inline(null, FromRef.literal("flt"),
-                            List.of(new SyncElement(null, "tgt_b", null, null, null, null)),
+                            List.of(new SyncElement(null, "tgt_b", null, null, null)),
                             null, null),
                     null, null);
 
@@ -644,9 +630,6 @@ class CanonicalWriterTest {
                         type: filter
                         from: [orders]
                         expr: "op != 'd'"
-                        options:
-                          error_policy: dead_letter
-                          parallelism: 4
                         experimental:
                           vectorized: true
                     serve:
@@ -665,7 +648,7 @@ class CanonicalWriterTest {
             // ADR-0016 §14.11 / X19: definition body = pure logic, from is forbidden;
             // drop rule renders as boolean false.
             TransformResource t = new TransformResource("mask_pii", null,
-                    new TransformBody.MapProjection(orderedFields()), null, null);
+                    new TransformBody.MapProjection(orderedFields()), null);
 
             assertThat(writer.write(t)).isEqualTo("""
                     version: tapstate/v1

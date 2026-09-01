@@ -154,13 +154,13 @@ class NestIsolatesSameLevelKeyspacesTest {
         aliases.put("cl", FromRef.literal("claims"));
         aliases.put("o", FromRef.literal("orders"));
         aliases.put("i", FromRef.literal("items"));
-        Step step = Step.inline("customer_doc", FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline("customer_doc", FromClause.aliases(aliases), body, null);
 
         PipelineResource pipeline = new PipelineResource("p", null,
                 List.of("customers", "policies", "claims", "orders", "items"),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("customer_doc"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();

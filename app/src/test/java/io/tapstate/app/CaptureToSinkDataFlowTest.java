@@ -120,14 +120,14 @@ class CaptureToSinkDataFlowTest {
         // that filters to even ids and serves the result to the sink. cdc_only so only the change tail runs.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE_ID, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(TABLE)), null, null, null));
-        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
+                List.of(TableRef.literal(TABLE)), null, null));
+        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SOURCE_ID),
                 List.of(Step.inline("keep_even", io.tapstate.core.model.FromClause.list(FromRef.literal(SOURCE_ID)),
-                        new TransformBody.Filter("after.id % 2 == 0"), null, null)),
+                        new TransformBody.Filter("after.id % 2 == 0"), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("keep_even"),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(

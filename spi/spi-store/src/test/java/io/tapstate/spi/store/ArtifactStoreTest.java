@@ -127,7 +127,7 @@ class ArtifactStoreTest {
 
     private static Resource source(String id, String host) {
         return new SourceResource(id, null, "mysql", Map.of("host", host),
-                null, null, null, null, null);
+                null, null, null, null);
     }
 
     private static String hash(Resource artifact) {

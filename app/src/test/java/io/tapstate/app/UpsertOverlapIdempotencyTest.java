@@ -164,14 +164,14 @@ class UpsertOverlapIdempotencyTest {
     private InMemoryStorePort seedPipelineAndSchema() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE_ID, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(TABLE)), null, null, null));
-        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
+                List.of(TableRef.literal(TABLE)), null, null));
+        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SOURCE_ID),
                 List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
-                        new TransformBody.Filter("true"), null, null)),
+                        new TransformBody.Filter("true"), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("keep_all"),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(

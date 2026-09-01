@@ -41,7 +41,7 @@ class DataBrowserServiceTailTest {
             public Optional<Resource> get(String id) {
                 return id.equals(sourceId)
                         ? Optional.of(new SourceResource(id, null, "mongodb", Map.of("uri", "mongodb://db.local"),
-                                null, null, null, null, null))
+                                null, null, null, null))
                         : Optional.empty();
             }
 

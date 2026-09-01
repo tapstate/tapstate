@@ -29,12 +29,12 @@ class SourceDraftServiceTest {
                 new SourceTableDraft("literal", "orders", null, null, null, null),
                 new SourceTableDraft("regex", null, "order_.*", null, null, null),
                 new SourceTableDraft("spec", "order_items", null, "status == 'OPEN'",
-                        List.of("id"), Map.of("batchSize", 100))),
+                        List.of("id"), null)),
                 null, List.of("password"));
 
         SourceDraftResult result = service().draft(draft);
 
-        assertThat(result.yaml()).contains("orders", "order_.*", "order_items", "batchSize: 100")
+        assertThat(result.yaml()).contains("orders", "order_.*", "order_items")
                 .doesNotContain("password");
     }
 

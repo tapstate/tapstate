@@ -68,7 +68,6 @@ public final class CanonicalWriter {
         if (s.tables() != null) {
             b.put("tables", tables(s.tables()));
         }
-        b.freeMap("options", s.options());
         if (s.srs() != null) {
             b.put("srs", srs(s.srs()));
         }
@@ -109,7 +108,6 @@ public final class CanonicalWriter {
         header(b, t);
         b.scalar("type", t.body().type());
         body(b, t.body());
-        b.freeMap("options", t.options());
         b.freeMap("experimental", t.experimental());
         return b.build();
     }
@@ -164,7 +162,6 @@ public final class CanonicalWriter {
                     e.scalar("name", sp.name());
                     e.expression("filter", sp.filter());
                     e.scalarSeq("pk", sp.pk());
-                    e.freeMap("options", sp.options());
                     items.add(e.build());
                 }
             }
@@ -196,7 +193,6 @@ public final class CanonicalWriter {
                 b.scalar("type", s.body().type());
                 b.put("from", fromClause(s.from()));
                 body(b, s.body());
-                b.freeMap("options", s.options());
                 b.freeMap("experimental", s.experimental());
             }
             case Step.Use u -> {
@@ -205,7 +201,6 @@ public final class CanonicalWriter {
                 }
                 b.scalar("use", u.use());
                 b.put("from", fromClause(u.from()));
-                b.freeMap("options", u.options());
             }
         }
         return b.build();
@@ -390,7 +385,6 @@ public final class CanonicalWriter {
         if (e.ddl() != null && e.ddl() != DdlPolicy.FAIL) {
             b.scalar("ddl", e.ddl().yaml());
         }
-        b.freeMap("options", dropDefault(e.options(), "auto_create_table", Boolean.TRUE));
         return b.build();
     }
 
@@ -419,7 +413,6 @@ public final class CanonicalWriter {
             case null -> {
             }
         }
-        b.freeMap("options", e.options());
         return b.build();
     }
 

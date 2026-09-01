@@ -154,13 +154,13 @@ class NestCascadeAssemblesDeepTreeTest {
         aliases.put("p", FromRef.literal("policies"));
         aliases.put("cl", FromRef.literal("claims"));
         aliases.put("d", FromRef.literal("documents"));
-        Step step = Step.inline("customer_doc", FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline("customer_doc", FromClause.aliases(aliases), body, null);
 
         PipelineResource pipeline = new PipelineResource("p", null,
                 List.of("customers", "policies", "claims", "documents"),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("customer_doc"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();

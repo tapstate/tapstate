@@ -285,11 +285,6 @@
         "format": {
           "description": "Serialization format used to encode each pushed change event.",
           "$ref": "#/$defs/PushFormat"
-        },
-        "options": {
-          "description": "Connector-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -662,11 +657,6 @@
             "$ref": "#/$defs/TableRef"
           }
         },
-        "options": {
-          "description": "Connector-specific source options; the read mode and start position live in pipeline settings.",
-          "type": "object",
-          "additionalProperties": true
-        },
         "srs": {
           "description": "Shared Record Store configuration; only valid on cdc sources.",
           "$ref": "#/$defs/Srs"
@@ -750,11 +740,6 @@
           "description": "The upstream steps or sources this transform reads from.",
           "$ref": "#/$defs/FromClause"
         },
-        "options": {
-          "description": "Transform-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
-        },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",
           "type": "object",
@@ -774,7 +759,7 @@
     },
     "Step.Use": {
       "type": "object",
-      "description": "A reference to a named transform definition; only options may override the referenced body.",
+      "description": "A reference to a named transform definition, used as defined.",
       "properties": {
         "id": {
           "description": "Unique step id within the pipeline; defaults to the referenced transform name.",
@@ -787,11 +772,6 @@
         "from": {
           "description": "The upstream steps or sources this transform reads from.",
           "$ref": "#/$defs/FromClause"
-        },
-        "options": {
-          "description": "Transform-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -893,11 +873,6 @@
           "description": "Policy controlling how schema changes are applied to the target store.",
           "$ref": "#/$defs/DdlPolicy",
           "default": "fail"
-        },
-        "options": {
-          "description": "Connector-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -934,11 +909,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "options": {
-          "description": "Connector-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -1115,11 +1085,6 @@
         "metadata": {
           "description": "Optional labels and free-text description.",
           "$ref": "#/$defs/Metadata"
-        },
-        "options": {
-          "description": "Transform-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",

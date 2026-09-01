@@ -356,11 +356,11 @@ class NestCascadeCostBench {
         }
 
         Step step = Step.inline("doc", FromClause.aliases(aliasRefs),
-                new TransformBody.Nest(null, null, root), null, null);
+                new TransformBody.Nest(null, null, root), null);
         PipelineResource pipeline = new PipelineResource("bench" + depth, null, sourceIds,
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         DagBindings bindings = new DagBindings(

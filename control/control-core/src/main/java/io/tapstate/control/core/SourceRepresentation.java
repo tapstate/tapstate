@@ -67,6 +67,12 @@ public final class SourceRepresentation {
         }
         clearSecrets.forEach(config::remove);
 
+        // Options are the engine's own configuration and its vocabulary is empty today, so the model
+        // has nowhere to put one. Refusing here rather than dropping it silently: a draft that keeps
+        // its options and loses them on the way in would read as accepted and configure nothing.
+        require(draft.options() == null || draft.options().isEmpty(),
+                "options carry no engine option today; remove the field");
+
         return new SourceResource(
                 draft.id(),
                 draft.metadata(),
@@ -74,7 +80,6 @@ public final class SourceRepresentation {
                 SourceDraft.copyJsonMap(config, false),
                 sourceMode(draft.mode()),
                 tableModels(draft.tables()),
-                SourceDraft.copyJsonMap(draft.options(), true),
                 srsModel(draft.srs()),
                 SourceDraft.copyJsonMap(draft.experimental(), true));
     }
@@ -99,7 +104,10 @@ public final class SourceRepresentation {
                 configuredSecrets,
                 source.mode() == null ? null : source.mode().yaml(),
                 tableViews(source.tables()),
-                source.options(),
+                // Always empty rather than absent: the wire contract keeps the field, and the model
+                // has no engine option to put in it. Dropping the key from responses would be an API
+                // change this slice has no business making.
+                Map.of(),
                 srsView(source.srs()),
                 source.experimental(),
                 contentHash);
@@ -201,8 +209,9 @@ public final class SourceRepresentation {
                         "spec tables require name and cannot carry pattern");
                 require(table.pk() == null || table.pk().stream().noneMatch(Objects::isNull),
                         "spec table pk cannot contain null entries");
-                yield TableRef.spec(
-                        table.name(), table.filter(), table.pk(), SourceDraft.copyJsonMap(table.options(), true));
+                require(table.options() == null || table.options().isEmpty(),
+                        "options carry no engine option today; remove the field");
+                yield TableRef.spec(table.name(), table.filter(), table.pk());
             }
             default -> throw malformed("unknown table type: " + table.type());
         };
@@ -220,7 +229,7 @@ public final class SourceRepresentation {
                 case TableRef.Regex regex -> new SourceTableView(
                         "regex", null, regex.pattern(), null, null, null);
                 case TableRef.Spec spec -> new SourceTableView(
-                        "spec", spec.name(), null, spec.filter(), spec.pk(), spec.options());
+                        "spec", spec.name(), null, spec.filter(), spec.pk(), Map.of());
             });
         }
         return List.copyOf(result);

@@ -86,7 +86,7 @@ public final class DslParser {
      * the product, so the vocabulary is empty and each of them is now rejected by name. Adding an
      * engine option means adding a typed component to the owning record and naming it here.
      */
-    private static final Set<String> SOURCE_OPTION_KEYS = Set.of();
+    private static final Set<String> NO_ENGINE_OPTIONS = Set.of();
     private static final Set<String> TABLE_SPEC_KEYS = Set.of("name", "filter", "pk", "options");
     private static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", "options", "experimental");
     private static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", "options");
@@ -141,8 +141,7 @@ public final class DslParser {
 
     private SourceResource source(YamlMap m) {
         m.requireOnly(SOURCE_KEYS);
-        Map<String, Object> options = m.freeMap("options");
-        requireKnownOptions(m, SOURCE_OPTION_KEYS);
+        requireKnownOptions(m, NO_ENGINE_OPTIONS);
         return new SourceResource(
                 idOf(m),
                 metadata(m),
@@ -150,7 +149,6 @@ public final class DslParser {
                 m.freeMap("config"),
                 mode(m, "mode"),
                 tables(m.seq("tables")),
-                options,
                 srs(m.mapping("srs")),
                 m.freeMap("experimental"));
     }
@@ -179,12 +177,13 @@ public final class DslParser {
             } else {
                 YamlMap ts = YamlMap.requireMapping(n, "tables");
                 ts.requireOnly(TABLE_SPEC_KEYS);
+                requireKnownOptions(ts, NO_ENGINE_OPTIONS);
                 // tables[].filter is a source-row CEL predicate bound to source columns (§12),
                 // not the event envelope. Its type environment is the source schema, unknown
                 // offline — so its compile / type-check is deferred to the engine, unlike the
                 // envelope-rooted expressions (filter node / map / push) checked at parse time.
                 refs.add(TableRef.spec(ts.string("name"), ts.string("filter"),
-                        scalarList(ts.seq("pk"), "tables.pk"), ts.freeMap("options")));
+                        scalarList(ts.seq("pk"), "tables.pk")));
             }
         }
         return refs;
@@ -242,12 +241,13 @@ public final class DslParser {
             index++;
             Step step;
             if (n instanceof ScalarNode sc) {
-                step = Step.use(null, sc.getValue(), naturalFrom(prevId, n), null);
+                step = Step.use(null, sc.getValue(), naturalFrom(prevId, n));
             } else {
                 YamlMap s = YamlMap.requireMapping(n, "transforms[" + (index - 1) + "]");
                 if (s.has("use")) {
                     s.requireOnly(STEP_USE_KEYS);
-                    step = Step.use(idOf(s), s.string("use"), fromFlow(s, prevId, n), s.freeMap("options"));
+                    requireKnownOptions(s, NO_ENGINE_OPTIONS);
+                    step = Step.use(idOf(s), s.string("use"), fromFlow(s, prevId, n));
                 } else {
                     step = inlineStep(s, index, prevId, n);
                 }
@@ -273,7 +273,8 @@ public final class DslParser {
         }
         boolean aliased = type.equals("nest") || type.equals("join");
         FromClause from = aliased ? fromAliases(s, at) : fromFlow(s, prevId, at);
-        return Step.inline(id, from, body(type, s), s.freeMap("options"), s.freeMap("experimental"));
+        requireKnownOptions(s, NO_ENGINE_OPTIONS);
+        return Step.inline(id, from, body(type, s), s.freeMap("experimental"));
     }
 
     private static Set<String> payloadKeys(String type) {
@@ -459,14 +460,14 @@ public final class DslParser {
         for (int i = 0; i < items.size(); i++) {
             YamlMap s = YamlMap.requireMapping(items.get(i), pathPrefix + "sync[" + i + "]");
             s.requireOnly(SYNC_KEYS);
+            requireKnownOptions(s, NO_ENGINE_OPTIONS);
             String id = s.string("id");
             out.add(new SyncElement(
                     id != null ? id : "sync_" + (i + 1),     // anonymous sync element -> sync_<N> (2026-06-15)
                     s.string("source"),
                     enumByYaml(WriteMode.values(), WriteMode::yaml, s, "write_mode"),
                     rename(s.mapping("rename")),
-                    enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
-                    s.freeMap("options")));
+                    enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl")));
         }
         return out;
     }
@@ -505,11 +506,12 @@ public final class DslParser {
         for (int i = 0; i < items.size(); i++) {
             YamlMap p = YamlMap.requireMapping(items.get(i), pathPrefix + "push[" + i + "]");
             p.requireOnly(PUSH_KEYS);
+            requireKnownOptions(p, NO_ENGINE_OPTIONS);
             String id = p.string("id");
             out.add(new PushElement(
                     id != null ? id : "push_" + (i + 1),     // anonymous push element -> push_<N> (2026-06-15)
                     p.string("source"), p.string("topic"),
-                    pushFormat(p), p.freeMap("options")));
+                    pushFormat(p)));
         }
         return out;
     }
@@ -565,8 +567,9 @@ public final class DslParser {
         Set<String> allowed = new HashSet<>(TRANSFORM_DEF_KEYS);
         allowed.addAll(payloadKeys(type));
         m.requireOnly(allowed);
+        requireKnownOptions(m, NO_ENGINE_OPTIONS);
         return new TransformResource(
-                idOf(m), metadata(m), body(type, m), m.freeMap("options"), m.freeMap("experimental"));
+                idOf(m), metadata(m), body(type, m), m.freeMap("experimental"));
     }
 
     /** A reusable MDM sink definition (ADR-0016 §7, X19): where/how to materialize, no wiring. */

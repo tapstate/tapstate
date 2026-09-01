@@ -23,13 +23,9 @@ public record SyncElement(
         RenameSpec rename,
         @Doc(value = "Policy controlling how schema changes are applied to the target store.",
                 def = "fail")
-        DdlPolicy ddl,
-        @Doc("Connector-owned extension options.")
-        Map<String, Object> options) {
+        DdlPolicy ddl) {
 
     public SyncElement {
         Objects.requireNonNull(source, "source");
-        options = options == null ? null
-                : Collections.unmodifiableMap(new LinkedHashMap<>(options));
     }
 }

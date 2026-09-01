@@ -29,6 +29,35 @@ class SourceRepresentationTest {
             new SourceRepresentation(TapstateCatalog.load());
 
     @Test
+    void refusesADraftCarryingOptions() {
+        // Options are the engine's own configuration and its vocabulary is empty today, so the model
+        // has nowhere to put one. Refusing beats dropping: a draft that keeps its options through the
+        // API and loses them on the way into the model reads as accepted and configures nothing.
+        SourceDraft draft = new SourceDraft(
+                "orders", null, "mysql", linkedMap("host", "mysql.internal"), "cdc", null,
+                Map.of("readPreference", "secondary"), null, null, List.of());
+
+        assertThatThrownBy(() -> representation.toModel(draft, null))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(error.args()).containsOnlyKeys("reason");
+                });
+    }
+
+    @Test
+    void refusesATableDraftCarryingOptions() {
+        SourceDraft draft = new SourceDraft(
+                "orders", null, "mysql", linkedMap("host", "mysql.internal"), "cdc",
+                List.of(new SourceTableDraft("spec", "customers", null, null, List.of("id"),
+                        Map.of("batch", 100))),
+                null, null, null, List.of());
+
+        assertThatThrownBy(() -> representation.toModel(draft, null))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+    }
+
+    @Test
     void mapsEverySourceFieldAndNormalizesTableAndEnumSpellings() {
         Map<String, Object> nested = new LinkedHashMap<>();
         nested.put("enabled", true);
@@ -53,8 +82,8 @@ class SourceRepresentationTest {
                                 null,
                                 "active == true",
                                 List.of("id"),
-                                Map.of("batch", 100))),
-                Map.of("readPreference", "secondary"),
+                                null)),
+                null,
                 new SourceDraft.SourceSrs(
                         "mysql-primary", "24h", "track", false, true),
                 Map.of("preview", List.of(1, 2, 3)),
@@ -74,9 +103,7 @@ class SourceRepresentationTest {
                 TableRef.spec(
                         "customers",
                         "active == true",
-                        List.of("id"),
-                        Map.of("batch", 100)));
-        assertThat(model.options()).isEqualTo(draft.options());
+                        List.of("id")));
         assertThat(model.srs()).isEqualTo(
                 new Srs("mysql-primary", "24h", SrsSchemaEvolution.TRACK, false, true));
         assertThat(model.experimental()).isEqualTo(draft.experimental());
@@ -89,7 +116,7 @@ class SourceRepresentationTest {
         assertThat(view.tables()).extracting(SourceTableView::type)
                 .containsExactly("literal", "regex", "spec");
         assertThat(view.srs().schemaEvolution()).isEqualTo("track");
-        assertThat(view.options()).isEqualTo(draft.options());
+        assertThat(view.options()).isEmpty();
         assertThat(view.experimental()).isEqualTo(draft.experimental());
         assertThat(view.contentHash()).matches("[0-9a-f]{64}");
     }
@@ -320,7 +347,7 @@ class SourceRepresentationTest {
     private static SourceResource source(String connector, Map<String, Object> config) {
         return new SourceResource(
                 "orders", null, connector, config, SourceMode.SNAPSHOT,
-                null, null, null, null);
+                null, null, null);
     }
 
     private static String hash(SourceResource source) {

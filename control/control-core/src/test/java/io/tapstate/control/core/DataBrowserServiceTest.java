@@ -49,7 +49,7 @@ class DataBrowserServiceTest {
     private static final SourceResource VIEWS = new SourceResource(
             "views", null, "mongodb",
             Map.of("uri", "mongodb://db.local", "database", "shop"),
-            null, null, null, null, null);
+            null, null, null, null);
 
     @Test
     void listsThroughTheProbeOnTheSourcesOwnConnection() {
@@ -537,7 +537,7 @@ class DataBrowserServiceTest {
     private static final SourceResource ON_A_CONNECTOR_THAT_IS_NOT_BROWSABLE = new SourceResource(
             "rows_in_sql", null, "mysql",
             Map.of("host", "db.local", "database", "shop"),
-            null, null, null, null, null);
+            null, null, null, null);
 
     /** A service over a source holding one collection, recording the query its find probe is driven with. */
     private static DataBrowserService finding(AtomicReference<DataBrowserQuery> driven) {

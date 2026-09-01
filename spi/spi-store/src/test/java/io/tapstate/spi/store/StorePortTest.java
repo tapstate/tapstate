@@ -43,7 +43,7 @@ class StorePortTest {
     private static final Instant T1 = Instant.parse("2026-07-03T00:00:01Z");
 
     private static SourceResource source(String id, String connector) {
-        return new SourceResource(id, null, connector, Map.of(), null, null, null, null, null);
+        return new SourceResource(id, null, connector, Map.of(), null, null, null, null);
     }
 
     // --- facade ---

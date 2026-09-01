@@ -241,7 +241,7 @@ class NestOverTwoSourcesDataFlowTest {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source(PARENT_SOURCE, PARENT_TABLE));
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
-        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
+        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
 
         Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
                 null, null, null);
@@ -250,12 +250,12 @@ class NestOverTwoSourcesDataFlowTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("o", FromRef.literal(PARENT_TABLE));
         aliases.put("i", FromRef.literal(CHILD_TABLE));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
 
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE),
                 List.of(step), null,
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
@@ -275,7 +275,7 @@ class NestOverTwoSourcesDataFlowTest {
 
     private static SourceResource source(String id, String table) {
         return new SourceResource(id, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static DiscoveredSourceModel discovered(String connectionId, SourceTable table) {

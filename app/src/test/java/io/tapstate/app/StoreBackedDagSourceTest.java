@@ -317,7 +317,7 @@ class StoreBackedDagSourceTest {
     void expands_a_multi_table_source_into_one_source_vertex_per_table() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
                 "multi", null, List.of("multi_src"), null, null,
@@ -337,7 +337,7 @@ class StoreBackedDagSourceTest {
     void omitted_tables_expand_to_the_latest_discovered_source_schema() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("all_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null, null));
+                SourceMode.CDC, null, null, null));
         store.schemas.save(new DiscoveredSourceModel("all_src", "mysql", 1L, new SourceModel(List.of(
                 new SourceTable("orders", List.of(), List.of(), List.of()),
                 new SourceTable("customers", List.of(), List.of(), List.of())))));
@@ -359,8 +359,7 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("players_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC,
-                List.of(TableRef.literal("Player"), TableRef.literal("PlayerCard"), TableRef.literal("Orders")),
-                null, null, null));
+                List.of(TableRef.literal("Player"), TableRef.literal("PlayerCard"), TableRef.literal("Orders")), null, null));
         store.artifacts().save(connectionSupplier("players_dest"));
         store.artifacts().save(new PipelineResource(
                 "players", null, List.of("players_src"), null, null,
@@ -443,11 +442,11 @@ class StoreBackedDagSourceTest {
 
     private static SourceResource cdcSource(String id, String table) {
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static SourceResource connectionSupplier(String id) {
-        return new SourceResource(id, null, "mysql", Map.of("host", "d"), null, null, null, null, null);
+        return new SourceResource(id, null, "mysql", Map.of("host", "d"), null, null, null, null);
     }
 
     private static ServeBlock serve(FromRef from, SyncElement... sync) {
@@ -455,11 +454,11 @@ class StoreBackedDagSourceTest {
     }
 
     private static SyncElement sync(String id, String source) {
-        return new SyncElement(id, source, null, null, null, null);
+        return new SyncElement(id, source, null, null, null);
     }
 
     private static Step filter(String id, String expr, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null);
     }
 
     /** Persists the source model a production sync start requires before constructing its DAG. */
