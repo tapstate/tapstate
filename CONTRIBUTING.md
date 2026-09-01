@@ -117,7 +117,8 @@ directly.
 
 ### Linking a pull request to its issue
 
-Write **`Refs #123`**, not `Fixes #123`.
+Write **Refs #123**, not `Fixes #123` — bare, without backticks. Inside a code span GitHub does
+not autolink it, so the number stops being clickable.
 
 `Fixes` closes the issue the moment the pull request merges, and one issue is regularly covered by
 more than one pull request, sometimes by more than one person. The first merge would then close work
