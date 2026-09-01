@@ -1,0 +1,140 @@
+name: release-start
+
+# Pin what a release ships, in every repository it ships from, before anything is built.
+#
+# A release used to be one dispatch against whatever `main` happened to be at that moment. That works
+# while a release takes minutes. It stops working the moment a release waits on something outside the
+# build -- a documentation page, a fix, an approval -- because `main` does not wait with it. Measured
+# on 2026-09-01, while 0.4.0 was held up by a documentation issue: 52 commits landed on `main`,
+# including an entire authentication surface. Nothing was blocked and nothing went wrong; the release
+# simply became a different, larger release than the one anyone had looked at.
+#
+# So a release starts here, by fixing a commit. From this point `main` carries on, and what ships is
+# `ws/release-<version>` -- created in tapstate at the commit named below, and in every satellite at
+# its own default branch tip. Fixes for the release land on `main` first and are cherry-picked onto
+# the branch, never the other way round: a fix that is born on a release branch is one somebody has
+# to remember to carry forward, and forgetting leaves no trace until the same bug ships again.
+#
+# What "checks are green" means here is deliberately NOT the release gates. It is the required checks
+# on the default branch -- the ones that say this commit is sound. The release gates ask a different
+# question, "may this go out", and one of them refuses until the documentation for the range has
+# landed. Requiring those to pass before the branch may be created would mean the branch can only be
+# created once the release is already unblocked, which is the exact moment the pin is worthless.
+#
+# Nothing here is irreversible. A branch created against the wrong commit is deleted and made again.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "How big is this release? The version number follows from this and the commit's history."
+        type: choice
+        options: [minor, patch, major]
+        required: true
+      commit:
+        description: "Which commit to pin. Leave empty for the tip of the default branch."
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  pin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: which commit is being pinned
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          want="${{ inputs.commit }}"
+          if [ -z "$want" ]; then
+            want="$(git rev-parse HEAD)"
+          fi
+          sha="$(git rev-parse "$want^{commit}")"
+          # A commit that is not on the default branch has not been through the merge-result build, so
+          # "its checks are green" would be answering about something else.
+          if ! git merge-base --is-ancestor "$sha" origin/${{ github.event.repository.default_branch }}; then
+            echo "$sha is not an ancestor of the default branch; it has not been built as a merge result." >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Pinning $sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: the required checks are green on that commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          bash .github/scripts/checks-on-commit.sh \
+            --sha "${{ steps.sha.outputs.sha }}" \
+            --from-ruleset "${{ github.event.repository.default_branch }}"
+          rc=$?
+          # 3 is "not settled yet", 1 is "something concluded red". They need different answers from a
+          # person, so they are not collapsed into one message here.
+          if [ "$rc" -eq 3 ]; then
+            echo "Checks on this commit have not finished. Wait for them, then dispatch again." >&2
+          elif [ "$rc" -ne 0 ]; then
+            echo "This commit is not green. Pick another, or fix it on the default branch first." >&2
+          fi
+          exit "$rc"
+
+      - name: what version this becomes
+        id: version
+        run: |
+          set -euo pipefail
+          bash .github/scripts/next-version.sh "${{ inputs.bump }}" "${{ steps.sha.outputs.sha }}" \
+            | tee -a "$GITHUB_OUTPUT"
+
+      - name: the satellite token reaches every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Before any branch exists, not after. A token that cannot reach one of them is worth finding
+          # out about while nothing has been created, rather than with three of four repositories pinned.
+          bash .github/scripts/satellites.sh reach | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: pin tapstate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="ws/release-${{ steps.version.outputs.version }}"
+          # An existing branch is refused rather than moved. Moving it is the one operation that would
+          # silently change what a release ships after somebody has already looked at it.
+          if gh api "repos/${{ github.repository }}/git/ref/heads/$branch" >/dev/null 2>&1; then
+            echo "$branch already exists. Delete it if this release is being re-pinned." >&2
+            exit 1
+          fi
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f "ref=refs/heads/$branch" -f "sha=${{ steps.sha.outputs.sha }}" >/dev/null
+          echo "${{ github.repository }}  $branch created at ${{ steps.sha.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: pin every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/satellites.sh branch "${{ steps.version.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: what happens next
+        run: |
+          {
+            echo
+            echo "### Pinned"
+            echo
+            echo "\`ws/release-${{ steps.version.outputs.version }}\` now exists in tapstate and in every satellite."
+            echo "\`main\` is free to carry on; it is no longer what this release ships."
+            echo
+            echo "Fixes for this release land on \`main\` first, then are cherry-picked onto the branch."
+            echo "When the release gates are green on it, dispatch \`release\` with"
+            echo "\`bump=${{ inputs.bump }}\` and \`commit\` set to the branch tip."
+          } >> "$GITHUB_STEP_SUMMARY"
