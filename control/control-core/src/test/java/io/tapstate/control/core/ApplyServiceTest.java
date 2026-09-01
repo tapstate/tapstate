@@ -840,7 +840,6 @@ class ApplyServiceTest {
                       username: cdc_user, password: Ora_2026 }
             mode: cdc
             tables: [ ORDERS, ORDER_ITEMS, CUSTOMERS ]
-            options: { include_ddl: true }
             """;
 
     // The same oracle source with no pipeline referencing it — a standalone resource for batch tests.

@@ -28,7 +28,6 @@ class DslParserTest {
                 config: { host: 10.20.0.15, port: 1521, service_name: ORCL }
                 mode: cdc
                 tables: [ ORDERS, ORDER_ITEMS, CUSTOMERS ]
-                options: { include_ddl: true, heartbeat_interval: 10s }
                 """;
 
         Resource r = parser.parse(yaml);
@@ -44,9 +43,9 @@ class DslParserTest {
                 .containsEntry("host", "10.20.0.15")
                 .containsEntry("port", 1521)
                 .containsEntry("service_name", "ORCL");
-        assertThat(s.options())
-                .containsEntry("include_ddl", true)
-                .containsEntry("heartbeat_interval", "10s");
+        // config keys belong to the connector, so they survive verbatim; options are the
+        // engine's own and its vocabulary is empty today, so a source carries none.
+        assertThat(s.options()).isNull();
     }
 
     @Test
@@ -71,6 +70,33 @@ class DslParserTest {
         assertThat(ex.code()).isEqualTo(DslError.UNKNOWN_FIELD);
         assertThat(ex.path()).isEqualTo("options.snapshot_mode");
         assertThat(ex.args()).containsEntry("field", "snapshot_mode");
+    }
+
+    @Test
+    void rejectsEverySourceOptionKey() {
+        // options is the engine's own configuration, so its keys are a closed vocabulary owned by
+        // the product - not a free map like config, whose keys belong to the connector. No engine
+        // option exists yet: every key that was here had no reader anywhere in the product, so the
+        // vocabulary is empty and any key is unknown. A key that does nothing must say so rather
+        // than be accepted in silence.
+        String yaml = """
+                version: tapstate/v1
+                kind: source
+                id: src_ora
+                connector: oracle
+                config: { host: 10.20.0.15 }
+                mode: cdc
+                tables: [ ORDERS ]
+                options: { include_ddl: true }
+                """;
+
+        Throwable t = catchThrowable(() -> parser.parse(yaml));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.code()).isEqualTo(DslError.UNKNOWN_FIELD);
+        assertThat(ex.path()).isEqualTo("options.include_ddl");
+        assertThat(ex.args()).containsEntry("field", "include_ddl");
     }
 
     @Test

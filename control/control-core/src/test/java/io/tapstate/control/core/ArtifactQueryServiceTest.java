@@ -253,7 +253,6 @@ class ArtifactQueryServiceTest {
                       username: cdc_user, password: Ora_2026 }
             mode: cdc
             tables: [ ORDERS, ORDER_ITEMS, CUSTOMERS ]
-            options: { include_ddl: true }
             """;
 
     private static final String PIPELINE = """

@@ -79,7 +79,14 @@ public final class DslParser {
     // snapshot_mode / start_from moved from source options to pipeline settings (read_mode / start_from).
     // options is otherwise a free connector map, so these two names are rejected explicitly instead of
     // being silently passed through to the connector as no-ops when a stale artifact still carries them.
-    private static final List<String> RELOCATED_SOURCE_OPTIONS = List.of("snapshot_mode", "start_from");
+    /**
+     * The engine options a source accepts. Options are the engine's own configuration, so the key
+     * set is a closed vocabulary the product owns - unlike config, whose keys belong to the
+     * connector and stay free. Every key that used to be accepted here had no reader anywhere in
+     * the product, so the vocabulary is empty and each of them is now rejected by name. Adding an
+     * engine option means adding a typed component to the owning record and naming it here.
+     */
+    private static final Set<String> SOURCE_OPTION_KEYS = Set.of();
     private static final Set<String> TABLE_SPEC_KEYS = Set.of("name", "filter", "pk", "options");
     private static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", "options", "experimental");
     private static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", "options");
@@ -135,7 +142,7 @@ public final class DslParser {
     private SourceResource source(YamlMap m) {
         m.requireOnly(SOURCE_KEYS);
         Map<String, Object> options = m.freeMap("options");
-        rejectRelocatedReadOptions(m, options);
+        requireKnownOptions(m, SOURCE_OPTION_KEYS);
         return new SourceResource(
                 idOf(m),
                 metadata(m),
@@ -148,16 +155,15 @@ public final class DslParser {
                 m.freeMap("experimental"));
     }
 
-    /** Rejects read options that have moved to pipeline settings (read_mode / start_from). */
-    private static void rejectRelocatedReadOptions(YamlMap m, Map<String, Object> options) {
-        if (options == null) {
-            return;
-        }
-        Node optionsNode = m.node("options");
-        for (String key : RELOCATED_SOURCE_OPTIONS) {
-            if (options.containsKey(key)) {
-                throw YamlMap.error(DslError.UNKNOWN_FIELD, "options." + key, optionsNode, Map.of("field", key));
-            }
+    /**
+     * Rejects every option key outside the owner's engine-option vocabulary, the same way
+     * {@code requireOnly} closes the structural keys one level up. An option nothing reads is
+     * worse accepted than rejected: it looks configured and does nothing, and no run reports it.
+     */
+    private static void requireKnownOptions(YamlMap owner, Set<String> allowed) {
+        YamlMap options = owner.mapping("options");
+        if (options != null) {
+            options.requireOnly(allowed);
         }
     }
 

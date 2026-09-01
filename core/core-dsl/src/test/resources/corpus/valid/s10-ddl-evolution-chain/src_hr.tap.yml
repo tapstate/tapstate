@@ -1,5 +1,5 @@
 # ADR-0016 §14.10 — upstream DDL / schema evolution, full five-hop chain in one batch:
-# capture (include_ddl) -> envelope op:ddl -> map passthrough -> srs track / view additive
+# capture -> envelope op:ddl -> map passthrough -> srs track / view additive
 # -> sink apply (X5/X15).
 version: tapstate/v1
 kind: source
@@ -8,5 +8,4 @@ connector: mysql
 config: { host: 10.40.0.7, username: cdc_user, password: Hr_2026 }
 mode: cdc
 tables: [ employees ]
-options: { include_ddl: true }
 srs: { retention: 7d, schema_evolution: track }

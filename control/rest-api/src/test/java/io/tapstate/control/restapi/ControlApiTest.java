@@ -939,7 +939,7 @@ class ControlApiTest {
             config: { host: 10.20.0.15 }
             mode: cdc
             tables: [ ORDERS ]
-            options: { snapshot_mode: initial, include_ddl: true }
+            options: { snapshot_mode: initial }
             """;
 
     private static final String TGT_MY = """
@@ -989,7 +989,6 @@ class ControlApiTest {
                       username: cdc_user, password: Ora_2026 }
             mode: cdc
             tables: [ ORDERS, ORDER_ITEMS, CUSTOMERS ]
-            options: { include_ddl: true }
             """;
 
     private static final String PIPELINE = """

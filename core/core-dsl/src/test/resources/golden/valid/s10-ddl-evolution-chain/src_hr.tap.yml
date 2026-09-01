@@ -8,8 +8,6 @@ config:
   username: cdc_user
 mode: cdc
 tables: [employees]
-options:
-  include_ddl: true
 srs:
   retention: 7d
   schema_evolution: track
