@@ -1,29 +1,36 @@
 name: release-start
 
-# Pin what a release ships, in every repository it ships from, before anything is built.
+# Pin what a release ships, in every repository it ships from, before the expensive part starts.
 #
-# A release used to be one dispatch against whatever `main` happened to be at that moment. That works
-# while a release takes minutes. It stops working the moment a release waits on something outside the
-# build -- a documentation page, a fix, an approval -- because `main` does not wait with it. Measured
-# on 2026-09-01, while 0.4.0 was held up by a documentation issue: 52 commits landed on `main`,
-# including an entire authentication surface. Nothing was blocked and nothing went wrong; the release
-# simply became a different, larger release than the one anyone had looked at.
+# There is exactly one manual step in a release, and it is here: stop merging to the default branch,
+# dispatch this, and start merging again as soon as it reports the branch. Everything this runs is a
+# read -- the conclusions already recorded on the commit, the version implied by its ancestry, the
+# documentation follow-ups for the range, whether the token reaches the satellites -- plus four ref
+# creations. No build, no test, no image. That is deliberate: the freeze is only as long as this
+# workflow, so this workflow does nothing that takes time.
 #
-# So a release starts here, by fixing a commit. From this point `main` carries on, and what ships is
-# `ws/release-<version>` -- created in tapstate at the commit named below, and in every satellite at
-# its own default branch tip. Fixes for the release land on `main` first and are cherry-picked onto
-# the branch, never the other way round: a fix that is born on a release branch is one somebody has
-# to remember to carry forward, and forgetting leaves no trace until the same bug ships again.
+# The heavy half runs afterwards, dispatched against the branch: building four binaries and two image
+# architectures, the release gates, the approval. That is the part a release actually waits on, and
+# it is also the part during which the default branch has to be free -- which it is, because what
+# ships is `ws/release-<version>` from here on and nothing merged after this point is in it.
 #
-# Two preconditions, and they are different in kind. The required checks on the default branch say
-# this commit is sound. The documentation gate says the pages for this release are written and
-# merged -- and that one is here rather than only in the release because the documentation repository
-# is pinned at its default branch tip: start a release before its pages land and the tag cut at the
-# end publishes documentation without them, silently.
+# What this asks of the commit before pinning it, and why each one is here rather than later:
 #
-# What is NOT required here is the rest of the release gates. They ask "may this go out", which is
-# the question the branch exists to let you work towards; requiring all of them would mean the branch
-# may only be created once the release is already unblocked, which is the moment the pin is worthless.
+#   the required checks are green   the commit is sound. Read off what already ran on it; nothing is
+#                                   started here, so a commit whose checks are still running is
+#                                   refused rather than waited for
+#   the documentation has landed    the satellites are pinned at their default branch tips, so a
+#                                   release started before its pages are merged cuts a documentation
+#                                   tag from a commit that predates them -- and that tag is what
+#                                   publishes the documentation
+#
+# What it does NOT ask is the rest of the release gates. They answer "may this go out", which is the
+# question the branch exists to let you work towards, and they need the build this deliberately does
+# not run.
+#
+# Fixes for the release land on `main` first and are cherry-picked onto the branch, never the other
+# way round: a fix born on a release branch is one somebody has to remember to carry forward, and
+# forgetting leaves no trace until the same bug ships again.
 #
 # Nothing here is irreversible. A branch created against the wrong commit is deleted and made again.
 
@@ -143,10 +150,11 @@ jobs:
         run: |
           {
             echo
-            echo "### Pinned"
+            echo "### Pinned — start merging again"
             echo
             echo "\`ws/release-${{ steps.version.outputs.version }}\` now exists in tapstate and in every satellite."
-            echo "\`main\` is free to carry on; it is no longer what this release ships."
+            echo "The freeze is over: \`main\` is free to carry on, and nothing merged from here is in this release."
+            echo "The expensive half runs next, against the branch, and the default branch is not part of it."
             echo
             echo "Fixes for this release land on \`main\` first, then are cherry-picked onto the branch."
             echo "When the release gates are green on it, dispatch \`release\` with"
