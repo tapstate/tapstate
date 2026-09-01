@@ -85,6 +85,35 @@ class AReadSourceDeclaresItsModeTest {
     }
 
     @Test
+    @DisplayName("the missing mode is reported whatever order the batch arrives in")
+    void theDiagnosticDoesNotDependOnWhereTheSourceSitsInTheBatch() {
+        // A modeless source carrying srs satisfies two rules' conditions at once: srs is legal only
+        // for cdc, and a read source must say how it is read. Judged in batch order, whichever
+        // resource came first decided which one the author was told about - and batch order is file
+        // order, so the answer turned on a filename. The missing mode is the earlier fact: the srs
+        // rule is asking what the mode is, of a document that has not said.
+        String withSrs = """
+                version: tapstate/v1
+                kind: source
+                id: src_a
+                connector: mysql
+                config: { host: 10.0.0.1 }
+                srs: { key: k }
+                tables: [ t1 ]
+                """;
+        Resource src = parser.parse(withSrs);
+        Resource tgt = parser.parse(WRITE_TARGET);
+        Resource pipe = parser.parse(pipeline(""));
+
+        for (List<Resource> order : List.of(List.of(src, tgt, pipe), List.of(pipe, tgt, src))) {
+            Throwable thrown = catchThrowable(() -> Workspace.of(order));
+            assertThat(((DslException) thrown).code())
+                    .as("batch order %s", order.stream().map(Resource::id).toList())
+                    .isEqualTo(DslError.MODE_REQUIRED_FOR_READ);
+        }
+    }
+
+    @Test
     @DisplayName("a source nothing reads is not judged")
     void anUnreadSourceIsNotJudged() {
         // A batch is not always a running system: a source declared ahead of the pipeline that will

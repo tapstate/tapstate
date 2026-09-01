@@ -52,6 +52,17 @@ final class ModeRules {
                 sources.put(s.id(), s);
             }
         }
+        // A whole pass of its own, before any rule that reads a mode. Every rule below resolves one,
+        // so a source missing it makes them all answer about a document that has not said enough yet
+        // -- and which of them speaks first would otherwise be decided by where the source happens to
+        // sit in the batch. A modeless source carrying srs reported the srs rule when the source came
+        // first and the missing mode when the pipeline did: the same three documents, two diagnostics,
+        // told apart by filename order.
+        for (Resource r : batch) {
+            if (r instanceof PipelineResource p) {
+                requireModeOnEveryReadSource(p, sources);
+            }
+        }
         for (Resource r : batch) {
             if (r instanceof SourceResource s) {
                 checkSource(s);
@@ -68,7 +79,6 @@ final class ModeRules {
     }
 
     private static void checkPipeline(PipelineResource p, Map<String, SourceResource> sources) {
-        requireModeOnEveryReadSource(p, sources);
         ReadMode readMode = readMode(p);
         boolean referencesStream = referencesMode(p, sources, SourceMode.STREAM);
         boolean referencesCdc = referencesMode(p, sources, SourceMode.CDC);
