@@ -30,6 +30,18 @@ final class LookupProcessor extends AbstractProcessor {
         this.store = Objects.requireNonNull(store, "store");
     }
 
+    /**
+     * Like every other vertex that reaches the state layer, and for the same reason: filing a row is a
+     * call into the map, and a call that waits made on a cooperative thread stops every other vertex
+     * sharing that thread rather than only this one. Cooperative is what a processor is unless it says
+     * otherwise, so saying nothing is the whole of the mistake - and it looks like nothing until some
+     * unrelated pipeline sharing the thread goes quiet.
+     */
+    @Override
+    public boolean isCooperative() {
+        return false;
+    }
+
     @Override
     protected boolean tryProcess(int ordinal, Object item) {
         Envelope event = (Envelope) item;

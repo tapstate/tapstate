@@ -580,16 +580,22 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         }
     }
 
+    /**
+     * How many vertices of its own this tree compiles to, against the limit. A level the document points at
+     * is counted alongside the levels that resolve one: it takes a vertex, and that vertex is not
+     * cooperative either, so it costs a thread by exactly the same measure. Counting only the resolvers
+     * would leave a tree pointing at forty tables paying for forty threads the limit never saw.
+     */
     private static void checkVertexCount(List<Node> all, int limit) {
-        int resolvers = 0;
+        int vertices = 0;
         for (Node node : all) {
-            if (!node.children().isEmpty()) {
-                resolvers++;
+            if (node.referenced() || !node.children().isEmpty()) {
+                vertices++;
             }
         }
-        if (resolvers > limit) {
+        if (vertices > limit) {
             throw new TapstateException(NestError.RESOLVER_VERTEX_LIMIT_EXCEEDED,
-                    Map.of("vertices", resolvers, "limit", limit), null);
+                    Map.of("vertices", vertices, "limit", limit), null);
         }
     }
 

@@ -3,9 +3,12 @@ package io.tapstate.archtests;
 import com.hazelcast.config.IndexConfig;
 import com.hazelcast.config.IndexType;
 import com.hazelcast.config.MapConfig;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.map.IMap;
 import com.tngtech.archunit.core.domain.JavaAccess;
+import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.domain.JavaModifier;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import java.util.LinkedHashMap;
@@ -159,6 +162,26 @@ class NestStateMapGatesTest {
                             + "guarding nothing at all", mechanism)
                     .isNotEmpty();
         });
+    }
+
+    @Test
+    @DisplayName("every nest processor says which kind of thread it runs on")
+    void everyNestProcessorDeclaresWhetherItIsCooperative() {
+        List<String> silent = productionClasses.stream()
+                .filter(type -> type.getName().startsWith(NEST))
+                .filter(type -> type.isAssignableTo(Processor.class))
+                .filter(type -> !type.getModifiers().contains(JavaModifier.ABSTRACT))
+                .filter(type -> type.tryGetMethod("isCooperative").isEmpty())
+                .map(JavaClass::getName)
+                .toList();
+
+        assertThat(silent)
+                .as("a nest processor reaches the state layer, and a call into it waits. Waiting on a "
+                        + "cooperative thread stops every other vertex sharing that thread, not just this "
+                        + "one - and cooperative is what a processor is unless it says otherwise, so the "
+                        + "whole of the mistake is saying nothing. It looks like nothing until some "
+                        + "unrelated pipeline sharing the thread goes quiet. Declare it either way")
+                .isEmpty();
     }
 
     @Test
