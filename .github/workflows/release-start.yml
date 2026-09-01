@@ -15,11 +15,15 @@ name: release-start
 # the branch, never the other way round: a fix that is born on a release branch is one somebody has
 # to remember to carry forward, and forgetting leaves no trace until the same bug ships again.
 #
-# What "checks are green" means here is deliberately NOT the release gates. It is the required checks
-# on the default branch -- the ones that say this commit is sound. The release gates ask a different
-# question, "may this go out", and one of them refuses until the documentation for the range has
-# landed. Requiring those to pass before the branch may be created would mean the branch can only be
-# created once the release is already unblocked, which is the exact moment the pin is worthless.
+# Two preconditions, and they are different in kind. The required checks on the default branch say
+# this commit is sound. The documentation gate says the pages for this release are written and
+# merged -- and that one is here rather than only in the release because the documentation repository
+# is pinned at its default branch tip: start a release before its pages land and the tag cut at the
+# end publishes documentation without them, silently.
+#
+# What is NOT required here is the rest of the release gates. They ask "may this go out", which is
+# the question the branch exists to let you work towards; requiring all of them would mean the branch
+# may only be created once the release is already unblocked, which is the moment the pin is worthless.
 #
 # Nothing here is irreversible. A branch created against the wrong commit is deleted and made again.
 
@@ -67,23 +71,18 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Pinning $sha" >> "$GITHUB_STEP_SUMMARY"
 
+      # Both of the next two let the script's own exit code fail the step. Each explains its refusal
+      # in its own words -- including the difference between a check still running and one that has
+      # concluded red, which need different answers from a person -- and a wrapper here would only
+      # restate that less well, or not at all: the default shell runs with -e, so anything after the
+      # failing line never runs.
       - name: the required checks are green on that commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
-          bash .github/scripts/checks-on-commit.sh \
+          .github/scripts/checks-on-commit.sh \
             --sha "${{ steps.sha.outputs.sha }}" \
             --from-ruleset "${{ github.event.repository.default_branch }}"
-          rc=$?
-          # 3 is "not settled yet", 1 is "something concluded red". They need different answers from a
-          # person, so they are not collapsed into one message here.
-          if [ "$rc" -eq 3 ]; then
-            echo "Checks on this commit have not finished. Wait for them, then dispatch again." >&2
-          elif [ "$rc" -ne 0 ]; then
-            echo "This commit is not green. Pick another, or fix it on the default branch first." >&2
-          fi
-          exit "$rc"
 
       - name: what version this becomes
         id: version
@@ -91,6 +90,21 @@ jobs:
           set -euo pipefail
           bash .github/scripts/next-version.sh "${{ inputs.bump }}" "${{ steps.sha.outputs.sha }}" \
             | tee -a "$GITHUB_OUTPUT"
+
+      # Pinning happens once the work for this release is done, documentation included, and the
+      # documentation repository is pinned at its default branch tip. Start a release before its
+      # pages are merged and that tip predates them: the release goes out, the documentation tag is
+      # cut from the pinned tip, and it publishes a version without the page the release was waiting
+      # for. Nothing about that is visible afterwards, which is why the order is refused here rather
+      # than written down somewhere as an instruction.
+      - name: the documentation for this range has landed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/docs-gate.sh \
+            --base "${{ steps.version.outputs.base }}" \
+            --sha "${{ steps.sha.outputs.sha }}" \
+            --bump "${{ inputs.bump }}"
 
       - name: the satellite token reaches every satellite
         env:
