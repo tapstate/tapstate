@@ -922,6 +922,38 @@ final class ControlPlane {
         return interpretRecordCount(response.statusCode(), response.body(), pipelineId);
     }
 
+    /**
+     * How many rows each selected table's full load has read <em>on the run that is live now</em>, keyed by
+     * table. Empty when the pipeline has no live run.
+     *
+     * <p>The per-run scope is the whole reason a witness reads this rather than the target: a resumed run
+     * that skips a table reports zero for it, while the target still holds every row the earlier run put
+     * there, so the target cannot tell a skipped table from a re-read one. Every selected table appears --
+     * one that was not read reports zero rather than going absent -- so a missing key is a broken reading
+     * and not a table that was skipped.
+     */
+    Map<String, Long> snapshotRowsRead(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Map.of();
+        }
+        if (response.statusCode() != 200) {
+            throw new AssertionError("could not read the snapshot progress of " + pipelineId
+                    + ": expected HTTP 200, got " + response.statusCode() + " - " + response.body());
+        }
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                || !(map.get("snapshot") instanceof Map<?, ?> snapshot)) {
+            throw new AssertionError("snapshot answer carried no snapshot: " + response.body());
+        }
+        Map<String, Long> read = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : snapshot.entrySet()) {
+            if (entry.getValue() instanceof Map<?, ?> table && table.get("rowsDone") instanceof Number done) {
+                read.put(String.valueOf(entry.getKey()), done.longValue());
+            }
+        }
+        return read;
+    }
+
     static Optional<Long> interpretRecordCount(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
             return Optional.empty();

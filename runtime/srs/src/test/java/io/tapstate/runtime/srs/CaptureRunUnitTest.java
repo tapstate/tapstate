@@ -168,6 +168,45 @@ class CaptureRunUnitTest {
                 .isEqualTo(CaptureStart.resume(new SourcePosition("seam-0")));
     }
 
+    /**
+     * The case above with its one stand-in removed: nothing confirms the write, so the table is read again.
+     *
+     * <p>These are the two halves of one rule, and only together do they discriminate. A table is owed
+     * until a sink has confirmed it, which is a different question from whether it was read -- and only the
+     * confirmed one is safe to skip on. A run that took the read for the answer would skip this table on
+     * the way back, and every row of it that has not changed since would be absent from the target for
+     * good: the tail only replays what changed after the seam, so nothing would ever fetch them again.
+     * Nothing thrown, nothing logged.
+     *
+     * <p>Asserted on the assembled run rather than on the snapshot phase alone, which is the whole of why
+     * it is here. The phase's own tests cover the phase; they stay green if the mark is made by whatever
+     * calls it, once the read returns. That is a read-side mark by another name, and this is the reading
+     * that sees it.
+     */
+    @Test
+    void aTableNoSinkConfirmedIsReadAgainByTheRunThatFollows() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(change(10)));
+        CaptureRun firstRun =
+                runUnit(first, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-unacked"), e -> { });
+        String chainId = firstRun.chainId().orElseThrow().value();
+
+        // The read drained every row of the table, and no sink confirmed any of them.
+        assertThat(firstRun.snapshotCount()).isEqualTo(2);
+        assertThat(meta.read(chainId)).get()
+                .extracting(SrsMeta::snapshotCompletedTables)
+                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.list(String.class))
+                .isEmpty();
+
+        FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(change(11)));
+        CaptureRun second = runUnit(restarted, meta)
+                .start(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-unacked"), e -> { });
+
+        assertThat(second.snapshotCount())
+                .as("no sink confirmed the table, so the full load is owed and read again")
+                .isEqualTo(2);
+    }
+
     @Test
     void snapshotAndCdcOverASharedRingProvisionsSnapshotsAttachesAndWritesTheChangeRing() throws Exception {
         InMemoryMeta meta = new InMemoryMeta();

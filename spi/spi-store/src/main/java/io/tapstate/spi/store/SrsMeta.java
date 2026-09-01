@@ -18,7 +18,7 @@ import java.util.List;
  * {@code schemaHistory} (the append-only versioned schema), {@code retention} (the retention
  * configuration passed through from the source; a config value only — the change ring is bounded by
  * its capacity and backpressure, not trimmed by this), {@code snapshotCompletedTables} (the tables
- * whose bounded snapshot read has drained to completion), {@code epoch} (the change ring's current
+ * whose snapshot rows a sink has confirmed), {@code epoch} (the change ring's current
  * generation, zero until one is opened) and {@code snapshotEpoch} (the generation the recorded snapshot
  * began in, zero until a snapshot records its seam).
  *
@@ -35,10 +35,15 @@ import java.util.List;
  * asymmetry is deliberate. A chain is keyed by the physical source coordinate and deliberately excludes
  * the table subset, so sources reading different tables of one database share this record: the cdc tail
  * is one log read with one offset, but each table is snapshotted by its own capture run and finishes at
- * its own time. A chain-level completion flag could not say which table it meant. A table is listed only
- * once its own snapshot has drained — presence means drained, never merely started, which is what
- * {@code cdcStartPosition} means. Membership is a set: marking a table that is already listed changes
- * nothing.
+ * its own time. A chain-level completion flag could not say which table it meant.
+ *
+ * <p>A table is listed once a sink has confirmed its snapshot rows — <em>written</em>, not merely read,
+ * and certainly not merely started, which is what {@code cdcStartPosition} means. The distinction is the
+ * whole value of the field: a table read and never written looks finished to whoever read it, and a run
+ * that skipped it on that basis would leave every row of it that has not changed since absent from the
+ * target for good, because the tail only replays what changed after the seam. So the mark is the sink's
+ * to make and no reader's, and a reader that also made it would be a second voice on the one question it
+ * cannot answer. Membership is a set: marking a table that is already listed changes nothing.
  *
  * <p>The field set is append-only: a field may be added but never removed or repurposed, so an older
  * reader stays forward-compatible. The lists are unmodifiable defensive copies. A pure value over
