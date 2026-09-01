@@ -484,18 +484,31 @@ fi
 
 # --- 13. TUI lifecycle -------------------------------------------------------------------------
 # A native image has a separate reachability surface for JLine terminal resources and shutdown
-# cleanup. Exercise the explicit TUI entry point on a real pseudo-terminal and require the alternate
-# screen to be restored after Ctrl-D exits an empty command bar.
-bold "[13] TUI lifecycle — native alternate screen and cleanup"
-pty_session $'\004' tui
+# cleanup. Exercise the explicit TUI entry point on a real pseudo-terminal with an explicit workspace,
+# then require the alternate screen to be restored after Ctrl-D exits.
+bold "[13] TUI dashboard — native workspace entry and cleanup"
+TUI_WORKSPACE="$STUB_DIR/tui-workspace"
+mkdir -p "$TUI_WORKSPACE/source"
+cat > "$TUI_WORKSPACE/source/src_orders.tap.yml" <<'EOF'
+version: tapstate/v1
+kind: source
+id: src_orders
+connector: mysql
+config: {}
+mode: cdc
+tables: [orders]
+EOF
+pty_session $'\004' tui -w "$TUI_WORKSPACE"
+TUI_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && printf '%s' "$PTY_OUT" | grep -Fq $'\033[?1049h' \
    && printf '%s' "$PTY_OUT" | grep -Fq $'\033[?1049l' \
+   && printf '%s' "$TUI_CLEAN" | grep -Fq "$TUI_WORKSPACE" \
    && { printf '%s' "$PTY_OUT" | grep -Fq $'\033[?25h' \
         || printf '%s' "$PTY_OUT" | grep -Fq $'\033[?12;25h'; }; then
-  ok "native tui entered and restored its alternate screen and cursor"
+  ok "native tui accepted its workspace and restored its alternate screen and cursor"
 else
-  bad "native tui PTY lifecycle failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
+  bad "native tui workspace PTY failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
 fi
 
 # --- summary ------------------------------------------------------------------------------------

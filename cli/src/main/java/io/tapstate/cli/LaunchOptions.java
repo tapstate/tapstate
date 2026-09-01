@@ -165,6 +165,7 @@ final class LaunchOptions {
         options.rejectBlankContext();
         options.rejectBlankMachineToken();
         options.consumeAuthContextAfterAction();
+        options.consumeTuiWorkspaceAfterEntryPoint();
         return options;
     }
 
@@ -210,6 +211,43 @@ final class LaunchOptions {
             }
             if (word.equals("--context")) {
                 throw new IllegalArgumentException("auth --context needs a non-empty name");
+            }
+            remaining.add(word);
+        }
+        command = List.copyOf(remaining);
+    }
+
+    /** Lets the full-screen entry point own its workspace selector, like the other workspace verbs. */
+    private void consumeTuiWorkspaceAfterEntryPoint() {
+        if (command.isEmpty() || !command.getFirst().equals("tui")) {
+            return;
+        }
+        List<String> remaining = new ArrayList<>(command.size());
+        remaining.add("tui");
+        for (int index = 1; index < command.size(); index++) {
+            String word = command.get(index);
+            if (word.equals("-w") || word.equals("--workdir")) {
+                if (index + 1 >= command.size() || command.get(index + 1).startsWith("-")) {
+                    throw new IllegalArgumentException("tui --workdir needs a directory");
+                }
+                workdir = command.get(++index);
+                continue;
+            }
+            if (word.startsWith("--workdir=")) {
+                String value = word.substring("--workdir=".length());
+                if (value.isBlank()) {
+                    throw new IllegalArgumentException("tui --workdir needs a directory");
+                }
+                workdir = value;
+                continue;
+            }
+            if (word.startsWith("-w=") || word.startsWith("-w") && word.length() > 2) {
+                String value = word.startsWith("-w=") ? word.substring(3) : word.substring(2);
+                if (value.isBlank()) {
+                    throw new IllegalArgumentException("tui -w needs a directory");
+                }
+                workdir = value;
+                continue;
             }
             remaining.add(word);
         }

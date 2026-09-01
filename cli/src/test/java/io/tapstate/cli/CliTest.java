@@ -92,6 +92,17 @@ class CliTest {
     }
 
     @Test
+    void tuiAcceptsItsWorkspaceOptionAfterTheEntryPoint() {
+        LaunchOptions launch = LaunchOptions.parse("tui", "-w", "orders-workspace");
+        Run help = run("tui", "--help");
+
+        assertThat(launch.isTui()).isTrue();
+        assertThat(launch.command()).containsExactly("tui");
+        assertThat(launch.root()).isEqualTo(Path.of("orders-workspace"));
+        assertThat(help.out()).contains("-w, --workdir");
+    }
+
+    @Test
     void tuiDoesNotTakeTheOneShotBypassBeforeTheTerminalEntryPoint() {
         assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("tui"))).isFalse();
     }

@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import picocli.CommandLine.Command;
+import picocli.CommandLine.Mixin;
 
 /** The discoverable command specification for the interactive full-screen dashboard. */
 @Command(name = "tui", mixinStandardHelpOptions = true,
@@ -8,6 +9,9 @@ import picocli.CommandLine.Command;
                 "Open the full-screen terminal dashboard.",
                 "Use the command bar to run the same commands as the regular session."})
 final class TuiCmd implements Runnable {
+
+    @Mixin
+    WorkspaceOption workspace;
 
     @Override
     public void run() {
