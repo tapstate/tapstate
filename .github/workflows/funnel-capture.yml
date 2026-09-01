@@ -64,10 +64,38 @@ jobs:
             sed 's/^/  /' probe.err || true
           fi
 
+      # The repository already authenticates a bot this way elsewhere, so an App is the vehicle with
+      # precedent here: no expiry, no personal identity, and Administration:read can be granted to it
+      # without handing anything a broader scope. This step establishes whether that grant is already
+      # in place; if it is not, the run says so and the schedule stays off.
+      - name: probe -- the existing bot App
+        if: env.traffic_token == 'none'
+        id: apptoken
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
+
+      - name: probe -- can the bot App read the traffic API
+        if: env.traffic_token == 'none' && steps.apptoken.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.apptoken.outputs.token }}
+        run: |
+          set -u
+          if gh api "repos/${GITHUB_REPOSITORY}/traffic/clones" >/dev/null 2>probe.err; then
+            echo "RESULT: the bot App CAN read /traffic/clones"
+            echo "traffic_token=app" >> "$GITHUB_ENV"
+          else
+            echo "RESULT: the bot App CANNOT read /traffic/clones"
+            sed 's/^/  /' probe.err || true
+            echo "NEXT: grant the App 'Administration: read' on this repository; nothing else is needed."
+          fi
+
       - name: capture
         if: env.traffic_token != 'none'
         env:
-          GH_TOKEN: ${{ env.traffic_token == 'secret' && secrets.FUNNEL_TRAFFIC_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ env.traffic_token == 'app' && steps.apptoken.outputs.token || (env.traffic_token == 'secret' && secrets.FUNNEL_TRAFFIC_TOKEN || secrets.GITHUB_TOKEN) }}
         run: |
           sh scripts/funnel-capture.sh --store "$RUNNER_TEMP/store"
           sh scripts/funnel-capture.sh --store "$RUNNER_TEMP/store" --gaps
