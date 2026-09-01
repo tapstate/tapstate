@@ -1,6 +1,9 @@
 package io.tapstate.runtime.engine.nest;
 
 import java.io.Serializable;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Where one nest vertex keeps its state between events, one entry per key the vertex is partitioned by.
@@ -14,6 +17,28 @@ public interface NestStore<S> extends Serializable {
 
     /** The state held under {@code key}, or null when this vertex has never seen that key. */
     S load(Object key);
+
+    /**
+     * The states held under {@code keys}, with keys this vertex has never seen simply absent from the
+     * result. Asking for many at once rather than one at a time is the whole point: a document resolving
+     * two hundred references pays one round trip, not two hundred.
+     *
+     * <p><b>An implementation with anything remote behind it must override this.</b> The default loops,
+     * which is free where the state is on the same heap and is exactly the degeneration to avoid where it
+     * is not - and a batch that has quietly become N round trips reads identically to one that has not,
+     * every document still correct, only slower. Nothing but a count of the trips can tell them apart,
+     * which is why one is kept.
+     */
+    default Map<Object, S> loadAll(Collection<Object> keys) {
+        Map<Object, S> loaded = new LinkedHashMap<>();
+        for (Object key : keys) {
+            S state = load(key);
+            if (state != null) {
+                loaded.put(key, state);
+            }
+        }
+        return loaded;
+    }
 
     /** Stores {@code state} under {@code key}, replacing whatever was there. */
     void save(Object key, S state);

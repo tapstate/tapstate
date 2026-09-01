@@ -54,6 +54,13 @@ public final class AssemblerProcessor extends AbstractProcessor {
 
     private final NestVertex vertex;
     private final List<EmbedSlot> slots;
+
+    /**
+     * Where the rows this tree's levels point at are read from, by the namespace the slot naming them
+     * carries. Read only, and read by key only: this vertex never writes an entry of any of them, which is
+     * what lets it reach outside its own partition for one at all.
+     */
+    private final Map<String, NestStore<Map<String, Object>>> referenced;
     private final NestStore<RootAssembly> store;
     private final String outputStream;
     private final Deque<Object> outgoing = new ArrayDeque<>();
@@ -278,6 +285,21 @@ public final class AssemblerProcessor extends AbstractProcessor {
             String outputStream, ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal,
             ReplayFloor floor, NestSettings settings, NestClock clock, NestSendPolicy sending,
             NestStore<ParkedSubtree> parking, NestDeadLetter deadLetter) {
+        this(vertex, slots, store, outputStream, axes, chainsByOrdinal, floor, settings, clock, sending,
+                parking, deadLetter, Map.of());
+    }
+
+    /**
+     * All of the above, with the rows this tree's levels point at reachable through {@code referenced} -
+     * one store per namespace a slot names. Empty for a tree that points at nothing, which is every tree
+     * written before there was a second direction.
+     */
+    public AssemblerProcessor(NestVertex vertex, List<EmbedSlot> slots, NestStore<RootAssembly> store,
+            String outputStream, ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal,
+            ReplayFloor floor, NestSettings settings, NestClock clock, NestSendPolicy sending,
+            NestStore<ParkedSubtree> parking, NestDeadLetter deadLetter,
+            Map<String, NestStore<Map<String, Object>>> referenced) {
+        this.referenced = Map.copyOf(referenced);
         this.parking = parking;
         this.deadLetter = Objects.requireNonNull(deadLetter, "deadLetter");
         this.vertex = Objects.requireNonNull(vertex, "vertex");
@@ -930,9 +952,51 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * nobody and goes on holding the frontier back. The state is stored after that, so what is written down
      * is what is still owed rather than what has just been paid.
      */
+    /**
+     * Fetches the rows every document in this drain points at, one reach per namespace for all of them at
+     * once. Gathered across the whole drain rather than per document: the documents of one drain overlap in
+     * what they point at far more often than not - that is what a reference is - so a shared batch asks for
+     * each row once where a batch per document would ask for a popular one as many times as it appeared.
+     *
+     * <p>A tree that points at nothing does none of this and reaches for nothing, which is what keeps the
+     * cost of the direction that already existed exactly where it was.
+     */
+    private Map<String, Map<Object, Map<String, Object>>> resolveReferences(Map<Object, Touched> touched) {
+        if (referenced.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Set<List<Object>>> needed = new LinkedHashMap<>();
+        for (Touched document : touched.values()) {
+            document.assembly.referencesNeeded(slots).forEach((namespace, keys) ->
+                    needed.computeIfAbsent(namespace, name -> new LinkedHashSet<>()).addAll(keys));
+        }
+        Map<String, Map<Object, Map<String, Object>>> resolved = new LinkedHashMap<>();
+        needed.forEach((namespace, keys) -> {
+            NestStore<Map<String, Object>> store = referenced.get(namespace);
+            if (store == null) {
+                throw new IllegalStateException(
+                        "a slot points at " + namespace + ", which this vertex was given no store for");
+            }
+            resolved.put(namespace, store.loadAll(new LinkedHashSet<>(keys)));
+        });
+        return resolved;
+    }
+
+    /** The rows one document points at, for the places a single document is rendered on its own. */
+    private Map<String, Map<Object, Map<String, Object>>> referencesFor(RootAssembly assembly) {
+        if (referenced.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Map<Object, Map<String, Object>>> resolved = new LinkedHashMap<>();
+        assembly.referencesNeeded(slots).forEach((namespace, keys) ->
+                resolved.put(namespace, referenced.get(namespace).loadAll(new LinkedHashSet<>(keys))));
+        return resolved;
+    }
+
     private void settle(Map<Object, Touched> touched) {
+        Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
         touched.forEach((key, document) -> {
-            document.assembly.render(slots).ifPresentOrElse(
+            document.assembly.render(slots, resolved).ifPresentOrElse(
                     rendered -> {
                         deleted.remove(key);
                         if (isOwedAHandOver(key)) {
@@ -1078,8 +1142,9 @@ public final class AssemblerProcessor extends AbstractProcessor {
                 continue;
             }
             RootAssembly assembly = store.load(entry.getKey());
-            Optional<Map<String, Object>> rendered =
-                    assembly == null ? Optional.empty() : assembly.render(slots);
+            Optional<Map<String, Object>> rendered = assembly == null
+                    ? Optional.empty()
+                    : assembly.render(slots, referencesFor(assembly));
             if (rendered.isEmpty()) {
                 open.remove();
                 continue;

@@ -57,6 +57,16 @@ public enum NestError implements TapstateErrorCode {
      */
     KEY_AMBIGUOUS("nest.key-ambiguous", Set.of("embedPath", "table", "candidates")),
 
+    /**
+     * Checking the tree: a level the document points at has embeds hanging beneath it. A row that is pointed
+     * at belongs to no one document — the same row can sit under thousands at once — so there is no document
+     * for its children to be grouped under and no answer to which of them a change beneath it should reach.
+     * Refused rather than assembled: the two shapes are written identically, and left to compile the rows
+     * beneath would be gathered into state nothing renders from, with every document still going out.
+     */
+    REFERENCED_LEVEL_CARRIES_EMBEDS("nest.referenced-level-carries-embeds",
+            Set.of("embedPath", "table", "children")),
+
     /** Checking the tree: it compiles to more resolver vertices than the limit allows, each taking a thread. */
     RESOLVER_VERTEX_LIMIT_EXCEEDED("nest.resolver-vertex-limit-exceeded", Set.of("vertices", "limit")),
 

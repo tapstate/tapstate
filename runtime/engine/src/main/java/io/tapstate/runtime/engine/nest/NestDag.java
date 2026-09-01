@@ -73,7 +73,47 @@ public final class NestDag {
             }
             assembler = vertex;
         }
+        // Drawn after the assembler and never mistaken for it: a lookup takes no part in assembly, and the
+        // vertex the rest of the pipeline reads from is the one that renders documents.
+        for (NestLookup lookup : topology.lookups()) {
+            attachLookup(dag, lookup, upstream, binding, nextOutbound, frontier);
+        }
         return assembler;
+    }
+
+    /**
+     * Draws the vertex that files away the rows one level points at, fed by that level's own stream and
+     * partitioned by what identifies those rows. Partitioning by the same key the entries are filed under
+     * is what makes one member the only writer of each of them, which is the premise the read from the
+     * assembler rests on.
+     *
+     * <p>It has no outbound edge, because a row arriving here reaches no document by arriving. Which
+     * documents refer to it is not something the row says.
+     */
+    private static void attachLookup(DAG dag, NestLookup lookup, Function<String, List<Vertex>> upstream,
+            NestBinding binding, ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
+        List<Vertex> sources = upstream.apply(lookup.alias());
+        if (sources == null || sources.isEmpty()) {
+            throw new IllegalStateException("nest alias '" + lookup.alias() + "' resolved to no vertex");
+        }
+        Vertex vertex = dag.newVertex(lookup.name(),
+                ProcessorMetaSupplier.of(new NestLookupSupplier(lookup, binding.stores())));
+        Vertex source = sources.size() == 1
+                ? sources.get(0)
+                : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
+        draw(dag, source, vertex, 0, fieldKey(lookup.partitionKey()), nextOutbound);
+    }
+
+    /** One passthrough gathering several producers of an alias, so the vertex below sees a single edge. */
+    private static Vertex gatheredInto(DAG dag, Vertex destination, String alias, List<Vertex> sources,
+            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
+        Vertex merge = dag.newVertex(destination.getName() + ":" + alias,
+                gathering(frontier, alias, sources.size()));
+        int ordinal = 0;
+        for (Vertex source : sources) {
+            dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(merge, ordinal++));
+        }
+        return merge;
     }
 
     /**
@@ -192,7 +232,41 @@ public final class NestDag {
                 ? NestSendPolicy.within(binding.settings().sendWindowIn(spec.mapName()))
                 : NestSendPolicy.everyChange();
         return ProcessorMetaSupplier.of(new NestVertexSupplier(spec, slots, stores, deadLetter, outputStream,
-                axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending));
+                axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending,
+                topology.lookups()));
+    }
+
+    /**
+     * Supplies the processors of one lookup vertex. Separate from the one that supplies assembly vertices
+     * because it needs none of what that one binds: no replay floor, no dead letter, no parking, no clock -
+     * a row is filed under its key and that is the whole of it.
+     */
+    private static final class NestLookupSupplier implements ProcessorSupplier {
+
+        private static final long serialVersionUID = 1L;
+
+        private final NestLookup lookup;
+        private final NestBinding.NestStores stores;
+        private transient NestBinding.NestStores bound;
+
+        private NestLookupSupplier(NestLookup lookup, NestBinding.NestStores stores) {
+            this.lookup = lookup;
+            this.stores = stores;
+        }
+
+        @Override
+        public void init(Context context) {
+            bound = stores.bind(context.hazelcastInstance(), JetNestStateGauge::new);
+        }
+
+        @Override
+        public Collection<? extends Processor> get(int count) {
+            List<Processor> processors = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                processors.add(new LookupProcessor(lookup, bound.forLookup(lookup)));
+            }
+            return processors;
+        }
     }
 
     /** Reads the key off the fields a row carries it in. */
@@ -244,6 +318,7 @@ public final class NestDag {
         private final NestSettings settings;
         private final NestClock clock;
         private final NestSendPolicy sending;
+        private final List<NestLookup> lookups;
         private transient ReplayFloor floor;
         private transient NestBinding.NestStores bound;
         private transient NestDeadLetter boundDeadLetter;
@@ -251,7 +326,8 @@ public final class NestDag {
         private NestVertexSupplier(NestVertex spec, List<EmbedSlot> slots, NestBinding.NestStores stores,
                 NestDeadLetter deadLetter, String outputStream, ChainAxes axes,
                 Map<Integer, List<String>> chainsByOrdinal, ReplayFloorFactory replayFloor,
-                NestSettings settings, NestClock clock, NestSendPolicy sending) {
+                NestSettings settings, NestClock clock, NestSendPolicy sending, List<NestLookup> lookups) {
+            this.lookups = lookups;
             this.clock = clock;
             this.sending = sending;
             this.spec = spec;
@@ -283,11 +359,24 @@ public final class NestDag {
                 processors.add(spec.isAssembler()
                         ? new AssemblerProcessor(spec, slots, bound.forAssembler(spec), outputStream,
                                 axes, chainsByOrdinal, floor, settings, clock, sending,
-                                bound.forParking(spec), boundDeadLetter)
+                                bound.forParking(spec), boundDeadLetter, referenced())
                         : new ResolverProcessor(spec, bound.forResolver(spec), boundDeadLetter, axes,
                                 chainsByOrdinal, floor, clock, settings, bound.forParking(spec)));
             }
             return processors;
+        }
+
+        /**
+         * The stores holding the rows this tree's levels point at, by the namespace a slot names. Bound
+         * here rather than reached for while rendering: what a distributed store is reached through does
+         * not travel with the graph, and a render that looked one up per document would pay for it there.
+         */
+        private Map<String, NestStore<Map<String, Object>>> referenced() {
+            Map<String, NestStore<Map<String, Object>>> byNamespace = new LinkedHashMap<>();
+            for (NestLookup lookup : lookups) {
+                byNamespace.put(lookup.mapName(), bound.forLookup(lookup));
+            }
+            return byNamespace;
         }
     }
 }

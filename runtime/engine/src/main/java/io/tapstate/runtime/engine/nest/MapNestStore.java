@@ -3,6 +3,8 @@ package io.tapstate.runtime.engine.nest;
 import com.hazelcast.map.EntryProcessor;
 import com.hazelcast.map.IMap;
 import java.io.Serializable;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
 
@@ -58,6 +60,27 @@ final class MapNestStore<S> implements NestStore<S> {
         S state = map.get(key);
         publishReading();
         return state;
+    }
+
+    /**
+     * One reach for however many keys were asked for, which is what makes resolving a document's references
+     * cost the same whether it holds one or two hundred. {@code getAll} is the map's own batch: it groups
+     * the keys by the member owning them and asks each once, so this is one trip per member rather than one
+     * per key - and where the entries are not resident, the layer behind the map is asked for the whole
+     * missing set at once too.
+     *
+     * <p>Counted as a single access for the same reason it is made as one. Counting per key would report a
+     * batch of two hundred as two hundred reaches and hide the very thing the batch was for.
+     */
+    @Override
+    public Map<Object, S> loadAll(Collection<Object> keys) {
+        if (keys.isEmpty()) {
+            return Map.of();
+        }
+        countAccess();
+        Map<Object, S> loaded = map.getAll(new LinkedHashSet<>(keys));
+        publishReading();
+        return loaded;
     }
 
     /**

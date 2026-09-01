@@ -37,7 +37,7 @@ import java.util.function.Function;
  *        decides how the assembler sends rather than what it assembles.
  */
 public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, List<EmbedSlot> slots,
-        boolean foldingAllowed) implements Serializable {
+        List<NestLookup> lookups, boolean foldingAllowed) implements Serializable {
 
     /**
      * How many resolver vertices one nest may compile to. Each takes a thread of its own rather than
@@ -56,6 +56,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         vertices = List.copyOf(vertices);
         streams = List.copyOf(streams);
         slots = List.copyOf(slots);
+        lookups = List.copyOf(lookups);
     }
 
     /** Compiles the tree against the default vertex limit. */
@@ -79,7 +80,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         if (declared.isEmpty()) {
             // A passthrough assembles nothing and so sends nothing of its own: how a document would be
             // folded is not a question it has.
-            return new NestTopology(List.of(), List.of(), List.of(), true);
+            return new NestTopology(List.of(), List.of(), List.of(), List.of(), true);
         }
 
         // The root is a level like any other: what identifies one of its rows is asked of the same four
@@ -115,6 +116,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         for (Node node : all) {
             node.arrayKey(resolveArrayKey(node, tables));
         }
+        checkReferencedLevelsAreLeaves(all, tables);
         checkAppendMode(root, all);
         checkVertexCount(all, resolverVertexLimit);
 
@@ -156,6 +158,13 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      */
     public Set<String> stateNamespaces() {
         Set<String> namespaces = new LinkedHashSet<>();
+        // The rows a level points at are state exactly as much as the documents holding them, and are the
+        // one namespace here nothing else would take down: no vertex is named for it, so a tree dropped
+        // without naming it would leave every row it ever pointed at behind, under a name that is now
+        // reachable from nothing.
+        for (NestLookup lookup : lookups) {
+            namespaces.add(lookup.mapName());
+        }
         for (NestVertex vertex : vertices) {
             namespaces.add(vertex.mapName());
             // Where a subtree sits while it moves between documents. Named here as well because it is state
@@ -225,7 +234,20 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                         Boolean.TRUE.equals(root.trackKeyChanges()), tables)));
 
         streams.add(new NestStream(root.from(), List.of(), 0, assemblerName, null));
+        List<NestLookup> lookups = new ArrayList<>();
         for (Node node : all) {
+            if (node.referenced()) {
+                // A row the level points at goes to a place of its own rather than into any document: it
+                // is one row shared by however many documents name it, so it enters the tree once and is
+                // read from there. It takes no hops - nothing cascades from it, and the read that finds it
+                // happens where the document is rendered rather than on the way in.
+                NestLookup lookup = new NestLookup(node.pathId(), node.embed().from(),
+                        lookupName(nodeId, node.pathId()), mapName(pipelineId, nodeId, node.pathId()),
+                        referenceIdentity(node.embed()));
+                lookups.add(lookup);
+                streams.add(new NestStream(node.embed().from(), node.pathId(), 0, lookup.name(), null));
+                continue;
+            }
             boolean leaf = node.children().isEmpty();
             int depth = node.pathId().size();
             String entry = leaf
@@ -234,8 +256,50 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             streams.add(new NestStream(node.embed().from(), node.pathId(), leaf ? depth - 1 : depth,
                     entry, node.arrayKey()));
         }
-        return new NestTopology(vertices, streams, slotsOf(top),
+        return new NestTopology(vertices, streams, slotsOf(pipelineId, nodeId, top), lookups,
                 !WriteMode.APPEND.yaml().equals(root.mode()));
+    }
+
+    /**
+     * Refuses a level the document points at that carries embeds of its own. Such a row belongs to no one
+     * document - the same row sits under however many point at it - so there is no document its children
+     * could be gathered under, and nothing says which of them a change beneath it should reach.
+     *
+     * <p>Refused rather than left to compile. The two directions are written identically, so this is an
+     * ordinary thing to write by accident; and left alone it builds a level whose rows are filed where the
+     * pointed-at rows themselves are kept, one namespace holding two unrelated kinds of state, while every
+     * document still goes out looking complete.
+     */
+    private static void checkReferencedLevelsAreLeaves(List<Node> all, Function<String, NestTable> tables) {
+        for (Node node : all) {
+            if (!node.referenced() || node.children().isEmpty()) {
+                continue;
+            }
+            List<String> beneath = new ArrayList<>();
+            for (Node child : node.children()) {
+                beneath.add(child.embed().path());
+            }
+            NestTable table = tables.apply(node.embed().from());
+            throw new TapstateException(NestError.REFERENCED_LEVEL_CARRIES_EMBEDS,
+                    Map.of("embedPath", render(node.pathId()),
+                            "table", table == null ? node.embed().from() : table.name(),
+                            "children", String.join(", ", beneath)), null);
+        }
+    }
+
+    /**
+     * The columns identifying the row an embed points at, in the order its {@code on} map wrote them. Both
+     * sides of the reference build their key by walking that same order - the row being pointed at off
+     * these columns, the level pointing at it off the ones they are mapped to - so neither side has to know
+     * anything about the other's table for the two keys to match.
+     */
+    private static List<String> referenceIdentity(Embed embed) {
+        return List.copyOf(embed.on().keySet());
+    }
+
+    /** The columns on the pointing level that hold the reference, in that same order. */
+    private static List<String> referenceFields(Embed embed) {
+        return List.copyOf(embed.on().values());
     }
 
     private static NestVertex vertexOf(String pipelineId, String nodeId, Node node, List<String> parentIdentity,
@@ -534,17 +598,30 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * absent one shows as an empty array or not at all. It is a property of the declared tree and not of
      * the data, which is why it is settled here rather than remembered per document.
      */
-    private static List<EmbedSlot> slotsOf(List<Node> nodes) {
+    private static List<EmbedSlot> slotsOf(String pipelineId, String nodeId, List<Node> nodes) {
         List<EmbedSlot> slots = new ArrayList<>();
         for (Node node : nodes) {
             Embed embed = node.embed();
-            slots.add(new EmbedSlot(embed.path(), embed.as(), slotsOf(node.children())));
+            slots.add(node.referenced()
+                    ? new EmbedSlot(embed.path(), embed.as(), referenceFields(embed),
+                            mapName(pipelineId, nodeId, node.pathId()),
+                            slotsOf(pipelineId, nodeId, node.children()))
+                    : new EmbedSlot(embed.path(), embed.as(), slotsOf(pipelineId, nodeId, node.children())));
         }
         return slots;
     }
 
     private static String vertexName(String nodeId, List<String> pathId) {
         return pathId.isEmpty() ? "nest:" + nodeId : "nest:" + nodeId + ":" + render(pathId);
+    }
+
+    /**
+     * The name of the vertex that files away the rows one level points at. Suffixed rather than sharing the
+     * name a resolver at that path would take: the two are different jobs over the same path, and a graph
+     * refusing a duplicate name is the only thing that would say so.
+     */
+    private static String lookupName(String nodeId, List<String> pathId) {
+        return vertexName(nodeId, pathId) + ":lookup";
     }
 
     private static String mapName(String pipelineId, String nodeId, List<String> pathId) {

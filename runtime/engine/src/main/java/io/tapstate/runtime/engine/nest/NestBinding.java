@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
 import io.tapstate.runtime.engine.ReplayFloorFactory;
 import java.io.Serializable;
+import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -90,6 +91,22 @@ public record NestBinding(
 
         /** The store for the assembler's documents. */
         NestStore<RootAssembly> forAssembler(NestVertex vertex);
+
+        /**
+         * The store for the rows a level points at, one entry per row and keyed by what identifies it.
+         * Written by the vertex carrying that stream and read by the assembler rendering the documents
+         * that refer to it, which is the one place a nest reaches outside its own partition - so it is a
+         * store like the others rather than anything the reading side keeps for itself.
+         *
+         * <p>Defaulted to a refusal rather than to an empty store. A binding with nowhere to keep these
+         * cannot serve a tree that points at anything, and a store that quietly kept nothing would render
+         * every such document with the field missing - which is precisely the failure this whole shape
+         * exists to end, and it would look like ordinary absent data.
+         */
+        default NestStore<Map<String, Object>> forLookup(NestLookup lookup) {
+            throw new IllegalStateException(
+                    "these nest stores have nowhere to keep the rows " + lookup.name() + " points at");
+        }
 
         /**
          * The store for subtrees between documents. Separate from the documents themselves because what is
@@ -181,17 +198,22 @@ public record NestBinding(
 
         @Override
         public NestStore<ParkedSubtree> forParking(NestVertex vertex) {
-            return metered(mapNamed(vertex, vertex.parkingMapName()));
+            return metered(mapNamed(vertex.name(), vertex.parkingMapName()));
+        }
+
+        @Override
+        public NestStore<Map<String, Object>> forLookup(NestLookup lookup) {
+            return metered(mapNamed(lookup.name(), lookup.mapName()));
         }
 
         private <S> IMap<Object, S> mapOf(NestVertex vertex) {
-            return mapNamed(vertex, vertex.mapName());
+            return mapNamed(vertex.name(), vertex.mapName());
         }
 
-        private <S> IMap<Object, S> mapNamed(NestVertex vertex, String name) {
+        private <S> IMap<Object, S> mapNamed(String askedFor, String name) {
             if (member == null) {
                 throw new IllegalStateException(
-                        "nest stores were asked for " + vertex.name() + " before being bound to a member");
+                        "nest stores were asked for " + askedFor + " before being bound to a member");
             }
             return member.getMap(name);
         }

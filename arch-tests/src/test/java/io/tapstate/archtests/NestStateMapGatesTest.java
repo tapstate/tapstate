@@ -42,6 +42,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * member it is merely a scan of everything and looks like it works, so the day this is wrong is the day a
  * second member appears, long after the code was written.
  *
+ * <p><b>One reach past a single key is allowed, and it is not a loosening of the ban above.</b> A row that
+ * a level points at belongs to no document - one of them can sit under thousands at once - so there is no
+ * partition it could be on that is also the partition of a document naming it, and it is fetched by the key
+ * set that document already carries. That grows with the document doing the asking, not with the keyspace,
+ * which is the property every ban here exists to keep. It is confined to the one store that holds those
+ * rows, and its own case asserts both halves: nothing else reads a key set, and that store still does - a
+ * batch that quietly became a round trip per reference leaves every document correct and fails nothing, so
+ * only a case that insists on its presence would ever notice.
+ *
  * <p>Both bans are checked against a fixture that really uses each mechanism before production is scanned.
  * A ban that matches nothing passes for free and keeps passing after the API it names is renamed, so the
  * positive control per mechanism is what stops this gate from quietly disarming itself.
@@ -58,11 +67,20 @@ class NestStateMapGatesTest {
     /** The single class that may name expiry, because naming it is how it is turned off. */
     private static final String DECLARES_WHAT_A_STATE_MAP_IS = NEST + "NestMaps";
 
+    /**
+     * The single class that may read several keys in one call. It is the store behind every namespace, and
+     * the only caller that hands it a set of keys is the one rendering a document's references - which has
+     * no other way to reach them, and reaches them by key rather than by spanning anything.
+     */
+    private static final String HOLDS_THE_ROWS_A_LEVEL_POINTS_AT = NEST + "MapNestStore";
+
     private static final Map<String, Predicate<JavaAccess<?>>> EXPIRY_MECHANISMS = expiryMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> WHOLE_MAP_MECHANISMS = wholeMapMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> PUT_ACROSS_MECHANISMS = putAcrossMechanisms();
+
+    private static final Map<String, Predicate<JavaAccess<?>>> BOUNDED_READ_MECHANISMS = boundedReadMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> INDEX_MECHANISMS = indexMechanisms();
 
@@ -89,6 +107,10 @@ class NestStateMapGatesTest {
                         + "gate would pass over production code that uses it", mechanism)
                 .isNotEmpty());
         PUT_ACROSS_MECHANISMS.forEach((mechanism, detects) -> assertThat(accesses(fixtureClasses, detects, ""))
+                .as("%s is no longer detected - the API it names has moved or been renamed, and this "
+                        + "gate would pass over production code that uses it", mechanism)
+                .isNotEmpty());
+        BOUNDED_READ_MECHANISMS.forEach((mechanism, detects) -> assertThat(accesses(fixtureClasses, detects, ""))
                 .as("%s is no longer detected - the API it names has moved or been renamed, and this "
                         + "gate would pass over production code that uses it", mechanism)
                 .isNotEmpty());
@@ -119,6 +141,27 @@ class NestStateMapGatesTest {
     }
 
     @Test
+    @DisplayName("only the store holding the rows a level points at reads several keys at once")
+    void readingASetOfKeysIsConfinedToTheStoreThatHoldsReferredToRows() {
+        BOUNDED_READ_MECHANISMS.forEach((mechanism, detects) -> {
+            List<String> found = accesses(productionClasses, detects, NEST);
+            assertThat(found)
+                    .as("%s is the one reach past a single key this design allows, and it is allowed in "
+                            + "one place. A row a level points at belongs to no document - one of them "
+                            + "can sit under thousands at once - so it cannot be on the partition of any "
+                            + "document that names it, and it is read by a key set the document already "
+                            + "carries. Anywhere else, the ban above is the rule", mechanism)
+                    .allMatch(access -> access.startsWith(HOLDS_THE_ROWS_A_LEVEL_POINTS_AT + " ->"));
+            assertThat(found)
+                    .as("%s has left the one place it was allowed. Either those rows are no longer read "
+                            + "in one call - which is a round trip per reference wearing the same shape, "
+                            + "every document still correct and nothing failing - or this gate is now "
+                            + "guarding nothing at all", mechanism)
+                    .isNotEmpty();
+        });
+    }
+
+    @Test
     @DisplayName("state is carried to its key rather than put across the map")
     void noNestCodePutsStateAcrossTheMap() {
         PUT_ACROSS_MECHANISMS.forEach((mechanism, detects) ->
@@ -143,6 +186,18 @@ class NestStateMapGatesTest {
         Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
         named(mechanisms, "putting the state across the map", "put", "set", "putAsync", "setAsync",
                 "putIfAbsent", "putTransient", "replace");
+        return Map.copyOf(mechanisms);
+    }
+
+    /**
+     * Reading several keys in one call. It is not a whole-map mechanism: the keys are handed in, so what it
+     * costs grows with the document asking rather than with the keyspace - which is the property every ban
+     * above is actually protecting. It is kept apart so it can be allowed in exactly one place and stay
+     * banned in every other.
+     */
+    private static Map<String, Predicate<JavaAccess<?>>> boundedReadMechanisms() {
+        Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
+        named(mechanisms, "reading a handed-in set of keys", "getAll");
         return Map.copyOf(mechanisms);
     }
 
@@ -176,7 +231,7 @@ class NestStateMapGatesTest {
         named(mechanisms, "measuring the whole map", "size", "isEmpty");
         named(mechanisms, "writing or removing across keys", "putAll", "setAll", "removeAll",
                 "clear", "evictAll");
-        named(mechanisms, "reading across keys", "getAll", "loadAll");
+        named(mechanisms, "reading across keys", "loadAll");
         named(mechanisms, "running over more than one entry", "executeOnEntries", "executeOnKeys",
                 "aggregate", "project", "forEach");
         return Map.copyOf(mechanisms);

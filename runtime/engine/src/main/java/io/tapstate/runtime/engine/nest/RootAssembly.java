@@ -10,10 +10,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * One nested document under assembly: the root row, the tree of elements attached beneath it, and the
@@ -576,13 +578,69 @@ public final class RootAssembly implements Serializable {
      * occupies and whether an absent one renders as an empty array or not at all.
      */
     public Optional<Map<String, Object>> render(List<EmbedSlot> slots) {
+        return render(slots, Map.of());
+    }
+
+    /**
+     * The document as it now stands, with the rows it points at filled in from {@code resolved} - what was
+     * fetched for the identities {@link #referencesNeeded} asked for, by namespace.
+     *
+     * <p>A reference with nothing fetched for it renders no field at all, exactly as an object embed with
+     * no element does. The two cases it covers want the same thing: a row that was deleted is gone from the
+     * document rather than frozen at its last value, and a row that has not arrived yet is not shown as
+     * absent data. Telling those apart is not this method's to do - it renders what it was handed.
+     */
+    public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         Objects.requireNonNull(slots, "slots");
+        Objects.requireNonNull(resolved, "resolved");
         if (!rootPresent) {
             return Optional.empty();
         }
         Map<String, Object> document = new LinkedHashMap<>(rootFields);
-        renderInto(document, children, slots);
+        renderInto(document, children, slots, resolved);
         return Optional.of(document);
+    }
+
+    /**
+     * Which rows this document would have to be handed to render, by the namespace each is kept in. It is
+     * asked before rendering rather than during it, so that a document naming two hundred rows is one reach
+     * for two hundred keys instead of two hundred reaches - and so that the depth they sit at costs
+     * nothing, every level's references landing in the same request as the root's.
+     *
+     * <p>A reference whose columns are null on the row carrying it asks for nothing. There is no row that
+     * answers to a key of nulls, and asking would spend a lookup to be told so.
+     */
+    public Map<String, Set<List<Object>>> referencesNeeded(List<EmbedSlot> slots) {
+        Objects.requireNonNull(slots, "slots");
+        Map<String, Set<List<Object>>> needed = new LinkedHashMap<>();
+        if (rootPresent) {
+            collectReferences(rootFields, children, slots, needed);
+        }
+        return needed;
+    }
+
+    private static void collectReferences(Map<String, Object> fields,
+            Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
+            Map<String, Set<List<Object>>> needed) {
+        for (EmbedSlot slot : slots) {
+            if (slot.isReference()) {
+                List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields());
+                if (!key.contains(null)) {
+                    needed.computeIfAbsent(slot.lookupMap(), namespace -> new LinkedHashSet<>()).add(key);
+                }
+                continue;
+            }
+            Map<List<Object>, ElementNode> elements = held.get(slot.path());
+            if (elements == null) {
+                continue;
+            }
+            for (ElementNode element : elements.values()) {
+                if (!element.deleted()) {
+                    collectReferences(element.fields(), element.children(), slot.children(), needed);
+                }
+            }
+        }
     }
 
     private boolean mutate(NestElement change) {
@@ -882,29 +940,42 @@ public final class RootAssembly implements Serializable {
     }
 
     private static void renderInto(Map<String, Object> document,
-            Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots) {
+            Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         for (EmbedSlot slot : slots) {
+            if (slot.isReference()) {
+                // Read off the row this level already carries. The columns holding the reference are ones
+                // the row has anyway, so pointing at something costs the document no bytes of its own.
+                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields());
+                Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
+                if (row != null) {
+                    document.put(slot.path(), new LinkedHashMap<>(row));
+                }
+                continue;
+            }
             Map<List<Object>, ElementNode> elements = held.get(slot.path());
             switch (slot.as()) {
-                case ARRAY -> document.put(slot.path(), liveOf(elements, slot));
+                case ARRAY -> document.put(slot.path(), liveOf(elements, slot, resolved));
                 case OBJECT -> latestOf(elements)
-                        .ifPresent(element -> document.put(slot.path(), renderOne(element, slot)));
+                        .ifPresent(element -> document.put(slot.path(), renderOne(element, slot, resolved)));
             }
         }
     }
 
-    private static Map<String, Object> renderOne(ElementNode element, EmbedSlot slot) {
+    private static Map<String, Object> renderOne(ElementNode element, EmbedSlot slot,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         Map<String, Object> rendered = new LinkedHashMap<>(element.fields());
-        renderInto(rendered, element.children(), slot.children());
+        renderInto(rendered, element.children(), slot.children(), resolved);
         return rendered;
     }
 
-    private static List<Map<String, Object>> liveOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot) {
+    private static List<Map<String, Object>> liveOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         List<Map<String, Object>> live = new ArrayList<>();
         if (elements != null) {
             for (ElementNode element : elements.values()) {
                 if (!element.deleted()) {
-                    live.add(renderOne(element, slot));
+                    live.add(renderOne(element, slot, resolved));
                 }
             }
         }

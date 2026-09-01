@@ -57,6 +57,38 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
     }
 
     @Test
+    void aRowPointedAtIsFiledUnderItsOwnIdentityRatherThanReachingAnyDocument() {
+        NestTopology topology = compile(nest("order", List.of("order_id"),
+                embed("customer", "customer_id", "customer_id", EmbedAs.OBJECT, "customer", null)));
+
+        assertThat(topology.lookups()).hasSize(1);
+        assertThat(topology.lookups().get(0).partitionKey())
+                .describedAs("filed under what identifies the customer, which is what a reference names")
+                .containsExactly("customer_id");
+        assertThat(topology.streamAt(List.of("customer")).entryVertex())
+                .describedAs("the stream enters the vertex that files it, not one holding documents")
+                .isEqualTo(topology.lookups().get(0).name());
+        assertThat(topology.stateNamespaces())
+                .describedAs("its namespace is named, or a tree taken down leaves every row it held")
+                .contains(topology.lookups().get(0).mapName());
+    }
+
+    @Test
+    void aRowPointedAtMayNotCarryEmbedsOfItsOwn() {
+        // Left to compile, this puts the customer's own rows and the rows of the level beneath it into one
+        // namespace under one name - two unrelated kinds of state in the same place - while every document
+        // still goes out looking whole. So the assertion is that it is refused, not that it assembles.
+        Throwable refused = catchThrowable(() -> compile(nest("order", List.of("order_id"),
+                embed("customer", "customer_id", "customer_id", EmbedAs.OBJECT, "customer", null,
+                        embed("profile", "customer_id", "customer_id", EmbedAs.OBJECT, "profile", null)))));
+
+        assertThat(refused)
+                .describedAs("a level the document points at cannot hold children of its own")
+                .isInstanceOf(TapstateException.class);
+        assertThat(refused.getMessage()).contains("customer").contains("profile");
+    }
+
+    @Test
     void anOrderLineCarryingItsOrdersIdentityHangsUnderThatOrder() {
         // The direction every embed written so far means, and it still compiles without saying so:
         // items.order_id is not what identifies an item, and orders.order_id is what identifies an order.
