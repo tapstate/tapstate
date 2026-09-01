@@ -187,6 +187,27 @@ class SnapshotPhaseTest {
     }
 
     @Test
+    void aSnapshotThatNeverDrainedResumesFromTheSeamItRecordedRatherThanTheOneSampledNow() {
+        // The same interruption as above, but the source has moved on: the batch this rerun opens samples
+        // a later seam than the one the interrupted run recorded.
+        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null,
+                List.of(), 2L, 1L);
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
+
+        SnapshotPhase.run(
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000099:1")), config(), "chain",
+                List.of("orders"), 2L, meta, e -> { });
+
+        // Overwriting the recorded seam with this run's would move where the tail begins forward over the
+        // span between the two, and nothing else covers that span: the rerun's snapshot re-reads the rows
+        // that are there now, so a row deleted since the first seam is in neither the re-read nor a tail
+        // that starts after the delete. It stays in the target for good, with nothing thrown and nothing
+        // logged. The seam and the generation are one recorded pair, and a resume reuses both or neither.
+        assertThat(meta.cdcStart).isEqualTo("binlog.000042:1024");
+        assertThat(meta.pinnedEpoch).isEqualTo(1L);
+    }
+
+    @Test
     void aSnapshotOfATableThatAlreadyDrainedTakesTheGenerationRunningNow() {
         // Same recorded seam, but this table drained: whatever runs now is a new snapshot -- a re-mine --
         // and it is a new baseline of truth, so it is entitled to beat what came before.
@@ -201,6 +222,11 @@ class SnapshotPhaseTest {
 
         assertThat(sink).extracting(event -> event.position().order()).containsOnly(SourceOrder.snapshotRow(2L));
         assertThat(meta.pinnedEpoch).isEqualTo(2L);
+        // The seam moves with the generation, for the same reason: a re-mine is a new baseline, so its tail
+        // joins where this read began, not where a run that has already drained once did. Reusing the old
+        // seam here would replay the whole span since that run every time a chain is re-mined -- the mirror
+        // mistake, and the reason the resume above is a condition rather than "never overwrite".
+        assertThat(meta.cdcStart).isEqualTo("binlog.000099:1");
     }
 
     @Test
