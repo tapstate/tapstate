@@ -23,9 +23,13 @@ import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
@@ -43,9 +47,10 @@ class SourceProjectionServiceTest {
 
     private final TapstateCatalog catalog = TapstateCatalog.load();
     private final RecordingArtifactStore store = new RecordingArtifactStore();
+    private final InMemorySchemaStore schemas = new InMemorySchemaStore();
     private final SourceProjectionService sources = new SourceProjectionService(
             new ApplyService(() -> catalog, store, new AuditGate(record -> { }, Clock.systemUTC()),
-                    new EmptySchemaStore(), PlanAdvisories.none()),
+                    schemas, PlanAdvisories.none()),
             new ArtifactQueryService(store),
             new ArtifactMutationService(store, new EmptyDesiredStore(), new EmptyStateStore(),
                     new EmptyObservationStore(), new EmptySrsMetaStore(),
@@ -108,6 +113,81 @@ class SourceProjectionServiceTest {
                 .containsEntry("path", "settings.schedule");
         assertThat(store.batchWrites).isEmpty();
         assertThat(hash(store.get("orders").orElseThrow())).isEqualTo(created.contentHash());
+    }
+
+    @Test
+    void creatingAnUnrelatedSourceDoesNotRevalidateAnExistingPipelineRuntimeGate() {
+        store.seed((Resource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: mysql_feynman
+                connector: mysql
+                config: { host: localhost, database: feynman, username: app }
+                mode: cdc
+                """));
+        store.seed((Resource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: mongodb_target
+                connector: mongodb
+                config: { host: localhost, database: warehouse }
+                mode: cdc
+                """));
+        store.seed((Resource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: existing_sync
+                source: mysql_feynman
+                serve:
+                  from: BB_0727
+                  sync:
+                    - id: mongodb_BB_0727
+                      source: mongodb_target
+                """));
+        schemas.save(new DiscoveredSourceModel(
+                "mysql_feynman", "mysql", 0L, new SourceModel(List.of(new SourceTable(
+                        "BB_0727", List.of(new SourceField("value", "varchar", null)),
+                        List.of(), List.of())))));
+
+        SourceView created = sources.create("alice", input("test_1", "new source"));
+
+        assertThat(created.id()).isEqualTo("test_1");
+        assertThat(store.get("test_1")).isPresent();
+    }
+
+    @Test
+    void replacingASourceUsedByAPipelineStillEnforcesThePipelineRuntimeGate() {
+        SourceView created = sources.create("alice", input("mysql_feynman", "before"));
+        store.seed((Resource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: mongodb_target
+                connector: mongodb
+                config: { host: localhost, database: warehouse }
+                mode: cdc
+                """));
+        store.seed((Resource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: existing_sync
+                source: mysql_feynman
+                serve:
+                  from: orders
+                  sync:
+                    - id: mongodb_orders
+                      source: mongodb_target
+                """));
+        schemas.save(new DiscoveredSourceModel(
+                "mysql_feynman", "mysql", 0L, new SourceModel(List.of(new SourceTable(
+                        "orders", List.of(new SourceField("value", "varchar", null)),
+                        List.of(), List.of())))));
+
+        Throwable failure = catchThrowable(() -> sources.replace(
+                "alice", "mysql_feynman", created.contentHash(), input("mysql_feynman", "after")));
+
+        assertThat(failure).isInstanceOf(TapstateException.class);
+        assertThat(((TapstateException) failure).code()).isEqualTo(DslError.UPSERT_NEEDS_KEY);
+        assertThat(store.get("mysql_feynman")).isPresent();
     }
 
     @Test
@@ -207,14 +287,17 @@ class SourceProjectionServiceTest {
         }
     }
 
-    private static final class EmptySchemaStore implements SchemaStore {
+    private static final class InMemorySchemaStore implements SchemaStore {
+        private final Map<String, DiscoveredSourceModel> models = new LinkedHashMap<>();
+
         @Override
-        public Optional<io.tapstate.spi.store.DiscoveredSourceModel> get(String sourceId) {
-            return Optional.empty();
+        public Optional<DiscoveredSourceModel> get(String sourceId) {
+            return Optional.ofNullable(models.get(sourceId));
         }
 
         @Override
-        public void save(io.tapstate.spi.store.DiscoveredSourceModel model) {
+        public void save(DiscoveredSourceModel model) {
+            models.put(model.connectionId(), model);
         }
     }
 
