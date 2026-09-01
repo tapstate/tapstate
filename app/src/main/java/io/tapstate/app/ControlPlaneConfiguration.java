@@ -12,6 +12,7 @@ import io.tapstate.adapters.pdk.PdkSchemaDiscoverer;
 import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -194,7 +195,7 @@ class ControlPlaneConfiguration {
     @Bean
     ApplyService applyService(
             ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
-            SchemaStore schemaStore, @Nullable NestSettings nestSettings) {
+            SchemaStore schemaStore, @Nullable NestSettings nestSettings, LivePipelines livePipelines) {
         // The online apply validates against the live catalog view (the bundled snapshot union the
         // connectors registered so far), so a connector registered at runtime is honoured without a restart.
         // It also reads the schema store, which is what lets it judge a row expression against the columns
@@ -209,12 +210,21 @@ class ControlPlaneConfiguration {
         // take the whole control plane down in exactly the shape that never nests anything locally.
         NestSettings settings = nestSettings == null ? NestSettings.defaults() : nestSettings;
         return new ApplyService(connectorCatalogView::merged, artifactStore, auditGate, schemaStore,
-                new NestSizingAdvisories(settings.entriesHeldInMemory()));
+                new NestSizingAdvisories(settings.entriesHeldInMemory()), livePipelines);
     }
 
     @Bean
     ArtifactQueryService artifactQueryService(ArtifactStore artifactStore) {
         return new ArtifactQueryService(artifactStore);
+    }
+
+    /**
+     * The one reading of which pipelines are up, shared by every guard that refuses a change to what a
+     * live pipeline is running on. Assembled here so the refusals cannot be wired to different readings.
+     */
+    @Bean
+    LivePipelines livePipelines(StorePort storePort) {
+        return new LivePipelines(storePort.desired(), storePort.state());
     }
 
     @Bean
@@ -478,13 +488,14 @@ class ControlPlaneConfiguration {
     @Bean
     SourceService sourceService(
             ConnectorCatalogView connectorCatalogView, ArtifactStore artifactStore,
-            SourceRepresentation representation, ObjectProvider<DataBrowserFollows> follows) {
+            SourceRepresentation representation, ObjectProvider<DataBrowserFollows> follows,
+            LivePipelines livePipelines) {
         // Resolved through a provider rather than injected directly: the streaming face is
         // servlet-only, and a control plane assembled without one still deletes sources -- it
         // simply has no follows to stop. Asked for at call time so it cannot depend on which
         // configuration Spring happens to process first.
         return new SourceService(connectorCatalogView::merged, artifactStore, representation,
-                follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+                follows.getIfAvailable(() -> DataBrowserFollows.NONE), livePipelines);
     }
 
     @Bean

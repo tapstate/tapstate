@@ -13,7 +13,8 @@ public enum SourceError implements TapstateErrorCode {
     ID_MISMATCH("source.id-mismatch", Set.of("pathId", "bodyId")),
     PRECONDITION_REQUIRED("source.precondition-required", Set.of("id")),
     VERSION_CONFLICT("source.version-conflict", Set.of("id")),
-    IN_USE("source.in-use", Set.of("id", "referrers"));
+    IN_USE("source.in-use", Set.of("id", "referrers")),
+    SRS_CHANGE_WHILE_RUNNING("source.srs-change-while-running", Set.of("id", "pipelines"));
 
     private final String code;
     private final Set<String> placeholders;

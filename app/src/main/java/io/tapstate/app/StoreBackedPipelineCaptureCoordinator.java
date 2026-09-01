@@ -222,7 +222,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 resolution.config(),
                 readMode,
                 resolution.srsKey(),
-                srsEnabled(source),
+                source.srsEnabled(),
                 resolution.sourceId(),
                 pipelineId,
                 StartFrom.parse(startFromRaw),
@@ -249,15 +249,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** Whether this pipeline currently has a live capture -- a test-visible view of the retained handles. */
     boolean isActive(String pipelineId) {
         return runsByPipeline.containsKey(pipelineId);
-    }
-
-    /** SRS is on unless the source declares an srs block that sets {@code enabled:false}. */
-    private static boolean srsEnabled(SourceResource source) {
-        if (source.srs() == null) {
-            return true;
-        }
-        Boolean enabled = source.srs().enabled();
-        return enabled == null || enabled;
     }
 
     private ArtifactStore artifacts() {

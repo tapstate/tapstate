@@ -32,21 +32,44 @@ public final class SourceService {
      * graph -- so a source that exists only to be read passes both and its stream outlives it.
      */
     private final DataBrowserFollows follows;
+
+    /**
+     * The reading of which pipelines are up, or null when the caller supplied none.
+     *
+     * <p>Null is a real answer rather than an oversight: a service built to validate and render Sources
+     * has no lifecycle to consult, and the one refusal that needs it says so where it is made. The
+     * production assembly always supplies one.
+     */
+    private final LivePipelines live;
+
     private final CanonicalWriter writer = new CanonicalWriter();
 
     public SourceService(
             TapstateCatalog catalog, ArtifactStore store, SourceRepresentation representation,
             DataBrowserFollows follows) {
-        this(() -> Objects.requireNonNull(catalog, "catalog"), store, representation, follows);
+        this(() -> Objects.requireNonNull(catalog, "catalog"), store, representation, follows, null);
     }
 
     public SourceService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, SourceRepresentation representation,
             DataBrowserFollows follows) {
+        this(catalog, store, representation, follows, null);
+    }
+
+    public SourceService(
+            TapstateCatalog catalog, ArtifactStore store, SourceRepresentation representation,
+            DataBrowserFollows follows, LivePipelines live) {
+        this(() -> Objects.requireNonNull(catalog, "catalog"), store, representation, follows, live);
+    }
+
+    public SourceService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, SourceRepresentation representation,
+            DataBrowserFollows follows, LivePipelines live) {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
         this.representation = Objects.requireNonNull(representation, "representation");
         this.follows = Objects.requireNonNull(follows, "follows");
+        this.live = live;
     }
 
     /** Validates one Source against the live connector contract and renders canonical YAML without writing. */
@@ -125,6 +148,12 @@ public final class SourceService {
         TapstateCatalog liveCatalog = catalog.get();
         Workspace.of(candidate, liveCatalog);
         CapabilityRules.validateOnline(replacement, liveCatalog);
+        // Judged after the draft is known to be well formed and before anything is written: an author
+        // whose edit is also invalid is told that rather than being told about lifecycle state they
+        // would then have to fix a second time.
+        if (live != null) {
+            live.refuseBufferingChangeWhileLive(existing, replacement, candidate);
+        }
 
         return switch (store.replace(id, expectedContentHash, replacement)) {
             case REPLACED -> view(replacement);

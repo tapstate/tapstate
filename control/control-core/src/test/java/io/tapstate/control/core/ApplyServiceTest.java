@@ -6,6 +6,7 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -74,6 +75,81 @@ class ApplyServiceTest {
             id: tgt_my
             connector: mysql
             config: { host: 10.30.0.5, username: writer, password: My_2026 }
+            """;
+
+    /**
+     * The refusal is reached through apply, which is the path an edit to a stored Source usually takes.
+     *
+     * <p>Guarding only the other write path would be a guard in name: the two services write through
+     * different calls, so a check on one of them leaves the other wide open, and the open one here is
+     * the one the command line uses.
+     */
+    @Test
+    void applyRefusesToTurnTheReplayStoreOffWhileAPipelineReadingItIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", PipelineState.RUNNING);
+        actual.put("p1", PipelineState.RUNNING);
+        ApplyService guarded = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+
+        assertThatThrownBy(() -> guarded.apply("author", List.of(draft(UNBUFFERED_SRC))))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    /** The same edit lands once the pipeline reading the source is stopped. */
+    @Test
+    void applyAllowsTheChangeOnceThePipelineReadingItIsStopped() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", PipelineState.STOPPED);
+        actual.put("p1", PipelineState.STOPPED);
+        ApplyService guarded = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+
+        guarded.apply("author", List.of(draft(UNBUFFERED_SRC)));
+
+        assertThat(stored("orders_src")).contains("enabled: false");
+    }
+
+    /** A cdc source whose changes are buffered through the shared replay store. */
+    private static final String BUFFERED_SRC = """
+            version: tapstate/v1
+            kind: source
+            id: orders_src
+            connector: mysql
+            mode: cdc
+            config: { host: 10.30.0.5, username: writer, password: My_2026 }
+            tables: [orders]
+            srs: { enabled: true }
+            """;
+
+    /** The same source with the buffering turned off -- the one field the guard watches. */
+    private static final String UNBUFFERED_SRC = BUFFERED_SRC.replace("enabled: true", "enabled: false");
+
+    /** A pipeline reading that source, in the minimal valid shape. */
+    private static final String READER_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: p1
+            source: orders_src
+            transforms:
+              - id: selected
+                type: filter
+                from: [orders]
+                expr: "op != 'd'"
+            view:
+              id: orders_view
+              from: selected
+              primary_key: id
+              storage:
+                warm:
+                  collection: orders_view
             """;
 
     private static ArtifactDraft draft(String content) {

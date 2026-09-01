@@ -151,6 +151,7 @@ source.id-mismatch
 source.in-use
 source.not-found
 source.precondition-required
+source.srs-change-while-running
 source.version-conflict
 store.invalid-uri
 store.not-replica-set

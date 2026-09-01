@@ -402,6 +402,9 @@ source.not-found:
 source.precondition-required:
   message: "Source '{id}' requires its current ETag for this operation."
   solution: "Read the Source, then retry with its ETag in If-Match."
+source.srs-change-while-running:
+  message: "Source '{id}' cannot change srs.enabled while these pipelines are still reading it: {pipelines}."
+  solution: "Stop those pipelines, then change srs.enabled. Pausing is not enough: a paused pipeline has only suspended its engine, and its capture is still reading the source."
 source.version-conflict:
   message: "Source '{id}' changed after it was read."
   solution: "Read the current Source and retry the operation with its new ETag."

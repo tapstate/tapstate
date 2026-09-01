@@ -76,12 +76,26 @@ public final class ApplyService {
     private final AuditGate auditGate;
     private final SchemaStore schemas;
     private final PlanAdvisories advisories;
+
+    /**
+     * The reading of which pipelines are up, or null when the caller supplied none -- see the same field
+     * on the Source service. Apply is the path most edits actually arrive on, so a guard that covered
+     * only the other one would be a guard in name.
+     */
+    private final LivePipelines live;
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories) {
+        this(catalog, store, auditGate, schemas, advisories, null);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, LivePipelines live) {
+        this.live = live;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -176,9 +190,15 @@ public final class ApplyService {
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
         Map<String, String> enforced = new LinkedHashMap<>();
+        // Read once for the refusal below, and only when there is a reading to judge against.
+        List<Resource> stored = live == null ? List.of() : store.list();
         for (PreparedArtifact prepared : plan.artifacts()) {
             ArtifactOutcome outcome = outcome(prepared);
             if (outcome.change() != ArtifactOutcome.Change.UNCHANGED) {
+                if (live != null && prepared.resource() instanceof SourceResource replacement) {
+                    live.refuseBufferingChangeWhileLive(
+                            storedSource(stored, replacement.id()), replacement, stored);
+                }
                 toWrite.add(prepared.resource());
                 // The declared version travels with the record, so a version-checked edit is
                 // distinguishable in the audit trail from a blind overwrite of the same id. A draft that
@@ -210,6 +230,16 @@ public final class ApplyService {
             }
             return new ApplyResult(outcomes, plan.warnings());
         });
+    }
+
+    /** The stored Source under {@code id}, or null when this apply is creating it. */
+    private static SourceResource storedSource(List<Resource> stored, String id) {
+        return stored.stream()
+                .filter(SourceResource.class::isInstance)
+                .map(SourceResource.class::cast)
+                .filter(source -> source.id().equals(id))
+                .findFirst()
+                .orElse(null);
     }
 
     /**

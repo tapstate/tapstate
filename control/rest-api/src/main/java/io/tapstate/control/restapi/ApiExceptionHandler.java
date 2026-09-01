@@ -84,7 +84,8 @@ class ApiExceptionHandler {
             case "control.bootstrap-closed" -> HttpStatus.CONFLICT;
             case "source.id-mismatch" -> HttpStatus.BAD_REQUEST;
             case "source.not-found" -> HttpStatus.NOT_FOUND;
-            case "source.already-exists", "source.in-use" -> HttpStatus.CONFLICT;
+            case "source.already-exists", "source.in-use", "source.srs-change-while-running" ->
+                    HttpStatus.CONFLICT;
             case "source.version-conflict" -> HttpStatus.PRECONDITION_FAILED;
             case "source.precondition-required" -> HttpStatus.PRECONDITION_REQUIRED;
             // The artifact refusals, mirroring the source.* mapping above because they mean the same things
