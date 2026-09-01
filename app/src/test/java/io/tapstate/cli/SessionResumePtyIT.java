@@ -60,6 +60,8 @@ class SessionResumePtyIT {
             import os, pty, select, signal, sys, termios, time
 
             data = os.environ.pop("TAPSTATE_PTY_INPUT").encode()
+            followup = os.environ.pop("TAPSTATE_PTY_FOLLOWUP", "").encode()
+            followup_delay = float(os.environ.pop("TAPSTATE_PTY_FOLLOWUP_DELAY", "1.5"))
             wait_no_echo = os.environ.pop("TAPSTATE_PTY_WAIT_NO_ECHO", "0") == "1"
             pid, fd = pty.fork()
             if pid == 0:
@@ -69,6 +71,8 @@ class SessionResumePtyIT {
 
             output = bytearray()
             sent = False
+            followup_sent = not followup
+            sent_at = 0
             status = None
             deadline = time.time() + 30
 
@@ -91,6 +95,10 @@ class SessionResumePtyIT {
                 if not sent and (no_echo() if wait_no_echo else bool(output)):
                     os.write(fd, data)
                     sent = True
+                    sent_at = time.time()
+                if sent and not followup_sent and time.time() - sent_at >= followup_delay:
+                    os.write(fd, followup)
+                    followup_sent = True
                 done, child_status = os.waitpid(pid, os.WNOHANG)
                 if done:
                     status = child_status
@@ -195,12 +203,12 @@ class SessionResumePtyIT {
         assertThat(response).isInstanceOf(Map.class);
         assertThat(((Map<?, ?>) response).get("connectors")).isInstanceOf(List.class);
 
-        ProcessResult logout = runWithoutTerminal(home, workspace,
-                "auth", "logout", "--context", "dev");
+        ProcessResult logout = runTuiInPty(home, workspace, ":logout\n", "\004");
 
         assertThat(logout.exitCode()).isZero();
         assertThat(logout.stdout()).contains("session revoked and local cache removed");
-        assertScriptOutputIsClean(logout);
+        assertThat(logout.stdout()).contains("\u001b[?1049h", "\u001b[?1049l");
+        assertThat(logout.stdout()).doesNotContain(PASSWORD);
         assertThat(AuthFileStore.underHome(home).load(context.authRef(), context.id())).isEmpty();
         assertThat(exchange(seed, cached.sessionToken())).isEqualTo(HttpStatus.UNAUTHORIZED);
 
@@ -265,6 +273,30 @@ class SessionResumePtyIT {
             int exitCode = awaitExit(process);
             String transcript = Files.readString(transcriptFile, StandardCharsets.UTF_8);
             return new ProcessResult(exitCode, transcript, "");
+        } finally {
+            if (process != null && process.isAlive()) {
+                stopProcessTree(process);
+            }
+            Files.deleteIfExists(transcriptFile);
+        }
+    }
+
+    private static ProcessResult runTuiInPty(Path home, Path workspace, String input, String followup)
+            throws Exception {
+        List<String> cli = cliCommand(home, "tui", "-w", workspace.toString());
+        List<String> command = new ArrayList<>(List.of("python3", "-c", PTY_DRIVER));
+        command.addAll(cli);
+        Path transcriptFile = Files.createTempFile(home, "tapstate-tui-pty-", ".log");
+        ProcessBuilder builder = process(command, workspace).redirectErrorStream(true);
+        builder.environment().put("TAPSTATE_PTY_INPUT", input);
+        builder.environment().put("TAPSTATE_PTY_FOLLOWUP", followup);
+        builder.redirectOutput(transcriptFile.toFile());
+        Process process = null;
+        try {
+            process = builder.start();
+            process.getOutputStream().close();
+            int exitCode = awaitExit(process);
+            return new ProcessResult(exitCode, Files.readString(transcriptFile, StandardCharsets.UTF_8), "");
         } finally {
             if (process != null && process.isAlive()) {
                 stopProcessTree(process);
