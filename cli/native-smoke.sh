@@ -56,7 +56,7 @@ pid, fd = pty.fork()
 if pid == 0:                              # child: the binary on a controlling terminal
     try:
         if os.environ.get("TERM", "") in ("", "dumb"):
-            os.environ["TERM"] = "linux"
+            os.environ["TERM"] = "xterm-256color"
         os.execv(binary, argv)
     except Exception:
         os._exit(127)
@@ -480,6 +480,22 @@ if (( MACHINE_RC == 0 )) \
   ok "one-line machine-token launch discovered the issuer before Bearer use and skipped password login"
 else
   bad "one-line --token did not preserve its discovery and process-only credential contract (rc=$MACHINE_RC)"
+fi
+
+# --- 13. TUI lifecycle -------------------------------------------------------------------------
+# A native image has a separate reachability surface for JLine terminal resources and shutdown
+# cleanup. Exercise the explicit TUI entry point on a real pseudo-terminal and require the alternate
+# screen to be restored after Ctrl-D exits an empty command bar.
+bold "[13] TUI lifecycle — native alternate screen and cleanup"
+pty_session $'\004' tui
+if (( PTY_RC == 0 )) \
+   && printf '%s' "$PTY_OUT" | grep -Fq $'\033[?1049h' \
+   && printf '%s' "$PTY_OUT" | grep -Fq $'\033[?1049l' \
+   && { printf '%s' "$PTY_OUT" | grep -Fq $'\033[?25h' \
+        || printf '%s' "$PTY_OUT" | grep -Fq $'\033[?12;25h'; }; then
+  ok "native tui entered and restored its alternate screen and cursor"
+else
+  bad "native tui PTY lifecycle failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
 fi
 
 # --- summary ------------------------------------------------------------------------------------
