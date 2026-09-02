@@ -41,6 +41,21 @@ public final class MongoConnection implements AutoCloseable {
     /** The database used when the connection URI names none. */
     private static final String DEFAULT_DATABASE = "tapstate";
 
+    /** The collection holding the one system-data metadata document. */
+    private static final String SYSTEM_META = "system_meta";
+    /** The id of that one document. */
+    private static final String SCHEMA_DOC_ID = "schema";
+    /** The field on it carrying the schema version the store has been brought to. */
+    private static final String INSTALLED_VERSION = "installedVersion";
+
+    /**
+     * The highest system-data schema version this build knows how to read. A store beyond it is one
+     * this process must not open: it was written by a later build, and reading it here would mean
+     * interpreting a shape nobody described to this code. Zero is the version of a store nothing has
+     * migrated yet, which is every store that predates the migrator.
+     */
+    private static final int SUPPORTED_DATA_VERSION = 0;
+
     private final MongoConnectionSettings settings;
     private MongoClient client;
     private String databaseName;
@@ -86,7 +101,44 @@ public final class MongoConnection implements AutoCloseable {
             opened.close();
             throw new TapstateException(StoreError.NOT_REPLICA_SET, Map.of("target", target), null);
         }
+        // The store answered and is a replica-set, so the last thing to settle before the connection is
+        // handed to anybody is whether what it holds is a shape this build can read. One findOne on one
+        // field: the read path an older release line's patch carries, and the shape every later
+        // migrator stays compatible with.
+        refuseWhenDataIsNewerThanBinary(opened);
         this.client = opened;
+    }
+
+    /**
+     * Refuses to start against a store whose system data is at a higher schema version than this build
+     * knows. A newer build may have reshaped documents this one would then read as if they were still
+     * in the old shape - silently, and only where the two shapes happen to overlap - so the refusal is
+     * up front and total rather than at the first document that does not fit.
+     *
+     * <p>Downgrading across a system-data version is not supported; the way back is the backup taken
+     * before the upgrade. Costs exactly one {@code findOne} on the overwhelmingly common path, where
+     * the store is at a version this build knows and nothing else happens.
+     */
+    private void refuseWhenDataIsNewerThanBinary(MongoClient opened) {
+        Document schema = opened.getDatabase(databaseName)
+                .getCollection(SYSTEM_META)
+                .find(new Document("_id", SCHEMA_DOC_ID))
+                .first();
+        Object installed = schema == null ? null : schema.get(INSTALLED_VERSION);
+        if (installed == null) {
+            // Nothing has ever migrated this store, so nothing in it can be newer than this build.
+            return;
+        }
+        // Only the migrator ever writes this field, so a value that is not a number means something
+        // else did. Refusing is the conservative reading of it: proceeding would be deciding the data
+        // is not newer on the strength of a value nothing here can compare.
+        int version = installed instanceof Number number ? number.intValue() : Integer.MAX_VALUE;
+        if (version > SUPPORTED_DATA_VERSION) {
+            opened.close();
+            throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY,
+                    Map.of("installed", String.valueOf(installed),
+                            "supported", String.valueOf(SUPPORTED_DATA_VERSION)), null);
+        }
     }
 
     /**

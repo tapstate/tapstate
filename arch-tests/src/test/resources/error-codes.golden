@@ -147,6 +147,7 @@ lifecycle.unknown-pipeline
 mcp.connector-spec-unavailable
 mcp.environment-missing
 mcp.server-rejected
+migration.data-newer-than-binary
 monitor.no-observation
 nest.append-mode-conflicts-with-key-tracking
 nest.array-key-unresolvable

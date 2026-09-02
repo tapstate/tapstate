@@ -279,6 +279,9 @@ store.invalid-uri:
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
+migration.data-newer-than-binary:
+  message: "The store holds system data at version {installed}, which is newer than this build supports (up to {supported})."
+  solution: "Start a build at or above the one that wrote it. Downgrading across a system-data version is not supported; to go back, restore the backup taken before the upgrade."
 io.store-unavailable:
   message: "A store operation could not complete: {detail}."
   solution: "Check the store is reachable and healthy, then retry."
