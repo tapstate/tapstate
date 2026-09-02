@@ -30,6 +30,21 @@ if [ -z "$product" ]; then
   exit 0
 fi
 
+# A pull request that rewrites the version pins and nothing else carries no behaviour to witness: a
+# version constant is a number, and the number is already held to the others by the check that makes
+# all six agree. One of the pins lives under src/main, so without this the release's own write-back
+# arrives red every time and can only be merged by waiving a gate -- a maintainer's act, spent on a
+# bot's mechanical edit, every release. Decided by the set of paths, never by the branch name or the
+# author: a branch name is chosen by whoever pushes, and would be a way past this gate for anything.
+pins="$("$(cd "$(dirname "$0")" && pwd)/set-version.sh" --list)"
+outside="$(printf '%s\n' "$changed" | grep -v '^[[:space:]]*$' \
+  | grep -vxF -f <(printf '%s\n' "$pins") || true)"
+if [ -z "$outside" ]; then
+  echo "not in scope: this pull request changes only version pins."
+  printf '%s\n' "$changed"
+  exit 0
+fi
+
 cases="$(printf '%s\n' "$present" \
   | grep -E '^e2e/examples/[^/]+/spec\.e2e\.yml$|^e2e/src/test/java/.*IT\.java$' || true)"
 if [ -n "$cases" ]; then

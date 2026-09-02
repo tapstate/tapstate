@@ -876,6 +876,18 @@ jobs:
             which is why the tag points at a tree still pinning the previous release and why this
             pull request exists.
 
+            ## Linked issue
+
+            none -- this pull request is not work anybody asked for. It is opened by the release run
+            that has just published, and its whole content is the version that run took.
+
+            ## Live verification scenario
+
+            Check out this branch and run `.github/scripts/set-version.sh` with no argument: it makes
+            every pin agree with `pom.xml`, so on this branch it must produce no diff at all. Then
+            `mvn -q -pl cli -am package && java -jar cli/target/tapstate.jar --version` prints the
+            same version this pull request writes.
+
             ## Documentation impact
 
             - **Draft in this repository:** none
