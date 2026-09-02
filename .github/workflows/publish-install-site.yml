@@ -132,7 +132,18 @@ jobs:
             echo "routing: $tag predates the checked-in routing; using this checkout's vercel.json"
             cp deploy/install-site/vercel.json "$site/vercel.json"
           fi
-          ls -l "$site"
+          # The event receiver travels with the routing, from the tag when the tag has it. Without this
+          # the site deploys with a /e rewrite and nothing behind it: the route 404s, the installer's
+          # report fails silently by design, and no signal anywhere says the endpoint was never
+          # published. A missing function and a quiet week look identical downstream.
+          mkdir -p "$site/api"
+          if git show "$tag:deploy/install-site/api/event.js" > "$site/api/event.js" 2>/dev/null; then
+            echo "receiver: from $tag"
+          else
+            echo "receiver: $tag predates the checked-in receiver; using this checkout's copy"
+            cp deploy/install-site/api/event.js "$site/api/event.js"
+          fi
+          ls -lR "$site"
           echo "dir=$site" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to production
@@ -188,3 +199,15 @@ jobs:
             echo "not yet serving the new deployment; retrying in 15s"
             sleep 15
           done
+
+          # The receiver is a route, not content, so the byte comparison above cannot see it. A GET is
+          # the probe that stores nothing: the handler answers 405 to anything but POST, so 405 proves
+          # the function is deployed and reachable while writing no event. A 404 here means the site
+          # published with a /e rewrite pointing at nothing.
+          code="$(curl -s -o /dev/null -w '%{http_code}' "https://$SITE_DOMAIN/e")"
+          if [ "$code" = "405" ]; then
+            echo "ok: the event receiver is live (GET /e -> 405, as it should be)"
+          else
+            echo "the event receiver is not live: GET /e answered $code, expected 405" >&2
+            exit 1
+          fi

@@ -123,6 +123,11 @@ jobs:
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
 
+      # The receiver decides what is stored, so its rules are tested rather than reviewed. node --test
+      # is built in; there is no package.json and no dependency to install.
+      - name: install event receiver tests
+        run: node --test deploy/install-site/api/event.test.js
+
   catalog-scripts:
     # The catalog refresh driver and the connector build it calls are shell, and the driver is a gate:
     # its whole job is turning "this step did not run" into a non-zero exit, because every step of a
