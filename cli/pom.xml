@@ -250,8 +250,8 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
 
       The bundled resources read at runtime via getResourceAsStream are not reachable in a native
       image unless declared: the connector catalog (/catalog/*.json), the grammar JSON Schema
-      (/schema/*.json) and the message catalog (/messages/*.yml). They are declared here as
-      IncludeResources globs. Reflection config for the picocli command tree comes from the
+      (/schema/*.json), the message catalog (/messages/*.yml), and TamboUI's built-in key bindings.
+      They are declared here as IncludeResources globs. Reflection config for the picocli command tree comes from the
       picocli-codegen processor (see the compiler plugin above); JLine / CEL / snakeyaml config
       comes from the GraalVM reachability-metadata repository.
     -->
@@ -281,6 +281,7 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
                 <buildArg>-H:IncludeResources=catalog/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=schema/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=messages/.*\.yml</buildArg>
+                <buildArg>-H:IncludeResources=dev/tamboui/tui/bindings/.*\.properties</buildArg>
               </buildArgs>
               <metadataRepository>
                 <enabled>true</enabled>

@@ -1,8 +1,6 @@
 package io.tapstate.cli;
 
 import dev.tamboui.backend.jline3.JLineBackend;
-import dev.tamboui.tui.TuiConfig;
-import dev.tamboui.tui.TuiRunner;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.utils.NonBlockingReader;
@@ -49,7 +47,8 @@ final class TuiApp {
             new ConcurrentLinkedQueue<>();
 
     private NonBlockingReader reader;
-    private TuiRunner display;
+    private dev.tamboui.terminal.Terminal<JLineBackend> display;
+    private JLineBackend backend;
     private Terminal terminal;
     private TuiAppState uiState;
     private final TuiKernel kernel;
@@ -91,11 +90,11 @@ final class TuiApp {
     int run() {
         try (Terminal terminal = TerminalBuilder.builder().system(true).build()) {
             this.terminal = terminal;
-            this.display = TuiRunner.create(TuiConfig.builder()
-                    .backend(new JLineBackend(terminal))
-                    .shutdownHook(false)
-                    .noTick()
-                    .build());
+            this.backend = new JLineBackend(terminal);
+            backend.enableRawMode();
+            backend.enterAlternateScreen();
+            backend.hideCursor();
+            this.display = new dev.tamboui.terminal.Terminal<>(backend);
             terminal.handle(Terminal.Signal.INT, signal -> {
                 interrupted.set(true);
                 repl.cancelStream();
@@ -119,6 +118,7 @@ final class TuiApp {
                 this.reader = null;
                 this.display = null;
                 this.terminal = null;
+                this.backend = null;
             }
         } catch (Exception failure) {
             if (failure instanceof IOException ioFailure) {
@@ -128,11 +128,19 @@ final class TuiApp {
         }
     }
 
-    private void restoreTerminal(TuiRunner display) {
+    private void restoreTerminal(dev.tamboui.terminal.Terminal<JLineBackend> display) {
         if (!terminationRequested.compareAndSet(false, true)) {
             return;
         }
-        display.close();
+        try {
+            JLineBackend activeBackend = display.backend();
+            activeBackend.showCursor();
+            activeBackend.leaveAlternateScreen();
+            activeBackend.disableRawMode();
+            activeBackend.flush();
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
+        }
     }
 
     static int requireInteractiveTerminal(BooleanSupplier terminalCheck, PrintWriter err) {
@@ -183,7 +191,7 @@ final class TuiApp {
         return List.copyOf(words);
     }
 
-    private int eventLoop(TuiRunner display, Terminal terminal) throws IOException {
+    private int eventLoop(dev.tamboui.terminal.Terminal<JLineBackend> display, Terminal terminal) throws IOException {
         this.reader = terminal.reader();
         int lastWidth = -1;
         int lastHeight = -1;
@@ -784,7 +792,7 @@ final class TuiApp {
         }
     }
 
-    private void draw(TuiRunner display, Terminal terminal) {
+    private void draw(dev.tamboui.terminal.Terminal<JLineBackend> display, Terminal terminal) {
         display.draw(frame -> dashboard.render(frame, state()));
     }
 

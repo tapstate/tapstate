@@ -46,7 +46,7 @@ pty_session() {
   local input="$1"; shift
   set +e
   PTY_OUT=$(TAPSTATE_BIN="$BINARY" TAPSTATE_PTY_INPUT="$input" python3 - "$@" <<'PY'
-import os, pty, sys, select, time, signal
+import fcntl, os, pty, struct, sys, select, termios, time, signal
 
 binary = os.environ["TAPSTATE_BIN"]
 data = os.environ["TAPSTATE_PTY_INPUT"].encode()
@@ -61,6 +61,7 @@ if pid == 0:                              # child: the binary on a controlling t
     except Exception:
         os._exit(127)
 else:
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     out = bytearray()
     input_sent = False
     write_failed = None
@@ -78,10 +79,10 @@ else:
                 timed_out = False
                 break
             out += chunk
-            # A REPL must enter terminal raw mode before TAB is written. Its banner is stable while
-            # the prompt contains terminal control sequences. The wizard can accept input as soon
-            # as it emits its first prompt bytes.
-            ready = (len(argv) == 1 and b"Tapstate CLI." in out) or (len(argv) > 1)
+            # The workbench must enter terminal raw mode before input is written. Its title is
+            # stable while the rest of the frame contains terminal control sequences. Explicit
+            # commands can accept input as soon as they emit their first prompt bytes.
+            ready = (len(argv) == 1 and b"TAPSTATE" in out) or (len(argv) > 1)
             if ready and not input_sent:
                 time.sleep(0.05)
                 try:
@@ -259,7 +260,7 @@ bold "[5] REPL — interactive loop under a pty (JLine)"
 # printf -v (not $(...)) so the trailing newline that submits `exit` survives — command substitution
 # would strip it, leaving the REPL waiting for Enter until the deadline.
 printf -v repl_in 'help\nvalidate %s\nexit\n' "$VALID_DIR"
-pty_session "$repl_in"
+pty_session "$repl_in" repl
 # match on ANSI-stripped text: anchor `valid:` so it cannot be satisfied by the `valid:` inside
 # `invalid:` (a rejected validate must not pass as a success), and require a clean child exit.
 REPL_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
@@ -317,7 +318,7 @@ fi
 # native exercise of completion; the JVM unit suite covers the candidate logic itself.
 bold "[8] Tab completion — verb completer under a pty (JLine)"
 printf -v comp_in 'va\t %s\nexit\n' "$VALID_DIR"
-pty_session "$comp_in"
+pty_session "$comp_in" repl
 COMP_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && printf '%s' "$COMP_CLEAN" | grep -qE '(^|[^[:alpha:]])valid:' \
@@ -395,7 +396,7 @@ PY
 python3 "$STUB_DIR/stub.py" "$STUB_DIR/port" "$STUB_DIR/pid" "$STUB_DIR/events"
 STUB_PORT="$(cat "$STUB_DIR/port" 2>/dev/null || true)"
 printf -v online_in 'connect 127.0.0.1:%s\nlogin admin\nsmoke-pw\nregister %s\nexit\n' "$STUB_PORT" "$STUB_DIR/smoke.jar"
-pty_session "$online_in"
+pty_session "$online_in" repl
 ONLINE_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && [[ -n "$STUB_PORT" ]] \
@@ -484,7 +485,7 @@ fi
 
 # --- 13. TUI lifecycle -------------------------------------------------------------------------
 # A native image has a separate reachability surface for JLine terminal resources and shutdown
-# cleanup. Exercise the explicit TUI entry point on a real pseudo-terminal with an explicit workspace,
+# cleanup. Exercise the default TUI entry point on a real pseudo-terminal with an explicit workspace,
 # then require the alternate screen to be restored after Ctrl-D exits.
 bold "[13] TUI dashboard — native workspace entry and cleanup"
 TUI_WORKSPACE="$STUB_DIR/tui-workspace"
