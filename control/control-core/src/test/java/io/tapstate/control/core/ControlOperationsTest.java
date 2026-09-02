@@ -176,6 +176,8 @@ class ControlOperationsTest {
     void mcpFaceIsTheOnlineAuthoringClosurePlusTheReadFaceAndRestExposureRemainsEmpty() {
         // The read face joins on the same terms as everything else here — a mark on the registry entry.
         // The three are read-scoped, so a caller holding no write capability still gets all three.
+        // pause / resume are here for the stop's sake: with only the clearing verb open, the answer it
+        // demands is a question with one available answer, and the caller on this face is a model.
         assertThat(registry.exposedOn(Frontend.MCP))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
@@ -184,7 +186,8 @@ class ControlOperationsTest {
                         "connection.test", "connection.test-result",
                         "connection.discover-schema", "connection.schema",
                         "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-                        "pipeline.start", "pipeline.stop", "pipeline.status",
+                        "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+                        "pipeline.status",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "data-browser.collections", "data-browser.find", "data-browser.stats");
         // Deliberately the widest ceiling, not the shipped one: REST carries no operation at any stage,

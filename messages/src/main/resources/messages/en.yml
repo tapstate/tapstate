@@ -123,6 +123,9 @@ cli.repl-builtin-only:
 cli.mcp-unavailable:
   message: "The MCP sidecar is unavailable: {reason}."
   solution: "Install the complete Tapstate CLI bundle, including libexec/tapstate-mcp, and retry."
+cli.confirmation-needs-a-terminal:
+  message: "`{verb}` clears what the pipeline accumulated, and there is no terminal here to confirm at."
+  solution: "Add `-y` to go ahead without being asked, or run `stop <pipeline-id> --keep-state` to stop it and keep everything it has."
 cli.watch-needs-a-terminal:
   message: "`watch` redraws one row in place, which needs a terminal; here its output is a pipe or a file."
   solution: "Use `tail <source>.<collection>` for a stream you can pipe, or `<source>.<collection>.find(...)` for a one-shot look."

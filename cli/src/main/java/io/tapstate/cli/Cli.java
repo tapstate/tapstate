@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -229,9 +230,9 @@ public final class Cli implements Runnable {
                     "Create, list, or revoke machine tokens.")),
             Map.entry("start", new VerbHelp("<pipeline-id>",
                     "Start a pipeline.")),
-            Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state]",
+            Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state] [-y]",
                     "Stop a pipeline and clear what it accumulated; --keep-state keeps it.")),
-            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun]",
+            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun] [-y]",
                     "Cycle a pipeline and carry on; --rerun reads the whole source again.")),
             Map.entry("pause", new VerbHelp("<pipeline-id>",
                     "Pause a running pipeline, holding its position.")),
@@ -450,8 +451,20 @@ public final class Cli implements Runnable {
      */
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter) {
+        return runSession(launch, controlPlane, prompter, () -> System.console() != null);
+    }
+
+    /**
+     * The same run, with the terminal question answered by the caller. A test process never has a
+     * terminal, so without this seam the one-shot face could only ever exercise the half of a
+     * confirmation that refuses -- and the half that asks is the one a person meets.
+     */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, BooleanSupplier terminal) {
         try {
             Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane);
+            repl.terminalCheck(terminal);
+            repl.prompterSource(prompter);
             if (launch.connects()) {
                 int established = repl.signIn(launch.connect(), launch.user(),
                         () -> launch.resolvePassword(prompter), launch.isOneShot());

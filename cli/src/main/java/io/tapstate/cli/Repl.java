@@ -5,6 +5,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.schema.SchemaNavigator;
 import io.tapstate.messages.MessageCatalog;
@@ -31,6 +32,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
@@ -102,6 +104,13 @@ final class Repl {
     private static final Set<String> BUSY_CODES =
             Set.of("connector.instances-busy", "connector.instance-limit-reached");
 
+    /** The word that keeps everything, and the words that only say "do not ask me". */
+    private static final String KEEP_STATE = "--keep-state";
+    private static final Set<String> STOP_OPTIONS = Set.of(KEEP_STATE, "-y", "--non-interactive");
+    private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
+    private static final String STOP_USAGE = "stop <pipeline-id> [--keep-state] [-y]";
+    private static final String RESTART_USAGE = "restart <pipeline-id> [--rerun] [-y]";
+
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "test", "test-result", "discover-schema", "schema", "register",
@@ -114,6 +123,13 @@ final class Repl {
 
     /** Reads the login password masked; a scripted fake is injected in tests, a JLine one bound in {@link #run}. */
     private Prompter prompter;
+
+    /**
+     * Where a prompter comes from when one is needed and none was injected. A supplier rather than a
+     * prompter because opening one opens a terminal: a verb that never asks anything must not pay for
+     * the ability to ask. The one-shot face sets this; the read loop binds the field directly.
+     */
+    private Supplier<Prompter> prompterSource;
 
     /**
      * Whether this process's output goes to a terminal, which is what the in-place view needs and the
@@ -192,6 +208,19 @@ final class Repl {
     /** Answers how wide the screen is; overridden so the narrow layout can be exercised. */
     void screenWidth(IntSupplier width) {
         this.screenWidth = width;
+    }
+
+    /** Where to get a prompter from if one is asked for and none was injected. */
+    void prompterSource(Supplier<Prompter> source) {
+        this.prompterSource = source;
+    }
+
+    /** The prompter to ask with, opened on first use; null when there is no way to ask at all. */
+    private Prompter prompter() {
+        if (prompter == null && prompterSource != null) {
+            prompter = prompterSource.get();
+        }
+        return prompter;
     }
 
     /** Answers whether this process has a terminal; overridden so both branches can be exercised. */
@@ -465,11 +494,10 @@ final class Repl {
         if (words.get(0).equals("restart")) {
             return restartOnline(words);
         }
-        // A stop says what becomes of the pipeline's state, and the terminal's plain stop says "clear".
-        // This is how a caller says the other thing. It is the one word that changes what a stop does
-        // rather than how it is shown, so it is parsed on its verb alone, like the two above.
-        if (words.get(0).equals("stop") && words.contains("--keep-state")) {
-            return stopKeepingState(words);
+        // A stop is the verb that clears, so it is the verb that asks first -- and it carries the two
+        // words that say otherwise. It parses its own line for the same reason the two above do.
+        if (words.get(0).equals("stop")) {
+            return stopOnline(words);
         }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
@@ -484,7 +512,7 @@ final class Repl {
             case "apply" -> applyOnline(words);
             case "get" -> getOnline(words);
             case "ls" -> lsOnline(words);
-            case "start", "stop", "pause", "resume" -> lifecycleOnline(words);
+            case "start", "pause", "resume" -> lifecycleOnline(words);
             case "status" -> statusOnline(words);
             case "metrics" -> metricsOnline(words);
             case "snapshot" -> snapshotOnline(words);
@@ -1015,28 +1043,96 @@ final class Repl {
     }
 
     /**
-     * {@code stop <pipeline-id> --keep-state} -- stops the pipeline and leaves everything it accumulated
-     * where it is, so the run that follows carries on rather than reading its whole source again.
+     * {@code stop <pipeline-id> [--keep-state] [-y]} -- the verb that clears, and the two words that
+     * change how it is asked for.
      *
-     * <p>A word rather than a default, and the plain stop keeps meaning "clear". Which of the two a
-     * caller wants is not something the terminal can work out for them: one leaves a pipeline that
-     * continues, the other leaves one whose next run re-reads everything, and the difference does not
-     * show until that next run is well under way.
+     * <p>Plain, it clears what the pipeline accumulated, and asks first. {@code --keep-state} leaves
+     * every one of those items where it is, so the run that follows carries on rather than reading its
+     * whole source again. Which of the two a caller wants is not something the terminal can work out
+     * for them: the difference does not show until that next run is well under way.
+     *
+     * <p>Both spellings print the same list. The keeping one names what it is holding on to rather than
+     * what it is dropping, which is how somebody reads what a clear would take without running one.
      */
-    private int stopKeepingState(List<String> words) {
+    private int stopOnline(List<String> words) {
         PrintWriter err = commandLine.getErr();
-        List<String> operands = words.stream().filter(word -> !word.equals("--keep-state")).toList();
+        boolean keepState = words.contains(KEEP_STATE);
+        List<String> operands = words.stream().filter(word -> !STOP_OPTIONS.contains(word)).toList();
+        for (int i = 1; i < operands.size(); i++) {
+            if (operands.get(i).startsWith("-")) {
+                err.println("stop: unknown option " + operands.get(i) + " (usage: " + STOP_USAGE + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
         if (operands.size() < 2 || operands.get(1).isBlank()) {
-            err.println("stop: missing operand (usage: stop <pipeline-id> [--keep-state])");
+            err.println("stop: missing operand (usage: " + STOP_USAGE + ")");
             err.flush();
             return Cli.EXIT_USAGE;
         }
-        return lifecycleOnline("stop", operands.get(1), Boolean.FALSE);
+        String id = operands.get(1);
+        if (keepState) {
+            // Nothing is going, so there is nothing to confirm: this is the spelling that belongs in a
+            // script. The list is still printed -- it is the whole of what the reader gets to check.
+            sayWhatBecomesOfTheState(false);
+            return lifecycleOnline("stop", id, Boolean.FALSE);
+        }
+        OptionalInt refused = clearanceToClear("stop", id, unattended(words));
+        return refused.isPresent() ? refused.getAsInt() : lifecycleOnline("stop", id, Boolean.TRUE);
+    }
+
+    /** Prints what a stop is about to do about the state, item by item, from the declarations. */
+    private void sayWhatBecomesOfTheState(boolean purgeState) {
+        PrintWriter out = commandLine.getOut();
+        PipelineStateInventory.lines(purgeState, PipelineStateInventory.vocabulary())
+                .forEach(out::println);
+        out.flush();
+    }
+
+    /** Whether the caller said not to ask; it says only that, and never that anything may be cleared. */
+    private boolean unattended(List<String> words) {
+        return words.contains("-y") || words.contains("--non-interactive");
     }
 
     /**
-     * {@code restart <pipeline-id> [--rerun]} -- the terminal's own composition of the four verbs the
-     * product has. There is no fifth verb behind this and no operation of its own: what a restart means
+     * The gate in front of both spellings that clear: say what goes, then get an answer, or refuse.
+     *
+     * <p>Three outcomes and no fourth. Told not to ask, it goes ahead -- the flag says "do not ask me",
+     * and what may be cleared is carried by the verb, never by this. Asked where there is no terminal,
+     * it refuses: waiting would hang on an input that never arrives, and a hung run reads as a slow one,
+     * while going ahead would make an irreversible clearing the default of exactly the situation where
+     * nobody is watching. Otherwise it asks, and anything but yes leaves the pipeline alone.
+     *
+     * @return the exit code to stop at, or empty when the caller may go ahead
+     */
+    private OptionalInt clearanceToClear(String verb, String id, boolean unattended) {
+        sayWhatBecomesOfTheState(true);
+        if (unattended) {
+            return OptionalInt.empty();
+        }
+        Prompter asking = terminal.getAsBoolean() ? prompter() : null;
+        if (asking == null) {
+            PrintWriter err = commandLine.getErr();
+            Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
+            err.flush();
+            return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
+        }
+        String answer = asking.ask("Clear " + id + "? Type yes to go ahead", "no");
+        String said = answer == null ? "" : answer.trim();
+        if (!said.equalsIgnoreCase("yes") && !said.equalsIgnoreCase("y")) {
+            PrintWriter out = commandLine.getOut();
+            out.println(verb + ": cancelled; " + id + " was left as it is");
+            out.flush();
+            // Not zero. A caller that reads the status of a verb which did not do what it was asked, and
+            // is told it went fine, concludes the pipeline is stopped.
+            return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
+        }
+        return OptionalInt.empty();
+    }
+
+    /**
+     * {@code restart <pipeline-id> [--rerun] [-y]} -- the terminal's own composition of the four verbs
+     * the product has. There is no fifth verb behind this and no operation of its own: what a restart means
      * is a sequence, and a sequence is what a front end is for.
      *
      * <p>Plain, it cycles the pipeline and lets it carry on from where it stopped -- a pause and a resume
@@ -1050,23 +1146,26 @@ final class Repl {
     private int restartOnline(List<String> words) {
         PrintWriter err = commandLine.getErr();
         boolean rerun = words.contains("--rerun");
-        List<String> operands = words.stream().filter(word -> !word.equals("--rerun")).toList();
+        List<String> operands = words.stream().filter(word -> !RESTART_OPTIONS.contains(word)).toList();
         for (int i = 1; i < operands.size(); i++) {
             if (operands.get(i).startsWith("-")) {
                 err.println("restart: unknown option " + operands.get(i)
-                        + " (usage: restart <pipeline-id> [--rerun])");
+                        + " (usage: " + RESTART_USAGE + ")");
                 err.flush();
                 return Cli.EXIT_USAGE;
             }
         }
         if (operands.size() < 2 || operands.get(1).isBlank()) {
-            err.println("restart: missing operand (usage: restart <pipeline-id> [--rerun])");
+            err.println("restart: missing operand (usage: " + RESTART_USAGE + ")");
             err.flush();
             return Cli.EXIT_USAGE;
         }
         String id = operands.get(1);
         if (rerun) {
-            return rerunFromTheStart(id);
+            // The plain restart clears nothing and asks nothing; this one is a stop that clears wearing
+            // another name, so it meets the same gate the plain stop does.
+            OptionalInt refused = clearanceToClear("restart", id, unattended(words));
+            return refused.isPresent() ? refused.getAsInt() : rerunFromTheStart(id);
         }
         StatusOutcome outcome = withFailover(() ->
                 controlPlane.status(session.landingNode(), session.credential(), id),

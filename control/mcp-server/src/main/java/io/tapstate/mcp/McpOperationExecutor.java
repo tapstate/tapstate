@@ -63,6 +63,8 @@ final class McpOperationExecutor {
                 case "artifact.delete" -> artifactDelete(args);
                 case "pipeline.start" -> pipelineAction(args, "start");
                 case "pipeline.stop" -> pipelineStop(args);
+                case "pipeline.pause" -> pipelineAction(args, "pause");
+                case "pipeline.resume" -> pipelineAction(args, "resume");
                 case "pipeline.status" -> pipelineRead(args, "status");
                 case "pipeline.metrics" -> pipelineRead(args, "metrics");
                 case "pipeline.snapshot" -> pipelineRead(args, "snapshot");

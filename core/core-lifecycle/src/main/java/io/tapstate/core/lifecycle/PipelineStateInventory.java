@@ -1,5 +1,6 @@
 package io.tapstate.core.lifecycle;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -21,6 +22,20 @@ public final class PipelineStateInventory {
 
     /** Said by every surface that describes a stop, because it is the fear a stop actually raises. */
     public static final String TARGET_UNTOUCHED = "Your target database is not touched either way.";
+
+    /**
+     * What clearing costs, said as the thing a reader will actually notice rather than as the name of
+     * what was dropped. It belongs to the clearing answer alone -- on the other one it would be false --
+     * and it is here rather than at a surface because every surface that offers the choice owes it.
+     *
+     * <p>It says the position is gone, and stops there. "Reads its whole source again" is the sentence a
+     * reader wants and it is not always true: which tables finished their initial load is recorded on
+     * the chain, not on the pipeline, so a pipeline leaving a chain that others are still reading has
+     * lost its position without that record going anywhere. Saying the stronger thing would be right for
+     * the ordinary pipeline and wrong for exactly the arrangement shared mining exists to produce.
+     */
+    public static final String NEXT_RUN_HAS_NO_POSITION =
+            "The run after this one has no position to carry on from.";
 
     /** What a nest assembled, the shape it assembled under, and the changes it could not assemble. */
     public static final PipelineStateHolding OPERATOR_STATE = PipelineStateHolding.named(
@@ -90,6 +105,29 @@ public final class PipelineStateInventory {
         return "purgeState true -- " + describe(true, VOCABULARY)
                 + " purgeState false -- " + describe(false, VOCABULARY)
                 + " " + TARGET_UNTOUCHED;
+    }
+
+    /**
+     * The same answer as {@link #describe}, laid out for a surface that shows it rather than says it: a
+     * lead line, then one line per item, then what a reader needs beyond the list itself.
+     *
+     * <p>The same declarations and the same labels, so a surface cannot come to speak about a different
+     * set than the one being worked through. Only the lead line turns on the answer -- writing the two
+     * outcomes as two texts is what lets the kept one quietly fall behind the cleared one, and the kept
+     * one is the half a cautious reader is reading.
+     */
+    public static List<String> lines(boolean purgeState, List<PipelineStateHolding> holdings) {
+        Objects.requireNonNull(holdings, "holdings");
+        List<String> lines = new ArrayList<>();
+        lines.add(purgeState
+                ? "This clears what the pipeline accumulated:"
+                : "This keeps what the pipeline accumulated:");
+        holdings.forEach(holding -> lines.add("  - " + holding.label()));
+        if (purgeState) {
+            lines.add(NEXT_RUN_HAS_NO_POSITION);
+        }
+        lines.add(TARGET_UNTOUCHED);
+        return List.copyOf(lines);
     }
 
     private PipelineStateInventory() {

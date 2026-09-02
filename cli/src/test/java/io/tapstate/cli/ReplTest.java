@@ -1,5 +1,7 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -946,6 +948,18 @@ class ReplTest {
     private static Harness onlineSession(Path workdir, FakeControlPlane client) {
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         Harness h = harness(workdir, client, new ScriptedPrompter("pw"));
+        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("login alice");
+        return h;
+    }
+
+    /**
+     * The same authenticated session over a prompter the test owns, for a case whose answers go on past
+     * the password. The script starts with the password, since signing in consumes the first answer.
+     */
+    private static Harness onlineSession(Path workdir, FakeControlPlane client, ScriptedPrompter prompter) {
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        Harness h = harness(workdir, client, prompter);
         h.repl().dispatch("connect node1:7900");
         h.repl().dispatch("login alice");
         return h;
@@ -3408,7 +3422,7 @@ class ReplTest {
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
         Harness h = onlineSession(Path.of("tap-work"), client);
 
-        h.repl().dispatch("restart pl1 --rerun");
+        h.repl().dispatch("restart pl1 --rerun -y");
 
         // The stop carries the clearing answer, and nothing here reads the pipeline's state first: what
         // --rerun asks for is the same whatever the pipeline was doing.
@@ -3423,7 +3437,7 @@ class ReplTest {
         client.lifecycleOutcome = new LifecycleOutcome.Rejected("lifecycle.illegal-transition", "Not running.");
         Harness h = onlineSession(Path.of("tap-work"), client);
 
-        h.repl().dispatch("restart pl1 --rerun");
+        h.repl().dispatch("restart pl1 --rerun -y");
 
         // A start after a refused stop would run a pipeline whose owner asked for it to be re-read from
         // scratch, without the clearing that makes it one -- so it would carry on while reporting the
@@ -3498,7 +3512,9 @@ class ReplTest {
         h.repl().dispatch("start pl1");
         h.repl().dispatch("pause pl1");
         h.repl().dispatch("resume pl1");
-        h.repl().dispatch("stop pl1");
+        // -y because this case is about which server verb each word reaches; the gate in front of the
+        // clearing one is its own case, and a test process has no terminal to answer at.
+        h.repl().dispatch("stop pl1 -y");
         assertThat(client.lifecycleCalls).containsExactly(
                 "jwt-tok@http://node1:7900 start pl1",
                 "jwt-tok@http://node1:7900 pause pl1",
@@ -4319,5 +4335,278 @@ class ReplTest {
                         + "over the wire, which is the cost the filter exists to cut")
                 .anySatisfy(call -> assertThat(call).contains("tail views.order_state")
                         .contains("status").contains("Paid"));
+    }
+
+    // --- a stop that clears asks first, and says in the same breath what "clear" takes ------------
+
+    /**
+     * Every kind of state the product declares, as the labels a surface speaks from. Read rather than
+     * written out, so a component that starts holding state widens this assertion by being declared --
+     * which is the property the list has to have to be worth printing at all.
+     */
+    private static String[] everyKindOfStateAPipelineHolds() {
+        return PipelineStateInventory.vocabulary().stream()
+                .map(PipelineStateHolding::label)
+                .toArray(String[]::new);
+    }
+
+    @Test
+    void stopAtATerminalListsWhatItWouldTakeAndTakesNothingWhenTheAnswerIsNo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("pw", "no");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("stop pl1");
+
+        // Nothing reached the server: a stop that was declined has to be a stop that did not happen,
+        // and the pipeline is still running.
+        assertThat(client.lifecycleCalls).isEmpty();
+        String output = h.sink().toString().substring(mark);
+        // The confirmation is only worth asking if it says what is at stake, item by item. A prompt that
+        // says "are you sure?" and nothing else trains its reader to answer yes without reading.
+        assertThat(output).contains(everyKindOfStateAPipelineHolds());
+        assertThat(output).contains(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
+        // Reporting success for a thing that did not happen is how a script concludes the opposite.
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void stopAtATerminalClearsOnceTheAnswerIsYes() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter("pw", "yes"));
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("stop pl1");
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
+        assertThat(h.repl().lastExitCode()).isZero();
+    }
+
+    @Test
+    void stopWithNoTerminalRefusesAndSaysWhichWayOutIsWhich() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("stop pl1");
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        // The half that matters most and shows least: a script, a CI job or a container step has nothing
+        // on its input, so a question here waits until something times it out -- and a hung run and a
+        // slow one are the same thing from outside.
+        assertThat(prompter.questions).isEmpty();
+        String output = h.sink().toString().substring(mark);
+        assertThat(output).contains("cli.confirmation-needs-a-terminal");
+        // Refusing is only useful if it names both ways on: go ahead unasked, or stop without clearing.
+        assertThat(output).contains("-y").contains("--keep-state");
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void stopWithTheNonInteractiveFlagClearsWithoutAsking() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("stop pl1 -y");
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
+        assertThat(prompter.questions).isEmpty();
+    }
+
+    @Test
+    void restartRerunAtATerminalAsksFirstAndAnsweringNoStartsNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("pw", "no");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        // Neither half of the sequence ran. A declined re-run that stopped the pipeline anyway would be
+        // the worst of the three outcomes: down, and not re-reading either.
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.sink().toString().substring(mark)).contains(everyKindOfStateAPipelineHolds());
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void restartRerunWithNoTerminalRefusesAndNeitherStopsNorStarts() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(prompter.questions).isEmpty();
+    }
+
+    @Test
+    void restartRerunWithTheNonInteractiveFlagRunsTheWholeSequence() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true",
+                "jwt-tok@http://node1:7900 start pl1");
+        assertThat(prompter.questions).isEmpty();
+    }
+
+    @Test
+    void stopKeepingStateNeitherAsksNorNeedsATerminalAndStillListsWhatItHoldsOnTo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("stop pl1 --keep-state");
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+        // Nothing destructive happens, so there is nothing to confirm -- which is what makes this the
+        // spelling a script reaches for.
+        assertThat(prompter.questions).isEmpty();
+        String output = h.sink().toString().substring(mark);
+        // The list is the case. Not printing it leaves a command that succeeds, exits zero and stops the
+        // pipeline exactly as it does now -- indistinguishable from this one unless somebody is watching
+        // the terminal, which is the reader this line exists for.
+        assertThat(output).contains(everyKindOfStateAPipelineHolds());
+        assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
+        // The one sentence that turns on the answer: saying it here would promise a re-read that is not
+        // going to happen, and this is the path whose whole point is that it does not.
+        assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        assertThat(h.repl().lastExitCode()).isZero();
+    }
+
+    @Test
+    void stopKeepingStateStillKeepsWhenTheNonInteractiveFlagIsGivenAsWell() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("stop pl1 --keep-state -y");
+
+        // The two flags say orthogonal things -- one "do not ask me", the other "do not clear" -- and a
+        // reading that let the first widen the second would give the pair a meaning opposite to each.
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+    }
+
+    @Test
+    void theVerbsThatClearNothingAskNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("start pl1");
+        h.repl().dispatch("pause pl1");
+        h.repl().dispatch("resume pl1");
+        // A plain restart of a failed run stops it keeping everything, then starts it: a stop on the
+        // wire, and nothing a confirmation is for. Confirming here is how a reader learns to answer
+        // yes without reading, which costs exactly the one prompt that mattered.
+        h.repl().dispatch("restart pl1");
+
+        assertThat(prompter.questions).isEmpty();
+        assertThat(client.lifecycleCalls).contains("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+    }
+
+    @Test
+    void aOneShotStopAtATerminalAsksBeforeItClears() {
+        // The second face. Both faces reach the same dispatch, but only one of them is the one a person
+        // types into, and a guard that lived in the read loop would leave this one clearing unasked.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("no");
+        LaunchOptions launch =
+                LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "stop", "pl1");
+
+        int code = Cli.runSession(launch, client, () -> prompter, () -> true);
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(code).isNotZero();
+    }
+
+    @Test
+    void aOneShotStopWithNoTerminalRefusesRatherThanClearing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        LaunchOptions launch =
+                LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "stop", "pl1");
+
+        int code = Cli.runSession(launch, client, () -> prompter, () -> false);
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(prompter.questions).isEmpty();
+        assertThat(code).isNotZero();
+    }
+
+    @Test
+    void aOneShotStopKeepingStateAlsoListsWhatItHoldsOnTo() {
+        // The keeping spelling on the second face, and the list with it. Half a gate is the failure
+        // this pair is written against: the two faces are the same words to whoever types them, and a
+        // list that only one of them prints is one a reader cannot rely on having seen.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        StringWriter sink = new StringWriter();
+        Repl repl = replWritingTo(sink, client);
+        repl.terminalCheck(() -> false);
+        repl.signIn("node1:7900", "admin", () -> "pw", true);
+        int mark = sink.toString().length();
+
+        repl.dispatch("stop pl1 --keep-state");
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+        String output = sink.toString().substring(mark);
+        assertThat(output).contains(everyKindOfStateAPipelineHolds());
+        assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
+        assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+    }
+
+    @Test
+    void aOneShotStopClearsWhenItWasToldNotToAsk() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        LaunchOptions launch =
+                LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "stop", "pl1", "-y");
+
+        int code = Cli.runSession(launch, client, ScriptedPrompter::new, () -> false);
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
+        assertThat(code).isZero();
     }
 }

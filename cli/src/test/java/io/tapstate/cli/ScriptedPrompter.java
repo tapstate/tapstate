@@ -23,12 +23,20 @@ final class ScriptedPrompter implements Prompter {
     /** The questions routed through {@link #secret} — for asserting masked prompting was used. */
     final List<String> secretQuestions = new ArrayList<>();
 
+    /**
+     * The free-text questions asked, in order — for asserting that a path which must not stop and wait
+     * did not ask one. A prompt that reaches a process with nothing on its input blocks until something
+     * times it out, and a blocked run and a slow one look the same from outside.
+     */
+    final List<String> questions = new ArrayList<>();
+
     ScriptedPrompter(String... scripted) {
         this.answers = new ArrayDeque<>(List.of(scripted));
     }
 
     @Override
     public String ask(String question, String defaultValue) {
+        questions.add(question);
         return answers.isEmpty() ? "" : answers.removeFirst();
     }
 

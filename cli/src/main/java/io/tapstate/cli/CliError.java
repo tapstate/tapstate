@@ -104,6 +104,15 @@ enum CliError implements TapstateErrorCode {
     WATCH_NEEDS_A_TERMINAL("cli.watch-needs-a-terminal", Set.of()),
 
     /**
+     * A verb that clears what a pipeline accumulated was run where there is no terminal to confirm at,
+     * and nothing said to go ahead unasked; {@code verb} names it. Refused rather than either of the
+     * two things it could have done instead: asking would stop and wait on an input that is never
+     * going to arrive, and going ahead would make an irreversible clearing the default of the one
+     * situation -- a script, a job, a container step -- where nobody is watching it happen.
+     */
+    CONFIRMATION_NEEDS_A_TERMINAL("cli.confirmation-needs-a-terminal", Set.of("verb")),
+
+    /**
      * A version precondition was offered for a batch holding more than one resource; {@code count} is how
      * many it holds. One hash names one version, so there is no resource it could be describing.
      */
