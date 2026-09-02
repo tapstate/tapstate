@@ -143,6 +143,9 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private int callSource(PrintWriter err) {
+        if (rejectsPrimaryKey(err, "source")) {
+            return EXIT_USAGE;
+        }
         if (!sources.isEmpty() || !syncTo.isEmpty()) {
             err.println("new: --source/--sync-to are not valid for --kind source");
             err.flush();
@@ -169,6 +172,9 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private int callPipeline(PrintWriter err) {
+        if (rejectsPrimaryKey(err, "pipeline")) {
+            return EXIT_USAGE;
+        }
         if (connector != null || mode != null || !config.isEmpty()) {
             err.println("new: --connector/--mode/--set are not valid for --kind pipeline");
             err.flush();
@@ -218,6 +224,9 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private int callTransform(PrintWriter err) {
+        if (rejectsPrimaryKey(err, "transform")) {
+            return EXIT_USAGE;
+        }
         // a transform is pure logic (X19): no connector, mode, config or pipeline-wiring flags
         if (connector != null || mode != null || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty()) {
             err.println("new: --connector/--mode/--set/--source/--sync-to are not valid for --kind transform");
@@ -304,6 +313,9 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private int callServe(PrintWriter err) {
+        if (rejectsPrimaryKey(err, "serve")) {
+            return EXIT_USAGE;
+        }
         if (rejectsDefinitionFlags(err, "serve")) {
             return EXIT_USAGE;
         }
@@ -329,6 +341,19 @@ final class NewCmd implements Callable<Integer> {
      * A standalone definition body (view / serve) is pure structure — it takes no connector, mode,
      * config or pipeline-wiring flags. Reports the offending flags and returns true when any are present.
      */
+    /**
+     * Only a view has a primary key. Rejected rather than ignored on the others, the way every
+     * other kind-specific flag here is: a flag that is silently dropped reads as one that worked.
+     */
+    private boolean rejectsPrimaryKey(PrintWriter err, String kindLabel) {
+        if (primaryKey != null) {
+            err.println("new: --primary-key is not valid for --kind " + kindLabel);
+            err.flush();
+            return true;
+        }
+        return false;
+    }
+
     private boolean rejectsDefinitionFlags(PrintWriter err, String kindLabel) {
         if (connector != null || mode != null || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty()) {
             err.println("new: --connector/--mode/--set/--source/--sync-to are not valid for --kind " + kindLabel);

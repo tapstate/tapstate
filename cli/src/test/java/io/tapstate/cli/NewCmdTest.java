@@ -820,6 +820,28 @@ class NewCmdTest {
     }
 
     @Test
+    void newSourceRejectsThePrimaryKeyFlag(@TempDir Path dir) {
+        Run r = run("new", "--non-interactive", "--kind", "source", "--connector", "mysql",
+                "--id", "src_a", "--mode", "cdc", "--primary-key", "id", "--out", dir.toString());
+
+        assertThat(r.code()).isEqualTo(2);
+        assertThat(r.err()).contains("--primary-key");
+        assertThat(dir.resolve("src_a.tap.yml")).doesNotExist();
+    }
+
+    @Test
+    void newServeRejectsThePrimaryKeyFlag(@TempDir Path dir) {
+        // serve shares its flag guard with view, and view is the one kind the key belongs to - so
+        // this is the pair where an over-broad or an over-narrow guard would show up.
+        Run r = run("new", "--non-interactive", "--kind", "serve", "--id", "std_api",
+                "--primary-key", "id", "--out", dir.toString());
+
+        assertThat(r.code()).isEqualTo(2);
+        assertThat(r.err()).contains("--primary-key");
+        assertThat(dir.resolve("std_api.tap.yml")).doesNotExist();
+    }
+
+    @Test
     void newServeRejectsTheSyncToFlag(@TempDir Path dir) {
         Run r = run("new", "--non-interactive", "--kind", "serve", "--id", "s1",
                 "--sync-to", "tgt_b", "--out", dir.toString());
