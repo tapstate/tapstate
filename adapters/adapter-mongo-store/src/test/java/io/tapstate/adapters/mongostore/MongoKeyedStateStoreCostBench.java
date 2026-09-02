@@ -35,7 +35,7 @@ import org.testcontainers.utility.DockerImageName;
  * failsafe one, so it costs a build nothing and is run deliberately:
  *
  * <pre>{@code mvn -o test -pl adapters/adapter-mongo-store -am -Dtest=MongoKeyedStateStoreCostBench \
- *   -DfailIfNoTests=false -Dapi.version=1.44}</pre>
+ *   -Dsurefire.failIfNoSpecifiedTests=false -Dapi.version=1.44}</pre>
  */
 @RequiresDocker
 class MongoKeyedStateStoreCostBench {
