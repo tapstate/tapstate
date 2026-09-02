@@ -677,18 +677,29 @@ class StorePortTest {
         meta.appendSchemaVersion("chain", new SchemaVersion(0, Map.of("id", "int"), 0));
         meta.upsertConsumerOffset("chain", new ConsumerOffset("leaving", Map.of("orders", 10L), null));
         meta.upsertConsumerOffset("chain", new ConsumerOffset("staying", Map.of("orders", 20L), null));
+        meta.markSnapshotComplete("chain", "orders");
+        long generation = meta.openEpoch("chain");
 
         meta.detachConsumer("chain", "leaving");
 
         SrsMeta after = meta.read("chain").orElseThrow();
         assertThat(after.consumerOffsets()).extracting(ConsumerOffset::pipelineId).containsExactly("staying");
         // The chain outlives its departing consumer. A detach that rebuilt the document from the kept
-        // consumers alone would drop these four, and the loss shows up only as a chain that re-reads
-        // from the beginning — no error, and nothing here would have said so.
+        // consumers alone would drop every one of these, and the loss shows up only as a chain that
+        // re-reads from the beginning — no error, and nothing here would have said so.
         assertThat(after.sourceReadOffset()).isEqualTo("gtid:aaa-1:500");
         assertThat(after.cdcStartPosition()).isEqualTo("gtid:aaa-1:1");
         assertThat(after.schemaHistory()).extracting(SchemaVersion::version).containsExactly(0L);
         assertThat(after.retention()).isEqualTo("7d");
+        // These three were what the list above was missing, and a store that dropped them passed it.
+        // The tables marked complete are half of what decides whether the next run reads the source
+        // again; the generation is worse still, because a chain whose generation went back to zero
+        // hands the same one out twice, and every ordering comparison downstream believes it.
+        assertThat(after.snapshotCompletedTables()).containsExactly("orders");
+        assertThat(after.epoch()).isEqualTo(generation);
+        // 1, because the seam above was recorded under generation 1 -- that third argument to
+        // setCdcStart is this field, and a detach has no business moving it either.
+        assertThat(after.snapshotEpoch()).isEqualTo(1L);
     }
 
     @Test
@@ -1285,8 +1296,12 @@ class StorePortTest {
                     List<ConsumerOffset> kept = current.consumerOffsets().stream()
                             .filter(offset -> !offset.pipelineId().equals(pipelineId))
                             .toList();
+                    // Everything but the consumers is carried across; the six-argument constructor
+                    // would default the snapshot-complete tables and both generations away, which a
+                    // detach does not do.
                     srsMeta.put(miningChainId, new SrsMeta(current.miningChainId(), current.sourceRead(),
-                            kept, current.cdcStartPosition(), current.schemaHistory(), current.retention()));
+                            kept, current.cdcStartPosition(), current.schemaHistory(), current.retention(),
+                            current.snapshotCompletedTables(), current.epoch(), current.snapshotEpoch()));
                 }
 
                 private SrsMeta require(String miningChainId) {

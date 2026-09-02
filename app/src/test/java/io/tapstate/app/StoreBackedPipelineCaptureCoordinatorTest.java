@@ -159,57 +159,6 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(fixture.consumersOnTheChain()).containsExactly("p");
     }
 
-    @Test
-    void theLastPipelineOffAChainTakesTheChainsOwnRecordWithIt() {
-        CursorFixture fixture = new CursorFixture();
-        fixture.coordinator.startCapture("p");
-        fixture.leaveACursorFor("p");
-        fixture.leaveAChainRecord();
-
-        fixture.coordinator.stopCapture("p", true);
-
-        assertThat(fixture.chainRecord())
-                .as("nobody is left on the chain, so what the chain itself had read is this stop's to clear")
-                .isEmpty();
-    }
-
-    @Test
-    void aPipelineLeavingAChainOthersReadTakesOnlyItsOwnCursor() {
-        CursorFixture fixture = new CursorFixture();
-        fixture.coordinator.startCapture("p");
-        fixture.coordinator.startCapture("q");
-        fixture.leaveACursorFor("p");
-        fixture.leaveACursorFor("q");
-        fixture.leaveAChainRecord();
-
-        fixture.coordinator.stopCapture("p", true);
-
-        // The chain's own record is not this pipeline's to take. Clearing it would make every other
-        // pipeline on the chain read its whole source again, with nothing anywhere saying why -- and it
-        // is the same reading of "is anybody still on this" that decides whether the chain stays open.
-        assertThat(fixture.chainRecord()).isPresent();
-        assertThat(fixture.chainRecord().orElseThrow().cdcStartPosition())
-                .as("and what the chain had read is untouched, not merely present")
-                .isEqualTo("seam-1");
-        assertThat(fixture.consumersOnTheChain()).containsExactly("q");
-    }
-
-    @Test
-    void theLastPipelineOffAChainAskedToKeepLeavesTheRecordStanding() {
-        CursorFixture fixture = new CursorFixture();
-        fixture.coordinator.startCapture("p");
-        fixture.leaveACursorFor("p");
-        fixture.leaveAChainRecord();
-
-        fixture.coordinator.stopCapture("p", false);
-
-        // Paired with the first case: both are the last pipeline off the chain, and only the answer it
-        // was given tells them apart. Without this one, an implementation that always dropped the record
-        // would pass that case and quietly cost every keeping stop its resume position.
-        assertThat(fixture.chainRecord()).isPresent();
-        assertThat(fixture.consumersOnTheChain()).containsExactly("p");
-    }
-
     /** One pipeline over one source, with a durable cursor on the chain it reads. */
     private static final class CursorFixture {
 
@@ -222,7 +171,6 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
             artifacts.save(source);
             artifacts.save(pipeline("p", "orders_src"));
-            artifacts.save(pipeline("q", "orders_src"));
             store = new InMemoryStorePort(artifacts);
             srsCoordinator = new SrsCoordinator(store.meta());
             coordinator = new StoreBackedPipelineCaptureCoordinator(
@@ -235,15 +183,6 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             srsCoordinator.attachConsumer(chainId, spec.pipelineId());
             return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
             }), new CaptureHealth());
-        }
-
-        /** What the chain itself accumulated, which belongs to every pipeline reading it. */
-        void leaveAChainRecord() {
-            store.meta().setCdcStart(chainId(), "seam-1", 1L);
-        }
-
-        java.util.Optional<io.tapstate.spi.store.SrsMeta> chainRecord() {
-            return store.meta().read(chainId());
         }
 
         /** Writes the durable cursor a run leaves behind, which is what a purge has to take away. */

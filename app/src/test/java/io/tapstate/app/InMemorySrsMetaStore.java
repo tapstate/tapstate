@@ -162,9 +162,14 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         }
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(pipelineId));
+        // Every field but the consumers is carried across. The six-argument constructor would
+        // default the snapshot-complete tables to none and both generations to zero, which is not what
+        // a detach does to a chain -- and a generation reset is indistinguishable, later, from a chain
+        // that never opened one.
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
-                m.schemaHistory(), m.retention()));
+                m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(),
+                m.snapshotEpoch()));
     }
 
     private SrsMeta require(String miningChainId) {

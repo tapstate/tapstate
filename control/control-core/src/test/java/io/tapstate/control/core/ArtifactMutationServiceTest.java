@@ -880,8 +880,11 @@ class ArtifactMutationServiceTest {
             List<ConsumerOffset> kept = chain.consumerOffsets().stream()
                     .filter(offset -> !offset.pipelineId().equals(pipelineId))
                     .toList();
+            // Everything but the consumers is carried across; the six-argument constructor would
+            // default the snapshot-complete tables and both generations away, which a detach does not do.
             chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceRead(), kept,
-                    chain.cdcStartPosition(), chain.schemaHistory(), chain.retention()));
+                    chain.cdcStartPosition(), chain.schemaHistory(), chain.retention(),
+                    chain.snapshotCompletedTables(), chain.epoch(), chain.snapshotEpoch()));
         }
 
         @Override
