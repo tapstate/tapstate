@@ -35,11 +35,43 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags and history. One witness here runs a build of the product other than this one, and that
+          # build is assembled below from a release tag plus one commit; a shallow checkout has neither.
+          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
           cache: maven
+
+      - name: the binary an older release line carries
+        id: old-binary
+        # Assembled the way the patch release for an older line is made: that line's tag, plus the one
+        # commit carrying the startup gate, and nothing else. So the witness that rolls back to it is
+        # not pointed at a fixture standing in for an old build -- it is pointed at that build, made by
+        # that recipe. A recipe that has stopped working is red here, before somebody ships by it.
+        #
+        # Both halves are derived rather than written down. A tag pinned here goes stale at the next
+        # release and a commit pinned here goes stale the moment history moves, and in both cases the
+        # lane would go on testing something other than what it says it tests.
+        run: |
+          set -euo pipefail
+          marker=adapters/adapter-mongo-store/src/main/java/io/tapstate/adapters/mongostore/MigrationError.java
+          base="$(git describe --tags --abbrev=0 HEAD)"
+          gate="$(git log --diff-filter=A --format=%H "$base"..HEAD -- "$marker")"
+          if [ "$(printf '%s\n' "$gate" | grep -c .)" != "1" ]; then
+            echo "expected exactly one commit adding $marker since $base, found: ${gate:-none}." \
+                 "That commit is what a patch release for an older line cherry-picks, so without it" \
+                 "this lane cannot build the binary the rollback witness is supposed to be handed" >&2
+            exit 1
+          fi
+          echo "building $base + $gate"
+          git worktree add --detach ../old-binary "$base"
+          git -C ../old-binary cherry-pick -n "$gate"
+          (cd ../old-binary && mvn -B -pl app -am -DskipTests package)
+          jar="$(ls ../old-binary/app/target/app-*-boot.jar)"
+          echo "jar=$(cd "$(dirname "$jar")" && pwd)/$(basename "$jar")" >> "$GITHUB_OUTPUT"
 
       - name: which witnesses asked for this lane
         id: witnesses
@@ -59,6 +91,7 @@ jobs:
         run: >
           mvn -B -pl e2e -am verify
           -Dtapstate.e2e.upgrade-lane=true
+          -Dtapstate.e2e.old-binary-jar=${{ steps.old-binary.outputs.jar }}
           -Dtest=ZzzNoSuchSurefireSelector -Dsurefire.failIfNoSpecifiedTests=false
           -Dit.test=${{ steps.witnesses.outputs.classes }}
           -Dfailsafe.failIfNoSpecifiedTests=false

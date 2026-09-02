@@ -39,7 +39,19 @@ final class RealProcessServer implements ServerHandle {
 
     /** Launches the deliverable and returns once its health probe answers. */
     static RealProcessServer start(String storeUri) {
-        RealProcessServer server = launching(storeUri);
+        return start(storeUri, bootJar());
+    }
+
+    /**
+     * The same, for a build of the product that is not the one this reactor made.
+     *
+     * <p>Only one witness needs this, and it needs it structurally: the reactor builds this build and
+     * nothing else, so a case whose subject is what an <em>older</em> binary does when handed a store
+     * this build has migrated cannot get its subject from here. The jar is built beside the run and
+     * named to it.
+     */
+    static RealProcessServer start(String storeUri, Path jar) {
+        RealProcessServer server = launching(storeUri, jar);
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
@@ -57,7 +69,11 @@ final class RealProcessServer implements ServerHandle {
      * would then always land after the work rather than inside it.
      */
     static RealProcessServer launching(String storeUri) {
-        Path jar = bootJar();
+        return launching(storeUri, bootJar());
+    }
+
+    /** The same, launching the jar named rather than the one this reactor built. See {@link #start(String, Path)}. */
+    static RealProcessServer launching(String storeUri, Path jar) {
         int port = freePort();
         URI baseUrl = URI.create("http://localhost:" + port);
         Path workingDirectory = workingDirectory();
@@ -102,6 +118,16 @@ final class RealProcessServer implements ServerHandle {
     /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
     boolean isAlive() {
         return process.isAlive();
+    }
+
+    /**
+     * What it exited with, for a witness whose subject is the server declining to start.
+     *
+     * <p>"Stopped" and "failed" are not the same outcome to anything supervising the process, so a
+     * witness of a refusal has to be able to tell them apart.
+     */
+    int exitValue() {
+        return process.exitValue();
     }
 
     /** The end of what it said, for a failure message that carries the server's own words. */
