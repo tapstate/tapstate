@@ -45,6 +45,20 @@ jobs:
           java-version: "21"
           cache: maven
 
+      - name: which witnesses asked for this lane
+        id: witnesses
+        run: |
+          set -euo pipefail
+          classes="$(grep -rl 'UpgradeLaneGate.require' e2e/src/test/java/io/tapstate/e2e/ \
+            | xargs -n1 basename | sed 's/\.java$//' | sort | paste -sd, -)"
+          if [ -z "$classes" ]; then
+            echo "no witness calls UpgradeLaneGate.require: either they were removed or the gate was" \
+                 "renamed and this lane now runs nothing" >&2
+            exit 1
+          fi
+          echo "classes=$classes" >> "$GITHUB_OUTPUT"
+          echo "running: $classes"
+
       - name: the binary an older release line carries
         id: old-binary
         # Assembled the way the patch release for an older line is made: that line's tag, plus the one
@@ -72,20 +86,6 @@ jobs:
           (cd ../old-binary && mvn -B -pl app -am -DskipTests package)
           jar="$(ls ../old-binary/app/target/app-*-boot.jar)"
           echo "jar=$(cd "$(dirname "$jar")" && pwd)/$(basename "$jar")" >> "$GITHUB_OUTPUT"
-
-      - name: which witnesses asked for this lane
-        id: witnesses
-        run: |
-          set -euo pipefail
-          classes="$(grep -rl 'UpgradeLaneGate.require' e2e/src/test/java/io/tapstate/e2e/ \
-            | xargs -n1 basename | sed 's/\.java$//' | sort | paste -sd, -)"
-          if [ -z "$classes" ]; then
-            echo "no witness calls UpgradeLaneGate.require: either they were removed or the gate was" \
-                 "renamed and this lane now runs nothing" >&2
-            exit 1
-          fi
-          echo "classes=$classes" >> "$GITHUB_OUTPUT"
-          echo "running: $classes"
 
       - name: run them against a published release
         run: >
