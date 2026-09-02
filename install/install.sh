@@ -339,7 +339,7 @@ telemetry_disclose() {
 
 new_installation_id() {
     if command -v uuidgen >/dev/null 2>&1; then
-        uuidgen | tr 'A-Z' 'a-z'
+        uuidgen | tr '[:upper:]' '[:lower:]'
     else
         od -An -tx1 -N16 /dev/urandom | tr -d ' \n'
     fi
