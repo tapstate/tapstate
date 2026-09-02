@@ -220,8 +220,21 @@ class UpgradeFromPublishedImageIT {
             } else {
                 control.bootstrapAndLogin(USER, PASSWORD);
             }
-            new E2eExecutor(binding(control), new FilePipelineLoader(workspace), TIMEOUT, POLL)
-                    .execute(EnvelopeParser.parse(specification()));
+            try {
+                new E2eExecutor(binding(control), new FilePipelineLoader(workspace), TIMEOUT, POLL)
+                        .execute(EnvelopeParser.parse(specification()));
+            } catch (RuntimeException | AssertionError e) {
+                // A server in a container says why it could not do something in its own log, and nothing
+                // else here reads it. Without this the failure is only ever "the rows did not arrive",
+                // which is the same sentence whether the pipeline was slow, the source was unreadable or
+                // the target could not be written to -- and the one place that distinguishes them is
+                // sitting right there unread.
+                if (server instanceof PublishedImageServer containerised) {
+                    throw new AssertionError(e.getMessage() + "\n\nwhat the released build said:\n"
+                            + containerised.logs(), e);
+                }
+                throw e;
+            }
         }
 
         /**
