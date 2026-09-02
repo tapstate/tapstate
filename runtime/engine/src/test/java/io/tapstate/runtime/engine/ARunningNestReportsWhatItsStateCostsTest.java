@@ -30,6 +30,7 @@ import io.tapstate.runtime.engine.nest.NestLookup;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
 import io.tapstate.runtime.engine.nest.NestTable;
+import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.store.KeyedStateStore;
@@ -39,6 +40,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -188,6 +190,37 @@ class ARunningNestReportsWhatItsStateCostsTest {
     }
 
     @Test
+    @DisplayName("every namespace the tree takes is a namespace the run reports on")
+    void theNamespacesReportedAreTheOnesTheCompiledTreeNames() {
+        Engine engine = new Engine(member);
+        engine.submit(PIPELINE, ordersWithCustomers());
+        try {
+            awaitReading(REFERENCE_INDEX_NAMESPACE, 1);
+
+            Set<String> reported = engine.nestStateReadings(PIPELINE).keySet();
+            List<String> holdingButUnreported = NestTopology
+                    .compile(PIPELINE, STEP, customersTree(), customerTables()::get).stateNamespaces()
+                    .stream()
+                    .filter(namespace -> !member.getMap(namespace).isEmpty())
+                    .filter(namespace -> !reported.contains(namespace))
+                    .toList();
+
+            assertThat(holdingButUnreported)
+                    .describedAs("the two cases above each name a namespace and check it is reported, "
+                            + "which cannot notice a namespace that exists and is reported by nobody - "
+                            + "and state nothing reports is state nothing can alarm on. Asked the other "
+                            + "way round, starting from what the tree says it takes, such a namespace is "
+                            + "the answer rather than the blind spot. Holding something is the condition "
+                            + "because a namespace this tree never reached into has nothing to report and "
+                            + "no growth to miss - reported %s, and the tree also names a parking area "
+                            + "that a round with no key changes never asks of", reported)
+                    .isEmpty();
+        } finally {
+            engine.cancel(PIPELINE);
+        }
+    }
+
+    @Test
     void aPipelineWithNoLiveJobReportsNothingRatherThanAnEmptyState() {
         // Absence and zero call for opposite responses: a state layer that has stopped being reported and
         // one that has emptied look the same to a reader given zeroes for both.
@@ -263,12 +296,25 @@ class ARunningNestReportsWhatItsStateCostsTest {
         return PipelineDagBuilder.build(pipeline, bindings);
     }
 
-    /** orders as the root with the customer each one points at, over the same map-backed state. */
-    private static DAG ordersWithCustomers() {
+    /** The tree the reference cases run, kept apart so the topology can be compiled from the same one. */
+    private static TransformBody.Nest customersTree() {
         Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
                 "customer", null, null, null, null);
-        TransformBody.Nest body = new TransformBody.Nest(null, null,
+        return new TransformBody.Nest(null, null,
                 new NestRoot("order", List.of("order_id"), null, null, List.of(customer)));
+    }
+
+    /** The streams that tree reads, and what identifies a row of each. */
+    private static Map<String, NestTable> customerTables() {
+        Map<String, NestTable> tables = new LinkedHashMap<>();
+        tables.put("order", new NestTable("orders", List.of("order_id")));
+        tables.put("customer", new NestTable("customers", List.of("customer_id")));
+        return tables;
+    }
+
+    /** orders as the root with the customer each one points at, over the same map-backed state. */
+    private static DAG ordersWithCustomers() {
+        TransformBody.Nest body = customersTree();
 
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("order", FromRef.literal("orders"));
@@ -290,9 +336,7 @@ class ARunningNestReportsWhatItsStateCostsTest {
         sources.put("customers", rowsSource("customers",
                 List.of(row("customer_id", 100, "name", "Ada"), row("customer_id", 200, "name", "Grace"))));
 
-        Map<String, NestTable> tables = new LinkedHashMap<>();
-        tables.put("order", new NestTable("orders", List.of("order_id")));
-        tables.put("customer", new NestTable("customers", List.of("customer_id")));
+        Map<String, NestTable> tables = customerTables();
 
         DagBindings bindings = new DagBindings(
                 sources::get,
