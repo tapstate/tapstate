@@ -93,6 +93,12 @@ final class Repl {
      * was busy serving somebody else this second, which is the arrangement working: the interactive
      * reads that took its turn are the ones a person is waiting on.
      */
+    /**
+     * The refusal a resume gets when the pipeline's definition was edited while it ran. Matched by code
+     * rather than by message: the message is prose for a person, and this is a branch.
+     */
+    private static final String INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
+
     private static final Set<String> BUSY_CODES =
             Set.of("connector.instances-busy", "connector.instance-limit-reached");
 
@@ -1080,14 +1086,32 @@ final class Repl {
             case "RUNNING": {
                 int paused = lifecycleOnline("pause", id, null);
                 if (paused != Cli.EXIT_OK) {
-                    // Said rather than left to be inferred from a pipeline that is now merely paused.
-                    // Nothing was lost -- the position is still there -- and trying again is the answer.
-                    err.println("restart: paused but did not resume; the position is still there, so "
-                            + "running restart again picks it up");
-                    err.flush();
                     return paused;
                 }
-                return lifecycleOnline("resume", id, null);
+                LifecycleOutcome resumed = drive("resume", id, null);
+                if (resumed instanceof LifecycleOutcome.Rejected rejected
+                        && INCOMPATIBLE_REVISION.equals(rejected.code())) {
+                    // The one refusal worth more than its own text. Carrying on runs the pipeline as it
+                    // was when it paused, and the definition has been edited since -- so the refusal is
+                    // right, and "try again" is the one thing that will never work. What the caller
+                    // actually wants is named instead.
+                    renderRejection(rejected.code(), rejected.message());
+                    err.println("restart: " + id + " is now paused, and its definition changed while it "
+                            + "ran, so it cannot carry on as it was; 'restart " + id + " --rerun' runs "
+                            + "the new definition and reads the whole source again");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                if (resumed instanceof LifecycleOutcome.Rejected rejected) {
+                    // Any other refusal leaves it paused with everything it had, and trying again is
+                    // an answer -- which the one above is not.
+                    renderRejection(rejected.code(), rejected.message());
+                    err.println("restart: " + id + " is now paused and nothing was lost; running restart "
+                            + "again picks it up");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                return render(resumed);
             }
             case "PAUSED":
                 return lifecycleOnline("resume", id, null);
@@ -1154,9 +1178,17 @@ final class Repl {
     }
 
     private int lifecycleOnline(String verb, String id, Boolean purgeState) {
-        LifecycleOutcome outcome = withFailover(() ->
+        return render(drive(verb, id, purgeState));
+    }
+
+    /** The verb over the wire, unrendered, for a caller that has to read the refusal before showing it. */
+    private LifecycleOutcome drive(String verb, String id, Boolean purgeState) {
+        return withFailover(() ->
                 controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb, purgeState),
                 o -> o instanceof LifecycleOutcome.Unreachable);
+    }
+
+    private int render(LifecycleOutcome outcome) {
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case LifecycleOutcome.Accepted accepted -> {

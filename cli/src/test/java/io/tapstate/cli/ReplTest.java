@@ -108,6 +108,13 @@ class ReplTest {
         final Map<Integer, ConnectorRegisterOutcome> registerOutcomeByLength = new HashMap<>();
         ConnectorListOutcome connectorListOutcome = new ConnectorListOutcome.Unreachable();
         LifecycleOutcome lifecycleOutcome = new LifecycleOutcome.Unreachable();
+        /**
+         * Per-verb outcomes, falling back to {@link #lifecycleOutcome}. A composed verb drives
+         * several of these in one go, and its interesting cases are the ones where they answer
+         * differently -- a pause that goes through and a resume that is refused is the whole of
+         * what "the definition changed under the run" looks like from here.
+         */
+        final Map<String, LifecycleOutcome> lifecycleOutcomeByVerb = new HashMap<>();
         StatusOutcome statusOutcome = new StatusOutcome.Unreachable();
         MetricsOutcome metricsOutcome = new MetricsOutcome.Unreachable();
         SnapshotOutcome snapshotOutcome = new SnapshotOutcome.Unreachable();
@@ -298,7 +305,8 @@ class ReplTest {
                 URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState) {
             lifecycleCalls.add(credential + "@" + baseUrl + " " + verb + " " + pipelineId
                     + (purgeState == null ? "" : " purgeState=" + purgeState));
-            return healthy.contains(baseUrl) ? lifecycleOutcome : new LifecycleOutcome.Unreachable();
+            LifecycleOutcome answer = lifecycleOutcomeByVerb.getOrDefault(verb, lifecycleOutcome);
+            return healthy.contains(baseUrl) ? answer : new LifecycleOutcome.Unreachable();
         }
 
         @Override
@@ -3325,6 +3333,40 @@ class ReplTest {
         assertThat(client.lifecycleCalls).containsExactly(
                 "jwt-tok@http://node1:7900 pause pl1",
                 "jwt-tok@http://node1:7900 resume pl1");
+    }
+
+    @Test
+    void restartOnAPipelineWhoseDefinitionChangedNamesTheOptionThatWorks() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
+        // The pause goes through; the resume is refused because the definition moved under the run.
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-old");
+        client.lifecycleOutcomeByVerb.put("resume", new LifecycleOutcome.Rejected(
+                "lifecycle.incompatible-revision", "rev-old is not rev-new."));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // The refusal is correct and the obvious advice is wrong: nothing about trying again changes the
+        // definition, so a caller told to retry retries forever. What they can actually do is named.
+        assertThat(h.sink().toString()).contains("--rerun");
+        assertThat(h.sink().toString()).doesNotContain("running restart again picks it up");
+    }
+
+    @Test
+    void restartLeftPausedByAnOrdinaryRefusalSaysTryingAgainWorks() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-old");
+        client.lifecycleOutcomeByVerb.put("resume", new LifecycleOutcome.Rejected(
+                "lifecycle.illegal-transition", "Not paused."));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // Its pair above. Every other refusal leaves the pipeline paused with everything it had, and
+        // retrying is a real answer -- so telling both kinds the same thing makes one of them a lie.
+        assertThat(h.sink().toString()).contains("running restart again picks it up");
     }
 
     @Test
