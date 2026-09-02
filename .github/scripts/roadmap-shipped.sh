@@ -108,6 +108,21 @@ set_field() {   # item, field id, the value expression jq built
         projectV2Item { id } } }" >/dev/null
 }
 
+# What the board says about one item now. The mutations report on the request, not on the state that
+# survives it: a project workflow triggered by an item being added lands after them and leaves the
+# item at its own value, with nothing in either response to say so.
+# shellcheck disable=SC2016  # the $ names are GraphQL variables, bound by the -f flags
+read_back() {   # item -> the status on line 1, the released-in text on line 2
+  gh api graphql -f item="$1" -f query='
+    query($item:ID!) { node(id:$item) { ... on ProjectV2Item { fieldValues(first:50) { nodes {
+      ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } }
+      ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { name } } } } } } } }' 2>/dev/null \
+    | jq -r --arg s "$status_field" --arg r "$released_field" '
+        (.data.node.fieldValues.nodes // []) | map(select(.field.name != null))
+        | ((map(select(.field.name == $s)) | first | .name) // ""),
+          ((map(select(.field.name == $r)) | first | .text) // "")'
+}
+
 failed=0
 for i in $issues; do
   # shellcheck disable=SC2016  # GraphQL variables again
@@ -116,7 +131,11 @@ for i in $issues; do
       repository(owner:$owner, name:$repo) { issue(number:$number) { id title } } }' \
     --jq '.data.repository.issue.id' 2>/dev/null)"
   if [ -z "$node" ]; then
-    echo "  #${i}: no such issue in ${repo}, skipped" >&2
+    # Two readings, and this cannot tell them apart: the number is wrong, or the credential cannot
+    # read issues at all. Passing over it in silence made the second one report success having moved
+    # nothing -- the exact shape a roadmap step must not have, since nobody reads a green job.
+    echo "  #${i}: not an issue in ${repo} -- either the number is wrong, or this credential cannot read issues" >&2
+    failed=1
     continue
   fi
   if [ "$dry" = 1 ]; then
@@ -133,11 +152,28 @@ for i in $issues; do
     failed=1
     continue
   fi
-  if set_field "$item" "$status_id" "$shipped_id" singleSelectOptionId &&
-     set_field "$item" "$released_id" "$version" text; then
+  set_field "$item" "$status_id" "$shipped_id" singleSelectOptionId
+  set_field "$item" "$released_id" "$version" text
+  # Asked, not assumed. Measured on the first real release: both mutations answered success for
+  # fifteen issues and the board kept seven of them -- the workflow fires when the item is added, so
+  # it lands after the write and the response carries no sign of it. Writing again wins because that
+  # trigger does not fire twice; three looks bound it, and a value that still will not hold is a
+  # failure rather than a line claiming it moved.
+  status_now=""; released_now=""; attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    board_now="$(read_back "$item")"
+    status_now="$(printf '%s\n' "$board_now" | sed -n 1p)"
+    released_now="$(printf '%s\n' "$board_now" | sed -n 2p)"
+    if [ "$status_now" = "$status_option" ] && [ "$released_now" = "$version" ]; then break; fi
+    [ "$attempt" -lt 3 ] || break
+    set_field "$item" "$status_id" "$shipped_id" singleSelectOptionId
+    set_field "$item" "$released_id" "$version" text
+  done
+  if [ "$status_now" = "$status_option" ] && [ "$released_now" = "$version" ]; then
     echo "  #${i}: ${status_option}, ${released_field} = ${version}"
   else
-    echo "  #${i}: on the board, but the fields were not written" >&2
+    echo "  #${i}: the board says '${status_now:-<unset>}' / '${released_now:-<unset>}' after ${attempt} attempt(s), not '${status_option}' / '${version}'" >&2
     failed=1
   fi
 done
