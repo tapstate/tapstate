@@ -519,6 +519,9 @@ nest.root-fanout-limit-exceeded:
 nest.migration-parking-limit-exceeded:
   message: "Rows on their way to {address} have parked {changes} changes, past the limit of {limit}."
   solution: "These rows are in no document while they sit there and the durable position is held below the change that moved them, so this is worth looking at rather than only raising. Reaching it usually means the half of the move that collects them is not being worked - check that side before raising the limit."
+nest.reference-fanout-limit-exceeded:
+  message: "Row {identity} behind embed {refPath} is referenced by {referrers} rows, past the per-row limit of {limit}."
+  solution: "One change to that row rewrites that many documents, which is what this bounds - it is not a limit on storage, so widening how the references are held does not lift it. Raise the limit if the data really is this wide, or embed the row from the other side so the change travels with one document instead of all of them."
 nest.pending-limit-exceeded:
   message: "Key {key} of nest state {namespace} holds {pending} changes waiting for something that has not arrived, past the limit of {limit}."
   solution: "Check whether the parent rows are simply late or are never coming - a load reading children before their parents fills these queues and empties them again, where a broken reference fills them for good. Raise the limit if the wait is real and this deep."

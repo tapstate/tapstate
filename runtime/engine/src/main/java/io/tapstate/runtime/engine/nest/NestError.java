@@ -125,6 +125,27 @@ public enum NestError implements TapstateErrorCode {
     ROOT_FANOUT_LIMIT_EXCEEDED("nest.root-fanout-limit-exceeded", Set.of("rootKey", "elements", "limit")),
 
     /**
+     * Running: more rows point at one row than are allowed to, so editing that row would redraw and write
+     * out that many documents at once.
+     *
+     * <p><b>The only limit here that is not about storage, and the distinction is the whole of why it
+     * exists.</b> The identities pointing at one row are spread over a fixed number of buckets, so what
+     * records them divides and the layer behind the map carries it however many there are - measured by
+     * entry, this is comfortable. What no store can help with is the far end: every identity recorded there
+     * is a whole document to draw again the moment the row is edited, and nothing folds them, because the
+     * throttle opens its window per document and these are a different document each. So what is refused
+     * here is the rewrite. Raising the bucket count does not soften it, and reading this as an entry that
+     * grew too large is what would lead someone to try.
+     *
+     * <p>Weighed on an edit to the row being pointed at rather than as each row registers, because that is
+     * where the count is already in hand. A row can therefore grow past the limit quietly and be refused
+     * only when it is first edited - which is also the first moment the cost this bounds is about to be
+     * paid.
+     */
+    REFERENCE_FANOUT_LIMIT_EXCEEDED("nest.reference-fanout-limit-exceeded",
+            Set.of("refPath", "identity", "referrers", "limit")),
+
+    /**
      * Running: one key is holding more changes for something that has not arrived than it is allowed to.
      * The second limit that bounds memory, and the one no other reaches: what waits lives inside a single
      * entry, so a budget counting entries is met however long one key's queue has grown, and a limit on the

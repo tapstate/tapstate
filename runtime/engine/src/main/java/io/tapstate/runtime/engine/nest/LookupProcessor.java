@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.LevelBounds;
@@ -55,15 +56,24 @@ final class LookupProcessor extends AbstractProcessor {
     private final NestLookup lookup;
     private final NestStore<Map<String, Object>> store;
     private final NestStore<Set<Object>> references;
+    private final long referrersAllowed;
     private final LevelBounds bounds;
     private final Queue<Object> outgoing = new ArrayDeque<>();
+    private NestFailureRecording failures = NestFailureRecording.of(null);
 
     LookupProcessor(NestLookup lookup, NestStore<Map<String, Object>> store,
-            NestStore<Set<Object>> references, LevelBounds bounds) {
+            NestStore<Set<Object>> references, long referrersAllowed, LevelBounds bounds) {
         this.lookup = Objects.requireNonNull(lookup, "lookup");
         this.store = Objects.requireNonNull(store, "store");
         this.references = Objects.requireNonNull(references, "references");
+        this.referrersAllowed = referrersAllowed;
         this.bounds = bounds;
+    }
+
+    /** Resolves where this vertex writes down what killed it; see {@link NestFailureRecording}. */
+    @Override
+    protected void init(Processor.Context context) {
+        this.failures = NestFailureRecording.of(context);
     }
 
     /**
@@ -87,6 +97,13 @@ final class LookupProcessor extends AbstractProcessor {
      */
     @Override
     public void process(int ordinal, Inbox inbox) {
+        failures.recording(() -> {
+            processRecording(ordinal, inbox);
+            return null;
+        });
+    }
+
+    private void processRecording(int ordinal, Inbox inbox) {
         if (!flush()) {
             return;
         }
@@ -137,10 +154,26 @@ final class LookupProcessor extends AbstractProcessor {
      * propagating at all is the behaviour this whole direction exists to fix. So the only thing bounding
      * this is the ceiling on how many rows may point at one, which fails the job outright rather than
      * letting it quietly grind: what is being refused there is the rewrite, not the storage.
+     *
+     * <p><b>That ceiling is weighed here, and it costs nothing to weigh.</b> Every bucket is in hand
+     * already and every identity in them is about to be walked, so counting them first is a second walk
+     * over what is on the heap rather than a second reach into the state layer - which is what lets the
+     * limit sit on the edit that pays for it rather than on the arrival of each row that registers, where
+     * it would have cost a read of every bucket per row of the pointing stream.
      */
     private void wake(List<Object> key, Envelope event) {
-        for (Set<Object> referrers : references.loadAll(bucketsOf(key)).values()) {
-            for (Object referrer : referrers) {
+        Collection<Set<Object>> buckets = references.loadAll(bucketsOf(key)).values();
+        long referrers = 0;
+        for (Set<Object> bucket : buckets) {
+            referrers += bucket.size();
+        }
+        // Before the words are built rather than after, so a row past the limit allocates none of the queue
+        // it was about to throw away. Only that: they would not have gone out either way, since an
+        // exception leaves before the flush that empties this queue - so nothing observes the ordering, and
+        // no case here asserts it.
+        NestLimits.refuseFanout(lookup, key, referrers, referrersAllowed);
+        for (Set<Object> bucket : buckets) {
+            for (Object referrer : bucket) {
                 outgoing.add(new NestTouch(referrer, event.ts(), event.positions()));
             }
         }

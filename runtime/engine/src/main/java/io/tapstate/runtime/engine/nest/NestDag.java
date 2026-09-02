@@ -112,6 +112,7 @@ public final class NestDag {
         }
         Vertex vertex = dag.newVertex(lookup.name(), ProcessorMetaSupplier.of(
                 new NestLookupSupplier(lookup, binding.stores(),
+                        binding.settings().referrersAllowedIn(lookup.mapName()),
                         frontier == null ? null : frontier.axes(), chainsIntoLookup(lookup, frontier))));
         Vertex source = sources.size() == 1
                 ? sources.get(0)
@@ -303,14 +304,23 @@ public final class NestDag {
 
         private final NestLookup lookup;
         private final NestBinding.NestStores stores;
+
+        /**
+         * How many rows may point at one of these. Carried as the one number rather than as the settings it
+         * was read out of: what is decided where the job is assembled has to travel to the member that
+         * enforces it, and this vertex wants nothing else from them.
+         */
+        private final long referrersAllowed;
+
         private final ChainAxes axes;
         private final Map<Integer, List<String>> chainsByOrdinal;
         private transient NestBinding.NestStores bound;
 
-        private NestLookupSupplier(NestLookup lookup, NestBinding.NestStores stores, ChainAxes axes,
-                Map<Integer, List<String>> chainsByOrdinal) {
+        private NestLookupSupplier(NestLookup lookup, NestBinding.NestStores stores, long referrersAllowed,
+                ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal) {
             this.lookup = lookup;
             this.stores = stores;
+            this.referrersAllowed = referrersAllowed;
             this.axes = axes;
             this.chainsByOrdinal = chainsByOrdinal;
         }
@@ -327,7 +337,7 @@ public final class NestDag {
                 // A level's bounds are worked out per instance, so each processor gets its own: sharing
                 // one would combine what different partitions have seen into a single promise.
                 processors.add(new LookupProcessor(lookup, bound.forLookup(lookup),
-                        bound.forReferences(lookup), axes == null ? null
+                        bound.forReferences(lookup), referrersAllowed, axes == null ? null
                                 : new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING)));
             }
             return processors;
