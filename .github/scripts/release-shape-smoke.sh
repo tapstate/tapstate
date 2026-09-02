@@ -112,6 +112,33 @@ has   "and states the tag it means"                  publish '\-f tag_name='
 hasnt "publishing re-sends no body"                  publish '\-\-notes|body_path|body:'
 hasnt "and does not run the release action again"    publish 'action-gh-release'
 
+# C16. Publishing is what the rest of the release is supposed to hear about, and the credential
+# decides whether anybody hears it. An event caused by GITHUB_TOKEN starts no workflow run, so a
+# draft published with it delivers `release: published` to nothing -- and the deployment that puts
+# the newly released installer on the domain the README tells people to pipe into sh is triggered by
+# exactly that event. Measured 2026-09-03: two releases went out that way and the site kept serving
+# the version before them, with every run green, every pin correct, and nothing red anywhere. The one
+# release that did reach it had been published by a person.
+#
+# So the token is pinned in both directions. Asserting only the app token would pass on a step that
+# had both; asserting only the absence would pass on a step with no token at all, which fails in a
+# way that at least stops.
+hasnt "publishing does not use the credential GitHub makes inert" publish 'GH_TOKEN: \$\{\{ github\.token \}\}'
+has   "and uses one whose events are delivered"                   publish 'GH_TOKEN: \$\{\{ steps\.token\.outputs\.token \}\}'
+has   "minted in this job"                                        publish 'create-github-app-token'
+# And minted before the image push, which is the first act in this job that cannot be taken back. A
+# credential that cannot be minted is the one failure this job can still have, and having it after
+# the push leaves an image in the registry for a release that never happened. Ordering inside a job
+# is invisible to every other case here, and moving a step is the tidy-up that would do it.
+tok_at="$(job publish | grep -n 'create-github-app-token' | head -1 | cut -d: -f1)"
+push_at="$(job publish | grep -n 'imagetools create' | head -1 | cut -d: -f1)"
+if [ -n "$tok_at" ] && [ -n "$push_at" ] && [ "$tok_at" -lt "$push_at" ]; then
+  ok "and minted before anything irreversible"
+else
+  bad "and minted before anything irreversible" \
+      "token step at line ${tok_at:-none} of the job, image push at ${push_at:-none}"
+fi
+
 # C7. Rejected, timed out, or failed on the way: the draft is the one thing a rejection can leave
 # behind that still looks publishable. By id for the same reason publishing is: the edit that blanks
 # the tag orphans the draft, and this is the step that was supposed to collect it.
