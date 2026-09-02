@@ -283,6 +283,57 @@ class NestOperatorCostBench {
         printPerDocument(report);
     }
 
+    /**
+     * What the parking area costs a round that parks nothing. A row of a level's own embed asks, every time
+     * it arrives, what may have been left for the identity it now has - and in a round with no structural
+     * key change nothing ever was, so every one of those asks is for a key that is not in the map and is
+     * not behind it either.
+     *
+     * <p>Measured as its own namespace rather than folded into the level's, because a total over both
+     * would hide it. The level's own reading is mostly served from memory; this one cannot be served from
+     * memory at all, and for a reason no budget changes: <b>an absent key never becomes an entry</b>, so
+     * nothing the round does makes the next ask a hit. The ratio the other phases report as a hit rate is
+     * fixed at one here.
+     *
+     * <p><b>The cold writes are what say whether anything could have been lost rather than merely
+     * re-read.</b> A namespace nothing ever wrote to has nothing an eviction could have dropped, which is
+     * the difference between a round-trip that costs time and one that costs data - and they are the same
+     * count from every other angle.
+     */
+    @Test
+    void whatTheParkingAreaCostsARoundThatParksNothing() {
+        String pipeline = "bench-parking";
+        String level = namespace(pipeline, "items");
+        String parking = level + ".parking";
+        Job job = member.getJet().newJob(parkingDag(pipeline));
+
+        feed("orders", roots());
+        quiesce();
+        Snapshot before = snapshot(level, parking);
+
+        int rows = ROOTS * CHILDREN_PER_ROOT;
+        feed("order_items", children());
+        quiesce();
+        Report report = report(before, snapshot(level, parking), rows);
+
+        job.cancel();
+        print("1:N - what the parking area is asked for in a round that parks nothing", report);
+        assertMeasured(report);
+
+        Counters parked = report.namespaces().get(parking);
+        assertThat(parked.accesses())
+                .describedAs("one ask per row of the level's own embed, whether or not anything is parked")
+                .isEqualTo(rows);
+        assertThat(parked.backfills())
+                .describedAs("every ask went behind the map: an absent key is never resident, so nothing "
+                        + "the round did could make the next one a hit")
+                .isEqualTo(parked.accesses());
+        assertThat(parked.coldSaves())
+                .describedAs("nothing was ever written here, so no eviction could have dropped anything - "
+                        + "what these trips cost is time, not data")
+                .isZero();
+    }
+
     // ---- what a phase is worth --------------------------------------------------------
 
     /**
@@ -407,8 +458,31 @@ class NestOperatorCostBench {
         Embed item = new Embed("item", Map.of("order_id", "order_id"), as,
                 as == EmbedAs.ARRAY ? "items" : "item",
                 as == EmbedAs.ARRAY ? List.of("item_id") : null, null, null, null);
-        return dag(pipeline, item, "order_items", List.of("order_items"),
-                new NestTable("order_items", List.of("item_id")), "item");
+        return dag(pipeline, item, levels("item", new NestTable("order_items", List.of("item_id"))));
+    }
+
+    /**
+     * The same gathering with one more level beneath it, which is the shallowest tree that gives a level a
+     * vertex of its own. A level is compiled into one only when something hangs below it: a two-level tree
+     * is assembled in a single place, so it has no parking area to ask of at all and measuring one there
+     * reports zeroes rather than a cost.
+     */
+    private static DAG parkingDag(String pipeline) {
+        Embed tax = new Embed("tax", Map.of("item_id", "item_id"), EmbedAs.ARRAY, "taxes",
+                List.of("tax_id"), null, null, null);
+        Embed item = new Embed("item", Map.of("order_id", "order_id"), EmbedAs.ARRAY, "items",
+                List.of("item_id"), null, null, List.of(tax));
+        return dag(pipeline, item, levels("item", new NestTable("order_items", List.of("item_id")),
+                "tax", new NestTable("item_taxes", List.of("tax_id"))));
+    }
+
+    /** The levels beneath the root, by the alias each is written under. Ordered, because edges are. */
+    private static Map<String, NestTable> levels(Object... aliasesAndTables) {
+        Map<String, NestTable> levels = new LinkedHashMap<>();
+        for (int level = 0; level < aliasesAndTables.length; level += 2) {
+            levels.put((String) aliasesAndTables[level], (NestTable) aliasesAndTables[level + 1]);
+        }
+        return levels;
     }
 
     /**
@@ -419,23 +493,22 @@ class NestOperatorCostBench {
     private static DAG referencingDag(String pipeline) {
         Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
                 "customer", null, null, null, null);
-        return dag(pipeline, customer, "customers", List.of("customers"),
-                new NestTable("customers", List.of("customer_id")), "customer");
+        return dag(pipeline, customer, levels("customer", new NestTable("customers",
+                List.of("customer_id"))));
     }
 
-    private static DAG dag(String pipeline, Embed embed, String otherStream, List<String> otherSources,
-            NestTable otherTable, String otherAlias) {
+    private static DAG dag(String pipeline, Embed embed, Map<String, NestTable> others) {
         TransformBody.Nest body = new TransformBody.Nest(null, null,
                 new NestRoot("order", List.of("order_id"), null, null, List.of(embed)));
 
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("order", FromRef.literal("orders"));
-        aliases.put(otherAlias, FromRef.literal(otherStream));
+        others.forEach((alias, table) -> aliases.put(alias, FromRef.literal(table.name())));
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
         List<String> sourceNames = new ArrayList<>();
         sourceNames.add("orders");
-        sourceNames.addAll(otherSources);
+        others.values().forEach(table -> sourceNames.add(table.name()));
         PipelineResource resource = new PipelineResource(pipeline, null, sourceNames, List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
@@ -443,11 +516,11 @@ class NestOperatorCostBench {
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
         sources.put("orders", fedSource("orders"));
-        sources.put(otherStream, fedSource(otherStream));
+        others.values().forEach(table -> sources.put(table.name(), fedSource(table.name())));
 
         Map<String, NestTable> tables = new LinkedHashMap<>();
         tables.put("order", new NestTable("orders", List.of("order_id")));
-        tables.put(otherAlias, otherTable);
+        tables.putAll(others);
 
         DagBindings bindings = new DagBindings(
                 sources::get,
