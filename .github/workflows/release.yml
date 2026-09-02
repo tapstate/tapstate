@@ -941,6 +941,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write   # retire the image this attempt pushed, if it did not publish
     steps:
       - uses: actions/checkout@v4
 
@@ -967,6 +968,50 @@ jobs:
           fi
           gh api -X DELETE "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}"
           echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. No tag was created, no image was pushed." >> "$GITHUB_STEP_SUMMARY"
+
+      # The third thing an abandoned attempt leaves behind, and the one nothing used to collect. The
+      # design enumerated two endings after the approval -- everything goes out, or nothing is left
+      # -- and in neither of them does an image exist without a release, so no step was ever written
+      # for it. There is a third ending: approved, image pushed, and the publish that follows it in
+      # the same job fails. Measured 2026-09-02, when `:0.4.1` sat in the registry with no release,
+      # no tag, and nothing anywhere that would have removed it.
+      #
+      # The push stays ahead of the publish. Publishing fires the install-site deployment and the
+      # clean-environment smoke, and both pull the image the moment the release exists; pushing
+      # afterwards would redden those on a release that is fine. So the window is closed from this
+      # end instead.
+      - name: retire the image this attempt pushed
+        if: needs.publish.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          image="ghcr.io/${{ github.repository }}:$version"
+          pkg="${GITHUB_REPOSITORY#*/}"
+          # `gh`'s own errors are left on stderr rather than redirected away. The other step in this
+          # job that hid them reported success while doing nothing at all, and the only way anyone
+          # found out was by opening the thing it claimed to have retired.
+          id="$(gh api --paginate \
+                  "/orgs/${{ github.repository_owner }}/packages/container/$pkg/versions" \
+                  --jq ".[] | select(.metadata.container.tags[]? == \"$version\") | .id" | head -1)"
+          if [ -z "$id" ]; then
+            # Nothing to do is the normal case: most attempts end before the push. It is reported
+            # rather than passed over silently, because "never pushed" and "could not look" arrive
+            # here as the same empty string.
+            echo "::warning::found no image version tagged $version. If $image exists, delete it by hand."
+            echo "$image  no version found to delete" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Not allowed to fail the run: the image is already pushed either way, and a red cleanup
+          # undoes nothing while telling whoever reads it to re-run a release they must not re-run.
+          # The warning is the signal, and it names what a person has to go and do.
+          if gh api -X DELETE \
+               "/orgs/${{ github.repository_owner }}/packages/container/$pkg/versions/$id"; then
+            echo "$image  deleted (package version $id)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::could not delete $image (package version $id). Delete it by hand before the next attempt at $version."
+            echo "$image  NOT deleted -- delete it by hand" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # The documentation site was asked, in an issue, to publish a version that is now not coming.
       # Nothing used to retire that request: two abandoned attempts at one version left two open

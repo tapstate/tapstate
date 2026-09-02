@@ -122,6 +122,29 @@ has "and only when nothing was published"     cleanup "publish.result != 'succes
 # Nothing retired that request: two abandoned attempts at one version left two open issues asking for
 # it, and the person they are assigned to had no way to tell either from a real one.
 has "and retires the request it made of the documentation site" cleanup 'docs-release[.]sh retire'
+# And the image, which is the third thing an abandoned attempt leaves behind and the one nothing
+# used to collect. The design enumerated two endings after the approval -- everything goes out, or
+# nothing is left -- and in neither of them does an image exist without a release, so no step was
+# written for it. There is a third: approved, image pushed, and the publish that follows it in the
+# same job fails. Measured 2026-09-02 -- `ghcr.io/<repo>:0.4.1` sat in the registry for hours with
+# no release, no tag, and nothing anywhere that would ever have removed it.
+#
+# The image is pushed BEFORE the release is published and stays that way: publishing fires the
+# install-site deployment and the clean-environment smoke, and both pull the image the moment the
+# release exists. Pushing afterwards would redden those on a release that is actually fine. So the
+# ordering stands, and the attempt is made atomic from the other end instead.
+has "and retires the image it pushed"         cleanup 'packages/container/.*versions'
+has "and holds the permission to do that"     cleanup 'packages: write'
+# Every one of the three is guarded on nothing having been published, and the image is the one where
+# getting that wrong deletes the image out from under a release that DID go out. A step-level `if:`
+# is invisible to a grep over the whole job, so what is pinned is that there are three of them: drop
+# the guard from the new step and this is 2.
+if [ "$(job cleanup | grep -cE "publish[.]result != 'success'")" = 3 ]; then
+  ok "each of the three is guarded on nothing having been published"
+else
+  bad "each of the three is guarded on nothing having been published" \
+      "wanted 3 (draft, documentation request, image), got $(job cleanup | grep -cE "publish[.]result != 'success'")"
+fi
 
 # --- one dispatch: the pin is this workflow's own first job ----------------------------------------
 # There is no separate workflow to dispatch first. The freeze lasts exactly as long as this job, which
