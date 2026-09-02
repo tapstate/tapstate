@@ -175,7 +175,8 @@ public final class CaptureRunUnit {
                 String firstTable = tables.getFirst();
                 String firstRing = SrsRingbuffer.ringName(cid, firstTable);
                 ringSource = Optional.of(SrsRingSource.create(
-                        firstRing, spec.startFrom(), readCursorPublisher(cid, spec.pipelineId(), firstTable)));
+                        firstRing, spec.startFrom(), readCursorPublisher(cid, spec.pipelineId(), firstTable),
+                        spec.retention()));
             } else if (plan.directTail()) {
                 // srs.enabled:false: the tail streams straight to the consumer with no shared ring. The ring
                 // is the whole of what the flag decides -- the chain is open and its record is kept either

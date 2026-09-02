@@ -6,6 +6,7 @@ import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.AfterAll;
@@ -19,6 +20,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /**
  * The per-consumer ring reader tails one per-table change ring, advancing a run-local cursor by
@@ -267,11 +269,41 @@ class SrsRingReaderTest {
     }
 
     @Test
-    void fromAnInstantOlderThanEveryBufferedChangeReplaysFromHead() {
-        // The ring only goes back so far: an instant older than everything buffered clamps to the head —
-        // the earliest change still available — rather than inventing history the buffer no longer holds.
+    void fromAnInstantOlderThanEveryBufferedChangeRefusesRatherThanStartingAtTheHead() {
+        // The buffer only goes back so far, and starting at its head instead is silent: the reader comes
+        // up healthy and streams a different stretch than the one asked for, with nothing saying so. The
+        // refusal has to carry all three of what was asked for, what is still held, and the retention that
+        // decides how far back that goes -- with any of them missing the reader cannot act on it.
+        assertThatThrownBy(() -> SrsRingReader.from(
+                filledWith("srs.start.at-old", 100, 200),
+                StartFrom.at(Instant.ofEpochMilli(50)),
+                seq -> { },
+                "6h"))
+                .isInstanceOf(TapstateException.class)
+                .extracting(e -> ((TapstateException) e).code())
+                .isEqualTo(CaptureError.START_FROM_OUTSIDE_WINDOW);
+    }
+
+    @Test
+    void theRefusalNamesWhatWasAskedForWhatIsHeldAndTheRetention() {
+        TapstateException refused = catchThrowableOfType(() -> SrsRingReader.from(
+                filledWith("srs.start.at-old-args", 100, 200),
+                StartFrom.at(Instant.ofEpochMilli(50)),
+                seq -> { },
+                "6h"), TapstateException.class);
+
+        assertThat(refused.args())
+                .containsEntry("requested", Instant.ofEpochMilli(50).toString())
+                .containsEntry("earliest", Instant.ofEpochMilli(100).toString())
+                .containsEntry("retention", "6h");
+    }
+
+    @Test
+    void fromTheOldestBufferedChangeItselfIsStillAccepted() {
+        // The control for the two above: this is a judgement about the window, not "anything old is
+        // refused". Without it an implementation that rejects every instant would satisfy them both.
         SrsRingReader reader = SrsRingReader.from(
-                filledWith("srs.start.at-old", 100, 200), StartFrom.at(Instant.ofEpochMilli(50)));
+                filledWith("srs.start.at-head", 100, 200), StartFrom.at(Instant.ofEpochMilli(100)));
         List<SrsItem> out = new ArrayList<>();
 
         assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(2);

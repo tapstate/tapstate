@@ -150,7 +150,7 @@ class SrsRingSourceTest {
 
         SrsReadCursorPublisherFactory factory = member -> SrsRingSourceTest::collect;
         Pipeline p = Pipeline.create();
-        p.readFrom(SrsRingSource.create("srs.chain.cursor", StartFrom.earliest(), factory))
+        p.readFrom(SrsRingSource.create("srs.chain.cursor", StartFrom.earliest(), factory, null))
                 .withoutTimestamps().writeTo(Sinks.list("srs-sink-cursor"));
         IList<SrsItem> sink = hz.getList("srs-sink-cursor");
         Job job = hz.getJet().newJob(p);

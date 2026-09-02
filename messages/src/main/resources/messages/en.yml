@@ -66,6 +66,9 @@ boot.hazelcast-unavailable:
 capture.start-from-unparsable:
   message: "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp."
   solution: "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."
+capture.start-from-outside-window:
+  message: "Cannot start consuming at `{requested}`; the replay buffer only goes back to `{earliest}`, and its retention is `{retention}`."
+  solution: "Start at or after that point, widen the source's srs retention and let the buffer refill, or read the source directly instead."
 capture.event-table-not-selected:
   message: "The capture stream emitted table `{table}`, which this pipeline did not select."
   solution: "Update the source table selection or verify the connector emits the configured table names."

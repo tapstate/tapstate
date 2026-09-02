@@ -29,6 +29,7 @@ artifact.version-conflict
 boot.hazelcast-unavailable
 capture.event-table-not-selected
 capture.snapshot-reports-no-seam
+capture.start-from-outside-window
 capture.start-from-unparsable
 cli.alias-install-dir-unknown
 cli.alias-link-failed
