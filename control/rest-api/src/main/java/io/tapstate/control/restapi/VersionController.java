@@ -1,6 +1,8 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.core.model.Resource;
 import org.springframework.http.ResponseEntity;
+import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
 
@@ -27,14 +29,23 @@ import java.util.Properties;
  *   <li>{@code dataVersion} — the schema version of the system data it is running against.</li>
  * </ul>
  *
- * <p>The last two are in the shape from the first release on, empty until what fills them lands: a
- * client that learns to read them must never have to tell "this server predates the field" from "this
- * server chose to omit it", and a field added later cannot be told apart from either.
+ * <p>All three are in the shape from the first release on. {@code dataVersion} is null on a run with
+ * no store: a client has to be able to tell that from a store nothing has migrated yet, which is zero.
  */
 @Controller
 class VersionController {
 
     private static final String VERSION = readVersion();
+
+    private final SystemDataVersion systemDataVersion;
+
+    /**
+     * Takes the store's schema version if this run has a store. A run without one -- a substrate check,
+     * say -- has no such bean, and reports the field as absent rather than inventing a number for it.
+     */
+    VersionController(@Nullable SystemDataVersion systemDataVersion) {
+        this.systemDataVersion = systemDataVersion;
+    }
 
     // The projection marker, on a handler that stays outside /api. What this annotation records is
     // which registered operation the endpoint answers for, not where it is mounted -- so the one
@@ -47,8 +58,10 @@ class VersionController {
         // an absent value has to travel as an explicit null for a client to read it that way.
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("version", VERSION);
-        body.put("dslVersions", List.of());
-        body.put("dataVersion", null);
+        // The same list the parser accepts against, not a copy of it: a client deciding what it may
+        // send and the server deciding what it will read must not be able to disagree.
+        body.put("dslVersions", Resource.SUPPORTED_VERSIONS);
+        body.put("dataVersion", systemDataVersion == null ? null : systemDataVersion.current());
         return ResponseEntity.ok(body);
     }
 

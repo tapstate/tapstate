@@ -1,5 +1,6 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.core.model.Resource;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -8,6 +9,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -24,6 +26,31 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @DisplayName("the version this build reports, and the build defects that leave it without one")
 class VersionControllerTest {
+
+    @Test
+    void allThreeNumbersAreReportedAndNoneIsDerivedFromAnother() {
+        Map<String, Object> body = new VersionController(() -> 7).version().getBody();
+
+        assertThat(body).containsOnlyKeys("version", "dslVersions", "dataVersion");
+        assertThat(body.get("dslVersions"))
+                .as("the grammar versions reported are the ones the parser accepts, not a second list "
+                        + "kept beside it -- a client deciding what it may send and the parser deciding "
+                        + "what it will read must not be able to disagree")
+                .isEqualTo(Resource.SUPPORTED_VERSIONS);
+        assertThat(body).containsEntry("dataVersion", 7);
+    }
+
+    /**
+     * A run with no store -- a substrate check, say -- has no data version to report. It has to travel
+     * as an explicit absence: zero is a real answer, and it means a store nothing has migrated yet.
+     */
+    @Test
+    void aRunWithNoStoreReportsNoDataVersionRatherThanZero() {
+        Map<String, Object> body = new VersionController(null).version().getBody();
+
+        assertThat(body).containsKey("dataVersion");
+        assertThat(body.get("dataVersion")).isNull();
+    }
 
     @Test
     void theVersionIsTheSubstitutedValueTheBuildFilteredIn() {

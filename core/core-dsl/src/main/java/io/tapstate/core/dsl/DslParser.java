@@ -175,10 +175,13 @@ public final class DslParser {
      */
     private static void requireSupportedVersion(YamlMap doc, MappingNode at) {
         String declared = doc.string("version");
-        if (!Resource.VERSION.equals(declared)) {
+        // Absent is checked on its own: an immutable list refuses to be asked whether it contains null,
+        // so folding the two together turns a document that declares no version -- the commonest way to
+        // get this wrong -- from a diagnostic into a bare crash.
+        if (declared == null || !Resource.SUPPORTED_VERSIONS.contains(declared)) {
             throw YamlMap.error(DslError.UNSUPPORTED_VERSION, "version", at,
                     Map.of("got", declared == null ? "(absent)" : declared,
-                            "supported", Resource.VERSION));
+                            "supported", String.join(", ", Resource.SUPPORTED_VERSIONS)));
         }
     }
 

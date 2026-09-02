@@ -666,12 +666,14 @@ class ControlApiTest {
 
         assertThat(answer.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(answer.getBody()).containsEntry("version", projectVersion);
-        // Both reserved fields are in the shape from the first release on, so a client that learns to
-        // read them never has to tell "this server is too old" from "this server left them out". They
-        // stay empty until what fills them lands. None of the three numbers derives from another: the
-        // product version here, the DSL grammar version, and the system-data version are independent.
+        // Both fields have been in the shape since the first release, so a client that learns to read
+        // them never has to tell "this server is too old" from "this server left them out". None of the
+        // three numbers derives from another: the product version here, the DSL grammar version, and
+        // the system-data version are independent. This assembly has no store, so it has no data
+        // version to report -- absent rather than zero, which would mean a store nothing has migrated.
         assertThat(answer.getBody()).containsKeys("dslVersions", "dataVersion");
-        assertThat((List<?>) answer.getBody().get("dslVersions")).isEmpty();
+        assertThat(answer.getBody().get("dslVersions")).isEqualTo(List.of(Resource.VERSION));
+        assertThat(answer.getBody().get("dataVersion")).isNull();
 
         HttpStatusCode versionUnderApi = client().get().uri("/api/version")
                 .exchange((request, response) -> response.getStatusCode());
