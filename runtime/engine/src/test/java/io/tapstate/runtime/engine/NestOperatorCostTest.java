@@ -85,13 +85,44 @@ import org.junit.jupiter.api.Test;
  * between two collections rather than between two phases - and the error is invisible, because both
  * numbers are plausible.
  *
- * <p>This is an instrument, not a regression test: the thresholds it feeds are asserted elsewhere, and
- * where a number is a duration it is a property of this machine. Its name keeps it out of the default
- * surefire selection, so it costs a build nothing and is run deliberately:
+ * <p><b>This is a gate as well as an instrument, and it runs in the default build.</b> Every table it
+ * prints is a trend record and nothing more; what fails the build is the assertions, and every one of
+ * them is over a count. No assertion here reads a clock. The same tree and the same code measured 6.9 s
+ * on a build machine and over 60 s on a developer's, and loading that developer's machine moved it by a
+ * further factor of nearly four - so a wall-clock gate would be flaky, and a flaky gate is switched off.
+ * A count is a property of the design and carries to any machine.
  *
- * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestOperatorCostBench -Dsurefire.failIfNoSpecifiedTests=false}</pre>
+ * <p><b>Which numbers are pinned exactly, and which are pinned as a property.</b> The distinction is not
+ * a softening; it is the difference between a number the design fixes and a number the run's drain
+ * boundary decides, and pinning the second exactly would produce a gate that reddens on a rerun:
+ *
+ * <ul>
+ *   <li><b>Exact.</b> What one event costs where the operator does not fold: the two touches of a state
+ *       that is read out and written back, the one write behind it, the one document out. Also the trips
+ *       a batch of references turns into, which is fixed by how many distinct rows were asked for and by
+ *       nothing else - not by how many documents asked.</li>
+ *   <li><b>A ratio, because the absolute number floats.</b> Where rows fold into one drain, how many
+ *       drains a phase happens to take moves every absolute count with it (measured across reruns of one
+ *       unchanged tree: 404/202/201 one round, 400/200/200 the next). What does not move is the cost of
+ *       one drain, so that is what is asserted - two touches per write, whatever the drain count.</li>
+ *   <li><b>Bounded, and only where the failure it guards is an order of magnitude.</b> That folding
+ *       happened at all is asserted as a bound rather than a value: folding gone means one write per row
+ *       instead of one per drain, which is a factor of five here, and no drain-boundary jitter reaches
+ *       half that.</li>
+ * </ul>
+ *
+ * <p><b>The rule for changing a number in here, which is the whole value of an exact gate.</b> A gate
+ * that says "exactly" will be reddened by legitimate changes, and the reflex is to update the number and
+ * move on. Doing that turns this into a threshold gate with extra steps - and a threshold gate at least
+ * does not claim to be precise. <b>So: the change that moves a number here says, in the same change set,
+ * what the extra touch or trip or write is and why it has to be there.</b> Not "the baseline moved" - the
+ * mechanism. A number that nobody can account for is a regression that has been written down.
+ *
+ * <p>To run this one alone, with its tables:
+ *
+ * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestOperatorCostTest -Dsurefire.failIfNoSpecifiedTests=false}</pre>
  */
-class NestOperatorCostBench {
+class NestOperatorCostTest {
 
     private static final String STEP = "order_doc";
 
@@ -134,7 +165,7 @@ class NestOperatorCostBench {
         EMITTED.set(0);
         DOCUMENT_BYTES.set(0);
         Config config = new Config();
-        config.setClusterName("nest-operator-cost-bench-" + System.nanoTime());
+        config.setClusterName("nest-operator-cost-gate-" + System.nanoTime());
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
@@ -176,11 +207,17 @@ class NestOperatorCostBench {
         quiesce();
         Report children = report(afterRoots, snapshot(root), ROOTS * CHILDREN_PER_ROOT);
 
+        Report arrivals = report(start, afterRoots, ROOTS);
         job.cancel();
-        print("1:N phase 1 - a root row arriving where nothing was held for it",
-                report(start, afterRoots, ROOTS));
+        print("1:N phase 1 - a root row arriving where nothing was held for it", arrivals);
         print("1:N phase 2 - a row gathered into an array under a root already there", children);
         assertMeasured(children);
+        assertThat(arrivals.emitted())
+                .describedAs("a root arriving is a document; %d arrived and %d came out",
+                        ROOTS, arrivals.emitted())
+                .isEqualTo(ROOTS);
+        assertOneRowPerEvent(arrivals, root, 2);
+        assertFoldedIntoDrains(children, root);
     }
 
     /**
@@ -203,11 +240,19 @@ class NestOperatorCostBench {
         quiesce();
         Report children = report(afterRoots, snapshot(root), ROOTS);
 
+        Report arrivals = report(start, afterRoots, ROOTS);
         job.cancel();
-        print("1:1 phase 1 - a root row arriving where nothing was held for it",
-                report(start, afterRoots, ROOTS));
+        print("1:1 phase 1 - a root row arriving where nothing was held for it", arrivals);
         print("1:1 phase 2 - a single row gathered into an object under a root already there", children);
         assertMeasured(children);
+        assertOneRowPerEvent(arrivals, root, 2);
+        // Nothing folds here - one row per root - so this phase is asserted as an unfolded cost, and the
+        // root it lands under is resident from the phase before, which is what makes the cold reads zero.
+        assertOneRowPerEvent(children, root, 0);
+        assertThat(children.emitted())
+                .describedAs("one row under one root is one document; %d rows produced %d",
+                        ROOTS, children.emitted())
+                .isEqualTo(ROOTS);
     }
 
     /**
@@ -246,6 +291,53 @@ class NestOperatorCostBench {
                         + "have gone behind the map; zero here means the eviction did not take and the "
                         + "cold numbers below are about a path nothing walked")
                 .isPositive();
+
+        assertOneRowPerEvent(report, root, 2);
+        // The reading this whole shape exists to pin. A pointed-at row is fetched once because it is one
+        // row, not once per document that points at it: REFERENCED_ROWS rows were asked for by ROOTS
+        // documents, and it is the first number that decides the trips. Were it the second, every reading
+        // above would be unchanged and every document would still render - the count is the only trace.
+        assertThat(batches.coldLoads())
+                .describedAs("%d documents pointing at %d rows cost %d reads behind the map. It has to be "
+                        + "the row count: a fetch driven by the documents asking would grow with them and "
+                        + "leave every other number, and every document, exactly as they are",
+                        ROOTS, REFERENCED_ROWS, batches.coldLoads())
+                .isEqualTo(REFERENCED_ROWS);
+        assertThat(batches.coldBatchedKeys())
+                .describedAs("the batches asked for %d keys to fetch %d distinct rows, so a key was asked "
+                        + "for more than once - the batch is being formed per document rather than per "
+                        + "drain", batches.coldBatchedKeys(), REFERENCED_ROWS)
+                .isEqualTo(REFERENCED_ROWS);
+        assertThat(batches.coldBatches())
+                .describedAs("%d keys were fetched in %d calls, which is more calls than keys - a batch "
+                        + "that asks for less than one key is not a batch. This is a ceiling and not a "
+                        + "value on purpose: the base splits a batch across partitions today, so the two "
+                        + "are equal, and the work to stop it splitting can only push the calls down",
+                        batches.coldBatchedKeys(), batches.coldBatches())
+                .isLessThanOrEqualTo(batches.coldBatchedKeys());
+        assertThat(batches.coldSaves())
+                .describedAs("fetching a row a document points at wrote %d times. Reading is not writing; "
+                        + "a write here is the pointed-at row being copied somewhere per reader, which is "
+                        + "the one thing this direction exists not to do", batches.coldSaves())
+                .isZero();
+
+        Counters indexEntries = report.namespaces().get(index);
+        assertThat(indexEntries.accesses())
+                .describedAs("%d rows registered themselves against the row they point at with %d touches "
+                        + "of the index. One row, one registration - more means a referring row is being "
+                        + "written into the index more than once", ROOTS, indexEntries.accesses())
+                .isEqualTo(ROOTS);
+        assertThat(indexEntries.coldSaves())
+                .describedAs("%d registrations wrote behind the map %d times. One write each; the entry "
+                        + "being rewritten twice per row is how this grows with fanout without anything "
+                        + "else changing", ROOTS, indexEntries.coldSaves())
+                .isEqualTo(ROOTS);
+        assertThat(indexEntries.coldLoads())
+                .describedAs("the index read behind the map %d times over %d touches, which is more reads "
+                        + "than touches. How many of the touches find their entry resident is the run's "
+                        + "to decide, so this is a ceiling; reading more often than it is asked is not",
+                        indexEntries.coldLoads(), indexEntries.accesses())
+                .isLessThanOrEqualTo(indexEntries.accesses());
     }
 
     /**
@@ -282,6 +374,28 @@ class NestOperatorCostBench {
                         + "edit that did nothing rather than the amplification it is meant to show")
                 .isEqualTo(REFERRERS_OF_ONE_ROW);
         printPerDocument(report);
+
+        // What one edit costs is one document's worth of work per document it reaches - no more, because
+        // redoing a document is redoing a document, and no less, because a cheaper number here would mean
+        // some of the reached documents were not rebuilt. Asserted per document rather than per event:
+        // the event is one, and the whole point is that one event is not one document's worth of work.
+        Counters roots = report.namespaces().get(root);
+        assertThat(roots.accesses())
+                .describedAs("%d documents were rebuilt with %d touches of their state, which is %.3f "
+                        + "each where rebuilding one is two - read it out, write it back. An edit that "
+                        + "reaches a document cannot cost less than rebuilding it, and anything above is "
+                        + "a touch this amplification does not account for",
+                        report.emitted(), roots.accesses(), (double) roots.accesses() / report.emitted())
+                .isEqualTo(2 * REFERRERS_OF_ONE_ROW);
+        assertThat(roots.coldSaves())
+                .describedAs("%d rebuilt documents wrote behind the map %d times, where it is one each",
+                        report.emitted(), roots.coldSaves())
+                .isEqualTo(REFERRERS_OF_ONE_ROW);
+        assertThat(roots.coldLoads())
+                .describedAs("rebuilding the reached documents read %d times behind the map. They were "
+                        + "assembled in the phase before and are resident, so a read here means the edit "
+                        + "path is fetching what it was already holding", roots.coldLoads())
+                .isZero();
     }
 
     /**
@@ -320,6 +434,9 @@ class NestOperatorCostBench {
         job.cancel();
         print("1:N - what the parking area is asked for in a round that parks nothing", report);
         assertMeasured(report);
+        // The level's own cost, held to the same price as any other level holding one row per event. The
+        // parking asks below are counted apart from it, and a total over the two would let either drift.
+        assertOneRowPerEvent(report, level, 2);
 
         Counters parked = report.namespaces().get(parking);
         assertThat(parked.accesses())
@@ -407,6 +524,77 @@ class NestOperatorCostBench {
         assertThat(report.documentBytes())
                 .describedAs("documents came out with no content, which no threshold should be read off")
                 .isPositive();
+    }
+
+    // ---- what the build refuses to let change ------------------------------------------
+
+    /**
+     * What one event costs a level that folds nothing into one drain: two touches of the state - read it
+     * out, change it, write it back - and one write behind the map carrying the result. Every shape a
+     * tree can take pays exactly this at a level holding one row per event, which is why one check stands
+     * over all of them: a shape that costs more is a shape whose carrier grew a touch nobody asked for.
+     *
+     * @param coldReadsPerEvent what the same event costs behind the map, which is a different question
+     *     with a different answer per phase. A key reached for the first time is asked for and then
+     *     written to, and both go behind a map that has nothing for it; a key already resident costs
+     *     none. So this is a parameter rather than a constant, and passing the wrong one is caught by
+     *     the run rather than by review.
+     */
+    private static void assertOneRowPerEvent(Report report, String namespace, long coldReadsPerEvent) {
+        long events = report.events();
+        Counters delta = report.namespaces().get(namespace);
+        assertThat(delta.accesses())
+                .describedAs("[%s] one event reached for the state %.3f times. Two is the entire carrier - "
+                        + "read it out, write it back - so a third touch is one the design does not "
+                        + "account for. If it is deliberate, say in this change what the extra touch is "
+                        + "and why it has to be there; updating the number alone turns this gate into a "
+                        + "threshold that only claims to be exact", namespace,
+                        (double) delta.accesses() / events)
+                .isEqualTo(2 * events);
+        assertThat(delta.coldSaves())
+                .describedAs("[%s] one event wrote behind the map %.3f times. One state, one write out; "
+                        + "two means the same state was written twice in one event", namespace,
+                        (double) delta.coldSaves() / events)
+                .isEqualTo(events);
+        assertThat(delta.coldLoads())
+                .describedAs("[%s] one event read behind the map %.3f times, where this phase costs %d. "
+                        + "Reading more than the phase costs means a key that was resident was fetched "
+                        + "anyway; reading less means the phase is not walking the path it names",
+                        namespace, (double) delta.coldLoads() / events, coldReadsPerEvent)
+                .isEqualTo(coldReadsPerEvent * events);
+    }
+
+    /**
+     * That the rows of one drain were folded, and that the drain cost the same whatever folded into it.
+     * Asserted as a ratio and a bound rather than as values, because the absolute counts move with how
+     * many drains the run happened to take - measured over reruns of one unchanged tree, 404/202/201 one
+     * round and 400/200/200 the next. The cost of a drain does not move, and neither does the factor
+     * folding is worth, so those are the two things worth refusing to let change.
+     */
+    private static void assertFoldedIntoDrains(Report report, String namespace) {
+        Counters delta = report.namespaces().get(namespace);
+        assertThat(delta.coldSaves())
+                .describedAs("[%s] nothing was written, so there were no drains to reason about and the "
+                        + "ratio below would be over zero", namespace)
+                .isPositive();
+        assertThat(delta.accesses())
+                .describedAs("[%s] a drain cost %.3f touches of the state, and a drain is the same read "
+                        + "out and write back as any other event - the rows folding into it are not "
+                        + "supposed to add touches, which is the whole of what folding is for",
+                        namespace, (double) delta.accesses() / delta.coldSaves())
+                .isEqualTo(2 * delta.coldSaves());
+        assertThat(delta.coldLoads())
+                .describedAs("[%s] a fold read behind the map, which it cannot legitimately do: the root "
+                        + "these rows fold into was landed and left resident by the phase before",
+                        namespace)
+                .isZero();
+        assertThat(delta.coldSaves() * 2)
+                .describedAs("[%s] %d rows drained %d times, so folding bought less than the factor of "
+                        + "two this bound allows. Folding gone entirely is one write per row - a factor "
+                        + "of %d here - and no drain-boundary jitter reaches half of that, so this is a "
+                        + "bound on a collapse, not on a number", namespace, report.events(),
+                        delta.coldSaves(), CHILDREN_PER_ROOT)
+                .isLessThanOrEqualTo(report.events());
     }
 
     // ---- printing ---------------------------------------------------------------------
