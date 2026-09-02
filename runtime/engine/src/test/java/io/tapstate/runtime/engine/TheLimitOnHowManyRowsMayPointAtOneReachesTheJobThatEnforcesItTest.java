@@ -155,7 +155,7 @@ class TheLimitOnHowManyRowsMayPointAtOneReachesTheJobThatEnforcesItTest {
 
     /** Named, because what a coded failure is filed under is the job's name. */
     private void run(DAG dag) {
-        member.getJet().newJob(dag, new JobConfig().setName(PIPELINE)).join();
+        JetJobs.submit(member, dag, PIPELINE).join();
     }
 
     // ---- the pipeline under test ------------------------------------------------------

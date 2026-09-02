@@ -157,13 +157,17 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
     void theChainThePointedAtRowsArriveOnKeepsMovingWhileADocumentWaits() {
         run(false);
 
-        // Wait on the thing known to happen, so what follows reads a settled run rather than a race.
-        await(() -> ACKED.contains(acked(ORDERS, MOVING_ORDER_AT)));
-        // Long enough that a chain which is pinned has been pinned measurably, and one that is not has
-        // had every chance to say so: the sources raise their bounds every few milliseconds throughout.
-        LockSupport.parkNanos(TimeUnit.SECONDS.toNanos(4));
+        // Waits for the state this case is about to actually arrive, rather than for a length of time
+        // that was long enough on a quiet machine. Under a full build the same run has taken several
+        // times as long, and a fixed wait that runs out reports "nothing is pinned" - which is the
+        // answer this case is looking for, arrived at by not having looked.
+        Map<String, Long> pinned = awaitPinned(ORDERS);
 
-        Map<String, Long> pinned = new Engine(member).frontierStalls("nest-waiting-frontier");
+        assertThat(pinned)
+                .describedAs("the control, and it is what says the run reached the state being asked "
+                        + "about at all: the waiting order's own chain is pinned, because its row went "
+                        + "out in no document and a restart skipping it would lose it")
+                .containsKey(ORDERS);
 
         assertThat(pinned)
                 .describedAs("the chain the pointed-at rows arrive on is not pinned, while a document is "
@@ -173,14 +177,21 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
                         + "waiting on, with the job running, every document correct and nothing to see. "
                         + "What is pinned: %s", pinned)
                 .doesNotContainKey(CUSTOMERS);
+    }
 
-        assertThat(pinned)
-                .describedAs("the control, and it is what stops the assertion above from passing on a run "
-                        + "where nothing was waiting at all: the waiting order's own chain is pinned, "
-                        + "because its row went out in no document and a restart skipping it would lose "
-                        + "it. Both directions are needed - one alone passes on an implementation that "
-                        + "pins everything, the other on one that pins nothing")
-                .containsKey(ORDERS);
+    /**
+     * The pinned-duration reading, once {@code chain} appears in it. Read at that moment rather than
+     * after a fixed wait: the two chains this case compares are only comparable once the run has got as
+     * far as pinning the one that must be pinned, and how long that takes belongs to the machine.
+     */
+    private Map<String, Long> awaitPinned(String chain) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+        Map<String, Long> pinned = new Engine(member).frontierStalls("nest-waiting-frontier");
+        while (System.nanoTime() < deadline && !pinned.containsKey(chain)) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(100));
+            pinned = new Engine(member).frontierStalls("nest-waiting-frontier");
+        }
+        return pinned;
     }
 
     // ---- the job under test ------------------------------------------------------------
@@ -234,7 +245,7 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
                 () -> new SettledFloor(AXES, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)));
         dag.edge(Edge.from(assembled, outbound.merge(assembled, 1, Integer::sum) - 1)
                 .to(sink, 0).distributed());
-        job = member.getJet().newJob(dag, new JobConfig().setName("nest-waiting-frontier"));
+        job = JetJobs.submit(member, dag, "nest-waiting-frontier");
     }
 
     /** One row a source emits, with the order the engine would have stamped on it. */
@@ -331,8 +342,17 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
         }
     }
 
+    /**
+     * Waits for what a run is supposed to reach, on a budget sized for the slowest way this runs rather
+     * than for a machine with nothing else on it. Measured: alone this case settles in about six seconds,
+     * and under a full build - every module's tests contending for the same cores - the same work took
+     * long enough to run out a thirty second budget entirely. A budget that fits the quiet case turns a
+     * slow build into a red that reads exactly like a chain being pinned, which is the one thing this
+     * case exists to tell apart. Lengthening it costs nothing it was measuring: what it waits for either
+     * happens or does not, and the message names what did happen either way.
+     */
     private static void await(BooleanSupplier reached) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
         while (System.nanoTime() < deadline) {
             if (reached.getAsBoolean()) {
                 return;
