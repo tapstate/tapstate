@@ -20,8 +20,8 @@ class CommandRegistryTest {
         assertThat(registry.invocation(List.of("help")).words()).containsExactly("help");
         assertThat(registry.completer().candidates(List.of(""), 0))
                 .contains("validate", "new", "apply", "help", "exit");
-        assertThat(registry.commandLine().getSubcommands()).containsKeys("validate", "new", "help", "repl")
-                .doesNotContainKey("tui");
+        assertThat(registry.commandLine().getSubcommands()).containsKeys("validate", "new", "help")
+                .doesNotContainKeys("repl", "tui");
     }
 
     @Test
@@ -36,7 +36,7 @@ class CommandRegistryTest {
     }
 
     @Test
-    void preservesTheOneShotAndReplCommandContract() {
+    void preservesTheOneShotAndSharedDispatcherContract() {
         CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
         StringWriter output = new StringWriter();
         StringWriter diagnostics = new StringWriter();

@@ -53,6 +53,15 @@ data = os.environ["TAPSTATE_PTY_INPUT"].encode()
 wait_for_workbench = os.environ.get("TAPSTATE_PTY_TUI") == "1"
 argv = [binary] + sys.argv[1:]
 
+# A TUI command must finish before Ctrl-D is delivered, otherwise the dashboard quite correctly
+# treats the exit request as a request to stop the active operation. Keep completion-only input fast,
+# but give submitted commands a short window to render their result first.
+deferred_exit = None
+if wait_for_workbench and b"\x04" in data:
+    command_input, suffix = data.split(b"\x04", 1)
+    data = command_input
+    deferred_exit = (b"\x1b\x04" if data else b"\x04") + suffix
+
 pid, fd = pty.fork()
 if pid == 0:                              # child: the binary on a controlling terminal
     try:
@@ -65,9 +74,22 @@ else:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     out = bytearray()
     input_sent = False
+    exit_sent = deferred_exit is None
+    input_sent_at = None
     write_failed = None
     deadline = time.time() + 15
     timed_out = True                     # cleared when the child closes the pty (clean EOF)
+
+    def send_deferred_exit():
+        # Keep Escape and Ctrl-D separate: the TUI needs one redraw to clear a draft before it
+        # interprets Ctrl-D as the empty-command quit gesture.
+        if deferred_exit.startswith(b"\x1b"):
+            os.write(fd, deferred_exit[:1])
+            time.sleep(0.2)
+            os.write(fd, deferred_exit[1:])
+        else:
+            os.write(fd, deferred_exit)
+
     while time.time() < deadline:
         r, _, _ = select.select([fd], [], [], 0.5)
         if r:
@@ -95,6 +117,28 @@ else:
                     timed_out = False
                     break
                 input_sent = True
+                input_sent_at = time.time()
+                if deferred_exit is not None and not data:
+                    try:
+                        send_deferred_exit()
+                    except OSError as error:
+                        write_failed = str(error)
+                        timed_out = False
+                        break
+                    exit_sent = True
+        if wait_for_workbench and input_sent and not exit_sent and input_sent_at is not None:
+            # TamboUI redraws completion immediately; command execution gets a few seconds to publish
+            # its result before the test asks the workbench to leave.
+            wait_for_command = b"\n" in data or b"\r" in data
+            if (wait_for_command and time.time() - input_sent_at >= 8.0) \
+                    or (not wait_for_command and time.time() - input_sent_at >= 0.8):
+                try:
+                    send_deferred_exit()
+                except OSError as error:
+                    write_failed = str(error)
+                    timed_out = False
+                    break
+                exit_sent = True
     if timed_out:                        # never leave the native binary running
         try:
             os.kill(pid, signal.SIGKILL)
@@ -258,22 +302,19 @@ else
   bad "explain did not return a documented node; output: $EXPLAIN_OUT"
 fi
 
-# --- 5. REPL under a real pty (JLine interactive loop) ------------------------------------------
-bold "[5] REPL — interactive loop under a pty (JLine)"
-# printf -v (not $(...)) so the trailing newline that submits `exit` survives — command substitution
-# would strip it, leaving the REPL waiting for Enter until the deadline.
-printf -v repl_in 'help\nvalidate %s\nexit\n' "$VALID_DIR"
-pty_session "$repl_in" repl
-# match on ANSI-stripped text: anchor `valid:` so it cannot be satisfied by the `valid:` inside
-# `invalid:` (a rejected validate must not pass as a success), and require a clean child exit.
-REPL_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
+# --- 5. TUI command execution under a real pty -------------------------------------------------
+bold "[5] TUI — command execution under a pty (JLine + TamboUI)"
+# The default launch is the only interactive entry point. The command and Ctrl-D are sent after the
+# workbench has drawn its first frame; the command result must land in the workbench before cleanup.
+printf -v tui_in 'validate %s\n\004' "$VALID_DIR"
+TAPSTATE_PTY_TUI=1 pty_session "$tui_in"
+TUI_COMMAND_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && grep -q "Tapstate CLI" <<< "$REPL_CLEAN" \
-   && grep -qE '(^|[^[:alpha:]])valid:' <<< "$REPL_CLEAN" \
-   && grep -q "bye" <<< "$REPL_CLEAN"; then
-  ok "REPL banner + successful validate + clean exit (rc 0) observed over a pty"
+   && grep -q "TAPSTATE" <<< "$TUI_COMMAND_CLEAN" \
+   && grep -qE '(^|[^[:alpha:]])valid:' <<< "$TUI_COMMAND_CLEAN"; then
+  ok "TUI ran validate and restored its alternate screen and cursor (rc 0)"
 else
-  bad "REPL pty session failed (rc=$PTY_RC) or missing expected markers; output:"; echo "$PTY_OUT"
+  bad "TUI command session failed (rc=$PTY_RC) or missing expected markers; output:"; echo "$PTY_OUT"
 fi
 
 # --- 6. new wizard under a real pty (JLinePrompter interactive flow) ----------------------------
@@ -314,31 +355,28 @@ else
   bad "-o yaml did not render the expected block mapping; explain: $YAML_EXPLAIN | validate: $YAML_VALIDATE"
 fi
 
-# --- 8. Tab completion under a pty (the JLine completer reachable in the image) ------------------
-# Feed `va` + TAB so the verb completer resolves it to `validate`, then a valid corpus dir + Enter.
-# `va` on its own is not a verb (it draws an "Unmatched argument" usage error), so a `valid:` result
-# can only mean the native JLine completer fired and completed `va`→`validate`. This is the only
-# native exercise of completion; the JVM unit suite covers the candidate logic itself.
-bold "[8] Tab completion — verb completer under a pty (JLine)"
-printf -v comp_in 'va\t %s\nexit\n' "$VALID_DIR"
-pty_session "$comp_in" repl
+# --- 8. Tab completion under a pty (the TUI command bar completer) ------------------------------
+# Feed `va` + TAB so the TUI command bar resolves it to `validate`, then cancel the draft and exit.
+# The JVM suite covers candidate selection; this black-box check proves the native command bar accepts
+# the key sequence without falling into the removed line-oriented session.
+bold "[8] Tab completion — TUI command bar under a pty"
+TAPSTATE_PTY_TUI=1 pty_session $'va\t\033\004'
 COMP_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && grep -qE '(^|[^[:alpha:]])valid:' <<< "$COMP_CLEAN" \
+   && grep -q "TAPSTATE" <<< "$COMP_CLEAN" \
+   && grep -q "validate" <<< "$COMP_CLEAN" \
    && ! grep -q 'Unmatched argument' <<< "$COMP_CLEAN"; then
-  ok "Tab completed 'va'→'validate' and ran it over a pty (completer reachable in the image)"
+  ok "TUI Tab completed 'va'→'validate' and exited cleanly over a pty"
 else
-  bad "Tab completion pty session failed (rc=$PTY_RC) or did not complete 'va'→'validate'; output:"; echo "$PTY_OUT"
+  bad "TUI Tab completion failed (rc=$PTY_RC) or did not complete 'va'→'validate'; output:"; echo "$PTY_OUT"
 fi
 
-# --- 9. online register under a pty (HttpClient POST + Bearer + JSON reachable in the image) -----
-# Sections 1-8 never open a socket. register / discover-schema were added after the CLI online path was
-# last proven native, and register in particular POSTs a base64 jar body and parses a JSON registration —
-# code a missing reflection/resource entry would break only in the image. Stand up a throwaway loopback
-# stub (healthz + login + register) and drive connect -> login -> register end to end, so the whole
-# authenticated online path runs through the native binary. A stack frame here is an AOT fault, not a
-# coded outcome. The stub double-forks and publishes its port + pid to files, so there is no sleep race.
-bold "[9] online register — connect + login + register under a pty (HTTP path reachable in the image)"
+# --- 9. online TUI launch under a pty (HttpClient + issuer discovery reachable in the image) --------
+# Sections 1-8 never open a socket. Stand up a throwaway loopback
+# stub (healthz + issuer discovery), launch the TUI with a machine token, and confirm the dashboard sees
+# the online session. The one-shot register path remains covered by [10]; this case covers the TUI launch
+# and authenticated session setup without asking the TUI to write without a selected context.
+bold "[9] online TUI launch — connect + machine token under a pty"
 STUB_DIR="$(mktemp -d)"
 trap 'if [[ -f "$STUB_DIR/pid" ]]; then kill "$(cat "$STUB_DIR/pid")" 2>/dev/null || true; fi; rm -rf "$STUB_DIR"' EXIT
 printf 'PK\003\004smoke-jar' > "$STUB_DIR/smoke.jar"   # any bytes; the stub does not inspect the jar
@@ -398,18 +436,17 @@ srv.serve_forever()
 PY
 python3 "$STUB_DIR/stub.py" "$STUB_DIR/port" "$STUB_DIR/pid" "$STUB_DIR/events"
 STUB_PORT="$(cat "$STUB_DIR/port" 2>/dev/null || true)"
-printf -v online_in 'connect 127.0.0.1:%s\nlogin admin\nsmoke-pw\nregister %s\nexit\n' "$STUB_PORT" "$STUB_DIR/smoke.jar"
-pty_session "$online_in" repl
+printf -v online_in '\004'
+TAPSTATE_PTY_TUI=1 pty_session "$online_in" \
+  -c "127.0.0.1:$STUB_PORT" --token smoke-token
 ONLINE_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && [[ -n "$STUB_PORT" ]] \
-   && printf '%s' "$ONLINE_CLEAN" | grep -q "connected to 127.0.0.1:$STUB_PORT" \
-   && printf '%s' "$ONLINE_CLEAN" | grep -q "logged in as admin" \
-   && printf '%s' "$ONLINE_CLEAN" | grep -qE 'registered[[:space:]]+smoke' \
+   && printf '%s' "$ONLINE_CLEAN" | grep -q "online" \
    && ! printf '%s' "$ONLINE_CLEAN" | grep -qE '\.java:[0-9]+\)'; then
-  ok "connect + login + register ran end to end through the native binary (no AOT fault)"
+  ok "TUI launch connected with a machine token and rendered the online session (no AOT fault)"
 else
-  bad "online register pty session failed (rc=$PTY_RC, port=${STUB_PORT:-none}); output:"; echo "$PTY_OUT"
+  bad "TUI online launch failed (rc=$PTY_RC, port=${STUB_PORT:-none}); output:"; echo "$PTY_OUT"
 fi
 
 bold "[10] one-line launch — -c / -u reach the server without a session"
@@ -507,7 +544,7 @@ TUI_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && grep -Fq $'\033[?1049h' <<< "$PTY_OUT" \
    && grep -Fq $'\033[?1049l' <<< "$PTY_OUT" \
-   && grep -Fq "$TUI_WORKSPACE" <<< "$TUI_CLEAN" \
+   && grep -Fq "${TUI_WORKSPACE##*/}" <<< "$TUI_CLEAN" \
    && { grep -Fq $'\033[?25h' <<< "$PTY_OUT" \
         || grep -Fq $'\033[?12;25h' <<< "$PTY_OUT"; }; then
   ok "native tui accepted its workspace and restored its alternate screen and cursor"

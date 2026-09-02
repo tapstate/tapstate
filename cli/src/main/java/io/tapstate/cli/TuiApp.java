@@ -432,14 +432,15 @@ final class TuiApp {
 
     private CommandResult dispatchOnUiThread(String line) {
         try {
-            if (isTuiBuiltin(line)) {
-                boolean keepRunning = repl.dispatch(line);
-                return new CommandResult(keepRunning, repl.lastExitCode());
-            }
-            return repl.registry().dispatch(repl, repl.registry().invocation(line));
+            boolean keepRunning = repl.dispatch(line);
+            return new CommandResult(keepRunning, repl.lastExitCode());
         } catch (Throwable failure) {
             return new CommandResult(true, Cli.EXIT_DIAGNOSTIC);
         }
+    }
+
+    private static boolean isTuiBuiltin(String line) {
+        return Set.of(":ctx", ":help", ":logout", ":quit").contains(line);
     }
 
     private void drainCommandCompletions() {
@@ -509,10 +510,6 @@ final class TuiApp {
         return verb.equals("context") || verb.equals("new") || verb.equals(":ctx")
                 || verb.equals("connect") || verb.equals("disconnect") || verb.equals("logout")
                 || verb.equals("cd") || (verb.equals("auth") && words.size() > 1 && words.get(1).equals("logout"));
-    }
-
-    private static boolean isTuiBuiltin(String line) {
-        return Set.of(":ctx", ":help", ":logout", ":quit").contains(line);
     }
 
     private boolean isInteractiveLogin(String line) {
@@ -960,7 +957,10 @@ final class TuiApp {
             context = initialContext;
         }
         String principal = contextSession.principal() == null ? session.principal() : contextSession.principal();
-        String notice = contextSession.notice().isBlank() ? uiState.notice() : contextSession.notice();
+        String notice = uiState.notice();
+        if (notice == null || notice.isBlank() || notice.startsWith("ready")) {
+            notice = contextSession.notice();
+        }
         return new TuiDashboard.State(repl.workdir(), context, principal, connection, notice,
                 uiState.command(), uiState.palette(), uiState.paletteIndex(), uiState.prompt(),
                 session.landingNode() == null ? null : session.landingNode().toString(),

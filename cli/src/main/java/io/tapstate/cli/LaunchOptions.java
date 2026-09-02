@@ -88,16 +88,6 @@ final class LaunchOptions {
         return command;
     }
 
-    /** Whether the explicit command asks for the line-oriented interactive session. */
-    boolean isRepl() {
-        return !command.isEmpty() && command.getFirst().equals("repl");
-    }
-
-    /** Converts the exact explicit REPL entry point into the session form consumed by {@link Cli}. */
-    void beginRepl() {
-        command = List.of();
-    }
-
     /** Replaces the launch environment; for tests. */
     LaunchOptions withEnv(UnaryOperator<String> replacement) {
         this.env = replacement;

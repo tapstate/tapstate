@@ -494,7 +494,7 @@ final class Repl {
                     DataBrowserCall.parseLive(live, trimmed.substring(live.length())), live);
             return true;
         }
-        return registry.dispatch(this, registry.invocation(trimmed)).keepRunning();
+        return dispatchWords(CommandInvocation.parse(trimmed).words());
     }
 
     /** The shared tail of both entry points: everything decided by the words rather than the raw line. */

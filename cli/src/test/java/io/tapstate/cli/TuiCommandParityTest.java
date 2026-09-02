@@ -12,15 +12,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TuiCommandParityTest {
 
     @Test
-    void exposesTheSharedRegistryVocabularyAcrossOneShotReplAndTui() {
+    void exposesTheSharedRegistryVocabularyAcrossOneShotAndTui() {
         CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
 
         List<String> oneShot = registry.commandLine().getSubcommands().keySet().stream().toList();
         List<String> repl = registry.completer().candidates(List.of(""), 0);
         List<String> tui = TuiApp.paletteCommands(registry);
 
-        assertThat(oneShot).contains("validate", "help", "repl").doesNotContain("tui");
-        assertThat(repl).contains("validate", "help", "exit");
+        assertThat(oneShot).contains("validate", "help").doesNotContain("repl", "tui");
+        assertThat(repl).contains("validate", "help", "exit").doesNotContain("repl", "tui");
         assertThat(tui).contains("validate", "help", "exit", ":help", ":quit").doesNotContain("tui");
     }
 

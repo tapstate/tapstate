@@ -69,7 +69,7 @@ final class TapstateCompleter implements Completer {
             }
         }
         if ("context".equals(verb) && wordIndex == 1) {
-            return List.of("list", "create", "choose", "edit", "bind", "unbind", "delete")
+            return List.of("list")
                     .stream().filter(value -> value.startsWith(current)).toList();
         }
         if ("explain".equals(verb) && isFirstPositional(words, wordIndex)) {

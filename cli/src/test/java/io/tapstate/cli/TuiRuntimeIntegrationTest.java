@@ -36,7 +36,7 @@ class TuiRuntimeIntegrationTest {
         CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
 
         assertThat(registry.completer().candidates(List.of("context", ""), 1))
-                .contains("list", "create", "choose", "bind");
+                .containsExactly("list");
     }
 
     @Test
@@ -75,6 +75,66 @@ class TuiRuntimeIntegrationTest {
         assertThat(help.keepRunning()).isTrue();
         assertThat(output.toString()).contains("Usage:");
         assertThat(quit.keepRunning()).isFalse();
+    }
+
+    @Test
+    void uiThreadCommandsUseTheReplDispatcher() throws Exception {
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+        StringWriter output = new StringWriter();
+        registry.commandLine().setOut(new java.io.PrintWriter(output));
+        Repl repl = new Repl(registry.commandLine(), Path.of("orders"));
+        TuiApp app = new TuiApp(repl, new StringWriter(), new StringWriter(), null);
+        Method dispatch = TuiApp.class.getDeclaredMethod("dispatchOnUiThread", String.class);
+        dispatch.setAccessible(true);
+
+        CommandResult result = (CommandResult) dispatch.invoke(app, "pwd");
+
+        assertThat(result.keepRunning()).isTrue();
+        assertThat(result.exitCode()).isZero();
+        assertThat(output.toString()).contains("orders");
+    }
+
+    @Test
+    void contextListRunsAsARealTuiCommand(@org.junit.jupiter.api.io.TempDir Path home) throws Exception {
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+        StringWriter output = new StringWriter();
+        registry.commandLine().setOut(new java.io.PrintWriter(output));
+        ContextManager contexts = new ContextManager(ContextConfigStore.underHome(home));
+        Repl repl = new Repl(registry.commandLine(), Path.of("orders"), new HttpControlPlaneClient(),
+                null, System::getenv, null, null, null, contexts);
+        TuiApp app = new TuiApp(repl, new StringWriter(), new StringWriter(), null);
+        Method dispatch = TuiApp.class.getDeclaredMethod("dispatchOnUiThread", String.class);
+        dispatch.setAccessible(true);
+
+        CommandResult result = (CommandResult) dispatch.invoke(app, "context list");
+
+        assertThat(result.keepRunning()).isTrue();
+        assertThat(result.exitCode()).isZero();
+        assertThat(output.toString()).contains("no saved contexts");
+    }
+
+    @Test
+    void submittingContextListLeavesItsResultInTheWorkbenchState(@org.junit.jupiter.api.io.TempDir Path home)
+            throws Exception {
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+        StringWriter output = new StringWriter();
+        registry.commandLine().setOut(new java.io.PrintWriter(output));
+        Repl repl = new Repl(registry.commandLine(), Path.of("orders"), new HttpControlPlaneClient(),
+                null, System::getenv, null, null, null,
+                new ContextManager(ContextConfigStore.underHome(home)));
+        TuiApp app = new TuiApp(repl, output, new StringWriter(), null);
+        Field commandInput = TuiApp.class.getDeclaredField("commandInput");
+        commandInput.setAccessible(true);
+        commandInput.set(app, "context list");
+        Method submit = TuiApp.class.getDeclaredMethod("submit");
+        submit.setAccessible(true);
+
+        assertThat((boolean) submit.invoke(app)).isTrue();
+
+        Field uiState = TuiApp.class.getDeclaredField("uiState");
+        uiState.setAccessible(true);
+        TuiAppState state = (TuiAppState) uiState.get(app);
+        assertThat(state.resultPane().lines()).containsExactly("no saved contexts");
     }
 
     @Test

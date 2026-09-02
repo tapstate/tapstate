@@ -70,32 +70,27 @@ class CliTest {
     }
 
     @Test
-    void replIsTheExplicitInteractiveCommandAndTuiIsNotRegistered() {
+    void tuiIsTheOnlyInteractiveCommandAndLegacyReplIsNotRegistered() {
         assertThat(Cli.newCommandLine().getSubcommands())
-                .containsKey("repl")
-                .doesNotContainKey("tui");
+                .doesNotContainKeys("repl", "tui");
 
-        Run help = run("repl", "--help");
-        Run version = run("repl", "--version");
+        Run legacy = run("repl");
 
-        assertThat(help.code()).isZero();
-        assertThat(help.out()).contains("Usage: tapstate repl").contains("interactive session");
-        assertThat(version.code()).isZero();
-        assertThat(version.out()).contains(Cli.VERSION);
+        assertThat(legacy.code()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(legacy.err()).contains("Unmatched argument at index 0: 'repl'");
     }
 
     @Test
-    void launchOptionsKeepBareLaunchForTheTuiAndRecognizeExplicitRepl() {
+    void launchOptionsKeepBareLaunchForTheTuiAndTreatLegacyReplAsACommand() {
         LaunchOptions tui = LaunchOptions.parse("--context", "dev", "-w", "orders-workspace");
         LaunchOptions repl = LaunchOptions.parse("--context", "dev", "repl");
 
         assertThat(tui.command()).isEmpty();
         assertThat(tui.root()).isEqualTo(Path.of("orders-workspace"));
         assertThat(tui.context()).isEqualTo("dev");
-        assertThat(repl.isRepl()).isTrue();
         assertThat(repl.command()).containsExactly("repl");
         assertThat(Cli.bypassesSessionResolution(tui)).isFalse();
-        assertThat(Cli.bypassesSessionResolution(repl)).isFalse();
+        assertThat(Cli.bypassesSessionResolution(repl)).isTrue();
     }
 
     @Test
