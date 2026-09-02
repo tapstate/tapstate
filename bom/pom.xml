@@ -59,6 +59,16 @@
          also manages these, so all four are pinned here to a single version aligned with the platform's
          managed Mongo line; the stack moves as a unit and cannot skew. -->
     <mongodb.driver.version>5.8.0</mongodb.driver.version>
+    <!-- Calcite: the SQL parser / validator / type deriver behind join declarations. Parsing
+         only, never execution, and core-sql is the only consumer (rule R1). calcite-core's own
+         25 declared dependencies are excluded there and the reachable ones are pinned here, so
+         an upgrade that reintroduces one of the excluded (a runtime Java compiler, a JDBC pool,
+         a geospatial stack) fails the ring gate instead of widening the core ring quietly.
+         avatica and commons-math3 are not optional extras: both are reached from static
+         initializers on the parse/validate path rather than from any call this repo writes. -->
+    <calcite.version>1.35.0</calcite.version>
+    <calcite.avatica.version>1.23.0</calcite.avatica.version>
+    <commons.math3.version>3.6.1</commons.math3.version>
     <!-- Hazelcast: the distributed-coordination substrate and the Jet execution engine (Jet ships
          inside the core artifact). The official Maven Central artifact is used as-is — it is pure
          Apache-2.0 (the HCL-licensed pieces live in separate artifacts, which are banned by the
@@ -142,6 +152,26 @@
         <groupId>org.yaml</groupId>
         <artifactId>snakeyaml</artifactId>
         <version>${snakeyaml.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.calcite</groupId>
+        <artifactId>calcite-core</artifactId>
+        <version>${calcite.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.calcite</groupId>
+        <artifactId>calcite-linq4j</artifactId>
+        <version>${calcite.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.calcite.avatica</groupId>
+        <artifactId>avatica-core</artifactId>
+        <version>${calcite.avatica.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-math3</artifactId>
+        <version>${commons.math3.version}</version>
       </dependency>
       <!-- CEL (Common Expression Language): the §12 ② row-expression layer. Used by core-dsl
            to compile + type-check filter / computed expressions at validate time (never to
