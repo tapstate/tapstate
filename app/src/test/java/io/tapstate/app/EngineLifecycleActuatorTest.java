@@ -210,8 +210,9 @@ class EngineLifecycleActuatorTest {
         }
 
         @Override
-        public Set<String> stateNamespacesOf(String pipelineId) {
-            return idle.stateNamespacesOf(pipelineId);
+        public java.util.List<io.tapstate.core.lifecycle.PipelineStateHolding> stateHeldBy(
+                String pipelineId) {
+            return idle.stateHeldBy(pipelineId);
         }
     }
 }

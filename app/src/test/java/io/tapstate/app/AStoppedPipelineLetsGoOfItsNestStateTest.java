@@ -29,6 +29,8 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
@@ -116,7 +118,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     void namesEveryNamespaceTheTreeKeepsStateIn() {
         InMemoryStorePort store = seedStore();
 
-        Set<String> namespaces = new StoreBackedDagSource(store).stateNamespacesOf(PIPELINE);
+        Set<String> namespaces = namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE));
 
         // Two per compiled vertex - the state itself and the area where a subtree sits while it moves
         // between documents - for the resolver serving the embed that has children and for the assembler;
@@ -131,11 +133,31 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
+    void everythingTheProductDeclaresItKeepsIsAKindItsOwnDescriptionCanName() {
+        InMemoryStorePort store = seedStore();
+
+        List<String> labels = new StoreBackedDagSource(store).stateHeldBy(PIPELINE).stream()
+                .map(PipelineStateHolding::label)
+                .toList();
+
+        // The gate the rendered description cannot be without. That description is written from the
+        // vocabulary, so it stays true about everything in the vocabulary by construction -- and says
+        // nothing at all about a kind of state a real pipeline turns out to hold under a name the
+        // vocabulary never heard of. This is what turns that into a red test rather than a sentence
+        // that is quietly incomplete.
+        assertThat(labels).isNotEmpty();
+        assertThat(PipelineStateInventory.vocabulary().stream()
+                .map(PipelineStateHolding::label).toList())
+                .as("a kind of state the product keeps under a name no surface can speak")
+                .containsAll(labels);
+    }
+
+    @Test
     void aPipelineThatNestsNothingHasNoNamespaceToBeLetGoOf() {
         InMemoryStorePort store = seedStore();
         store.artifacts().save(pipelineWithoutNest());
 
-        assertThat(new StoreBackedDagSource(store).stateNamespacesOf(PIPELINE))
+        assertThat(new StoreBackedDagSource(store).stateHeldBy(PIPELINE))
                 .describedAs("a stop of an ordinary pipeline drops nothing, and notes nothing to drop later")
                 .isEmpty();
     }
@@ -412,8 +434,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         }
 
         @Override
-        public Set<String> stateNamespacesOf(String pipelineId) {
-            return Set.of(namespace);
+        public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
+            return List.of(PipelineStateInventory.OPERATOR_STATE.in(Set.of(namespace)));
         }
     }
 
@@ -533,5 +555,11 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
     private static DiscoveredSourceModel discovered(String connectionId, SourceTable table) {
         return new DiscoveredSourceModel(connectionId, "fake", 0L, new SourceModel(List.of(table)));
+    }
+    /** Where the declared holdings are kept, flattened -- the same reduction the actuator makes. */
+    private static Set<String> namespacesOf(List<PipelineStateHolding> held) {
+        Set<String> namespaces = new java.util.LinkedHashSet<>();
+        held.forEach(holding -> namespaces.addAll(holding.namespaces()));
+        return namespaces;
     }
 }

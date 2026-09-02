@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.PipelineStateInventory;
+
 import java.util.List;
 import java.util.Map;
 
@@ -153,9 +155,14 @@ public final class ControlOperations {
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
+    // The description is rendered from the same declarations a stop works through, both outcomes of
+            // them. Written out by hand it would describe whatever was true when somebody last edited it,
+            // and a description that has fallen behind reads exactly like one that is complete.
     public static final Operation PIPELINE_STOP = mcp(
             "pipeline.stop", Scope.WRITE, true,
-            "Set a Pipeline's desired state to stopped.");
+            "Set a Pipeline's desired state to stopped. purgeState is required and has no default: it "
+                    + "says what becomes of what the Pipeline accumulated. "
+                    + PipelineStateInventory.describeBothOutcomes());
     public static final Operation PIPELINE_PAUSE = new Operation("pipeline.pause", Scope.WRITE, true, null, CLI_ONLY);
     public static final Operation PIPELINE_RESUME = new Operation("pipeline.resume", Scope.WRITE, true, null, CLI_ONLY);
 

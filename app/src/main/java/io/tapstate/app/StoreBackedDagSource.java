@@ -7,6 +7,8 @@ import com.hazelcast.jet.core.Watermark;
 import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
@@ -176,16 +178,18 @@ final class StoreBackedDagSource implements DagSource {
      * ordinary pipeline's stop untouched by any of this.
      */
     @Override
-    public Set<String> stateNamespacesOf(String pipelineId) {
+    public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
         if (!PipelineDagBuilder.hasNest(pipeline)) {
-            return Set.of();
+            return List.of();
         }
         Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
         Set<String> namespaces =
                 new LinkedHashSet<>(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
         namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
-        return namespaces;
+        // The label comes from the declaration rather than being written out here, so what a stop calls
+        // this and what a stop drops are one string rather than two that agree today.
+        return List.of(PipelineStateInventory.OPERATOR_STATE.in(namespaces));
     }
 
     private record SourceVertex(

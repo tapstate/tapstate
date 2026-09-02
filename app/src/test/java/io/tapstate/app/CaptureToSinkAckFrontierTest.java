@@ -227,9 +227,10 @@ class CaptureToSinkAckFrontierTest {
             }
 
             @Override
-            public Set<String> stateNamespacesOf(String pipelineId) {
+            public java.util.List<io.tapstate.core.lifecycle.PipelineStateHolding> stateHeldBy(
+                    String pipelineId) {
                 // The probe adds a vertex, never state: whatever the product keeps is all there is to name.
-                return product.stateNamespacesOf(pipelineId);
+                return product.stateHeldBy(pipelineId);
             }
         };
     }
