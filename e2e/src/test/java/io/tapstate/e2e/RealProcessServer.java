@@ -39,24 +39,74 @@ final class RealProcessServer implements ServerHandle {
 
     /** Launches the deliverable and returns once its health probe answers. */
     static RealProcessServer start(String storeUri) {
+        RealProcessServer server = launching(storeUri);
+        try {
+            awaitHealthy(server.process, server.baseUrl, server.output);
+        } catch (RuntimeException | AssertionError e) {
+            server.process.destroyForcibly();
+            throw e;
+        }
+        return server;
+    }
+
+    /**
+     * Launches the deliverable and returns straight away, without waiting for it to serve.
+     *
+     * <p>For a witness whose subject is something the server does on the way up. Waiting for health
+     * would mean waiting for the very thing such a witness means to interrupt, and the interruption
+     * would then always land after the work rather than inside it.
+     */
+    static RealProcessServer launching(String storeUri) {
         Path jar = bootJar();
         int port = freePort();
         URI baseUrl = URI.create("http://localhost:" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
         Process process = launch(jar, port, storeUri, workingDirectory, output);
-        try {
-            awaitHealthy(process, baseUrl, output);
-        } catch (RuntimeException | AssertionError e) {
-            process.destroyForcibly();
-            throw e;
-        }
         return new RealProcessServer(process, baseUrl, output);
+    }
+
+    /**
+     * Ends the process the way losing power ends it: no signal it can handle, nothing of its own run
+     * on the way out.
+     *
+     * <p>{@link #close()} asks the process to stop and gives it time to, which is what a witness of
+     * ordinary shutdown wants. A witness of a crash wants the opposite, and the difference is not
+     * cosmetic: a process shut down politely gets to finish what it was doing, which is precisely the
+     * state a crash witness needs it never to reach.
+     */
+    void kill() {
+        process.destroyForcibly();
+        try {
+            process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting for the killed server to go away", e);
+        }
     }
 
     @Override
     public URI baseUrl() {
         return baseUrl;
+    }
+
+    /**
+     * Where this launch wrote what it said. Some claims are only about a member's own start - which of
+     * two members did a piece of one-time work, and how often - and the store records how far that work
+     * got rather than who did it, so the account the server gave of itself is the only place to look.
+     */
+    Path output() {
+        return output;
+    }
+
+    /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
+    boolean isAlive() {
+        return process.isAlive();
+    }
+
+    /** The end of what it said, for a failure message that carries the server's own words. */
+    String tail() {
+        return tail(output);
     }
 
     @Override
