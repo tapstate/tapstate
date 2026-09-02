@@ -154,19 +154,40 @@ if [ "$verb" = retire ]; then
         exit 0
     fi
     if [ -z "${number:-}" ]; then
-        echo "$repo  could not identify the request for $tag; withdraw it by hand if it is there" >&2
+        echo "::warning::$repo may still hold an open request for $tag; withdraw it by hand"
+        echo "$repo  could not identify the request for $tag; withdraw it by hand if it is there"
         exit 0
     fi
-    gh issue comment "$number" --repo "$repo" --body \
+    # Every outcome below goes to stdout, and that is the fix rather than a detail. The caller tees
+    # stdout into the step summary; these failures used to go to stderr, which is teed nowhere -- so a
+    # retire that wrote nothing and a retire that worked left the same green step and the same empty
+    # summary. Measured on a real rejected release: neither the comment nor the close landed, and the
+    # only trace anywhere was a line nothing reads.
+    #
+    # gh's own error is kept rather than discarded. `>/dev/null 2>&1` is why the old message could say
+    # "could not" and never why, and whoever picks this up next needs the reason, not the fact.
+    if comment_err="$(gh issue comment "$number" --repo "$repo" --body \
 "Withdrawing this: the release attempt that opened it ended without publishing, so $tag is not
 coming from it. **No documentation work is owed from this issue.**
 
 When $tag is actually released, a new issue is opened here by that release, and that one is the real
-request. Nothing is carried over from this one." >/dev/null 2>&1 || true
-    if gh issue close "$number" --repo "$repo" --reason "not planned" >/dev/null 2>&1; then
-        echo "$repo  withdrew the request for $tag (#$number)"
+request. Nothing is carried over from this one." 2>&1 >/dev/null)"; then
+        commented=yes
     else
-        echo "$repo  could not close #$number -- withdraw it by hand" >&2
+        commented=no
+    fi
+    if close_err="$(gh issue close "$number" --repo "$repo" --reason "not planned" 2>&1 >/dev/null)"; then
+        if [ "$commented" = yes ]; then
+            echo "$repo  withdrew the request for $tag (#$number)"
+        else
+            # Closed with no reason on it -- worse for the person it is assigned to than leaving it
+            # open, because the request leaves their queue with nothing saying why.
+            echo "::warning::$repo#$number was closed for $tag but the explanation could not be posted: $comment_err"
+            echo "$repo  withdrew the request for $tag (#$number), but the explanation did not post"
+        fi
+    else
+        echo "::warning::$repo#$number still asks for $tag, which is not coming -- withdraw it by hand: $close_err"
+        echo "$repo  could not close #$number -- withdraw it by hand: $close_err"
     fi
     exit 0
 fi
