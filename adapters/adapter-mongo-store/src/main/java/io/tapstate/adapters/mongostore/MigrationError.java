@@ -29,7 +29,22 @@ public enum MigrationError implements TapstateErrorCode {
      * moved forward is not opened by a binary that predates the move. Downgrading across a system-data
      * version is not supported: the way back is the backup taken before the upgrade.
      */
-    DATA_NEWER_THAN_BINARY("migration.data-newer-than-binary", Set.of("installed", "supported"));
+    DATA_NEWER_THAN_BINARY("migration.data-newer-than-binary", Set.of("installed", "supported")),
+
+    /**
+     * Another member has held the migration lock for longer than this one is prepared to wait, and the
+     * store is still not at the version this build needs. {@code holder} is the member holding it and
+     * {@code since} when it took it -- both are what an operator needs to go and look at that member,
+     * which is where the answer is.
+     */
+    LOCK_TIMEOUT("migration.lock-timeout", Set.of("holder", "since")),
+
+    /**
+     * A changeset failed. {@code changeset} names it and {@code cause} carries what went wrong
+     * underneath. The recorded version stays at the changeset before this one, so a start that gets
+     * past the cause resumes from here rather than from the beginning.
+     */
+    CHANGESET_FAILED("migration.changeset-failed", Set.of("changeset", "cause"));
 
     private final String code;
     private final Set<String> placeholders;

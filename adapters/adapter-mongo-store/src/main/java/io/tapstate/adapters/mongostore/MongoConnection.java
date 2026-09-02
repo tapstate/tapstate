@@ -6,6 +6,7 @@ import com.mongodb.MongoException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.core.common.TapstateException;
 
 import java.io.IOException;
@@ -16,6 +17,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -41,19 +43,6 @@ public final class MongoConnection implements AutoCloseable {
     /** The database used when the connection URI names none. */
     private static final String DEFAULT_DATABASE = "tapstate";
 
-    /** The id of the one system-data metadata document. */
-    private static final String SCHEMA_DOC_ID = "schema";
-    /** The field on it carrying the schema version the store has been brought to. */
-    private static final String INSTALLED_VERSION = "installedVersion";
-
-    /**
-     * The highest system-data schema version this build knows how to read. A store beyond it is one
-     * this process must not open: it was written by a later build, and reading it here would mean
-     * interpreting a shape nobody described to this code. Zero is the version of a store nothing has
-     * migrated yet, which is every store that predates the migrator.
-     */
-    private static final int SUPPORTED_DATA_VERSION = 0;
-
     private final MongoConnectionSettings settings;
     private MongoClient client;
     private String databaseName;
@@ -63,12 +52,32 @@ public final class MongoConnection implements AutoCloseable {
     }
 
     /**
-     * Opens the client and verifies the store is reachable and is a replica-set. Raises a
-     * {@code store.unreachable} coded diagnostic if the target cannot be reached within the
-     * configured server-selection timeout, or {@code store.not-replica-set} if it is reached but
-     * is a standalone server. On success the client is held open for the process lifetime.
+     * Opens the store and brings its system data to the shape this build expects, in that order, before
+     * the connection is handed to anybody. Everything that touches the store gets its handle from here,
+     * so putting the migration inside makes every one of those things come after it without any wiring
+     * having to say so — and a migration that cannot finish stops the process rather than letting half
+     * of it start.
      */
     public void verify() {
+        verifyConnectivity();
+        try {
+            MigrationRunner.migrate(database());
+        } catch (RuntimeException e) {
+            close();
+            throw e;
+        }
+    }
+
+    /**
+     * Opens the client and verifies the store is reachable and is a replica-set, and nothing further.
+     * Raises a {@code store.unreachable} coded diagnostic if the target cannot be reached within the
+     * configured server-selection timeout, or {@code store.not-replica-set} if it is reached but is a
+     * standalone server. On success the client is held open for the process lifetime.
+     *
+     * <p>Separate from {@link #verify()} for the read-only inspection commands, whose whole point is to
+     * work on a store a normal start refuses on: they have to reach it without changing it.
+     */
+    public void verifyConnectivity() {
         // A repeated verify() must not orphan a previously opened client (its pool and monitor threads).
         close();
 
@@ -99,43 +108,32 @@ public final class MongoConnection implements AutoCloseable {
             opened.close();
             throw new TapstateException(StoreError.NOT_REPLICA_SET, Map.of("target", target), null);
         }
-        // The store answered and is a replica-set, so the last thing to settle before the connection is
-        // handed to anybody is whether what it holds is a shape this build can read. One findOne on one
-        // field: the read path an older release line's patch carries, and the shape every later
-        // migrator stays compatible with.
-        refuseWhenDataIsNewerThanBinary(opened);
         this.client = opened;
     }
 
     /**
-     * Refuses to start against a store whose system data is at a higher schema version than this build
-     * knows. A newer build may have reshaped documents this one would then read as if they were still
-     * in the old shape - silently, and only where the two shapes happen to overlap - so the refusal is
-     * up front and total rather than at the first document that does not fit.
-     *
-     * <p>Downgrading across a system-data version is not supported; the way back is the backup taken
-     * before the upgrade. Costs exactly one {@code findOne} on the overwhelmingly common path, where
-     * the store is at a version this build knows and nothing else happens.
+     * What schema version the store says its system data is at, and what this build has that has not
+     * run against it. Read live rather than reported from the build's own highest changeset: after a
+     * successful start the two agree by construction, and if they ever do not, this shows it instead of
+     * asserting it.
      */
-    private void refuseWhenDataIsNewerThanBinary(MongoClient opened) {
-        Document schema = SystemCollections.SYSTEM_META.on(opened.getDatabase(databaseName))
-                .find(new Document("_id", SCHEMA_DOC_ID))
-                .first();
-        Object installed = schema == null ? null : schema.get(INSTALLED_VERSION);
-        if (installed == null) {
-            // Nothing has ever migrated this store, so nothing in it can be newer than this build.
-            return;
-        }
-        // Only the migrator ever writes this field, so a value that is not a number means something
-        // else did. Refusing is the conservative reading of it: proceeding would be deciding the data
-        // is not newer on the strength of a value nothing here can compare.
-        int version = installed instanceof Number number ? number.intValue() : Integer.MAX_VALUE;
-        if (version > SUPPORTED_DATA_VERSION) {
-            opened.close();
-            throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY,
-                    Map.of("installed", String.valueOf(installed),
-                            "supported", String.valueOf(SUPPORTED_DATA_VERSION)), null);
-        }
+    public MigrationRunner.Status systemDataStatus() {
+        return MigrationRunner.inspect(database());
+    }
+
+    /** Every changeset this build carries, in the order they run. Named for the inspection commands. */
+    public List<String> knownChangeSets() {
+        return MigrationRunner.changeSets().stream().map(ChangeSet::changeSetName).toList();
+    }
+
+    /** What a changeset that has not run would do, without doing any of it. */
+    public List<String> systemDataDryRun() {
+        MongoDatabase database = database();
+        int installed = systemDataStatus().installed();
+        return MigrationRunner.changeSets().stream()
+                .filter(changeSet -> changeSet.version() > installed)
+                .map(changeSet -> changeSet.changeSetName() + ": " + changeSet.dryRunSummary(database))
+                .toList();
     }
 
     /**

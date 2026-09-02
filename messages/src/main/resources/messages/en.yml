@@ -282,6 +282,12 @@ store.tls-ca-unreadable:
 migration.data-newer-than-binary:
   message: "The store holds system data at version {installed}, which is newer than this build supports (up to {supported})."
   solution: "Start a build at or above the one that wrote it. Downgrading across a system-data version is not supported; to go back, restore the backup taken before the upgrade."
+migration.lock-timeout:
+  message: "Another member ({holder}) has been migrating the system data since {since} and has not finished."
+  solution: "Check that member is still running. If it has died, this one takes over on its own once the lock goes stale; if it is stuck, stop it and start this one again."
+migration.changeset-failed:
+  message: "System data changeset {changeset} failed: {cause}"
+  solution: "Fix what the cause names, then start again -- the migration resumes at this changeset rather than repeating the ones before it."
 io.store-unavailable:
   message: "A store operation could not complete: {detail}."
   solution: "Check the store is reachable and healthy, then retry."

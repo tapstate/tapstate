@@ -213,6 +213,15 @@ public enum SystemCollections {
         return physicalNames().get(0);
     }
 
+    /**
+     * The handle on the collection an index declared on this row lands on. A bucket's metadata half is
+     * a physical collection with no row of its own, so this is the only way to reach it without a
+     * second place taking a handle.
+     */
+    public MongoCollection<Document> indexTargetOn(MongoDatabase database) {
+        return database.getCollection(indexTarget());
+    }
+
     /** Every physical collection name expected in {@code database}. */
     public static Set<String> physicalNamesIn(Database database) {
         Set<String> names = new LinkedHashSet<>();

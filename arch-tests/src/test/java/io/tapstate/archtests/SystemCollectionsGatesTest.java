@@ -88,7 +88,8 @@ class SystemCollectionsGatesTest {
      * than one predicate over both: matched as a disjunction, one half could stop matching -- a driver
      * rename, a wrapper introduced -- and the other half would keep the positive control satisfied on
      * its own. Measured while building this gate: breaking the plain-collection half left both
-     * assertions green while eighteen of the nineteen handle-takings went unchecked.
+     * assertions green with only the bucket form still being checked, and the plain form is how every
+     * collection but one is reached.
      */
     private static void assertTakenOnlyInTheRegistry(
             DescribedPredicate<JavaMethodCall> takesAHandle, String form) {
