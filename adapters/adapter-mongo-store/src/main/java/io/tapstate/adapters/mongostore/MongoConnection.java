@@ -41,9 +41,7 @@ public final class MongoConnection implements AutoCloseable {
     /** The database used when the connection URI names none. */
     private static final String DEFAULT_DATABASE = "tapstate";
 
-    /** The collection holding the one system-data metadata document. */
-    private static final String SYSTEM_META = "system_meta";
-    /** The id of that one document. */
+    /** The id of the one system-data metadata document. */
     private static final String SCHEMA_DOC_ID = "schema";
     /** The field on it carrying the schema version the store has been brought to. */
     private static final String INSTALLED_VERSION = "installedVersion";
@@ -120,8 +118,7 @@ public final class MongoConnection implements AutoCloseable {
      * the store is at a version this build knows and nothing else happens.
      */
     private void refuseWhenDataIsNewerThanBinary(MongoClient opened) {
-        Document schema = opened.getDatabase(databaseName)
-                .getCollection(SYSTEM_META)
+        Document schema = SystemCollections.SYSTEM_META.on(opened.getDatabase(databaseName))
                 .find(new Document("_id", SCHEMA_DOC_ID))
                 .first();
         Object installed = schema == null ? null : schema.get(INSTALLED_VERSION);
