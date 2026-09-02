@@ -12,7 +12,6 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
-import com.hazelcast.map.IMap;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.Embed;
@@ -46,38 +45,36 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * That the record of a pointed-at row has an end, and that the end is only reached by a row that was
- * already deleted.
+ * That deleting a row documents point at takes it out of them, rather than leaving them holding its last
+ * known value for ever.
  *
- * <p><b>Both halves are needed and they pull in opposite directions.</b> Keeping every row a document ever
- * pointed at, for as long as the job runs, is a leak nothing reports: the documents are right, the counts
- * are right, and what grows is one entry per row of a table nobody is looking at. Letting go of a row the
- * moment nothing points at it fixes that and introduces something worse - "nothing points at it" is a
- * statement about the documents seen so far and never about the ones to come, and a source sends a row
- * once, so a live row let go of is a row no later document can be given. Such a document renders with the
- * field simply missing, which is what a document with no such row looks like. Neither failure moves a
- * count, so each half needs its own case.
+ * <p><b>Holding the old value is not an error state, which is what makes this worth its own case.</b> An
+ * implementation that reads a pointed-at row once and keeps what it read produces documents that are
+ * complete, well formed and internally consistent; every count is right, nothing is thrown, and the value
+ * they carry was true when it was read. It is wrong only against a source that has since said the row is
+ * gone - and no assertion about a steady state can tell the two apart, because in a steady state they are
+ * the same document.
  *
- * <p>The end that does exist is for a row whose deletion has already been recorded. That record exists to
- * answer documents still naming the row - so they render without the field and go, rather than waiting for
- * an arrival that is in the past - and once no document names it there is nobody left to answer.
+ * <p><b>The first assertion is a control and is not optional.</b> It holds the documents to carrying the
+ * row <em>before</em> the deletion, so a run in which the pointed-at row never reached them at all -
+ * because the fetch never happened, or because the customer stream never started - cannot be read as the
+ * deletion having been honoured. Without it, "the field is absent" is satisfied by a document that never
+ * had it, which is the outcome a broken fetch produces.
  *
- * <p><b>The pair beside this one asks the same two questions through the other door, and that is why both
- * exist.</b> There, the last document stops pointing at the row by being <em>re-pointed</em> somewhere
- * else; here, by being <em>deleted</em>. Those are two separate places in the code that reach the same
- * decision, added at different times for different reasons, and either one can be right while the other
- * does nothing at all - a reclaim wired only to the re-point leaves every deleted document's row standing
- * for the life of the job, and no case driven by re-pointing can see it.
+ * <p>The field is expected to be absent rather than null. A null is a value, and a sink handed one writes
+ * it over whatever is there; absent is how a document says the row it named is not there to show.
  */
-class WhatNothingPointsAtIsLetGoOfOnlyIfItIsAlreadyGoneTest {
+class ADeletedRowLeavesTheDocumentsThatPointedAtItWithoutItTest {
 
     private static final String STEP = "order_doc";
+    private static final String PIPELINE = "deleted-reference";
+
     private static final int CUSTOMER = 7;
     private static final int ORDERS = 3;
+    private static final String NAME = "Ada";
 
     private static final Duration ORDERS_AFTER_CUSTOMER = Duration.ofMillis(400);
-    private static final Duration DELETE_CUSTOMER_AT = Duration.ofMillis(1_600);
-    private static final Duration DELETE_ORDERS_AT = Duration.ofMillis(2_600);
+    private static final Duration DELETE_AT = Duration.ofMillis(2_000);
 
     private static final List<Envelope> WRITTEN = Collections.synchronizedList(new ArrayList<>());
     private static final AtomicLong SEQ = new AtomicLong();
@@ -89,7 +86,7 @@ class WhatNothingPointsAtIsLetGoOfOnlyIfItIsAlreadyGoneTest {
         WRITTEN.clear();
         SEQ.set(0);
         Config config = new Config();
-        config.setClusterName("nest-reclaim-test-" + System.nanoTime());
+        config.setClusterName("nest-deleted-reference-test-" + System.nanoTime());
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
@@ -109,80 +106,68 @@ class WhatNothingPointsAtIsLetGoOfOnlyIfItIsAlreadyGoneTest {
     }
 
     @Test
-    @DisplayName("a deleted row is let go of once the last document pointing at it is deleted too")
-    void theRecordOfADeletedRowEndsWhenNothingPointsAtItAnyMore() {
-        String pipeline = "reclaim-gone";
-        member.getJet().newJob(ordersPointingAtOneCustomer(pipeline, true)).join();
+    @DisplayName("a document stops showing the row it points at once that row is deleted")
+    void everyDocumentThatCarriedTheRowEndsUpWithoutIt() {
+        member.getJet().newJob(ordersPointingAtACustomerThatIsThenDeleted()).join();
 
-        assertThat(referrersRecordedFor(pipeline))
-                .describedAs("every order that was deleted has to have been taken out of what the "
-                        + "customer remembers about who points at it, or what follows is about a "
-                        + "reclamation that could not have happened rather than one that did")
-                .isZero();
-        assertThat(rowsHeldIn(pipeline))
-                .describedAs("the record of the deleted customer is still there with nothing pointing at "
-                        + "it. It is kept for one purpose - answering a document that still names the "
-                        + "row - and there is nobody left to answer, so every deletion a source ever "
-                        + "makes would otherwise leave one of these behind for the life of the job")
-                .isEmpty();
+        assertThat(ordersThatEverCarriedTheCustomer())
+                .describedAs("the control. Every document has to have carried the row at some point, or "
+                        + "the assertion below is satisfied by documents that never had it - which is what "
+                        + "a fetch that never happened produces, and it looks the same from here")
+                .hasSize(ORDERS);
+
+        Map<Object, Map<String, Object>> finalDocuments = latestPerOrder();
+        assertThat(finalDocuments)
+                .describedAs("all of them were emitted again after the deletion; a document not re-emitted "
+                        + "is one the deletion never reached, and it would still be holding the old value")
+                .hasSize(ORDERS);
+        assertThat(finalDocuments.values())
+                .describedAs("none of them still shows the deleted row. Keeping its last value is what an "
+                        + "implementation that reads once and holds does, and those documents are complete, "
+                        + "consistent and wrong only against a source nobody here asks again")
+                .allSatisfy(document -> assertThat(document)
+                        .describedAs("a null would be a value a sink writes over what is there; absent is "
+                                + "how a document says the row it named is not there to show")
+                        .doesNotContainKey("customer"));
     }
 
-    @Test
-    @DisplayName("a row that is still there is kept even when nothing points at it any more")
-    void aLiveRowIsNotLetGoOfJustBecauseNothingPointsAtItRightNow() {
-        String pipeline = "reclaim-live";
-        member.getJet().newJob(ordersPointingAtOneCustomer(pipeline, false)).join();
-
-        assertThat(referrersRecordedFor(pipeline))
-                .describedAs("the orders were deleted here too, so this half differs from the one above "
-                        + "in exactly one thing: whether the customer itself was deleted. If they differ "
-                        + "in what points at it as well, neither says anything about the other")
-                .isZero();
-        assertThat(rowsHeldIn(pipeline))
-                .describedAs("the customer is still there and still carries its fields. Nothing points at "
-                        + "it today, which says nothing about tomorrow: a source sends a row once, so a "
-                        + "live row dropped here is one no later document can ever be given, and such a "
-                        + "document renders with the field missing - the same document a customer that "
-                        + "never existed produces")
-                .containsExactly(Map.entry(List.of(CUSTOMER), row("customer_id", CUSTOMER, "name", "Ada")));
-    }
-
-    // ---- what the state was left holding ----------------------------------------------
-
-    /** The rows the lookup namespace still holds, by the key each is filed under. */
-    private List<Map.Entry<Object, Object>> rowsHeldIn(String pipeline) {
-        IMap<Object, Object> lookup = member.getMap("nest." + pipeline + "." + STEP + ".customer");
-        List<Map.Entry<Object, Object>> held = new ArrayList<>();
-        for (Object key : lookup.keySet()) {
-            held.add(Map.entry(key, lookup.get(key)));
+    /** Which orders were seen carrying the customer at any point in the run. */
+    private static List<Object> ordersThatEverCarriedTheCustomer() {
+        List<Object> carried = new ArrayList<>();
+        for (Envelope written : WRITTEN) {
+            Map<String, Object> document = written.after();
+            if (document == null) {
+                continue;
+            }
+            if (document.get("customer") instanceof Map<?, ?> customer
+                    && NAME.equals(customer.get("name"))
+                    && !carried.contains(document.get("order_id"))) {
+                carried.add(document.get("order_id"));
+            }
         }
-        return held;
+        return carried;
     }
 
-    /** How many referring rows are still recorded against the customer, across every bucket. */
-    private int referrersRecordedFor(String pipeline) {
-        IMap<Object, java.util.Collection<Object>> index =
-                member.getMap("nest." + pipeline + "." + STEP + ".customer.refs");
-        int recorded = 0;
-        for (Object key : index.keySet()) {
-            java.util.Collection<Object> bucket = index.get(key);
-            recorded += bucket == null ? 0 : bucket.size();
+    /** The last document emitted for each order. */
+    private static Map<Object, Map<String, Object>> latestPerOrder() {
+        Map<Object, Map<String, Object>> latest = new LinkedHashMap<>();
+        for (Envelope written : WRITTEN) {
+            Map<String, Object> document = written.after();
+            if (document != null && document.get("order_id") != null) {
+                latest.put(document.get("order_id"), document);
+            }
         }
-        return recorded;
+        return latest;
     }
 
     // ---- the pipeline under test ------------------------------------------------------
 
-    /**
-     * One customer and three orders pointing at it, all three orders deleted at the end. Whether the
-     * customer is deleted before them is the one thing that differs between the two halves.
-     */
-    private static DAG ordersPointingAtOneCustomer(String pipelineId, boolean deleteTheCustomer) {
-        List<Map<String, Object>> orders = new ArrayList<>();
+    private static DAG ordersPointingAtACustomerThatIsThenDeleted() {
+        List<Map<String, Object>> orders = new ArrayList<>(ORDERS);
         for (int i = 1; i <= ORDERS; i++) {
             orders.add(row("order_id", i, "cust_ref", CUSTOMER));
         }
-        Map<String, Object> customer = row("customer_id", CUSTOMER, "name", "Ada");
+        Map<String, Object> customer = row("customer_id", CUSTOMER, "name", NAME);
 
         Embed embed = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
                 "customer", null, null, null, null);
@@ -194,23 +179,17 @@ class WhatNothingPointsAtIsLetGoOfOnlyIfItIsAlreadyGoneTest {
         aliases.put("customer", FromRef.literal("customers"));
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
-        PipelineResource pipeline = new PipelineResource(pipelineId, null,
+        PipelineResource pipeline = new PipelineResource(PIPELINE, null,
                 List.of("orders", "customers"), List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
                 null, null);
 
-        List<Wave> customerWaves = new ArrayList<>();
-        customerWaves.add(new Wave(Duration.ZERO, false, List.of(customer)));
-        if (deleteTheCustomer) {
-            customerWaves.add(new Wave(DELETE_CUSTOMER_AT, true, List.of(customer)));
-        }
-
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
-        sources.put("orders", wavesSource("orders", List.of(
-                new Wave(ORDERS_AFTER_CUSTOMER, false, orders),
-                new Wave(DELETE_ORDERS_AT, true, orders))));
-        sources.put("customers", wavesSource("customers", customerWaves));
+        sources.put("orders", wavesSource("orders", List.of(new Wave(ORDERS_AFTER_CUSTOMER, false, orders))));
+        sources.put("customers", wavesSource("customers", List.of(
+                new Wave(Duration.ZERO, false, List.of(customer)),
+                new Wave(DELETE_AT, true, List.of(customer)))));
 
         Map<String, NestTable> tables = new LinkedHashMap<>();
         tables.put("order", new NestTable("orders", List.of("order_id")));
@@ -238,7 +217,6 @@ class WhatNothingPointsAtIsLetGoOfOnlyIfItIsAlreadyGoneTest {
                 ProcessorSupplier.of((SupplierEx<Processor>) () -> new WavesSource(src, waves)));
     }
 
-    /** Rows to send, whether they are being deleted, and how long after the start they are due. */
     private record Wave(Duration after, boolean deleted, List<Map<String, Object>> rows)
             implements Serializable {
     }
