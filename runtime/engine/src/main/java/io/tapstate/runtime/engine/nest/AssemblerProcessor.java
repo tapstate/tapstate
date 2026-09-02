@@ -105,6 +105,23 @@ public final class AssemblerProcessor extends AbstractProcessor {
      */
     private final Set<Object> keeping = new LinkedHashSet<>();
 
+    /**
+     * Keys held back because a row they point at has not been read yet. Kept so that the word saying such
+     * a row is already filed can be dropped without reading anything: it is sent on every row of a
+     * pointing stream, and on the ordinary path none of them is waiting.
+     *
+     * <p><b>Wrong in only one direction, and it is the harmless one.</b> A key left here after it stopped
+     * waiting costs one drain that had nothing to do; a key missing from here while it waits is the lost
+     * word this exists to deliver. So it is added wherever a wait is seen and removed only where the
+     * document demonstrably went out or went away - never on a path that returned early for some other
+     * reason, where what it is waiting for was not re-decided.
+     *
+     * <p>A restart starts it empty, and needs nothing else: a document waiting on a row it points at has
+     * its own row held short of the durable frontier, so that row is replayed and the document is drawn
+     * again from it, reading the row it wanted rather than being told about it.
+     */
+    private final Set<Object> waiting = new LinkedHashSet<>();
+
     /** When the records of deletion were last swept, or null before the first sweep. */
     private Long forgottenAt;
 
@@ -622,6 +639,12 @@ public final class AssemblerProcessor extends AbstractProcessor {
         // word that a row some level beneath points at was edited, climbing with that level's own changes.
         // The ordinal says which level it came from and says nothing about which of the two it is.
         if (item instanceof NestTouch word) {
+            // A word that only answers a wait is dropped where there is none, before anything is read: it
+            // is sent on every row of a pointing stream whose row is already filed, and drawing those
+            // documents again would double what a stream costs to say nothing new.
+            if (word.onlyIfWaiting() && !waiting.contains(word.key())) {
+                return;
+            }
             // Nothing here changes - what the document should now show is read out of that row's own
             // namespace when it is drawn - so all this does is put the document in the drain, which is
             // what gets it drawn and sent again.
@@ -1016,8 +1039,10 @@ public final class AssemblerProcessor extends AbstractProcessor {
                             return;
                         }
                         if (document.assembly.waitsForARowItPointsAt(slots, resolved)) {
+                            waiting.add(key);
                             return;
                         }
+                        waiting.remove(key);
                         if (mayGoOutNow(key)) {
                             outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
                                     .withPositions(document.assembly.covered()));
@@ -1036,6 +1061,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
                             // The window goes with it. What it was holding back names a key that is gone,
                             // and the row bringing that key back is a change nothing should delay.
                             windows.remove(key);
+                            waiting.remove(key);
                         }
                     });
             store.save(key, document.assembly);
@@ -1173,6 +1199,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
             if (assembly.waitsForARowItPointsAt(slots, references)) {
                 continue;
             }
+            waiting.remove(entry.getKey());
             outgoing.add(Envelope.insert(window.ts, outputStream, rendered.get(), null)
                     .withPositions(assembly.covered()));
             assembly.documentSent();

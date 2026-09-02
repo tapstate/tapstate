@@ -9,6 +9,7 @@ import io.tapstate.runtime.engine.LevelBounds;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -107,8 +108,10 @@ final class LookupProcessor extends AbstractProcessor {
         if (!flush()) {
             return;
         }
+        Map<Object, Map<String, Object>> filed =
+                ordinal == REGISTRATIONS ? rowsNamedIn(inbox) : Map.of();
         for (Object item; (item = inbox.peek()) != null; ) {
-            handle(ordinal, (Envelope) item);
+            handle(ordinal, (Envelope) item, filed);
             inbox.remove();
             if (!flush()) {
                 return;
@@ -116,10 +119,32 @@ final class LookupProcessor extends AbstractProcessor {
         }
     }
 
-    private void handle(int ordinal, Envelope event) {
+    /**
+     * Which of the rows this drain's registrations name are filed already, asked for in one request.
+     *
+     * <p><b>Once per drain rather than once per row, which is the difference between one round trip and
+     * as many as the drain is long.</b> Behind this namespace is a store, and a read of it per arrival of
+     * the pointing stream is exactly the degeneration nothing else here is allowed either - and one that
+     * reads identically to a batch from every angle but a count of the trips.
+     *
+     * <p>Taken before the drain and used throughout it, which is sound because the two edges are drained
+     * separately: nothing files a row while this ordinal is being worked, so the reading cannot go stale
+     * inside the loop. A row filed after this drain arrives to a bucket that now names the registration,
+     * and is answered by the wake on its own arrival - the two paths meet exactly, with no gap and no
+     * overlap.
+     */
+    private Map<Object, Map<String, Object>> rowsNamedIn(Inbox inbox) {
+        Collection<Object> named = new LinkedHashSet<>();
+        for (Object item : inbox) {
+            named.add(NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), lookup.referenceFields()));
+        }
+        return store.loadAll(named);
+    }
+
+    private void handle(int ordinal, Envelope event, Map<Object, Map<String, Object>> filed) {
         Map<String, Object> row = NestKeys.rowOf(event);
         if (ordinal == REGISTRATIONS) {
-            register(row, NestKeys.isDeletion(event));
+            register(event, row, filed);
             return;
         }
         if (ordinal == DEPARTED_REGISTRATIONS) {
@@ -174,7 +199,7 @@ final class LookupProcessor extends AbstractProcessor {
         NestLimits.refuseFanout(lookup, key, referrers, referrersAllowed);
         for (Set<Object> bucket : buckets) {
             for (Object referrer : bucket) {
-                outgoing.add(new NestTouch(referrer, event.ts(), event.positions()));
+                outgoing.add(new NestTouch(referrer, event.ts(), event.positions(), false));
             }
         }
     }
@@ -204,16 +229,60 @@ final class LookupProcessor extends AbstractProcessor {
      * adding and removing the same identity in the same bucket, from two deliveries the engine is free to
      * hand over in either order, so which one won would be a coin toss nothing reports.
      */
-    private void register(Map<String, Object> row, boolean deleted) {
+    private void register(Envelope event, Map<String, Object> row,
+            Map<Object, Map<String, Object>> filed) {
         List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields());
         List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity());
         Object bucket = NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer));
-        if (deleted) {
+        if (NestKeys.isDeletion(event)) {
             references.remove(bucket, referrer);
             reclaimIfNothingPointsAtIt(referenced);
-        } else {
-            references.add(bucket, referrer);
+            return;
         }
+        references.add(bucket, referrer);
+        if (filed.containsKey(referenced)) {
+            tellItWhatItMissed(referrer, event);
+        }
+    }
+
+    /**
+     * Tells one row that what it points at is here already, where it is.
+     *
+     * <p><b>The two deliveries race and only one order of them was answered.</b> A row and the identities
+     * pointing at it arrive on separate edges from separate streams, so the engine hands them over in
+     * whichever order it likes. Waking on the row's arrival answers the order where the pointing came
+     * first; in the other order the row is filed while no bucket names anybody, it says nothing, and the
+     * registration that follows records an identity and goes quiet. The document is then parked waiting
+     * for an arrival that has already happened, and no later event is coming to say so.
+     *
+     * <p><b>Nothing reports it.</b> The job stays running, nothing is thrown, no count moves, no row is
+     * discarded, and every document that did assemble is correct - so the only trace is one document that
+     * never appears. Measured over twenty runs of the job-level witness, three hung this way.
+     *
+     * <p><b>An entry that is here but empty is an answer too, and the one that ends the wait.</b> A row
+     * deleted before anything pointed at it is left standing as an empty row for exactly this, so the
+     * document renders without the field and goes rather than waiting for ever. Present-and-empty and
+     * absent are different answers here, which is why the test is against absence and not against content.
+     *
+     * <p><b>What it carries is this arrival, not the one it missed.</b> The change that lets the document
+     * be drawn now is this registration, and its positions are the ones a frontier must not pass before
+     * the document has gone. The earlier arrival needs none: filing a row nothing pointed at owed nothing
+     * to any chain, which is why that chain was never held back for it.
+     *
+     * <p><b>It goes as the word that is dropped where nothing was waiting, and that mark is what makes it
+     * affordable.</b> On the ordinary path the row has been filed since long before the stream pointing at
+     * it started, so every one of these finds a document that resolved the row on its own. Sent as an
+     * edit, each would draw and send that document a second time - measured over two hundred, twice the
+     * records downstream and two and a half times the reach into the assembling vertex's state, all of it
+     * on the path where nothing is ever waiting.
+     *
+     * <p>What it does cost is the reading of the row namespace this drain already took in one request.
+     * That is the price of the one ordering no other place can answer: whether the row is here is not
+     * knowable from the pointing row, and the vertex that does know it is waiting cannot be told without
+     * an edge back to this one.
+     */
+    private void tellItWhatItMissed(List<Object> referrer, Envelope event) {
+        outgoing.add(new NestTouch(referrer, event.ts(), event.positions(), true));
     }
 
     /**
