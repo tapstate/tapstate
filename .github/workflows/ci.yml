@@ -210,7 +210,7 @@ jobs:
       # taken back are all downstream of the approval, and every one of them is one line from
       # moving; a rejected release is otherwise the only thing that would find out.
       - name: The release workflow still puts every irreversible act after the approval
-        run: bash .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh
+        run: bash .github/scripts/release-shape-smoke.sh
 
       # Same reason, one lane over. The quickstart lanes run nightly against published releases, so
       # what they cover is never read on a pull request -- and the edits that hollow them out are one

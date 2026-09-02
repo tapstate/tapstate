@@ -78,9 +78,9 @@ hasnt "the publish path retires no branches of its own" satellites 'unbranch'
 for j in $jobs_list; do
   case "$j" in publish|satellites) continue ;; esac
   body="$(job "$j")"
-  if grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest=|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
+  if grep -qE 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
     bad "no irreversible act in '$j'" \
-        "$(grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=|satellites[.]sh release|docs-release[.]sh settle' <<<"$body" | head -1)"
+        "$(grep -E 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body" | head -1)"
   else
     ok "no irreversible act in '$j'"
   fi
@@ -94,13 +94,29 @@ hasnt "the image is not rebuilt after approval" publish      'build-push-action'
 
 # C6. The publish step edits the existing release; it never re-sends a body. Re-running the action
 # that assembled the draft would overwrite whatever the approver wrote, and nothing would say so.
-has   "publishing edits the draft that was reviewed" publish 'gh release edit'
+#
+# It reaches that release by its id, which nothing can change, and never by its tag name, which the
+# approver can. Editing a draft's body through the API without re-sending `tag_name` blanks the tag
+# to `untagged-<hex>`, and editing that body at the approval point is one of the four things the
+# design asks the approver to do. Measured 2026-09-02: one such edit took out the publish and the
+# cleanup meant to catch it in the same run, because both looked the release up by a name it no
+# longer answered to. It left an orphan draft nothing would collect, and spent the version.
+has   "publishing edits the draft that was reviewed" publish 'releases/\$\{\{ needs\.draft\.outputs\.id \}\}'
+hasnt "and never by the tag the approver can blank"  publish 'gh release (edit|view|delete)'
+# Addressing by id alone would be worse than the bug it fixes: it finds the release and publishes it
+# under `untagged-<hex>` -- a real tag on a real release, instead of a run that failed loudly. So the
+# publish states the tag it means, and a blanked one is repaired on the way out.
+# The field as sent, not the word: the step also reads `.tag_name` back out of the response, and a
+# case matching the bare word was satisfied by that readback while the field itself was gone.
+has   "and states the tag it means"                  publish '\-f tag_name='
 hasnt "publishing re-sends no body"                  publish '\-\-notes|body_path|body:'
 hasnt "and does not run the release action again"    publish 'action-gh-release'
 
 # C7. Rejected, timed out, or failed on the way: the draft is the one thing a rejection can leave
-# behind that still looks publishable.
-has "a rejected run deletes its draft"        cleanup 'gh release delete'
+# behind that still looks publishable. By id for the same reason publishing is: the edit that blanks
+# the tag orphans the draft, and this is the step that was supposed to collect it.
+has "a rejected run deletes its draft"        cleanup '\-X DELETE .*releases/\$\{\{ needs\.draft\.outputs\.id \}\}'
+hasnt "and not by the tag either"             cleanup 'gh release (view|delete)'
 has "and only when nothing was published"     cleanup "publish.result != 'success'"
 # The documentation site was asked, in an issue, to publish a version that is now not being released.
 # Nothing retired that request: two abandoned attempts at one version left two open issues asking for

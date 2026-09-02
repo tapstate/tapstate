@@ -566,6 +566,10 @@ jobs:
       contents: write   # create the draft release
     outputs:
       url: ${{ steps.create.outputs.url }}
+      # The handle everything downstream uses. A release's tag name is not one: the approver is asked
+      # to edit this draft's body, and an edit that does not re-send `tag_name` blanks it to
+      # `untagged-<hex>`, after which a lookup by tag misses a release sitting right there.
+      id: ${{ steps.create.outputs.id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -715,15 +719,32 @@ jobs:
       # passed: whoever reviewed the draft may have edited the body, and re-sending the assembled body
       # would silently put their edit back the way it was.
       #
-      # `--latest` is the floating pointer, and it is the reason a fix to an older line is worked out
-      # from that line's own history. Publishing 0.5.1 after 0.6.0 must not point new installs at 0.5.1.
+      # `make_latest` is the floating pointer, and it is the reason a fix to an older line is worked
+      # out from that line's own history. Publishing 0.5.1 after 0.6.0 must not point new installs at
+      # 0.5.1.
+      #
+      # By release id, and `tag_name` sent rather than inherited. The draft is reached by the one
+      # handle the approval point cannot change: an edit to the body that omits `tag_name` blanks it
+      # to `untagged-<hex>`, and both this step and the cleanup meant to catch it then look for a
+      # release by a name it no longer answers to. Measured 2026-09-02 -- the publish failed, the
+      # orphan draft outlived the run, and the version was spent.
       - name: publish the draft, and move the floating pointer only if this is the newest line
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release edit "${{ needs.version.outputs.tag }}" \
-            --draft=false \
-            --latest=${{ needs.version.outputs.is_latest }}
+          published="$(gh api -X PATCH \
+            "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}" \
+            -F draft=false \
+            -f tag_name="${{ needs.version.outputs.tag }}" \
+            -f make_latest="${{ needs.version.outputs.is_latest }}" \
+            --jq '.tag_name')"
+          # The one field that changed silently the day this went wrong, so it is the one read back.
+          # Publishing under a blanked tag would put `untagged-<hex>` on a real release and a real
+          # git tag -- worse than the failure it replaced, because that one at least stopped.
+          if [ "$published" != "${{ needs.version.outputs.tag }}" ]; then
+            echo "published as '$published', expected '${{ needs.version.outputs.tag }}'" >&2
+            exit 1
+          fi
       - name: what went out
         run: |
           {
@@ -928,14 +949,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # An attempt that died before the draft was assembled has none to collect, and saying so is
+          # not the same as saying it found a published release and left it alone. Both have happened.
+          if [ -z "${{ needs.draft.outputs.id }}" ]; then
+            echo "No draft was assembled, so there is none to delete." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # Only ever a draft. Publish creates the tag and makes the release public one step before
           # its last, and `always()` fires on cancellation too, so a half-finished publish can leave a
           # real release here -- deleting that one keeps the tag and spends the version for good.
-          if [ "$(gh release view "${{ needs.version.outputs.tag }}" --json isDraft --jq '.isDraft' 2>/dev/null)" != true ]; then
+          #
+          # By id, for the reason the publish is: the body edit that blanks a draft's tag orphans it
+          # from every lookup by name, and this is the step that was supposed to collect it.
+          if [ "$(gh api "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}" --jq '.draft' 2>/dev/null)" != true ]; then
             echo "${{ needs.version.outputs.tag }} is not an unpublished draft; leaving it alone." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          gh release delete "${{ needs.version.outputs.tag }}" --yes
+          gh api -X DELETE "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}"
           echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. No tag was created, no image was pushed." >> "$GITHUB_STEP_SUMMARY"
 
       # The documentation site was asked, in an issue, to publish a version that is now not coming.
