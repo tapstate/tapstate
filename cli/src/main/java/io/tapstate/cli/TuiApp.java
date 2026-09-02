@@ -104,6 +104,7 @@ final class TuiApp {
             Runtime.getRuntime().addShutdownHook(shutdownHook);
             try {
                 initializeContextSession();
+                this.reader = terminal.reader();
                 draw(display, terminal);
                 startContextRecoveryIfNeeded();
                 return eventLoop(display, terminal);
@@ -192,7 +193,6 @@ final class TuiApp {
     }
 
     private int eventLoop(dev.tamboui.terminal.Terminal<JLineBackend> display, Terminal terminal) throws IOException {
-        this.reader = terminal.reader();
         int lastWidth = -1;
         int lastHeight = -1;
         long nextDashboardRefresh = 0L;
@@ -261,10 +261,16 @@ final class TuiApp {
                 int wordIndex = Math.max(0, words.size() - 1);
                 TuiCommandBar.Completion completion = TuiCommandBar.complete(
                         repl.registry().completer(), history, words, wordIndex);
-                if (!completion.selected().isEmpty()) {
+                if (completion.candidates().size() == 1) {
                     commandInput = applyCompletion(commandInput, completion);
                     uiState = reduce(new TuiAction.SetCommand(
                             commandInput));
+                    uiState = reduce(new TuiAction.SetNotice("completed: " + completion.selected()));
+                } else if (!completion.candidates().isEmpty()) {
+                    uiState = reduce(new TuiAction.OpenPalette(completion.candidates(),
+                            completion.candidates().size() + " completions · ↑/↓ choose · Enter select"));
+                } else {
+                    uiState = reduce(new TuiAction.SetNotice("no completions"));
                 }
                 draw(display, terminal);
                 continue;
@@ -1015,7 +1021,7 @@ final class TuiApp {
         if (lines.isEmpty()) {
             return "";
         }
-        return TuiActivity.result(lines.getLast());
+        return TuiActivity.result(String.join("\n", lines));
     }
 
     private void clearOutput() {

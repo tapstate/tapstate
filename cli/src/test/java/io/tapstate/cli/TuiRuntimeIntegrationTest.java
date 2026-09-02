@@ -113,6 +113,17 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
+    void offlineWorkbenchUsesOneCleanWorkspaceAndOneCommandContainer() {
+        TuiDashboard.State state = TuiDashboard.State.offline(Path.of("orders"), null);
+        Buffer buffer = Buffer.empty(new Rect(0, 0, 100, 24));
+
+        new TamboDashboard().render(Frame.forTesting(buffer), state);
+
+        assertThat(buffer.toAnsiString()).contains("TAPSTATE", "Try: validate ./work", "[COMMAND]");
+        assertThat(buffer.toAnsiString()).doesNotContain("ACTIVITY", "WORKSPACE", "WELCOME");
+    }
+
+    @Test
     void stdoutAndStderrProjectionRedactsSecretsBeforeResultStorage() {
         String password = "pw-output-secret";
         String token = "tok-output-secret";
@@ -126,6 +137,15 @@ class TuiRuntimeIntegrationTest {
                 .doesNotContain(password, token, "\u001b"));
         assertThat(pane.notice()).doesNotContain(password, token, "\u001b");
         assertThat(pane.toString()).doesNotContain(password, token, "\u001b");
+    }
+
+    @Test
+    void resultProjectionPreservesTheDiagnosticExplanation() {
+        TuiCommandBar.ResultPane pane = TuiCommandBar.project(new CommandResult(true, Cli.EXIT_DIAGNOSTIC),
+                "error: cli.server-required\nConnect to a server before running ls.\n(cli 0.3.0, server not connected)");
+
+        assertThat(pane.lines()).containsExactly("error: cli.server-required",
+                "Connect to a server before running ls.", "(cli 0.3.0, server not connected)");
     }
 
     @Test

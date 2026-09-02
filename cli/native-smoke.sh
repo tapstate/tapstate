@@ -36,7 +36,7 @@ red()   { printf '\033[31m%s\033[0m\n' "$1"; }
 green() { printf '\033[32m%s\033[0m\n' "$1"; }
 bold()  { printf '\033[1m%s\033[0m\n' "$1"; }
 # strip CSI escape sequences: a pty makes the binary emit colour, so matches must run on clean text
-strip_ansi() { sed $'s/\033\\[[0-9;]*[a-zA-Z]//g'; }
+strip_ansi() { sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' | tr -d '\r'; }
 
 # Drive the native binary under a real pty (JLine needs a terminal): feed $1 to its stdin, run it with
 # the remaining args, capture all output into PTY_OUT and set PTY_RC=0 only on a clean child exit. A
@@ -45,11 +45,12 @@ strip_ansi() { sed $'s/\033\\[[0-9;]*[a-zA-Z]//g'; }
 pty_session() {
   local input="$1"; shift
   set +e
-  PTY_OUT=$(TAPSTATE_BIN="$BINARY" TAPSTATE_PTY_INPUT="$input" python3 - "$@" <<'PY'
+  PTY_OUT=$(TAPSTATE_BIN="$BINARY" TAPSTATE_PTY_INPUT="$input" TAPSTATE_PTY_TUI="${TAPSTATE_PTY_TUI:-}" python3 - "$@" <<'PY'
 import fcntl, os, pty, struct, sys, select, termios, time, signal
 
 binary = os.environ["TAPSTATE_BIN"]
 data = os.environ["TAPSTATE_PTY_INPUT"].encode()
+wait_for_workbench = os.environ.get("TAPSTATE_PTY_TUI") == "1"
 argv = [binary] + sys.argv[1:]
 
 pid, fd = pty.fork()
@@ -82,9 +83,11 @@ else:
             # The workbench must enter terminal raw mode before input is written. Its title is
             # stable while the rest of the frame contains terminal control sequences. Explicit
             # commands can accept input as soon as they emit their first prompt bytes.
-            ready = (len(argv) == 1 and b"TAPSTATE" in out) or (len(argv) > 1)
+            ready = b"TAPSTATE" in out if wait_for_workbench else len(argv) > 1
             if ready and not input_sent:
-                time.sleep(0.05)
+                # The TamboUI backend finishes its terminal capability negotiation just before
+                # the first frame. Do not let the PTY race that negotiation with the first key.
+                time.sleep(0.75 if len(argv) == 1 else 0.05)
                 try:
                     os.write(fd, data)
                 except OSError as error:
@@ -265,9 +268,9 @@ pty_session "$repl_in" repl
 # `invalid:` (a rejected validate must not pass as a success), and require a clean child exit.
 REPL_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && printf '%s' "$REPL_CLEAN" | grep -q "Tapstate CLI" \
-   && printf '%s' "$REPL_CLEAN" | grep -qE '(^|[^[:alpha:]])valid:' \
-   && printf '%s' "$REPL_CLEAN" | grep -q "bye"; then
+   && grep -q "Tapstate CLI" <<< "$REPL_CLEAN" \
+   && grep -qE '(^|[^[:alpha:]])valid:' <<< "$REPL_CLEAN" \
+   && grep -q "bye" <<< "$REPL_CLEAN"; then
   ok "REPL banner + successful validate + clean exit (rc 0) observed over a pty"
 else
   bad "REPL pty session failed (rc=$PTY_RC) or missing expected markers; output:"; echo "$PTY_OUT"
@@ -321,8 +324,8 @@ printf -v comp_in 'va\t %s\nexit\n' "$VALID_DIR"
 pty_session "$comp_in" repl
 COMP_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && printf '%s' "$COMP_CLEAN" | grep -qE '(^|[^[:alpha:]])valid:' \
-   && ! printf '%s' "$COMP_CLEAN" | grep -q 'Unmatched argument'; then
+   && grep -qE '(^|[^[:alpha:]])valid:' <<< "$COMP_CLEAN" \
+   && ! grep -q 'Unmatched argument' <<< "$COMP_CLEAN"; then
   ok "Tab completed 'va'→'validate' and ran it over a pty (completer reachable in the image)"
 else
   bad "Tab completion pty session failed (rc=$PTY_RC) or did not complete 'va'→'validate'; output:"; echo "$PTY_OUT"
@@ -499,14 +502,14 @@ config: {}
 mode: cdc
 tables: [orders]
 EOF
-pty_session $'\004' -w "$TUI_WORKSPACE"
+TAPSTATE_PTY_TUI=1 pty_session $'\004' -w "$TUI_WORKSPACE"
 TUI_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && printf '%s' "$PTY_OUT" | grep -Fq $'\033[?1049h' \
-   && printf '%s' "$PTY_OUT" | grep -Fq $'\033[?1049l' \
-   && printf '%s' "$TUI_CLEAN" | grep -Fq "$TUI_WORKSPACE" \
-   && { printf '%s' "$PTY_OUT" | grep -Fq $'\033[?25h' \
-        || printf '%s' "$PTY_OUT" | grep -Fq $'\033[?12;25h'; }; then
+   && grep -Fq $'\033[?1049h' <<< "$PTY_OUT" \
+   && grep -Fq $'\033[?1049l' <<< "$PTY_OUT" \
+   && grep -Fq "$TUI_WORKSPACE" <<< "$TUI_CLEAN" \
+   && { grep -Fq $'\033[?25h' <<< "$PTY_OUT" \
+        || grep -Fq $'\033[?12;25h' <<< "$PTY_OUT"; }; then
   ok "native tui accepted its workspace and restored its alternate screen and cursor"
 else
   bad "native tui workspace PTY failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
