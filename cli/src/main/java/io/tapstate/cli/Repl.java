@@ -454,6 +454,12 @@ final class Repl {
         if (words.get(0).equals("logs") && words.contains("--follow")) {
             return logsFollow(words);
         }
+        // A stop says what becomes of the pipeline's state, and the terminal's plain stop says "clear".
+        // This is how a caller says the other thing. It is the one word that changes what a stop does
+        // rather than how it is shown, so it is parsed on its verb alone, like the two above.
+        if (words.get(0).equals("stop") && words.contains("--keep-state")) {
+            return stopKeepingState(words);
+        }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
         for (int i = 1; i < words.size(); i++) {
@@ -994,6 +1000,30 @@ final class Repl {
         // say and send nothing. Stop clears -- that is what the verb is -- and the terminal asking
         // first is a separate concern from the wire carrying the answer.
         Boolean purgeState = verb.equals("stop") ? Boolean.TRUE : null;
+        return lifecycleOnline(verb, id, purgeState);
+    }
+
+    /**
+     * {@code stop <pipeline-id> --keep-state} -- stops the pipeline and leaves everything it accumulated
+     * where it is, so the run that follows carries on rather than reading its whole source again.
+     *
+     * <p>A word rather than a default, and the plain stop keeps meaning "clear". Which of the two a
+     * caller wants is not something the terminal can work out for them: one leaves a pipeline that
+     * continues, the other leaves one whose next run re-reads everything, and the difference does not
+     * show until that next run is well under way.
+     */
+    private int stopKeepingState(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        List<String> operands = words.stream().filter(word -> !word.equals("--keep-state")).toList();
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("stop: missing operand (usage: stop <pipeline-id> [--keep-state])");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        return lifecycleOnline("stop", operands.get(1), Boolean.FALSE);
+    }
+
+    private int lifecycleOnline(String verb, String id, Boolean purgeState) {
         LifecycleOutcome outcome = withFailover(() ->
                 controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb, purgeState),
                 o -> o instanceof LifecycleOutcome.Unreachable);

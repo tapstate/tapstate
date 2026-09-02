@@ -3310,6 +3310,34 @@ class ReplTest {
     }
 
     @Test
+    void stopKeepingStateSendsTheOtherAnswerRatherThanNoneAtAll() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("stop pl1 --keep-state");
+
+        // Paired with the plain stop below, which sends true. The word changes what the stop does, not
+        // how it is shown, so the only place the difference exists is the argument on the wire -- and
+        // sending nothing at all would be refused by the server rather than meaning "keep".
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+    }
+
+    @Test
+    void stopKeepingStateStillNeedsAPipelineToStop() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("stop --keep-state");
+
+        // The option must not be read as the operand. Taken for one, this would have stopped a pipeline
+        // named "--keep-state" -- or, worse on a server that has one, some other pipeline entirely.
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
+    @Test
     void theFourLifecycleVerbsEachRouteToTheirOwnServerVerb() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
