@@ -3391,18 +3391,21 @@ class ReplTest {
     }
 
     @Test
-    void restartOnAFailedPipelineRefusesRatherThanQuietlyReReadingEverything() {
+    void restartOnAFailedPipelineCarriesOnFromWhereItGotTo() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         h.repl().dispatch("restart pl1");
 
-        // Degrading to a start here is the tempting shape and the wrong one: the position a failed run
-        // stopped at is still on record, and starting would read the whole source again while reporting
-        // the word the caller typed to avoid exactly that.
-        assertThat(client.lifecycleCalls).isEmpty();
-        assertThat(h.sink().toString()).contains("--rerun");
+        // purgeState=false is the whole case. The same two verbs with the clearing answer would also
+        // leave the pipeline running -- and would have thrown away the position the failed run reached,
+        // so the next run reads the entire source. Both look identical until it is well under way, and
+        // only this argument tells them apart.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=false",
+                "jwt-tok@http://node1:7900 start pl1");
     }
 
     @Test

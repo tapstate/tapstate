@@ -1101,15 +1101,20 @@ final class Repl {
                 out.flush();
                 return lifecycleOnline("start", id, null);
             }
-            case "FAILED":
-                // Refused rather than degraded. Starting it would read the whole source again while
-                // reporting the word the caller typed to avoid exactly that, and the position a failed
-                // run stopped at is still on record -- so a silent full re-read would throw away
-                // something that is still there.
-                err.println("restart: " + id + " failed, and carrying on from where a failed run stopped "
-                        + "is not available yet; 'restart --rerun' reads the whole source again");
-                err.flush();
-                return Cli.EXIT_VERB_UNAVAILABLE;
+            case "FAILED": {
+                // A failed run is carried on the same way anything else is, once the sequence is written
+                // out: a stop that keeps what the pipeline has, then a start. The state machine is built
+                // for it -- stopping is legal from failed and starting is not, precisely so recovery is a
+                // deliberate two steps -- and keeping is what makes it a recovery rather than a re-read:
+                // the position the run stopped at is still on record, and a start reads it back.
+                out.println("restart: " + id + " failed; carrying on from the position it reached");
+                out.flush();
+                int stopped = lifecycleOnline("stop", id, Boolean.FALSE);
+                if (stopped != Cli.EXIT_OK) {
+                    return stopped;
+                }
+                return lifecycleOnline("start", id, null);
+            }
             default:
                 err.println("restart: " + id + " is " + state.toLowerCase(Locale.ROOT)
                         + ", which restart does not know how to carry on from");
