@@ -2,6 +2,7 @@ package io.tapstate.cli;
 
 import dev.tamboui.layout.Constraint;
 import dev.tamboui.layout.Layout;
+import dev.tamboui.layout.Margin;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.style.Color;
 import dev.tamboui.terminal.Frame;
@@ -17,8 +18,9 @@ import java.util.List;
 final class TamboDashboard {
 
     void render(Frame frame, TuiDashboard.State state) {
+        Rect screen = frame.area().inner(Margin.uniform(1));
         List<Rect> vertical = Layout.vertical().constraints(
-                Constraint.length(2), Constraint.fill(), Constraint.length(4)).split(frame.area());
+                Constraint.length(2), Constraint.fill(), Constraint.length(4)).split(screen);
         renderStatus(frame, vertical.get(0), state);
         renderWorkspace(frame, vertical.get(1), state);
         renderCommandBar(frame, vertical.get(2), state);

@@ -32,6 +32,14 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
+    void contextSubcommandsAreAvailableToTheTuiCompleter() {
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+
+        assertThat(registry.completer().candidates(List.of("context", ""), 1))
+                .contains("list", "create", "choose", "bind");
+    }
+
+    @Test
     void runtimeClassifiesOperationsWithoutChangingCommandSemantics() {
         assertThat(TuiApp.operationFor("status orders --watch", 1).kind())
                 .isEqualTo(TuiOperation.Kind.STREAM);

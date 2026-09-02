@@ -546,7 +546,8 @@ final class Repl {
             return true;
         }
         if (words.get(0).equals("context")) {
-            lastExitCode = context();
+            lastExitCode = words.size() > 1 && words.get(1).equals("list")
+                    ? listContexts() : context();
             return true;
         }
         if (words.get(0).equals("auth")
@@ -3665,6 +3666,27 @@ final class Repl {
         }
         return new ContextConsole(contextManager, prompter, workdir,
                 commandLine.getOut(), commandLine.getErr(), tuiContextSelection).run();
+    }
+
+    /** Lists saved contexts without opening the interactive picker. */
+    private int listContexts() {
+        if (contextManager == null) {
+            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_USAGE,
+                    Map.of("reason", "context manager is unavailable in this session"));
+            return Cli.EXIT_USAGE;
+        }
+        List<ContextManager.ContextChoice> choices = contextManager.suggestions();
+        PrintWriter out = commandLine.getOut();
+        if (choices.isEmpty()) {
+            out.println("no saved contexts");
+        } else {
+            for (ContextManager.ContextChoice choice : choices) {
+                out.println((choice.suggested() ? "* " : "  ") + choice.name() + "  "
+                        + String.join(", ", choice.definition().seeds().stream().map(URI::toString).toList()));
+            }
+        }
+        out.flush();
+        return Cli.EXIT_OK;
     }
 
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */
