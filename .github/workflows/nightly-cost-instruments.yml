@@ -34,6 +34,13 @@
 name: Cost instruments
 
 on:
+  # TEMPORARY, removed in the commit that follows this one. Neither trigger below can be exercised
+  # before this file is on the default branch: a schedule only fires there, and a dispatch of a
+  # workflow that is not there is refused outright. So the only way to watch this lane actually run
+  # is to give it a trigger the branch can pull, once.
+  push:
+    branches:
+      - ws/beta-nest-hardening
   workflow_dispatch:
   schedule:
     # Off the hour, and clear of the connector lane's slot: scheduled runs are queued, and two of ours
