@@ -28,6 +28,18 @@
 
 set -eu
 
+# Answering "which files pin the version" without writing anything. The list is produced by the same
+# pin calls that do the writing, so a pin added or renamed is listed by construction. A second,
+# hand-kept copy of the list would drift the first time one moved, and the admission gate that reads
+# this would silently put the release's own write-back back in scope -- demanding an end-to-end case
+# for a version constant, which is a demand no write-back can satisfy.
+list_only=no
+if [ "${1:-}" = "--list" ]; then
+    list_only=yes
+    version=0.0.0
+fi
+
+if [ "$list_only" = no ]; then
 version="${1:-}"
 
 if [ -z "$version" ]; then
@@ -46,10 +58,15 @@ if [ "$bad" = yes ] || [ "$(echo "$version" | tr -cd . | wc -c)" -ne 2 ]; then
     echo "'$version' is not a release version - expected three numbers, as in 0.4.0" >&2
     exit 1
 fi
+fi
 
 # file, sed expression writing the version, and the text that proves it landed.
 pin() {
     local file="$1" expression="$2" proof="$3"
+    if [ "$list_only" = yes ]; then
+        printf '%s\n' "$file"
+        return 0
+    fi
     if [ ! -f "$file" ]; then
         echo "$file is missing - it pins the version, so this is not a tree we can release from" >&2
         exit 1
@@ -86,4 +103,6 @@ pin deploy/quickstart/docker-compose.yml \
     "s|image: ghcr.io/tapstate/tapstate:.*|image: ghcr.io/tapstate/tapstate:$version|" \
     "image: ghcr.io/tapstate/tapstate:$version"
 
-echo "$version"
+if [ "$list_only" = no ]; then
+    echo "$version"
+fi

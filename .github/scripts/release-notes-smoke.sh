@@ -204,5 +204,39 @@ else
   printf '  FAIL  an unknown base refuses by name: %s\n' "$bad"; failed=$((failed + 1))
 fi
 
+# --- the order of the body -----------------------------------------------------------------------
+#
+# What a reader came for goes first. Nothing else here checks position, so the arrangement was free
+# to drift: every case above passes on a body whose sections are in any order at all, and the one
+# thing a release body is read for -- what changed for me -- had been sitting under two paragraphs
+# of download instructions and a disclosure block.
+#
+# Line numbers, because "both appear" is what the content cases already say. `grep -n` on the first
+# match of each: a section that moved above another is the only way these invert.
+line_of() { grep -nF -m1 -- "$1" <<<"$out" | cut -d: -f1; }
+order_case() {
+  local name="$1" first="$2" second="$3" a b
+  a="$(line_of "$first")"; b="$(line_of "$second")"
+  if [ -z "$a" ] || [ -z "$b" ]; then
+    printf '  FAIL  %s\n        one of them is not in the body at all\n' "$name"; failed=$((failed + 1))
+  elif [ "$a" -lt "$b" ]; then
+    printf '  ok    %s\n' "$name"; passed=$((passed + 1))
+  else
+    printf '  FAIL  %s\n        "%s" is at line %s, after "%s" at %s\n' "$name" "$first" "$a" "$second" "$b"
+    failed=$((failed + 1))
+  fi
+}
+
+order_case "what changed comes before the limits"      "## What's new" "## Known limits in this preview"
+order_case "what changed comes before the known issues" "## What's new" "<!-- Known issues:"
+order_case "what changed comes before the download prose" "## What's new" "Native CLI binaries for macOS"
+# The one line that stays above everything: it says this build is not for production, and a reader
+# who has already scrolled past the news has stopped reading warnings.
+order_case "the preview warning is still first"        "Preview build" "## What's new"
+# Sibling headings at the same level. It was ### while What's new was ##, which is not only untidy:
+# a reader extracting "the bullets under What's new" stops at the next ## and would have swallowed
+# the limits with them.
+has "the limits heading sits at the same level as the others" "## Known limits in this preview"
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]
