@@ -41,6 +41,7 @@ import java.io.Serializable;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -382,7 +383,7 @@ class NestOperatorCostBench {
             Trips trips = TRIPS.getOrDefault(namespace, new Trips());
             counters.put(namespace, new Counters(counted.accesses(), counted.backfills(),
                     counted.backfillNanos(), trips.loads.get(), trips.saves.get(), trips.deletes.get(),
-                    trips.bytes.get()));
+                    trips.bytes.get(), trips.batches.get(), trips.batchedKeys.get()));
         }
         return new Snapshot(counters, EMITTED.get(), DOCUMENT_BYTES.get());
     }
@@ -425,6 +426,9 @@ class NestOperatorCostBench {
             out.append(per("cold deletes per event", delta.coldDeletes(), report.events()));
             out.append(per("bytes written cold per event", delta.coldBytes(), report.events()));
             out.append(per("trips behind the map per read", delta.backfills(), Math.max(delta.accesses(), 1)));
+            out.append(per("of those trips, batch calls", delta.coldBatches(), report.events()));
+            out.append(per("keys per batch call", delta.coldBatchedKeys(),
+                    Math.max(delta.coldBatches(), 1)));
             out.append("    millis behind the map (this machine) "
                     + delta.backfillNanos() / 1_000_000L + '\n');
         });
@@ -690,6 +694,31 @@ class NestOperatorCostBench {
             return Optional.ofNullable(COLD.get(namespace + "\0" + key));
         }
 
+        /**
+         * One trip for the whole batch, which is what a store with a batch read of its own costs and so
+         * what the threshold on this is written against. Counting a key each here would report the number
+         * the per-key form costs no matter which form is running, and the two would be indistinguishable -
+         * which is the exact confusion the threshold exists to catch.
+         */
+        @Override
+        public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
+            if (keys.isEmpty()) {
+                return Map.of();
+            }
+            Trips trips = trips(namespace);
+            trips.loads.incrementAndGet();
+            trips.batches.incrementAndGet();
+            trips.batchedKeys.addAndGet(keys.size());
+            Map<String, byte[]> found = new LinkedHashMap<>();
+            for (String key : keys) {
+                byte[] state = COLD.get(namespace + "\0" + key);
+                if (state != null) {
+                    found.put(key, state);
+                }
+            }
+            return found;
+        }
+
         @Override
         public void save(String namespace, String key, byte[] state) {
             Trips trips = trips(namespace);
@@ -726,19 +755,28 @@ class NestOperatorCostBench {
         private final AtomicLong saves = new AtomicLong();
         private final AtomicLong deletes = new AtomicLong();
         private final AtomicLong bytes = new AtomicLong();
+
+        /**
+         * How many of the loads arrived as a batch, and how many keys those batches carried between them.
+         * Counted apart because "the batch verb is never called" and "it is called once per key" produce
+         * the same trip count, and only the second is something the store can do anything about.
+         */
+        private final AtomicLong batches = new AtomicLong();
+        private final AtomicLong batchedKeys = new AtomicLong();
     }
 
     /** What one namespace had cost by some moment. */
     private record Counters(long accesses, long backfills, long backfillNanos, long coldLoads,
-            long coldSaves, long coldDeletes, long coldBytes) {
+            long coldSaves, long coldDeletes, long coldBytes, long coldBatches, long coldBatchedKeys) {
 
-        static final Counters NONE = new Counters(0, 0, 0, 0, 0, 0, 0);
+        static final Counters NONE = new Counters(0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         Counters minus(Counters earlier) {
             return new Counters(accesses - earlier.accesses, backfills - earlier.backfills,
                     backfillNanos - earlier.backfillNanos, coldLoads - earlier.coldLoads,
                     coldSaves - earlier.coldSaves, coldDeletes - earlier.coldDeletes,
-                    coldBytes - earlier.coldBytes);
+                    coldBytes - earlier.coldBytes, coldBatches - earlier.coldBatches,
+                    coldBatchedKeys - earlier.coldBatchedKeys);
         }
     }
 

@@ -190,7 +190,13 @@ class NestStateMapGatesTest {
         PUT_ACROSS_MECHANISMS.forEach((mechanism, detects) ->
                 assertThat(accesses(productionClasses, detects, NEST))
                         .as("%s: a put serializes the whole assembled document on every write, where "
-                                + "carrying it to its own key serializes none of it", mechanism)
+                                + "carrying it to its own key serializes none of it. Measured as the pair "
+                                + "a level performs - read the state out, change it, write it back - on "
+                                + "the object format these maps are configured with: put costs two "
+                                + "serializations and two deserializations per write, carry costs one of "
+                                + "each, at every state size measured. Measure it on the binary format "
+                                + "instead and the two come out equal, which is the trap: that is a "
+                                + "carrier this operator does not use", mechanism)
                         .isEmpty());
     }
 
