@@ -60,8 +60,8 @@ class MigrateCommandIT {
         Output output = run("migrate", "--status", uriArgument(database));
 
         assertThat(output.exitCode).isZero();
-        assertThat(output.out).contains("installed: 0").contains("supported: 1")
-                .contains("V1BaselineIndexes");
+        assertThat(output.out).contains("installed: 0").contains("supported: 2")
+                .contains("V1BaselineIndexes").contains("V2StructuredArtifacts");
         assertThat(collectionNames(database))
                 .as("the command is read-only; it must not bring the store part way forward while "
                         + "reporting on it")
@@ -93,7 +93,10 @@ class MigrateCommandIT {
 
         Output output = run("migrate", "--status", uriArgument(database));
 
-        assertThat(output.out).contains("installed: 1").contains("pending:   none");
+        assertThat(output.out)
+                .contains("installed: "
+                        + io.tapstate.adapters.mongostore.migration.MigrationRunner.SUPPORTED_VERSION)
+                .contains("pending:   none");
     }
 
     @Test

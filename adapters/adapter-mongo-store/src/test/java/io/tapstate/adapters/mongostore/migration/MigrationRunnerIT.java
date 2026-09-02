@@ -237,7 +237,7 @@ class MigrationRunnerIT {
         MigrationRunner.Status before = MigrationRunner.inspect(database);
         assertThat(before.installed()).isZero();
         assertThat(before.supported()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
-        assertThat(before.pending()).containsExactly("V1BaselineIndexes");
+        assertThat(before.pending()).containsExactly("V1BaselineIndexes", "V2StructuredArtifacts");
 
         MigrationRunner.migrate(database);
 

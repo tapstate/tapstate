@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.runtime.engine.Engine;
@@ -119,7 +120,7 @@ class FullAssemblyStartupIT {
         assertThat(version).containsEntry("dslVersions", List.of("tapstate/v1"));
         assertThat(version)
                 .as("the store a real start opened has been brought to the version this build knows")
-                .containsEntry("dataVersion", 1);
+                .containsEntry("dataVersion", MigrationRunner.SUPPORTED_VERSION);
     }
 
     private int startFullAssembly(String... extraProperties) {
