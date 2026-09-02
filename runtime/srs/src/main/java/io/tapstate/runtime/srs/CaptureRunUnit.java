@@ -43,6 +43,12 @@ import java.util.function.Supplier;
  * turns the buffering off keeps the position it had, and one that turns it back on finds it still there.
  * The alternative is a second account to move a position between, and the move is the step that loses one.
  *
+ * <p>What the flag does decide is where a run with nothing recorded begins, because the two paths read
+ * {@code start_from} in different coordinates: a direct tail resolves it against the source's own log,
+ * while a buffered one resolves it against changes already mined into the ring and leaves the shared
+ * miner on the present. That is a difference in what the setting points into, not in whether it is
+ * honoured -- and it holds only for a first run, which is the one a recorded position does not outrank.
+ *
  * <p>A shared-ring run reads every configured stream through one connector subscription and routes each
  * stream into its own per-table ring. Where the tail begins and what position each change carries are the
  * source's own, read back from the durable record and learned from the changes respectively.
@@ -88,7 +94,9 @@ public final class CaptureRunUnit {
      *       is a pure drain with no chain to position or mark;</li>
      *   <li>a shared-ring tail then attaches the consumer, runs the cdc phase into the change ring, and
      *       exposes the Jet source; an srs-disabled tail attaches the same consumer and streams straight to
-     *       the pass-through sink. Both begin where the durable record says.</li>
+     *       the pass-through sink. Both begin where the durable record says, and where it says nothing
+     *       the direct one begins where {@code start_from} asked while the shared miner takes the
+     *       present — see {@link #sourceStart}.</li>
      * </ol>
      */
     public CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough) {
@@ -170,8 +178,9 @@ public final class CaptureRunUnit {
                     LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
                     routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
                 }
-                subscription = Optional.of(
-                        CdcPhase.run(port, spec.config(), tailStart(meta, cid), routes, health));
+                subscription = Optional.of(CdcPhase.run(
+                        port, spec.config(), tailStart(meta, cid, CaptureStart.present()),
+                        routes, health));
                 String firstTable = tables.getFirst();
                 String firstRing = SrsRingbuffer.ringName(cid, firstTable);
                 ringSource = Optional.of(SrsRingSource.create(
@@ -193,7 +202,8 @@ public final class CaptureRunUnit {
                 Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
                 AtomicLong forwarded = new AtomicLong();
                 AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
-                subscription = Optional.of(port.cdc(spec.config(), tailStart(meta, directChain),
+                subscription = Optional.of(port.cdc(
+                        spec.config(), tailStart(meta, directChain, sourceStart(spec.startFrom())),
                         health.recording((events, position) -> forwardDirect(
                                 events, position, directChain, directEpoch, forwarded,
                                 directConsumers, directLastWritten, passthrough))));
@@ -313,23 +323,51 @@ public final class CaptureRunUnit {
      *   <li>no read offset but a recorded seam — the snapshot ran and the tail has not advanced past
      *       where the snapshot began, so it starts at the seam and the idempotent sink absorbs the
      *       overlap;</li>
-     *   <li>neither — nothing has read this chain, so the caller asked for changes from now on.</li>
+     *   <li>neither — nothing has read this chain, so {@code firstRun} decides: the start the
+     *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
      *
      * <p>Taking the present in any of the first two states is the silent loss this exists to prevent: the
      * tail comes up healthy, and every change between where it had reached and now is simply gone.
      */
-    private static CaptureStart tailStart(SrsMetaStore meta, String miningChainId) {
+    private static CaptureStart tailStart(
+            SrsMetaStore meta, String miningChainId, CaptureStart firstRun) {
         return meta.read(miningChainId)
                 .map(record -> {
                     if (record.sourceReadOffset() != null) {
                         return CaptureStart.resume(new SourcePosition(record.sourceReadOffset()));
                     }
                     return record.cdcStartPosition() == null
-                            ? CaptureStart.present()
+                            ? firstRun
                             : CaptureStart.resume(new SourcePosition(record.cdcStartPosition()));
                 })
-                .orElseGet(CaptureStart::present);
+                .orElse(firstRun);
+    }
+
+    /**
+     * The start a {@code start_from} setting names in the source's own log, for a tail that reads the
+     * source directly. Every form is an ask only the source can answer -- which of its positions is
+     * the oldest it still retains, or which one a given moment corresponds to -- so each crosses the
+     * port as itself rather than as a position worked out here.
+     *
+     * <p>It resolves a first run and nothing later: a recorded position outranks it, because the
+     * setting says where a read begins rather than where every run of it begins. Applied again on the
+     * way back it would re-read the stretch already read after every restart, and asking for the whole
+     * source again is a separate request.
+     *
+     * <p><strong>Only a direct tail resolves it here.</strong> Through the shared buffer the same
+     * setting is this one pipeline's cursor into changes already mined, and the miner is shared by
+     * every consumer of the chain -- so a miner that honoured one consumer's ask would move where all
+     * the others' changes came from. {@code latest} is the one form the two readings agree on only by
+     * accident: with no buffer holding what was already mined, "only what is written from now on" and
+     * "the source's present moment" are the same point, and through the buffer they are not.
+     */
+    private static CaptureStart sourceStart(StartFrom startFrom) {
+        return switch (startFrom) {
+            case StartFrom.Earliest ignored -> CaptureStart.earliest();
+            case StartFrom.Latest ignored -> CaptureStart.present();
+            case StartFrom.At at -> CaptureStart.at(at.instant());
+        };
     }
 
     /**

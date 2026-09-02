@@ -29,6 +29,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Iterator;
@@ -103,8 +104,14 @@ class CaptureRunUnitTest {
      * and so its own per-table ring on the member shared across this class, keeping the tests isolated.
      */
     private static CaptureRunSpec spec(ReadMode mode, boolean srsEnabled, String srsKey) {
+        return spec(mode, srsEnabled, srsKey, StartFrom.earliest());
+    }
+
+    /** A run spec that pins {@code start_from} rather than taking this fixture's default. */
+    private static CaptureRunSpec spec(
+            ReadMode mode, boolean srsEnabled, String srsKey, StartFrom startFrom) {
         return new CaptureRunSpec(
-                config(), mode, srsKey, srsEnabled, "src-1", "pipe-1", StartFrom.earliest(), null, 0L);
+                config(), mode, srsKey, srsEnabled, "src-1", "pipe-1", startFrom, null, 0L);
     }
 
     private CaptureRunUnit runUnit(CapturePort port, SrsMetaStore meta) {
@@ -847,5 +854,88 @@ class CaptureRunUnitTest {
             }
             return m;
         }
+    }
+
+    /**
+     * A direct tail with nothing recorded yet begins where its author asked. {@code start_from} is that
+     * ask, and on this path it names a position in the source's own log rather than a cursor into a replay
+     * buffer -- there is no buffer here for it to point into.
+     *
+     * <p>The three forms are not interchangeable: {@code earliest} asks for the oldest change the source
+     * still retains, an instant asks the source to resolve that moment to a position of its own, and
+     * {@code latest} asks for only what is written from now on. Collapsing any of them into the present is
+     * the silent form of ignoring the setting -- the tail comes up healthy having read a different stretch
+     * than the one asked for, which is the same failure a start clamped to a buffer's head makes.
+     */
+    @Test
+    void aDirectTailWithNothingRecordedBeginsWhereItsAuthorAsked() {
+        Instant asked = Instant.parse("2026-09-01T00:00:00Z");
+
+        assertThat(directTailStart(StartFrom.earliest(), "chain-first-earliest"))
+                .as("earliest asks the source for the oldest change it still retains")
+                .isEqualTo(CaptureStart.earliest());
+        assertThat(directTailStart(StartFrom.at(asked), "chain-first-at"))
+                .as("an instant is a start only the source can resolve to a position of its own")
+                .isEqualTo(CaptureStart.at(asked));
+        assertThat(directTailStart(StartFrom.latest(), "chain-first-latest"))
+                .as("latest is the present moment: only changes written from now on")
+                .isEqualTo(CaptureStart.present());
+    }
+
+    /**
+     * A recorded position outranks {@code start_from} on a direct tail. The setting says where a read
+     * begins, not where every later run of it begins: honoured again on the way back it would re-read the
+     * stretch already read on every restart, and asking for the whole source again is a separate request
+     * with its own verb.
+     *
+     * <p>This is what makes the case above a statement about a first run rather than about the setting
+     * always winning, and the two readings are distinguishable only here: with nothing recorded they give
+     * the same answer.
+     */
+    @Test
+    void aRecordedPositionOutranksStartFromOnADirectTail() {
+        InMemoryMeta meta = new InMemoryMeta();
+        MiningChainId chainId = MiningChainId.resolve(config(), "chain-start-from-outranked");
+        meta.create(chainId.value(), null);
+        meta.advanceSourceReadOffset(chainId.value(), new ChainPosition(new SourceOrder(1L, 7L), "src-11"));
+
+        FakeSource port = new FakeSource(List.of(), List.of());
+        runUnit(port, meta).start(
+                spec(ReadMode.CDC_ONLY, false, "chain-start-from-outranked", StartFrom.earliest()), e -> { });
+
+        assertThat(port.cdcStart)
+                .as("the position the last run reached wins; start_from named where the first one began")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
+    }
+
+    /**
+     * A buffered tail's miner does not take {@code start_from}, because on that path the setting is this
+     * one pipeline's cursor into the shared buffer and the miner is shared by all of them. The buffer is
+     * mined once and each consumer finds its own start in it, so a miner that honoured one consumer's ask
+     * would move where every other consumer's changes came from.
+     *
+     * <p>This is the control on the case above: it is what separates "the direct path resolves the ask"
+     * from "the ask is resolved on every path", and only the buffered side can tell the two apart.
+     */
+    @Test
+    void aBufferedTailsMinerDoesNotTakeStartFrom() {
+        FakeSource port = new FakeSource(List.of(), List.of());
+        runUnit(port, new InMemoryMeta()).start(
+                spec(ReadMode.CDC_ONLY, true, "chain-miner-ignores-start-from", StartFrom.latest()), e -> { });
+
+        assertThat(port.cdcStart)
+                .as("the miner begins at the present with nothing recorded, whatever a consumer asked for")
+                .isEqualTo(CaptureStart.present());
+    }
+
+    /**
+     * Where a direct tail with nothing recorded asks its source to begin, given one {@code start_from}.
+     * A fresh store per call is what makes it a first run; the key keeps each call's chain its own.
+     */
+    private CaptureStart directTailStart(StartFrom startFrom, String srsKey) {
+        FakeSource port = new FakeSource(List.of(), List.of());
+        runUnit(port, new InMemoryMeta())
+                .start(spec(ReadMode.CDC_ONLY, false, srsKey, startFrom), e -> { });
+        return port.cdcStart;
     }
 }

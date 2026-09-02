@@ -12,8 +12,14 @@ import java.util.Objects;
  * Where a pipeline starts consuming a mining chain's incremental tail — the typed reading of its
  * {@code start_from} setting. Three forms: {@link Earliest} replays every change still buffered,
  * {@link Latest} takes only changes from now on, and {@link At} starts from the first change at or after
- * an instant. It positions this one pipeline's consumer cursor into the change ring; it never moves the
- * shared mining chain's own read offset.
+ * an instant.
+ *
+ * <p>What it points into depends on whether this pipeline buffers through the shared replay ring.
+ * Buffered, it positions this one pipeline's consumer cursor into the ring and never moves the shared
+ * mining chain's own read offset -- the chain is mined once and each consumer finds its own start in
+ * what was mined. Read directly, there is no ring to point into, so it names a position in the
+ * source's own log and the tail begins there. Either way it decides a first run only: a recorded
+ * position outranks it, or a restart would re-read the same stretch every time.
  *
  * <p>The authoring layer holds {@code start_from} as a free string and does not constrain its format, so
  * an unrecognized value is caught here at consumption time rather than by the validate layer.
