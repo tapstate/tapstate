@@ -400,6 +400,68 @@ fi
 
 help_prints_no_shell "--help prints documentation, not source" bash "$driver"
 
+# --- the two lanes that open catalog pull requests -----------------------------------------------
+#
+# Both lanes open a pull request nobody wrote by hand, and both meet gates written for pull requests
+# somebody did. Two of those gates cannot be cleared from the pull request itself: the template check
+# reads sections a bot has to have answered when it opened it, and admission wants an end-to-end case
+# for a diff of regenerated data, where none can exist -- no case fails when a provenance hash is
+# reverted. The drift lane answers both, and says why in its own body. The refresh lane did neither,
+# so every nightly rebuild arrived red on two checks and could only move by somebody clicking a label.
+#
+# Nothing checked this, which is how the two lanes came apart in the first place. Asserted for both,
+# so whichever is edited next cannot quietly lose it.
+# A heading is matched as a whole line, and the label only inside the block that carries labels.
+# Both halves were wrong first time round and both mutations survived: `no-e2e` appears in these
+# bodies as prose explaining the label, so a file-wide grep passed with the label deleted; and
+# "### Release note" is a prefix of "### Release notes", so a substring match passed a typo that
+# would have made the gate refuse. An assertion that cannot fail is worse than none, because it
+# reads as coverage.
+heading_case() {
+  local name="$1" file="$2" heading="$3"
+  if grep -qE "^[[:space:]]*${heading}[[:space:]]*$" "$file"; then
+    printf '  ok    %s\n' "$name"; passed=$((passed + 1))
+  else
+    printf '  FAIL  %s\n        no line in %s is exactly: %s\n' "$name" "$(basename "$file")" "$heading"
+    failed=$((failed + 1))
+  fi
+}
+
+# The labels block: from `labels:` to the next key at the same indentation.
+labels_of() {
+  awk '
+    /^[[:space:]]*labels:[[:space:]]*\|?[[:space:]]*$/ { inside = 1; next }
+    inside && /^[[:space:]]*[a-z-]+:/ { inside = 0 }
+    inside { print }
+  ' "$1"
+}
+
+label_case() {
+  local name="$1" file="$2" label="$3"
+  if labels_of "$file" | grep -qE "^[[:space:]]*${label}[[:space:]]*$"; then
+    printf '  ok    %s\n' "$name"; passed=$((passed + 1))
+  else
+    printf '  FAIL  %s\n        %s has no "%s" in its labels block\n' "$name" "$(basename "$file")" "$label"
+    failed=$((failed + 1))
+  fi
+}
+
+wf_dir="$(cd "$here/../.github/workflows" && pwd)"
+for lane in catalog-refresh catalog-spec-drift; do
+  wf="$wf_dir/$lane.yml"
+  if [ ! -f "$wf" ]; then
+    printf '  FAIL  %s exists\n' "$lane"; failed=$((failed + 1)); continue
+  fi
+  # The first three are exactly what pr-template refuses a body for lacking, read from its own
+  # `required=` list; the fourth is what admission asks for.
+  for section in "## Linked issue" "## Live verification scenario" "### Release note" "## End-to-end case"; do
+    heading_case "$lane answers \"$section\"" "$wf" "$section"
+  done
+  # Applied by the lane, not clicked each run: the exception is one decision reviewed once in the
+  # workflow. A lane without it cannot merge unless somebody does the same thing every night.
+  label_case "$lane applies the no-e2e label itself" "$wf" "no-e2e"
+done
+
 echo
 if [ "$failed" -gt 0 ]; then
   printf '%s passed, %s FAILED\n' "$passed" "$failed"
