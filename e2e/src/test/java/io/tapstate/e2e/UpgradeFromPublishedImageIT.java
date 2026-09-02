@@ -52,6 +52,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * path it has out here. A file endpoint's address is a path and it is stored inside the resource, so
  * any other mount point would leave the older build's resources naming somewhere the newer build
  * cannot open -- and the upgrade would look like it had lost the pipeline.
+ *
+ * <p><b>What comparing against a fresh install structurally cannot see.</b> Both stores are brought
+ * forward by the same runner from the same starting version, so a fault that hits the upgrade and the
+ * fresh install equally cancels out of the comparison and this passes. Measured, not reasoned about:
+ * making the runner jump to the newest pending changeset instead of applying each in turn -- the
+ * "upgrading two releases at once only runs the last script" fault -- leaves this green, because a
+ * fresh install skips the same steps and the two agree on having skipped them. Three cases a level
+ * down go red on it.
+ *
+ * <p>So this case is not where stepwise application is held, and nothing here should be read as
+ * covering it. What it holds is the half no unit-level case can reach: that the data a released build
+ * actually wrote is readable, convertible, and still serves a running pipeline afterwards.
  */
 class UpgradeFromPublishedImageIT {
 
