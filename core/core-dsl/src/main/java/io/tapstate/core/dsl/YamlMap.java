@@ -101,9 +101,23 @@ final class YamlMap {
         return n == null ? null : nodeValue(n);
     }
 
+    /**
+     * Free-form mapping value, or null if absent. A value that is present but is not a mapping is
+     * refused here rather than cast: the cast succeeds unchecked and the failure surfaces later as a
+     * class-cast crash carrying no field, no position and no document — an authoring mistake reported
+     * as a fault in the reader.
+     */
     @SuppressWarnings("unchecked")
     Map<String, Object> freeMap(String key) {
-        return (Map<String, Object>) value(key);
+        Object value = value(key);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Map<?, ?>)) {
+            throw errorAt(key, DslError.ILLEGAL_VALUE,
+                    Map.of("value", nodeTypeName(values.get(key)), "expected", "a mapping"));
+        }
+        return (Map<String, Object>) value;
     }
 
     /** Sub-mapping as a located view, carrying the extended path; null if absent; error if not a mapping. */
