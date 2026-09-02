@@ -19,9 +19,9 @@ class TuiCommandParityTest {
         List<String> repl = registry.completer().candidates(List.of(""), 0);
         List<String> tui = TuiApp.paletteCommands(registry);
 
-        assertThat(oneShot).contains("validate", "help", "tui");
+        assertThat(oneShot).contains("validate", "help", "repl").doesNotContain("tui");
         assertThat(repl).contains("validate", "help", "exit");
-        assertThat(tui).contains("validate", "help", "exit", ":help", ":quit");
+        assertThat(tui).contains("validate", "help", "exit", ":help", ":quit").doesNotContain("tui");
     }
 
     @Test

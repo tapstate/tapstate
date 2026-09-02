@@ -498,7 +498,7 @@ config: {}
 mode: cdc
 tables: [orders]
 EOF
-pty_session $'\004' tui -w "$TUI_WORKSPACE"
+pty_session $'\004' -w "$TUI_WORKSPACE"
 TUI_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && printf '%s' "$PTY_OUT" | grep -Fq $'\033[?1049h' \

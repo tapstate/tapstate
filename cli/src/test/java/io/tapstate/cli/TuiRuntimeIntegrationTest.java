@@ -1,7 +1,9 @@
 package io.tapstate.cli;
 
+import dev.tamboui.buffer.Buffer;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.terminal.Frame;
 import io.tapstate.core.schema.SchemaNavigator;
-import org.jline.utils.AttributedString;
 import org.junit.jupiter.api.Test;
 
 import java.io.StringWriter;
@@ -104,12 +106,10 @@ class TuiRuntimeIntegrationTest {
                 List.of("Authorization: Bearer " + token + ansi),
                 List.of(), List.of(), null, null);
 
-        List<String> frame = new TuiDashboard().render(state, 100, 24).stream()
-                .map(AttributedString::toString)
-                .toList();
+        Buffer buffer = Buffer.empty(new Rect(0, 0, 100, 24));
+        new TamboDashboard().render(Frame.forTesting(buffer), state);
 
-        assertThat(frame).allSatisfy(line -> assertThat(line)
-                .doesNotContain(password, token, ansi));
+        assertThat(buffer.toAnsiString()).doesNotContain(password, token, ansi);
     }
 
     @Test

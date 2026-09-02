@@ -263,7 +263,7 @@ context_input=$'context\n\x1e\n\x1e'"$context_name"$'\n\x1ehttp://127.0.0.1:8081
 set +e
 TAPSTATE_PTY_CHUNK_DELAY=1.0 TAPSTATE_PTY_FOLLOWUP=$'\004' TAPSTATE_PTY_FOLLOWUP_DELAY=5 \
   run_pty "$context_input" "$context_output" env HOME="$home_dir" TAPSTATE_WORKDIR="$workspace_path" \
-  java -Duser.home="$home_dir" -jar "$jar" tui
+  java -Duser.home="$home_dir" -jar "$jar"
 context_rc=$?
 set -e
 [[ "$context_rc" -eq 0 ]] || {
@@ -282,7 +282,7 @@ palette_input=$'\x10\x1e\e[B\x1e\e[B\x1e\e[B\x1e\n\x1e\n\x1e\004'
 set +e
 TAPSTATE_PTY_CHUNK_DELAY=0.4 TAPSTATE_PTY_FOLLOWUP=$'\004' TAPSTATE_PTY_FOLLOWUP_DELAY=3 \
   run_pty "$palette_input" "$palette_output" env HOME="$home_dir" TAPSTATE_WORKDIR="$workspace_path" \
-  java -Duser.home="$home_dir" -jar "$jar" tui
+  java -Duser.home="$home_dir" -jar "$jar"
 palette_rc=$?
 set -e
 [[ "$palette_rc" -eq 0 ]] || {
@@ -299,7 +299,7 @@ term_output="$work_dir/term.pty"
 set +e
 TAPSTATE_PTY_SIGNAL=TERM TAPSTATE_PTY_SIGNAL_DELAY=1 \
   run_pty $'' "$term_output" env HOME="$home_dir" TAPSTATE_WORKDIR="$workspace_path" \
-  java -Duser.home="$home_dir" -jar "$jar" tui
+  java -Duser.home="$home_dir" -jar "$jar"
 term_rc=$?
 set -e
 [[ "$term_rc" -eq 0 ]] || {
@@ -314,7 +314,7 @@ cancel_input=$'pw\x1e\003'
 set +e
 TAPSTATE_PTY_CHUNK_DELAY=0.4 TAPSTATE_PTY_FOLLOWUP=$'\004' TAPSTATE_PTY_FOLLOWUP_DELAY=3 \
   run_pty "$cancel_input" "$cancel_output" env HOME="$home_dir" TAPSTATE_WORKDIR="$workspace" \
-  java -Duser.home="$home_dir" -jar "$jar" tui
+  java -Duser.home="$home_dir" -jar "$jar"
 cancel_rc=$?
 set -e
 [[ "$cancel_rc" -eq 0 ]] || {
@@ -330,7 +330,7 @@ navigation_input=$'\e[B\x1e\n\x1e\e\x1e\004'
 set +e
 TAPSTATE_PTY_CHUNK_DELAY=0.5 TAPSTATE_PTY_FOLLOWUP=$'\004' TAPSTATE_PTY_FOLLOWUP_DELAY=2 \
   run_pty "$navigation_input" "$navigation_output" env HOME="$home_dir" TAPSTATE_WORKDIR="$workspace_path" \
-  java -Duser.home="$home_dir" -jar "$jar" tui
+  java -Duser.home="$home_dir" -jar "$jar"
 navigation_rc=$?
 set -e
 [[ "$navigation_rc" -eq 0 ]] || {
@@ -349,7 +349,7 @@ set +e
 TAPSTATE_PTY_INITIAL_SIZE=120x24 TAPSTATE_PTY_RESIZE=50x12 TAPSTATE_PTY_RESIZE_DELAY=0.75 \
   TAPSTATE_PTY_FOLLOWUP=$'\004' TAPSTATE_PTY_FOLLOWUP_DELAY=1.5 \
   run_pty "$resize_input" "$resize_output" env HOME="$home_dir" TAPSTATE_WORKDIR="$workspace_path" \
-  java -Duser.home="$home_dir" -jar "$jar" tui
+  java -Duser.home="$home_dir" -jar "$jar"
 resize_rc=$?
 set -e
 [[ "$resize_rc" -eq 0 ]] || {

@@ -1,10 +1,10 @@
 package io.tapstate.cli;
 
-import org.jline.terminal.Attributes;
+import dev.tamboui.backend.jline3.JLineBackend;
+import dev.tamboui.tui.TuiConfig;
+import dev.tamboui.tui.TuiRunner;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
-import org.jline.utils.Display;
-import org.jline.utils.InfoCmp;
 import org.jline.utils.NonBlockingReader;
 
 import java.io.IOException;
@@ -38,7 +38,7 @@ final class TuiApp {
     private final Repl repl;
     private final StringWriter out;
     private final StringWriter err;
-    private final TuiDashboard dashboard = new TuiDashboard();
+    private final TamboDashboard dashboard = new TamboDashboard();
     private final String initialContext;
     private final ContextResolver contextResolver;
     private final TuiSessionRecovery sessionRecovery;
@@ -49,7 +49,7 @@ final class TuiApp {
             new ConcurrentLinkedQueue<>();
 
     private NonBlockingReader reader;
-    private Display display;
+    private TuiRunner display;
     private Terminal terminal;
     private TuiAppState uiState;
     private final TuiKernel kernel;
@@ -91,17 +91,16 @@ final class TuiApp {
     int run() {
         try (Terminal terminal = TerminalBuilder.builder().system(true).build()) {
             this.terminal = terminal;
-            Attributes original = terminal.enterRawMode();
-            this.display = new Display(terminal, true);
+            this.display = TuiRunner.create(TuiConfig.builder()
+                    .backend(new JLineBackend(terminal))
+                    .shutdownHook(false)
+                    .noTick()
+                    .build());
             terminal.handle(Terminal.Signal.INT, signal -> {
                 interrupted.set(true);
                 repl.cancelStream();
             });
-            terminal.puts(InfoCmp.Capability.enter_ca_mode);
-            terminal.puts(InfoCmp.Capability.clear_screen);
-            terminal.puts(InfoCmp.Capability.cursor_invisible);
-            terminal.flush();
-            Thread shutdownHook = new Thread(() -> restoreTerminal(display, terminal, original),
+            Thread shutdownHook = new Thread(() -> restoreTerminal(display),
                     "tapstate-tui-terminal-restore");
             Runtime.getRuntime().addShutdownHook(shutdownHook);
             try {
@@ -115,26 +114,25 @@ final class TuiApp {
                 }
                 Runtime.getRuntime().removeShutdownHook(shutdownHook);
                 commandExecution.close();
-                restoreTerminal(display, terminal, original);
+                restoreTerminal(display);
                 this.uiState = reduce(new TuiAction.ClearPrompt());
                 this.reader = null;
                 this.display = null;
                 this.terminal = null;
             }
-        } catch (IOException failure) {
-            throw new UncheckedIOException(failure);
+        } catch (Exception failure) {
+            if (failure instanceof IOException ioFailure) {
+                throw new UncheckedIOException(ioFailure);
+            }
+            throw new IllegalStateException("Unable to initialize the terminal workbench", failure);
         }
     }
 
-    private void restoreTerminal(Display display, Terminal terminal, Attributes original) {
+    private void restoreTerminal(TuiRunner display) {
         if (!terminationRequested.compareAndSet(false, true)) {
             return;
         }
-        display.reset();
-        terminal.puts(InfoCmp.Capability.cursor_visible);
-        terminal.puts(InfoCmp.Capability.exit_ca_mode);
-        terminal.setAttributes(original);
-        terminal.flush();
+        display.close();
     }
 
     static int requireInteractiveTerminal(BooleanSupplier terminalCheck, PrintWriter err) {
@@ -185,7 +183,7 @@ final class TuiApp {
         return List.copyOf(words);
     }
 
-    private int eventLoop(Display display, Terminal terminal) throws IOException {
+    private int eventLoop(TuiRunner display, Terminal terminal) throws IOException {
         this.reader = terminal.reader();
         int lastWidth = -1;
         int lastHeight = -1;
@@ -786,14 +784,8 @@ final class TuiApp {
         }
     }
 
-    private void draw(Display display, Terminal terminal) {
-        int width = dimension(terminal.getWidth(), DEFAULT_WIDTH);
-        int height = dimension(terminal.getHeight(), DEFAULT_HEIGHT);
-        display.resize(width, height);
-        // JLine's Display mutates the frame while reconciling rows. Keep the pure renderer's
-        // immutable result at the boundary and hand JLine its own mutable frame.
-        display.update(new ArrayList<>(dashboard.render(state(), width, height)), -1);
-        terminal.flush();
+    private void draw(TuiRunner display, Terminal terminal) {
+        display.draw(frame -> dashboard.render(frame, state()));
     }
 
     private void startDashboardRefreshIfNeeded(int width) {

@@ -16,7 +16,7 @@ import java.util.function.Supplier;
 
 /**
  * The Tapstate CLI: the surface-ring product front-end. Dual-mode — bare {@code tapstate} opens the
- * offline REPL; one-shot subcommands share the same verb table for scripting / AI.
+ * terminal workbench; one-shot subcommands share the same verb table for scripting / AI.
  *
  * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code explain} / {@code ls} /
  * {@code desc} run fully without any server. The server-state verbs are registered too, so they are
@@ -27,15 +27,16 @@ import java.util.function.Supplier;
 @Command(name = "tapstate", mixinStandardHelpOptions = true, version = Cli.VERSION,
         subcommands = {
                 ValidateCmd.class, NewCmd.class, DemoCmd.class, ExplainCmd.class, LsCmd.class,
-                DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class, TuiCmd.class},
+                DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class, Cli.ReplCmd.class},
         // the second line is indented by hand under the "Usage: " heading picocli prints before the first
         customSynopsis = {
-                "tapstate [LAUNCH]                   open a session (interactive)",
+                "tapstate [LAUNCH]                   open the terminal workbench",
+                "       tapstate [LAUNCH] repl              open an interactive session",
                 "       tapstate [LAUNCH] COMMAND [ARGS...]  run one command and exit"},
         description = {
                 "",
-                "With no command, opens a session: a prompt that holds a workspace and, once you",
-                "connect, a server connection. The session commands are listed below.",
+                "With no command, opens the full-screen terminal workbench. Use `tapstate repl`",
+                "for the line-oriented interactive session. The session commands are listed below.",
                 "",
                 "With a command, runs it once and exits -- the form for scripts. A command takes",
                 "its own options, so the workspace is `tapstate validate -w DIR`, not",
@@ -55,8 +56,9 @@ import java.util.function.Supplier;
                 ""},
         footerHeading = "%nExamples:%n",
         footer = {
-                "  tapstate                      open a session in the default workspace",
-                "  tapstate -w ./work            open a session in ./work",
+                "  tapstate                      open the terminal workbench in the default workspace",
+                "  tapstate -w ./work            open the terminal workbench in ./work",
+                "  tapstate repl                 open the line-oriented interactive session",
                 "  tapstate validate ./work      validate a workspace and exit",
                 "  tapstate help apply           describe one command",
                 "  TAPSTATE_PASSWORD=secret tapstate -c localhost:8080 -u admin",
@@ -274,7 +276,7 @@ public final class Cli implements Runnable {
      * so appear on the table, but they project no operation and belong to no whitelist — the guard that
      * pins registered verbs to the offline whitelist reads this to tell "meta" from "undeclared".
      */
-    static final List<String> META_VERBS = List.of("help", "mcp", "alias", "auth", "context", "tui");
+    static final List<String> META_VERBS = List.of("help", "mcp", "alias", "auth", "context", "repl");
 
     /**
      * Help for the words the REPL handles itself. They are deliberately not subcommands — a connection
@@ -345,13 +347,18 @@ public final class Cli implements Runnable {
             System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
-        if (launch.isTui()) {
-            // `tui` itself is the interactive surface. Extra words stay with picocli so `--help`,
-            // `--version`, and malformed options retain the normal command-line diagnostics.
+        if (launch.isRepl()) {
+            // `repl` is the line-oriented interactive surface. Extra words stay with picocli so
+            // `--help`, `--version`, and malformed options retain normal command-line diagnostics.
             if (launch.command().size() != 1) {
                 System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
                 return;
             }
+            launch.beginRepl();
+            System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
+            return;
+        }
+        if (!launch.isOneShot()) {
             System.exit(runTui(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
             return;
         }
@@ -364,10 +371,21 @@ public final class Cli implements Runnable {
      * direct seed or saved context makes it ask the running server for the second half of the report.
      */
     static boolean bypassesSessionResolution(LaunchOptions launch) {
-        if (launch.isTui() || !launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {
+        if (!launch.isOneShot() || launch.isRepl() || Repl.isOnlineVerb(launch.command().getFirst())) {
             return false;
         }
         return !launch.command().getFirst().equals("version") || !launch.targetsServer();
+    }
+
+    /** Picocli specification for the explicit line-oriented session entry point. */
+    @Command(name = "repl", mixinStandardHelpOptions = true,
+            description = "Open the line-oriented interactive session.")
+    static final class ReplCmd implements Runnable {
+
+        @Override
+        public void run() {
+            // Cli.main intercepts the exact entry point before Picocli dispatches it.
+        }
     }
 
     /** The production password reader: a JLine prompter over the terminal, opened only if one is needed. */

@@ -20,7 +20,8 @@ class CommandRegistryTest {
         assertThat(registry.invocation(List.of("help")).words()).containsExactly("help");
         assertThat(registry.completer().candidates(List.of(""), 0))
                 .contains("validate", "new", "apply", "help", "exit");
-        assertThat(registry.commandLine().getSubcommands()).containsKeys("validate", "new", "help", "tui");
+        assertThat(registry.commandLine().getSubcommands()).containsKeys("validate", "new", "help", "repl")
+                .doesNotContainKey("tui");
     }
 
     @Test

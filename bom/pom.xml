@@ -47,11 +47,11 @@
          first-import-wins), and snakeyaml is a direct managed pin (a direct entry always overrides any
          imported BOM, order-independent). The spring-boot-dependencies import is placed last only to
          read as the lowest-priority substrate, not as the cause of that precedence. -->
-    <!-- CLI facade libraries (surface ring): the command framework and the REPL line reader.
-         Both are self-contained (picocli has no transitive deps; jline aggregates its own
-         modules at one version) and are allowlisted to the cli module only (rule R6). -->
+    <!-- CLI facade libraries (surface ring): the command framework, TUI toolkit, and terminal
+         line reader. These libraries are allowlisted to the cli module only (rule R6). -->
     <picocli.version>4.7.7</picocli.version>
     <jline.version>3.26.3</jline.version>
+    <tamboui.version>0.4.0</tamboui.version>
     <!-- MongoDB driver stack (sync + core + bson + bson-record-codec): the store adapter's backing
          driver (rule R3 locks it to adapter-mongo-store). The family must resolve to one version — the
          sync driver calls into core/bson internals and core pulls bson-record-codec, so a split version
@@ -139,6 +139,13 @@
         <scope>import</scope>
       </dependency>
       <dependency>
+        <groupId>dev.tamboui</groupId>
+        <artifactId>tamboui-bom</artifactId>
+        <version>${tamboui.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
         <groupId>org.yaml</groupId>
         <artifactId>snakeyaml</artifactId>
         <version>${snakeyaml.version}</version>
@@ -206,7 +213,7 @@
         <artifactId>archunit-junit5</artifactId>
         <version>${archunit.version}</version>
       </dependency>
-      <!-- CLI framework + REPL line reader; allowlisted to the cli module only (R6). -->
+      <!-- CLI framework + terminal UI dependencies; allowlisted to the cli module only (R6). -->
       <dependency>
         <groupId>info.picocli</groupId>
         <artifactId>picocli</artifactId>

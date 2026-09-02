@@ -70,41 +70,32 @@ class CliTest {
     }
 
     @Test
-    void tuiIsRegisteredAndKeepsTheSharedHelpAndVersionContract() {
-        assertThat(Cli.newCommandLine().getSubcommands()).containsKey("tui");
+    void replIsTheExplicitInteractiveCommandAndTuiIsNotRegistered() {
+        assertThat(Cli.newCommandLine().getSubcommands())
+                .containsKey("repl")
+                .doesNotContainKey("tui");
 
-        Run help = run("tui", "--help");
-        Run version = run("tui", "--version");
+        Run help = run("repl", "--help");
+        Run version = run("repl", "--version");
 
         assertThat(help.code()).isZero();
-        assertThat(help.out()).contains("Usage: tapstate tui").contains("full-screen terminal dashboard");
+        assertThat(help.out()).contains("Usage: tapstate repl").contains("interactive session");
         assertThat(version.code()).isZero();
         assertThat(version.out()).contains(Cli.VERSION);
     }
 
     @Test
-    void launchOptionsRecognizeTheExplicitTuiEntryPoint() {
-        LaunchOptions launch = LaunchOptions.parse("--context", "dev", "tui");
+    void launchOptionsKeepBareLaunchForTheTuiAndRecognizeExplicitRepl() {
+        LaunchOptions tui = LaunchOptions.parse("--context", "dev", "-w", "orders-workspace");
+        LaunchOptions repl = LaunchOptions.parse("--context", "dev", "repl");
 
-        assertThat(launch.isTui()).isTrue();
-        assertThat(launch.command()).containsExactly("tui");
-        assertThat(launch.context()).isEqualTo("dev");
-    }
-
-    @Test
-    void tuiAcceptsItsWorkspaceOptionAfterTheEntryPoint() {
-        LaunchOptions launch = LaunchOptions.parse("tui", "-w", "orders-workspace");
-        Run help = run("tui", "--help");
-
-        assertThat(launch.isTui()).isTrue();
-        assertThat(launch.command()).containsExactly("tui");
-        assertThat(launch.root()).isEqualTo(Path.of("orders-workspace"));
-        assertThat(help.out()).contains("-w, --workdir");
-    }
-
-    @Test
-    void tuiDoesNotTakeTheOneShotBypassBeforeTheTerminalEntryPoint() {
-        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("tui"))).isFalse();
+        assertThat(tui.command()).isEmpty();
+        assertThat(tui.root()).isEqualTo(Path.of("orders-workspace"));
+        assertThat(tui.context()).isEqualTo("dev");
+        assertThat(repl.isRepl()).isTrue();
+        assertThat(repl.command()).containsExactly("repl");
+        assertThat(Cli.bypassesSessionResolution(tui)).isFalse();
+        assertThat(Cli.bypassesSessionResolution(repl)).isFalse();
     }
 
     @Test
