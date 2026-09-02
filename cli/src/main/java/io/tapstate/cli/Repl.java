@@ -97,7 +97,7 @@ final class Repl {
             Set.of("connector.instances-busy", "connector.instance-limit-reached");
 
     private static final List<String> ONLINE_VERBS = List.of(
-            "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "status", "metrics",
+            "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "test", "test-result", "discover-schema", "schema", "register",
             "connectors", "token");
 
@@ -453,6 +453,11 @@ final class Repl {
         }
         if (words.get(0).equals("logs") && words.contains("--follow")) {
             return logsFollow(words);
+        }
+        // Composed here out of the verbs the product has, so it parses its own words: the four it
+        // composes are all positional, and the guard below would refuse the one option this takes.
+        if (words.get(0).equals("restart")) {
+            return restartOnline(words);
         }
         // A stop says what becomes of the pipeline's state, and the terminal's plain stop says "clear".
         // This is how a caller says the other thing. It is the one word that changes what a stop does
@@ -1021,6 +1026,126 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         return lifecycleOnline("stop", operands.get(1), Boolean.FALSE);
+    }
+
+    /**
+     * {@code restart <pipeline-id> [--rerun]} -- the terminal's own composition of the four verbs the
+     * product has. There is no fifth verb behind this and no operation of its own: what a restart means
+     * is a sequence, and a sequence is what a front end is for.
+     *
+     * <p>Plain, it cycles the pipeline and lets it carry on from where it stopped -- a pause and a resume
+     * over a running one, a resume over a paused one. With {@code --rerun} it asks for the whole source
+     * to be read again, which is a stop that clears followed by a start.
+     *
+     * <p>A pipeline with nothing to carry on from is started, and <em>told so</em>. The two outcomes are
+     * indistinguishable from the outside until the run is well under way -- one continues, the other
+     * re-reads everything -- so a restart that quietly did the second would be reporting the first.
+     */
+    private int restartOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        boolean rerun = words.contains("--rerun");
+        List<String> operands = words.stream().filter(word -> !word.equals("--rerun")).toList();
+        for (int i = 1; i < operands.size(); i++) {
+            if (operands.get(i).startsWith("-")) {
+                err.println("restart: unknown option " + operands.get(i)
+                        + " (usage: restart <pipeline-id> [--rerun])");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("restart: missing operand (usage: restart <pipeline-id> [--rerun])");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = operands.get(1);
+        if (rerun) {
+            return rerunFromTheStart(id);
+        }
+        StatusOutcome outcome = withFailover(() ->
+                controlPlane.status(session.landingNode(), session.credential(), id),
+                o -> o instanceof StatusOutcome.Unreachable);
+        return switch (outcome) {
+            case StatusOutcome.Found found -> carryOnFrom(id, found.state());
+            case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case StatusOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /** The plain restart, once the pipeline's state says which sequence carrying on actually is. */
+    private int carryOnFrom(String id, String state) {
+        PrintWriter out = commandLine.getOut();
+        PrintWriter err = commandLine.getErr();
+        switch (state.toUpperCase(Locale.ROOT)) {
+            case "RUNNING": {
+                int paused = lifecycleOnline("pause", id, null);
+                if (paused != Cli.EXIT_OK) {
+                    // Said rather than left to be inferred from a pipeline that is now merely paused.
+                    // Nothing was lost -- the position is still there -- and trying again is the answer.
+                    err.println("restart: paused but did not resume; the position is still there, so "
+                            + "running restart again picks it up");
+                    err.flush();
+                    return paused;
+                }
+                return lifecycleOnline("resume", id, null);
+            }
+            case "PAUSED":
+                return lifecycleOnline("resume", id, null);
+            case "NEW":
+            case "STOPPED":
+            case "COMPLETED": {
+                // The half that is not the state change. Both outcomes end with the pipeline running, and
+                // which one happened shows only in how much of the source the run reads.
+                out.println("restart: " + id + " has no position to carry on from; this run reads "
+                        + "everything from the start");
+                out.flush();
+                return lifecycleOnline("start", id, null);
+            }
+            case "FAILED":
+                // Refused rather than degraded. Starting it would read the whole source again while
+                // reporting the word the caller typed to avoid exactly that, and the position a failed
+                // run stopped at is still on record -- so a silent full re-read would throw away
+                // something that is still there.
+                err.println("restart: " + id + " failed, and carrying on from where a failed run stopped "
+                        + "is not available yet; 'restart --rerun' reads the whole source again");
+                err.flush();
+                return Cli.EXIT_VERB_UNAVAILABLE;
+            default:
+                err.println("restart: " + id + " is " + state.toLowerCase(Locale.ROOT)
+                        + ", which restart does not know how to carry on from");
+                err.flush();
+                return Cli.EXIT_VERB_UNAVAILABLE;
+        }
+    }
+
+    /**
+     * {@code restart --rerun} -- clear what the pipeline has, then start it, so the whole source is read
+     * again.
+     *
+     * <p>The ordering that matters is already the product's: a stop that names a pipeline the server does
+     * not have, or one the state machine forbids stopping, is refused before the intent is written -- and
+     * nothing is cleared until the intent is written. So there is no window in which this asks for the
+     * clearing and then discovers the start was never going to be allowed.
+     *
+     * <p>What is left is the window nobody can close: the start being refused after the stop was accepted,
+     * because the pipeline was removed in between. That is reported as what it is rather than as a failed
+     * command, because the pipeline is now stopped with nothing to resume from and the next step is not
+     * "try again".
+     */
+    private int rerunFromTheStart(String id) {
+        int stopped = lifecycleOnline("stop", id, Boolean.TRUE);
+        if (stopped != Cli.EXIT_OK) {
+            return stopped;
+        }
+        int started = lifecycleOnline("start", id, null);
+        if (started != Cli.EXIT_OK) {
+            PrintWriter err = commandLine.getErr();
+            err.println("restart: " + id + " was stopped and its state cleared, but starting it did not "
+                    + "go through; it is stopped with no position to resume from, so the next run reads "
+                    + "the whole source");
+            err.flush();
+        }
+        return started;
     }
 
     private int lifecycleOnline(String verb, String id, Boolean purgeState) {

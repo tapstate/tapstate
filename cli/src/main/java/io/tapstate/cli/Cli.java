@@ -152,6 +152,15 @@ public final class Cli implements Runnable {
     static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("run", "export", "diff", "edit");
 
     /**
+     * Verbs this face composes out of registered operations rather than projecting one. They need a
+     * connection like any other online verb, and they are listed apart from the projection because the
+     * projection is checked against the operation registry in both directions -- a composed verb has no
+     * operation of its own to be checked against, and putting one there to satisfy the check is exactly
+     * the thing composing it was meant to avoid.
+     */
+    static final List<String> COMPOSITE_VERBS = List.of("restart");
+
+    /**
      * The live views over a collection. They project no registered operation and never will: each is a
      * client-side loop over reads that are already registered, in the same category as the streaming
      * flags on the two pipeline read verbs. The verb itself carries the choice a reader is making —
@@ -222,6 +231,8 @@ public final class Cli implements Runnable {
                     "Start a pipeline.")),
             Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state]",
                     "Stop a pipeline and clear what it accumulated; --keep-state keeps it.")),
+            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun]",
+                    "Cycle a pipeline and carry on; --rerun reads the whole source again.")),
             Map.entry("pause", new VerbHelp("<pipeline-id>",
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",
@@ -310,6 +321,9 @@ public final class Cli implements Runnable {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
         for (String verb : LIVE_VIEW_VERBS) {
+            commandLine.addSubcommand(verb, new ConnectedVerb());
+        }
+        for (String verb : COMPOSITE_VERBS) {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
         for (String verb : UNIMPLEMENTED_COMPOSITE_VERBS) {

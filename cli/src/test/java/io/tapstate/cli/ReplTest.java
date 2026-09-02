@@ -3309,6 +3309,114 @@ class ReplTest {
         assertThat(client.lifecycleCalls).containsExactly("jwt-tok@http://node1:7900 start pl1");
     }
 
+    // ---- restart: composed here out of the four verbs, never a fifth ----------------------------
+
+    @Test
+    void restartOnARunningPipelineCyclesItAndCarriesOn() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // The order is the assertion. A resume before the pause, or a stop anywhere in here, is a
+        // different act on the pipeline's state -- and all three end with it running again.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 pause pl1",
+                "jwt-tok@http://node1:7900 resume pl1");
+    }
+
+    @Test
+    void restartOnAPausedPipelineOnlyResumesIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "PAUSED");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // Pausing something already paused is refused by the state machine, so a restart that always
+        // paused first would fail here -- on a pipeline whose owner asked for the ordinary thing.
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 resume pl1");
+    }
+
+    @Test
+    void restartOnACleanPipelineSaysItIsAFullRun() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "STOPPED");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        assertThat(client.lifecycleCalls).containsExactly("jwt-tok@http://node1:7900 start pl1");
+        // This assertion is the case. Both outcomes end with the pipeline running, and which one
+        // happened shows only in how much of the source gets read -- hours later, if at all. An
+        // implementation that degraded quietly passes every other assertion here.
+        assertThat(h.sink().toString())
+                .contains("no position to carry on from")
+                .contains("reads everything from the start");
+    }
+
+    @Test
+    void restartRerunClearsWhatThePipelineHasAndThenStartsIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        // The stop carries the clearing answer, and nothing here reads the pipeline's state first: what
+        // --rerun asks for is the same whatever the pipeline was doing.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true",
+                "jwt-tok@http://node1:7900 start pl1");
+    }
+
+    @Test
+    void restartRerunDoesNotStartWhenTheStopWasRefused() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Rejected("lifecycle.illegal-transition", "Not running.");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        // A start after a refused stop would run a pipeline whose owner asked for it to be re-read from
+        // scratch, without the clearing that makes it one -- so it would carry on while reporting the
+        // opposite. The refusal ends the sequence.
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
+    }
+
+    @Test
+    void restartOnAFailedPipelineRefusesRatherThanQuietlyReReadingEverything() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // Degrading to a start here is the tempting shape and the wrong one: the position a failed run
+        // stopped at is still on record, and starting would read the whole source again while reporting
+        // the word the caller typed to avoid exactly that.
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.sink().toString()).contains("--rerun");
+    }
+
+    @Test
+    void restartStillNeedsAPipelineToRestart() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart --rerun");
+
+        // The option must not be read as the operand, for the reason --keep-state must not be.
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
     @Test
     void stopKeepingStateSendsTheOtherAnswerRatherThanNoneAtAll() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));

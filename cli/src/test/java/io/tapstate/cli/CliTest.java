@@ -94,6 +94,10 @@ class CliTest {
         TreeSet<String> registeredOffline = new TreeSet<>(Cli.newCommandLine().getSubcommands().keySet());
         registeredOffline.removeAll(Cli.CONNECTED_VERBS);
         registeredOffline.removeAll(Cli.UNIMPLEMENTED_COMPOSITE_VERBS);
+        // a composed verb projects no operation of its own -- it is a sequence of ones that do -- so it
+        // is not in the connected list either, and it is the opposite of offline: every verb it composes
+        // needs a server
+        registeredOffline.removeAll(Cli.COMPOSITE_VERBS);
         // the live views project no operation, so they are not in the connected list, but they are the
         // opposite of offline: each is a loop over reads that only a server can answer
         registeredOffline.removeAll(Cli.LIVE_VIEW_VERBS);
@@ -556,6 +560,7 @@ class CliTest {
         // does — this pins the entries to the registered names, in both directions
         TreeSet<String> registered = new TreeSet<>(Cli.CONNECTED_VERBS);
         registered.addAll(Cli.UNIMPLEMENTED_COMPOSITE_VERBS);
+        registered.addAll(Cli.COMPOSITE_VERBS);
         registered.addAll(Cli.LIVE_VIEW_VERBS);
         assertThat(new TreeSet<>(Cli.VERB_HELP.keySet())).isEqualTo(registered);
     }
