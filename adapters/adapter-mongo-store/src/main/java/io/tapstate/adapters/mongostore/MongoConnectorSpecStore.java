@@ -98,6 +98,7 @@ public final class MongoConnectorSpecStore implements ConnectorSpecStore {
             return binary.getData();
         }
         throw new TapstateException(
-                IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(contentHash)), null);
+                IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", String.valueOf(contentHash), "field", "spec"), null);
     }
 }

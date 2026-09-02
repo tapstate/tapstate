@@ -103,7 +103,8 @@ public final class MongoTokenStore implements TokenStore {
             // A stored document whose fields no longer form a valid token record — absent, blank, or the
             // wrong type — is a storage-integrity failure, surfaced as an io diagnostic (the original
             // failure kept as the cause) rather than crashing bare from a cast or the record's validation.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), invalid);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "token"), invalid);
         }
     }
 }

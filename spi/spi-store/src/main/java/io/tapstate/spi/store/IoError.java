@@ -43,7 +43,7 @@ public enum IoError implements TapstateErrorCode {
      * newer grammar, or a document missing a field this version requires. {@code id} is the stored
      * document's id.
      */
-    DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id"));
+    DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id", "field"));
 
     private final String code;
     private final Set<String> placeholders;

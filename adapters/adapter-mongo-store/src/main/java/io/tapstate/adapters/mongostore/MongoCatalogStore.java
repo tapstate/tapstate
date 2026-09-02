@@ -83,13 +83,15 @@ public final class MongoCatalogStore implements CatalogStore {
         if (connectorId == null) {
             // A stored connection missing its connector id is store corruption, surfaced as a coded io
             // diagnostic rather than a bare null-argument crash while reconstructing.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "connectorId"), null);
         }
         Object settings = document.get("settings");
         if (settings != null && !(settings instanceof Document)) {
             // A settings field that is present but is not a sub-document is corruption — surfaced as
             // unreadable rather than silently coerced to an empty-settings config.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "settings"), null);
         }
         Map<String, Object> normalized = settings instanceof Document sub ? normalizeMap(sub) : Map.of();
         return new ConnectionConfig(id, connectorId, normalized);

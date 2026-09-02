@@ -308,7 +308,7 @@ class ConnectorCatalogViewTest {
             @Override
             public Optional<byte[]> get(String contentHash) {
                 throw new TapstateException(
-                        IoError.DOCUMENT_UNREADABLE, java.util.Map.of("id", contentHash), null);
+                        IoError.DOCUMENT_UNREADABLE, java.util.Map.of("id", contentHash, "field", "artifact"), null);
             }
         };
         ConnectorCatalogView view = new ConnectorCatalogView(BUNDLED, store, damaged, emptyRegistry());

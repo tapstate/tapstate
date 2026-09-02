@@ -295,7 +295,7 @@ io.store-unauthorized:
   message: "The store rejected the credentials for the operation."
   solution: "Check the store username and password in the connection settings."
 io.document-unreadable:
-  message: "A stored document with id '{id}' could not be read back."
+  message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."
 connector.not-official:
   message: "Runtime registration supports these connectors today: {official}. '{connector}' is not among them yet."
