@@ -99,7 +99,10 @@ class UpgradeFromPublishedImageIT {
     private Path workspace;
 
     @BeforeAll
-    static void requireDocker() {
+    static void requireTheUpgradeLane() {
+        // Asked for before Docker is: this witness reaches for a published release, so it belongs to
+        // the lane that may fail over a stale release rather than to every pull request.
+        UpgradeLaneGate.require();
         DockerGate.require();
     }
 

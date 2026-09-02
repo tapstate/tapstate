@@ -1,0 +1,101 @@
+# Upgrade-from-a-released-build lane.
+#
+# The witnesses here start a build somebody already published, let it write a store, and then hand
+# that store to the build under test. That is the only way to ask the question the migration exists
+# for -- whether it reads what people actually have -- and it is also why these cannot be a per-commit
+# gate: they reach for a published release, so a red run can mean the release is stale or the registry
+# is unavailable rather than that the pull request is wrong. Blocking unrelated work on that would be
+# a lie about what failed. The quickstart's live journey is nightly for the same reason.
+#
+# Which classes run is derived from the source rather than listed here. A witness asks for this lane
+# by calling the lane gate, and this reads those calls back. A hand-maintained list fails open: the
+# witness somebody adds without editing this file simply never runs, and that looks exactly like a
+# lane with nothing to do. Five nest witnesses were once written, committed, documented and never run
+# by anything, which is the failure this shape avoids.
+#
+# Every way this can go wrong is red rather than quiet. Finding no witnesses at all fails, because the
+# gate having been renamed and the lane having no work are the same empty list. And each witness is
+# checked to have actually run, name by name -- a witness that skipped still writes a report, so
+# counting reports would pass over exactly the outcome this lane exists to prevent.
+name: Upgrade from a released build
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Clear of the real-connector lane and the quickstart journey, so the three do not queue together.
+    - cron: "10 21 * * *"
+
+concurrency:
+  group: upgrade-lane-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: which witnesses asked for this lane
+        id: witnesses
+        run: |
+          set -euo pipefail
+          classes="$(grep -rl 'UpgradeLaneGate.require' e2e/src/test/java/io/tapstate/e2e/ \
+            | xargs -n1 basename | sed 's/\.java$//' | sort | paste -sd, -)"
+          if [ -z "$classes" ]; then
+            echo "no witness calls UpgradeLaneGate.require: either they were removed or the gate was" \
+                 "renamed and this lane now runs nothing" >&2
+            exit 1
+          fi
+          echo "classes=$classes" >> "$GITHUB_OUTPUT"
+          echo "running: $classes"
+
+      - name: run them against a published release
+        run: >
+          mvn -B -pl e2e -am verify
+          -Dtapstate.e2e.upgrade-lane=true
+          -Dtest=ZzzNoSuchSurefireSelector -Dsurefire.failIfNoSpecifiedTests=false
+          -Dit.test=${{ steps.witnesses.outputs.classes }}
+          -Dfailsafe.failIfNoSpecifiedTests=false
+
+      - name: every witness the lane named actually ran
+        # The gate skips when the lane did not ask, and a skipped class still writes a report. So the
+        # reports are read for what they say rather than counted: a class that reports no tests run is
+        # a witness that was named, was gated out anyway, and would otherwise leave this lane green
+        # having proven nothing.
+        if: always()
+        run: |
+          set -euo pipefail
+          status=0
+          IFS=',' read -ra named <<< "${{ steps.witnesses.outputs.classes }}"
+          for class in "${named[@]}"; do
+            report="e2e/target/failsafe-reports/io.tapstate.e2e.$class.txt"
+            if [ ! -f "$report" ]; then
+              echo "$class: no report at all, so it never ran" >&2
+              status=1
+              continue
+            fi
+            line="$(grep -m1 'Tests run:' "$report" || true)"
+            case "$line" in
+              *"Tests run: 0"*|"")
+                echo "$class: $line -- named by this lane and did not run" >&2
+                status=1
+                ;;
+              *) echo "$class: $line" ;;
+            esac
+          done
+          exit "$status"
+
+      - name: the scene where a witness failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-failure-scenes
+          path: e2e/target/failure-scenes/
+          if-no-files-found: ignore
+          retention-days: 7
