@@ -126,6 +126,12 @@ public final class DslParser {
     static final Set<String> REQUIRED_PIPELINE_KEYS = Set.of("id", "source");
     /** Every definition body: the rest of what they require is supplied or checked by shape. */
     static final Set<String> REQUIRED_DEFINITION_KEYS = Set.of("id");
+    // A view carries a key of its own; the other two definition bodies do not, so they cannot share
+    // one set. The key is what the sink indexes uniquely, so a view without it cannot be built.
+    static final Set<String> REQUIRED_VIEW_DEF_KEYS = Set.of("id", "primary_key");
+    // Only the key: an inline view's id is generated when omitted and its from comes from natural
+    // order, so neither is required of the document even though the model requires both.
+    static final Set<String> REQUIRED_VIEW_INLINE_KEYS = Set.of("primary_key");
     static final Set<String> REQUIRED_TABLE_SPEC_KEYS = Set.of("name");
     static final Set<String> REQUIRED_SYNC_KEYS = Set.of("source");
     static final Set<String> REQUIRED_PUSH_KEYS = Set.of("source");
@@ -447,6 +453,7 @@ public final class DslParser {
             return new ViewBlock.Use(idOf(v), v.string("use"), blockFrom(v, prevId, n));
         }
         v.requireOnly(VIEW_INLINE_KEYS);
+        v.requirePresent(REQUIRED_VIEW_INLINE_KEYS);
         String id = idOf(v);
         return new ViewBlock.Inline(
                 id != null ? id : "view",
@@ -644,7 +651,7 @@ public final class DslParser {
     private ViewResource viewDefinition(YamlMap m) {
         forbidFrom(m);
         m.requireOnly(VIEW_DEF_KEYS);
-        m.requirePresent(REQUIRED_DEFINITION_KEYS);
+        m.requirePresent(REQUIRED_VIEW_DEF_KEYS);
         return new ViewResource(
                 idOf(m), metadata(m), m.string("primary_key"),
                 storage(m.mapping("storage")), viewSchema(m.mapping("schema")), m.freeMap("experimental"));

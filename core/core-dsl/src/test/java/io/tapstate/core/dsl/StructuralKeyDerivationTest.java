@@ -30,6 +30,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.RecordComponent;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -144,13 +145,20 @@ class StructuralKeyDerivationTest {
         return keys;
     }
 
+    /** What the document must carry: everything the model requires, less what the parser supplies. */
+    private static Set<String> requiredOfTheDocument(Class<?> record) {
+        Set<String> keys = new TreeSet<>(deriveRequired(record));
+        keys.removeAll(ANSWERED_BY_THE_PARSER.getOrDefault(record, Set.of()));
+        return keys;
+    }
+
     private static void assertRequired(Set<String> demanded, Class<?> record) {
         assertThat(new TreeSet<>(demanded))
                 .as("%s: what the parser demands of a document must be what the model declares "
                         + "required — a component that becomes required without reaching this list is "
                         + "a NullPointerException at the boundary rather than a coded refusal",
                         record.getSimpleName())
-                .isEqualTo(new TreeSet<>(deriveRequired(record)));
+                .isEqualTo(requiredOfTheDocument(record));
     }
 
     @Test
@@ -177,7 +185,8 @@ class StructuralKeyDerivationTest {
         assertRequired(DslParser.REQUIRED_EMBED_KEYS, Embed.class);
         // The three definition bodies each require an id and nothing else of their own, so one set
         // serves all three; TransformResource's other required component is its flattened body.
-        assertRequired(DslParser.REQUIRED_DEFINITION_KEYS, ViewResource.class);
+        assertRequired(DslParser.REQUIRED_VIEW_DEF_KEYS, ViewResource.class);
+        assertRequired(DslParser.REQUIRED_VIEW_INLINE_KEYS, ViewBlock.Inline.class);
         assertRequired(DslParser.REQUIRED_DEFINITION_KEYS, ServeResource.class);
         assertRequired(DslParser.REQUIRED_DEFINITION_KEYS, TransformResource.class);
     }
@@ -197,6 +206,7 @@ class StructuralKeyDerivationTest {
             SourceResource.class, PipelineResource.class, TableRef.Spec.class, SyncElement.class,
             PushElement.class, QueryElement.class, Storage.Hot.class, Storage.Warm.class,
             NestRoot.class, Embed.class, ViewResource.class, ServeResource.class,
+            ViewBlock.Inline.class,
             TransformResource.class, TransformBody.Js.class, TransformBody.MapProjection.class,
             TransformBody.Filter.class, TransformBody.Nest.class, TransformBody.Join.class);
 
@@ -213,9 +223,16 @@ class StructuralKeyDerivationTest {
      *       a branch guarded on {@code use:} being present, so the key is there by construction.</li>
      * </ul>
      */
-    private static final Set<Class<?>> ANSWERED_BY_THE_PARSER = Set.of(
-            Step.Inline.class, Step.Use.class, ViewBlock.Inline.class, ViewBlock.Use.class,
-            ServeBlock.Inline.class, ServeBlock.Use.class);
+    private static final Map<Class<?>, Set<String>> ANSWERED_BY_THE_PARSER = Map.of(
+            Step.Inline.class, Set.of("id", "from"),
+            Step.Use.class, Set.of("use", "from"),
+            // Not primary_key: nothing supplies a view's key, so it is demanded of the document.
+            // Naming the record alone used to exempt every component it would ever require, which
+            // is how a key the model calls required reached the sink as a null.
+            ViewBlock.Inline.class, Set.of("id", "from"),
+            ViewBlock.Use.class, Set.of("use", "from"),
+            ServeBlock.Inline.class, Set.of("from"),
+            ServeBlock.Use.class, Set.of("use", "from"));
 
     /** Every record the grammar is made of — the population the account below is taken over. */
     private static final Set<Class<?>> MODEL_RECORDS = Set.of(
@@ -240,7 +257,11 @@ class StructuralKeyDerivationTest {
         }
         Set<String> accountedFor = new TreeSet<>();
         DEMANDED_OF_THE_DOCUMENT.forEach(c -> accountedFor.add(c.getSimpleName()));
-        ANSWERED_BY_THE_PARSER.forEach(c -> accountedFor.add(c.getSimpleName()));
+        ANSWERED_BY_THE_PARSER.forEach((c, answered) -> {
+            if (requiredOfTheDocument(c).isEmpty()) {
+                accountedFor.add(c.getSimpleName());
+            }
+        });
 
         assertThat(withARequirement)
                 .as("a model record declaring a required component must either be demanded of the "
@@ -269,6 +290,7 @@ class StructuralKeyDerivationTest {
             "REQUIRED_SOURCE_KEYS", "REQUIRED_PIPELINE_KEYS", "REQUIRED_DEFINITION_KEYS",
             "REQUIRED_TABLE_SPEC_KEYS", "REQUIRED_SYNC_KEYS", "REQUIRED_PUSH_KEYS",
             "REQUIRED_QUERY_KEYS", "REQUIRED_HOT_KEYS", "REQUIRED_WARM_KEYS",
+            "REQUIRED_VIEW_DEF_KEYS", "REQUIRED_VIEW_INLINE_KEYS",
             "REQUIRED_NEST_ROOT_KEYS", "REQUIRED_EMBED_KEYS");
 
     @Test

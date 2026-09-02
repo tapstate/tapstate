@@ -83,6 +83,10 @@ final class NewCmd implements Callable<Integer> {
             description = "Source read mode (cdc, snapshot, stream, file, api) — must suit the connector.")
     SourceMode mode;
 
+    @Option(names = "--primary-key", paramLabel = "FIELD",
+            description = "Field that uniquely identifies a record in a view - required for --kind view.")
+    String primaryKey;
+
     @Option(names = "--set", paramLabel = "KEY=VALUE",
             description = "A connector config entry (repeatable).")
     Map<String, String> config = new LinkedHashMap<>();
@@ -279,13 +283,16 @@ final class NewCmd implements Callable<Integer> {
             return EXIT_USAGE;
         }
         boolean interactive = prompter != null || (!nonInteractive && id == null && System.console() != null);
-        if (!interactive && id == null) {
-            err.println("new: provide --id, or run interactively at a terminal");
+        if (!interactive && (id == null || primaryKey == null)) {
+            // Named rather than defaulted: the key is the view's unique index, and a scaffold that
+            // guessed one would hand back a document that validates and indexes the wrong field.
+            err.println("new: provide --id and --primary-key, or run interactively at a terminal");
             err.flush();
             return EXIT_USAGE;
         }
         try {
-            Resource resource = interactive ? runViewWizard() : new ViewResource(id, null, null, null, null, null);
+            Resource resource =
+                    interactive ? runViewWizard() : new ViewResource(id, null, primaryKey, null, null, null);
             return emit(resource);
         } catch (TapstateException e) {
             return emitDiagnostic(e);

@@ -33,21 +33,23 @@ class ViewWizardTest {
     }
 
     @Test
-    void buildsAViewWithoutAPrimaryKey() {
-        // a blank primary-key answer leaves the field out — a view without a declared key is legal
-        ScriptedPrompter p = new ScriptedPrompter("v_cust", "");
+    void repromptsABlankPrimaryKey() {
+        // A view is materialized into a sink keyed on this field, so there is no legal view without
+        // one and nothing sensible to default it to: a blank answer is asked again rather than kept.
+        ScriptedPrompter p = new ScriptedPrompter("v_cust", "", "cust_id");
         ViewResource view = new ViewWizard(p).run();
         assertThat(yaml(view)).isEqualTo(
                 """
                 version: tapstate/v1
                 kind: view
                 id: v_cust
+                primary_key: cust_id
                 """);
     }
 
     @Test
     void defaultsTheViewIdWhenLeftBlank() {
-        ScriptedPrompter p = new ScriptedPrompter("", "");
+        ScriptedPrompter p = new ScriptedPrompter("", "cust_id");
         ViewResource view = new ViewWizard(p).run();
         assertThat(view.id()).isEqualTo("view");
     }
@@ -55,7 +57,7 @@ class ViewWizardTest {
     @Test
     void repromptsAnIdContainingADot() {
         // ids may not contain a dot (it would crash the parser); the wizard re-prompts on one
-        ScriptedPrompter p = new ScriptedPrompter("a.b", "v_ok", "");
+        ScriptedPrompter p = new ScriptedPrompter("a.b", "v_ok", "cust_id");
         ViewResource view = new ViewWizard(p).run();
         assertThat(view.id()).isEqualTo("v_ok");
     }

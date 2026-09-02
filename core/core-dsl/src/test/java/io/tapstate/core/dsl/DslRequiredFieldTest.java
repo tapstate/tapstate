@@ -41,6 +41,8 @@ class DslRequiredFieldTest {
             js-without-script        | script             | transforms[0].script
             join-without-sql         | sql                | transforms[0].sql
             nest-without-root        | root               | transforms[0].root
+            inline-view-without-key  | primary_key        | view.primary_key
+            view-def-without-key     | primary_key        | primary_key
             """)
     void aRequiredFieldLeftOutIsRefused(String scenario, String field, String path) {
         Throwable thrown = catchThrowable(() -> parser.parse(document(scenario)));
@@ -146,6 +148,14 @@ class DslRequiredFieldTest {
                     transforms: [ { type: nest, from: { a: t1 }, primary_key: k } ]
                     serve: { from: t1, sync: [ { source: tgt } ] }
                     """);
+            case "inline-view-without-key" -> pipeline("""
+                    view: { id: v_a, from: t1 }
+                    """);
+            case "view-def-without-key" -> """
+                    version: tapstate/v1
+                    kind: view
+                    id: v_a
+                    """;
             default -> throw new IllegalArgumentException("no such scenario: " + scenario);
         };
     }

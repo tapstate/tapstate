@@ -431,7 +431,7 @@ class NewCmdTest {
         CommandLine cl = Cli.newCommandLine();
         NewCmd cmd = cl.getSubcommands().get("new").getCommand();
         cmd.prompter = new ScriptedPrompter(
-                "p1", "src_a", "(done)", "sync", "tgt_b", "inline", "serve", "v_real", "");
+                "p1", "src_a", "(done)", "sync", "tgt_b", "inline", "serve", "v_real", "cust_id");
         cl.setOut(new PrintWriter(new StringWriter()));
         cl.setErr(new PrintWriter(new StringWriter()));
         assertThat(cl.execute("new", "--kind", "pipeline", "--out", dir.toString())).isZero();
@@ -513,10 +513,10 @@ class NewCmdTest {
 
     @Test
     void newViewNonInteractiveWritesAMinimalArtifact(@TempDir Path dir) throws Exception {
-        // the non-interactive path scaffolds the minimal view skeleton (id only); the richer fields
-        // (primary key, storage, schema) are authored interactively or by hand
+        // the minimal view skeleton is id plus the key it is indexed on; the richer fields
+        // (storage, schema) are still authored interactively or by hand
         Run r = run("new", "--non-interactive", "--kind", "view", "--id", "v_cust",
-                "--out", dir.toString());
+                "--primary-key", "cust_id", "--out", dir.toString());
 
         assertThat(r.code()).isZero();
         assertThat(Files.readString(dir.resolve("v_cust.tap.yml"))).isEqualTo(
@@ -524,6 +524,7 @@ class NewCmdTest {
                 version: tapstate/v1
                 kind: view
                 id: v_cust
+                primary_key: cust_id
                 """);
     }
 
@@ -830,15 +831,15 @@ class NewCmdTest {
     @Test
     void newViewJsonEmitsACreatedEnvelope(@TempDir Path dir) {
         Run r = run("new", "--non-interactive", "--kind", "view", "--id", "v_cust",
-                "--out", dir.toString(), "-o", "json");
+                "--primary-key", "cust_id", "--out", dir.toString(), "-o", "json");
 
         assertThat(r.code()).isZero();
         assertThat(r.out()).contains("\"status\": \"created\"")
                 .contains("\"kind\": \"view\"")
                 .contains("\"id\": \"v_cust\"")
                 .contains("\"path\":")
-                // a keyless view omits the primary_key field entirely (a kind-field appears only when it has content)
-                .doesNotContain("primary_key");
+                // the key is part of every view now, so the envelope always carries it
+                .contains("\"primary_key\": \"cust_id\"");
     }
 
     @Test
@@ -945,8 +946,20 @@ class NewCmdTest {
     @Test
     void aScaffoldedStandaloneViewValidates(@TempDir Path dir) {
         assertThat(run("new", "--non-interactive", "--kind", "view", "--id", "v_cust",
-                "--out", dir.toString()).code()).isZero();
+                "--primary-key", "cust_id", "--out", dir.toString()).code()).isZero();
 
         assertThatCode(() -> WorkspaceLoader.load(dir)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void newViewNonInteractiveRefusesWithoutAPrimaryKey(@TempDir Path dir) {
+        // The other half of the test above: the scaffold may not write a document its own validate
+        // refuses, and the key is the one field it cannot invent - so it asks instead of guessing.
+        Run r = run("new", "--non-interactive", "--kind", "view", "--id", "v_cust",
+                "--out", dir.toString());
+
+        assertThat(r.code()).isEqualTo(2);
+        assertThat(r.err()).contains("--primary-key");
+        assertThat(dir.resolve("v_cust.tap.yml")).doesNotExist();
     }
 }

@@ -1,0 +1,4 @@
+rule: missing-field
+adr: "ADR-0016 §7"
+path: view.primary_key
+note: "an inline view declares no primary_key; the sink indexes that field uniquely, so there is nothing to build the view on"

@@ -1142,7 +1142,8 @@
       },
       "required": [
         "id",
-        "from"
+        "from",
+        "primary_key"
       ],
       "additionalProperties": false
     },
@@ -1210,7 +1211,8 @@
       "required": [
         "version",
         "kind",
-        "id"
+        "id",
+        "primary_key"
       ],
       "additionalProperties": false
     },

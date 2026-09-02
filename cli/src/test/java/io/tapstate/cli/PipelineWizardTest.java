@@ -387,9 +387,11 @@ class PipelineWizardTest {
     }
 
     @Test
-    void buildsAViewWithoutAPrimaryKey() {
+    void repromptsABlankPrimaryKeyOnAnInlineView() {
+        // An inline view is materialized into a sink keyed on this field, so a blank answer is asked
+        // again rather than kept: there is no legal keyless view and nothing to default the key to.
         ScriptedPrompter p = new ScriptedPrompter(
-                "p1", "src_a", "(done)", "(none)", "inline", "v_cust", "");
+                "p1", "src_a", "(done)", "(none)", "inline", "v_cust", "", "cust_id");
         PipelineResource pipe = new PipelineWizard(p, List.of()).run();
         assertThat(yaml(pipe)).isEqualTo(
                 """
@@ -400,6 +402,7 @@ class PipelineWizardTest {
                 view:
                   id: v_cust
                   from: /.*/
+                  primary_key: cust_id
                 """);
     }
 
@@ -593,7 +596,7 @@ class PipelineWizardTest {
         // a combined pipeline's inline serve is id "serve"; an inline view named "serve" would
         // duplicate it and crash validate, so the wizard re-prompts until a distinct id is given
         ScriptedPrompter p = new ScriptedPrompter(
-                "p1", "src_a", "(done)", "sync", "tgt_b", "inline", "serve", "v_real", "");
+                "p1", "src_a", "(done)", "sync", "tgt_b", "inline", "serve", "v_real", "cust_id");
         PipelineResource pipe = new PipelineWizard(p, List.of()).run();
         assertThat(pipe.view()).isInstanceOf(ViewBlock.Inline.class);
         assertThat(((ViewBlock.Inline) pipe.view()).id()).isEqualTo("v_real");
@@ -605,7 +608,7 @@ class PipelineWizardTest {
         // view after the transform would duplicate the id, so the wizard re-prompts
         ScriptedPrompter p = new ScriptedPrompter(
                 "p1", "src_a", "filter", "norm", "orders", "op != 'd'",
-                "(done)", "(none)", "inline", "norm", "v_real", "");
+                "(done)", "(none)", "inline", "norm", "v_real", "cust_id");
         PipelineResource pipe = new PipelineWizard(p, List.of()).run();
         assertThat(((ViewBlock.Inline) pipe.view()).id()).isEqualTo("v_real");
     }
