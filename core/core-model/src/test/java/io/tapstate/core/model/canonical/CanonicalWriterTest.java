@@ -22,6 +22,8 @@ import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.SrsSchemaEvolution;
 import io.tapstate.core.model.Step;
@@ -42,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Canonical-form serialization, locked by docs/reference/canonical-form.md (2026-06-12
@@ -704,5 +707,40 @@ class CanonicalWriterTest {
                       - type: mcp
                     """);
         }
+    }
+
+    @Test
+    void narrowsEveryNumberInTheTreeToWhatADocumentStoreHandsBack() {
+        // A free-form config carries whatever number the JSON face accepted. Measured against the store
+        // this tree is written to: a byte and a short come back as ints, a float as a double, a decimal
+        // as a decimal type of the store's own, and a big integer cannot be written at all. A value that
+        // changed type between being written and being read would change the resource's identity by
+        // being stored, so the narrowing happens here, once, rather than at each end.
+        Map<String, Object> numbers = new LinkedHashMap<>();
+        numbers.put("byte", (byte) 1);
+        numbers.put("short", (short) 2);
+        numbers.put("int", 3);
+        numbers.put("long", 4L);
+        numbers.put("float", 5.5f);
+        numbers.put("double", 6.5d);
+        numbers.put("decimal", new BigDecimal("7.25"));
+        numbers.put("bigint", new BigInteger("8"));
+
+        Object stored = new CanonicalWriter()
+                .tree(new SourceResource("orders", null, "postgres", Map.of(), null, null, null, numbers))
+                .get("experimental");
+
+        assertThat(stored).isEqualTo(Map.of(
+                "byte", 1, "short", 2, "int", 3, "long", 4L,
+                "float", 5.5d, "double", 6.5d, "decimal", 7.25d, "bigint", 8L));
+    }
+
+    @Test
+    void refusesAnIntegerNoStoreCouldHoldRatherThanStoringADifferentNumber() {
+        Map<String, Object> tooBig = Map.of("count", new BigInteger("9223372036854775808"));
+
+        assertThatThrownBy(() -> new CanonicalWriter()
+                .tree(new SourceResource("orders", null, "postgres", Map.of(), null, null, null, tooBig)))
+                .isInstanceOf(ArithmeticException.class);
     }
 }

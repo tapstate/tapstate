@@ -1454,8 +1454,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     private static RemoteArtifact artifactOf(Map<?, ?> m) {
         if (m.get("id") instanceof String id && m.get("kind") instanceof String kind) {
             String canonical = m.get("canonicalForm") instanceof String s ? s : null;
+            String contentHash = m.get("contentHash") instanceof String h ? h : null;
             boolean readable = !(m.get("readable") instanceof Boolean b) || b;
-            return new RemoteArtifact(id, kind, canonical, readable);
+            return new RemoteArtifact(id, kind, canonical, contentHash, readable);
         }
         return null;
     }
@@ -1466,7 +1467,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 && m.get("kind") instanceof String kind
                 && m.get("canonicalForm") instanceof String canonical
                 && (!(m.get("readable") instanceof Boolean readable) || readable)) {
-            return new RemoteArtifact(id, kind, canonical);
+            return new RemoteArtifact(id, kind, canonical,
+                    m.get("contentHash") instanceof String h ? h : null, true);
         }
         return null;
     }

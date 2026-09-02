@@ -470,7 +470,7 @@ class SourceApiTest {
         public synchronized Optional<Resource> get(String id) { return Optional.ofNullable(byId.get(id)); }
         public synchronized List<Resource> list() { return new ArrayList<>(byId.values()); }
         private static String hash(Resource resource) {
-            return CanonicalHash.of(new CanonicalWriter().write(resource));
+            return CanonicalHash.of(resource);
         }
     }
 }

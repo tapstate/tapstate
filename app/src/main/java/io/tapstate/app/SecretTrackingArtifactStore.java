@@ -112,6 +112,14 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return delegate.listStored();
     }
 
+    @Override
+    public List<StoredArtifactRecord> listStored(String kind) {
+        // Delegated rather than left to the interface default: the default would filter here, over rows
+        // the delegate had already read and returned, which is the read this decorator has no reason to
+        // make more expensive than the store it wraps.
+        return delegate.listStored(kind);
+    }
+
     private void track(Resource resource) {
         if (!(resource instanceof SourceResource source)) {
             redactor.remove(resource.id());

@@ -3,6 +3,7 @@ package io.tapstate.spi.store;
 import io.tapstate.core.model.Resource;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -100,5 +101,15 @@ public interface ArtifactStore {
      */
     default List<StoredArtifactRecord> listStored() {
         return list().stream().map(StoredArtifactRecord::of).toList();
+    }
+
+    /**
+     * The browse projection restricted to one kind. The default reads every row and discards the rest,
+     * which is what a store with no way to select on a field can do; a store that can select on one
+     * overrides this so the discarding never happens.
+     */
+    default List<StoredArtifactRecord> listStored(String kind) {
+        Objects.requireNonNull(kind, "kind");
+        return listStored().stream().filter(row -> kind.equals(row.kind())).toList();
     }
 }

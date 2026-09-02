@@ -6,6 +6,10 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
 import org.junit.jupiter.api.Test;
 
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
@@ -275,5 +279,61 @@ class DslParserTest {
         DslException ex = (DslException) t;
         assertThat(ex.code()).isEqualTo(DslError.ILLEGAL_VALUE);
         assertThat(ex.path()).isEqualTo("kind");
+    }
+
+    @Test
+    void bindsAStoredDocumentWithoutParsingAnyText() {
+        // What a document store hands back: plain maps and already-typed scalars, no text anywhere.
+        // The port stays an int through the binding, which is the half a text round trip cannot show --
+        // there every scalar arrives as characters and the type is re-guessed from them.
+        Map<String, Object> stored = new LinkedHashMap<>();
+        stored.put("version", "tapstate/v1");
+        stored.put("kind", "source");
+        stored.put("id", "src_ora");
+        stored.put("connector", "oracle");
+        stored.put("config", new LinkedHashMap<>(Map.of("port", 1521)));
+
+        Resource r = parser.fromTree(stored);
+
+        assertThat(r).isInstanceOf(SourceResource.class);
+        assertThat(r.id()).isEqualTo("src_ora");
+        assertThat(((SourceResource) r).config()).containsEntry("port", 1521);
+    }
+
+    @Test
+    void refusesAStoredDocumentDeclaringAGrammarThisBuildCannotRead() {
+        // Reading a stored document skips the text, not the grammar gate. A document a later build
+        // wrote is refused whole, rather than bound field by field under a grammar it does not claim --
+        // which would read some fields correctly and quietly drop the ones that moved.
+        Map<String, Object> stored = new LinkedHashMap<>();
+        stored.put("version", "tapstate/v2");
+        stored.put("kind", "source");
+        stored.put("id", "src_ora");
+        stored.put("connector", "oracle");
+
+        Throwable t = catchThrowable(() -> parser.fromTree(stored));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.code()).isEqualTo(DslError.UNSUPPORTED_VERSION);
+        assertThat(ex.args()).containsEntry("got", "tapstate/v2");
+    }
+
+    @Test
+    void namesTheFieldWhenAStoredDocumentHasTheWrongShapeThere() {
+        // A stored document has no line to point at, so the field path is the whole of the position.
+        Map<String, Object> stored = new LinkedHashMap<>();
+        stored.put("version", "tapstate/v1");
+        stored.put("kind", "source");
+        stored.put("id", "src_ora");
+        stored.put("connector", "oracle");
+        stored.put("srs", List.of("not", "a", "mapping"));
+
+        Throwable t = catchThrowable(() -> parser.fromTree(stored));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.path()).isEqualTo("srs");
+        assertThat(ex.line()).isZero();
     }
 }

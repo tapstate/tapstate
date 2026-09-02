@@ -120,14 +120,14 @@ class ArtifactQueryServiceTest {
 
     @Test
     void aReadCarriesTheContentHashOfTheVersionItReturns() {
-        // The hash is the precondition an edit or a removal has to supply, and a remote model calling
-        // this read cannot compute SHA-256 for itself, so the read is what hands it over. It is taken
-        // from the very bytes this read returned: get then delete needs no second source for it.
+        // The hash is the precondition an edit or a removal has to supply, and it is taken over the
+        // resource's structure -- so the canonical bytes returned beside it are not enough to derive it,
+        // and this read is the only place a caller can get it. get then delete needs no second source.
         apply.apply("alice", List.of(draft(TGT_MY)));
 
         StoredArtifact got = query.get("tgt_my").orElseThrow();
 
-        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(got.canonicalForm()));
+        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(new DslParser().parse(got.canonicalForm())));
     }
 
     @Test

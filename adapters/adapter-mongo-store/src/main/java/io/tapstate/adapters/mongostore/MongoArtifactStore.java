@@ -3,11 +3,13 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.client.ClientSession;
+import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -26,17 +28,21 @@ import java.util.Optional;
 
 /**
  * The MongoDB artifact truth layer: stores each applied resource as one document keyed by the
- * resource's top-level id, holding the resource in its canonical form and its canonical content
- * hash. Reading reconstructs the resource from that canonical form through the canonical parser —
- * the inverse of the canonical writer — so the store keeps a single serialization contract and a
- * written artifact reads back to the same canonical form.
+ * resource's top-level id, holding the resource's canonical structure and its content hash. Reading
+ * binds that structure straight back to the model and parses no text on the way, so the canonical
+ * form is something the store renders on request rather than something it keeps.
  *
- * <p>The document carries the id (as {@code _id}), kind, canonical text, and canonical content hash.
- * A batch is written in one multi-document transaction, so a mid-batch write failure aborts the whole
+ * <p>The document carries the id (as {@code _id}), the kind, the structure (as {@code body}), and the
+ * content hash. Kind is kept beside the body rather than only inside it because it is what a read by
+ * kind filters on, and an index cannot be asked to reach into a body a query never looks at. A batch
+ * is written in one multi-document transaction, so a mid-batch write failure aborts the whole
  * transaction and leaves no partial batch behind; the transaction is why the store binds a
- * replica-set. Driver IO failures during mutations, save, get, or list are translated into coded io
- * diagnostics, and a stored body that no longer reconstructs is surfaced as an io diagnostic rather
- * than a leaked authoring code, so no driver type escapes the module (rule R3).
+ * replica-set.
+ *
+ * <p>Driver IO failures are translated into coded io diagnostics so no driver type escapes the module
+ * (rule R3), and a stored body this build cannot bind is surfaced the same way, naming the field it
+ * failed at. A failure that is not about the document — a bug in the read mapping — is left to crash
+ * bare: coding it would file a defect of ours under storage corruption, where nobody would look for it.
  */
 public final class MongoArtifactStore implements ArtifactStore {
 
@@ -205,13 +211,27 @@ public final class MongoArtifactStore implements ArtifactStore {
     }
 
     @Override
+    public List<StoredArtifactRecord> listStored(String kind) {
+        Objects.requireNonNull(kind, "kind");
+        // Pushed to the store rather than filtered here: kind is an indexed field, and reading every
+        // document to discard most of them is the cost this layout exists to remove.
+        return browse(collection.find(new Document("kind", kind)));
+    }
+
+    @Override
     public List<StoredArtifactRecord> listStored() {
-        // The browse projection reads document metadata and tests the body one row at a time. A body
-        // that this build cannot reconstruct is retained as an unreadable row instead of aborting the
-        // whole inventory; get() and the strict resource list above still surface the coded IO error.
+        return browse(collection.find());
+    }
+
+    /**
+     * The browse projection over a query: document metadata read and the body tested one row at a time.
+     * A body this build cannot bind is retained as an unreadable row instead of aborting the whole
+     * inventory; get() and the strict resource list still surface the coded IO error.
+     */
+    private List<StoredArtifactRecord> browse(FindIterable<Document> found) {
         return StoreIo.call(() -> {
             List<StoredArtifactRecord> rows = new ArrayList<>();
-            try (MongoCursor<Document> cursor = collection.find().iterator()) {
+            try (MongoCursor<Document> cursor = found.iterator()) {
                 while (cursor.hasNext()) {
                     rows.add(toStoredArtifactRecord(cursor.next()));
                 }
@@ -220,54 +240,56 @@ public final class MongoArtifactStore implements ArtifactStore {
         });
     }
 
-    /** Maps a resource to its stored id, kind, canonical text, and canonical-content hash. */
+    /** Maps a resource to its stored id, kind, canonical structure, and content hash. */
     static Document toDocument(Resource artifact) {
-        String canonical = WRITER.write(artifact);
         return new Document("_id", artifact.id())
                 .append("kind", artifact.kind())
-                .append("canonical", canonical)
-                .append("contentHash", CanonicalHash.of(canonical));
+                .append("body", new Document(WRITER.tree(artifact)))
+                .append("contentHash", CanonicalHash.of(artifact));
     }
 
-    /** Reconstructs a resource from its stored document by parsing the canonical body. */
+    /** Binds a resource back out of its stored document's structure, parsing no text. */
     static Resource toResource(Document document) {
-        String id = document.getString("_id");
-        String canonical = document.getString("canonical");
-        if (canonical == null) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+        String id = String.valueOf(document.get("_id"));
+        if (!(document.get("body") instanceof Document body)) {
+            throw unreadable(id, "body", null);
         }
         try {
-            return PARSER.parse(canonical);
-        } catch (RuntimeException e) {
-            // A stored body that no longer reconstructs — corruption, or a newer grammar whose kind or
-            // shape this version cannot build — is a storage-layer failure, surfaced as an io diagnostic
-            // (with the original failure kept as the cause) rather than a leaked authoring code for a
-            // document the user never authored. The catch is deliberately broad: a body from a newer
-            // grammar can fail as more than a coded parse error (an unsupported kind, say), and all such
-            // failures are the same storage-integrity signal.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), e);
+            return PARSER.fromTree(body);
+        } catch (DslException e) {
+            // A stored body this build cannot bind — corruption, or a shape written by a newer grammar
+            // — is a storage-layer failure, surfaced as an io diagnostic naming the field it failed at
+            // rather than as an authoring code for a document the user never wrote. Only this type is
+            // caught: everything else is a fault in the mapping rather than in the document.
+            throw unreadable(id, e.path().isEmpty() ? "body" : e.path(), e);
         }
     }
 
-    /** Maps one stored document to the tolerant browse projection without losing its raw body. */
+    /**
+     * Maps one stored document to the tolerant browse projection. A body this build cannot bind keeps
+     * its row, with no canonical form to show: the form is rendered from the model, so a body that does
+     * not become a model has none. The document itself is still there to be inspected in the store.
+     */
     static StoredArtifactRecord toStoredArtifactRecord(Document document) {
         String id = String.valueOf(document.get("_id"));
         String kind = text(document, "kind");
         if (kind == null) {
             kind = "unknown";
         }
-        String canonical = text(document, "canonical");
         String contentHash = text(document, "contentHash");
-        boolean readable = false;
-        if (canonical != null) {
+        if (document.get("body") instanceof Document body) {
             try {
-                PARSER.parse(canonical);
-                readable = true;
-            } catch (RuntimeException ignored) {
-                // The raw canonical body is deliberately retained for diagnostics and repair.
+                return new StoredArtifactRecord(id, kind, WRITER.write(PARSER.fromTree(body)), contentHash, true);
+            } catch (DslException retained) {
+                // Falls through to the unreadable row: one damaged document must not make the whole
+                // inventory unavailable. get() and the strict list still surface the coded IO error.
             }
         }
-        return new StoredArtifactRecord(id, kind, canonical, contentHash, readable);
+        return new StoredArtifactRecord(id, kind, null, contentHash, false);
+    }
+
+    private static TapstateException unreadable(String id, String field, Throwable cause) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", field), cause);
     }
 
     private static String text(Document document, String field) {

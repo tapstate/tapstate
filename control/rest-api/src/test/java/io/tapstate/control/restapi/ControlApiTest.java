@@ -520,10 +520,11 @@ class ControlApiTest {
     @Test
     void deleteOfAReferencedArtifactIsAConflictNamingTheReferrersWithNothingRemoved() {
         applyDrafts(SRC_ORA, TGT_MY, PIPELINE);
-        // The precondition is derived from the canonical form the read face returns: the stored content
-        // hash is the hash of exactly those bytes, so a reader never has to be told it separately.
-        String hash = CanonicalHash.of(client().get().uri("/api/artifacts/src_ora")
-                .retrieve().toEntity(StoredArtifact.class).getBody().canonicalForm());
+        // The precondition comes from the read face rather than from the bytes it returned: the stored
+        // content hash is taken over the resource's structure, so a reader cannot derive it and the read
+        // is what hands it over.
+        String hash = client().get().uri("/api/artifacts/src_ora")
+                .retrieve().toEntity(StoredArtifact.class).getBody().contentHash();
 
         ApiError body = client().method(HttpMethod.DELETE).uri("/api/artifacts/src_ora")
                 .header(HttpHeaders.IF_MATCH, "\"" + hash + "\"")
@@ -1041,7 +1042,7 @@ class ControlApiTest {
             // them inside its transaction, so the boundary tests see the same refusal a real one gives.
             for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
                 String canonical = byId.get(expected.getKey());
-                if (canonical == null || !CanonicalHash.of(canonical).equals(expected.getValue())) {
+                if (canonical == null || !storedHash(canonical).equals(expected.getValue())) {
                     return Optional.of(expected.getKey());
                 }
             }
@@ -1086,13 +1087,22 @@ class ControlApiTest {
             return rows;
         }
 
+        /**
+         * The stored version identity for a stored body: taken over the structure the canonical text
+         * describes, not over the text. Hashing the text here would let this fake agree with a caller
+         * that also hashed text, while the store it stands in for agreed with neither.
+         */
+        private static String storedHash(String canonical) {
+            return CanonicalHash.of(new DslParser().parse(canonical));
+        }
+
         @Override
         public ArtifactMutation delete(String id, String expectedContentHash) {
             String canonical = byId.get(id);
             if (canonical == null) {
                 return ArtifactMutation.NOT_FOUND;
             }
-            if (!CanonicalHash.of(canonical).equals(expectedContentHash)) {
+            if (!storedHash(canonical).equals(expectedContentHash)) {
                 return ArtifactMutation.VERSION_CONFLICT;
             }
             byId.remove(id);

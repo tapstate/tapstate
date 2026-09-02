@@ -168,7 +168,7 @@ class PipelineLifecycleServiceTest {
 
     /** The revision of an artifact is the content hash of its canonical form — the same value apply stamps. */
     private static String revisionOf(String dsl) {
-        return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+        return CanonicalHash.of(parse(dsl));
     }
 
     private static final String PIPELINE_V1 = """

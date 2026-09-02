@@ -1439,7 +1439,9 @@ final class Repl {
                     o -> o instanceof GetOutcome.Unreachable);
             switch (read) {
                 case GetOutcome.Found found -> {
-                    ifMatch = CanonicalHash.of(found.artifact().canonicalForm());
+                    // Taken from the response, not recomputed from the canonical form beside it: the
+                    // hash is over the resource's structure, so these bytes cannot produce it.
+                    ifMatch = found.artifact().contentHash();
                     kind = found.artifact().kind();
                 }
                 case GetOutcome.Absent ignored -> {

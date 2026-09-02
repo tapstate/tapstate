@@ -315,7 +315,7 @@ class SourceServiceTest {
     }
 
     private static String hash(Resource resource) {
-        return CanonicalHash.of(new CanonicalWriter().write(resource));
+        return CanonicalHash.of(resource);
     }
 
     private static void assertSourceError(

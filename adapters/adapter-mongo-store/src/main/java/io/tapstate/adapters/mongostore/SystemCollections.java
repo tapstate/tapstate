@@ -36,7 +36,13 @@ public enum SystemCollections {
 
     // ---- the store database: what the product keeps about itself ----
 
-    ARTIFACTS(MongoStorePort.ARTIFACTS, Database.STORE, MongoArtifactStore.class, Strategy.MIGRATED, 0),
+    /**
+     * The applied resources, one document each, held as structure rather than text. The index below is
+     * what a browse filtered to one kind reads; without it that read is a scan of every resource in the
+     * workspace to keep a fraction of them.
+     */
+    ARTIFACTS(MongoStorePort.ARTIFACTS, Database.STORE, MongoArtifactStore.class, Strategy.MIGRATED, 0,
+            new IndexSpec(List.of("kind"), false)),
     PIPELINE_STATE(MongoStorePort.PIPELINE_STATE, Database.STORE, MongoStateStore.class, Strategy.MIGRATED, 0),
     PIPELINE_DESIRED(MongoStorePort.PIPELINE_DESIRED, Database.STORE, MongoDesiredStore.class, Strategy.MIGRATED, 0),
     PIPELINE_OBSERVATION(

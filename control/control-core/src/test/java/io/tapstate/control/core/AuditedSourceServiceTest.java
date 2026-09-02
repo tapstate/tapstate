@@ -67,7 +67,7 @@ class AuditedSourceServiceTest {
         RecordingArtifactStore store = new RecordingArtifactStore(events);
         Resource existing = representation.toModel(draft("orders", "before"), null);
         store.seed(existing);
-        String hash = CanonicalHash.of(new CanonicalWriter().write(existing));
+        String hash = CanonicalHash.of(existing);
         AuditStore failingAuditStore = record -> {
             throw new IllegalStateException("audit unavailable");
         };
@@ -190,7 +190,7 @@ class AuditedSourceServiceTest {
         }
 
         private static String hash(Resource resource) {
-            return CanonicalHash.of(new CanonicalWriter().write(resource));
+            return CanonicalHash.of(resource);
         }
     }
 }

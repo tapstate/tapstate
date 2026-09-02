@@ -54,6 +54,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -148,6 +149,24 @@ public final class DslParser {
             throw YamlMap.error(DslError.ILLEGAL_VALUE, "", root,
                     Map.of("value", YamlMap.nodeTypeName(root), "expected", "a mapping"));
         }
+        return bind(mapping);
+    }
+
+    /**
+     * Reads a document that is already structured -- plain maps, lists and scalars, the shape a
+     * document store returns -- into its {@link Resource} model, parsing no text on the way.
+     *
+     * <p>It is the same binding as {@link #parse}, entered one step later: the declared grammar version
+     * is settled first and every structural rule applies unchanged, because a stored document has to
+     * satisfy the grammar it claims exactly as a written one does. What it does not have is a position:
+     * diagnostics name the field and report no line, which is all a stored document can be pointed at.
+     */
+    public Resource fromTree(Map<String, Object> document) {
+        Objects.requireNonNull(document, "document");
+        return bind(TreeNodes.mapping(document, ""));
+    }
+
+    private Resource bind(MappingNode mapping) {
         YamlMap doc = YamlMap.of(mapping, "");
         requireSupportedVersion(doc, mapping);
         String kind = doc.string("kind");

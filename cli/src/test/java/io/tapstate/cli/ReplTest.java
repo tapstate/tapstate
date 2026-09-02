@@ -37,6 +37,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 class ReplTest {
 
+    /**
+     * A hash the server sent and nothing local could have produced. The precondition the CLI sends must
+     * be this exact value: it is taken over the resource's structure, so a client holding only the
+     * canonical bytes beside it cannot derive it, and one that tried would send something the server has
+     * never stored — refused on every request, with the canonical text sitting right there looking right.
+     */
+    private static final String STORED_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     private static final UUID TEST_CONTEXT_ID =
             UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
     private static final UUID TEST_AUTH_REF =
@@ -1568,15 +1576,15 @@ class ReplTest {
 
     /**
      * Without {@code --if-match} the verb reads first and removes the version it read. The hash sent is
-     * asserted against the canonical bytes that came back: sending anything else — a blank, a literal
-     * null, a hash of something else — would make the removal unconditional in effect, which is the one
-     * property the precondition exists to provide.
+     * asserted against the one the read handed over: sending anything else — a blank, a literal null, a
+     * hash recomputed from the canonical bytes — would make the removal unconditional in effect, which is
+     * the one property the precondition exists to provide.
      */
     @Test
     void deleteWithoutAPreconditionReadsTheArtifactAndRemovesThatExactVersion() {
         String canonical = "version: tapstate/v1\nkind: source\nid: src_kfk\n";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical, STORED_HASH, true));
         client.deleteOutcome = new DeleteOutcome.Removed("src_kfk");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -1585,7 +1593,7 @@ class ReplTest {
 
         assertThat(h.sink().toString().substring(mark)).contains("deleted").contains("source").contains("src_kfk");
         assertThat(client.deleteCalls).containsExactly(
-                "jwt-tok@http://node1:7900/src_kfk#" + CanonicalHash.of(canonical));
+                "jwt-tok@http://node1:7900/src_kfk#" + STORED_HASH);
     }
 
     @Test
@@ -1621,7 +1629,7 @@ class ReplTest {
         // verb picks the version itself, and the caller has no other way to learn which one went.
         String canonical = "version: tapstate/v1\nkind: source\nid: src_kfk\n";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical, STORED_HASH, true));
         client.deleteOutcome = new DeleteOutcome.Removed("src_kfk");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -1633,7 +1641,7 @@ class ReplTest {
                 .contains("\"id\": \"src_kfk\"")
                 .contains("\"kind\": \"source\"")
                 .contains("\"removed\": true")
-                .contains("\"expectedContentHash\": \"" + CanonicalHash.of(canonical) + "\"");
+                .contains("\"expectedContentHash\": \"" + STORED_HASH + "\"");
         assertThat(h.repl().lastExitCode()).isZero();
     }
 

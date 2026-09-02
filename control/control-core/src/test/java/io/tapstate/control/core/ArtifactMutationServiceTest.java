@@ -162,6 +162,24 @@ class ArtifactMutationServiceTest {
     }
 
     @Test
+    void aPreconditionHeldFromBeforeTheHashWasReboundIsARefusalRatherThanACrash() {
+        // A client that read an artifact before the upgrade holds the digest of its canonical text. The
+        // stored hash is now taken over the structure, so that value names no version -- and the answer
+        // has to be the ordinary conflict, which tells the client to read again. Anything else (a crash,
+        // or io.document-unreadable) would read as "the store is damaged" over a client that is merely
+        // out of date.
+        SourceResource orders = source("orders");
+        store.save(orders);
+        String heldBeforeTheUpgrade = CanonicalHash.ofText(new CanonicalWriter().write(orders));
+
+        assertArtifactError(
+                () -> service.delete(PRINCIPAL, "orders", heldBeforeTheUpgrade),
+                ArtifactError.VERSION_CONFLICT,
+                Map.of("id", "orders"));
+        assertThat(store.get("orders")).contains(orders);
+    }
+
+    @Test
     void referencedDeleteIsRefusedWithSortedReferrersAndNoCascade() {
         SourceResource orders = source("orders");
         store.save(orders);
@@ -645,7 +663,7 @@ class ArtifactMutationServiceTest {
     }
 
     private static String hash(Resource resource) {
-        return CanonicalHash.of(new CanonicalWriter().write(resource));
+        return CanonicalHash.of(resource);
     }
 
     private static void assertArtifactError(

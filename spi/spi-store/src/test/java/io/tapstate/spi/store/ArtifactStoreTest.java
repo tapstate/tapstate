@@ -131,7 +131,7 @@ class ArtifactStoreTest {
     }
 
     private static String hash(Resource artifact) {
-        return CanonicalHash.of(WRITER.write(artifact));
+        return CanonicalHash.of(artifact);
     }
 
     /**

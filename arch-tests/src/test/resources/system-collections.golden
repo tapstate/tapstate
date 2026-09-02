@@ -1,5 +1,5 @@
 # collection | database | owner | strategy | introducedIn | indexes
-artifacts | store | MongoArtifactStore | migrated | 0 | -
+artifacts | store | MongoArtifactStore | migrated | 0 | kind
 pipeline_state | store | MongoStateStore | migrated | 0 | -
 pipeline_desired | store | MongoDesiredStore | migrated | 0 | -
 pipeline_observation | store | MongoObservationStore | migrated | 0 | -

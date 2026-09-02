@@ -91,7 +91,7 @@ class SourceRepresentationTest {
 
         SourceResource model = representation.toModel(draft, null);
         SourceView view = representation.toView(
-                model, CanonicalHash.of(new CanonicalWriter().write(model)));
+                model, CanonicalHash.of(model));
 
         assertThat(model.id()).isEqualTo("orders");
         assertThat(model.metadata()).isEqualTo(draft.metadata());
@@ -351,7 +351,7 @@ class SourceRepresentationTest {
     }
 
     private static String hash(SourceResource source) {
-        return CanonicalHash.of(new CanonicalWriter().write(source));
+        return CanonicalHash.of(source);
     }
 
     private static Map<String, Object> linkedMap(Object... keyValues) {

@@ -50,18 +50,15 @@ public final class ArtifactQueryService {
         if (kind == null || kind.isBlank()) {
             return list();
         }
-        return store.listStored().stream()
-                .filter(r -> r.kind().equals(kind))
-                .map(this::view)
-                .toList();
+        return store.listStored(kind).stream().map(this::view).toList();
     }
 
     private StoredArtifact view(Resource resource) {
-        // The hash is taken over the very bytes this view returns, not over the resource or its id, so a
-        // caller can hand it straight back as a precondition without re-deriving anything.
-        String canonicalForm = writer.write(resource);
+        // The hash comes back beside the canonical form rather than being derivable from it: it is taken
+        // over the resource's structure, so a caller holding only these bytes cannot recompute it and
+        // must hand this field straight back as a precondition.
         return new StoredArtifact(
-                resource.id(), resource.kind(), canonicalForm, CanonicalHash.of(canonicalForm));
+                resource.id(), resource.kind(), writer.write(resource), CanonicalHash.of(resource));
     }
 
     private ArtifactListEntry view(StoredArtifactRecord row) {

@@ -38,7 +38,7 @@ public record MiningChainId(String value) {
     /** The chain a source reads by its physical coordinate: a content hash of the connector and settings. */
     public static MiningChainId of(CaptureConfig config) {
         Objects.requireNonNull(config, "config");
-        return new MiningChainId(DERIVED_PREFIX + CanonicalHash.of(canonicalConfig(config)));
+        return new MiningChainId(DERIVED_PREFIX + CanonicalHash.ofText(canonicalConfig(config)));
     }
 
     /** The chain a manual {@code srs.key} asserts directly, overriding config derivation. */

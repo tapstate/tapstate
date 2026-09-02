@@ -74,7 +74,7 @@ public final class PipelineLifecycleService {
         Objects.requireNonNull(pipelineId, "pipelineId");
 
         String latest = artifacts.get(pipelineId)
-                .map(a -> CanonicalHash.of(a.canonicalForm()))
+                .map(StoredArtifact::contentHash)
                 .orElseThrow(() -> new TapstateException(
                         LifecycleError.UNKNOWN_PIPELINE, Map.of("pipeline", pipelineId), null));
 

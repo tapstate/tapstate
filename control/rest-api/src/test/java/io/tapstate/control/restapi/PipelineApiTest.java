@@ -325,7 +325,7 @@ class PipelineApiTest {
 
     /** The revision of a pipeline is the content hash of its canonical form — the value apply stamps. */
     private static String revisionOf(String dsl) {
-        return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+        return CanonicalHash.of(parse(dsl));
     }
 
     private void seedUser(String username, String password, String role) {

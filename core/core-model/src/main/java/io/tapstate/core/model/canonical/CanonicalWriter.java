@@ -31,7 +31,10 @@ import io.tapstate.core.model.WriteMode;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.ErrorPolicy;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -45,14 +48,74 @@ import java.util.TreeMap;
 public final class CanonicalWriter {
 
     public String write(Resource resource) {
-        Node.MapN tree = switch (resource) {
+        return new YamlEmitter().emit(render(resource));
+    }
+
+    /**
+     * The same canonical form as {@link #write}, carried as plain maps, lists and scalars instead of
+     * text. Key order, default omission and sugar normalization are decided in one place and shared:
+     * this is the tree the emitter renders, not a second arrangement of the model that happens to
+     * agree with it today.
+     *
+     * <p>Only plain values come out -- {@link String}, {@link Integer}, {@link Long}, {@link Double},
+     * {@link Boolean}, {@code null}, and maps and lists of those -- because the caller is a document
+     * store, and a render node reaching one would fail at the storage boundary rather than here.
+     *
+     * <p>Numbers are narrowed to those three because a free-form config may hold any {@link Number} the
+     * JSON face accepted, and the three are what a document store hands back: a byte, a short and a
+     * float widen on the way through, a {@link java.math.BigDecimal} comes back as a decimal type of the
+     * store's own, and a {@link java.math.BigInteger} cannot be written at all. Nothing is lost that was
+     * not already lost -- the canonical text has always read back to these same three -- and a value
+     * that changes type between writing and reading would change the resource's identity by being
+     * stored.
+     */
+    public Map<String, Object> tree(Resource resource) {
+        return plainMap(render(resource));
+    }
+
+    private Node.MapN render(Resource resource) {
+        return switch (resource) {
             case SourceResource s -> source(s);
             case PipelineResource p -> pipeline(p);
             case TransformResource t -> transformDefinition(t);
             case ViewResource v -> viewDefinition(v);
             case ServeResource s -> serveDefinition(s);
         };
-        return new YamlEmitter().emit(tree);
+    }
+
+    private static Map<String, Object> plainMap(Node.MapN map) {
+        // Insertion-ordered: the tree's key order is the canonical key order, and a store that keeps
+        // the document as written keeps it. Nothing downstream reads order, but a document whose
+        // fields move between writes makes every diff of the stored form unreadable.
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Node.Entry entry : map.entries()) {
+            out.put(entry.key(), plain(entry.value()));
+        }
+        return out;
+    }
+
+    private static Object plain(Node node) {
+        return switch (node) {
+            case Node.MapN m -> plainMap(m);
+            case Node.SeqN s -> s.items().stream().map(CanonicalWriter::plain).toList();
+            // Style is presentation -- quoting and block form -- so it is dropped here and rebuilt by
+            // the emitter from the same tree. A carrier that has no notion of quoting has no use for it.
+            case Node.ScalarN sc -> plainScalar(sc.value());
+        };
+    }
+
+    private static Object plainScalar(Object value) {
+        return switch (value) {
+            case Byte b -> b.intValue();
+            case Short s -> s.intValue();
+            case Float f -> f.doubleValue();
+            case BigDecimal d -> d.doubleValue();
+            // No 64-bit integer holds it, and neither does any store this tree is written to. Storing a
+            // different number instead is the one outcome worth refusing: the canonical text has never
+            // read such a value back either, so nothing is being taken away that worked before.
+            case BigInteger i -> i.longValueExact();
+            case null, default -> value;
+        };
     }
 
     // ---- top-level resources ------------------------------------------------------
