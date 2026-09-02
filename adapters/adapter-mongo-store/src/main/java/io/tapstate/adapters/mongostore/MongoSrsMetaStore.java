@@ -284,6 +284,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public void dropChain(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        // deleteOne on a missing _id removes nothing and reports so without failing, which is the no-op
+        // an absent chain is meant to be.
+        StoreIo.run(() -> collection.deleteOne(new Document("_id", miningChainId)));
+    }
+
+    @Override
     public void detachConsumer(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         // Deliberately not routed through update(): a detach is idempotent, so an absent chain is the end

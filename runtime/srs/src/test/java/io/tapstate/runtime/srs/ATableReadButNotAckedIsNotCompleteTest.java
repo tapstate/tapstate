@@ -215,6 +215,12 @@ class ATableReadButNotAckedIsNotCompleteTest {
         }
 
         @Override
+        public void dropChain(String miningChainId) {
+            throw new UnsupportedOperationException(
+                    "chain removal is not exercised by this double");
+        }
+
+        @Override
         public void detachConsumer(String miningChainId, String pipelineId) {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
         }

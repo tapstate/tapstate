@@ -171,4 +171,23 @@ public interface SrsMetaStore {
      * exists to prevent.
      */
     void detachConsumer(String miningChainId, String pipelineId);
+
+    /**
+     * Removes a mining chain's whole record — the read offset, the seam the tail resumes from, the
+     * schema history, and which tables have finished their initial load. Only the last pipeline to
+     * leave a chain may call this: what it removes is shared, and taking it away while another pipeline
+     * reads the chain would have that pipeline read its whole source again with nothing anywhere saying
+     * why.
+     *
+     * <p>It follows that a pipeline asked to re-read everything, on a chain somebody else is still on,
+     * does not get its tables' completion marks cleared -- those are the chain's, not its own. That is
+     * the answer rather than a shortfall: one consumer cannot make a shared chain forget what it has
+     * read without deciding it on every other consumer's behalf.
+     *
+     * <p>Idempotent rather than an ordering error on an absent chain, for the reason
+     * {@link #detachConsumer} is: this states the end condition "there is no record for this chain",
+     * which an absent one already satisfies, and refusing it would let one benign race abandon a
+     * clearing partway.
+     */
+    void dropChain(String miningChainId);
 }

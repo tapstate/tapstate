@@ -37,7 +37,20 @@ public final class PipelineStateInventory {
             "the position it had read and confirmed up to",
             PipelineStateHolding.Scope.PIPELINE);
 
-    private static final List<PipelineStateHolding> VOCABULARY = List.of(OPERATOR_STATE, RESUME_POSITION);
+    /**
+     * What the shared mining chain itself accumulated -- how far it had read, the seam its tail resumes
+     * from, the schema it saw, and which tables finished their initial load. It belongs to the chain
+     * rather than to any one pipeline on it, so a stop only takes it when the pipeline stopping was the
+     * last one reading that chain. Its label says so, because a description that promised to clear it
+     * unconditionally would be untrue for every pipeline that shares a chain -- which is the arrangement
+     * shared mining exists to produce.
+     */
+    public static final PipelineStateHolding CHAIN_RECORD = PipelineStateHolding.named(
+            "what the shared mining chain had read, once this is the last pipeline reading it",
+            PipelineStateHolding.Scope.CHAIN);
+
+    private static final List<PipelineStateHolding> VOCABULARY =
+            List.of(OPERATOR_STATE, RESUME_POSITION, CHAIN_RECORD);
 
     /**
      * Every kind of state this product records about a running pipeline. What a surface says without a

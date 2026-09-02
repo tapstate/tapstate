@@ -148,6 +148,12 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void dropChain(String miningChainId) {
+        // Idempotent for the same reason the detach below is: an absent chain already satisfies it.
+        records.remove(miningChainId);
+    }
+
+    @Override
     public synchronized void detachConsumer(String miningChainId, String pipelineId) {
         // Idempotent, unlike the advancing mutators: an absent chain already satisfies what a detach states.
         SrsMeta m = records.get(miningChainId);

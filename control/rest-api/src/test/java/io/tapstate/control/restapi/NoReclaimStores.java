@@ -162,6 +162,11 @@ final class NoReclaimStores {
             public void detachConsumer(String miningChainId, String pipelineId) {
                 throw unexpected("SrsMetaStore.detachConsumer");
             }
+
+            @Override
+            public void dropChain(String miningChainId) {
+                throw unexpected("SrsMetaStore.dropChain");
+            }
         };
     }
 }

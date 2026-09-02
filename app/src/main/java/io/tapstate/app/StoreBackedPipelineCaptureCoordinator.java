@@ -197,12 +197,35 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // per table, which is what a pipeline over a parent and a child table is; releasing it per run would
         // have the second source release a chain the first already closed, and the release refuses that.
         for (MiningChainId chainId : chains) {
-            firstFailure = runCleanup(() -> srsCoordinator.releaseConsumer(chainId, pipelineId), firstFailure);
-            if (purgeState) {
-                // Run whether or not the release above succeeded, and safe to run twice: the detach states
-                // the end condition "this consumer holds nothing here", which an absent chain and an absent
-                // cursor already satisfy. Skipping it after one failure is what leaves a cursor nobody will
-                // ever advance holding back every pipeline still on the chain.
+            // Whether this pipeline was the last one on the chain, which decides how much of the chain's
+            // record is this stop's to take. Read from the release itself rather than asked again after
+            // it: a consumer attaching in between would make a second reading stale, and the two answers
+            // would then disagree about a record one of them is about to delete.
+            boolean chainClosed = false;
+            try {
+                chainClosed = srsCoordinator.releaseConsumer(chainId, pipelineId);
+            } catch (RuntimeException failure) {
+                if (firstFailure == null) {
+                    firstFailure = failure;
+                } else {
+                    firstFailure.addSuppressed(failure);
+                }
+            }
+            if (!purgeState) {
+                continue;
+            }
+            if (chainClosed) {
+                // Nobody is left on it, so the whole record goes: the read offset, the seam the tail
+                // resumes from, the schema history, and which tables finished their initial load. This
+                // is what makes the next run of this pipeline read its source from the beginning, which
+                // is what asking for the state to be cleared meant.
+                firstFailure = runCleanup(() -> storePort.meta().dropChain(chainId.value()), firstFailure);
+            } else {
+                // Others are still reading it, so only this pipeline's own cursor is its to give back.
+                // Run whether or not the release above succeeded, and safe to run twice: the detach
+                // states the end condition "this consumer holds nothing here", which an absent chain and
+                // an absent cursor already satisfy. Skipping it after one failure is what leaves a cursor
+                // nobody will ever advance holding back every pipeline still on the chain.
                 firstFailure = runCleanup(
                         () -> storePort.meta().detachConsumer(chainId.value(), pipelineId), firstFailure);
             }

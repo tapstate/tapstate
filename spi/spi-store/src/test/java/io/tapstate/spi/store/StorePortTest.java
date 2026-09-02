@@ -1268,6 +1268,13 @@ class StorePortTest {
                 }
 
                 @Override
+                public void dropChain(String miningChainId) {
+                    // Idempotent for the same reason the detach below is: an absent chain already
+                    // satisfies the end condition this states.
+                    srsMeta.remove(miningChainId);
+                }
+
+                @Override
                 public void detachConsumer(String miningChainId, String pipelineId) {
                     // Idempotent, unlike the advancing mutators: an absent chain already satisfies the
                     // end condition a detach states.

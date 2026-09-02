@@ -865,6 +865,13 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
+        public void dropChain(String miningChainId) {
+            // Removing a whole chain is a stop's act, not a removal's: what this double stands in for
+            // never reaches it, so it refuses rather than quietly answering.
+            throw new UnsupportedOperationException("chain removal is not exercised by this double");
+        }
+
+        @Override
         public void detachConsumer(String miningChainId, String pipelineId) {
             // Fail before mutating, so an armed chain keeps the departing consumer's cursor — the residue
             // the report is about has to really be there for the assertions to witness anything.
