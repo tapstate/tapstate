@@ -112,7 +112,7 @@ class ArtifactDeleteLeavesNestStateStandingIT {
                     () -> "chains=" + documents.miningChainIds() + " consumers="
                             + documents.miningChainIds().stream().map(documents::consumersOf).toList());
 
-            control.lifecycle(departingId, LifecycleVerb.STOP);
+            control.stop(departingId, true);
             Await.until(
                     departingId + " to reach " + PipelineState.STOPPED,
                     () -> control.state(departingId).filter(PipelineState.STOPPED::equals).isPresent(),

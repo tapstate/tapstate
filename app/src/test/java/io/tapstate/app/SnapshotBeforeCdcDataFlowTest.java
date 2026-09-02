@@ -157,7 +157,7 @@ class SnapshotBeforeCdcDataFlowTest {
             awaitSinkSize(5);
             arrived = List.copyOf(CapturingSinkWriter.collected());
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         // The load-bearing assertion: the three snapshot reads (op r) arrive first, in buffered order, then the

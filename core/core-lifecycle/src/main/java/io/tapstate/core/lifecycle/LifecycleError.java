@@ -26,6 +26,15 @@ public enum LifecycleError implements TapstateErrorCode {
     INCOMPATIBLE_REVISION("lifecycle.incompatible-revision", Set.of("requested", "latest")),
 
     /**
+     * A {@code stop} that did not say whether to clear what the pipeline has accumulated:
+     * {@code pipeline} is the id it was aimed at. Refused rather than defaulted, in either direction.
+     * Defaulting to clearing destroys a resume position on a caller who never asked; defaulting to
+     * keeping makes one verb mean two things depending on how it was reached, and the difference is
+     * invisible until the next run either continues or reads its whole source again.
+     */
+    PURGE_STATE_NOT_STATED("lifecycle.purge-state-not-stated", Set.of("pipeline")),
+
+    /**
      * A lifecycle verb, or a status/metrics/snapshot read, named a pipeline that was never applied:
      * {@code pipeline} is the id the caller gave. Permanent -- unlike an applied pipeline with no
      * observation published yet, waiting will never turn this into a usable id.

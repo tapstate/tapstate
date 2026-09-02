@@ -24,6 +24,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.StorePort;
 import java.util.List;
@@ -137,11 +138,81 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(coordinator.isActive("p")).as("start retains a live handle for the pipeline").isTrue();
         assertThat(srsCoordinator.isProvisioned(chainId)).isTrue();
 
-        coordinator.stopCapture("p");
+        coordinator.stopCapture("p", true);
 
         assertThat(subscriptionClosed).as("stop closes the capture subscription, stopping the daemon").isTrue();
         assertThat(srsCoordinator.isProvisioned(chainId)).as("stop tears the source chain down").isFalse();
         assertThat(coordinator.isActive("p")).as("stop drops the handle").isFalse();
+    }
+
+    @Test
+    void aStopAskedToClearAlsoGivesBackTheCursorItLeftOnTheChain() {
+        CursorFixture fixture = new CursorFixture();
+        fixture.coordinator.startCapture("p");
+        fixture.leaveACursorFor("p");
+
+        fixture.coordinator.stopCapture("p", true);
+
+        assertThat(fixture.consumersOnTheChain())
+                .as("a cursor nobody will ever advance again bounds the whole chain, so a stop that was "
+                        + "asked to clear this pipeline's position has to take it off the record too")
+                .isEmpty();
+    }
+
+    @Test
+    void aStopAskedToKeepLeavesTheCursorExactlyWhereItIs() {
+        CursorFixture fixture = new CursorFixture();
+        fixture.coordinator.startCapture("p");
+        fixture.leaveACursorFor("p");
+
+        fixture.coordinator.stopCapture("p", false);
+
+        // Its pair above is what makes this an assertion. Both stops close the run and give the chain
+        // back; only the record says which one was asked to throw the position away, and that position
+        // is the entire thing a later resume reads.
+        assertThat(fixture.consumersOnTheChain()).containsExactly("p");
+    }
+
+    /** One pipeline over one source, with a durable cursor on the chain it reads. */
+    private static final class CursorFixture {
+
+        private final InMemoryStorePort store;
+        private final SrsCoordinator srsCoordinator;
+        private final StoreBackedPipelineCaptureCoordinator coordinator;
+        private final SourceResource source = cdcSource("orders_src", "orders", null);
+
+        CursorFixture() {
+            InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+            artifacts.save(source);
+            artifacts.save(pipeline("p", "orders_src"));
+            store = new InMemoryStorePort(artifacts);
+            srsCoordinator = new SrsCoordinator(store.meta());
+            coordinator = new StoreBackedPipelineCaptureCoordinator(
+                    store, this::start, srsCoordinator, new SnapshotBuffer());
+        }
+
+        private CaptureRun start(CaptureRunSpec spec, java.util.function.Consumer<Envelope> passthrough) {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
+            }), new CaptureHealth());
+        }
+
+        /** Writes the durable cursor a run leaves behind, which is what a purge has to take away. */
+        void leaveACursorFor(String pipelineId) {
+            store.meta().upsertConsumerOffset(chainId(), new ConsumerOffset(pipelineId, Map.of(), null));
+        }
+
+        List<String> consumersOnTheChain() {
+            return store.meta().read(chainId()).orElseThrow().consumerOffsets().stream()
+                    .map(ConsumerOffset::pipelineId)
+                    .toList();
+        }
+
+        private String chainId() {
+            return MiningChainId.resolve(SourceCaptureResolution.of(source).config(), null).value();
+        }
     }
 
     @Test
@@ -314,7 +385,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 new SrsCoordinator(new InMemorySrsMetaStore()),
                 new SnapshotBuffer());
 
-        coordinator.stopCapture("never-started");
+        coordinator.stopCapture("never-started", true);
 
         assertThat(coordinator.isActive("never-started")).isFalse();
     }

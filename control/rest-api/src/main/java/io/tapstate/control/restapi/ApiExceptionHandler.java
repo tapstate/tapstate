@@ -109,6 +109,9 @@ class ApiExceptionHandler {
             // from the current state, or a start/resume at a stale revision, is a 409 state conflict.
             case "lifecycle.unknown-pipeline" -> HttpStatus.NOT_FOUND;
             case "lifecycle.illegal-transition", "lifecycle.incompatible-revision" -> HttpStatus.CONFLICT;
+            // The request did not say something it has to say, which is the caller's to fix by sending
+            // it -- not a conflict with the pipeline's state, which is what the two above are.
+            case "lifecycle.purge-state-not-stated" -> HttpStatus.BAD_REQUEST;
             // A status / metrics / snapshot read of a pipeline that has published no observation is a 404: the
             // observation resource does not exist yet, like a get of an unknown artifact.
             case "monitor.no-observation" -> HttpStatus.NOT_FOUND;

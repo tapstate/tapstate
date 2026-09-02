@@ -166,7 +166,7 @@ class CaptureToSinkDataFlowTest {
         try {
             awaitSinkSize(2);
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         // The sink saw exactly the even-id changes the filter kept, after the transform, in read order, each

@@ -990,8 +990,12 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         String id = words.get(1);
+        // A stop says what it means to do about the pipeline's state; the other three have nothing to
+        // say and send nothing. Stop clears -- that is what the verb is -- and the terminal asking
+        // first is a separate concern from the wire carrying the answer.
+        Boolean purgeState = verb.equals("stop") ? Boolean.TRUE : null;
         LifecycleOutcome outcome = withFailover(() ->
-                controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb),
+                controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb, purgeState),
                 o -> o instanceof LifecycleOutcome.Unreachable);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {

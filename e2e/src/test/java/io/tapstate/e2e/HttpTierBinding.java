@@ -138,6 +138,13 @@ final class HttpTierBinding implements TierBinding {
 
     @Override
     public void drive(String pipelineId, LifecycleVerb verb) {
+        if (verb == LifecycleVerb.STOP) {
+            // The declarative word "stop" is the product's stop, and the product's stop clears. A step
+            // that means to stop and keep what the pipeline has is a different word, not this one with
+            // a quietly different answer behind it.
+            control.stop(pipelineId, true);
+            return;
+        }
         control.lifecycle(pipelineId, verb);
     }
 

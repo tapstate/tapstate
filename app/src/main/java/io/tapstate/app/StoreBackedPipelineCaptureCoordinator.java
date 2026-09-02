@@ -85,7 +85,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts);
             }
         } catch (RuntimeException | Error failure) {
-            RuntimeException cleanupFailure = closeRuns(runs, pipelineId);
+            // A start that fell over releases what it took and nothing else. It is an abandoned attempt,
+            // not somebody asking for the pipeline's position to be thrown away, and the sources that did
+            // start may have advanced it before the one that failed.
+            RuntimeException cleanupFailure = closeRuns(runs, pipelineId, false);
             if (cleanupFailure != null) {
                 failure.addSuppressed(cleanupFailure);
             }
@@ -150,7 +153,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
-    public void stopCapture(String pipelineId) {
+    public void stopCapture(String pipelineId, boolean purgeState) {
         // The load belongs to the run being torn down: a stopped pipeline reports no snapshot rather than the
         // rows its previous run happened to load.
         snapshotsByPipeline.remove(pipelineId);
@@ -158,7 +161,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (runs == null) {
             return;
         }
-        RuntimeException cleanupFailure = closeRuns(runs, pipelineId);
+        RuntimeException cleanupFailure = closeRuns(runs, pipelineId, purgeState);
         if (cleanupFailure != null) {
             throw cleanupFailure;
         }
@@ -167,14 +170,21 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /**
      * Releases live runs after a stop, or after a later source prevents a multi-source start from completing.
      *
-     * <p>Close first: stops every capture daemon so no thread leaks. Then release this pipeline's consumer
-     * membership and tear the source chain down -- a shared-ring run only; a run that opened no chain has
-     * nothing to release.
+     * <p>{@code purgeState} decides only whether the source-side record is let go of as well; the hold on
+     * the chain is given back either way, because holding it is what a running pipeline does and this one
+     * has stopped.
+     *
+     * <p>Close first: stops every capture daemon so no thread leaks. Then give back this pipeline's hold on
+     * each chain it read -- a shared-ring run only; a run that opened no chain has nothing to release. The
+     * chain itself closes when the pipeline giving it back was the last one on it, which is the coordinator's
+     * to decide: a stop tears nothing down, because a chain several pipelines read is not this one's to take
+     * away. Stopping one used to remove it outright, and what that cost the others was measured -- their own
+     * stop then threw, and a pipeline restarted afterwards read under a generation of its own.
      *
      * <p>Every step runs even when an earlier one throws, and the first failure carries the rest as
      * suppressed. A release abandoned half way is what leaves a chain nobody owns and a daemon nobody stops.
      */
-    private RuntimeException closeRuns(List<CaptureRun> runs, String pipelineId) {
+    private RuntimeException closeRuns(List<CaptureRun> runs, String pipelineId, boolean purgeState) {
         RuntimeException firstFailure = null;
         Set<MiningChainId> chains = new LinkedHashSet<>();
         for (CaptureRun run : runs) {
@@ -187,8 +197,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // per table, which is what a pipeline over a parent and a child table is; releasing it per run would
         // have the second source release a chain the first already closed, and the release refuses that.
         for (MiningChainId chainId : chains) {
-            firstFailure = runCleanup(() -> srsCoordinator.detachConsumer(chainId, pipelineId), firstFailure);
-            firstFailure = runCleanup(() -> srsCoordinator.teardownSource(chainId), firstFailure);
+            firstFailure = runCleanup(() -> srsCoordinator.releaseConsumer(chainId, pipelineId), firstFailure);
+            if (purgeState) {
+                // Run whether or not the release above succeeded, and safe to run twice: the detach states
+                // the end condition "this consumer holds nothing here", which an absent chain and an absent
+                // cursor already satisfy. Skipping it after one failure is what leaves a cursor nobody will
+                // ever advance holding back every pipeline still on the chain.
+                firstFailure = runCleanup(
+                        () -> storePort.meta().detachConsumer(chainId.value(), pipelineId), firstFailure);
+            }
         }
         return firstFailure;
     }

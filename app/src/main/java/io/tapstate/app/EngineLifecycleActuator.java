@@ -19,7 +19,10 @@ import java.util.Optional;
  *       nor onto state that was half let go of.</li>
  *   <li>{@code stop} cancels the job first (engine) then stops the capture behind it (coordinator), so the
  *       capture daemon is torn down only once nothing reads its ring; the operator state the run kept is
- *       let go of last, once the job it belonged to is actually over.</li>
+ *       let go of last, once the job it belonged to is actually over -- and only where the stop asked for
+ *       it. A stop that was asked to keep the state does not write the drop down either, which is a
+ *       stronger thing than not carrying it out: the note is what a later start finishes, so one written
+ *       here would have the state dropped by the next start of a pipeline nobody asked to clear.</li>
  *   <li>{@code pause} / {@code resume} are engine-only: the capture keeps running while a pipeline is paused,
  *       held back by the ring's headroom backpressure, and a resume replays the buffered ring.</li>
  * </ul>
@@ -77,16 +80,19 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
-    public void stop(String pipelineId) {
+    public void stop(String pipelineId, boolean purgeState) {
         engine.cancel(pipelineId);
-        // Noted before the job is even known to be over, and before the drop: a stop is driven once, on the
-        // transition, so a process that dies anywhere after this point leaves a note the next start finishes.
-        // What the runs said they keep is the half that survives an edit; what the pipeline compiles to now
-        // is the half that covers state older than there being anywhere to say it. The note takes both.
-        stateTeardown.note(pipelineId, dagSource.stateNamespacesOf(pipelineId));
+        if (purgeState) {
+            // Noted before the job is even known to be over, and before the drop: a stop is driven once, on
+            // the transition, so a process that dies anywhere after this point leaves a note the next start
+            // finishes. What the runs said they keep is the half that survives an edit; what the pipeline
+            // compiles to now is the half that covers state older than there being anywhere to say it. The
+            // note takes both.
+            stateTeardown.note(pipelineId, dagSource.stateNamespacesOf(pipelineId));
+        }
         boolean jobOver = engine.awaitTerminal(pipelineId, JOB_TEARDOWN_BUDGET);
-        captureCoordinator.stopCapture(pipelineId);
-        if (jobOver) {
+        captureCoordinator.stopCapture(pipelineId, purgeState);
+        if (purgeState && jobOver) {
             // Only once nothing is left to write into it. A processor still winding down writes state as it
             // closes, and a drop racing that leaves entries behind with the note already gone.
             stateTeardown.finishPending(pipelineId);

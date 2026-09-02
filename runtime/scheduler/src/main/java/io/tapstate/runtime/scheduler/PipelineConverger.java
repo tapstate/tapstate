@@ -46,6 +46,10 @@ public final class PipelineConverger {
             return ConvergeResult.nothingToDo();
         }
         PipelineState target = intent.get().targetState();
+        // Only what the user asked for clears anything. Every other road to a stopped job below --
+        // a source that ran out, a job that died -- drives the same verb with this false, because
+        // nobody asked for those and a run that ends on its own still has somewhere to carry on from.
+        boolean purgeState = intent.get().purgeState();
         Optional<CheckpointDoc> actualDoc = state.read(pipelineId);
         PipelineState actual = actualDoc.map(doc -> StateJson.parse(doc.stateJson())).orElse(null);
 
@@ -55,7 +59,8 @@ public final class PipelineConverger {
             // the driver can surface it. A converge-side transition, never a user verb.
             Optional<Throwable> failure = actuator.failure(pipelineId);
             if (failure.isPresent()) {
-                ConvergeResult driven = driveTo(pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null));
+                ConvergeResult driven =
+                        driveTo(pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null), false);
                 return driven.checkpoint()
                         .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
                         .orElse(driven);
@@ -93,7 +98,7 @@ public final class PipelineConverger {
             return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
-        return driveTo(pipelineId, target, true, actualDoc.orElse(null));
+        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState);
     }
 
     /**
@@ -104,11 +109,12 @@ public final class PipelineConverger {
      * or a later convergence pass would drive its actual state back toward a non-terminal desired target.
      */
     public ConvergeResult markCompleted(String pipelineId) {
-        return driveTo(pipelineId, PipelineState.COMPLETED, false, state.read(pipelineId).orElse(null));
+        return driveTo(pipelineId, PipelineState.COMPLETED, false, state.read(pipelineId).orElse(null), false);
     }
 
     private ConvergeResult driveTo(
-            String pipelineId, PipelineState target, boolean seedIfAbsent, CheckpointDoc current) {
+            String pipelineId, PipelineState target, boolean seedIfAbsent, CheckpointDoc current,
+            boolean purgeState) {
         String targetJson = StateJson.of(target);
         if (current == null) {
             if (!seedIfAbsent) {
@@ -127,7 +133,7 @@ public final class PipelineConverger {
                 // Record first, then actuate: the store is the source of truth and Jet is subordinate, so the
                 // fenced write lands the intent durably before the job side is driven to match it.
                 try {
-                    actuate(pipelineId, from, target);
+                    actuate(pipelineId, from, target, purgeState);
                 } catch (TapstateException refused) {
                     // The job side refused with a diagnosis. Record it the way a job that died is recorded,
                     // because to everyone reading the product they are the same event: the pipeline is not
@@ -157,8 +163,12 @@ public final class PipelineConverger {
      * land in RUNNING, so the origin state decides between them: RUNNING reached from PAUSED continues
      * the held job (resume), reached from anywhere else begins a fresh run (start). A pipeline seeded at
      * NEW is never a transition target here, so it drives nothing.
+     *
+     * <p>{@code purgeState} reaches only the stop, and only ever carries what a user's own stop asked
+     * for. A pipeline that completed or failed arrives at the same verb, and arrives with it false: an
+     * ending nobody asked for is not permission to throw away where it had got to.
      */
-    private void actuate(String pipelineId, PipelineState from, PipelineState target) {
+    private void actuate(String pipelineId, PipelineState from, PipelineState target, boolean purgeState) {
         switch (target) {
             case RUNNING -> {
                 if (from == PipelineState.PAUSED) {
@@ -168,7 +178,7 @@ public final class PipelineConverger {
                 }
             }
             case PAUSED -> actuator.pause(pipelineId);
-            case STOPPED, COMPLETED, FAILED -> actuator.stop(pipelineId);
+            case STOPPED, COMPLETED, FAILED -> actuator.stop(pipelineId, purgeState);
             case NEW -> {
                 // The seed state is written through create(), never a compare-and-swap target, so it
                 // never reaches this actuation path.
@@ -182,7 +192,8 @@ public final class PipelineConverger {
      * by a different road.
      */
     private ConvergeResult failedWith(String pipelineId, TapstateException cause) {
-        ConvergeResult driven = driveTo(pipelineId, PipelineState.FAILED, false, requireCheckpoint(pipelineId));
+        ConvergeResult driven =
+                driveTo(pipelineId, PipelineState.FAILED, false, requireCheckpoint(pipelineId), false);
         return driven.checkpoint()
                 .map(checkpoint -> ConvergeResult.failed(checkpoint, cause))
                 .orElse(driven);

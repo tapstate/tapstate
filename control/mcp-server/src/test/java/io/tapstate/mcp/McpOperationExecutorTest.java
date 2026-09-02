@@ -50,6 +50,9 @@ class McpOperationExecutorTest {
             Map<String, Object> connection = Map.of(
                     "id", "orders", "connectorId", "mysql", "settings", Map.of());
             Map<String, Object> pipeline = Map.of("id", "orders");
+            // A stop reaches the server only with the answer; without it this executor refuses at its
+            // own end and no request is made, which is what the routing assertion below counts.
+            Map<String, Object> stop = Map.of("id", "orders", "purgeState", true);
             Map<String, Object> logs = new LinkedHashMap<>(pipeline);
             logs.put("limit", 999);
 
@@ -68,7 +71,7 @@ class McpOperationExecutorTest {
                     Map.entry(ControlOperations.ARTIFACT_DELETE,
                             Map.of("id", "orders", "expectedContentHash", "a".repeat(64))),
                     Map.entry(ControlOperations.PIPELINE_START, pipeline),
-                    Map.entry(ControlOperations.PIPELINE_STOP, pipeline),
+                    Map.entry(ControlOperations.PIPELINE_STOP, stop),
                     Map.entry(ControlOperations.PIPELINE_STATUS, pipeline),
                     Map.entry(ControlOperations.PIPELINE_METRICS, pipeline),
                     Map.entry(ControlOperations.PIPELINE_SNAPSHOT, pipeline),

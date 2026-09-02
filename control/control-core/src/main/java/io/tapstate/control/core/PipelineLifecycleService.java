@@ -28,7 +28,9 @@ import java.util.Optional;
  * check is that a run verb (start / resume) runs at the latest applied revision: start always adopts the
  * latest, so it is compatible by construction; resume continues at the revision it was paused against, so
  * a re-apply in the meantime makes it {@code incompatible-revision}. Per-field revision rules are not
- * decided here. There is no rewind verb — a re-dig is stop then start composed by the caller.
+ * decided here. There is no rewind verb — a re-dig is stop then start composed by the caller, and the
+ * stop half of that composition is the one that clears what the pipeline has, which is why {@link #stop}
+ * takes the answer rather than assuming one.
  */
 public final class PipelineLifecycleService {
 
@@ -51,25 +53,31 @@ public final class PipelineLifecycleService {
 
     /** Starts the pipeline (from NEW / STOPPED / COMPLETED), running it at the latest applied revision. */
     public DesiredState start(String principal, String pipelineId) {
-        return apply(principal, pipelineId, LifecycleVerb.START);
+        return apply(principal, pipelineId, LifecycleVerb.START, false);
     }
 
-    /** Stops the pipeline (from RUNNING / PAUSED), discarding its progress. */
-    public DesiredState stop(String principal, String pipelineId) {
-        return apply(principal, pipelineId, LifecycleVerb.STOP);
+    /**
+     * Stops the pipeline (from RUNNING / PAUSED). {@code purgeState} says whether stopping also clears
+     * what this pipeline has accumulated — its resume position and its operators' state — and it is a
+     * parameter rather than a policy because the two answers are not variations of one act: keeping
+     * leaves a pipeline that carries on where it left off, clearing leaves one whose next run reads its
+     * whole source again. The surface that takes the verb refuses a stop that did not state it.
+     */
+    public DesiredState stop(String principal, String pipelineId, boolean purgeState) {
+        return apply(principal, pipelineId, LifecycleVerb.STOP, purgeState);
     }
 
     /** Pauses the running pipeline, retaining the revision it was running at. */
     public DesiredState pause(String principal, String pipelineId) {
-        return apply(principal, pipelineId, LifecycleVerb.PAUSE);
+        return apply(principal, pipelineId, LifecycleVerb.PAUSE, false);
     }
 
     /** Resumes the paused pipeline, provided its paused revision is still the latest applied one. */
     public DesiredState resume(String principal, String pipelineId) {
-        return apply(principal, pipelineId, LifecycleVerb.RESUME);
+        return apply(principal, pipelineId, LifecycleVerb.RESUME, false);
     }
 
-    private DesiredState apply(String principal, String pipelineId, LifecycleVerb verb) {
+    private DesiredState apply(String principal, String pipelineId, LifecycleVerb verb, boolean purgeState) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
 
@@ -90,7 +98,7 @@ public final class PipelineLifecycleService {
                     LifecycleError.INCOMPATIBLE_REVISION, Map.of("requested", runRevision, "latest", latest), null);
         }
 
-        DesiredState next = new DesiredState(pipelineId, target, runRevision);
+        DesiredState next = new DesiredState(pipelineId, target, runRevision, purgeState);
         return auditGate.dispatch(OPERATIONS.get(verb), new AuditContext(principal, pipelineId), () -> {
             desired.save(next);
             return next;

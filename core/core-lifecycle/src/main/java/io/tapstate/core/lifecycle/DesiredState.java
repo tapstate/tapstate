@@ -15,13 +15,28 @@ import java.util.Objects;
  *   <li>{@code pipelineId} — the primary key, one desired doc per pipeline.</li>
  *   <li>{@code targetState} — the state the user wants the pipeline to reach.</li>
  *   <li>{@code revision} — the artifact revision the intent was expressed against.</li>
+ *   <li>{@code purgeState} — whether reaching {@link PipelineState#STOPPED} also clears the state this
+ *       pipeline accumulated. Only a stop expresses it; every other verb writes {@code false}, and so
+ *       does a stored intent written before this field existed. It rides on the intent rather than
+ *       being decided where the stop is carried out, because those are two moments in two processes:
+ *       the user says it here, and the converge side is what eventually does it.</li>
  * </ul>
  */
-public record DesiredState(String pipelineId, PipelineState targetState, String revision) {
+public record DesiredState(String pipelineId, PipelineState targetState, String revision, boolean purgeState) {
 
     public DesiredState {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(targetState, "targetState");
         Objects.requireNonNull(revision, "revision");
+    }
+
+    /**
+     * An intent that clears nothing — every verb but a stop, and every stop that was asked to keep what
+     * the pipeline has. Keeping is the answer this shorthand is allowed to assume because it is the one
+     * that destroys nothing: a caller who meant to clear has to say so, and the surface that takes the
+     * verb refuses a stop that did not.
+     */
+    public DesiredState(String pipelineId, PipelineState targetState, String revision) {
+        this(pipelineId, targetState, revision, false);
     }
 }

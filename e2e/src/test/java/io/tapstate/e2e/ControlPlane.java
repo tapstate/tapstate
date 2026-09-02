@@ -664,10 +664,29 @@ final class ControlPlane {
     /**
      * Records a lifecycle intent. The verb's own spelling comes from the product's enum, so the wire
      * word cannot drift from the word the product accepts.
+     *
+     * <p>A stop does not come through here. The product refuses one that does not say what becomes of
+     * the pipeline's state, and a harness that picked an answer on the caller's behalf would be the one
+     * place in the system where that question has a default -- so {@link #stop} takes it and every
+     * caller has to say. The refusal below is for a caller who reached for the wrong one.
      */
     void lifecycle(String pipelineId, LifecycleVerb verb) {
+        if (verb == LifecycleVerb.STOP) {
+            throw new IllegalArgumentException(
+                    "a stop says what becomes of the pipeline's state: call stop(pipelineId, purgeState)");
+        }
         expect(send(authed("/api/pipelines/" + pipelineId + ":" + verb.id(), "")),
                 200, verb.id() + " " + pipelineId);
+    }
+
+    /**
+     * Stops the pipeline, saying whether stopping also clears what it has accumulated -- its resume
+     * position and its operators' state.
+     */
+    void stop(String pipelineId, boolean purgeState) {
+        expect(send(authed("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.STOP.id(),
+                        "{\"purgeState\":" + purgeState + "}")),
+                200, LifecycleVerb.STOP.id() + " " + pipelineId);
     }
 
     /**

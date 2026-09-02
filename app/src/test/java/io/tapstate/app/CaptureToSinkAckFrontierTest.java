@@ -166,7 +166,7 @@ class CaptureToSinkAckFrontierTest {
             assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE))
                     .containsExactly(entry(TABLE, "src-3"));
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         assertThat(gatedSource.cdcClosed).as("stop closes the capture subscription").isTrue();
@@ -193,7 +193,7 @@ class CaptureToSinkAckFrontierTest {
             epoch = store.meta().read(chainId).orElseThrow().epoch();
             awaitBound();
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         // One chain in this job, so it is numbered onto the first axis after the one the engine keeps for its

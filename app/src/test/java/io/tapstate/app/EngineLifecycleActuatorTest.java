@@ -84,11 +84,12 @@ class EngineLifecycleActuatorTest {
         // Pause and resume are engine-only: the capture keeps running, so the coordinator is never touched.
         assertThat(events).containsExactly("startCapture:" + PIPE, "submit:" + PIPE);
 
-        actuator.stop(PIPE);
+        actuator.stop(PIPE, true);
         awaitStatus(job, JobStatus.FAILED); // Jet reports a cancelled job as FAILED
         // Stop cancels the job, then stops the capture behind it: the job was already terminal when capture stopped.
         assertThat(events).containsExactly(
-                "startCapture:" + PIPE, "submit:" + PIPE, "stopCapture:" + PIPE + "[jobTerminal]");
+                "startCapture:" + PIPE, "submit:" + PIPE,
+                "stopCapture:" + PIPE + "[purge][jobTerminal]");
     }
 
     @Test
@@ -175,8 +176,9 @@ class EngineLifecycleActuatorTest {
         }
 
         @Override
-        public void stopCapture(String pipelineId) {
-            events.add("stopCapture:" + pipelineId + (jobTerminalProbe.get() ? "[jobTerminal]" : "[jobLive]"));
+        public void stopCapture(String pipelineId, boolean purgeState) {
+            events.add("stopCapture:" + pipelineId + (purgeState ? "[purge]" : "[keep]")
+                    + (jobTerminalProbe.get() ? "[jobTerminal]" : "[jobLive]"));
         }
 
         @Override

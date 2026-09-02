@@ -139,8 +139,9 @@ class PipelineLifecycleServiceTest {
         assertThat(service.start("alice", "pl1")).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev));
         assertThat(service.pause("alice", "pl1")).isEqualTo(new DesiredState("pl1", PipelineState.PAUSED, rev));
         assertThat(service.resume("alice", "pl1")).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev));
-        assertThat(service.stop("alice", "pl1")).isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev));
-        assertThat(desired.read("pl1")).contains(new DesiredState("pl1", PipelineState.STOPPED, rev));
+        assertThat(service.stop("alice", "pl1", false))
+                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false));
+        assertThat(desired.read("pl1")).contains(new DesiredState("pl1", PipelineState.STOPPED, rev, false));
         // each verb is audited under its own operation — pins the whole verb->operation map, not just start.
         assertThat(audit.records).extracting(AuditRecord::operationId)
                 .containsExactly("pipeline.start", "pipeline.pause", "pipeline.resume", "pipeline.stop");
@@ -153,11 +154,39 @@ class PipelineLifecycleServiceTest {
         service.start("alice", "pl1");
         service.pause("alice", "pl1");
 
-        DesiredState written = service.stop("alice", "pl1");
+        DesiredState written = service.stop("alice", "pl1", false);
 
-        assertThat(written).isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev));
+        assertThat(written).isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false));
         assertThat(desired.read("pl1")).contains(written);
         assertThat(audit.records.get(audit.records.size() - 1).operationId()).isEqualTo("pipeline.stop");
+    }
+
+    @Test
+    void theAnswerAStopWasGivenIsWhatGetsWrittenDown() {
+        artifacts.save(PIPELINE_V1);
+        String rev = revisionOf(PIPELINE_V1);
+        service.start("alice", "pl1");
+
+        DesiredState written = service.stop("alice", "pl1", true);
+
+        // The intent is the only place this answer survives the call that gave it: the converge side runs
+        // later, in another process, and reads it from here. Written wrong, the pipeline is either cleared
+        // against its owner's wishes or left holding state they asked to be rid of, and both look like a
+        // normal stop until the next run either continues or reads its whole source again.
+        assertThat(written).isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, true));
+        assertThat(desired.read("pl1")).contains(written);
+    }
+
+    @Test
+    void everyOtherVerbWritesAnIntentThatClearsNothing() {
+        artifacts.save(PIPELINE_V1);
+
+        // Asserted over all three rather than trusting the field's default, because they are the verbs a
+        // pipeline passes through on its way to a stop: an intent left saying "clear" by a pause would be
+        // acted on by whichever stop came next, and nothing in between would say so.
+        assertThat(service.start("alice", "pl1").purgeState()).isFalse();
+        assertThat(service.pause("alice", "pl1").purgeState()).isFalse();
+        assertThat(service.resume("alice", "pl1").purgeState()).isFalse();
     }
 
     // ---- fixtures ----

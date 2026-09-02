@@ -184,7 +184,7 @@ class NestOverTwoSourcesDataFlowTest {
                 .describedAs("both sources merged onto it rather than opening one each")
                 .containsExactlyInAnyOrder(PARENT_SOURCE, CHILD_SOURCE);
 
-        actuator.stop(PIPELINE);
+        actuator.stop(PIPELINE, true);
 
         assertThat(srsCoordinator.isProvisioned(chain))
                 .describedAs("the shared chain is closed once, not once per source")
@@ -198,7 +198,7 @@ class NestOverTwoSourcesDataFlowTest {
      */
     private static void stopQuietly(LifecycleActuator actuator) {
         try {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         } catch (RuntimeException e) {
             System.out.println("stop failed after the run: " + e);
         }

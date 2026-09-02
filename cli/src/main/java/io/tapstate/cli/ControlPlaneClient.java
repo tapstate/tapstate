@@ -155,7 +155,8 @@ interface ControlPlaneClient extends AutoCloseable {
      * refuses (an unknown pipeline, a forbidden transition, or a stale revision), or unreachable on any I/O
      * failure. Never throws.
      */
-    LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb);
+    LifecycleOutcome lifecycle(
+            URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState);
 
     /**
      * Reads a pipeline's lifecycle state via {@code GET {baseUrl}/api/pipelines/{pipelineId}/status},

@@ -74,7 +74,8 @@ public final class MongoDesiredStore implements DesiredStore {
     static Document toDocument(DesiredState desired) {
         return new Document("_id", desired.pipelineId())
                 .append("targetState", desired.targetState().name())
-                .append("revision", desired.revision());
+                .append("revision", desired.revision())
+                .append("purgeState", desired.purgeState());
     }
 
     /** Reconstructs a desired state from its stored document. */
@@ -87,7 +88,13 @@ public final class MongoDesiredStore implements DesiredStore {
             // as a coded io diagnostic rather than a bare null-argument crash while reconstructing.
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
         }
-        return new DesiredState(id, parseState(targetState, id), revision);
+        // Absent reads as false, and that is the one direction it may default in: a document written
+        // before this field existed was written by a stop that could not have asked for anything to be
+        // cleared, so reading it as "clear it" would act on an intent nobody expressed. Unlike the two
+        // fields above it is not treated as corruption when missing -- an older document is a document
+        // this version can still read, which is what makes adding a field backward compatible at all.
+        return new DesiredState(
+                id, parseState(targetState, id), revision, document.getBoolean("purgeState", false));
     }
 
     /** A stored target state this version does not recognize is corruption, not a bare enum-valueOf crash. */

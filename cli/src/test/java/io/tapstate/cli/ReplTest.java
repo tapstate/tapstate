@@ -294,8 +294,10 @@ class ReplTest {
         }
 
         @Override
-        public LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb) {
-            lifecycleCalls.add(credential + "@" + baseUrl + " " + verb + " " + pipelineId);
+        public LifecycleOutcome lifecycle(
+                URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState) {
+            lifecycleCalls.add(credential + "@" + baseUrl + " " + verb + " " + pipelineId
+                    + (purgeState == null ? "" : " purgeState=" + purgeState));
             return healthy.contains(baseUrl) ? lifecycleOutcome : new LifecycleOutcome.Unreachable();
         }
 
@@ -3320,7 +3322,9 @@ class ReplTest {
                 "jwt-tok@http://node1:7900 start pl1",
                 "jwt-tok@http://node1:7900 pause pl1",
                 "jwt-tok@http://node1:7900 resume pl1",
-                "jwt-tok@http://node1:7900 stop pl1");
+                // The terminal's plain stop is the product's stop, and the product's stop clears. The
+                // three above carry nothing because there is nothing for them to say.
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true");
     }
 
     @Test

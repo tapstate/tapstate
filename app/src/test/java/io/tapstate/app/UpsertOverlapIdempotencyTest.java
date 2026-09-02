@@ -128,7 +128,7 @@ class UpsertOverlapIdempotencyTest {
         try {
             awaitKeyPresent("5");
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         assertThat(UpsertSink.keys()).containsExactlyInAnyOrder("1", "2", "3", "4", "5");
@@ -153,7 +153,7 @@ class UpsertOverlapIdempotencyTest {
         try {
             awaitTotalAtLeast(9);
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         // Nine rows delivered (three snapshot, six cdc including the three re-delivered), yet the keyed upsert

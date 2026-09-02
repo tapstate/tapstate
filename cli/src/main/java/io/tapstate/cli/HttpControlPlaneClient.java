@@ -722,11 +722,22 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
-    public LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb) {
+    public LifecycleOutcome lifecycle(
+            URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + ":" + verb, credential)
-                    .POST(HttpRequest.BodyPublishers.noBody())
-                    .build();
+            // Only a stop has anything to say in a body, and it is refused by the server without one.
+            // The other three send none at all rather than an empty object, which keeps them the
+            // requests they already were.
+            HttpRequest.BodyPublisher body = purgeState == null
+                    ? HttpRequest.BodyPublishers.noBody()
+                    : HttpRequest.BodyPublishers.ofString(
+                            "{\"purgeState\":" + purgeState + "}", StandardCharsets.UTF_8);
+            HttpRequest.Builder builder =
+                    authed(baseUrl, "/api/pipelines/" + pipelineId + ":" + verb, credential).POST(body);
+            if (purgeState != null) {
+                builder = builder.header("Content-Type", "application/json");
+            }
+            HttpRequest request = builder.build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {

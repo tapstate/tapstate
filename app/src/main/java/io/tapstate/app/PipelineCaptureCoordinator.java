@@ -16,8 +16,17 @@ interface PipelineCaptureCoordinator {
     /** Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop. */
     void startCapture(String pipelineId);
 
-    /** Stops the cdc capture started for the pipeline, tearing down each source run and releasing its chain. */
-    void stopCapture(String pipelineId);
+    /**
+     * Stops the cdc capture started for the pipeline, tearing down each source run and giving back its hold
+     * on each chain it read. {@code purgeState} additionally lets go of what the pipeline left in the
+     * source-side record -- the cursor it reads and acknowledges from.
+     *
+     * <p>That cursor is why the answer reaches this far down. It is not the stopped pipeline's own concern
+     * alone: every consumer's cursor is folded into two minimums the whole chain is bounded by, so one that
+     * will never advance again holds back every pipeline still on it. A stop asked to keep the pipeline's
+     * position keeps that cost with it -- deliberately, because the position is the thing being kept.
+     */
+    void stopCapture(String pipelineId, boolean purgeState);
 
     /**
      * The failure a running pipeline's cdc capture died with, or empty while it is healthy. The cdc stream runs

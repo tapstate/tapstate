@@ -7,6 +7,7 @@ import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.Operation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -61,7 +62,7 @@ final class McpOperationExecutor {
                 case "artifact.get" -> get("/api/artifacts/" + segment(required(args, "id")));
                 case "artifact.delete" -> artifactDelete(args);
                 case "pipeline.start" -> pipelineAction(args, "start");
-                case "pipeline.stop" -> pipelineAction(args, "stop");
+                case "pipeline.stop" -> pipelineStop(args);
                 case "pipeline.status" -> pipelineRead(args, "status");
                 case "pipeline.metrics" -> pipelineRead(args, "metrics");
                 case "pipeline.snapshot" -> pipelineRead(args, "snapshot");
@@ -83,6 +84,27 @@ final class McpOperationExecutor {
         return post(
                 "/api/pipelines/" + segment(required(arguments, "id")) + ":" + action,
                 null,
+                RequestBudget.LIGHT);
+    }
+
+    /**
+     * Stop is the one lifecycle verb that carries a body: whether to clear what the pipeline has. The
+     * argument is demanded here rather than left to the server, for the reason the delete below demands
+     * its precondition -- the server refuses without it anyway, and refusing at this end names the
+     * argument that was missing instead of handing back a refusal the caller has to decode.
+     *
+     * <p>A value that is not a boolean is treated as not stated. A model that answered "yes" in some
+     * other shape has not said what this asks, and reading it as either answer is exactly the guess the
+     * whole argument exists to stop.
+     */
+    private McpResult pipelineStop(Map<String, Object> arguments) {
+        String id = required(arguments, "id");
+        if (!(arguments.get("purgeState") instanceof Boolean purgeState)) {
+            return McpResult.coded(LifecycleError.PURGE_STATE_NOT_STATED, Map.of("pipeline", id));
+        }
+        return post(
+                "/api/pipelines/" + segment(id) + ":stop",
+                Map.of("purgeState", purgeState),
                 RequestBudget.LIGHT);
     }
 

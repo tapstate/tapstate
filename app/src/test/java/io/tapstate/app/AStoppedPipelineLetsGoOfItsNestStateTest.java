@@ -146,7 +146,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         InMemoryStorePort store = seedStore();
         seedState(store, ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE, OTHER_PIPELINE_NAMESPACE);
 
-        actuator(store).stop(PIPELINE);
+        actuator(store).stop(PIPELINE, true);
 
         assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isEmpty();
         assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isEmpty();
@@ -158,6 +158,32 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         assertThat(store.keyedState().load(OTHER_PIPELINE_NAMESPACE, "k"))
                 .describedAs("a stop drops what this pipeline named, never what merely looks like it")
                 .isPresent();
+    }
+
+    @Test
+    @DisplayName("a stop asked to keep the state leaves it standing, and leaves no drop for a later start")
+    void stoppingWithoutClearingTouchesNothingNowOrAtTheNextStart() {
+        InMemoryStorePort store = seedStore();
+        seedState(store, ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE, OTHER_PIPELINE_NAMESPACE);
+        EngineLifecycleActuator actuator = actuator(store);
+
+        actuator.stop(PIPELINE, false);
+
+        assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(SHAPE_NAMESPACE, "k")).isPresent();
+
+        // The second half is the one that discriminates. A stop that wrote the drop down and then merely
+        // declined to carry it out passes everything above: the note it left is finished by the next
+        // start, so the state goes at the start of a pipeline whose owner asked for it to be kept, and
+        // nothing between the two says a word. Keeping has to mean nothing was written down either.
+        actuator.start(PIPELINE);
+
+        assertThat(store.keyedState().load(ROOT_NAMESPACE, "k"))
+                .describedAs("still there across the start that follows, not merely across the stop")
+                .isPresent();
+        assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(SHAPE_NAMESPACE, "k")).isPresent();
     }
 
     /**
@@ -174,7 +200,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.nestDeadLetters().record(new NestDeadLetterRecord(OTHER_PIPELINE_NAMESPACE, "e2", "orders",
                 "1:1", 0L, 0L, Map.of("id", 2)));
 
-        actuator(store).stop(PIPELINE);
+        actuator(store).stop(PIPELINE, true);
 
         assertThat(store.nestDeadLetters().read(ITEMS_NAMESPACE, 10)).isEmpty();
         assertThat(store.nestDeadLetters().read(OTHER_PIPELINE_NAMESPACE, 10))
@@ -193,7 +219,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         // the pipeline is in, and the run already up goes on keeping state where it was built to keep it.
         store.artifacts().save(pipelineWithoutNest());
 
-        actuator.stop(PIPELINE);
+        actuator.stop(PIPELINE, true);
 
         // Worked out from the pipeline as it now reads, the names are none at all - and a stop that drops
         // none leaves every entry where it is with nothing left that can name it: the namespaces are gone
@@ -237,7 +263,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         EngineLifecycleActuator actuator = actuator(store);
 
         actuator.start(PIPELINE);
-        actuator.stop(PIPELINE);
+        actuator.stop(PIPELINE, true);
 
         // Recording "this run keeps state in nowhere" would put a record where a pipeline with no state has
         // none to describe, and every later reader would have to tell that from a run that kept something.
@@ -294,7 +320,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
         actuator.start(PIPELINE);
         awaitRunning();
-        actuator.stop(PIPELINE);
+        actuator.stop(PIPELINE, true);
         // Read only once the job is genuinely finished, which is the moment the two orderings first differ.
         // Read at the moment the stop returns, a drop that had raced ahead would look identical to one that
         // had waited: the write it is racing has not landed yet either, so the map is empty under both.

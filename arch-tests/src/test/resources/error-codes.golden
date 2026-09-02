@@ -119,6 +119,7 @@ io.store-unauthorized
 io.store-unavailable
 lifecycle.illegal-transition
 lifecycle.incompatible-revision
+lifecycle.purge-state-not-stated
 lifecycle.unknown-pipeline
 mcp.connector-spec-unavailable
 mcp.environment-missing
