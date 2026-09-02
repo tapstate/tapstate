@@ -230,6 +230,22 @@ class SourceApiTest {
     }
 
     @Test
+    void sourceCreateRejectsABodyMissingATopLevelRequiredField() {
+        // This path builds the record straight from JSON, so a required component left out is refused
+        // by the record's own constructor rather than by any rule that could carry a diagnostic. That
+        // refusal still has to reach the caller as a code: uncaught it becomes the stack trace this
+        // API reserves for a defect on its own side. Neither neighbour covers it - one adds a field
+        // the shape does not have, the other omits a field inside the connector config.
+        for (String required : List.of("\"connector\":\"mysql\",", "\"id\":\"gap\",")) {
+            String body = sourceJson("gap", "bad").replace(required, "");
+            assertThat(body).doesNotContain(required);
+            assertError(request("writer").post().uri("/api/sources")
+                            .contentType(MediaType.APPLICATION_JSON).body(body),
+                    HttpStatus.BAD_REQUEST, "control.malformed-request");
+        }
+    }
+
+    @Test
     void sourceCreateRejectsMissingLiveConnectorConfigBeforePersisting() {
         String missingDatabase = sourceJson("missing-config", "bad")
                 .replace("\"database\":\"orders\",", "");
