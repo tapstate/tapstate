@@ -4,11 +4,14 @@ import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.LevelBounds;
+import io.tapstate.runtime.engine.SettledPositions;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -34,10 +37,12 @@ import java.util.Set;
  * one row is the only thing here that grows without bound - and an entry holding all of them is right
  * until the day it is too large to store, with nothing before then to tell the two apart.
  *
- * <p><b>One outbound edge, and one kind of thing on it.</b> A row landing here changes no document by
+ * <p><b>One outbound edge, and two kinds of thing on it.</b> A row landing here changes no document by
  * arriving - which documents refer to it is not knowable from the row - so what goes out is worked out
  * from what was recorded about who points where: a word to each of them that the row they point at has
  * changed. It carries no fields; the document reads what to show out of the namespace this just wrote.
+ * The second kind is for the rows that word goes to nobody about: filed, named by no document, and so
+ * carried to a sink by nothing - see {@link #sayWhatOwesNothing()} for why a chain needs telling.
  */
 final class LookupProcessor extends AbstractProcessor {
 
@@ -60,6 +65,10 @@ final class LookupProcessor extends AbstractProcessor {
     private final long referrersAllowed;
     private final LevelBounds bounds;
     private final Queue<Object> outgoing = new ArrayDeque<>();
+    // The highest position per chain among the rows this drain filed that woke nothing, folded as they are
+    // met and said in one word when the drain ends. Kept across a drain that stopped early on a full
+    // outbox: the word is queued at the end of a later drain, or where the next bound is passed on.
+    private final Map<String, ChainPosition> owingNothing = new LinkedHashMap<>();
     private NestFailureRecording failures = NestFailureRecording.of(null);
 
     LookupProcessor(NestLookup lookup, NestStore<Map<String, Object>> store,
@@ -117,6 +126,34 @@ final class LookupProcessor extends AbstractProcessor {
                 return;
             }
         }
+        sayWhatOwesNothing();
+        flush();
+    }
+
+    /**
+     * Queues one word for the rows this drain filed that woke nothing, and forgets them.
+     *
+     * <p><b>Nothing else downstream will ever speak for them.</b> A row here reaches a sink only inside the
+     * documents naming it, so a row nobody names produces no record at all - which is the shape of this
+     * direction working, not a fault. But the chain it arrived on is then never advanced past it: the sink
+     * learns a position is durable by writing what carries it, and there is nothing to write. Left alone
+     * the chain stops at the last row some document happened to name and stays there for the life of the
+     * job, with every document correct and a restart replaying that table from further back every day.
+     *
+     * <p><b>Once per drain rather than once per row.</b> On a table nothing points at, every row takes this
+     * path, so a word each would put as many records on the edge as the stream has rows. Only the highest
+     * position per chain is of any use downstream - a frontier advances to the highest it is given at or
+     * below its bound - so the drain's are folded into one and the rest cost nothing to drop.
+     *
+     * <p>Queued rather than emitted, like everything else this vertex produces: it must sit behind the
+     * words already in the queue, and being in the queue is what puts it behind them.
+     */
+    private void sayWhatOwesNothing() {
+        if (owingNothing.isEmpty()) {
+            return;
+        }
+        outgoing.add(new SettledPositions(owingNothing));
+        owingNothing.clear();
     }
 
     /**
@@ -197,6 +234,12 @@ final class LookupProcessor extends AbstractProcessor {
         // exception leaves before the flush that empties this queue - so nothing observes the ordering, and
         // no case here asserts it.
         NestLimits.refuseFanout(lookup, key, referrers, referrersAllowed);
+        if (referrers == 0) {
+            // Filed, and owed to nobody: no document names this row, so no record downstream will ever
+            // carry where it sat. Kept until the drain ends, where the drain's are said in one word.
+            SettledPositions.fold(owingNothing, event.positions());
+            return;
+        }
         for (Set<Object> bucket : buckets) {
             for (Object referrer : bucket) {
                 outgoing.add(new NestTouch(referrer, event.ts(), event.positions(), false));
@@ -365,6 +408,10 @@ final class LookupProcessor extends AbstractProcessor {
         if (bounds == null || ordinal != ROWS) {
             return true;
         }
+        // Ahead of the flush, so a drain that stopped early on a full outbox still says what it filed
+        // before the bound that covers it goes past. Without this the word waits for the next row of a
+        // stream that may have gone quiet, which is exactly the stream this is for.
+        sayWhatOwesNothing();
         if (!flush()) {
             return false;
         }

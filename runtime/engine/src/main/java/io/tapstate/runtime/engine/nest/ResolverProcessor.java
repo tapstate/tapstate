@@ -11,6 +11,7 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.ReplayFloor;
+import io.tapstate.runtime.engine.SettledPositions;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -428,6 +429,13 @@ public final class ResolverProcessor extends AbstractProcessor {
         // that points at something of its own. The ordinal tells the two levels apart, not the two kinds.
         if (item instanceof NestTouch word) {
             passOn(word, touched);
+            return;
+        }
+        // Passed straight up, unread. It is about a chain rather than about a document, so this level has
+        // nothing to add to it and no key of its own to re-address it by - and holding it here would hold
+        // it for ever, since what it says is already true and no later event is coming to say it again.
+        if (item instanceof SettledPositions settled) {
+            emit(settled);
             return;
         }
         if (edge.isCascade()) {

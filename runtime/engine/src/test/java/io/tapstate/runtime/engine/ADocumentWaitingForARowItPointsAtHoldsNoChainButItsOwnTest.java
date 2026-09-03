@@ -58,16 +58,22 @@ import org.junit.jupiter.api.Test;
  * durable frontier - the record of how far a restart may skip - and a frontier that has quietly stopped
  * looks exactly like one with nothing to advance past.
  *
- * <p><b>Which chain is asked about is the whole of the discrimination.</b> The document's own row is
- * genuinely held: it went out in no document, and letting a restart skip past it would lose it. The chain
- * the pointed-at rows arrive on is not - filing one of those rows wakes everything pointing at it within
- * the same drain, so nothing about it is ever owed. An implementation that holds that chain too is
- * indistinguishable from this one on every document it produces, and the two differ only in whether a
- * restart of a long-lived job replays from the beginning of a table nobody was waiting on.
+ * <p><b>Neither chain is held, and that is the ruling on both of them.</b> A document waiting for a row it
+ * points at is written through to the state as it waits, and the row's arrival is what wakes it - so the
+ * frontier crossing the row that put it there loses nothing, and holding it would burn a source's
+ * retention window in exchange for nothing. The chain the pointed-at rows arrive on is not held either, for
+ * a different reason: a row nobody names owes no document at all. What the two share is that the frontier
+ * must cross them; where they differ is what can say so. The waiting document's own row goes out in a later
+ * document on its chain. The unnamed row goes out in nothing, ever - so only the vertex that filed it can
+ * speak for it, and an implementation that waits for a record instead stops that chain at whichever row
+ * some document happened to name, for the life of the job.
  *
- * <p>So the case asserts both directions at once: the chain that must move has moved, and the chain that
- * must not has not. Either one alone passes on an implementation that stalls everything, or on one that
- * acknowledges everything.
+ * <p><b>What this case must not be read off is the pinned-duration reading alone.</b> That reading names a
+ * chain in either of two states, and one of them - a bound climbed over positions it was never given - is
+ * where every chain sits whenever a source's bound runs ahead of its own rows. Asserting a chain is absent
+ * from it therefore passes on an implementation whose frontier never moved at all, which is how this case
+ * read green while the property did not hold. So what is asserted is the positions actually written down,
+ * with the reading kept as the second direction: that having moved, nothing then reports them stopped.
  */
 class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
 
@@ -91,9 +97,6 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
 
     /** A row on the same chain that nothing points at - the unrelated arrival the frontier must pass. */
     private static final String UNRELATED = "C-unrelated";
-
-    /** Far above anything that arrives, so nothing here is short of a bound to advance under. */
-    private static final long FAR_ABOVE = FrontierOrders.pack(CUSTOMERS, new SourceOrder(1, 900));
 
     /** Every position the sink wrote down, as {@code chain:epoch:seq}. Static: the job runs on the member. */
     private static final List<String> ACKED = Collections.synchronizedList(new ArrayList<>());
@@ -159,39 +162,42 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
 
         // Waits for the state this case is about to actually arrive, rather than for a length of time
         // that was long enough on a quiet machine. Under a full build the same run has taken several
-        // times as long, and a fixed wait that runs out reports "nothing is pinned" - which is the
-        // answer this case is looking for, arrived at by not having looked.
-        Map<String, Long> pinned = awaitPinned(ORDERS);
+        // times as long, and a fixed wait that runs out leaves every reading below saying what an
+        // unstarted run says.
+        await(() -> acked().contains(acked(ORDERS, MOVING_ORDER_AT)));
 
-        assertThat(pinned)
-                .describedAs("the control, and it is what says the run reached the state being asked "
-                        + "about at all: the waiting order's own chain is pinned, because its row went "
-                        + "out in no document and a restart skipping it would lose it")
-                .containsKey(ORDERS);
+        assertThat(DOCUMENTS)
+                .describedAs("the control: the run reached the state being asked about. One order's row "
+                        + "named a customer that arrived and its document went out; the other names one "
+                        + "that never does, so its document is still being waited on. Without this every "
+                        + "assertion below is one an unstarted run would also pass")
+                .hasSize(1);
 
-        assertThat(pinned)
-                .describedAs("the chain the pointed-at rows arrive on is not pinned, while a document is "
-                        + "still waiting for one of its rows. Filing such a row wakes everything pointing "
-                        + "at it inside the same drain, so nothing about that chain is ever owed - and a "
-                        + "wait that pinned it would stop a restart from skipping a table nobody was "
-                        + "waiting on, with the job running, every document correct and nothing to see. "
-                        + "What is pinned: %s", pinned)
-                .doesNotContainKey(CUSTOMERS);
-    }
+        assertThat(acked())
+                .describedAs("the unrelated row on the pointed-at chain was let past. No document names "
+                        + "it, so no record downstream carries where it sat and nothing but the vertex "
+                        + "that filed it can say it is durable. An implementation that leaves it to a "
+                        + "record stops this chain at whichever row some document happened to name, for "
+                        + "the life of the job, with every document correct and nothing to see but a "
+                        + "restart replaying that table from further back every day. "
+                        + "What was written down: %s", acked())
+                .contains(acked(CUSTOMERS, UNRELATED_CUSTOMER_AT));
 
-    /**
-     * The pinned-duration reading, once {@code chain} appears in it. Read at that moment rather than
-     * after a fixed wait: the two chains this case compares are only comparable once the run has got as
-     * far as pinning the one that must be pinned, and how long that takes belongs to the machine.
-     */
-    private Map<String, Long> awaitPinned(String chain) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
-        Map<String, Long> pinned = new Engine(member).frontierStalls("nest-waiting-frontier");
-        while (System.nanoTime() < deadline && !pinned.containsKey(chain)) {
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(100));
-            pinned = new Engine(member).frontierStalls("nest-waiting-frontier");
-        }
-        return pinned;
+        assertThat(acked())
+                .describedAs("and the waiting document's own chain was let past its row too, which is "
+                        + "the ruling rather than a slip: a document held back for a row it points at is "
+                        + "written through to the state as it waits, and the row's arrival wakes it, so "
+                        + "a restart above it loses nothing and holding the chain would burn a retention "
+                        + "window for no gain. The moving order sits above the waiting one on that chain, "
+                        + "so this says the frontier crossed it. What was written down: %s", acked())
+                .contains(acked(ORDERS, MOVING_ORDER_AT));
+
+        assertThat(new Engine(member).frontierStalls("nest-waiting-frontier"))
+                .describedAs("and nothing reports a stopped frontier, because nothing has stopped. This "
+                        + "is the direction the other two cannot fail in: they would still pass on an "
+                        + "implementation that acked these positions and then held the chains anyway, "
+                        + "which is what anything reading this to raise an alarm would see")
+                .isEmpty();
     }
 
     // ---- the job under test ------------------------------------------------------------
@@ -259,22 +265,31 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
     }
 
     /**
-     * Emits its rows, then keeps raising its bound for as long as the job runs. Raising it repeatedly is
-     * what makes the waiting case decidable: a level only reconsiders a chain when a bound on it arrives.
+     * Emits its rows, then the one bound that stands for them, and then says nothing more.
+     *
+     * <p><b>The bound stops at the last row read, and that is the contract rather than a convenience.</b>
+     * A real source announces what it has read off its ring and nothing beyond it, sends a bound only when
+     * it climbs - a repeated one is a torn contract that fails the job - and goes silent when it is idle.
+     * A fixture that instead raises its bound for ever, with no rows behind it, models a source that cannot
+     * exist, and it made this case undecidable: every chain is then permanently "short of positions it was
+     * never given", which is one of the two states the pinned reading is written to report. Both of this
+     * case's chains reported pinned under it, so neither the property nor its control could be told from
+     * an implementation that stalls everything.
      */
     private static final class RowsThenBounds extends AbstractProcessor {
 
         private final String stream;
         private final List<Row> rows;
         private int next;
-        private long bound = FAR_ABOVE;
+        private SourceOrder read;
+        private long announced = Long.MIN_VALUE;
 
         RowsThenBounds(String stream, List<Row> rows) {
             this.stream = stream;
             this.rows = rows;
         }
 
-        /** Not cooperative so it can pace itself: raising the bound as fast as it can spins the job. */
+        /** Not cooperative so it can pace itself rather than spin a shared thread between empty turns. */
         @Override
         public boolean isCooperative() {
             return false;
@@ -289,11 +304,15 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
                     return false;
                 }
                 next++;
+                read = row.order();
             }
-            if (!tryEmit(new Watermark(bound, AXES.axisOf(stream)))) {
-                return false;
+            if (read != null) {
+                long bound = FrontierOrders.pack(stream, read);
+                if (bound > announced && !tryEmit(new Watermark(bound, AXES.axisOf(stream)))) {
+                    return false;
+                }
+                announced = Math.max(announced, bound);
             }
-            bound++;
             // Never finishes: a completed queue stops constraining the coalesced bound.
             return false;
         }

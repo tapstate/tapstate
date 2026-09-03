@@ -13,6 +13,7 @@ import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.PassthroughProcessor;
 import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.ReplayFloorFactory;
+import io.tapstate.runtime.engine.SettledPositions;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -371,8 +372,25 @@ public final class NestDag {
      * longer all of that.
      */
     private static FunctionEx<Object, Object> routedKey() {
-        return item -> item instanceof NestTouch word ? word.key() : ((KeyedElement) item).key();
+        return item -> {
+            if (item instanceof NestTouch word) {
+                return word.key();
+            }
+            // Word that a chain got past some rows with nothing to deliver for them belongs to no document,
+            // so there is no key it could be routed on and any one instance will do. A constant sends every
+            // one of them to the same instance, which is what makes it a hand-off rather than a broadcast:
+            // it is passed straight up to the sink, and a copy per instance would be a copy per instance of
+            // the same claim. It is one word per drain of a lookup, so the instance it lands on is not
+            // carrying a share of the stream's volume.
+            if (item instanceof SettledPositions) {
+                return SETTLED_POSITIONS_LANE;
+            }
+            return ((KeyedElement) item).key();
+        };
     }
+
+    /** The one key every {@link SettledPositions} is routed on; see {@link #routedKey()}. */
+    private static final String SETTLED_POSITIONS_LANE = "settled-positions";
 
     /**
      * Supplies one nest vertex's processors on one member. It exists rather than a plain supplier because

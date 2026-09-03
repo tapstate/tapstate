@@ -11,6 +11,7 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.ReplayFloor;
+import io.tapstate.runtime.engine.SettledPositions;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -174,6 +175,11 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * bound.
      */
     private final Map<Object, Window> windows = new LinkedHashMap<>();
+
+    // The highest position per chain that a lookup has said owes nothing, waiting until this level holds
+    // nothing lower on that chain. In memory, like the windows beside it: a restart that has lost it has
+    // lost only a chance to advance a frontier, which is the direction to lose in.
+    private final Map<String, ChainPosition> settledAhead = new LinkedHashMap<>();
 
     /**
      * The moves whose subtree is parked and not yet collected, against what the change that started each was
@@ -369,6 +375,9 @@ public final class AssemblerProcessor extends AbstractProcessor {
         // coming from costing a chain more than its protection.
         giveUpOnHandOversNobodyCollected();
         if (!sendWhatWindowsHaveRunOutOn()) {
+            return false;
+        }
+        if (!passOnWhatOwesNothing()) {
             return false;
         }
         weighDeletedRoots();
@@ -614,6 +623,9 @@ public final class AssemblerProcessor extends AbstractProcessor {
         if (!sendWhatWindowsHaveRunOutOn()) {
             return false;
         }
+        if (!passOnWhatOwesNothing()) {
+            return false;
+        }
         if (bounds == null) {
             return true;
         }
@@ -638,6 +650,10 @@ public final class AssemblerProcessor extends AbstractProcessor {
         // vertex filing the rows this document itself points at; the other is an ordinary cascade, carrying
         // word that a row some level beneath points at was edited, climbing with that level's own changes.
         // The ordinal says which level it came from and says nothing about which of the two it is.
+        if (item instanceof SettledPositions settled) {
+            SettledPositions.fold(settledAhead, settled.positions());
+            return;
+        }
         if (item instanceof NestTouch word) {
             // A word that only answers a wait is dropped where there is none, before anything is read: it
             // is sent on every row of a pointing stream whose row is already filed, and drawing those
@@ -1223,6 +1239,46 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * whole of what this level keeps the frontier below: everything else it holds is written through with
      * the state and comes back out on its own.
      */
+    /**
+     * Queues on, for each chain, the position a lookup said owes nothing, once this level holds nothing
+     * lower on that chain.
+     *
+     * <p><b>Held rather than passed straight on, and the hold is the whole of what makes it safe.</b> What
+     * it says is true where it was said: those rows are durable and no record about them is coming. What it
+     * cannot see is a document sitting here in its window holding a <em>lower</em> position on the same
+     * chain - a document that is not durable anywhere, because a word about a row it points at changes
+     * nothing in the state, only what has to be drawn again. Let past that document, this would have a sink
+     * ack above a change that is then neither delivered nor replayable: the document stays at its previous
+     * version for ever, the job running and every count healthy.
+     *
+     * <p>So the condition is the one the bound already uses, asked of the same reading: whatever a window
+     * or an uncollected hand-over keeps this level's promise below, keeps this below it too. Queued after
+     * the documents whose windows just ran out, for the same reason a bound is - one sent ahead of what is
+     * queued behind it would say those documents had gone.
+     */
+    private boolean passOnWhatOwesNothing() {
+        if (settledAhead.isEmpty()) {
+            return true;
+        }
+        Map<String, ChainPosition> free = new LinkedHashMap<>();
+        settledAhead.entrySet().removeIf(entry -> {
+            SourceOrder unsent = lowestUnsentOn(entry.getKey());
+            if (unsent != null && unsent.compareTo(entry.getValue().order()) <= 0) {
+                return false;
+            }
+            free.put(entry.getKey(), entry.getValue());
+            return true;
+        });
+        if (free.isEmpty()) {
+            return true;
+        }
+        outgoing.add(new SettledPositions(free));
+        // Flushed here rather than left to whatever runs next: every caller has already flushed by the
+        // time this is reached, so a word only queued would wait for the next turn that happens to flush
+        // - and on the stream this is for, that turn is one no further row is coming to cause.
+        return flush();
+    }
+
     private SourceOrder lowestUnsentOn(String chain) {
         SourceOrder lowest = null;
         for (Window window : windows.values()) {

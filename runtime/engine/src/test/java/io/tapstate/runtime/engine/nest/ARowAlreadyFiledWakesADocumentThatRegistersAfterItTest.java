@@ -14,6 +14,7 @@ import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.runtime.engine.SettledPositions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -132,10 +133,16 @@ class ARowAlreadyFiledWakesADocumentThatRegistersAfterItTest {
         return processor;
     }
 
-    /** The words this vertex sent, which are the documents it asked to be drawn again. */
+    /**
+     * The words this vertex sent asking a document to be drawn again. The other kind it sends - word that
+     * a chain got past rows no document names - is left out on purpose: this case is about which documents
+     * are told what, and counting a word addressed to no document among them would have every case here
+     * read one higher. What that word does and when it is sent has its own case.
+     */
     private static List<Object> woken(TestOutbox outbox) {
         List<Object> sent = new ArrayList<>();
         outbox.drainQueueAndReset(0, sent, false);
+        sent.removeIf(item -> item instanceof SettledPositions);
         return sent;
     }
 

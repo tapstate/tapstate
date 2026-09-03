@@ -30,6 +30,13 @@ import java.util.concurrent.CompletionException;
  * inbox, so Jet holds the upstream back until an outstanding write settles and frees a slot. A batch's
  * events are handed to the writer and never touched again, honouring the writer's ownership window.
  *
+ * <p><b>Not everything that arrives is a record.</b> A vertex upstream may also send word that a chain got
+ * past changes it has nothing to deliver for — absorbed where they arrived, with no record coming for them
+ * ever. Those are never offered to the writer, but they take part in the frontier, and they take part
+ * <em>with the batch they arrived in</em> rather than on arrival: a position may only be acked once every
+ * record carrying a lower one has landed, and settling with the batch is what makes that true here without
+ * anything having to work out what is still outstanding.
+ *
  * <p>The vertex runs at total parallelism one and, by default, keeps a single write in flight: one
  * {@code serve.sync} is one external target, and applying one batch to completion before the next is
  * issued is what keeps a key's change events in their arrival order. Two batches that straddle a key
@@ -148,11 +155,25 @@ public final class SinkProcessor extends AbstractProcessor {
         reapSettled();
         while (!inbox.isEmpty() && inFlight.size() < maxInFlight) {
             List<Envelope> batch = new ArrayList<>();
-            while (batch.size() < maxBatchSize && !inbox.isEmpty()) {
-                batch.add((Envelope) inbox.poll());
+            List<ChainEntry> absorbed = new ArrayList<>();
+            int taken = 0;
+            while (taken < maxBatchSize && !inbox.isEmpty()) {
+                Object item = inbox.poll();
+                taken++;
+                // Word that a chain got past some changes with nothing to deliver for them. It is not a
+                // record and is never offered to the writer, but it settles with this batch rather than on
+                // arrival: it may only be acked once every record before it has landed, and riding the
+                // batch is what makes that true without anything here having to work it out.
+                if (item instanceof SettledPositions settled) {
+                    settled.positions().forEach(
+                            (chain, position) -> absorbed.add(new ChainEntry(chain, position)));
+                    continue;
+                }
+                batch.add((Envelope) item);
             }
-            inFlight.add(new InFlightBatch(
-                    writer.write(batch).toCompletableFuture(), positionsOf(batch)));
+            List<ChainEntry> positions = new ArrayList<>(positionsOf(batch));
+            positions.addAll(absorbed);
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions));
         }
         // A saturated in-flight set leaves the rest of the inbox unread; Jet backpressures upstream
         // until reapSettled frees a slot on a later call.
@@ -261,6 +282,18 @@ public final class SinkProcessor extends AbstractProcessor {
     /** What this batch contributes to the frontier, empty when no frontier is tracked. */
     private List<ChainEntry> positionsOf(List<Envelope> batch) {
         return frontier == null ? List.of() : frontier.positions(batch);
+    }
+
+    /**
+     * The write that settles this batch, or an already-settled one where the batch holds no record. A drain
+     * of nothing but words about chains has nothing to deliver, and handing the writer an empty list would
+     * put an empty call on an external target on every one of them - on a pointed-at stream nobody names,
+     * that is every drain of it.
+     */
+    private CompletableFuture<WriteResult> settlementOf(List<Envelope> batch) {
+        return batch.isEmpty()
+                ? CompletableFuture.completedFuture(new WriteResult(0))
+                : writer.write(batch).toCompletableFuture();
     }
 
     /**
