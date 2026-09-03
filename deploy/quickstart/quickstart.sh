@@ -36,7 +36,7 @@ set -eu
 # nothing and install.sh refuses, which would strand the quickstart at the CLI step on a clean machine.
 # Pin it here instead, the same way the demo connector jars are pinned to a published tag. This must
 # match the version in pom.xml; quickstart-smoke.sh fails the build when the two drift apart.
-CLI_VERSION="0.3.0"
+CLI_VERSION="0.4.1"
 
 die() {
     printf 'quickstart: %s\n' "$1" >&2
