@@ -27,6 +27,26 @@
       <version>${revision}</version>
     </dependency>
 
+    <!-- The carrier-agnostic plan a join declaration compiles to, and the evaluation of the
+         expressions its output columns are written from. Core ring, so rule R4 admits it.
+
+         The SQL library that produced the plan is excluded wholesale, and that is the point of
+         declaring the exclusions rather than taking the closure: nothing in this module names one of
+         its types, an arch-test holds the plan's own signatures to the same line, and a closure on the
+         classpath is how something would quietly start to. Excluded here, a reference to one of those
+         types does not compile. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-sql</artifactId>
+      <version>${revision}</version>
+      <exclusions>
+        <exclusion><groupId>org.apache.calcite</groupId><artifactId>*</artifactId></exclusion>
+        <exclusion><groupId>org.apache.calcite.avatica</groupId><artifactId>*</artifactId></exclusion>
+        <exclusion><groupId>org.apache.commons</groupId><artifactId>commons-math3</artifactId></exclusion>
+        <exclusion><groupId>com.google.guava</groupId><artifactId>guava</artifactId></exclusion>
+      </exclusions>
+    </dependency>
+
     <!-- The stateless transform seam the runtime adapter wraps; brings the event envelope currency
          transitively (rule R4: core + spi only). -->
     <dependency>
