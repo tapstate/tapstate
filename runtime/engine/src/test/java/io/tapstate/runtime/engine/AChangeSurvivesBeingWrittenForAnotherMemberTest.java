@@ -151,4 +151,18 @@ class AChangeSurvivesBeingWrittenForAnotherMemberTest {
         assertThat(roundTrip(written).positions())
                 .isEqualTo(Map.of("orders", new ChainPosition(new SourceOrder(2, 9), "cursor-abc")));
     }
+
+    @Test
+    @DisplayName("a position with no order comes back with none")
+    void aPositionWithoutAnOrderIsCarriedAsSuch() {
+        Envelope written = new Envelope(Op.INSERT, 1L, "orders", null, row("id", 1), null,
+                Map.of("orders", new ChainPosition(null, "cursor-abc")));
+
+        assertThat(roundTrip(written).positions())
+                .describedAs("either half of a position may be absent, so a change stamped with a token "
+                        + "before its order was worked out is a shape the wire has to carry - and a form "
+                        + "that reads the order off the object instead fails the job at the serializer, "
+                        + "on the first such change to cross a member, with the row nowhere in the message")
+                .isEqualTo(Map.of("orders", new ChainPosition(null, "cursor-abc")));
+    }
 }
