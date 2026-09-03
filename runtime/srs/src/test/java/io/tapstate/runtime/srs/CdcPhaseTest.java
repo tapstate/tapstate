@@ -173,6 +173,134 @@ class CdcPhaseTest {
     }
 
     @Test
+    void oneRunOfChangesTouchesTheRecordOncePerChangeAndNeverForTheWholeOfIt() {
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.cost")));
+        CountingMeta meta = new CountingMeta(List.of(new ConsumerOffset(
+                "p1", Map.of("orders", 9L),
+                new ChainPosition(new SourceOrder(RING_GENERATION, 9), "w9"))));
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+        FakeCdcPort port = new FakeCdcPort(List.of(
+                Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
+                Envelope.insert(2, "orders", Map.of("id", 2), Map.of()),
+                Envelope.insert(3, "orders", Map.of("id", 3), Map.of()),
+                Envelope.insert(4, "orders", Map.of("id", 4), Map.of()),
+                Envelope.insert(5, "orders", Map.of("id", 5), Map.of())));
+
+        // Wired the way the runtime wires it: the cursors are fetched through the store, not handed in
+        // as a constant. A supplier that closed over a list would make this case unable to see a read.
+        CdcPhase.run(port, config(), chain, () -> meta.consumerOffsets("chain"), new CaptureHealth());
+
+        assertThat(meta.cursorReads)
+                .as("one cursor read per change, and no more: this is the figure a machine's speed cannot "
+                        + "move, which is why it is counted rather than timed")
+                .isEqualTo(5);
+        assertThat(meta.wholeRecordReads)
+                .as("and never the whole record, which carries a schema history that grows per DDL and is "
+                        + "not read on this path; falling back to it is a cost that grows with the chain")
+                .isZero();
+        assertThat(meta.writes)
+                .as("at most one write per change, and fewer once a position resolves to what the record "
+                        + "already holds")
+                .isLessThanOrEqualTo(5);
+    }
+
+    /**
+     * A store that answers the cursor read directly, the way the shipped one does, and counts every way
+     * it is touched. The distinction between the two read counters is the point: a store that dropped the
+     * override would still be correct and would answer through the whole record instead, which this can
+     * tell apart and a single total cannot.
+     */
+    private static final class CountingMeta implements SrsMetaStore {
+
+        private final List<ConsumerOffset> consumers;
+        int cursorReads;
+        int wholeRecordReads;
+        int writes;
+
+        CountingMeta(List<ConsumerOffset> consumers) {
+            this.consumers = consumers;
+        }
+
+        @Override
+        public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+            cursorReads++;
+            return consumers;
+        }
+
+        @Override
+        public Optional<SrsMeta> read(String miningChainId) {
+            wholeRecordReads++;
+            return Optional.empty();
+        }
+
+        @Override
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+            writes++;
+        }
+
+        @Override
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            throw new UnsupportedOperationException("no write-back on this path");
+        }
+
+        @Override
+        public void create(String miningChainId, String retention) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void advanceConsumerReadSeq(
+                String miningChainId, String pipelineId, String table, long lastReadSeq) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public long openEpoch(String miningChainId) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void appendSchemaVersion(String miningChainId, io.tapstate.spi.store.SchemaVersion version) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public java.util.List<String> miningChainIdsWithConsumer(String pipelineId) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void detachConsumer(String miningChainId, String pipelineId) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void dropChain(String miningChainId) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    @Test
     void cutsTheDurableLogBackToWhatEveryConsumerHasLanded() {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.trim")));
         RecordingMeta meta = new RecordingMeta();
