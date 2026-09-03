@@ -125,6 +125,49 @@ class JoinOutputTargetTest {
         assertThat(namesOf(targets.get("widen"))).contains("customer_id");
     }
 
+    /**
+     * The other spelling. {@code FROM orders o} makes the plan call the source by its alias while the
+     * table behind it is {@code orders}; {@code FROM o} makes both the alias. The key is resolved
+     * against the name the plan uses and the target is named after the real table, so the two have to
+     * be looked up separately - conflating them names the target after an alias, or fails to find the
+     * key at all and refuses a perfectly ordinary query.
+     */
+    @Test
+    void theAliasedFromSpellingResolvesTheSameKeyAndTheSameTable() {
+        Map<String, TargetTable> targets = bind(ALIASED_FROM_PIPELINE);
+
+        assertThat(keyOf(targets.get("widen"))).containsExactly("order_id");
+        assertThat(targets.get("widen").name()).isEqualTo("orders");
+    }
+
+    /**
+     * An append never matches a write to an existing row, so it has no use for a key - the reading the
+     * source-side key rule already takes, and the two must not disagree about what a keyless write
+     * means. Measured while the refusal was unconditional: this pipeline was refused by name for a
+     * key it never needed. The upsert half of the pair is what keeps the refusal from being switched
+     * off altogether; without it, "no key needed" would read the same as "the check is gone".
+     */
+    @Test
+    void anAppendNeedsNoFactKeyWhileAnUpsertStillDoes() {
+        Map<String, TargetTable> appended = bind(unkeyedInto("append"));
+        assertThat(keyOf(appended.get("widen"))).isEmpty();
+        assertThat(namesOf(appended.get("widen"))).containsExactly("total", "customer_name");
+
+        assertThatThrownBy(() -> bind(unkeyedInto("upsert")))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
+                        .isEqualTo("actuation.join-output-key-not-published"));
+    }
+
+    /** The same, with the mode left out entirely - which is how the upsert default is written. */
+    @Test
+    void anAbsentWriteModeIsTheUpsertItDefaultsToAndStillNeedsTheKey() {
+        assertThatThrownBy(() -> bind(UNKEYED_PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
+                        .isEqualTo("actuation.join-output-key-not-published"));
+    }
+
     // ---- fixtures ----------------------------------------------------------------------
 
     private static final String ORDERS_SRC = """
@@ -173,6 +216,46 @@ class JoinOutputTargetTest {
                   from: widen
                   sync: [ { id: sync_1, source: orders_dest } ]
                 """.formatted(select);
+    }
+
+    /** {@code FROM orders o} rather than {@code FROM o}: the alias and the table differ. */
+    private static final String ALIASED_FROM_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: wide
+            source: [ orders_src, customers_src ]
+            transforms:
+              - id: widen
+                type: join
+                from: { o: orders, c: customers }
+                engine: builtin
+                sql: |
+                  SELECT o.id AS order_id, c.name AS customer_name
+                  FROM orders o LEFT JOIN customers c ON o.customer_ref = c.cust_ref
+            serve:
+              from: widen
+              sync: [ { id: sync_1, source: orders_dest } ]
+            """;
+
+    /** A projection with no fact key in it, written into a sink with the given write mode. */
+    private static String unkeyedInto(String writeMode) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: wide
+                source: [ orders_src, customers_src ]
+                transforms:
+                  - id: widen
+                    type: join
+                    from: { o: orders, c: customers }
+                    engine: builtin
+                    sql: |
+                      SELECT o.region AS total, c.name AS customer_name
+                      FROM o LEFT JOIN c ON o.customer_ref = c.cust_ref
+                serve:
+                  from: widen
+                  sync: [ { id: sync_1, source: orders_dest, write_mode: %s } ]
+                """.formatted(writeMode);
     }
 
     private static final String JOIN_PIPELINE =

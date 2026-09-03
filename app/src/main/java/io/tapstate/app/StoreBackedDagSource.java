@@ -187,6 +187,7 @@ final class StoreBackedDagSource implements DagSource {
                 ? streamsReaching(pipeline, view.from(), sourceKeyByTable, sourceKeysById,
                         sourceVertices, stepIds)
                 : Set.of();
+        requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
         FrontierBinding frontier = frontierBinding(sourceVertices);
         return PipelineDagBuilder.build(
                 pipeline,
@@ -359,17 +360,8 @@ final class StoreBackedDagSource implements DagSource {
     private TargetTable joinTarget(Step step, CompiledJoin compiled,
             Map<String, TargetTable> bySourceTable) {
         io.tapstate.core.sql.JoinPlan plan = compiled.plan();
-        String factName = plan.factSource().name();
-        String factTable = compiled.tableByName().getOrDefault(factName, plan.factSource().table());
-        List<String> key = new ArrayList<>();
-        for (String column : compiled.factKeyColumns()) {
-            String published = plan.publishedAs(factName, column);
-            if (published == null) {
-                throw new TapstateException(ActuationError.JOIN_OUTPUT_KEY_NOT_PUBLISHED,
-                        Map.of("step", step.id(), "table", factTable, "column", column), null);
-            }
-            key.add(published);
-        }
+        String factTable = factTableOf(compiled);
+        List<String> key = publishedFactKey(compiled);
         List<TargetField> fields = new ArrayList<>();
         for (String name : key) {
             fields.add(new TargetField(name, joinFieldType(compiled, name, bySourceTable), true));
@@ -381,6 +373,89 @@ final class StoreBackedDagSource implements DagSource {
             }
         }
         return new TargetTable(factTable, fields);
+    }
+
+    /**
+     * The fact key under the names the projection publishes it by, or empty where it does not publish
+     * all of it.
+     *
+     * <p><b>Empty rather than partial.</b> A key one column short still looks like a key and still
+     * matches writes to rows, so it merges rows the query says are distinct - the same silent failure
+     * as no key at all, wearing a key's clothes. Whether an empty one is allowed to reach a sink is
+     * decided by what that sink does with it, which is not known here.
+     */
+    private static List<String> publishedFactKey(CompiledJoin compiled) {
+        String factName = compiled.plan().factSource().name();
+        List<String> key = new ArrayList<>();
+        for (String column : compiled.factKeyColumns()) {
+            String published = compiled.plan().publishedAs(factName, column);
+            if (published == null) {
+                return List.of();
+            }
+            key.add(published);
+        }
+        return key;
+    }
+
+    /** The first fact key column the projection does not publish, or null where it publishes them all. */
+    private static String unpublishedFactKeyColumn(CompiledJoin compiled) {
+        String factName = compiled.plan().factSource().name();
+        for (String column : compiled.factKeyColumns()) {
+            if (compiled.plan().publishedAs(factName, column) == null) {
+                return column;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Refuses a join whose projection does not publish its driving table's key - but only where
+     * something actually matches a write to an existing row on that key.
+     *
+     * <p><b>An append is not judged, and that is the whole reason this is not decided where the target
+     * is built.</b> Append never matches a write to an existing row, so it has no use for a key at
+     * all; refusing one for want of a key would refuse a pipeline that is not broken. This is the same
+     * reading the source-side key rule takes, and the two must not disagree about what a keyless write
+     * means. Measured while this was still unconditional: a join feeding an append-mode sync was
+     * refused by name for a key it never needed.
+     *
+     * <p>Read across the whole serve block rather than per element, the way the source-side rule reads
+     * it: one keyed write anywhere in it is enough, because every element is fed by the same streams.
+     * A view is not judged here - it declares its own key and its own gate compares that key against
+     * what feeds it.
+     */
+    private static void requireFactKeyPublishedWhereAWriteMatchesOnIt(
+            PipelineResource pipeline, Map<String, CompiledJoin> compiledJoins,
+            Set<String> serveStreams) {
+        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null) {
+            return;
+        }
+        boolean matchesOnAKey = false;
+        for (SyncElement sync : serve.sync()) {
+            matchesOnAKey |= sync.writeMode() == null
+                    || sync.writeMode() == io.tapstate.core.model.WriteMode.UPSERT;
+        }
+        if (!matchesOnAKey) {
+            return;
+        }
+        for (String stream : serveStreams) {
+            CompiledJoin compiled = compiledJoins.get(stream);
+            if (compiled == null) {
+                continue;
+            }
+            String missing = unpublishedFactKeyColumn(compiled);
+            if (missing != null) {
+                throw new TapstateException(ActuationError.JOIN_OUTPUT_KEY_NOT_PUBLISHED,
+                        Map.of("step", stream, "table", factTableOf(compiled), "column", missing),
+                        null);
+            }
+        }
+    }
+
+    /** The real table behind the name the plan calls the driving source by. */
+    private static String factTableOf(CompiledJoin compiled) {
+        String factName = compiled.plan().factSource().name();
+        return compiled.tableByName().getOrDefault(factName, compiled.plan().factSource().table());
     }
 
     /** The declared type of the column one output field publishes verbatim, or null where it computes one. */
