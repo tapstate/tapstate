@@ -137,8 +137,16 @@ public final class EnvelopeSerializer implements StreamSerializer<Envelope> {
         for (Map.Entry<String, ChainPosition> entry : positions.entrySet()) {
             out.writeString(entry.getKey());
             ChainPosition position = entry.getValue();
-            out.writeLong(position.order().epoch());
-            out.writeLong(position.order().seq());
+            // An order may be absent - a position stamped with a token before its order was worked out
+            // carries one and not the other - so it is written as present-or-not rather than as two
+            // numbers that have to exist. Reading it off the object instead fails the job on the first
+            // such change to cross a member boundary, at a serializer, with the row nowhere in the message.
+            SourceOrder order = position.order();
+            out.writeBoolean(order != null);
+            if (order != null) {
+                out.writeLong(order.epoch());
+                out.writeLong(order.seq());
+            }
             // A token is absent far more often than not, and the platform's string writer takes null.
             out.writeString(position.token());
         }
@@ -152,9 +160,8 @@ public final class EnvelopeSerializer implements StreamSerializer<Envelope> {
         Map<String, ChainPosition> positions = new LinkedHashMap<>();
         for (int i = 0; i < size; i++) {
             String chain = in.readString();
-            long epoch = in.readLong();
-            long seq = in.readLong();
-            positions.put(chain, new ChainPosition(new SourceOrder(epoch, seq), in.readString()));
+            SourceOrder order = in.readBoolean() ? new SourceOrder(in.readLong(), in.readLong()) : null;
+            positions.put(chain, new ChainPosition(order, in.readString()));
         }
         return positions;
     }

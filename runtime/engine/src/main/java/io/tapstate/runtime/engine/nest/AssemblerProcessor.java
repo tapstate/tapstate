@@ -1204,6 +1204,15 @@ public final class AssemblerProcessor extends AbstractProcessor {
             if (isOwedAHandOver(entry.getKey())) {
                 continue;
             }
+            // Asked before anything is read, because what ends this wait is an arrival and never this pass:
+            // the row turning up wakes the document through the drain, which is where the wait is lifted. A
+            // window that has run out is looked at again on every idle turn, so re-reading the state and the
+            // rows it names each time is one state reach per waiting document per turn, for as long as the
+            // wait lasts - and the reach for a row that is not there is a miss the layer behind the map
+            // answers every single time.
+            if (waiting.contains(entry.getKey())) {
+                continue;
+            }
             RootAssembly assembly = store.load(entry.getKey());
             Map<String, Map<Object, Map<String, Object>>> references = assembly == null
                     ? Map.of()
@@ -1218,6 +1227,10 @@ public final class AssemblerProcessor extends AbstractProcessor {
             // The same as the hold above, and for the same reason: a window running out is a clock, and a
             // clock is exactly what must not release a document that is still missing a row it names.
             if (assembly.waitsForARowItPointsAt(slots, references)) {
+                // Recorded as well as skipped, so the next turn takes the cheap exit above rather than
+                // reading the same absence again. A restart arrives here with nothing recorded, which is
+                // what this covers: the drain that first saw the wait may be on the other side of it.
+                waiting.add(entry.getKey());
                 continue;
             }
             waiting.remove(entry.getKey());
