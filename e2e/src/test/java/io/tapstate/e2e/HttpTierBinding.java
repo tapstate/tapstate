@@ -149,6 +149,15 @@ final class HttpTierBinding implements TierBinding {
     }
 
     @Override
+    public void restart(String pipelineId, boolean rereadEverything) {
+        // Exactly what the terminal composes, in the same order and with the same answer: a stop
+        // that keeps or clears, then a start. Sending the two verbs is the point -- the product has
+        // no restart to call, and a harness that pretended otherwise would be testing itself.
+        control.stop(pipelineId, rereadEverything);
+        control.lifecycle(pipelineId, LifecycleVerb.START);
+    }
+
+    @Override
     public void cdc(TableAlias table, CdcOp op, long rows) {
         Endpoint endpoint = endpoint(table);
         endpoint.driver().cdc(endpoint.address(), table.table(), op, rows);

@@ -82,6 +82,7 @@ final class FailureScene {
                 case Step.Assertion assertion -> assertion.matcher();
                 case Step.Lifecycle ignored -> null;
                 case Step.StreamLifecycle ignored -> null;
+                case Step.Composed ignored -> null;
                 case Step.Cdc ignored -> null;
             };
             if (matcher instanceof Matcher.Doc doc) {
@@ -123,6 +124,7 @@ final class FailureScene {
                 case Step.Assertion assertion -> places.addAll(tablesOf(assertion.matcher()));
                 case Step.Lifecycle ignored -> { }
                 case Step.StreamLifecycle ignored -> { }
+                case Step.Composed ignored -> { }
             }
         }
         return places;

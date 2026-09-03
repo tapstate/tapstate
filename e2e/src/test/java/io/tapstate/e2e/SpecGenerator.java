@@ -162,9 +162,13 @@ final class SpecGenerator {
         lifecycle.put("type", "string");
         lifecycle.put(
                 "description",
-                "A lifecycle verb, spelled as the product spells it. There is no rewind: re-snapshotting "
-                        + "is stop then start.");
-        lifecycle.put("enum", List.copyOf(Vocabulary.LIFECYCLE_STEPS));
+                "A step written on its own: a lifecycle verb spelled as the product spells it, or a word "
+                        + "the terminal offers that expands into several of them. There is no rewind: "
+                        + "re-snapshotting is stop then start, which is what restart --rerun does.");
+        List<String> onTheirOwn = new ArrayList<>(Vocabulary.LIFECYCLE_STEPS);
+        onTheirOwn.addAll(Vocabulary.COMPOSED_STEPS);
+        onTheirOwn.sort(String::compareTo);
+        lifecycle.put("enum", List.copyOf(onTheirOwn));
         forms.add(lifecycle);
         // Exhaustive: a keyword added to the vocabulary does not compile until its shape is here.
         for (StepKeyword keyword : StepKeyword.values()) {
@@ -418,6 +422,10 @@ final class SpecGenerator {
                     ? "A lifecycle verb. Written on its own it drives the pipeline; written with one "
                             + "source id it holds or releases that stream alone."
                     : "A lifecycle verb, driven on the pipeline. Written on its own."));
+        }
+        for (String composed : Vocabulary.COMPOSED_STEPS) {
+            steps.add(word(composed, "A word the terminal offers, driven on the pipeline. It expands "
+                    + "into the product's own verbs; the vocabulary follows what a person types."));
         }
         for (String keyword : Vocabulary.BODIED_STEPS) {
             steps.add(word(keyword, bodiedStepDescription(keyword)));

@@ -72,6 +72,16 @@ public interface TierBinding {
      */
     void driveStream(String sourceId, StreamVerb verb);
 
+    /**
+     * Cycles the pipeline the way the terminal's {@code restart} does, and says which of its two
+     * forms this is: {@code rereadEverything} is the answer its stop carries, and it is the whole
+     * difference between carrying on and reading the source again.
+     *
+     * <p>The expansion lives in the binding rather than in the executor because it is the product's,
+     * and a tier that ever offers the word directly should be free to send it as one call.
+     */
+    void restart(String pipelineId, boolean rereadEverything);
+
     /** Produces changes against a table while the pipeline runs. */
     void cdc(TableAlias table, CdcOp op, long rows);
 
