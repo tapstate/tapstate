@@ -552,6 +552,31 @@ else
   bad "native tui workspace PTY failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
 fi
 
+# The first frame is the visual contract for the modern workbench: the composer is a quiet rounded
+# input surface, its usage hint is below it, and transient scroll state never appears in that surface.
+if (( PTY_RC == 0 )) \
+   && grep -Fq '╭' <<< "$TUI_CLEAN" \
+   && grep -Fq '╰' <<< "$TUI_CLEAN" \
+   && grep -Fq 'Enter run · Type for' <<< "$TUI_CLEAN" \
+   && ! grep -Fq '[COMMAND]' <<< "$TUI_CLEAN" \
+   && ! grep -qE 'scroll [0-9]+' <<< "$TUI_CLEAN"; then
+  ok "native tui rendered the rounded composer and kept hints/scroll state out of the input"
+else
+  bad "native tui visual contract failed; output:"; echo "$TUI_CLEAN"
+fi
+
+# Picocli help is deliberately long enough to exercise the workspace viewport. The scrollbar belongs
+# to that result area, not to the command composer, and must remain a glyph rather than a status label.
+TAPSTATE_PTY_TUI=1 pty_session $'help\n\004' -w "$TUI_WORKSPACE"
+TUI_SCROLL_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
+if (( PTY_RC == 0 )) \
+   && grep -Fq '┃' <<< "$TUI_SCROLL_CLEAN" \
+   && ! grep -qE 'scroll [0-9]+' <<< "$TUI_SCROLL_CLEAN"; then
+  ok "native tui rendered a workspace scrollbar for long command output"
+else
+  bad "native tui scrollbar contract failed; output:"; echo "$TUI_SCROLL_CLEAN"
+fi
+
 # --- summary ------------------------------------------------------------------------------------
 echo
 bold "native smoke: ${PASS} passed, ${FAIL} failed"

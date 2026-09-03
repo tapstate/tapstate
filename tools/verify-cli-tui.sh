@@ -322,7 +322,7 @@ set -e
   tail -c 4000 "$cancel_output" >&2 || true
   exit 1
 }
-assert_output "$cancel_output" "command cleared" "[COMMAND] >"
+assert_output "$cancel_output" "command cleared" "Enter run · Type for suggestions"
 assert_terminal_cleanup "$cancel_output"
 
 navigation_output="$work_dir/navigation.pty"

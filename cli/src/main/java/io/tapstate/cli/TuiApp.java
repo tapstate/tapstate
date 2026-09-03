@@ -1132,7 +1132,6 @@ final class TuiApp {
         if (commandInput.isEmpty()) {
             if (uiState.resultPane() != null && !uiState.resultPane().lines().isEmpty()) {
                 workspaceScroll = Math.max(0, workspaceScroll + (key == EscapeKey.UP ? -1 : 1));
-                uiState = reduce(new TuiAction.SetNotice("scroll " + workspaceScroll));
                 return;
             }
             TuiNavigation navigation = navigation();

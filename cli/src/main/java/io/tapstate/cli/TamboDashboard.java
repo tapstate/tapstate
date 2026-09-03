@@ -9,8 +9,12 @@ import dev.tamboui.style.Overflow;
 import dev.tamboui.terminal.Frame;
 import dev.tamboui.text.Text;
 import dev.tamboui.widgets.block.Block;
+import dev.tamboui.widgets.block.BorderType;
 import dev.tamboui.widgets.block.Borders;
 import dev.tamboui.widgets.paragraph.Paragraph;
+import dev.tamboui.widgets.scrollbar.Scrollbar;
+import dev.tamboui.widgets.scrollbar.ScrollbarOrientation;
+import dev.tamboui.widgets.scrollbar.ScrollbarState;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -25,7 +29,7 @@ final class TamboDashboard {
     void render(Frame frame, TuiDashboard.State state, int workspaceScroll) {
         Rect screen = frame.area().inner(Margin.uniform(1));
         List<Rect> vertical = Layout.vertical().constraints(
-                Constraint.length(2), Constraint.fill(), Constraint.length(4)).split(screen);
+                Constraint.length(2), Constraint.fill(), Constraint.length(5)).split(screen);
         renderStatus(frame, vertical.get(0), state);
         renderWorkspace(frame, vertical.get(1), state, workspaceScroll);
         renderCommandBar(frame, vertical.get(2), state);
@@ -43,25 +47,55 @@ final class TamboDashboard {
     private void renderWorkspace(Frame frame, Rect area, TuiDashboard.State state, int workspaceScroll) {
         List<String> lines = state.prompt() != null ? promptLines(state.prompt())
                 : !state.palette().isEmpty() ? paletteLines(state, area.height()) : contentLines(state);
-        if (state.prompt() == null && state.palette().isEmpty() && state.resultPane() != null
-                && workspaceScroll > 0 && !lines.isEmpty()) {
-            int start = Math.min(workspaceScroll, lines.size() - 1);
-            lines = lines.subList(start, lines.size());
+        boolean scrollable = state.prompt() == null && state.palette().isEmpty()
+                && state.resultPane() != null && lines.size() > area.height();
+        Rect textArea = area;
+        Rect scrollbarArea = Rect.ZERO;
+        if (scrollable) {
+            List<Rect> horizontal = Layout.horizontal().constraints(
+                    Constraint.fill(), Constraint.length(1)).split(area);
+            textArea = horizontal.get(0);
+            scrollbarArea = horizontal.get(1);
+        }
+        int maxScroll = Math.max(0, lines.size() - textArea.height());
+        int scroll = Math.min(Math.max(0, workspaceScroll), maxScroll);
+        if (scroll > 0 && !lines.isEmpty()) {
+            lines = lines.subList(Math.min(scroll, lines.size() - 1), lines.size());
         }
         Paragraph.Builder paragraph = Paragraph.builder()
                 .text(Text.from(String.join("\n", lines)))
                 .overflow(Overflow.WRAP_WORD);
-        frame.renderWidget(paragraph.build(), area);
+        frame.renderWidget(paragraph.build(), textArea);
+        if (scrollable) {
+            ScrollbarState scrollbarState = new ScrollbarState()
+                    .contentLength(lines.size() + scroll)
+                    .viewportContentLength(textArea.height())
+                    .position(scroll);
+            frame.renderStatefulWidget(Scrollbar.builder()
+                    .orientation(ScrollbarOrientation.VERTICAL_RIGHT)
+                    .thumbSymbol("┃")
+                    .trackSymbol("┊")
+                    .beginSymbol("")
+                    .endSymbol("")
+                    .thumbColor(Color.LIGHT_CYAN)
+                    .trackColor(Color.DARK_GRAY)
+                    .build(), scrollbarArea, scrollbarState);
+        }
     }
 
     private void renderCommandBar(Frame frame, Rect area, TuiDashboard.State state) {
-        String line = state.prompt() == null ? state.command() + "▌"
-                : state.prompt().question() + "  " + state.prompt().input();
-        Block block = Block.builder().borders(Borders.ALL).borderColor(Color.DARK_GRAY).build();
-        frame.renderWidget(block, area);
-        frame.renderWidget(Paragraph.builder().text(Text.from(line + "\n" + commandHint(state)))
+        List<Rect> rows = Layout.vertical().constraints(Constraint.length(3), Constraint.fill()).split(area);
+        String line = state.prompt() == null ? state.command() + "▌" : state.prompt().input() + "▌";
+        Color composerBackground = Color.rgb(38, 40, 43);
+        Block block = Block.builder().borders(Borders.ALL).borderType(BorderType.ROUNDED)
+                .borderColor(Color.GRAY).background(composerBackground).build();
+        frame.renderWidget(block, rows.get(0));
+        frame.renderWidget(Paragraph.builder().text(Text.from(line))
                 .overflow(Overflow.WRAP_WORD)
-                .foreground(Color.BRIGHT_WHITE).build(), block.inner(area));
+                .foreground(Color.LIGHT_CYAN).background(composerBackground).build(), block.inner(rows.get(0)));
+        frame.renderWidget(Paragraph.builder().text(Text.from(commandHint(state, rows.get(1).width())))
+                .overflow(Overflow.WRAP_WORD)
+                .foreground(Color.GRAY).build(), rows.get(1));
     }
 
     private static List<String> contentLines(TuiDashboard.State state) {
@@ -122,12 +156,13 @@ final class TamboDashboard {
         return lines;
     }
 
-    private static String commandHint(TuiDashboard.State state) {
+    private static String commandHint(TuiDashboard.State state, int width) {
         if (state.prompt() != null) return state.prompt().hint();
-        if (state.notice() != null && !state.notice().isBlank() && !state.notice().startsWith("ready")) return state.notice();
+        String compact = "Enter run · Type for suggestions · Ctrl-P commands";
+        String full = compact + " · Esc clear · Ctrl-C cancel";
         return state.connection() == TuiDashboard.Connection.ONBOARDING || state.connection() == TuiDashboard.Connection.OFFLINE
-                ? "Local: validate, new, explain, demo · Server: connect host:port · Type for suggestions · Ctrl-P commands"
-                : "Enter run · Type for suggestions · Ctrl-P commands · Esc clear · Ctrl-C cancel";
+                ? (width >= 84 ? "Local: validate, new, explain, demo · Server: connect host:port · " + compact : compact)
+                : (width >= 84 ? full : compact);
     }
 
     private static Color connectionColor(TuiDashboard.Connection connection) {

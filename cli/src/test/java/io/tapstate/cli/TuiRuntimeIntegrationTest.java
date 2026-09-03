@@ -339,6 +339,26 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
+    void dashboardUsesAQuietRoundedComposerAndVisibleWorkspaceScrollbar() {
+        List<String> output = java.util.stream.IntStream.range(0, 12)
+                .mapToObj(index -> "line-" + index)
+                .toList();
+        TuiCommandBar.ResultPane result = TuiCommandBar.project(
+                new CommandResult(true, Cli.EXIT_OK), String.join("\n", output));
+        TuiDashboard.State state = new TuiDashboard.State(
+                Path.of("orders"), null, null, TuiDashboard.Connection.OFFLINE,
+                "scroll 3", "ls", List.of(), 0, null, null, null, null, List.of(), List.of(),
+                List.of(), null, result);
+        Buffer buffer = Buffer.empty(new Rect(0, 0, 60, 16));
+
+        new TamboDashboard().render(Frame.forTesting(buffer), state, 3);
+
+        String rendered = buffer.toAnsiStringTrimmed();
+        assertThat(rendered).contains("╭", "╮", "╰", "╯", "┃", "ls▌")
+                .doesNotContain("scroll 3");
+    }
+
+    @Test
     void dashboardRendersLiveSuggestionsAboveTheComposer() {
         TuiDashboard.State state = new TuiDashboard.State(
                 Path.of("orders"), null, null, TuiDashboard.Connection.OFFLINE,
