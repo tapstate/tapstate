@@ -97,17 +97,29 @@ public final class MigrationRunner {
             Duration lockTtl, Duration waitTimeout, Clock clock) {
         int supported = highestVersionIn(changeSets);
         SystemMetaStore meta = new SystemMetaStore(database);
-        Object stored = meta.installedVersion().orElse(null);
-        int installed = readVersion(stored);
-        if (installed == supported) {
+        if (versionOrRefuse(meta, supported) == supported) {
             return;
         }
+        bringForward(database, meta, changeSets, supported, lockTtl, waitTimeout, clock);
+    }
+
+    /**
+     * What the store is at, refusing outright when that is past what this build knows.
+     *
+     * <p>Every place that acts on the version reads it through here, the waiting loop and the run
+     * under the lock included. The member being waited for may be a later build, and the version it
+     * leaves behind is the one this member would then start against -- so a check made only before the
+     * wait is a check that did not cover the outcome it waited for.
+     */
+    private static int versionOrRefuse(SystemMetaStore meta, int supported) {
+        Object stored = meta.installedVersion().orElse(null);
+        int installed = readVersion(stored);
         if (installed > supported) {
             throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY,
                     Map.of("installed", String.valueOf(stored),
                             "supported", String.valueOf(supported)), null);
         }
-        bringForward(database, meta, changeSets, supported, lockTtl, waitTimeout, clock);
+        return installed;
     }
 
     private static int highestVersionIn(List<ChangeSet> changeSets) {
@@ -156,7 +168,7 @@ public final class MigrationRunner {
             }
             // Somebody else is doing it. Their finishing is what releases this member to start, and
             // their going quiet for longer than the lock lives is what lets this member take over.
-            if (readVersion(meta.installedVersion().orElse(null)) >= supported) {
+            if (versionOrRefuse(meta, supported) == supported) {
                 return;
             }
             if (!clock.instant().isBefore(deadline)) {
@@ -180,9 +192,21 @@ public final class MigrationRunner {
             thread.setDaemon(true);
             return thread;
         })) {
-            heartbeat.scheduleAtFixedRate(() -> meta.heartbeat(epoch, Instant.now()),
-                    HEARTBEAT_INTERVAL.toMillis(), HEARTBEAT_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
-            int installed = readVersion(meta.installedVersion().orElse(null));
+            // A beat that throws must not take the schedule with it: scheduleAtFixedRate suppresses
+            // every later execution of a task that threw, so one transient write failure would end the
+            // heartbeat silently, let the lock go stale, and hand the store to another member while
+            // this one is still changing it. Losing a beat is survivable; losing all of them is not.
+            heartbeat.scheduleAtFixedRate(() -> {
+                try {
+                    meta.heartbeat(epoch, Instant.now());
+                } catch (RuntimeException beatFailed) {
+                    LOG.warn("system data migration heartbeat failed; the lock is held until it lands "
+                            + "again or goes stale", beatFailed);
+                }
+            }, HEARTBEAT_INTERVAL.toMillis(), HEARTBEAT_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+            // Re-read under the lock, and refuse the same way: the member that just released it may
+            // have been a later build that moved the store past this one.
+            int installed = versionOrRefuse(meta, highestVersionIn(changeSets));
             for (ChangeSet changeSet : changeSets) {
                 if (changeSet.version() <= installed) {
                     continue;

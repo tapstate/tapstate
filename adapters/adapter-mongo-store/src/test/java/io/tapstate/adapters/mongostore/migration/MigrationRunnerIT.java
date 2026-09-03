@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -210,6 +211,42 @@ class MigrationRunnerIT {
     }
 
     @Test
+    void aMemberThatWaitedWhileALaterBuildMigratedRefusesRatherThanStarting() throws InterruptedException {
+        // The rolling upgrade this gate exists for. This member checked the version before it waited,
+        // and the version it checked is not the version it would start against: the member it waited
+        // for was a later build, and what it left behind is past what this one can read. Reading "at
+        // least what I need" there is how an old binary opens a store it does not understand.
+        MongoDatabase database = freshDatabase("runner_waits_past");
+        seedSchemaDocument(database, 0, lock("later-build@host", 4L, Instant.now(), Instant.now()));
+
+        CompletableFuture<Void> waiting = CompletableFuture.runAsync(() ->
+                MigrationRunner.migrate(database, List.of(counting(1, new AtomicInteger())),
+                        LOCK_TTL, PATIENT, CLOCK));
+
+        // The version has to move while this member is already waiting, and the two threads have no
+        // signal to order them by: the wait writes nothing, so there is nothing to observe it from.
+        // Hence the pause -- and then the assertion that turns it from a hope into a checked
+        // precondition. If the version had moved before the member read it, the refusal would have
+        // come from the check before the wait, this future would already be done, and the test would
+        // pass without the waiting loop ever deciding anything. Measured: with that assertion absent
+        // and the waiting loop's refusal reverted, this case still passed.
+        Thread.sleep(Duration.ofMillis(800));
+        assertThat(waiting).as("it must still be waiting, or this proves nothing about the wait").isNotDone();
+
+        schemaDocuments(database).updateOne(SCHEMA_ID,
+                new Document("$set", new Document("installedVersion", 7)));
+
+        // join() rather than a timed assertion on the future: without the refusal this member simply
+        // returns, so the failure to catch is a value rather than a hang.
+        CompletionException failure = catchThrowableOfType(waiting::join, CompletionException.class);
+        assertThat(failure).as("it started against a store seven versions past what it can read").isNotNull();
+        assertThat(failure.getCause()).isInstanceOf(TapstateException.class);
+        TapstateException refusal = (TapstateException) failure.getCause();
+        assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
+        assertThat(refusal.args()).containsEntry("installed", "7").containsEntry("supported", "1");
+    }
+
+    @Test
     void theEpochKeepsCountingAcrossHoldersRatherThanRestarting() {
         // The epoch is what refuses a write from a member that has been taken over, so two different
         // holders must never work under the same number. Giving a lock up is the case that can quietly
@@ -263,7 +300,7 @@ class MigrationRunnerIT {
         assertThat(refusal).isNotNull();
         // The driver's own failure names one colliding value and stops, which leaves an operator
         // finding the rest one restart at a time.
-        assertThat(refusal).hasMessageContaining("1 duplicated value(s)").hasMessageContaining("same");
+        assertThat(refusal).hasMessageContaining("duplicated values").hasMessageContaining("same");
         assertThat(indexNames(database, SystemCollections.SESSIONS)).containsExactly("_id_");
     }
 

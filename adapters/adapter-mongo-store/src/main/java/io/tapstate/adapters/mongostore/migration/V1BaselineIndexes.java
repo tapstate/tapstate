@@ -114,9 +114,12 @@ public final class V1BaselineIndexes implements ChangeSet {
             // Thrown bare: the runner turns whatever a changeset throws into the coded failure that
             // names the changeset, so raising a coded one here would only decide which of two codes
             // an operator sees for the same event.
+            // No count is claimed: the sample is taken with a limit, so the number collected is the
+            // limit long before it is the number of duplicates, and reporting it as one would tell an
+            // operator there are five of something there may be thousands of.
             throw new IllegalStateException("cannot build unique index " + index.indexName() + " on "
-                    + collection.getNamespace().getCollectionName() + ": "
-                    + colliding.size() + " duplicated value(s), for example "
+                    + collection.getNamespace().getCollectionName()
+                    + ": duplicated values, up to " + DUPLICATE_SAMPLE_LIMIT + " of them shown: "
                     + colliding.stream().map(document -> String.valueOf(document.get("_id"))).toList());
         }
     }
