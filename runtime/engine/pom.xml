@@ -30,21 +30,19 @@
     <!-- The carrier-agnostic plan a join declaration compiles to, and the evaluation of the
          expressions its output columns are written from. Core ring, so rule R4 admits it.
 
-         The SQL library that produced the plan is excluded wholesale, and that is the point of
-         declaring the exclusions rather than taking the closure: nothing in this module names one of
-         its types, an arch-test holds the plan's own signatures to the same line, and a closure on the
-         classpath is how something would quietly start to. Excluded here, a reference to one of those
-         types does not compile. -->
+         No exclusions, and that is deliberate. Excluding the SQL library here reads like tightening
+         the ring - nothing in this module names one of its types - but a Maven exclusion applies to
+         everything downstream of this path, and this is the path the assembly root reaches core-sql
+         by. Measured: with the exclusions, zero of that library's artifacts were on the assembly
+         root's classpath; without them, three. The offline gate that refuses join SQL this release
+         cannot run is parsed there, so the exclusion turned it into a link error on the first
+         pipeline carrying a join - and the whole build stayed green, because nothing runs that gate
+         on the assembled classpath. What actually keeps this module from naming those types is the
+         package-level R4 rule, which is checked rather than assumed. -->
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-sql</artifactId>
       <version>${revision}</version>
-      <exclusions>
-        <exclusion><groupId>org.apache.calcite</groupId><artifactId>*</artifactId></exclusion>
-        <exclusion><groupId>org.apache.calcite.avatica</groupId><artifactId>*</artifactId></exclusion>
-        <exclusion><groupId>org.apache.commons</groupId><artifactId>commons-math3</artifactId></exclusion>
-        <exclusion><groupId>com.google.guava</groupId><artifactId>guava</artifactId></exclusion>
-      </exclusions>
     </dependency>
 
     <!-- The stateless transform seam the runtime adapter wraps; brings the event envelope currency

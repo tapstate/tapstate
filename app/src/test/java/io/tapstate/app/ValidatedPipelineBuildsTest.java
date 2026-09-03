@@ -209,6 +209,44 @@ class ValidatedPipelineBuildsTest {
     // ---- fixtures ----------------------------------------------------------------------
 
     /** Parses and validates through the product's own gate, then stores what it accepted. */
+    /**
+     * A pipeline whose join SQL this release cannot run. The refusal happens while the artifact is
+     * read, which is the whole point of it: the shapes it names run silently wrong rather than
+     * failing, so the check has to sit in the offline path.
+     *
+     * <p><b>What this case is really about is that the check runs at all, here.</b> It is written in
+     * one core module against a SQL library, and whether that library reaches the assembly root is a
+     * property of the dependency graph rather than of any code. Measured: one exclusion on the path
+     * this module reaches that library by took every one of its artifacts off this classpath, and the
+     * whole build stayed green - because nothing else parses a join step from here. A missing library
+     * makes this case fail to link rather than refuse, which is a different failure and a loud one.
+     */
+    @Test
+    void aJoinShapeThisReleaseCannotRunIsRefusedWhileTheArtifactIsRead() {
+        assertThatThrownBy(() -> new DslParser().parse(UNRUNNABLE_JOIN_PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("FULL OUTER JOIN");
+    }
+
+    /** The same shape the validator's own corpus refuses, addressed the way an author writes it. */
+    private static final String UNRUNNABLE_JOIN_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: wide
+            source: [ orders_src, items_src ]
+            transforms:
+              - id: widen
+                type: join
+                from: { o: orders, i: order_items }
+                engine: builtin
+                sql: |
+                  SELECT o.id AS order_id, i.id AS item_id
+                  FROM o FULL OUTER JOIN i ON i.order_id = o.id
+            serve:
+              from: widen
+              sync: [ { id: sync_1, source: orders_dest } ]
+            """;
+
     private static InMemoryStorePort validated(String... documents) {
         DslParser parser = new DslParser();
         List<Resource> resources = new ArrayList<>();
