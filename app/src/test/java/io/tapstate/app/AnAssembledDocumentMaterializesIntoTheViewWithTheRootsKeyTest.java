@@ -8,6 +8,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -162,7 +163,7 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
         // A view and no serve block: declaring the view is the whole instruction to materialize.
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
                 List.of(step),
                 new ViewBlock.Inline(VIEW, FromRef.literal(STEP), "id", null, null),
                 null,

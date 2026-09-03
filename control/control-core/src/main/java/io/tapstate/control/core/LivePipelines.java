@@ -7,10 +7,14 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.StateStore;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -67,6 +71,54 @@ public final class LivePipelines {
     /** Where the pipeline has been asked to be. A pipeline with no intent has been asked for nothing. */
     public PipelineState intentOf(String pipelineId) {
         return desired.read(pipelineId).map(DesiredState::targetState).orElse(PipelineState.NEW);
+    }
+
+    /**
+     * Refuses a change to a pipeline's own srs switches while that pipeline is still up.
+     *
+     * <p>The peer of {@link #refuseBufferingChangeWhileLive}, for the half of the same decision that
+     * moved onto the pipeline. The reasoning is the reasoning there -- the switch decides how a run is
+     * assembled, a run is assembled once at start, so an edit under a live pipeline changes nothing now
+     * and everything at the next start, with nothing to report the disagreement in between. What is new
+     * is that guarding only the source side would now leave the whole thing open: the switch the capture
+     * path actually reads is this one.
+     *
+     * <p>Only a switch that was already recorded and now differs counts. A reference gaining its first
+     * recorded value is materialization, not an edit -- it is how the value got there at all -- and a
+     * reference the pipeline did not have before is a new source, which start-time assembly picks up
+     * anyway.
+     */
+    public void refuseBufferingChangeWhileLive(PipelineResource stored, PipelineResource replacement) {
+        Objects.requireNonNull(replacement, "replacement");
+        if (stored == null || isAtRest(replacement.id())) {
+            return;
+        }
+        Map<String, Boolean> before = recordedSwitches(stored);
+        List<String> moved = new ArrayList<>();
+        for (Map.Entry<String, Boolean> after : recordedSwitches(replacement).entrySet()) {
+            Boolean was = before.get(after.getKey());
+            if (was != null && !was.equals(after.getValue())) {
+                moved.add(after.getKey());
+            }
+        }
+        if (!moved.isEmpty()) {
+            Collections.sort(moved);
+            throw new TapstateException(
+                    SourceError.SRS_CHANGE_WHILE_RUNNING,
+                    Map.of("id", moved.get(0), "pipelines", List.of(replacement.id())),
+                    null);
+        }
+    }
+
+    /** The switches this pipeline has recorded, by source id; references carrying none are absent. */
+    private static Map<String, Boolean> recordedSwitches(PipelineResource pipeline) {
+        Map<String, Boolean> switches = new LinkedHashMap<>();
+        for (SourceRef ref : pipeline.sources()) {
+            if (ref instanceof SourceRef.Spec spec) {
+                switches.put(spec.id(), spec.srs());
+            }
+        }
+        return switches;
     }
 
     /**

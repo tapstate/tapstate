@@ -132,6 +132,79 @@ class ApplyServiceTest {
     /** The same source with the buffering turned off -- the one field the guard watches. */
     private static final String UNBUFFERED_SRC = BUFFERED_SRC.replace("enabled: true", "enabled: false");
 
+    /**
+     * The peer of the two cases above, for the half of the same switch that lives on the pipeline.
+     *
+     * <p>Guarding only the source side would now be a guard in name: after the switch moved, the value
+     * the capture path actually reads is the pipeline's own, so an author who edits it there reaches
+     * exactly the state the source-side refusal exists to prevent, by the shorter route.
+     */
+    @Test
+    void applyRefusesToChangeAPipelinesOwnBufferingSwitchWhileThatPipelineIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatThrownBy(() -> guarded.apply(
+                "author", List.of(draft(BUFFERED_SRC), draft(PINNED_OFF_PIPELINE))))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    /** And it lands once that pipeline is stopped -- the refusal is about timing, not about the edit. */
+    @Test
+    void theSameEditToAPipelinesOwnSwitchLandsOnceItIsStopped() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.STOPPED);
+
+        guarded.apply("author", List.of(draft(BUFFERED_SRC), draft(PINNED_OFF_PIPELINE)));
+
+        assertThat(stored("p1")).contains("srs: false");
+    }
+
+    /**
+     * A live pipeline whose switch did not move is left alone. Without this, the guard could be
+     * satisfied by refusing every edit to a running pipeline, which is a different rule and one this
+     * layer does not make.
+     */
+    @Test
+    void aLivePipelineEditedAnywhereElseIsNotRefused() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatCode(() -> guarded.apply("author", List.of(
+                draft(BUFFERED_SRC), draft(READER_PIPELINE.replace("op != 'd'", "op != 'u'")))))
+                .doesNotThrowAnyException();
+    }
+
+    /**
+     * Recording a switch for the first time is materialization, not an edit: it is how the value gets
+     * onto the artifact at all, so a pipeline that is already up must not be refused for it. This is the
+     * case a guard written as "the stored and incoming switches differ" gets wrong, because before the
+     * first apply the stored one is absent rather than equal.
+     */
+    @Test
+    void aFirstRecordingOnALivePipelineIsNotRefused() {
+        // Land a pipeline with no switch recorded at all, the way one stored before this field existed
+        // reads, then bring it up and re-apply the same text.
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        store.landDirectly(new DslParser().parse(READER_PIPELINE));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatCode(() -> guarded.apply(
+                "author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE))))
+                .doesNotThrowAnyException();
+    }
+
+    private ApplyService guardedWith(PipelineState state) {
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", state);
+        actual.put("p1", state);
+        return new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+    }
+
     /** A pipeline reading that source, in the minimal valid shape. */
     private static final String READER_PIPELINE = """
             version: tapstate/v1
@@ -151,6 +224,10 @@ class ApplyServiceTest {
                 warm:
                   collection: orders_view
             """;
+
+    /** The same pipeline with its own switch for that source written off. */
+    private static final String PINNED_OFF_PIPELINE =
+            READER_PIPELINE.replace("source: orders_src", "source: [ { id: orders_src, srs: false } ]");
 
     private static ArtifactDraft draft(String content) {
         return new ArtifactDraft(null, content);

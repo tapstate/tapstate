@@ -17,6 +17,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -255,7 +256,7 @@ class NestOverTwoSourcesDataFlowTest {
         aliases.put("i", FromRef.literal(CHILD_TABLE));
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
                 List.of(step), null,
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),

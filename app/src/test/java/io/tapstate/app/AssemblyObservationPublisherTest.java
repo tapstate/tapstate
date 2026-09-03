@@ -13,6 +13,7 @@ import com.hazelcast.jet.JetService;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
@@ -44,7 +45,7 @@ class AssemblyObservationPublisherTest {
                 SourceMode.CDC, List.of(TableRef.literal(TABLE)), null, null, null);
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source);
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("orders_src"), null, null, null, null, null));
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("orders_src", true)), null, null, null, null, null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         String chain = SourceCaptureResolution.of(source).chainId().value();
         store.meta().create(chain, null);

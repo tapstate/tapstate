@@ -220,15 +220,15 @@
           "$ref": "#/$defs/Metadata"
         },
         "source": {
-          "description": "Ids of pre-created sources this pipeline reads from; at least one is required.",
+          "description": "The sources this pipeline reads from; at least one is required. Each is a bare source id, or an object carrying this pipeline's own srs switch for that source.",
           "oneOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/SourceRef"
             },
             {
               "type": "array",
               "items": {
-                "type": "string"
+                "$ref": "#/$defs/SourceRef"
               }
             }
           ]
@@ -621,6 +621,36 @@
           "description": "Pull from an API or SaaS endpoint."
         }
       ]
+    },
+    "SourceRef": {
+      "description": "A source this pipeline reads from: a bare source id, or an object carrying its srs switch.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/SourceRef.Spec"
+        }
+      ]
+    },
+    "SourceRef.Spec": {
+      "type": "object",
+      "description": "A source reference carrying this pipeline's own srs switch for that source.",
+      "properties": {
+        "id": {
+          "description": "Id of the source this pipeline reads from.",
+          "type": "string"
+        },
+        "srs": {
+          "description": "Whether this pipeline reads that source through the shared replay store. Materialized from the source on first apply, and only follows this file after.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "srs"
+      ],
+      "additionalProperties": false
     },
     "SourceResource": {
       "type": "object",

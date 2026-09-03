@@ -17,6 +17,7 @@ import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
@@ -79,11 +80,7 @@ public final class CanonicalWriter {
     private Node.MapN pipeline(PipelineResource p) {
         B b = new B();
         header(b, p);
-        if (p.sources().size() == 1) {
-            b.scalar("source", p.sources().get(0));
-        } else {
-            b.scalarSeq("source", p.sources());
-        }
+        b.put("source", sources(p.sources()));
         if (p.transforms() != null) {
             List<Node> steps = new ArrayList<>();
             for (Step st : p.transforms()) {
@@ -165,6 +162,29 @@ public final class CanonicalWriter {
                     e.expression("filter", sp.filter());
                     e.scalarSeq("pk", sp.pk());
                     e.freeMap("options", sp.options());
+                    items.add(e.build());
+                }
+            }
+        }
+        return new Node.SeqN(items);
+    }
+
+    private Node sources(List<SourceRef> refs) {
+        // X13: one source carrying no switch of its own is a bare scalar; every other shape is a
+        // list, in which a reference carrying no switch is still a bare string. The switch itself is
+        // never omitted when present -- reading it back as absent would mean "take the source's
+        // value", which is the link this field exists to cut.
+        if (refs.size() == 1 && refs.get(0) instanceof SourceRef.Bare only) {
+            return scalar(only.id());
+        }
+        List<Node> items = new ArrayList<>();
+        for (SourceRef ref : refs) {
+            switch (ref) {
+                case SourceRef.Bare bare -> items.add(scalar(bare.id()));
+                case SourceRef.Spec spec -> {
+                    B e = new B();
+                    e.scalar("id", spec.id());
+                    e.scalar("srs", spec.srs());
                     items.add(e.build());
                 }
             }

@@ -23,6 +23,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -83,7 +84,7 @@ class PipelineDagBuilderAckTest {
         SinkAckFactory sinkAck = m -> (SinkAck) m.getUserContext().get(ACK_KEY);
 
         PipelineResource pipeline = new PipelineResource(
-                "p", null, List.of("orders_src"), null, null,
+                "p", null, List.of(SourceRef.bare("orders_src")), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("orders_src"),
                         List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)), null, null),
                 null, null);

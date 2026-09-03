@@ -66,17 +66,43 @@ class ArtifactQueryServiceTest {
     @Test
     void appliedArtifactsReadBackByteStableAsTheOfflineCanonical() {
         // The core golden: the online read path (apply -> store -> get) reproduces the offline canonical
-        // form byte-for-byte across kinds — source and pipeline here — using the one CanonicalWriter the
-        // authoring corpus golden locks. No second baseline is checked in on the online side: forking the
-        // canonical form here is exactly the drift this guards, so the expectation is the offline contract.
+        // form byte-for-byte, using the one CanonicalWriter the authoring corpus golden locks. No second
+        // baseline is checked in on the online side: forking the canonical form here is exactly the drift
+        // this guards, so the expectation is the offline contract.
         apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
 
         assertThat(query.get("src_ora")).get().extracting(StoredArtifact::canonicalForm)
                 .isEqualTo(offlineCanonical(SRC_ORA));
         assertThat(query.get("tgt_my")).get().extracting(StoredArtifact::canonicalForm)
                 .isEqualTo(offlineCanonical(TGT_MY));
-        assertThat(query.get("ora2my_ods")).get().extracting(StoredArtifact::canonicalForm)
-                .isEqualTo(offlineCanonical(PIPELINE));
+    }
+
+    /**
+     * A pipeline is the one kind whose stored form is not the offline canonical of the text that was
+     * applied, and the difference is deliberate: apply records this pipeline's own srs switch for each
+     * source it reads, which the author's text does not carry.
+     *
+     * <p>So the equality is asserted where it still means what it was written to mean. "The online path
+     * did not fork the canonical form" reduces, once the two inputs legitimately differ, to: the stored
+     * text is a fixed point of the offline writer. A second writer would have to agree with the first
+     * byte-for-byte on its own output to pass this, which is the drift the original case guarded.
+     *
+     * <p>The second assertion is what keeps the first from passing vacuously -- were materialization
+     * dropped, the fixed point would still hold and only this would notice.
+     */
+    @Test
+    void aPipelinesStoredFormIsTheOfflineCanonicalPlusTheSwitchesApplyRecorded() {
+        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
+
+        String stored = query.get("ora2my_ods").orElseThrow().canonicalForm();
+
+        assertThat(offlineCanonical(stored))
+                .as("the online path writes what the offline writer writes for the same artifact")
+                .isEqualTo(stored);
+        assertThat(stored)
+                .as("and it differs from the author's text by exactly the recorded switch")
+                .isNotEqualTo(offlineCanonical(PIPELINE))
+                .contains("srs:");
     }
 
     @Test

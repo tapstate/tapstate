@@ -55,6 +55,7 @@ import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
@@ -890,7 +891,7 @@ class PipelineApiTest {
 
             @Override
             public Optional<Resource> get(String id) {
-                return Optional.of(new PipelineResource(id, null, List.of("src_x"), null, null, null, null, null));
+                return Optional.of(new PipelineResource(id, null, List.of(SourceRef.bare("src_x")), null, null, null, null, null));
             }
 
             @Override

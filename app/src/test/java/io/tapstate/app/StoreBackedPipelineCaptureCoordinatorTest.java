@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
 
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.ReadMode;
@@ -51,7 +52,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest");
 
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                "pipe-1", settings, source, SourceCaptureResolution.of(source));
+                "pipe-1", settings, source, SourceCaptureResolution.of(source), true);
 
         assertThat(spec.pipelineId()).isEqualTo("pipe-1");
         assertThat(spec.sourceId()).isEqualTo("orders_src");
@@ -59,7 +60,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(spec.config().streams()).containsExactly("orders");
         assertThat(spec.readMode()).isEqualTo(ReadMode.CDC_ONLY);
         assertThat(spec.srsKey()).isNull();
-        assertThat(spec.srsEnabled()).as("srs defaults on when the source declares no srs block").isTrue();
+        assertThat(spec.srsEnabled()).as("the switch this pipeline recorded is carried through").isTrue();
         assertThat(spec.startFrom()).isEqualTo(io.tapstate.runtime.srs.StartFrom.earliest());
         assertThat(spec.schemaVer()).isZero();
     }
@@ -82,7 +83,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest");
 
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                "pipe-1", settings, source, SourceCaptureResolution.of(source));
+                "pipe-1", settings, source, SourceCaptureResolution.of(source), true);
 
         assertThat(spec.getClass().getRecordComponents())
                 .extracting(java.lang.reflect.RecordComponent::getType)
@@ -91,16 +92,17 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
-    void aSourceWithSrsDisabledDerivesTheDirectTailAndAnExplicitKeyIsCarried() {
+    void aPipelineWhoseSwitchIsOffDerivesTheDirectTailAndAnExplicitKeyIsStillCarried() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null,
                 new Srs("shared-key", null, null, null, false), null);
 
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                "pipe-1", null, source, SourceCaptureResolution.of(source));
+                "pipe-1", null, source, SourceCaptureResolution.of(source), false);
 
-        assertThat(spec.srsEnabled()).as("srs.enabled:false is honoured").isFalse();
-        assertThat(spec.srsKey()).isEqualTo("shared-key");
+        assertThat(spec.srsEnabled()).as("the off switch is honoured").isFalse();
+        assertThat(spec.srsKey()).as("the key is the chain's identity, not the switch, so it is carried either way")
+                .isEqualTo("shared-key");
         assertThat(spec.readMode()).as("null settings default the read mode").isEqualTo(ReadMode.SNAPSHOT_AND_CDC);
         assertThat(spec.startFrom()).as("null settings default the start position to latest")
                 .isEqualTo(io.tapstate.runtime.srs.StartFrom.latest());
@@ -124,13 +126,13 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         SourceResource source = cdcSource("orders_src", "orders", null);
 
         CaptureRunSpec noSettings = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                "pipe-1", null, source, SourceCaptureResolution.of(source));
+                "pipe-1", null, source, SourceCaptureResolution.of(source), true);
         CaptureRunSpec settingsWithoutOne = StoreBackedPipelineCaptureCoordinator.deriveSpec(
                 "pipe-1", new Settings(null, null, null, null, ReadMode.CDC_ONLY, null),
-                source, SourceCaptureResolution.of(source));
+                source, SourceCaptureResolution.of(source), true);
         CaptureRunSpec authorAskedForEarliest = StoreBackedPipelineCaptureCoordinator.deriveSpec(
                 "pipe-1", new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"),
-                source, SourceCaptureResolution.of(source));
+                source, SourceCaptureResolution.of(source), true);
 
         assertThat(noSettings.startFrom()).as("no settings at all")
                 .isEqualTo(io.tapstate.runtime.srs.StartFrom.latest());
@@ -169,13 +171,14 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(buffered.srsEnabled()).as("the two sources really do take different paths").isTrue();
         assertThat(direct.srsEnabled()).isFalse();
 
-        for (SourceResource source : List.of(buffered, direct)) {
+        for (boolean srsEnabled : List.of(true, false)) {
+            SourceResource source = srsEnabled ? buffered : direct;
             // The description goes on the call, not after it: a .as() chained onto the returned assertion
             // never reaches the "no throwable was raised" failure, which is precisely the failure this
             // case exists to produce -- and without it the report cannot say which of the two paths broke.
             assertThatThrownBy(() -> StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                            "pipe-1", settings, source, SourceCaptureResolution.of(source)),
-                    "srs enabled: %s", source.srsEnabled())
+                            "pipe-1", settings, source, SourceCaptureResolution.of(source), srsEnabled),
+                    "srs enabled: %s", srsEnabled)
                     .isInstanceOf(TapstateException.class)
                     .satisfies(e -> {
                         TapstateException refused = (TapstateException) e;
@@ -183,6 +186,68 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                         assertThat(refused.args()).containsEntry("value", binlogCoordinate);
                     });
         }
+    }
+
+
+    /**
+     * The whole point of moving the switch: the source says buffered, this pipeline recorded direct, and
+     * the run it derives is direct. Reading the source here -- even as a fallback -- puts back the
+     * coupling where editing one source re-routed every pipeline reading it.
+     */
+    @Test
+    void thePipelinesOwnSwitchDecidesEvenWhereTheSourceDisagrees() {
+        SourceResource buffered = cdcSource("orders_src", "orders", null);
+        assertThat(buffered.srsEnabled()).as("the source itself says buffered").isTrue();
+
+        CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, buffered, SourceCaptureResolution.of(buffered), false);
+
+        assertThat(spec.srsEnabled())
+                .as("the pipeline recorded off, so it reads direct however the source is configured")
+                .isFalse();
+    }
+
+    /** And the mirror, so neither direction is satisfied by an implementation that answers a constant. */
+    @Test
+    void thePipelinesOwnSwitchDecidesInTheOtherDirectionToo() {
+        SourceResource direct = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null,
+                new Srs(null, null, null, null, false), null);
+        assertThat(direct.srsEnabled()).as("the source itself says direct").isFalse();
+
+        CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, direct, SourceCaptureResolution.of(direct), true);
+
+        assertThat(spec.srsEnabled()).isTrue();
+    }
+
+    /**
+     * A stored pipeline carries a recorded switch on every reference -- apply puts one there. One that
+     * does not has never been through apply, so starting it is refused loudly rather than run on a guess.
+     *
+     * <p>Guessing is the failure worth preventing: the pipeline would come up, report healthy, and read
+     * through the other path, which is the same silent shape this line exists to close. The refusal names
+     * both halves, so a reader is told which reference is missing it rather than that something is.
+     */
+    @Test
+    void aReferenceWithNoRecordedSwitchIsRefusedRatherThanRunOnAGuess() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src")), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"),
+                        List.of(new SyncElement("sync_1", "orders_src", null, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        CaptureStarter starter = (spec, passthrough) -> {
+            throw new AssertionError("capture must not start: no switch was ever recorded");
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer());
+
+        assertThatThrownBy(() -> coordinator.startCapture("p"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("'p'")
+                .hasMessageContaining("'orders_src'");
     }
 
     // ---- handle lifecycle ------------------------------------------------------------------------
@@ -407,7 +472,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("src_a", "orders", null));
         artifacts.save(cdcSource("src_b", "orders", null));
-        artifacts.save(new PipelineResource("p", null, List.of("src_a", "src_b"), null, null,
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("src_a"),
                         List.of(new SyncElement("sync_1", "src_a", null, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
@@ -571,7 +636,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         artifacts.save(cdcSource("src_b", "customers", null));
         artifacts.save(new SourceResource("src_c", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, null, null, null, null));
-        artifacts.save(new PipelineResource("p", null, List.of("src_a", "src_b", "src_c"), null, null,
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true), SourceRef.spec("src_c", true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("src_a"),
                         List.of(new SyncElement("sync_1", "src_a", null, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
@@ -618,14 +683,14 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     private static PipelineResource pipelineWithReadMode(String id, String sourceId, ReadMode readMode) {
-        return new PipelineResource(id, null, List.of(sourceId), null, null,
+        return new PipelineResource(id, null, List.of(SourceRef.spec(sourceId, true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal(sourceId),
                         List.of(new SyncElement("sync_1", sourceId, null, null, null, null)), null, null),
                 new Settings(null, null, null, null, readMode, "earliest"), null);
     }
 
     private static PipelineResource twoSourcePipeline(String id, String sourceA, String sourceB) {
-        return new PipelineResource(id, null, List.of(sourceA, sourceB), null, null,
+        return new PipelineResource(id, null, List.of(SourceRef.spec(sourceA, true), SourceRef.spec(sourceB, true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal(sourceA),
                         List.of(new SyncElement("sync_1", sourceA, null, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);

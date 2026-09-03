@@ -1,0 +1,13 @@
+version: tapstate/v1
+kind: pipeline
+id: ord_direct
+source:
+  - id: src_ord
+    srs: false
+view:
+  id: ord_direct
+  from: orders
+  primary_key: id
+  storage:
+    warm:
+      collection: ord_direct

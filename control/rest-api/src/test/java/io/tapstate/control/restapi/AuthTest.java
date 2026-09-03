@@ -53,6 +53,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.messages.MessageCatalog;
 import io.tapstate.spi.store.ArtifactStore;
@@ -1021,7 +1022,7 @@ class AuthTest {
 
             @Override
             public Optional<Resource> get(String id) {
-                return Optional.of(new PipelineResource(id, null, List.of("src_x"), null, null, null, null, null));
+                return Optional.of(new PipelineResource(id, null, List.of(SourceRef.bare("src_x")), null, null, null, null, null));
             }
 
             @Override

@@ -6,6 +6,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -188,7 +189,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         }
 
         private static PipelineResource pipeline(String id) {
-            return new PipelineResource(id, null, List.of("orders_src"), null, null,
+            return new PipelineResource(id, null, List.of(SourceRef.spec("orders_src", true)), null, null,
                     new ServeBlock.Inline(null, FromRef.literal("orders_src"),
                             List.of(new SyncElement("sync_1", "orders_src", null, null, null, null)), null, null),
                     new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);

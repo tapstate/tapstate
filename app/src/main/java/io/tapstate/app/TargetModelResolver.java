@@ -42,7 +42,7 @@ final class TargetModelResolver {
     /** Resolves one target model per selected source table, preserving source and discovery order. */
     Map<String, TargetTable> resolveAll(PipelineResource pipeline) {
         Map<String, TargetTable> targets = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
             SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
             for (String table : resolution.tables()) {

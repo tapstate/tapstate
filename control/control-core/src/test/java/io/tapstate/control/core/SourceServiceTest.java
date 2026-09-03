@@ -6,6 +6,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.model.Metadata;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -350,7 +351,7 @@ class SourceServiceTest {
     }
 
     private static PipelineResource pipeline(String id, String sourceId) {
-        return new PipelineResource(id, null, List.of(sourceId), null, null, null, null, null);
+        return new PipelineResource(id, null, List.of(SourceRef.bare(sourceId)), null, null, null, null, null);
     }
 
     private static PipelineResource validShapePipeline(String id, String sourceId) {

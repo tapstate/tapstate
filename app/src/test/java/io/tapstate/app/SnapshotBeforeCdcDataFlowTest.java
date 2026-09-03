@@ -13,6 +13,7 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -117,7 +118,7 @@ class SnapshotBeforeCdcDataFlowTest {
         artifacts.save(new SourceResource(SOURCE_ID, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(TABLE)), null, null, null));
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SOURCE_ID),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE_ID, true)),
                 List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
                         new TransformBody.Filter("true"), null, null)),
                 null,

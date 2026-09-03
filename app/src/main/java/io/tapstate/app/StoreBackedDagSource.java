@@ -234,7 +234,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline) {
         Map<String, SourceVertex> vertices = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
             SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
             for (String table : resolution.tables()) {
@@ -338,7 +338,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private Map<String, String> chainIdByTable(PipelineResource pipeline) {
         Map<String, String> chainIdByTable = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
             SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
             for (String table : resolution.tables()) {

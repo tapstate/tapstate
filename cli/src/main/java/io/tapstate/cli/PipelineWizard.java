@@ -2,6 +2,7 @@ package io.tapstate.cli;
 
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.QueryElement;
@@ -74,7 +75,7 @@ final class PipelineWizard {
         ViewBlock view = askView(output, servePlan, reservedIds(transforms, servePlan));
         FromRef serveFrom = view != null ? FromRef.literal(viewId(view)) : output;
         ServeBlock serve = buildServe(servePlan, serveFrom);
-        return new PipelineResource(id, null, List.of(source),
+        return new PipelineResource(id, null, List.of(SourceRef.bare(source)),
                 transforms.isEmpty() ? null : transforms, view, serve, null, null);
     }
 

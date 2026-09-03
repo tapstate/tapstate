@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameCase;
 import io.tapstate.core.model.RenameSpec;
@@ -100,7 +101,7 @@ class RenameRulesTest {
         batch.add(new SourceResource("src", null, "mysql", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.regex(".*")), null, null, null));
         batch.add(new SourceResource("tgt", null, "mysql", Map.of("host", "h"), null, null, null, null, null));
-        batch.add(new PipelineResource("p", null, List.of("src"), null, null,
+        batch.add(new PipelineResource("p", null, List.of(SourceRef.bare("src")), null, null,
                 new ServeBlock.Inline(null, FromRef.regex(".*"),
                         List.of(new SyncElement("a", "tgt", null, rename(null, RenameCase.CAMEL, null, null),
                                 null, null)),
@@ -129,7 +130,7 @@ class RenameRulesTest {
         for (String target : targets) {
             batch.add(new SourceResource(target, null, "mysql", Map.of("host", "h"), null, null, null, null, null));
         }
-        batch.add(new PipelineResource("p", null, List.of("src"), null, null,
+        batch.add(new PipelineResource("p", null, List.of(SourceRef.bare("src")), null, null,
                 new ServeBlock.Inline(null, FromRef.regex(".*"), sync, null, null), null, null));
         return batch;
     }

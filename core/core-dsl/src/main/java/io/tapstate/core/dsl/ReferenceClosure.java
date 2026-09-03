@@ -68,7 +68,7 @@ final class ReferenceClosure {
         }
         checkInternalIds(p);
         // source: id references must name kind: source resources in the batch.
-        for (String sid : p.sources()) {
+        for (String sid : p.sourceIds()) {
             if (!sources.containsKey(sid)) {
                 throw missing("source", sid);
             }
@@ -162,7 +162,7 @@ final class ReferenceClosure {
         if (p.transforms() == null) {
             return;
         }
-        Set<String> sourceIds = new LinkedHashSet<>(p.sources());
+        Set<String> sourceIds = new LinkedHashSet<>(p.sourceIds());
         Set<String> literalTables = new HashSet<>();
         for (SourceTables st : universe) {
             literalTables.addAll(st.literals);
@@ -310,7 +310,7 @@ final class ReferenceClosure {
         // duplicate id never inflates the cross-source match count into a false ambiguity. (Rejecting
         // a duplicate id in the source list itself is a separate concern, out of B3-6 closure scope.)
         List<SourceTables> out = new ArrayList<>();
-        for (String sid : new LinkedHashSet<>(p.sources())) {
+        for (String sid : new LinkedHashSet<>(p.sourceIds())) {
             out.add(tableSetOf(sources.get(sid)));     // sources resolved above
         }
         return out;

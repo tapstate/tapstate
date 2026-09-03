@@ -11,6 +11,7 @@ import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.dsl.WriteKeyRules;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -37,8 +38,9 @@ import java.util.regex.PatternSyntaxException;
  * the catalog), judges the batch's row expressions against the columns of the tables its sources were
  * discovered to hold, then emits each resource's canonical form and content hash. It writes nothing. It reads the
  * schema store — an observation of what discovery found, never the config truth layer, which apply is
- * the one writer of — and reads the artifact store only for a draft that carries a precondition, to
- * judge that precondition against the stored version.
+ * the one writer of — and reads the artifact store for a draft that carries a precondition, to
+ * judge that precondition against the stored version, and for a pipeline, to read back the srs
+ * switches it has already recorded so that an unedited file re-applies as a no-op.
  * {@link #apply} runs a plan and then upserts each artifact into the store by its id, skipping the
  * write when the stored artifact's content hash is unchanged (a no-op).
  *
@@ -142,12 +144,74 @@ public final class ApplyService {
         RowExpressionTypeRules.validate(resources, discovered);
         WriteKeyRules.validate(resources, discovered);
         List<Resource> validated = List.copyOf(workspace.resources());
+        Map<String, SourceResource> batchSources = new LinkedHashMap<>();
+        for (Resource resource : validated) {
+            if (resource instanceof SourceResource source) {
+                batchSources.put(source.id(), source);
+            }
+        }
         List<PreparedArtifact> prepared = new ArrayList<>();
         for (Resource resource : validated) {
-            String canonicalForm = writer.write(resource);
-            prepared.add(new PreparedArtifact(resource, canonicalForm, CanonicalHash.of(canonicalForm)));
+            Resource recorded = resource instanceof PipelineResource pipeline
+                    ? withOwnSrsSwitches(pipeline, batchSources) : resource;
+            String canonicalForm = writer.write(recorded);
+            prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(canonicalForm)));
         }
         return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions);
+    }
+
+    /**
+     * Records this pipeline's own srs switch for each source it reads. A switch the author wrote wins;
+     * failing that, the value this pipeline already recorded for that source is kept; failing that,
+     * the reference is new and the source's own switch is taken once -- here, and never again.
+     *
+     * <p>Why it is per pipeline at all: the switch decides whether a source is read through the shared
+     * replay store, and editing it on the source moved every pipeline reading that source at once -- a
+     * consent none of them could give individually. Recorded here, moving one pipeline is an edit to
+     * that one pipeline.
+     *
+     * <p>"First" is judged per source, not per pipeline: a source added to an existing pipeline has no
+     * recorded value, so it takes that source's, while the references beside it keep theirs.
+     *
+     * <p>This runs before the canonical form is written, and therefore before the content hash. After
+     * it, a draft that omits the switch would hash differently from the stored artifact that carries
+     * one, so every apply of an unedited file would read as a change: rewrite without the switch,
+     * materialize again, one revision per apply on a file nobody touched.
+     */
+    private PipelineResource withOwnSrsSwitches(
+            PipelineResource pipeline, Map<String, SourceResource> batchSources) {
+        Map<String, Boolean> alreadyRecorded = new LinkedHashMap<>();
+        if (store.get(pipeline.id()).orElse(null) instanceof PipelineResource stored) {
+            for (SourceRef ref : stored.sources()) {
+                if (ref instanceof SourceRef.Spec spec) {
+                    alreadyRecorded.put(spec.id(), spec.srs());
+                }
+            }
+        }
+        List<SourceRef> refs = new ArrayList<>();
+        boolean anyRecorded = false;
+        for (SourceRef ref : pipeline.sources()) {
+            if (ref instanceof SourceRef.Spec) {
+                refs.add(ref);
+                anyRecorded = true;
+                continue;
+            }
+            Boolean own = alreadyRecorded.get(ref.id());
+            if (own == null) {
+                // The source is read from the batch alone, because the batch is the closure: a pipeline
+                // referencing a source that is not in it is refused before this runs. A reference left
+                // bare here therefore cannot happen; if that closure rule is ever widened, the capture
+                // side names the pipeline and the source rather than guessing a value.
+                SourceResource declaring = batchSources.get(ref.id());
+                own = declaring == null ? null : declaring.srsEnabled();
+            }
+            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own));
+            anyRecorded |= own != null;
+        }
+        return anyRecorded
+                ? new PipelineResource(pipeline.id(), pipeline.metadata(), refs, pipeline.transforms(),
+                        pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental())
+                : pipeline;
     }
 
     /** Validates and plans a batch while performing no store or audit write. */
@@ -199,6 +263,10 @@ public final class ApplyService {
                     live.refuseBufferingChangeWhileLive(
                             storedSource(stored, replacement.id()), replacement, stored);
                 }
+                if (live != null && prepared.resource() instanceof PipelineResource replacement) {
+                    live.refuseBufferingChangeWhileLive(
+                            storedPipeline(stored, replacement.id()), replacement);
+                }
                 toWrite.add(prepared.resource());
                 // The declared version travels with the record, so a version-checked edit is
                 // distinguishable in the audit trail from a blind overwrite of the same id. A draft that
@@ -233,6 +301,15 @@ public final class ApplyService {
     }
 
     /** The stored Source under {@code id}, or null when this apply is creating it. */
+    private static PipelineResource storedPipeline(List<Resource> stored, String id) {
+        return stored.stream()
+                .filter(PipelineResource.class::isInstance)
+                .map(PipelineResource.class::cast)
+                .filter(pipeline -> pipeline.id().equals(id))
+                .findFirst()
+                .orElse(null);
+    }
+
     private static SourceResource storedSource(List<Resource> stored, String id) {
         return stored.stream()
                 .filter(SourceResource.class::isInstance)

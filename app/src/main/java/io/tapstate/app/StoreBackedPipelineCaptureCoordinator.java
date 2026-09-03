@@ -5,6 +5,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureError;
@@ -75,10 +76,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         List<CaptureRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
         try {
-            for (String sourceId : pipeline.sources()) {
+            for (SourceRef ref : pipeline.sources()) {
+                String sourceId = ref.id();
                 SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
                 SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-                CaptureRunSpec spec = deriveSpec(pipelineId, pipeline.settings(), source, resolution);
+                CaptureRunSpec spec = deriveSpec(
+                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref));
                 Map<String, Long> observedSnapshotCounts = new LinkedHashMap<>();
                 CaptureRun run = captureStarter.start(spec, snapshotPassthrough(resolution, observedSnapshotCounts));
                 runs.add(run);
@@ -247,9 +250,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /**
-     * Derives one source run spec from the source, the pipeline settings, and the shared resolution. The read
-     * axis comes from settings (read mode defaulting to snapshot-then-cdc, start position to latest); srs is
-     * on unless the source declares it off.
+     * Derives one source run spec from the source, the pipeline settings, the shared resolution, and this
+     * pipeline's own srs switch for that source. The read axis comes from settings (read mode defaulting to
+     * snapshot-then-cdc, start position to latest); the srs switch is passed in rather than read off the
+     * source, and there is deliberately no fallback to the source here -- one would put back exactly the
+     * coupling that made an edit to a source re-route every pipeline reading it.
      *
      * <p>The start position defaults to latest because that is what the setting publishes as its default and
      * what the canonical form encodes by dropping an explicit {@code latest}. Filling in earliest instead
@@ -258,7 +263,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * window rather than picking up from now.
      */
     static CaptureRunSpec deriveSpec(
-            String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution) {
+            String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution,
+            boolean srsEnabled) {
         ReadMode readMode = settings != null && settings.readMode() != null
                 ? settings.readMode() : ReadMode.SNAPSHOT_AND_CDC;
         String startFromRaw = settings != null && settings.startFrom() != null
@@ -268,12 +274,26 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 resolution.config(),
                 readMode,
                 resolution.srsKey(),
-                source.srsEnabled(),
+                srsEnabled,
                 resolution.sourceId(),
                 pipelineId,
                 StartFrom.parse(startFromRaw),
                 retention,
                 MOCK_SCHEMA_VER);
+    }
+
+    /**
+     * This pipeline's own srs switch for that source. Apply records one on every reference it stores, so a
+     * reference without one has never been through apply -- an invariant violation rather than anything an
+     * author did, and so a bare crash naming both halves rather than a coded diagnostic. Guessing a value
+     * here is the one thing this must not do: it would read as a working pipeline running the other way.
+     */
+    private static boolean srsSwitchOf(String pipelineId, SourceRef ref) {
+        if (ref instanceof SourceRef.Spec spec) {
+            return spec.srs();
+        }
+        throw new IllegalStateException(
+                "pipeline '" + pipelineId + "' has no srs switch recorded for source '" + ref.id() + "'");
     }
 
     @Override

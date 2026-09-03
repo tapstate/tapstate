@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
@@ -117,7 +118,7 @@ class TargetModelResolverTest {
     }
 
     private static PipelineResource pipeline(String id, String sourceId) {
-        return new PipelineResource(id, null, List.of(sourceId), null, null, null, null, null);
+        return new PipelineResource(id, null, List.of(SourceRef.spec(sourceId, true)), null, null, null, null, null);
     }
 
     private static DiscoveredSourceModel discovered(String connectionId, String connectorId, SourceTable table) {

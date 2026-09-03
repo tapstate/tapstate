@@ -21,6 +21,7 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
@@ -433,7 +434,7 @@ class PipelineObservationApiTest {
     private static ArtifactStore storeHolding(String... ids) {
         Map<String, Resource> byId = new LinkedHashMap<>();
         for (String id : ids) {
-            byId.put(id, new PipelineResource(id, null, List.of("src_x"), null, null, null, null, null));
+            byId.put(id, new PipelineResource(id, null, List.of(SourceRef.bare("src_x")), null, null, null, null, null));
         }
         return new ArtifactStore() {
             @Override

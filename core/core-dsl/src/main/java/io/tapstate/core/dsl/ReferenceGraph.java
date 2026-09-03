@@ -96,7 +96,7 @@ public final class ReferenceGraph {
     private static Set<String> referencedIds(Resource r) {
         Set<String> ids = new LinkedHashSet<>();
         if (r instanceof PipelineResource p) {
-            ids.addAll(p.sources());
+            ids.addAll(p.sourceIds());
             if (p.transforms() != null) {
                 for (Step step : p.transforms()) {
                     if (step instanceof Step.Use u) {

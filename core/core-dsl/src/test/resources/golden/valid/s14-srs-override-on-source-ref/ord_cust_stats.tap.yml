@@ -1,0 +1,24 @@
+version: tapstate/v1
+kind: pipeline
+id: ord_cust_stats
+source:
+  - id: src_ord
+    srs: true
+  - src_cust
+transforms:
+  - id: ord_by_cust
+    type: join
+    from:
+      c: customers
+      o: orders
+    engine: duckdb
+    sql: |
+      SELECT c.id AS customer_id, count(*) AS order_cnt
+      FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id
+view:
+  id: ord_cust_stats
+  from: ord_by_cust
+  primary_key: customer_id
+  storage:
+    warm:
+      collection: ord_cust_stats

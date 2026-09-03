@@ -22,6 +22,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -283,7 +284,7 @@ class CaptureToSinkAckFrontierTest {
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
         // A passthrough filter (keeps every change), so every fed position reaches the sink and the sink size
         // tracks the number of changes fed. cdc_only, so only the change tail runs.
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SOURCE_ID),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE_ID, true)),
                 List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
                         new TransformBody.Filter("true"), null, null)),
                 null,

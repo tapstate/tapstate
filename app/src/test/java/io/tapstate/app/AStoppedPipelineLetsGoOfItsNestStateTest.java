@@ -19,6 +19,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -533,7 +534,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         aliases.put("o", FromRef.literal(PARENT_TABLE));
         aliases.put("i", FromRef.literal(CHILD_TABLE));
         aliases.put("p", FromRef.literal(GRANDCHILD_TABLE));
-        return new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE, GRANDCHILD_SOURCE),
+        return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true), SourceRef.spec(GRANDCHILD_SOURCE, true)),
                 List.of(Step.inline(STEP, FromClause.aliases(aliases), body, null, null)), null,
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
@@ -542,7 +543,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
     /** The same pipeline with its nest step taken out, so nothing keeps state. */
     private static PipelineResource pipelineWithoutNest() {
-        return new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE), List.of(), null,
+        return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true)), List.of(), null,
                 new ServeBlock.Inline(null, FromRef.literal(PARENT_SOURCE),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);

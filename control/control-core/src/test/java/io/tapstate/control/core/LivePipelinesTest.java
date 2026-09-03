@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -154,7 +155,7 @@ class LivePipelinesTest {
     }
 
     private static PipelineResource pipeline(String id, String sourceId) {
-        return new PipelineResource(id, null, List.of(sourceId), null, null, null, null, null);
+        return new PipelineResource(id, null, List.of(SourceRef.bare(sourceId)), null, null, null, null, null);
     }
 
 }
