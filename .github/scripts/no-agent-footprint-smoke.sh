@@ -37,7 +37,7 @@ expect() { # expect <name> <mode> <want code> <want text>
   local name="$1" mode="$2" want_code="$3" want_text="$4" out code
   bash "$gate" "$mode" > "$scratch/out" 2>&1; code=$?
   out="$(cat "$scratch/out")"
-  if [ "$code" = "$want_code" ] && printf '%s' "$out" | grep -qF "$want_text"; then
+  if [ "$code" = "$want_code" ] && grep -qF "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"; passed=$((passed + 1))
   else
     printf '  FAIL  %s\n        wanted exit %s containing %s\n        got exit %s: %s\n' \
@@ -99,7 +99,7 @@ msg_case() { # msg_case <name> <commit message> <want code> <want text>
   EVENT_BEFORE="$(git rev-parse HEAD~1)" EVENT_SHA="$(git rev-parse HEAD)" \
     bash "$gate" messages > "$scratch/out" 2>&1; code=$?
   out="$(cat "$scratch/out")"
-  if [ "$code" = "$want_code" ] && printf '%s' "$out" | grep -qF "$want_text"; then
+  if [ "$code" = "$want_code" ] && grep -qF "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"; passed=$((passed + 1))
   else
     printf '  FAIL  %s\n        wanted exit %s containing %s\n        got exit %s: %s\n' \
