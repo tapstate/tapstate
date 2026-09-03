@@ -32,6 +32,7 @@ import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -362,23 +363,21 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
     }
 
     /**
-     * Waits for what a run is supposed to reach, on a budget sized for the slowest way this runs rather
-     * than for a machine with nothing else on it. Measured: alone this case settles in about six seconds,
-     * and under a full build - every module's tests contending for the same cores - the same work took
-     * long enough to run out a thirty second budget entirely. A budget that fits the quiet case turns a
-     * slow build into a red that reads exactly like a chain being pinned, which is the one thing this
-     * case exists to tell apart. Lengthening it costs nothing it was measuring: what it waits for either
-     * happens or does not, and the message names what did happen either way.
+     * Waits for what a run is supposed to reach, giving up the moment the job itself ends.
+     *
+     * <p>The budget is sized for the slowest way this runs rather than for a machine with nothing else on
+     * it. Measured: alone this case settles in about six seconds, and under a full build - every module's
+     * tests contending for the same cores - the same work took long enough to run out a thirty second
+     * budget entirely. A budget that fits the quiet case turns a slow build into a red that reads exactly
+     * like a chain being pinned, which is the one thing this case exists to tell apart.
+     *
+     * <p><b>The budget is the second line, though, not the first.</b> A job that dies stops writing into
+     * what this watches without disturbing anything visible here, so a plain deadline spends the whole
+     * budget and then names the frontier rather than the death underneath it - measured on this very
+     * lane, thirty seconds of waiting on a job that had ended twenty-four milliseconds in.
      */
-    private static void await(BooleanSupplier reached) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
-        while (System.nanoTime() < deadline) {
-            if (reached.getAsBoolean()) {
-                return;
-            }
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
-        }
-        throw new AssertionError("what was waited for never happened; acked: " + List.copyOf(ACKED)
-                + ", documents: " + List.copyOf(DOCUMENTS));
+    private void await(BooleanSupplier reached) {
+        JobWatch.until(job, Duration.ofSeconds(90), reached,
+                () -> "acked: " + acked() + ", documents: " + List.copyOf(DOCUMENTS));
     }
 }
