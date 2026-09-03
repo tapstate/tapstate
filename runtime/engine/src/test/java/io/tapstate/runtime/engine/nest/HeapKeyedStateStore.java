@@ -6,8 +6,13 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 
-/** A store that keeps what it is given, so an evicted entry has somewhere to have gone. */
-final class HeapKeyedStateStore implements KeyedStateStore {
+/**
+ * A store that keeps what it is given, so an evicted entry has somewhere to have gone.
+ *
+ * <p>Public because the shape a nest map takes in production - a map with this behind it - has to be
+ * reachable from the cases outside this package that assert on behaviour, not only from the ones in it.
+ */
+public final class HeapKeyedStateStore implements KeyedStateStore {
 
     private final Map<String, Map<String, byte[]>> byNamespace = new LinkedHashMap<>();
 

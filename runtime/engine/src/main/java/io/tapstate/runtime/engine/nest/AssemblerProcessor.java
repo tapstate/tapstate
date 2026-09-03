@@ -1061,7 +1061,12 @@ public final class AssemblerProcessor extends AbstractProcessor {
                         waiting.remove(key);
                         if (mayGoOutNow(key)) {
                             outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
-                                    .withPositions(document.assembly.covered()));
+                                    .withPositions(document.assembly.covered())
+                                    // Said out loud, because a field that stopped being rendered and a
+                                    // field this tree never had are the same document downstream - and a
+                                    // target applies one by setting what is in it, so what is gone from it
+                                    // stays there at its last value unless the emission names it.
+                                    .withRemoved(RootAssembly.embedsNotRendered(slots, rendered)));
                             document.assembly.documentSent();
                         } else {
                             windows.get(key).holds(document.ts, document.assembly.lowestUnsentByChain());
@@ -1217,7 +1222,11 @@ public final class AssemblerProcessor extends AbstractProcessor {
             }
             waiting.remove(entry.getKey());
             outgoing.add(Envelope.insert(window.ts, outputStream, rendered.get(), null)
-                    .withPositions(assembly.covered()));
+                    .withPositions(assembly.covered())
+                    // As on the drain's own path. A document released by the window is the same document
+                    // and needs the same saying-so - and this is the path a deployment with a window open
+                    // sends most of them on, so leaving it out would fix nothing where it matters.
+                    .withRemoved(RootAssembly.embedsNotRendered(slots, rendered.get())));
             assembly.documentSent();
             store.save(entry.getKey(), assembly);
             window.reopen(now);

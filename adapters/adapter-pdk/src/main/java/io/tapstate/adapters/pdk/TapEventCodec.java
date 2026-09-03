@@ -151,9 +151,11 @@ public final class TapEventCodec {
     public static TapEvent encode(Envelope env) {
         return switch (env.op()) {
             case INSERT, READ -> TapInsertRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after()));
+                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after()))
+                    .removedFields(dropped(env));
             case UPDATE -> TapUpdateRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before())).after(mutable(env.after()));
+                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before())).after(mutable(env.after()))
+                    .removedFields(dropped(env));
             case DELETE -> TapDeleteRecordEvent.create()
                     .table(env.src()).referenceTime(env.ts()).before(mutable(env.before()));
             case DDL -> encodeDdl(env);
@@ -163,6 +165,21 @@ public final class TapEventCodec {
     /** A fresh mutable copy PDK can write through in place, or {@code null} when the map is absent. */
     private static Map<String, Object> mutable(Map<String, Object> map) {
         return map == null ? null : new LinkedHashMap<>(map);
+    }
+
+    /**
+     * The fields this row no longer has, as the connector reads them, or null where there are none.
+     *
+     * <p><b>Null rather than an empty list, so that a producer dropping nothing is indistinguishable from
+     * one written before any producer could.</b> A connector tests this for emptiness either way, and the
+     * two answers must not diverge on a path nothing exercises.
+     *
+     * <p>Without this the removal does not travel at all: a write into a keyed target sets the fields it is
+     * given, so a field that stopped being produced stays in the target for as long as the row does, with
+     * the write succeeding and the row that arrived correct.
+     */
+    private static List<String> dropped(Envelope env) {
+        return env.removed().isEmpty() ? null : List.copyOf(env.removed());
     }
 
     private static TapEvent encodeDdl(Envelope env) {

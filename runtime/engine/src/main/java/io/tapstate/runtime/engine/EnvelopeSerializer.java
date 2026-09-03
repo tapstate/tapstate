@@ -9,7 +9,9 @@ import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 import java.io.IOException;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * How a change crosses a member boundary.
@@ -53,6 +55,7 @@ public final class EnvelopeSerializer implements StreamSerializer<Envelope> {
         writeRow(out, envelope.after());
         writeRow(out, envelope.schema());
         writePositions(out, envelope.positions());
+        writeNames(out, envelope.removed());
     }
 
     @Override
@@ -64,7 +67,35 @@ public final class EnvelopeSerializer implements StreamSerializer<Envelope> {
         Map<String, Object> after = readRow(in);
         Map<String, Object> schema = readRow(in);
         Map<String, ChainPosition> positions = readPositions(in);
-        return new Envelope(op, ts, src, before, after, schema, positions);
+        Set<String> removed = readNames(in);
+        return new Envelope(op, ts, src, before, after, schema, positions, removed);
+    }
+
+    /**
+     * The names of fields the row no longer has. Written as plain strings with a leading count, like
+     * everything else here: what a target is told to drop must not depend on the shape of a class.
+     */
+    private static void writeNames(ObjectDataOutput out, Set<String> names) throws IOException {
+        if (names == null) {
+            out.writeInt(ABSENT);
+            return;
+        }
+        out.writeInt(names.size());
+        for (String name : names) {
+            out.writeString(name);
+        }
+    }
+
+    private static Set<String> readNames(ObjectDataInput in) throws IOException {
+        int size = in.readInt();
+        if (size == ABSENT) {
+            return Set.of();
+        }
+        Set<String> names = new LinkedHashSet<>();
+        for (int i = 0; i < size; i++) {
+            names.add(in.readString());
+        }
+        return names;
     }
 
     private static void writeRow(ObjectDataOutput out, Map<String, Object> row) throws IOException {

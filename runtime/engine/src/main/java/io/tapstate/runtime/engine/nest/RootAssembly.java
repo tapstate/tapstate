@@ -627,6 +627,38 @@ public final class RootAssembly implements Serializable {
     }
 
     /**
+     * The embeds this tree declares that {@code rendered} carries no field for - what the document had to
+     * say about them is that they are not there.
+     *
+     * <p><b>Rendering no field and having no such embed are the same document, and a target cannot tell
+     * them apart.</b> Every write into a keyed target applies a document by setting the fields in it, so a
+     * field that stops being rendered is left standing in the target at its last value for as long as the
+     * document lives - and nothing reports it, because the write succeeds and the document that arrived is
+     * right. Measured on a live stack: a document went on naming a deleted row for fifteen minutes and
+     * through a restart, while the document the engine emitted had not named it since the deletion.
+     *
+     * <p><b>Only the top level, and that is the whole rule rather than a simplification.</b> An embed
+     * nested inside another is written as part of whatever holds it - that container is a field of this
+     * document and is set whole - so naming it would be naming a field no target keeps separately. What
+     * cannot be reached that way is exactly a top-level field that has gone, which is this.
+     *
+     * <p>An embed that has never rendered is named too, and harmlessly: a target asked to drop what it does
+     * not have drops nothing. Telling "gone" from "never here" would need a memory of what was last sent,
+     * which is a second copy of every document to save nothing.
+     */
+    public static Set<String> embedsNotRendered(List<EmbedSlot> slots, Map<String, Object> rendered) {
+        Objects.requireNonNull(slots, "slots");
+        Objects.requireNonNull(rendered, "rendered");
+        Set<String> absent = new LinkedHashSet<>();
+        for (EmbedSlot slot : slots) {
+            if (!rendered.containsKey(slot.path())) {
+                absent.add(slot.path());
+            }
+        }
+        return absent;
+    }
+
+    /**
      * Which rows this document would have to be handed to render, by the namespace each is kept in. It is
      * asked before rendering rather than during it, so that a document naming two hundred rows is one reach
      * for two hundred keys instead of two hundred reaches - and so that the depth they sit at costs
