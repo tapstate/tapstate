@@ -52,7 +52,7 @@
   </modules>
 
   <properties>
-    <revision>0.3.0</revision>
+    <revision>0.4.1</revision>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>21</maven.compiler.release>
     <!-- Reproducible build: the same commit must produce bit-identical artifacts -->
