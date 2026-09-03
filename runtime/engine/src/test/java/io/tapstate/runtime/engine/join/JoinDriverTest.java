@@ -283,6 +283,60 @@ class JoinDriverTest {
                 .isEqualTo(1);
     }
 
+    /**
+     * The first load and the changes after it, through the one method that serves both. A source
+     * delivers its snapshot as read events on the stream its later changes arrive on, so there is no
+     * second phase to run - and the rows a snapshot arrives in no useful order still have to converge.
+     *
+     * <p>The order here is the hostile one on purpose: every fact row before any dimension row, which
+     * is what a snapshot over two independent tables routinely produces. Each of those rows publishes
+     * with nulls first and is corrected when its dimension row lands, which is the same mechanism a
+     * late dimension row uses at any other time - not a separate one for loading.
+     */
+    @Test
+    @DisplayName("the first load and the changes after it come out of the same call")
+    void theSnapshotAndTheChangesAfterItShareOnePath() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        for (long id = 0; id < 3; id++) {
+            fixture.apply(fact(read(Map.of("id", id, "cust_id", 1L))));
+        }
+        fixture.apply(dimension("c", read(Map.of("id", 1L, "name", "Ada"))));
+        fixture.clear();
+
+        // A change arriving after the load is applied by the same call, and lands on the rows the load
+        // left behind rather than on a second copy of them.
+        fixture.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(fixture.published()).containsExactlyInAnyOrder(
+                Map.entry(Op.INSERT, Map.of("order_id", 0L, "customer_name", "Grace")),
+                Map.entry(Op.INSERT, Map.of("order_id", 1L, "customer_name", "Grace")),
+                Map.entry(Op.INSERT, Map.of("order_id", 2L, "customer_name", "Grace")));
+    }
+
+    /**
+     * The load itself, in that hostile order: what it settles on. Not "no nulls were ever published" -
+     * they are, and that is the mechanism working - but that the last thing said about each row is the
+     * joined one.
+     */
+    @Test
+    @DisplayName("a snapshot whose fact rows arrive before their dimension rows still converges")
+    void aSnapshotConvergesWhateverOrderItArrivesIn() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+
+        for (long id = 0; id < 3; id++) {
+            fixture.apply(fact(read(Map.of("id", id, "cust_id", 1L))));
+        }
+        fixture.apply(dimension("c", read(Map.of("id", 1L, "name", "Ada"))));
+
+        Map<Object, Object> settled = new LinkedHashMap<>();
+        for (Map.Entry<Op, Map<String, Object>> row : fixture.published()) {
+            settled.put(row.getValue().get("order_id"), row.getValue().get("customer_name"));
+        }
+        assertThat(settled).containsExactly(
+                Map.entry(0L, "Ada"), Map.entry(1L, "Ada"), Map.entry(2L, "Ada"));
+    }
+
     @Test
     @DisplayName("a null in a join key matches nothing, on either side")
     void aNullJoinKeyMatchesNothing() {
@@ -314,6 +368,10 @@ class JoinDriverTest {
 
     private static SourceChange dimension(String source, Envelope event) {
         return new SourceChange(source, event);
+    }
+
+    private static Envelope read(Map<String, Object> after) {
+        return Envelope.read(1L, "src", after, null);
     }
 
     private static Envelope insert(Map<String, Object> after) {

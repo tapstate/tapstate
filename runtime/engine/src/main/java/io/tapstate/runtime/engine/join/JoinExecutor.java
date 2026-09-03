@@ -14,6 +14,14 @@ import java.util.List;
  * a front end that cannot see a carrier, and the changelog goes out as the same event envelope every
  * other transform speaks.
  *
+ * <p><b>There is no separate call for the first load, and that is a decision rather than an omission.</b>
+ * A source delivers its snapshot as read events on the same stream its later changes arrive on, so the
+ * full phase is the front of that stream rather than a second thing to run - and one carrier method
+ * serves both. Giving the two phases their own paths is exactly what makes them able to disagree: the
+ * same SQL text would be executed twice over, and a change to what one of them projects would land on
+ * half the output with nothing comparing the halves. A carrier whose full phase really is a different
+ * mechanism can still have one; it just does not get to be a different <em>answer</em>.
+ *
  * <p><b>{@code apply} is called with nothing to do, on purpose, and that is a contract rather than a
  * convenience.</b> A change to one dimension row can mean a million rows have to be built again, and
  * that work outlives the change that caused it. If the only moment it were pushed were the arrival of
@@ -26,13 +34,6 @@ public interface JoinExecutor extends AutoCloseable {
 
     /** Compiles {@code plan}: what is matched on, what is kept, and what each output column is. */
     void open(JoinPlan plan);
-
-    /**
-     * Produces the whole result once, as a consistent snapshot of the sources.
-     *
-     * @return whether it is finished; false means it was refused by the sink and must be called again
-     */
-    boolean loadFull(JoinSink sink);
 
     /**
      * Absorbs {@code changes} and pushes as much of the changelog as {@code sink} will take. An empty
