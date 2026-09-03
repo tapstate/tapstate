@@ -3714,6 +3714,32 @@ class ReplTest {
     }
 
     @Test
+    void restartRerunWhoseStartIsRefusedAfterTheStopSaysWhatThatLeftBehind() {
+        // The one ordering the product concedes it cannot make atomic: the stop went through, so the
+        // position is already gone, and the start is then refused. Nothing here can undo that, which is
+        // exactly why what it says has to be right.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcomeByVerb.put("stop", new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc"));
+        client.lifecycleOutcomeByVerb.put(
+                "start", new LifecycleOutcome.Rejected("lifecycle.artifact-missing", "No such pipeline."));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        // Both verbs really went, in that order: without this the case could pass on a run that was
+        // refused before the stop, which is a different situation with nothing to report.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true",
+                "jwt-tok@http://node1:7900 start pl1");
+
+        // All three, because a reader told only the first is told the least useful of them.
+        String out = h.sink().toString();
+        assertThat(out).contains("was stopped and its state cleared");
+        assertThat(out).contains("no position to resume from");
+        assertThat(out).contains("reads the whole source");
+    }
+
+    @Test
     void restartOnAFailedPipelineCarriesOnFromWhereItGotTo() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");

@@ -195,6 +195,11 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isPresent();
         assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isPresent();
         assertThat(store.keyedState().load(SHAPE_NAMESPACE, "k")).isPresent();
+        // The map as well as the store behind it, for the mirror of the reason the clearing case gives:
+        // a reader answers from the map, so dropping that alone takes the state away from everything
+        // that would look for it while every load above still says it is there.
+        assertThat(member.getMap(ROOT_NAMESPACE).get("k")).isEqualTo("held");
+        assertThat(member.getMap(ITEMS_NAMESPACE).get("k")).isEqualTo("held");
 
         // The second half is the one that discriminates. A stop that wrote the drop down and then merely
         // declined to carry it out passes everything above: the note it left is finished by the next
@@ -207,6 +212,10 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
                 .isPresent();
         assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isPresent();
         assertThat(store.keyedState().load(SHAPE_NAMESPACE, "k")).isPresent();
+        assertThat(member.getMap(ROOT_NAMESPACE).get("k"))
+                .describedAs("and still readable from where a run reads it, across that start")
+                .isEqualTo("held");
+        assertThat(member.getMap(ITEMS_NAMESPACE).get("k")).isEqualTo("held");
     }
 
     /**
