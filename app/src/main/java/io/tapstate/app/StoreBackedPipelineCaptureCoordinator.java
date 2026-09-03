@@ -248,15 +248,21 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     /**
      * Derives one source run spec from the source, the pipeline settings, and the shared resolution. The read
-     * axis comes from settings (read mode defaulting to snapshot-then-cdc, start position to earliest); srs is
+     * axis comes from settings (read mode defaulting to snapshot-then-cdc, start position to latest); srs is
      * on unless the source declares it off.
+     *
+     * <p>The start position defaults to latest because that is what the setting publishes as its default and
+     * what the canonical form encodes by dropping an explicit {@code latest}. Filling in earliest instead
+     * disagreed with both, and the disagreement is not cosmetic: for a tail that reads its source directly,
+     * earliest is the oldest change the source still retains, so a first run replays the whole retention
+     * window rather than picking up from now.
      */
     static CaptureRunSpec deriveSpec(
             String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution) {
         ReadMode readMode = settings != null && settings.readMode() != null
                 ? settings.readMode() : ReadMode.SNAPSHOT_AND_CDC;
         String startFromRaw = settings != null && settings.startFrom() != null
-                ? settings.startFrom() : "earliest";
+                ? settings.startFrom() : "latest";
         String retention = source.srs() != null ? source.srs().retention() : null;
         return new CaptureRunSpec(
                 resolution.config(),

@@ -102,8 +102,87 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(spec.srsEnabled()).as("srs.enabled:false is honoured").isFalse();
         assertThat(spec.srsKey()).isEqualTo("shared-key");
         assertThat(spec.readMode()).as("null settings default the read mode").isEqualTo(ReadMode.SNAPSHOT_AND_CDC);
-        assertThat(spec.startFrom()).as("null settings default the start position to earliest")
+        assertThat(spec.startFrom()).as("null settings default the start position to latest")
+                .isEqualTo(io.tapstate.runtime.srs.StartFrom.latest());
+    }
+
+    /**
+     * A pipeline that names no start position begins where its published contract says it does.
+     *
+     * <p>The setting documents its own default as {@code latest} and the canonical form encodes that same
+     * reading by dropping an explicit {@code latest}, so a run that filled in {@code earliest} instead told
+     * an author one thing and did the opposite: "only what is written from now on" against "replay every
+     * change still retained". Nothing read the filled-in value until a tail that reads its source directly
+     * began resolving it, at which point the disagreement became a first run that re-reads the whole
+     * retention window.
+     *
+     * <p>The third case is what makes the other two mean anything: an implementation that answers
+     * {@code latest} to everything satisfies both defaults and still throws away what an author wrote.
+     */
+    @Test
+    void aPipelineThatNamesNoStartPositionBeginsWhereItsContractSaysItDoes() {
+        SourceResource source = cdcSource("orders_src", "orders", null);
+
+        CaptureRunSpec noSettings = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, source, SourceCaptureResolution.of(source));
+        CaptureRunSpec settingsWithoutOne = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", new Settings(null, null, null, null, ReadMode.CDC_ONLY, null),
+                source, SourceCaptureResolution.of(source));
+        CaptureRunSpec authorAskedForEarliest = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"),
+                source, SourceCaptureResolution.of(source));
+
+        assertThat(noSettings.startFrom()).as("no settings at all")
+                .isEqualTo(io.tapstate.runtime.srs.StartFrom.latest());
+        assertThat(settingsWithoutOne.startFrom()).as("settings that name every other field but this one")
+                .isEqualTo(io.tapstate.runtime.srs.StartFrom.latest());
+        assertThat(authorAskedForEarliest.startFrom()).as("what the author wrote still wins")
                 .isEqualTo(io.tapstate.runtime.srs.StartFrom.earliest());
+    }
+
+    /**
+     * A hand-written source position is refused whether or not this pipeline buffers, rather than passed
+     * through to the connector.
+     *
+     * <p>Handing one through was the drafted behaviour for the unbuffered path, and there is no channel for
+     * it: a recorded position is the connector own offset object serialized, not text a person writes, and
+     * the plugin interface offers no way to build an offset from a string. It could not be documented
+     * either -- the offset type differs per connector and per connector configuration, so no shape could be
+     * named for an author to write. Asking for an exact position is served instead by reading one back and
+     * writing it again, which refuses out loud when it cannot be honoured; a start setting yields silently
+     * to an already-recorded position, so the same ask would have gone unanswered with nothing said.
+     *
+     * <p>Both paths are asserted because only their conjunction discriminates: an implementation that
+     * forwards the value once buffering is off stays green on the buffered case, which is the half a
+     * single-case test would have picked.
+     */
+    @Test
+    void aHandWrittenSourcePositionIsRefusedOnBothPathsRatherThanPassedThrough() {
+        String binlogCoordinate = """
+                {"file":"mysql-bin.000003","pos":154}""";
+        Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, binlogCoordinate);
+        SourceResource buffered = cdcSource("orders_src", "orders", null);
+        SourceResource direct = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null,
+                new Srs(null, null, null, null, false), null);
+
+        assertThat(buffered.srsEnabled()).as("the two sources really do take different paths").isTrue();
+        assertThat(direct.srsEnabled()).isFalse();
+
+        for (SourceResource source : List.of(buffered, direct)) {
+            // The description goes on the call, not after it: a .as() chained onto the returned assertion
+            // never reaches the "no throwable was raised" failure, which is precisely the failure this
+            // case exists to produce -- and without it the report cannot say which of the two paths broke.
+            assertThatThrownBy(() -> StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                            "pipe-1", settings, source, SourceCaptureResolution.of(source)),
+                    "srs enabled: %s", source.srsEnabled())
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(e -> {
+                        TapstateException refused = (TapstateException) e;
+                        assertThat(refused.code().code()).isEqualTo("capture.start-from-unparsable");
+                        assertThat(refused.args()).containsEntry("value", binlogCoordinate);
+                    });
+        }
     }
 
     // ---- handle lifecycle ------------------------------------------------------------------------
