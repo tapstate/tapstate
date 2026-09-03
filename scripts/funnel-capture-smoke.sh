@@ -169,9 +169,163 @@ after_second="$(git -C "$clone" rev-list --count HEAD)"
 [ "$after_second" = "$after_first" ] || fail "case 9: an unchanged run still produced a commit"
 pass "case 9: an unchanged run commits nothing and still succeeds"
 
-# and the push actually reached the origin, rather than only committing locally
-git -C "$origin" show HEAD:funnel/daily/clones.jsonl >/dev/null 2>&1 \
+# and the push actually reached the origin, rather than only committing locally.
+# Reads `main:`, the branch funnel-publish.sh pushes -- NOT `HEAD:`. A bare repository's HEAD is
+# whatever init.defaultBranch says, which is `master` unless something set it, and only `main` was
+# ever created here. Reading HEAD therefore resolved a branch that does not exist, so this case was
+# red on any machine that had not been configured otherwise -- and, worse, it was red with and
+# without the push, which makes its mutation evidence vacuous: a case that fails identically whether
+# the code works is not testing the code.
+git -C "$origin" show main:funnel/daily/clones.jsonl >/dev/null 2>&1 \
   || fail "case 10: the series is not present on the origin -- it was committed but never pushed"
 pass "case 10: the series reaches the origin"
+
+
+# --- the receiver's events become the denominator ---------------------------------------------------
+# The receiver writes one file per event because a unique path is the only write that cannot lose a
+# concurrent one. Nothing reads that shape: the report counts a JSONL. Until this step existed the
+# events piled up unread and the report said "L1 is unavailable" every week, forever, while installs
+# were arriving -- the exact opposite of what was happening, and the denominator this line exists to
+# produce never came into being at all.
+store="$work/store7"; fx="$work/fx7"; mkdir -p "$fx" "$store/events"
+: > "$fx/clones.json"; : > "$fx/releases.json"
+cat > "$store/events/2026-08-18T01-00-00Z-aaaa1111.json" <<'JSON'
+{"installation_id":"e1","version":"0.4.1","os":"darwin","arch":"arm64","entrypoint":"cli","country":"SG","timestamp":"2026-08-18T01:00:00Z"}
+JSON
+cat > "$store/events/2026-08-19T02-00-00Z-bbbb2222.json" <<'JSON'
+{"installation_id":"e2","version":"0.4.1","os":"linux","arch":"x64","entrypoint":"quickstart","country":"ZZ","timestamp":"2026-08-19T02:00:00Z"}
+JSON
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+[ -f "$store/events/installs.jsonl" ] \
+  || fail "case 11: the events were never folded -- no installs.jsonl exists"
+folded="$(wc -l < "$store/events/installs.jsonl" | tr -d ' ')"
+[ "$folded" = "2" ] || fail "case 11: expected 2 folded events, got $folded"
+left="$(find "$store/events" -name '*.json' ! -name 'installs.jsonl' | wc -l | tr -d ' ')"
+[ "$left" = "0" ] || fail "case 11: $left event file(s) were folded but not consumed, so the next run refolds them"
+pass "case 11: the receiver's per-event files are folded into the series the report counts"
+
+# Idempotent, because the job runs forever and a re-run must not double the denominator. Re-adding an
+# already-folded event must change nothing: the key is (installation_id, timestamp), not the filename.
+cat > "$store/events/2026-08-18T01-00-00Z-cccc3333.json" <<'JSON'
+{"installation_id":"e1","version":"0.4.1","os":"darwin","arch":"arm64","entrypoint":"cli","country":"SG","timestamp":"2026-08-18T01:00:00Z"}
+JSON
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+folded2="$(wc -l < "$store/events/installs.jsonl" | tr -d ' ')"
+[ "$folded2" = "2" ] || fail "case 12: refolding the same event changed the count to $folded2 -- L1 would inflate on every re-run"
+pass "case 12: refolding an already-folded event does not inflate the denominator"
+
+# A file that is not an event is left exactly where it is. Deleting it would destroy the only copy of
+# whatever it actually is, and this directory is the one place a receiver write lands.
+printf 'not json at all\n' > "$store/events/broken.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+[ -f "$store/events/broken.json" ] || fail "case 13: an unparseable file was deleted rather than left alone"
+pass "case 13: a file that does not parse as an event is kept, not silently dropped"
+
+# The report must not be blind in the window between a receiver write and the next capture run, and
+# an absent event store must still say "unavailable" rather than zero -- they are opposite findings.
+store="$work/store8"; mkdir -p "$store/events" "$store/daily"
+cat > "$store/events/2026-08-18T03-00-00Z-dddd4444.json" <<'JSON'
+{"installation_id":"e9","version":"0.4.1","os":"linux","arch":"x64","entrypoint":"cli","country":"ZZ","timestamp":"2026-08-18T03:00:00Z"}
+JSON
+out3="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out3" | grep -qE 'installs completed: *1' \
+  || fail "case 14: an event not yet folded was invisible to the report: $(echo "$out3" | grep -i 'L1\|installs completed')"
+pass "case 14: an event that has arrived but not been folded still counts"
+
+store="$work/store9"; mkdir -p "$store/daily"
+out4="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out4" | grep -qi 'L1 is unavailable' \
+  || fail "case 15: with no event store at all the report did not say L1 is unavailable"
+echo "$out4" | grep -qE 'installs completed: *0' \
+  && fail "case 15: the report printed L1 as zero when it is actually unavailable"
+pass "case 15: no event store reports L1 unavailable, never zero"
+
+# --- release totals span every page ----------------------------------------------------------------
+# /releases serves 30 per page. Unpaginated, the "cumulative" total is the newest 30 releases, so
+# publishing the 31st drops the oldest out and the next period's difference comes out NEGATIVE with
+# nothing to say the series stopped being cumulative. `--paginate --slurp` returns an array of pages,
+# so the reader has to flatten -- and a reader that does not flatten sums zero assets and reports 0.
+store="$work/store10"; fx="$work/fx10"; mkdir -p "$fx"
+: > "$fx/clones.json"
+printf '[[{"assets":[{"download_count":100}]},{"assets":[{"download_count":5}]}],[{"assets":[{"download_count":7}]}]]\n' > "$fx/releases.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" --observed-at 2026-08-18T04:17:00Z >/dev/null
+snap="$(sed -n '1p' "$store/snapshots/release_asset_downloads.jsonl")"
+echo "$snap" | grep -q '"value":112' \
+  || fail "case 16: expected 112 summed across both pages, got: $snap"
+pass "case 16: a paginated releases payload is flattened before summing"
+
+# --- a period's figure is bounded by that period ---------------------------------------------------
+# `rows[-1] - rows[-2]` is "the two newest readings", not "the readings bounding the week asked for".
+# Measured on the old code: --week 2026-08-18 printed 370, a figure for 08-25..09-01, under the
+# 08-18 header -- while the daily metrics on the same page were correctly week-filtered.
+store="$work/store11"; mkdir -p "$store/snapshots" "$store/daily" "$store/events"
+cat > "$store/snapshots/release_asset_downloads.jsonl" <<'JSON'
+{"observed_at":"2026-08-18T04:17:00Z","value":100}
+{"observed_at":"2026-08-25T04:17:00Z","value":130}
+{"observed_at":"2026-09-01T04:17:00Z","value":500}
+JSON
+out5="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out5" | grep -qE 'release asset downloads +30\b' \
+  || fail "case 17: the week of 08-18 did not report its own 30: $(echo "$out5" | grep -i 'release asset')"
+echo "$out5" | grep -qE 'release asset downloads +370\b' \
+  && fail "case 17: the report printed a later period's figure under the requested week's header"
+out6="$(sh "$report" --store "$store" --week 2026-08-25)"
+echo "$out6" | grep -qE 'release asset downloads +370\b' \
+  || fail "case 17: the week of 08-25 did not report its own 370: $(echo "$out6" | grep -i 'release asset')"
+pass "case 17: the snapshot delta is bounded by the requested week, not by which readings are newest"
+
+# workflow_dispatch is enabled, so a manual run or a re-run after a failed step is ordinary. A second
+# reading inside one week must not report that week's real growth as ~0.
+printf '{"observed_at":"2026-09-01T09:00:00Z","value":500}\n' >> "$store/snapshots/release_asset_downloads.jsonl"
+out7="$(sh "$report" --store "$store" --week 2026-08-25)"
+echo "$out7" | grep -qE 'release asset downloads +370\b' \
+  || fail "case 18: a second reading in one week collapsed it: $(echo "$out7" | grep -i 'release asset')"
+pass "case 18: a re-run inside one week does not zero that week"
+
+# A week with no closing reading is n/a, not the running total and not zero.
+out8="$(sh "$report" --store "$store" --week 2026-09-01)"
+echo "$out8" | grep -qE 'release asset downloads +n/a' \
+  || fail "case 19: a week with no closing reading did not report n/a: $(echo "$out8" | grep -i 'release asset')"
+pass "case 19: a week with no reading on its far side reports n/a"
+
+# --- coverage tells the truth when nothing was observed --------------------------------------------
+# Clamping the gap window to the observed range meant that when the week and the range do not overlap
+# the window is empty, so no day can be called missing and the report answered "gaps: none" for a week
+# in which nothing was observed at all -- the precise "plausible and badly wrong" answer this section
+# exists to prevent. Measured: a series ending 2026-08-02, asked for --week 2026-09-01.
+store="$work/store12"; fx="$work/fx12"; mkdir -p "$fx" "$store/events"
+cat > "$fx/clones.json" <<'JSON'
+{"count":10,"uniques":1,"clones":[
+{"timestamp":"2026-08-01T00:00:00Z","count":5,"uniques":1},
+{"timestamp":"2026-08-02T00:00:00Z","count":5,"uniques":1}
+]}
+JSON
+: > "$fx/releases.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+out9="$(sh "$report" --store "$store" --week 2026-09-01)"
+echo "$out9" | grep -qi 'gaps: *none' \
+  && fail "case 20: a week entirely outside the observed range reported no gaps"
+echo "$out9" | grep -qi 'collection stopped after 2026-08-02' \
+  || fail "case 20: the report did not say collection had stopped: $out9"
+pass "case 20: a week wholly outside the observed range says so instead of 'gaps: none'"
+
+# An expected series that nothing has ever written prints n/a. Printing nothing at all makes an absent
+# capture source indistinguishable from a quiet week, and those want opposite reactions.
+echo "$out9" | grep -qE 'views +n/a' \
+  || fail "case 21: a never-captured series printed nothing rather than n/a: $out9"
+pass "case 21: an expected series that was never captured prints n/a, not silence"
+
+# --- the one cross-check that catches a dead receiver ----------------------------------------------
+# Distribution signals and installs arrive by completely separate paths -- a pull from GitHub's API
+# against a push from the installer -- so traffic with no installs at all is either a real collapse
+# or, far more often, the callback failing quietly. Neither is visible in any single figure.
+store="$work/store13"; fx="$work/fx13"; mkdir -p "$fx"
+window > "$fx/clones.json"
+: > "$fx/releases.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+out10="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out10" | grep -qi 'WARNING: distribution signals are non-zero' \
+  || fail "case 22: traffic with no installs at all raised no warning: $out10"
+pass "case 22: traffic with no installs raises a warning rather than reading as a real ratio"
 
 printf 'funnel-capture-smoke: all cases passed\n'

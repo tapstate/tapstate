@@ -116,6 +116,10 @@ jobs:
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
           shellcheck deploy/install-site/verify-smoke.sh
+          shellcheck -s sh scripts/funnel-capture.sh
+          shellcheck -s sh scripts/funnel-publish.sh
+          shellcheck -s sh scripts/funnel-report.sh
+          shellcheck -s sh scripts/funnel-capture-smoke.sh
       - name: installer smoke
         run: bash install/install-smoke.sh
       - name: quickstart smoke
@@ -127,6 +131,13 @@ jobs:
       # is built in; there is no package.json and no dependency to install.
       - name: install event receiver tests
         run: node --test deploy/install-site/api/event.test.js
+
+      # The capture/report/publish half of the funnel is where a wrong number is produced silently: a
+      # double-counted window, a running total presented as a period, or a gap reported as zero all
+      # look entirely plausible on the page. Fixtures stand in for the API, so this needs no network
+      # and no credentials.
+      - name: funnel capture smoke
+        run: sh scripts/funnel-capture-smoke.sh
 
   catalog-scripts:
     # The catalog refresh driver and the connector build it calls are shell, and the driver is a gate:

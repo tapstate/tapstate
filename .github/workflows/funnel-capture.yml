@@ -13,8 +13,11 @@ name: funnel capture
 
 on:
   schedule:
-    # Weekly, comfortably inside the 14-day window so one missed run still loses nothing.
-    - cron: '17 4 * * 1'
+    # Twice weekly, Monday and Thursday. Weekly was NOT comfortably inside the 14-day window as it
+    # claimed: one missed run puts 14 days between successful captures, which is exactly when the
+    # oldest days expire -- the boundary, not a margin. Two runs a week means a single miss leaves at
+    # most 7 days, and two consecutive misses still leave under 14.
+    - cron: '17 4 * * 1,4'
   workflow_dispatch:
 
 permissions:

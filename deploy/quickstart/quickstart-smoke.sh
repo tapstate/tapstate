@@ -839,12 +839,17 @@ PYEOF
   qs_run() {   # $1 stdout file  $2 stderr file
     local outf="$1" errf="$2" shim
     DEMO="$(mktemp -d)/tapstate-demo"; mkdir -p "$DEMO"; cp "$QUICKSTART_SH" "$DEMO/quickstart.sh"
+    # A sandboxed HOME, so "the installer wrote nothing outside the demo directory" is a claim that
+    # can be checked at all. install.sh's default install directory is $HOME/.tapstate/bin, and the
+    # quickstart's TAPSTATE_INSTALL_DIR="$PWD" is the only thing keeping the identifier out of it.
+    QS_HOME="$(mktemp -d)"
     shim="$(mktemp -d)"
     # shellcheck disable=SC2016
     printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; *) echo unknown ;; esac\n' > "$shim/uname"
     chmod +x "$shim/uname"
     printf '#!/bin/sh\nexit 0\n' > "$shim/xattr"; chmod +x "$shim/xattr"
     ( cd "$DEMO" && PATH="$shim:$PATH" \
+      HOME="$QS_HOME" \
       TAPSTATE_VERSION="$VERSION" \
       TAPSTATE_BASE_URL="file://$CLI_STUB" \
       TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
@@ -883,13 +888,22 @@ PYEOF
   id_here="$(find "$DEMO" -name '.installation-id' 2>/dev/null | head -1)"
   if [ -n "$id_here" ]; then ok "the installation id is inside the demo directory"
   else bad "no installation id under the demo directory -- it was written somewhere rm -rf will not reach"; fi
+
+  # and it is the ONLY one: nothing was written where the documented cleanup cannot reach. Searched in
+  # the sandboxed HOME, which is where install.sh puts things when the quickstart's
+  # TAPSTATE_INSTALL_DIR seam is absent. The previous form of this case searched the demo directory
+  # AFTER rm -rf had removed it, so it could never return anything and therefore could never fail --
+  # it passed identically whether the product behaved or not.
+  stray="$(find "$QS_HOME" -name '*installation*' 2>/dev/null | head -1)"
+  if [ -z "$stray" ]; then ok "the installer writes no identifier outside the demo directory"
+  else bad "an identifier was written outside the demo directory, where rm -rf will not reach: $stray"; fi
+
   demo_parent="$(dirname "$DEMO")"
   rm -rf "$demo_parent"
-  if [ -n "$(find "$demo_parent" -name '*installation*' 2>/dev/null)" ]; then
-    bad "an identifier survived rm -rf of the demo directory"
-  else
-    ok "rm -rf of the demo directory leaves no identifier behind"
-  fi
+  left="$(find "$demo_parent" "$QS_HOME" -name '*installation*' 2>/dev/null | head -1)"
+  if [ -z "$left" ]; then ok "rm -rf of the demo directory leaves no identifier anywhere"
+  else bad "an identifier survived rm -rf of the demo directory: $left"; fi
+  rm -rf "$QS_HOME"
 
   rm -f "$qs_out" "$qs_err"
   kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null

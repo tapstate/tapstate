@@ -200,10 +200,12 @@ jobs:
             sleep 15
           done
 
-          # The receiver is a route, not content, so the byte comparison above cannot see it. A GET is
-          # the probe that stores nothing: the handler answers 405 to anything but POST, so 405 proves
-          # the function is deployed and reachable while writing no event. A 404 here means the site
-          # published with a /e rewrite pointing at nothing.
+          # The receiver is a route, not content, so the byte comparison above cannot see it. Two
+          # probes, neither of which stores anything.
+          #
+          # First: a GET. The handler answers 405 to anything but POST, so 405 proves the route
+          # resolves to the function. A 404 means the site published with a /e rewrite pointing at
+          # nothing.
           code="$(curl -s -o /dev/null -w '%{http_code}' "https://$SITE_DOMAIN/e")"
           if [ "$code" = "405" ]; then
             echo "ok: the event receiver is live (GET /e -> 405, as it should be)"
@@ -211,3 +213,23 @@ jobs:
             echo "the event receiver is not live: GET /e answered $code, expected 405" >&2
             exit 1
           fi
+
+          # Second: a POST the receiver must refuse. 400 proves the handler BODY ran -- the validator
+          # executed and rejected -- rather than only that a route exists, which is all 405 shows. A
+          # rewrite pointing at a stale or broken function can still answer 405 for a GET.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+                    -X POST -H 'Content-Type: application/json' \
+                    -d '{"installation_id":"no"}' "https://$SITE_DOMAIN/e")"
+          if [ "$code" = "400" ]; then
+            echo "ok: the receiver validates (POST of a malformed event -> 400)"
+          else
+            echo "the receiver did not validate: malformed POST answered $code, expected 400" >&2
+            exit 1
+          fi
+
+          # What is deliberately NOT probed here: a successful write. The only POST that reaches
+          # storage is a well-formed event, and sending one would fabricate an install in the very
+          # denominator this endpoint exists to measure -- a probe that corrupts its own measurement.
+          # A broken credential surfaces two other ways instead: the handler answers 500 rather than
+          # 204 when a store fails, so the platform's own function metrics show it, and the weekly
+          # report warns when distribution signals are non-zero while the install count is not.
