@@ -9,19 +9,27 @@ import picocli.CommandLine;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -30,6 +38,31 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * The JLine read loop itself is not unit-tested; {@link Repl#dispatch} is the testable seam.
  */
 class ReplTest {
+
+    private static final UUID TEST_CONTEXT_ID =
+            UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+    private static final UUID TEST_AUTH_REF =
+            UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+
+    private static ResolvedContext.Named namedContext(URI seed) {
+        return new ResolvedContext.Named(
+                "dev",
+                new ContextDefinition(TEST_CONTEXT_ID, List.of(seed), new ContextTls(true), TEST_AUTH_REF),
+                ResolvedContext.Source.EXPLICIT);
+    }
+
+    private static LoginOutcome.Success persistentLogin(
+            Instant now, String issuer, String principal, String sessionToken) {
+        return new LoginOutcome.Success(
+                "jwt-" + principal,
+                now.plusSeconds(900),
+                issuer,
+                principal,
+                List.of("read"),
+                sessionToken,
+                now.plusSeconds(3600),
+                now.plusSeconds(7200));
+    }
 
     private record Harness(Repl repl, StringWriter sink) {
     }
@@ -84,10 +117,18 @@ class ReplTest {
      */
     private static final class FakeControlPlane implements ControlPlaneClient {
         private final Set<URI> healthy;
+        final List<String> events = new ArrayList<>();
         final List<URI> probed = new ArrayList<>();
+        final List<URI> discovered = new ArrayList<>();
+        /** What the server answers when asked its version; null is a server that does not say. */
+        String serverVersion;
         /** The canned login outcome and a log of the login calls made ({@code user:pass@base}). */
         LoginOutcome loginOutcome = new LoginOutcome.Unreachable();
         final List<String> loginCalls = new ArrayList<>();
+        SessionExchangeOutcome exchangeOutcome = new SessionExchangeOutcome.Unreachable();
+        SessionLogoutOutcome logoutOutcome = new SessionLogoutOutcome.Unreachable();
+        final List<String> sessionCalls = new ArrayList<>();
+        Runnable beforeLogoutResult = () -> { };
 
         TokenCreateOutcome tokenCreateOutcome = new TokenCreateOutcome.Unreachable();
         TokenListOutcome tokenListOutcome = new TokenListOutcome.Unreachable();
@@ -183,6 +224,16 @@ class ReplTest {
             return healthy.contains(baseUrl);
         }
 
+        @Override
+        public DiscoveryOutcome discover(URI baseUrl) {
+            events.add("discover " + baseUrl);
+            discovered.add(baseUrl);
+            return healthy.contains(baseUrl)
+                    ? new DiscoveryOutcome.Discovered("urn:tapstate:cluster:test-cluster", "test-cluster",
+                            "tapstate/v1", List.of("password", "machine_token"))
+                    : new DiscoveryOutcome.Unreachable();
+        }
+
         /** Replaces the reachable set, so a test can knock a landing node down mid-session. */
         void setHealthy(URI... urls) {
             healthy.clear();
@@ -190,9 +241,37 @@ class ReplTest {
         }
 
         @Override
+        public String serverVersion(URI baseUrl) {
+            return healthy.contains(baseUrl) ? serverVersion : null;
+        }
+
+        @Override
         public LoginOutcome login(URI baseUrl, String username, String password) {
+            events.add("login " + baseUrl);
             loginCalls.add(username + ":" + password + "@" + baseUrl);
             return loginOutcome;
+        }
+
+        @Override
+        public LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
+            events.add("login " + baseUrl);
+            loginCalls.add(username + ":" + password + "@" + baseUrl + " persistent=" + createSession);
+            return loginOutcome;
+        }
+
+        @Override
+        public SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
+            events.add("exchange " + baseUrl);
+            sessionCalls.add("exchange " + sessionToken + "@" + baseUrl);
+            return exchangeOutcome;
+        }
+
+        @Override
+        public SessionLogoutOutcome logoutSession(URI baseUrl, String sessionToken) {
+            events.add("logout " + baseUrl);
+            sessionCalls.add("logout " + sessionToken + "@" + baseUrl);
+            beforeLogoutResult.run();
+            return logoutOutcome;
         }
 
         @Override
@@ -260,6 +339,7 @@ class ReplTest {
 
         @Override
         public ListOutcome list(URI baseUrl, String credential, String kind) {
+            events.add("list " + baseUrl);
             listCalls.add(credential + "@" + baseUrl + "?" + kind);
             return healthy.contains(baseUrl) ? listOutcome : new ListOutcome.Unreachable();
         }
@@ -623,6 +703,161 @@ class ReplTest {
         assertThat(h.sink().toString()).contains("connected").contains("node1:7900");
     }
 
+    /**
+     * C14. A CLI is installed by one path and a server pulled by another, so the two can be different
+     * builds; a reader who can only see one number states it with confidence when reporting what the
+     * other one did. Connecting is where both are known at once, so it is where both are said.
+     */
+    @Test
+    void connectingReportsBothVersionsAndStaysQuietWhenTheyAgree() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = buildVersion();
+        Harness h = harness(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("connect node1:7900")).isTrue();
+
+        String out = h.sink().toString();
+        assertThat(out).contains(buildVersion());
+        // The control group. Without a matched pair, an implementation that warns unconditionally
+        // passes the mismatch test just as well, and the warning would then mean nothing.
+        assertThat(out).doesNotContain("cli.version-mismatch");
+    }
+
+    @Test
+    void connectingToAServerOnAnotherVersionWarnsAndNamesBothNumbers() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = harness(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("connect node1:7900")).isTrue();
+        // A warning, not a refusal: the connection is good and every verb still works. Refusing here
+        // would make the CLI unusable against exactly the servers a reader most needs to inspect.
+        assertThat(h.repl().session().isConnected()).isTrue();
+
+        String out = h.sink().toString();
+        assertThat(out).contains("cli.version-mismatch");
+        // Both numbers, because "they differ" without saying how is a sentence nobody can act on.
+        assertThat(out).contains(buildVersion()).contains("9.9.9");
+    }
+
+    /**
+     * The boundary of C14: a version belongs on the human surface, never in output something else
+     * parses. This is a regression guard rather than a live defect -- today the banner is printed by
+     * connect alone, and connect has no {@code -o} -- so it is green the day it is written. What it
+     * exists to catch is the easiest future shortcut, printing the pair on every command, which fails
+     * nothing and no one notices until a caller's parser meets a line it has no grammar for.
+     */
+    @Test
+    void noVerbsMachineReadableOutputCarriesAVersionNumber() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.listOutcome = new ListOutcome.Listed(List.of(
+                new RemoteArtifact("src_kfk", "source", "kind: source\n")));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("ls -o json")).isTrue();
+        String machineReadable = h.sink().toString().substring(mark);
+
+        assertThat(machineReadable).doesNotContain(buildVersion()).doesNotContain("9.9.9");
+    }
+
+    @Test
+    void theVersionVerbAnswersWithBothNumbersOnceConnected() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out).contains(buildVersion()).contains("9.9.9").contains("node1:7900");
+    }
+
+    @Test
+    void theVersionVerbSaysThereIsNoServerRatherThanLeavingTheHalfBlank() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = harness(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("version")).isTrue();
+
+        String out = h.sink().toString();
+        assertThat(out).contains(buildVersion()).contains("not connected");
+        // Never a version number it did not get: an unconnected session has no server to report.
+        assertThat(out).doesNotContain("9.9.9");
+    }
+
+    @Test
+    void aReportedProblemCarriesTheServersVersionOnceThereIsOne() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = harness(Path.of("tap-work"), client);
+        assertThat(h.repl().dispatch("connect node1:7900")).isTrue();
+
+        int mark = h.sink().toString().length();
+        // any verb that needs a credential this session does not hold -- the diagnostic is the subject,
+        // not the verb
+        assertThat(h.repl().dispatch("ls")).isTrue();
+        String diagnostic = h.sink().toString().substring(mark);
+
+        assertThat(diagnostic).contains("cli.not-authenticated");
+        // The pair the session is actually running, not the offline default: a stamp that said "not
+        // connected" from inside a live session would be worse than none, because it reads as fact.
+        assertThat(diagnostic).contains("cli " + buildVersion()).contains("server 9.9.9");
+    }
+
+    /**
+     * The same stamp on the read shell's own refusal. Its connection checks are a second copy, made
+     * before the verb table is reached, so a version reaching the diagnostic above says nothing about
+     * this one: the shortcut that breaks it -- stamping where the verbs are dispatched -- leaves every
+     * other case exactly as it was.
+     */
+    @Test
+    void theReadShellsRefusalCarriesTheVersionsThisSessionIsRunning() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = harness(Path.of("tap-work"), client);
+        assertThat(h.repl().dispatch("connect node1:7900")).isTrue();
+
+        int mark = h.sink().toString().length();
+        h.repl().dispatch(List.of("data-browser", "views.order_state.find()"));
+        String diagnostic = h.sink().toString().substring(mark);
+
+        assertThat(diagnostic).contains("cli.not-authenticated");
+        assertThat(diagnostic).contains("cli " + buildVersion()).contains("server 9.9.9");
+    }
+
+    /**
+     * A server that answers the connection and says nothing about its version -- an older build, or one
+     * behind something that does not forward the endpoint. Not knowing is printed as not knowing. The
+     * two shapes it could take instead are both read as agreement: a blank where a number belongs, and
+     * the CLI's own number standing in for an answer that never came.
+     */
+    @Test
+    void theVersionVerbSaysNotReportedWhenTheServerAnswersWithoutOne() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = null;
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out).contains("not reported").contains("node1:7900");
+        // never its own number in the server's half -- that is the failure this shape exists to avoid
+        assertThat(out).doesNotContain("server " + buildVersion());
+    }
+
+    /** The version the build was run at -- handed in by surefire, so it is not read back off the code. */
+    private static String buildVersion() {
+        String projectVersion = System.getProperty("tapstate.project.version");
+        assertThat(projectVersion)
+                .as("the build must pass -Dtapstate.project.version so these guards can run at all")
+                .isNotBlank();
+        return projectVersion;
+    }
+
     @Test
     void connectTriesSeedsInOrderAndLandsOnTheFirstReachable() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node2:7900"));
@@ -814,66 +1049,66 @@ class ReplTest {
 
     @Test
     void loginReadsAMaskedPasswordAndAuthenticatesOnSuccess() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-abc");
         ScriptedPrompter prompter = new ScriptedPrompter("s3cret");
         Harness h = harness(Path.of("tap-work"), client, prompter);
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         assertThat(h.repl().dispatch("login alice")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isTrue();
         assertThat(h.repl().session().principal()).isEqualTo("alice");
         assertThat(h.repl().session().credential()).isEqualTo("jwt-abc");
         assertThat(prompter.secretQuestions).isNotEmpty();   // the password was read masked, never echoed
-        assertThat(client.loginCalls).containsExactly("alice:s3cret@http://node1:7900");
+        assertThat(client.loginCalls).containsExactly("alice:s3cret@http://localhost:7900");
         assertThat(h.sink().toString()).contains("logged in as alice");
     }
 
     @Test
     void authenticatedPromptShowsThePrincipalAtTheNode() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-abc");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("s3cret"));
-        h.repl().dispatch("connect node1:7900");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(node1:7900)> ");   // connected, unauthenticated
+        h.repl().dispatch("connect localhost:7900");
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(localhost:7900)> ");   // connected, unauthenticated
         h.repl().dispatch("login alice");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(alice@node1:7900)> ");
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(alice@localhost:7900)> ");
     }
 
     @Test
     void loginRejectedRendersTheServerErrorAndStaysUnauthenticated() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Rejected("control.auth-failed", "Login failed.");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("wrong"));
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         assertThat(h.repl().dispatch("login alice")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isFalse();
         assertThat(h.sink().toString()).contains("control.auth-failed").contains("Login failed.");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(node1:7900)> ");   // stays connected-unauthenticated
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(localhost:7900)> ");   // stays connected-unauthenticated
     }
 
     @Test
     void loginUnreachableReportsAndStaysUnauthenticated() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Unreachable();
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         assertThat(h.repl().dispatch("login alice")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isFalse();
-        assertThat(h.sink().toString()).contains("login:").contains("node1:7900");
+        assertThat(h.sink().toString()).contains("login:").contains("localhost:7900");
     }
 
     @Test
     void logoutClearsAuthenticationButKeepsTheConnection() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
         assertThat(h.repl().dispatch("logout")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isFalse();
         assertThat(h.repl().session().isConnected()).isTrue();
         assertThat(h.sink().toString()).contains("logged out");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(node1:7900)> ");
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(localhost:7900)> ");
     }
 
     @Test
@@ -889,17 +1124,18 @@ class ReplTest {
 
     @Test
     void failoverRelandsOnAnotherHealthyMemberKeepingTheCredential() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");      // both healthy -> lands n1, members = [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));   // n1 goes down
+        client.setHealthy(URI.create("http://localhost:7901"));   // the first seed goes down
         assertThat(h.repl().failover()).isTrue();
-        assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://n2:7900"));
+        assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://localhost:7901"));
         assertThat(h.repl().session().isAuthenticated()).isTrue();   // cluster-wide credential survives
         assertThat(h.repl().session().credential()).isEqualTo("jwt");
-        assertThat(h.repl().prompt()).isEqualTo("tapstate(alice@n2:7900)> ");
+        assertThat(h.repl().prompt()).isEqualTo("tapstate(alice@localhost:7901)> ");
     }
 
     @Test
@@ -915,10 +1151,10 @@ class ReplTest {
 
     @Test
     void failoverWithNoReachableMemberLosesTheConnection() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900");
+        h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
         client.setHealthy();   // nothing reachable
         assertThat(h.repl().failover()).isFalse();
@@ -954,32 +1190,32 @@ class ReplTest {
 
     /** An authenticated session with stdout and stderr kept apart. */
     private static SplitHarness onlineSplitStreamSession(Path workdir, FakeControlPlane client) {
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         SplitHarness h = splitStreamHarness(workdir, client);
-        h.repl().dispatch("connect node1:7900");
-        h.repl().dispatch("login alice");
+        authenticateOnNode1(h.repl());
         return h;
     }
 
     /** Connects to a single healthy node and logs in, so a test starts from an authenticated session. */
     private static Harness onlineSession(Path workdir, FakeControlPlane client) {
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         Harness h = harness(workdir, client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect node1:7900");
-        h.repl().dispatch("login alice");
+        authenticateOnNode1(h.repl());
         return h;
     }
 
     /**
-     * The same authenticated session over a prompter the test owns, for a case whose answers go on past
-     * the password. The script starts with the password, since signing in consumes the first answer.
+     * The same authenticated session over a prompter the test owns, for a case whose answers are its
+     * own. Signing in consumes no answer, so the script starts at the first question the case asks.
      */
     private static Harness onlineSession(Path workdir, FakeControlPlane client, ScriptedPrompter prompter) {
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         Harness h = harness(workdir, client, prompter);
-        h.repl().dispatch("connect node1:7900");
-        h.repl().dispatch("login alice");
+        authenticateOnNode1(h.repl());
         return h;
+    }
+
+    private static void authenticateOnNode1(Repl repl) {
+        URI seed = URI.create("http://node1:7900");
+        repl.session().connect(List.of(seed), seed);
+        repl.session().authenticate("jwt-tok", "alice", null, List.of(seed));
     }
 
     // ---- the read shell ----
@@ -1328,10 +1564,8 @@ class ReplTest {
 
     /** An authenticated session whose interpolation reads {@code env} instead of the process environment. */
     private static Harness onlineSession(Path workdir, FakeControlPlane client, Map<String, String> env) {
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         Harness h = harness(workdir, client, new ScriptedPrompter("pw"), env);
-        h.repl().dispatch("connect node1:7900");
-        h.repl().dispatch("login alice");
+        authenticateOnNode1(h.repl());
         return h;
     }
 
@@ -1451,19 +1685,19 @@ class ReplTest {
     @Test
     void aRemovalThatGetsNoAnswerIsSentOnceAndNeverReplayedElsewhere() {
         FakeControlPlane client = new FakeControlPlane(
-                URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");       // lands n1, members = [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));    // n1 takes the removal, then goes quiet
+        client.setHealthy(URI.create("http://localhost:7901"));    // the first seed takes the removal, then goes quiet
         int mark = h.sink().toString().length();
 
         assertThat(h.repl().dispatch("delete src_kfk --if-match " + "a".repeat(64))).isTrue();
 
-        // One call, to the node that went quiet — n2 is reachable and would have taken a replay.
+        // One call, to the node that went quiet — the second seed is reachable and would have taken a replay.
         assertThat(client.deleteCalls).hasSize(1);
-        assertThat(client.deleteCalls.get(0)).contains("http://n1:7900");
+        assertThat(client.deleteCalls.get(0)).contains("http://localhost:7900");
         // And the report says which it is: neither "deleted" nor "not found", both of which would be
         // asserting something nobody here knows.
         assertThat(h.sink().toString().substring(mark)).contains("may or may not have been applied");
@@ -1784,6 +2018,22 @@ class ReplTest {
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("src_kfk").contains("kfk2my").contains("source").contains("pipeline");
         assertThat(client.listCalls).containsExactly("jwt-tok@http://node1:7900?null");
+    }
+
+    @Test
+    void lsWhileConnectedShowsUnreadableServerArtifactsWithoutFailingTheListing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.listOutcome = new ListOutcome.Listed(List.of(
+                new RemoteArtifact("src_kfk", "source", "kind: source\n"),
+                new RemoteArtifact("p1", "pipeline", "not: [valid", false)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("ls")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("src_kfk").contains("p1").contains("unreadable");
+        assertThat(h.repl().lastExitCode()).isZero();
     }
 
     @Test
@@ -3047,7 +3297,7 @@ class ReplTest {
     @Test
     void onlineLsSourcesTheServerAndNeverTheLocalWorkspace(@TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);   // a real local workspace: source/src_kfk + pipeline/kfk2my
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of());
         Harness h = harness(base, client, new ScriptedPrompter("pw"));
         // precondition: offline, ls really does read these local artifacts (so the guard below is load-bearing)
@@ -3055,7 +3305,7 @@ class ReplTest {
         assertThat(h.sink().toString()).contains("src_kfk").contains("kfk2my");
         // once online, the same session's ls sources the (empty) server, not that local workspace
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        h.repl().dispatch("connect node1:7900");
+        h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
         int mark = h.sink().toString().length();
         h.repl().dispatch("ls");
@@ -3587,17 +3837,18 @@ class ReplTest {
 
     @Test
     void aLifecycleVerbFailsOverToAHealthyMemberAndRetriesOnceOnTheNewNode() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");   // land n1, members [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));   // n1 goes down before the request
+        client.setHealthy(URI.create("http://localhost:7901"));   // the first seed goes down before the request
         int mark = h.sink().toString().length();
         h.repl().dispatch("start pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("reconnected to n2:7900");
+        assertThat(out).contains("reconnected to localhost:7901");
         assertThat(out).contains("pl1").contains("running");
     }
 
@@ -4035,17 +4286,18 @@ class ReplTest {
 
     @Test
     void aReadVerbFailsOverToAHealthyMemberAndRetriesOnceOnTheNewNode() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");   // land n1, members [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));   // n1 goes down before the request
+        client.setHealthy(URI.create("http://localhost:7901"));   // the first seed goes down before the request
         int mark = h.sink().toString().length();
         h.repl().dispatch("status pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("reconnected to n2:7900");
+        assertThat(out).contains("reconnected to localhost:7901");
         assertThat(out).contains("pl1").contains("running");
     }
 
@@ -4066,31 +4318,32 @@ class ReplTest {
 
     @Test
     void anOnlineVerbFailsOverToAHealthyMemberAndRetriesOnceOnTheNewNode() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"), URI.create("http://n2:7900"));
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", "kind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900,n2:7900");   // land n1, members [n1, n2]
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
-        client.setHealthy(URI.create("http://n2:7900"));   // n1 goes down before the request
+        client.setHealthy(URI.create("http://localhost:7901"));   // the first seed goes down before the request
 
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("reconnected to n2:7900").contains("kind: source");
-        assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://n2:7900"));
-        // the verb was attempted on n1 (unreachable) then retried on n2 after failover, credential intact
+        assertThat(out).contains("reconnected to localhost:7901").contains("kind: source");
+        assertThat(h.repl().session().landingNode()).isEqualTo(URI.create("http://localhost:7901"));
+        // the verb was attempted on the first seed (unreachable) then retried after failover, credential intact
         assertThat(client.getCalls).containsExactly(
-                "jwt-tok@http://n1:7900/src_kfk", "jwt-tok@http://n2:7900/src_kfk");
+                "jwt-tok@http://localhost:7900/src_kfk", "jwt-tok@http://localhost:7901/src_kfk");
     }
 
     @Test
     void anOnlineVerbWithNoReachableMemberLosesTheConnectionAndReportsItOnce() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://n1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact("x", "source", "kind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
-        h.repl().dispatch("connect n1:7900");
+        h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
         client.setHealthy();   // every member is down
 
@@ -4167,43 +4420,848 @@ class ReplTest {
         assertThat(h.repl().lastExitCode()).isEqualTo(2);
     }
 
-    // --- one-line launch: -c / -u / -p establish the session before anything runs ------------------
+    // --- one-line launch: -c / -u establish the session before anything runs ------------------------
 
     @Test
     void aOneLineLaunchConnectsSignsInAndRunsTheCommand() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.listOutcome = new ListOutcome.Listed(List.of(
                 new RemoteArtifact("src_kfk", "source", "")));
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "ls");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "ls")
+                .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
         int code = Cli.runSession(launch, client, () -> new ScriptedPrompter());
         assertThat(code).isZero();
         // the whole chain ran off one line: probe, credential exchange, then the verb against the server
-        assertThat(client.loginCalls).containsExactly("admin:pw@http://node1:7900");
+        assertThat(client.discovered).containsExactly(URI.create("http://localhost:7900"));
+        assertThat(client.loginCalls).containsExactly("admin:pw@http://localhost:7900");
         assertThat(client.listCalls).hasSize(1);
+    }
+
+    @Test
+    void aRemotePlaintextLaunchStopsBeforeReadingOrSendingThePassword() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        ScriptedPrompter prompter = new ScriptedPrompter("should-not-be-read");
+        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "ls")
+                .withEnv(name -> null);
+
+        int code = Cli.runSession(launch, client, () -> prompter);
+
+        assertThat(code).isNotZero();
+        assertThat(prompter.secretQuestions).isEmpty();
+        assertThat(client.discovered).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(client.listCalls).isEmpty();
+    }
+
+    @Test
+    void aRemotePlaintextReplLoginStopsBeforePromptingOrSendingThePassword() {
+        URI seed = URI.create("http://node1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        ScriptedPrompter prompter = new ScriptedPrompter("should-not-be-read");
+        Harness harness = harness(Path.of("tap-work"), client, prompter);
+
+        harness.repl().dispatch("connect node1:7900");
+        harness.repl().dispatch("login admin");
+
+        assertThat(prompter.secretQuestions).isEmpty();
+        assertThat(client.discovered).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(harness.sink().toString()).contains("cli.remote-plaintext");
+    }
+
+    @Test
+    void onlineDispatcherLazilyConnectsTheExactWorkspaceContext(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://dev:7900");
+        ContextDefinition definition = new ContextDefinition(
+                java.util.UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"), List.of(seed),
+                new ContextTls(true),
+                java.util.UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed"));
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        PrintWriter writer = new PrintWriter(sink);
+        commandLine.setOut(writer);
+        commandLine.setErr(writer);
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null);
+
+        repl.dispatch(List.of("ls"));
+
+        assertThat(client.probed).containsExactly(seed);
+        assertThat(repl.session().isConnected()).isTrue();
+        assertThat(sink.toString()).contains("cli.not-authenticated");
+    }
+
+    @Test
+    void authCommandsPersistResumeReportAndRemotelyRevokeTheNamedContext(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        client.loginOutcome = new LoginOutcome.Success(
+                "jwt-login", now.plusSeconds(900), "urn:tapstate:cluster:test-cluster", "alice",
+                List.of("read", "write"), "tss_s01.session-secret", now.plusSeconds(2_592_000),
+                now.plusSeconds(7_776_000));
+        client.exchangeOutcome = new SessionExchangeOutcome.Success(
+                "jwt-resumed", now.plusSeconds(900), "urn:tapstate:cluster:test-cluster", "alice",
+                List.of("read", "write"));
+        client.logoutOutcome = new SessionLogoutOutcome.Success();
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        AuthFileStore store = AuthFileStore.underHome(home);
+        Clock clock = Clock.fixed(now, ZoneOffset.UTC);
+
+        CommandLine loginLine = Cli.newCommandLine();
+        StringWriter loginOut = new StringWriter();
+        StringWriter loginErr = new StringWriter();
+        loginLine.setOut(new PrintWriter(loginOut));
+        loginLine.setErr(new PrintWriter(loginErr));
+        Repl login = new Repl(loginLine, workspace, client, new ScriptedPrompter("pw"),
+                name -> null, resolver, null, new AuthService(client, store, clock));
+        login.terminalCheck(() -> true);
+        login.dispatch(List.of("auth", "login", "alice"), true);
+
+        assertThat(login.lastExitCode()).isZero();
+        assertThat(loginOut.toString()).isEmpty();
+        assertThat(loginErr.toString()).contains("signed in as alice").doesNotContain("pw");
+        assertThat(login.session().credential()).isEqualTo("jwt-login");
+        assertThat(client.loginCalls).containsExactly("alice:pw@http://127.0.0.1:7900 persistent=true");
+        assertThat(store.load(authRef, contextId)).get()
+                .extracting(AuthSessionRecord::sessionToken).isEqualTo("tss_s01.session-secret");
+        login.dispatch(List.of("disconnect"), true);
+        assertThat(login.session().isConnected()).isFalse();
+        assertThat(store.load(authRef, contextId)).isPresent();
+
+        CommandLine resumedLine = Cli.newCommandLine();
+        StringWriter resumedOutput = new StringWriter();
+        resumedLine.setOut(new PrintWriter(resumedOutput));
+        resumedLine.setErr(new PrintWriter(resumedOutput));
+        Repl resumed = new Repl(resumedLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null, new AuthService(client, store, clock));
+        resumed.dispatch(List.of("ls"), true);
+        resumed.dispatch(List.of("auth", "status"), true);
+        resumed.dispatch(List.of("auth", "logout"), true);
+
+        assertThat(client.sessionCalls).contains(
+                "exchange tss_s01.session-secret@http://127.0.0.1:7900",
+                "logout tss_s01.session-secret@http://127.0.0.1:7900");
+        assertThat(resumedOutput.toString()).contains("signed in as alice").contains("session revoked");
+        assertThat(store.load(authRef, contextId)).isEmpty();
+    }
+
+    @Test
+    void authServiceRendersRejectedAndUnreachableLoginOutcomes(@TempDir Path home) {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ResolvedContext.Named context = namedContext(seed);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        AuthService service = new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(Instant.parse("2026-08-17T10:00:00Z"), ZoneOffset.UTC));
+
+        client.loginOutcome = new LoginOutcome.Rejected("control.auth-failed", "bad credential");
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Rejected("control.auth-failed", "alice"));
+
+        client.loginOutcome = new LoginOutcome.Rejected("control.rate-limited", "try later");
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Rejected("unknown", "alice"));
+
+        client.loginOutcome = new LoginOutcome.Unreachable();
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Unreachable());
+    }
+
+    @Test
+    void authServiceFailsClosedForNonPersistentOrInvalidLoginSuccess(@TempDir Path home) {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ResolvedContext.Named context = namedContext(seed);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthService service = new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(now, ZoneOffset.UTC));
+
+        client.loginOutcome = new LoginOutcome.Success("jwt");
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Unreachable());
+
+        client.loginOutcome = persistentLogin(now, "urn:tapstate:cluster:other", "alice",
+                "tss_alice.other");
+        assertThatThrownBy(() -> service.login(context, "alice", "pw", false))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-issuer-mismatch"));
+
+        client.loginOutcome = new LoginOutcome.Success("jwt-alice", now.minusSeconds(1),
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_alice.expired", now.plusSeconds(3600), now.plusSeconds(7200));
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Unreachable());
+
+        client.loginOutcome = new LoginOutcome.Success("jwt-alice", now.plusSeconds(900),
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_alice.idle", now.minusSeconds(1), now.plusSeconds(7200));
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Unreachable());
+    }
+
+    @Test
+    void authServiceUsesProcessMemoryWhenInteractiveCachePersistenceIsUnsafe(@TempDir Path home)
+            throws IOException {
+        assumeTrue(Files.getFileStore(home).supportsFileAttributeView("posix"));
+        Path root = Files.createDirectory(home.resolve(".tapstate"));
+        Files.setPosixFilePermissions(root, Set.of(PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE,
+                PosixFilePermission.GROUP_READ));
+
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ResolvedContext.Named context = namedContext(seed);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        client.loginOutcome = persistentLogin(now,"urn:tapstate:cluster:test-cluster", "alice",
+                "tss_alice.memory");
+        AuthService service = new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(now, ZoneOffset.UTC));
+
+        AuthService.LoginResult result = service.login(context, "alice", "pw", true);
+
+        assertThat(result).isInstanceOfSatisfying(AuthService.LoginResult.Success.class,
+                success -> assertThat(success.storage()).isEqualTo(AuthFileStore.SaveResult.MEMORY_ONLY));
+        assertThat(service.resume(context)).isPresent();
+        assertThat(service.status(context)).isInstanceOf(AuthService.Status.SignedIn.class);
+        assertThat(service.logout(context, true)).isEqualTo(new AuthService.LogoutResult.Removed(true));
+        assertThat(service.status(context)).isEqualTo(new AuthService.Status.SignedOut());
+    }
+
+    @Test
+    void authServiceKeepsCachesForRejectedOrUnreachableRemoteLogoutAndDetectsMemoryReplacement(
+            @TempDir Path home) throws IOException {
+        assumeTrue(Files.getFileStore(home).supportsFileAttributeView("posix"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ResolvedContext.Named context = namedContext(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+
+        AuthFileStore store = AuthFileStore.underHome(home);
+        AuthSessionRecord cached = new AuthSessionRecord(1, context.definition().authRef(),
+                context.definition().id(), "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_alice.persisted", now, now.plusSeconds(3600), now.plusSeconds(7200));
+        store.save(cached, false);
+
+        FakeControlPlane client = new FakeControlPlane(seed);
+        AuthService service = new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC));
+        client.logoutOutcome = new SessionLogoutOutcome.Rejected("control.auth-failed", "bad session");
+        assertThat(service.logout(context, false))
+                .isEqualTo(new AuthService.LogoutResult.Rejected("unknown", "alice"));
+        assertThat(store.load(context.definition().authRef(), context.definition().id())).contains(cached);
+
+        client.logoutOutcome = new SessionLogoutOutcome.Unreachable();
+        assertThat(service.logout(context, false)).isEqualTo(new AuthService.LogoutResult.Unreachable());
+        assertThat(store.load(context.definition().authRef(), context.definition().id())).contains(cached);
+
+        Path root = home.resolve(".tapstate");
+        Files.setPosixFilePermissions(root, Set.of(PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE,
+                PosixFilePermission.GROUP_READ));
+        AuthService memoryService = new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(now, ZoneOffset.UTC));
+        client.loginOutcome = persistentLogin(now, "urn:tapstate:cluster:test-cluster", "alice",
+                "tss_alice.old");
+        memoryService.login(context, "alice", "pw", true);
+        client.logoutOutcome = new SessionLogoutOutcome.Success();
+        client.beforeLogoutResult = () -> {
+            client.loginOutcome = persistentLogin(now, "urn:tapstate:cluster:test-cluster", "bob",
+                    "tss_bob.new");
+            memoryService.login(context, "bob", "pw", true);
+        };
+        assertThat(memoryService.logout(context, false))
+                .isEqualTo(new AuthService.LogoutResult.CacheChanged());
+    }
+
+    @Test
+    void temporaryConnectAndLegacyLoginNeverCreateAnAuthCache(@TempDir Path home) {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.loginOutcome = new LoginOutcome.Success("jwt-temporary");
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, home, client, new ScriptedPrompter("pw"), name -> null,
+                new ContextResolver(ContextConfig::empty, name -> null), null,
+                new AuthService(client, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        repl.dispatch(List.of("connect", seed.toString()));
+        repl.dispatch(List.of("login", "alice"));
+
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(repl.session().credential()).isEqualTo("jwt-temporary");
+        assertThat(client.loginCalls).containsExactly("alice:pw@http://127.0.0.1:7900");
+        assertThat(home.resolve(".tapstate/auth")).doesNotExist();
+    }
+
+    @Test
+    void authHelpDoesNotResolveAContextOrTouchTheNetwork(@TempDir Path workspace) {
+        AtomicInteger configReads = new AtomicInteger();
+        ContextResolver resolver = new ContextResolver(() -> {
+            configReads.incrementAndGet();
+            return ContextConfig.empty();
+        }, name -> null);
+        FakeControlPlane client = new FakeControlPlane();
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null, null);
+
+        repl.dispatch(List.of("auth", "--help"), true);
+
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(output.toString()).contains("tapstate auth <login|status|logout>")
+                .contains("--local-only");
+        assertThat(configReads).hasValue(0);
+        assertThat(client.probed).isEmpty();
+    }
+
+    @Test
+    void contextCommandCreatesAndBindsThroughTheSharedManager(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+        ScriptedPrompter prompter = new ScriptedPrompter(
+                "Create a context", "dev", "http://127.0.0.1:7900", "", "y");
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, new FakeControlPlane(), prompter, name -> null,
+                new ContextResolver(store, name -> null), null, null, new ContextManager(store));
+
+        repl.dispatch(List.of("context"), true);
+
+        ContextConfig saved = store.load();
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(saved.contexts()).containsOnlyKeys("dev");
+        assertThat(saved.contexts().get("dev").seeds()).containsExactly(URI.create("http://127.0.0.1:7900"));
+        assertThat(saved.workspaceBindings()).containsEntry(workspace.toRealPath().toString(), "dev");
+        assertThat(output.toString()).contains("created context dev").contains("bound dev");
+    }
+
+    @Test
+    void ctxBuiltinCanChooseEditUnbindAndDeleteThroughTheSharedManager(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+        ContextManager manager = new ContextManager(store);
+        manager.create("dev", List.of(URI.create("http://127.0.0.1:7900")), true);
+        manager.create("prod", List.of(URI.create("https://prod.example.com")), true);
+        manager.bind(workspace, "dev");
+        ScriptedPrompter prompter = new ScriptedPrompter(
+                "Choose a context", "prod",
+                "Edit a context", "prod", "https://prod2.example.com", "n",
+                "Unbind this workspace",
+                "Delete a context", "prod", "yes", "yes");
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, new FakeControlPlane(), prompter, name -> null,
+                new ContextResolver(store, name -> null), null, null, manager);
+
+        repl.dispatch(":ctx");
+        repl.dispatch(":ctx");
+        repl.dispatch(":ctx");
+        repl.dispatch(":ctx");
+
+        ContextConfig saved = store.load();
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(saved.lastContext()).isNull();
+        assertThat(saved.contexts()).containsOnlyKeys("dev");
+        assertThat(saved.workspaceBindings()).isEmpty();
+        assertThat(output.toString()).contains("chose context prod")
+                .contains("updated context prod")
+                .contains("unbound dev")
+                .contains("authRef")
+                .contains("deleted context prod");
+    }
+
+    @Test
+    void failedRemoteLogoutKeepsTheCacheWhileLocalOnlyRemovesItWithAWarning(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthSessionRecord record = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.session-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(record, false);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null, new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.dispatch(List.of("auth", "logout"), true);
+        assertThat(repl.lastExitCode()).isNotZero();
+        assertThat(store.load(authRef, contextId)).contains(record);
+        assertThat(output.toString()).contains("local cache was kept");
+
+        repl.dispatch(List.of("auth", "logout", "--local-only"), true);
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(store.load(authRef, contextId)).isEmpty();
+        assertThat(output.toString()).contains("remote session remains valid until expiry");
+    }
+
+    @Test
+    void freshProcessLocalOnlyLogoutResolvesNamedContextWithoutAnyNetwork(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        FakeControlPlane unreachable = new FakeControlPlane();
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.session-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000)),
+                false);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, unreachable, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> config, name -> null), null,
+                new AuthService(unreachable, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.dispatch(List.of("auth", "logout", "--local-only"), true);
+
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(store.load(authRef, contextId)).isEmpty();
+        assertThat(unreachable.probed).isEmpty();
+        assertThat(unreachable.discovered).isEmpty();
+        assertThat(unreachable.sessionCalls).isEmpty();
+        assertThat(output.toString()).contains("remote session remains valid until expiry");
+    }
+
+    @Test
+    void remoteLogoutOfOldSessionNeverDeletesConcurrentReplacement(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.logoutOutcome = new SessionLogoutOutcome.Success();
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthSessionRecord oldRecord = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.old-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
+        AuthSessionRecord replacement = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "bob", List.of("read"),
+                "tss_s02.new-secret", now.plusSeconds(1), now.plusSeconds(2_592_001),
+                now.plusSeconds(7_776_001));
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(oldRecord, false);
+        client.beforeLogoutResult = () -> AuthFileStore.underHome(home).save(replacement, false);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> config, name -> null), null,
+                new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.dispatch(List.of("auth", "logout"), true);
+
+        assertThat(repl.lastExitCode()).isNotZero();
+        assertThat(store.load(authRef, contextId)).contains(replacement);
+        assertThat(client.sessionCalls).containsExactly("logout tss_s01.old-secret@" + seed);
+        assertThat(output.toString()).contains("cli.auth-logout-cache-changed")
+                .doesNotContain("tss_s01.old-secret", "tss_s02.new-secret");
+    }
+
+    @Test
+    void cachedNamedSessionResumesForDataBrowserAliasesAndLiveViews(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.session-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000)),
+                false);
+        List<String> commands = List.of(
+                "data-browser show collections views",
+                "show collections views",
+                "views.orders.find()",
+                "tail views.orders");
+
+        for (String command : commands) {
+            FakeControlPlane client = new FakeControlPlane(seed);
+            client.exchangeOutcome = new SessionExchangeOutcome.Success(
+                    "jwt-resumed", now.plusSeconds(900), "urn:tapstate:cluster:test-cluster", "alice",
+                    List.of("read"));
+            client.collectionsOutcome = new DataBrowserOutcome.Collections.Listed(List.of("orders"));
+            client.findOutcome = new DataBrowserOutcome.Find.Read(List.of(), null, false);
+            client.tailRefusal = "data-browser.follow-idle";
+            CommandLine commandLine = Cli.newCommandLine();
+            StringWriter output = new StringWriter();
+            commandLine.setOut(new PrintWriter(output));
+            commandLine.setErr(new PrintWriter(output));
+            Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                    new ContextResolver(() -> config, name -> null), null,
+                    new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+            repl.dispatch(command);
+
+            assertThat(client.discovered).as(command).containsExactly(seed);
+            assertThat(client.sessionCalls).as(command)
+                    .containsExactly("exchange tss_s01.session-secret@" + seed);
+            assertThat(client.dataBrowserCalls).as(command).isNotEmpty();
+        }
+    }
+
+    @Test
+    void machineTokenWinsOverACachedHumanSessionWithoutPersistingOrExchangingIt(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        AuthSessionRecord cached = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.cached-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
+        store.save(cached, false);
+        Path cachePath = home.resolve(".tapstate/auth").resolve(authRef + ".json");
+        String cacheBefore = Files.readString(cachePath);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> config, name -> null), null,
+                new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.installMachineToken("machine-token-secret");
+        repl.dispatch(List.of("ls"), true);
+
+        assertThat(repl.lastExitCode()).isZero();
+        assertThat(client.discovered).containsExactly(seed);
+        assertThat(client.sessionCalls).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(client.listCalls).containsExactly("machine-token-secret@http://127.0.0.1:7900?null");
+        assertThat(Files.readString(cachePath)).isEqualTo(cacheBefore);
+        assertThat(output.toString()).doesNotContain("machine-token-secret", "tss_s01.cached-secret");
+    }
+
+    @Test
+    void launchMachineTokenDiscoversIssuerBeforeSendingBearerAndNeverUsesHumanAuth() {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        LaunchOptions launch = LaunchOptions.parse(
+                "--connect", seed.toString(), "--token", "machine-token-secret", "ls")
+                .withEnv(name -> null);
+
+        int code = Cli.runSession(launch, client, () -> new ScriptedPrompter());
+
+        assertThat(code).isZero();
+        assertThat(client.events).containsExactly(
+                "discover http://127.0.0.1:7900",
+                "list http://127.0.0.1:7900");
+        assertThat(client.sessionCalls).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(client.listCalls).containsExactly("machine-token-secret@http://127.0.0.1:7900?null");
+    }
+
+    @Test
+    void machineTokenAuthCommandsAndBareLogoutDoNotTouchCachedHumanAuth(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(
+                contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        AuthSessionRecord cached = new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
+                "tss_s01.cached-secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
+        store.save(cached, false);
+        Path cachePath = home.resolve(".tapstate/auth").resolve(authRef + ".json");
+        byte[] cacheBefore = Files.readAllBytes(cachePath);
+
+        for (List<String> command : List.of(
+                List.of("auth", "status"),
+                List.of("auth", "logout"),
+                List.of("logout"))) {
+            FakeControlPlane client = new FakeControlPlane(seed);
+            CommandLine commandLine = Cli.newCommandLine();
+            StringWriter output = new StringWriter();
+            commandLine.setOut(new PrintWriter(output));
+            commandLine.setErr(new PrintWriter(output));
+            Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                    new ContextResolver(() -> config, name -> null), null,
+                    new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+            repl.installMachineToken("machine-token-secret");
+            repl.dispatch(command, true);
+
+            assertThat(repl.lastExitCode()).as(command.toString()).isZero();
+            assertThat(client.sessionCalls).as(command.toString()).isEmpty();
+            assertThat(client.loginCalls).as(command.toString()).isEmpty();
+            assertThat(Files.readAllBytes(cachePath)).as(command.toString()).isEqualTo(cacheBefore);
+            assertThat(output.toString()).as(command.toString())
+                    .doesNotContain("machine-token-secret", "tss_s01.cached-secret");
+        }
+    }
+
+    @Test
+    void machineTokenLocalAuthCommandsDoNotNeedAContextOrNetwork(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+
+        FakeControlPlane statusClient = new FakeControlPlane();
+        CommandLine statusLine = Cli.newCommandLine();
+        StringWriter statusOutput = new StringWriter();
+        statusLine.setOut(new PrintWriter(statusOutput));
+        statusLine.setErr(new PrintWriter(statusOutput));
+        Repl statusRepl = new Repl(statusLine, workspace, statusClient, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> new ContextConfig(1, null, Map.of(), Map.of()), name -> null), null,
+                new AuthService(statusClient, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        statusRepl.installMachineToken("machine-token-secret");
+        statusRepl.dispatch(List.of("auth", "status"), true);
+
+        assertThat(statusRepl.lastExitCode()).isZero();
+        assertThat(statusClient.probed).isEmpty();
+        assertThat(statusClient.discovered).isEmpty();
+        assertThat(statusClient.sessionCalls).isEmpty();
+        assertThat(statusClient.loginCalls).isEmpty();
+        assertThat(statusOutput.toString())
+                .contains("machine token selected")
+                .doesNotContain("machine-token-secret");
+
+        FakeControlPlane logoutClient = new FakeControlPlane();
+        CommandLine logoutLine = Cli.newCommandLine();
+        StringWriter logoutOutput = new StringWriter();
+        logoutLine.setOut(new PrintWriter(logoutOutput));
+        logoutLine.setErr(new PrintWriter(logoutOutput));
+        Repl logoutRepl = new Repl(logoutLine, workspace, logoutClient, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> new ContextConfig(1, null, Map.of(), Map.of()), name -> null), null,
+                new AuthService(logoutClient, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        logoutRepl.installMachineToken("machine-token-secret");
+        logoutRepl.dispatch(List.of("auth", "logout"), true);
+
+        assertThat(logoutRepl.lastExitCode()).isZero();
+        assertThat(logoutClient.probed).isEmpty();
+        assertThat(logoutClient.discovered).isEmpty();
+        assertThat(logoutClient.sessionCalls).isEmpty();
+        assertThat(logoutClient.loginCalls).isEmpty();
+        assertThat(logoutOutput.toString())
+                .contains("machine token cleared")
+                .doesNotContain("machine-token-secret");
+
+        FakeControlPlane localOnlyLogoutClient = new FakeControlPlane();
+        CommandLine localOnlyLogoutLine = Cli.newCommandLine();
+        StringWriter localOnlyLogoutOutput = new StringWriter();
+        localOnlyLogoutLine.setOut(new PrintWriter(localOnlyLogoutOutput));
+        localOnlyLogoutLine.setErr(new PrintWriter(localOnlyLogoutOutput));
+        Repl localOnlyLogoutRepl = new Repl(
+                localOnlyLogoutLine, workspace, localOnlyLogoutClient, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> new ContextConfig(1, null, Map.of(), Map.of()), name -> null), null,
+                new AuthService(localOnlyLogoutClient, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        localOnlyLogoutRepl.installMachineToken("machine-token-secret");
+        localOnlyLogoutRepl.dispatch(List.of("auth", "logout", "--local-only"), true);
+
+        assertThat(localOnlyLogoutRepl.lastExitCode()).isZero();
+        assertThat(localOnlyLogoutClient.probed).isEmpty();
+        assertThat(localOnlyLogoutClient.discovered).isEmpty();
+        assertThat(localOnlyLogoutClient.sessionCalls).isEmpty();
+        assertThat(localOnlyLogoutClient.loginCalls).isEmpty();
+        assertThat(localOnlyLogoutOutput.toString())
+                .contains("machine token cleared")
+                .doesNotContain("machine-token-secret");
+    }
+
+    @Test
+    void machineTokenRefusesRemotePlaintextBeforeDiscoveryOrBearerUse(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://node1:7900");
+        ContextDefinition definition = new ContextDefinition(
+                UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"), List.of(seed),
+                new ContextTls(true), UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed"));
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        FakeControlPlane client = new FakeControlPlane(seed);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                new ContextResolver(() -> config, name -> null), null,
+                new AuthService(client, AuthFileStore.underHome(home), Clock.systemUTC()));
+
+        repl.installMachineToken("machine-token-secret");
+        repl.dispatch(List.of("ls"), true);
+
+        assertThat(repl.lastExitCode()).isNotZero();
+        assertThat(client.discovered).isEmpty();
+        assertThat(client.sessionCalls).isEmpty();
+        assertThat(client.loginCalls).isEmpty();
+        assertThat(client.listCalls).isEmpty();
+        assertThat(output.toString()).contains("cli.remote-plaintext")
+                .doesNotContain("machine-token-secret");
+    }
+
+    @Test
+    void cachedSessionIsNeverExchangedWhenAnonymousDiscoveryFindsAnotherIssuer(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        UUID contextId = UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
+        UUID authRef = UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+        ContextDefinition definition = new ContextDefinition(contextId, List.of(seed), new ContextTls(true), authRef);
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        AuthFileStore store = AuthFileStore.underHome(home);
+        store.save(new AuthSessionRecord(1, authRef, contextId,
+                "urn:tapstate:cluster:replaced", "alice", List.of("read"),
+                "tss_must-not-be-sent.secret", now, now.plusSeconds(2_592_000), now.plusSeconds(7_776_000)),
+                false);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null, new AuthService(client, store, Clock.fixed(now, ZoneOffset.UTC)));
+
+        repl.dispatch("show collections views");
+
+        assertThat(repl.lastExitCode()).isNotZero();
+        assertThat(client.discovered).containsExactly(seed);
+        assertThat(client.sessionCalls).isEmpty();
+        assertThat(output.toString()).contains("cli.auth-issuer-mismatch")
+                .doesNotContain("tss_must-not-be-sent.secret");
+    }
+
+    @Test
+    void liveViewDispatcherLazilyConnectsTheExactWorkspaceContext(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://dev:7900");
+        ContextDefinition definition = new ContextDefinition(
+                java.util.UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"), List.of(seed),
+                new ContextTls(true),
+                java.util.UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed"));
+        ContextConfig config = new ContextConfig(1, null, Map.of("dev", definition),
+                Map.of(workspace.toRealPath().toString(), "dev"));
+        ContextResolver resolver = new ContextResolver(() -> config, name -> null);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        PrintWriter writer = new PrintWriter(sink);
+        commandLine.setOut(writer);
+        commandLine.setErr(writer);
+        Repl repl = new Repl(commandLine, workspace, client, new ScriptedPrompter(), name -> null,
+                resolver, null);
+
+        repl.dispatch(List.of("tail", "src.orders"));
+
+        assertThat(client.probed).containsExactly(seed);
+        assertThat(repl.session().isConnected()).isTrue();
+        assertThat(sink.toString()).contains("cli.not-authenticated").doesNotContain("cli.not-connected");
+    }
+
+    @Test
+    void onlineDispatcherReportsContextRequiredWithoutGuessingATarget(@TempDir Path home) {
+        ContextResolver resolver = new ContextResolver(ContextConfig::empty, name -> null);
+        FakeControlPlane client = new FakeControlPlane();
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        PrintWriter writer = new PrintWriter(sink);
+        commandLine.setOut(writer);
+        commandLine.setErr(writer);
+        Repl repl = new Repl(commandLine, home, client, new ScriptedPrompter(), name -> null,
+                resolver, null);
+
+        repl.dispatch(List.of("get", "missing"));
+
+        assertThat(client.probed).isEmpty();
+        assertThat(repl.session().isConnected()).isFalse();
+        assertThat(sink.toString()).contains("cli.context-required").doesNotContain("cli.not-connected");
     }
 
     @Test
     void aOneShotLaunchKeepsItsConnectionNoiseOffTheCommandsOutput() {
         // the point of the one-line form is piping the command's output somewhere; two lines about
         // having connected, ahead of it, land in whatever is reading the result
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.listOutcome = new ListOutcome.Listed(List.of(new RemoteArtifact("src", "source", "")));
         StringWriter sink = new StringWriter();
         Repl repl = replWritingTo(sink, client);
-        repl.signIn("node1:7900", "admin", () -> "pw", true);
+        repl.signIn("localhost:7900", "admin", () -> "pw", true);
         assertThat(sink.toString()).doesNotContain("connected to").doesNotContain("logged in as");
     }
 
     @Test
     void aSessionLaunchStillConfirmsThatItConnected() {
         // in a session those lines are the answer to what was just typed, so they stay
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         StringWriter sink = new StringWriter();
         Repl repl = replWritingTo(sink, client);
-        repl.signIn("node1:7900", "admin", () -> "pw", false);
+        repl.signIn("localhost:7900", "admin", () -> "pw", false);
         assertThat(sink.toString()).contains("connected to").contains("logged in as");
     }
 
@@ -4217,17 +5275,19 @@ class ReplTest {
 
     @Test
     void aOneLineLaunchYieldsTheCommandsOwnStatus() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.getOutcome = new GetOutcome.Absent();
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "get", "nope");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "get", "nope")
+                .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
         assertThat(Cli.runSession(launch, client, () -> new ScriptedPrompter())).isNotZero();
     }
 
     @Test
     void aLaunchThatCannotConnectStopsBeforeRunningTheCommand() {
         FakeControlPlane client = new FakeControlPlane();   // nothing is healthy
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "ls");
+        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "ls")
+                .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
         int code = Cli.runSession(launch, client, () -> new ScriptedPrompter());
         // running the verb anyway would report a missing connection rather than why there is none
         assertThat(code).isNotZero();
@@ -4237,9 +5297,10 @@ class ReplTest {
 
     @Test
     void aLaunchThatCannotSignInStopsBeforeRunningTheCommand() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Rejected("auth.bad-credentials", "Wrong password.");
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "nope", "ls");
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "ls")
+                .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "nope" : null);
         assertThat(Cli.runSession(launch, client, () -> new ScriptedPrompter())).isNotZero();
         assertThat(client.listCalls).isEmpty();
     }
@@ -4266,32 +5327,24 @@ class ReplTest {
 
     @Test
     void anOmittedPasswordIsAskedForWhenTheEnvironmentHasNone() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "ls")
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "ls")
                 .withEnv(name -> null);
         Cli.runSession(launch, client, () -> new ScriptedPrompter("asked"));
-        assertThat(client.loginCalls).containsExactly("admin:asked@http://node1:7900");
-    }
-
-    @Test
-    void thePasswordFlagAlwaysTakesItsValueSoAVerbIsNeverSwallowed() {
-        // -p once had an optional value, and `-p ls` then signed in with the password "ls" and ran
-        // nothing. The command has to survive whatever precedes it
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "ls");
-        assertThat(launch.command()).containsExactly("ls");
+        assertThat(client.loginCalls).containsExactly("admin:asked@http://localhost:7900");
     }
 
     @Test
     void anOmittedPasswordFallsBackToTheEnvironmentBeforeAsking() {
         // the point of the fallback is that a script need not put the password in argv, where the
         // process list and the shell history can both read it
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        LaunchOptions launch = LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "ls")
+        LaunchOptions launch = LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "ls")
                 .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "from-env" : null);
         Cli.runSession(launch, client, () -> new ScriptedPrompter("asked"));
-        assertThat(client.loginCalls).containsExactly("admin:from-env@http://node1:7900");
+        assertThat(client.loginCalls).containsExactly("admin:from-env@http://localhost:7900");
     }
 
     // ---- the in-place view ----
@@ -4442,7 +5495,7 @@ class ReplTest {
     void stopAtATerminalListsWhatItWouldTakeAndTakesNothingWhenTheAnswerIsNo() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("pw", "no");
+        ScriptedPrompter prompter = new ScriptedPrompter("no");
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
         h.repl().terminalCheck(() -> true);
         int mark = h.sink().toString().length();
@@ -4466,7 +5519,7 @@ class ReplTest {
     void stopAtATerminalClearsOnceTheAnswerIsYes() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter("pw", "yes"));
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter("yes"));
         h.repl().terminalCheck(() -> true);
 
         h.repl().dispatch("stop pl1");
@@ -4480,7 +5533,7 @@ class ReplTest {
     void stopWithNoTerminalRefusesAndSaysWhichWayOutIsWhich() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        ScriptedPrompter prompter = new ScriptedPrompter();
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
         h.repl().terminalCheck(() -> false);
         int mark = h.sink().toString().length();
@@ -4503,7 +5556,7 @@ class ReplTest {
     void stopWithTheNonInteractiveFlagClearsWithoutAsking() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        ScriptedPrompter prompter = new ScriptedPrompter();
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
         h.repl().terminalCheck(() -> false);
 
@@ -4518,7 +5571,7 @@ class ReplTest {
     void restartRerunAtATerminalAsksFirstAndAnsweringNoStartsNothing() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("pw", "no");
+        ScriptedPrompter prompter = new ScriptedPrompter("no");
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
         h.repl().terminalCheck(() -> true);
         int mark = h.sink().toString().length();
@@ -4536,7 +5589,7 @@ class ReplTest {
     void restartRerunWithNoTerminalRefusesAndNeitherStopsNorStarts() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        ScriptedPrompter prompter = new ScriptedPrompter();
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
         h.repl().terminalCheck(() -> false);
 
@@ -4550,7 +5603,7 @@ class ReplTest {
     void restartRerunWithTheNonInteractiveFlagRunsTheWholeSequence() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        ScriptedPrompter prompter = new ScriptedPrompter();
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
         h.repl().terminalCheck(() -> false);
 
@@ -4566,7 +5619,7 @@ class ReplTest {
     void stopKeepingStateNeitherAsksNorNeedsATerminalAndStillListsWhatItHoldsOnTo() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        ScriptedPrompter prompter = new ScriptedPrompter();
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
         h.repl().terminalCheck(() -> false);
         int mark = h.sink().toString().length();
@@ -4594,7 +5647,7 @@ class ReplTest {
     void stopKeepingStateStillKeepsWhenTheNonInteractiveFlagIsGivenAsWell() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
         h.repl().terminalCheck(() -> false);
 
         h.repl().dispatch("stop pl1 --keep-state -y");
@@ -4610,7 +5663,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("pw");
+        ScriptedPrompter prompter = new ScriptedPrompter();
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
         h.repl().terminalCheck(() -> true);
 
@@ -4630,27 +5683,32 @@ class ReplTest {
     void aOneShotStopAtATerminalAsksBeforeItClears() {
         // The second face. Both faces reach the same dispatch, but only one of them is the one a person
         // types into, and a guard that lived in the read loop would leave this one clearing unasked.
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
         ScriptedPrompter prompter = new ScriptedPrompter("no");
         LaunchOptions launch =
-                LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "stop", "pl1");
+                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1")
+                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
 
         int code = Cli.runSession(launch, client, () -> prompter, () -> true);
 
+        // Asked, and the answer is what stopped it. Without this the case passes on a run that never
+        // reached the question at all -- the same empty call list, the same non-zero code.
+        assertThat(prompter.questions).isNotEmpty();
         assertThat(client.lifecycleCalls).isEmpty();
         assertThat(code).isNotZero();
     }
 
     @Test
     void aOneShotStopWithNoTerminalRefusesRatherThanClearing() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
         ScriptedPrompter prompter = new ScriptedPrompter();
         LaunchOptions launch =
-                LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "stop", "pl1");
+                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1")
+                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
 
         int code = Cli.runSession(launch, client, () -> prompter, () -> false);
 
@@ -4664,19 +5722,19 @@ class ReplTest {
         // The keeping spelling on the second face, and the list with it. Half a gate is the failure
         // this pair is written against: the two faces are the same words to whoever types them, and a
         // list that only one of them prints is one a reader cannot rely on having seen.
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
         StringWriter sink = new StringWriter();
         Repl repl = replWritingTo(sink, client);
         repl.terminalCheck(() -> false);
-        repl.signIn("node1:7900", "admin", () -> "pw", true);
+        repl.signIn("localhost:7900", "admin", () -> "pw", true);
         int mark = sink.toString().length();
 
         repl.dispatch("stop pl1 --keep-state");
 
         assertThat(client.lifecycleCalls)
-                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+                .containsExactly("jwt-tok@http://localhost:7900 stop pl1 purgeState=false");
         String output = sink.toString().substring(mark);
         assertThat(output).contains(everyKindOfStateAPipelineHolds());
         assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
@@ -4685,16 +5743,17 @@ class ReplTest {
 
     @Test
     void aOneShotStopClearsWhenItWasToldNotToAsk() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
         LaunchOptions launch =
-                LaunchOptions.parse("-c", "node1:7900", "-u", "admin", "-p", "pw", "stop", "pl1", "-y");
+                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1", "-y")
+                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
 
         int code = Cli.runSession(launch, client, ScriptedPrompter::new, () -> false);
 
         assertThat(client.lifecycleCalls)
-                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
+                .containsExactly("jwt-tok@http://localhost:7900 stop pl1 purgeState=true");
         assertThat(code).isZero();
     }
 }

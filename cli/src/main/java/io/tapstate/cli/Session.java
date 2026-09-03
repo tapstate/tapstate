@@ -17,6 +17,11 @@ import java.util.List;
  */
 final class Session {
 
+    enum CredentialKind {
+        HUMAN_ACCESS,
+        MACHINE
+    }
+
     private List<URI> seeds = List.of();
     private URI landingNode;
     private boolean connected;
@@ -24,11 +29,17 @@ final class Session {
     /** The bearer credential presented on authenticated requests (opaque; {@code null} while unauthenticated). */
     private String credential;
 
+    /** The provenance of the bearer credential, or {@code null} while unauthenticated. */
+    private CredentialKind credentialKind;
+
     /** The principal to display in the prompt (a username; {@code null} while unauthenticated). */
     private String principal;
 
     /** The cluster name once known; {@code null} until membership discovery yields one (none in L1). */
     private String clusterName;
+
+    /** What the landing node reported as its version when this connection was made; null if it did not. */
+    private String serverVersion;
 
     /** The member base URLs to fail over across; the seeds until discovery refines them. */
     private List<URI> members = List.of();
@@ -43,9 +54,29 @@ final class Session {
         return credential != null;
     }
 
+    /** Whether the process currently carries a machine bearer rather than a human access token. */
+    boolean hasMachineCredential() {
+        return credentialKind == CredentialKind.MACHINE;
+    }
+
     /** The base URL that answered the probe, or {@code null} while offline. */
     URI landingNode() {
         return landingNode;
+    }
+
+    /**
+     * How the pair of versions reads right now, for anything that reports a problem. Remembered from
+     * the connection rather than asked for again: a diagnostic is already a bad moment to spend a round
+     * trip in, and one that hung waiting for a version would be a worse failure than the one it came to
+     * report. What the server said when the connection was made is what the session has been talking to
+     * since.
+     */
+    String versions() {
+        if (!connected) {
+            return "cli " + Cli.VERSION_NUMBER + ", server not connected";
+        }
+        return "cli " + Cli.VERSION_NUMBER
+                + ", server " + (serverVersion == null ? "not reported" : serverVersion);
     }
 
     /** The ordered seed list used to connect (unmodifiable); empty while offline. */
@@ -81,15 +112,35 @@ final class Session {
         this.members = this.seeds;   // members = seeds until discovery refines them
         // a fresh connect is a new transport target: never carry a credential the previous node issued
         this.credential = null;
+        this.credentialKind = null;
         this.principal = null;
         this.clusterName = null;
+        // Reset with the rest: a version carried over from the node this session used to be on would be
+        // reported as the new one's, which is worse than not knowing it.
+        this.serverVersion = null;
+    }
+
+    /** The same, plus what that node answered when asked its version ({@code null} = it did not say). */
+    void connect(List<URI> seeds, URI landingNode, String serverVersion) {
+        connect(seeds, landingNode);
+        this.serverVersion = serverVersion;
     }
 
     /** Records an authenticated session: the credential, the principal, an optional cluster name, and members. */
     void authenticate(String credential, String principal, String clusterName, List<URI> members) {
         this.credential = credential;
+        this.credentialKind = CredentialKind.HUMAN_ACCESS;
         this.principal = principal;
         this.clusterName = clusterName;
+        this.members = List.copyOf(members);
+    }
+
+    /** Records a verified machine bearer without associating it with a persisted human principal. */
+    void authenticateMachine(String credential, List<URI> members) {
+        this.credential = credential;
+        this.credentialKind = CredentialKind.MACHINE;
+        this.principal = "machine";
+        this.clusterName = null;
         this.members = List.copyOf(members);
     }
 
@@ -101,6 +152,7 @@ final class Session {
     /** Drops the credential while keeping the transport connection; members fall back to the seeds. */
     void logout() {
         this.credential = null;
+        this.credentialKind = null;
         this.principal = null;
         this.clusterName = null;
         this.members = this.seeds;
@@ -112,8 +164,10 @@ final class Session {
         this.landingNode = null;
         this.connected = false;
         this.credential = null;
+        this.credentialKind = null;
         this.principal = null;
         this.clusterName = null;
+        this.serverVersion = null;
         this.members = List.of();
     }
 }

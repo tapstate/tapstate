@@ -13,6 +13,7 @@ import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.LivePipelines;
+import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -22,6 +23,7 @@ import io.tapstate.control.core.AuditedSourceService;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
+import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ConnectorConfigValidator;
 import io.tapstate.control.core.ConnectorRegisterService;
 import io.tapstate.control.core.ControlOperations;
@@ -42,6 +44,7 @@ import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -69,11 +72,13 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.CapabilityDeriver;
+import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.SchemaDiscoverer;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.TokenStore;
 import io.tapstate.spi.store.UserStore;
@@ -136,8 +141,23 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    SessionStore sessionStore(MongoAuthStores authStores) {
+        return authStores.sessions();
+    }
+
+    @Bean
     AuditStore auditStore(MongoAuthStores authStores) {
         return authStores.audit();
+    }
+
+    @Bean
+    ClusterIdentityStore clusterIdentityStore(MongoAuthStores authStores) {
+        return authStores.clusterIdentity();
+    }
+
+    @Bean
+    ClusterIdentityService clusterIdentityService(ClusterIdentityStore store) {
+        return new ClusterIdentityService(store);
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----
@@ -175,8 +195,20 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    LoginService loginService(UserStore userStore, PasswordHasher passwordHasher, TokenSigner tokenSigner) {
-        return new LoginService(userStore, passwordHasher, tokenSigner);
+    AccessTokenService accessTokenService(TokenSigner tokenSigner, Clock clock) {
+        return new AccessTokenService(tokenSigner, clock);
+    }
+
+    @Bean
+    SessionService sessionService(
+            SessionStore sessionStore, TokenSecrets tokenSecrets, AccessTokenService accessTokens, Clock clock) {
+        return new SessionService(sessionStore, tokenSecrets, accessTokens, clock);
+    }
+
+    @Bean
+    LoginService loginService(
+            UserStore userStore, PasswordHasher passwordHasher, AccessTokenService accessTokens) {
+        return new LoginService(userStore, passwordHasher, accessTokens);
     }
 
     @Bean

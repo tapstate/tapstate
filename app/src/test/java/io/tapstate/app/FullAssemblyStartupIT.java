@@ -75,7 +75,7 @@ class FullAssemblyStartupIT {
         assertThat(member.getLifecycleService().isRunning()).isTrue();
 
         // The liveness probe answers over the full assembly, not merely the control-plane-only subset.
-        RestClient client = RestClient.create("http://localhost:" + port);
+        RestClient client = RestClient.create("http://127.0.0.1:" + port);
         String health = client.get().uri("/healthz").retrieve().body(String.class);
         assertThat(health).isEqualTo("ok");
     }
@@ -84,7 +84,6 @@ class FullAssemblyStartupIT {
         // A per-run database on the shared class container keeps runs independent.
         String database = "assembly_all_" + Long.toUnsignedString(System.nanoTime(), 16);
         List<String> properties = new ArrayList<>(List.of(
-                "server.port=0",
                 "tapstate.store.mongo.enabled=true",
                 "tapstate.store.mongo.uri=" + REPLICA_SET.getReplicaSetUrl(database),
                 // the container speaks plaintext; TLS is opt-in, so no flag is needed here
@@ -92,7 +91,13 @@ class FullAssemblyStartupIT {
         properties.addAll(List.of(extraProperties));
         context = new SpringApplicationBuilder(Bootstrap.class)
                 .properties(properties.toArray(String[]::new))
-                .run();
+                // Both the address and the port are run arguments, not default properties: `properties(...)`
+                // populates the lowest-ranked source Spring has, and the product's own application
+                // configuration publishes 8080, so a port asked for there is silently overridden. The
+                // address is the other half -- a free port alone binds the wildcard, and a wildcard bind
+                // does not reserve 127.0.0.1:<port>, so a process already holding that port on the loopback
+                // keeps receiving what this test sends.
+                .run("--server.address=127.0.0.1", "--server.port=0");
         return ((WebServerApplicationContext) context).getWebServer().getPort();
     }
 }

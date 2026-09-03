@@ -185,6 +185,7 @@ class ValidatedPipelineBuildsTest {
     @Test
     void aValidatedPipelineWithATransformBuildsIntoADag() {
         InMemoryStorePort store = validated(SOURCE, TARGET, PIPELINE);
+        discovered(store, "orders_src", "orders", List.of("id"));
 
         DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("p");
 
@@ -198,6 +199,7 @@ class ValidatedPipelineBuildsTest {
     @Test
     void aValidatedPipelineServingItsSourceDirectlyBuildsIntoADag() {
         InMemoryStorePort store = validated(SOURCE, TARGET, DIRECT_PIPELINE);
+        discovered(store, "orders_src", "orders", List.of("id"));
 
         DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("direct");
 

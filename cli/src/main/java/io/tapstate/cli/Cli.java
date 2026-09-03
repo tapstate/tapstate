@@ -28,7 +28,7 @@ import java.util.function.Supplier;
 @Command(name = "tapstate", mixinStandardHelpOptions = true, version = Cli.VERSION,
         subcommands = {
                 ValidateCmd.class, NewCmd.class, DemoCmd.class, ExplainCmd.class, LsCmd.class,
-                DescCmd.class, McpCmd.class, AliasCmd.class},
+                DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class},
         // the second line is indented by hand under the "Usage: " heading picocli prints before the first
         customSynopsis = {
                 "tapstate [LAUNCH]                   open a session (interactive)",
@@ -47,10 +47,12 @@ import java.util.function.Supplier;
                 "                        $TAPSTATE_WORKDIR)",
                 "  -c, --connect URL   reach a server before doing anything else; takes the",
                 "                        same seed list as `connect`",
-                "  -u, --user NAME     sign in as this user once connected (needs -c)",
-                "  -p, --password PW   the password; else $TAPSTATE_PASSWORD, else asked for.",
-                "                        A password here is readable in the process list and",
-                "                        stays in shell history -- prefer the other two.",
+                "      --context NAME  select a saved context for online commands",
+                "                        (or place it after an auth action)",
+                "  -u, --user NAME     sign in as this user once connected (needs -c); the password",
+                "                        comes from $TAPSTATE_PASSWORD or a masked prompt",
+                "      --token TOKEN   use a machine token for this process only (or",
+                "                        $TAPSTATE_TOKEN); it is never saved in a user session",
                 ""},
         footerHeading = "%nExamples:%n",
         footer = {
@@ -58,7 +60,7 @@ import java.util.function.Supplier;
                 "  tapstate -w ./work            open a session in ./work",
                 "  tapstate validate ./work      validate a workspace and exit",
                 "  tapstate help apply           describe one command",
-                "  tapstate -c localhost:8080 -u admin -p pw",
+                "  TAPSTATE_PASSWORD=secret tapstate -c localhost:8080 -u admin",
                 "                                open a session already signed in",
                 "  tapstate -c localhost:8080 -u admin ls",
                 "                                run one command against a server and exit"},
@@ -77,7 +79,14 @@ public final class Cli implements Runnable {
      * declaration, and the version is wanted on a path that must not depend on either. The build pins it
      * to the project version, so the string here cannot quietly drift from what was released.
      */
-    static final String VERSION = "tapstate 0.3.0";
+    static final String VERSION = "tapstate 0.4.1";
+
+    /**
+     * Just the number out of {@link #VERSION}, for the places that print it beside another version and
+     * would read as nonsense with the product name repeated in both halves. Derived rather than written
+     * twice: a second literal is a second thing a release can leave behind.
+     */
+    static final String VERSION_NUMBER = VERSION.substring(VERSION.indexOf(' ') + 1);
 
     /** Exit code for a verb that ran and did what was asked. */
     static final int EXIT_OK = 0;
@@ -97,7 +106,7 @@ public final class Cli implements Runnable {
      * so the declared list can never drift from the verbs actually wired up.
      */
     static final List<String> OFFLINE_VERBS =
-            List.of("validate", "new", "demo", "explain", "ls", "desc");
+            List.of("validate", "new", "demo", "explain", "ls", "desc", "version");
 
     /**
      * How this face spells each operation it projects: operation id → verb name. The spelling is not
@@ -121,6 +130,7 @@ public final class Cli implements Runnable {
             Map.entry("data-browser.collections", DATA_BROWSER_VERB),
             Map.entry("data-browser.find", DATA_BROWSER_VERB),
             Map.entry("data-browser.stats", DATA_BROWSER_VERB),
+            Map.entry("system.version", "version"),
             Map.entry("artifact.apply", "apply"),
             Map.entry("artifact.validate", "validate"),
             Map.entry("artifact.get", "get"),
@@ -284,7 +294,7 @@ public final class Cli implements Runnable {
      * so appear on the table, but they project no operation and belong to no whitelist — the guard that
      * pins registered verbs to the offline whitelist reads this to tell "meta" from "undeclared".
      */
-    static final List<String> META_VERBS = List.of("help", "mcp", "alias");
+    static final List<String> META_VERBS = List.of("help", "mcp", "alias", "auth", "context");
 
     /**
      * Help for the words the REPL handles itself. They are deliberately not subcommands — a connection
@@ -305,6 +315,8 @@ public final class Cli implements Runnable {
                     "Sign in; prompts for the password.")),
             Map.entry("logout", new VerbHelp("",
                     "Drop the credential, stay connected.")),
+            Map.entry(":ctx", new VerbHelp("",
+                    "Manage saved contexts.")),
             Map.entry("cd", new VerbHelp("<dir>",
                     "Change the session workspace.")),
             Map.entry("pwd", new VerbHelp("",
@@ -326,6 +338,8 @@ public final class Cli implements Runnable {
         // to be a word the CLI answers to, in both modes. Unregistered it was an unmatched argument,
         // answered with a spelling suggestion for a word that was spelt right.
         commandLine.addSubcommand(new CommandLine.HelpCommand());
+        commandLine.addSubcommand(new AuthCmd());
+        commandLine.addSubcommand(new ContextCmd());
         for (String verb : CONNECTED_VERBS) {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
@@ -433,11 +447,31 @@ public final class Cli implements Runnable {
             System.exit(newCommandLine().execute(args));
             return;
         }
-        if (!launch.connects() && launch.isOneShot()) {
-            System.exit(newCommandLine().execute(args));      // the plain one-shot path, unchanged
+        if (launch.hasConflictingTargets()) {
+            CommandLine commandLine = newCommandLine();
+            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
+            System.exit(EXIT_USAGE);
+            return;
+        }
+        if (bypassesSessionResolution(launch)) {
+            // Offline verbs finish before context resolution. Launch-only target flags are intentionally
+            // discarded here, so even a configured or temporary seed cannot cause DNS or a socket.
+            System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
         System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
+    }
+
+    /**
+     * Whether a one-shot can run without constructing a session. {@code version} is deliberately a
+     * hybrid: without a target it reports the local binary and says no server is connected, while a
+     * direct seed or saved context makes it ask the running server for the second half of the report.
+     */
+    static boolean bypassesSessionResolution(LaunchOptions launch) {
+        if (!launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {
+            return false;
+        }
+        return !launch.command().getFirst().equals("version") || !launch.targetsServer();
     }
 
     /** The production password reader: a JLine prompter over the terminal, opened only if one is needed. */
@@ -469,24 +503,67 @@ public final class Cli implements Runnable {
      */
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, BooleanSupplier terminal) {
+        Path home = Path.of(System.getProperty("user.home"));
+        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
+        AuthService authService = new AuthService(
+                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        return runSession(launch, controlPlane, prompter, resolver, authService, terminal);
+    }
+
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver) {
+        return runSession(launch, controlPlane, prompter, resolver, null,
+                () -> System.console() != null);
+    }
+
+    private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                                  Supplier<Prompter> prompter, ContextResolver resolver,
+                                  AuthService authService, BooleanSupplier terminal) {
+        Prompter oneShotPrompter = null;
         try {
-            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane);
+            if (launch.hasConflictingTargets()) {
+                Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
+                return EXIT_USAGE;
+            }
+            if (launch.isOneShot() && launch.command().size() >= 2
+                    && launch.command().get(0).equals("auth")
+                    && launch.command().get(1).equals("login")
+                    && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
+            if (launch.isOneShot() && launch.command().size() == 1
+                    && launch.command().get(0).equals("context")
+                    && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
+            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
+                    launch::environment, resolver, launch.context(), authService,
+                    new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
             repl.terminalCheck(terminal);
             repl.prompterSource(prompter);
+            String machineToken = launch.machineToken();
+            if (machineToken != null) {
+                repl.installMachineToken(machineToken);
+            }
             if (launch.connects()) {
-                int established = repl.signIn(launch.connect(), launch.user(),
-                        () -> launch.resolvePassword(prompter), launch.isOneShot());
+                int established = machineToken == null
+                        ? repl.signIn(launch.connect(), launch.user(),
+                                () -> launch.resolvePassword(prompter), launch.isOneShot())
+                        : repl.connectForLaunch(launch.connect(), launch.isOneShot());
                 if (established != EXIT_OK) {
                     return established;
                 }
             }
             if (launch.isOneShot()) {
-                repl.dispatch(launch.command());
+                repl.dispatch(launch.command(), true);
                 return repl.lastExitCode();
             }
             repl.run();
             return EXIT_OK;
         } finally {
+            if (oneShotPrompter instanceof JLinePrompter jline) {
+                jline.close();
+            }
             controlPlane.close();
         }
     }

@@ -27,6 +27,12 @@ for t in intake proposal; do
     "$(grep -q 'needs-triage' "$tpl/$t.yml" && echo 0 || echo 1)"
 done
 
+# One command, both numbers. A form that named the flag instead would ask for the CLI's version
+# alone, and a reporter has no way to know that is only half of what is running -- so the answer
+# would arrive confident and wrong, which is worse for triage than an empty field.
+check "the intake form asks for both versions with one command" \
+  "$(grep -q 'tapstate version`' "$tpl/intake.yml" && ! grep -q 'tapstate --version' "$tpl/intake.yml" && echo 0 || echo 1)"
+
 check "blank issues stay off" \
   "$(grep -q 'blank_issues_enabled: false' "$tpl/config.yml" && echo 0 || echo 1)"
 # Directives, not prose: config.yml explains at length why there are none, and a check that cannot

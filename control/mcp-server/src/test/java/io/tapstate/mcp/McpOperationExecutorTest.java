@@ -57,6 +57,7 @@ class McpOperationExecutorTest {
             logs.put("limit", 999);
 
             List<Map.Entry<io.tapstate.control.core.Operation, Map<String, Object>>> calls = List.of(
+                    Map.entry(ControlOperations.SYSTEM_VERSION, Map.of()),
                     Map.entry(ControlOperations.CONNECTOR_LIST, Map.of()),
                     Map.entry(ControlOperations.CONNECTOR_GET, Map.of("id", "mysql")),
                     Map.entry(ControlOperations.SOURCE_DRAFT, Map.of(
@@ -98,6 +99,9 @@ class McpOperationExecutorTest {
             }
 
             assertThat(paths).contains(
+                    // At the root, not under /api: the version answer is the anonymous endpoint the
+                    // CLI also reads while connecting, and a second one would be a second truth.
+                    "/version",
                     "/api/connectors", "/api/connectors/mysql", "/api/connections:test",
                     "/api/sources:draft",
                     "/api/connections/orders/test-result", "/api/connections:discover-schema",

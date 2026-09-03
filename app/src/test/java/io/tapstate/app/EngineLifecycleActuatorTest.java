@@ -7,6 +7,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import org.junit.jupiter.api.AfterEach;
@@ -16,12 +17,14 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The assembly-layer binding from the lifecycle actuator seam to the Jet engine and the capture coordinator,
@@ -104,6 +107,24 @@ class EngineLifecycleActuatorTest {
         // the seam the converge loop reads, which is what drives a pipeline whose tail died into FAILED even
         // though its Jet job keeps running over a ring gone quiet.
         assertThat(actuator.failure(PIPE)).contains(boom);
+    }
+
+    @Test
+    void validatesBeforeCaptureOrSubmission() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        TapstateException refused = new TapstateException(
+                ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED, Map.of("source", "orders_src"), null);
+        dagSource.validation = () -> {
+            events.add("validate:" + PIPE);
+            throw refused;
+        };
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, teardown());
+
+        assertThatThrownBy(() -> actuator.start(PIPE)).isSameAs(refused);
+        assertThat(events).containsExactly("validate:" + PIPE);
     }
 
     @Test
@@ -198,9 +219,16 @@ class EngineLifecycleActuatorTest {
 
         private final List<String> events;
         private final IdleDagSource idle = new IdleDagSource();
+        private Runnable validation = () -> {
+        };
 
         RecordingDagSource(List<String> events) {
             this.events = events;
+        }
+
+        @Override
+        public void validateStart(String pipelineId) {
+            validation.run();
         }
 
         @Override

@@ -25,7 +25,7 @@ jobs:
 
       - name: The gate still decides the way it is supposed to
         run: |
-          shellcheck .github/scripts/pr-template.sh .github/scripts/pr-template-smoke.sh
+          shellcheck .github/scripts/pr-template.sh .github/scripts/pr-template-smoke.sh .github/scripts/_pr-section.sh
           bash .github/scripts/pr-template-smoke.sh
 
       - name: The linked issue and the live verification scenario are both answered

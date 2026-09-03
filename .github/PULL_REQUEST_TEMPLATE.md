@@ -8,8 +8,11 @@ See CONTRIBUTING.md, "Language".
 ## Linked issue
 
 <!--
-Which issue this belongs to, and where its design is written: `Refs #123` — not `Fixes`, which
+Which issue this belongs to, and where its design is written: Refs #123 — not `Fixes`, which
 would close the issue on merge and take with it whatever else is still in flight under it.
+
+Write it bare, the way it is written above. Inside backticks it is a code span, and GitHub does
+not autolink inside one: the number renders as text and the reader has nothing to click.
 
 For an external contribution this is the only context a reviewer has, so say which part of the
 issue holds the design. A change that genuinely has no issue behind it (documentation, build and
@@ -59,6 +62,30 @@ check enforces it. See CONTRIBUTING.md, "Documentation".
 - [ ] This change needs documentation follow-up (add the `docs-needed` label)
 - **Draft in this repository:** <!-- path under docs/, or "none" -->
 - **Public page it is headed for:** <!-- URL under https://tapstate.dev/docs, or "none" -->
+
+### Release note
+
+<!--
+One sentence, as a user story: as <who>, I can <do what>, so that <what I am spared or gain>.
+
+- "as <who>" only when the change means something to one kind of user in particular; a generic
+  subject says nothing, so leave it out.
+- "so that" has to be specific enough to be wrong. "Improves the experience" is not; "so that
+  rows deleted at the source disappear from the target too, and stale data need not be cleaned
+  up by hand" is.
+- Cannot fill in "so that"? Write `none`. That is a conclusion -- you judged it and there is no
+  user-visible change -- not a section skipped.
+- Write it from the issue this belongs to and what it promised, and look at the diff last. Starting
+  from the diff produces "reordered the initialisation of X"; starting from the issue produces
+  "you no longer have to register it first".
+
+`**Kind:** new` for a capability somebody gains, `**Kind:** fix` for something that stopped
+being wrong. It decides which heading the sentence lands under in the release. Writing `none`
+needs no Kind -- there is nothing to file.
+
+This sentence is collected into the release notes, unedited, when a release is cut. See
+CONTRIBUTING.md, "Release notes".
+-->
 
 ## Checks
 

@@ -22,7 +22,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY=""
 DO_BUILD=0
-STARTUP_BUDGET_MS=200
+# Sized by the slowest runner in the matrix, not the fastest: a budget sized on a fast machine costs
+# a whole release each time a slow one is busy. Measured across the four release platforms once the
+# timer stopped charging its own startup to the binary, the slowest median is 55ms, so 200 already
+# carries 3.6x headroom. Widening it further only buys back discrimination we want: a startup
+# regression that matters -- reflection reaching into the image, a resource read moving to
+# class-init -- is a multiple, not a drift, and lands well outside this budget either way.
+STARTUP_BUDGET_MS=${STARTUP_BUDGET_MS:-200}
 
 for arg in "$@"; do
   case "$arg" in
@@ -171,19 +177,44 @@ bold "Native smoke — binary: $BINARY"
 CORPUS="$REPO_ROOT/core/core-dsl/src/test/resources/corpus"
 
 # --- timing helper: median of N runs of a command, in milliseconds -----------------------------
+#
+# One python process does the whole measurement, and it times only the child. Written the other way
+# -- a shell loop asking `python3` for the clock on either side of each run -- the second reading
+# cannot be taken until that interpreter has started, so every sample carried one python startup
+# inside the interval it was supposed to be measuring. That is tens of milliseconds on an idle
+# machine and a great deal more on a loaded one, and it is charged to the binary.
+#
+# The first run is discarded. It pays for whatever touching this binary costs the first time --
+# on macOS the signature assessment of a freshly built, unsigned image, and a cold page cache for
+# something this size -- and none of that is what a startup budget is about. Measured: on the same
+# runner label, `--version` (the first command to touch the binary) went 86ms -> 394ms between two
+# runs of identical code, while `validate`, which does strictly more work and runs second, went
+# 92ms -> 142ms.
 median_ms() {
-  local n=5 i t samples=()
-  for ((i=0; i<n; i++)); do
-    local start end
-    start=$(python3 -c 'import time; print(int(time.time()*1000))')
-    "$@" >/dev/null 2>&1 || true
-    end=$(python3 -c 'import time; print(int(time.time()*1000))')
-    samples+=( $((end-start)) )
-  done
-  printf '%s\n' "${samples[@]}" | sort -n | sed -n '3p'
+  python3 - "$@" <<'MEDIAN'
+import subprocess, sys, time
+cmd = sys.argv[1:]
+run = lambda: subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+run()  # discarded: first touch is not startup
+xs = []
+for _ in range(5):
+    t = time.time()
+    run()
+    xs.append(int((time.time() - t) * 1000))
+print(sorted(xs)[2])
+MEDIAN
 }
 
 # --- 1. startup budget --------------------------------------------------------------------------
+# The timer is checked before it is trusted. One that answered 0 -- or answered the wrong process --
+# would pass the budget below for ever while measuring nothing, and nothing else here would notice.
+TIMER_MS=$(median_ms sleep 0.3)
+if (( TIMER_MS >= 250 && TIMER_MS < 2000 )); then
+  ok "the timer measures the command it is given (sleep 0.3 read as ${TIMER_MS}ms)"
+else
+  bad "the timer read sleep 0.3 as ${TIMER_MS}ms; the budget below would mean nothing"
+fi
+
 bold "[1] startup time (<${STARTUP_BUDGET_MS}ms)"
 VERSION_MS=$(median_ms "$BINARY" --version)
 if (( VERSION_MS < STARTUP_BUDGET_MS )); then
@@ -340,7 +371,14 @@ trap 'if [[ -f "$STUB_DIR/pid" ]]; then kill "$(cat "$STUB_DIR/pid")" 2>/dev/nul
 printf 'PK\003\004smoke-jar' > "$STUB_DIR/smoke.jar"   # any bytes; the stub does not inspect the jar
 cat > "$STUB_DIR/stub.py" <<'PY'
 import http.server, json, os, socketserver, sys
+EVENTS = sys.argv[3]
 class H(http.server.BaseHTTPRequestHandler):
+    def _event(self):
+        authorization = self.headers.get("Authorization")
+        authorization_kind = ("none" if authorization is None else
+                              "bearer" if authorization.startswith("Bearer ") else "other")
+        with open(EVENTS, "a") as f:
+            f.write(f"{self.command} {self.path} auth={authorization_kind}\n")
     def _send(self, code, obj=None):
         self.send_response(code)
         if obj is not None:
@@ -352,8 +390,20 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             self.end_headers()
     def do_GET(self):
-        self._send(200 if self.path == "/healthz" else 404)
+        self._event()
+        if self.path == "/healthz":
+            self._send(200)
+        elif self.path == "/.well-known/tapstate":
+            self._send(200, {
+                "issuer": "urn:tapstate:cluster:native-smoke",
+                "clusterId": "native-smoke",
+                "apiVersion": "tapstate/v1",
+                "authModes": ["password", "machine_token"],
+            })
+        else:
+            self._send(404)
     def do_POST(self):
+        self._event()
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if self.path == "/auth/login":
             self._send(200, {"token": "smoke-token"})
@@ -373,7 +423,7 @@ with open(sys.argv[2], "w") as f:                       # publish the child pid 
     f.write(str(os.getpid()))
 srv.serve_forever()
 PY
-python3 "$STUB_DIR/stub.py" "$STUB_DIR/port" "$STUB_DIR/pid"
+python3 "$STUB_DIR/stub.py" "$STUB_DIR/port" "$STUB_DIR/pid" "$STUB_DIR/events"
 STUB_PORT="$(cat "$STUB_DIR/port" 2>/dev/null || true)"
 printf -v online_in 'connect 127.0.0.1:%s\nlogin admin\nsmoke-pw\nregister %s\nexit\n' "$STUB_PORT" "$STUB_DIR/smoke.jar"
 pty_session "$online_in"
@@ -389,11 +439,11 @@ else
   bad "online register pty session failed (rc=$PTY_RC, port=${STUB_PORT:-none}); output:"; echo "$PTY_OUT"
 fi
 
-bold "[10] one-line launch — -c / -u / -p reach the server without a session"
+bold "[10] one-line launch — -c / -u reach the server without a session"
 # The scripting form: connect, sign in and run one command from the arguments alone. Checked on the
 # native binary because this path parses its own options before the command table is built, so an AOT
 # fault here would not show up in any of the interactive cases above.
-ONELINE_OUT=$("$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin -p smoke-pw \
+ONELINE_OUT=$(TAPSTATE_PASSWORD=smoke-pw "$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin \
                 register "$STUB_DIR/smoke.jar" 2>"$STUB_DIR/oneline.err") && ONELINE_RC=0 || ONELINE_RC=$?
 ONELINE_CLEAN=$(printf '%s' "$ONELINE_OUT" | strip_ansi)
 if (( ONELINE_RC == 0 )) \
@@ -408,7 +458,7 @@ else
 fi
 
 # a command that fails must fail the process: the whole point of running one from a script
-"$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin -p smoke-pw start >/dev/null 2>&1 && BADRC=0 || BADRC=$?
+TAPSTATE_PASSWORD=smoke-pw "$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin start >/dev/null 2>&1 && BADRC=0 || BADRC=$?
 if (( BADRC != 0 )); then
   ok "a one-line command that failed exited non-zero (rc=$BADRC)"
 else
@@ -442,6 +492,26 @@ else
   bad "kafka.modes in the image is [$KAFKA_MODES], not the overlay-declared [stream]"
 fi
 rm -rf "$KAFKA_DIR"
+# --- 12. one-line machine token ---------------------------------------------------------------
+bold "[12] one-line machine token — discovery precedes Bearer and password login stays unused"
+MACHINE_TOKEN="native-smoke-machine-token"
+MACHINE_EVENT_COUNT=$(wc -l < "$STUB_DIR/events")
+MACHINE_OUT=$("$BINARY" --token "$MACHINE_TOKEN" -c "127.0.0.1:$STUB_PORT" \
+                register "$STUB_DIR/smoke.jar" 2>"$STUB_DIR/machine.err") && MACHINE_RC=0 || MACHINE_RC=$?
+MACHINE_CLEAN=$(printf '%s' "$MACHINE_OUT" | strip_ansi)
+MACHINE_EVENTS=$(tail -n +$((MACHINE_EVENT_COUNT + 1)) "$STUB_DIR/events" 2>/dev/null || true)
+DISCOVERY_LINE=$(printf '%s\n' "$MACHINE_EVENTS" | grep -n '^GET /.well-known/tapstate auth=none$' | head -1 | cut -d: -f1 || true)
+API_LINE=$(printf '%s\n' "$MACHINE_EVENTS" | grep -n '^POST /api/connectors:register auth=bearer$' | head -1 | cut -d: -f1 || true)
+if (( MACHINE_RC == 0 )) \
+   && printf '%s' "$MACHINE_CLEAN" | grep -qE 'registered[[:space:]]+smoke' \
+   && ! printf '%s' "$MACHINE_CLEAN" | grep -q "$MACHINE_TOKEN" \
+   && ! printf '%s\n' "$MACHINE_EVENTS" | grep -q '^POST /auth/login ' \
+   && [[ -n "$DISCOVERY_LINE" && -n "$API_LINE" ]] \
+   && (( DISCOVERY_LINE < API_LINE )); then
+  ok "one-line machine-token launch discovered the issuer before Bearer use and skipped password login"
+else
+  bad "one-line --token did not preserve its discovery and process-only credential contract (rc=$MACHINE_RC)"
+fi
 
 # --- summary ------------------------------------------------------------------------------------
 echo

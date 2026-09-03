@@ -88,8 +88,10 @@ try:
     # It happened again, the same way, with the three data-browser tools: they were added on 2026-08-20
     # and this list was not, and nothing said so until a release was cut five days later. Naming the
     # tool rather than counting it made the failure legible in one line -- but a legible failure that
-    # only a release can produce still costs a release to find. The list below is not the fix for that;
-    # running this smoke on every pull request is, and it is not done here.
+    # only a release can produce still costs a release to find. It happened a third time, with
+    # system_version, and cost a third release run before anything said so. The list below was never
+    # the fix for that; being executed before a release is, so the build job on every pull request now
+    # runs this smoke as well.
     expected = {
         "artifact_get",
         "artifact_validate",
@@ -105,6 +107,7 @@ try:
         "pipeline_snapshot",
         "pipeline_status",
         "source_draft",
+        "system_version",
     }
     assert tool_names == expected, (
         f"unexpected tools: {sorted(tool_names - expected)}; "

@@ -17,13 +17,13 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.runtime.engine.JobWatch;
 import io.tapstate.runtime.engine.ChainAxes;
 import java.io.Serializable;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -154,15 +154,8 @@ class NestGatheringPassesOnEveryChainsBoundTest {
         return chain + ":" + value;
     }
 
-    private static void await(BooleanSupplier reached) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (System.nanoTime() < deadline) {
-            if (reached.getAsBoolean()) {
-                return;
-            }
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
-        }
-        // Timing out silently would leave the assertion below reading an empty list as agreement.
-        throw new AssertionError("the bounds waited for never arrived; what did: " + List.copyOf(BOUNDS));
+    /** Waits on the running job, so a job that dies is reported as that and not as a slow mechanism. */
+    private void await(BooleanSupplier reached) {
+        JobWatch.until(job, Duration.ofSeconds(30), reached, () -> String.valueOf(List.copyOf(BOUNDS)));
     }
 }

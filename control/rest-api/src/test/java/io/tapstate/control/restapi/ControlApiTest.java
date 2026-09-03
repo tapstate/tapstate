@@ -7,6 +7,7 @@ import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactOutcome;
 import io.tapstate.control.core.ArtifactValidationResult;
 import io.tapstate.control.core.ArtifactQueryService;
+import io.tapstate.control.core.ArtifactListEntry;
 import io.tapstate.control.core.AuditGate;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -38,6 +39,7 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -129,7 +131,7 @@ class ControlApiTest {
     }
 
     private RestClient client() {
-        return RestClient.create("http://localhost:" + port);
+        return RestClient.create("http://127.0.0.1:" + port);
     }
 
     private ApplyResult applyDrafts(String... drafts) {
@@ -403,8 +405,29 @@ class ControlApiTest {
         ArtifactList listed = client().get().uri("/api/artifacts")
                 .retrieve().toEntity(ArtifactList.class).getBody();
 
-        assertThat(listed.artifacts()).extracting(StoredArtifact::id)
+        assertThat(listed.artifacts()).extracting(ArtifactListEntry::id)
                 .containsExactlyInAnyOrder("src_ora", "tgt_my", "ora2my_ods");
+    }
+
+    @Test
+    void listReturnsReadableSiblingsWhenOneStoredDocumentIsUnreadable() {
+        applyDrafts(TGT_MY);
+        InMemoryArtifactStore store = (InMemoryArtifactStore) context.getBean(ArtifactStore.class);
+        store.putUnreadable("p1", "pipeline", "not: [valid");
+
+        ArtifactList listed = client().get().uri("/api/artifacts")
+                .retrieve().toEntity(ArtifactList.class).getBody();
+
+        assertThat(listed.artifacts()).extracting(ArtifactListEntry::id)
+                .containsExactlyInAnyOrder("tgt_my", "p1");
+        assertThat(listed.artifacts()).filteredOn(a -> a.id().equals("tgt_my")).singleElement()
+                .satisfies(a -> assertThat(a.readable()).isTrue());
+        assertThat(listed.artifacts()).filteredOn(a -> a.id().equals("p1")).singleElement()
+                .satisfies(a -> {
+                    assertThat(a.kind()).isEqualTo("pipeline");
+                    assertThat(a.canonicalForm()).isEqualTo("not: [valid");
+                    assertThat(a.readable()).isFalse();
+                });
     }
 
     @Test
@@ -414,7 +437,7 @@ class ControlApiTest {
         ArtifactList sources = client().get().uri("/api/artifacts?kind=source")
                 .retrieve().toEntity(ArtifactList.class).getBody();
 
-        assertThat(sources.artifacts()).extracting(StoredArtifact::id)
+        assertThat(sources.artifacts()).extracting(ArtifactListEntry::id)
                 .containsExactlyInAnyOrder("src_ora", "tgt_my");
     }
 
@@ -627,6 +650,35 @@ class ControlApiTest {
     }
 
     @Test
+    void versionAnswersAtTheRootWithWhatTheBuildStampedIn() {
+        // The server's own version must be askable before anyone logs in: the CLI reads it while
+        // connecting, and connecting is decoupled from authenticating. So this is the second anonymous
+        // root endpoint, and like the probe it is a plain @Controller outside the /api prefix.
+        // The expected value comes from the build, not from a constant in this module -- a version the
+        // code carries can only be compared with itself, which pins nothing.
+        String projectVersion = System.getProperty("tapstate.project.version");
+        assertThat(projectVersion)
+                .as("the build must pass -Dtapstate.project.version so this guard can run at all")
+                .isNotBlank();
+
+        ResponseEntity<Map<String, Object>> answer = client().get().uri("/version")
+                .retrieve().toEntity(new ParameterizedTypeReference<>() { });
+
+        assertThat(answer.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(answer.getBody()).containsEntry("version", projectVersion);
+        // Both reserved fields are in the shape from the first release on, so a client that learns to
+        // read them never has to tell "this server is too old" from "this server left them out". They
+        // stay empty until what fills them lands. None of the three numbers derives from another: the
+        // product version here, the DSL grammar version, and the system-data version are independent.
+        assertThat(answer.getBody()).containsKeys("dslVersions", "dataVersion");
+        assertThat((List<?>) answer.getBody().get("dslVersions")).isEmpty();
+
+        HttpStatusCode versionUnderApi = client().get().uri("/api/version")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(versionUnderApi).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
     void clusterMembersIsRoutedButNotYetImplemented() {
         // Topology must never leak anonymously: until the authentication interceptor and the member
         // listing land, the endpoint is reserved and answers 501 — it exposes nothing.
@@ -702,7 +754,8 @@ class ControlApiTest {
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, SourceDraftTestConfiguration.class, ArtifactController.class,
             SourceDraftController.class, ConnectionController.class,
-            ClusterController.class, HealthController.class, ApiExceptionHandler.class, FaultController.class})
+            ClusterController.class, HealthController.class, VersionController.class,
+            ApiExceptionHandler.class, FaultController.class})
     static class TestApp {
 
         @Bean
@@ -964,9 +1017,16 @@ class ControlApiTest {
         private final CanonicalWriter writer = new CanonicalWriter();
         private final DslParser parser = new DslParser();
         private final Map<String, String> byId = new LinkedHashMap<>();
+        private final Map<String, String> kindById = new LinkedHashMap<>();
+
+        void putUnreadable(String id, String kind, String canonical) {
+            byId.put(id, canonical);
+            kindById.put(id, kind);
+        }
 
         void clear() {
             byId.clear();
+            kindById.clear();
         }
 
         @Override
@@ -989,6 +1049,9 @@ class ControlApiTest {
                 staged.put(artifact.id(), writer.write(artifact));
             }
             byId.putAll(staged);
+            for (Resource artifact : artifacts) {
+                kindById.put(artifact.id(), artifact.kind());
+            }
             return Optional.empty();
         }
 
@@ -1008,6 +1071,21 @@ class ControlApiTest {
         }
 
         @Override
+        public List<StoredArtifactRecord> listStored() {
+            List<StoredArtifactRecord> rows = new ArrayList<>();
+            for (Map.Entry<String, String> entry : byId.entrySet()) {
+                try {
+                    rows.add(StoredArtifactRecord.of(parser.parse(entry.getValue())));
+                } catch (RuntimeException unreadable) {
+                    rows.add(new StoredArtifactRecord(
+                            entry.getKey(), kindById.getOrDefault(entry.getKey(), "unknown"),
+                            entry.getValue(), null, false));
+                }
+            }
+            return rows;
+        }
+
+        @Override
         public ArtifactMutation delete(String id, String expectedContentHash) {
             String canonical = byId.get(id);
             if (canonical == null) {
@@ -1017,6 +1095,7 @@ class ControlApiTest {
                 return ArtifactMutation.VERSION_CONFLICT;
             }
             byId.remove(id);
+            kindById.remove(id);
             return ArtifactMutation.DELETED;
         }
     }

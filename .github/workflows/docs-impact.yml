@@ -1,0 +1,47 @@
+# Whether the documentation-impact section was answered, and whether it agrees with the label.
+#
+# A required check, unlike the template gate beside it, and the difference is what each one can
+# know. That one asks whether prose is any good, which no grep decides, so it stays advisory. This
+# one asks whether a field was filled in at all -- a question with an answer -- and the answer has to
+# be captured here, at the moment the author is looking at the pull request. It cannot be recovered
+# later: the release gate downstream reads these same fields across a whole release range, and by
+# then every one of those pull requests is merged and its body is nobody's to fix.
+#
+# `pull_request`, deliberately, and not the `pull_request_target` its sibling `docs-followup.yml`
+# needs. That one has to reach a secret; this one reads the event payload and runs a shell script, so
+# it wants no secrets and must never have any. The consequence is the one that matters: it runs, and
+# reports, on a pull request from a fork. A check that quietly declines to run on outside
+# contributions is not a lenient check -- it is an absent one, and an absent check-run is invisible
+# to anything counting failures.
+#
+# `labeled` and `unlabeled` are in the trigger because half of what this decides is the label, and
+# `edited` is there because the other half is the body. Without both, the only way to clear a red
+# would be to push a commit that changes nothing.
+name: docs-impact
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, edited, labeled, unlabeled, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-impact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The gate still decides the way it is supposed to
+        run: |
+          shellcheck .github/scripts/docs-impact.sh .github/scripts/docs-impact-smoke.sh .github/scripts/_pr-section.sh
+          bash .github/scripts/docs-impact-smoke.sh
+
+      - name: The documentation impact is answered, and the label agrees with it
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_ACTOR: ${{ github.event.pull_request.user.login }}
+        run: bash .github/scripts/docs-impact.sh

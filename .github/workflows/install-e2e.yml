@@ -94,6 +94,50 @@ jobs:
           test -L "$HOME/.tapstate/bin/tapstate" || { echo "the stable entry is not a link" >&2; exit 1; }
       - name: Negative paths against the checked-in fixtures
         run: bash install/install-smoke.sh
+      - name: Upgrading from the previous release lands on the new one, and it still works
+        # The step above re-runs the same version, which proves the installer is idempotent and nothing
+        # else: the version directory it points at, the alias it moves, and the binary it leaves behind
+        # are all the ones already there, so an installer that could not change versions at all passes
+        # it. A release that cannot be upgraded onto is published and useless, and this is the cheapest
+        # place that difference is visible -- on every platform, without a container.
+        #
+        # In a directory of its own. The steps above have their own subject and their own assertions
+        # about $HOME/.tapstate, and installing an older version underneath them would answer for both.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          prev="$(.github/scripts/latest-release-tag.sh --previous)"
+          newest="$(.github/scripts/latest-release-tag.sh)"
+          dir="$HOME/upgrade"
+          mkdir -p "$dir"
+          reports() {   # $1 = the version the binary must claim
+            got="$("$dir/tapstate" --version)"
+            case "$got" in
+              *"$1"*) echo "installed: $got" ;;
+              *) echo "expected $1, but the binary reports '$got'" >&2; exit 1 ;;
+            esac
+          }
+          curl -sSL https://install.tapstate.dev/cli \
+            | TAPSTATE_INSTALL_DIR="$dir" TAPSTATE_VERSION="${prev#v}" sh
+          reports "${prev#v}"
+          # The upgrade itself is the plain one-liner a second time -- no version named, no flag. That
+          # is what a user runs, and it is the form the documentation gives them.
+          curl -sSL https://install.tapstate.dev/cli | TAPSTATE_INSTALL_DIR="$dir" sh
+          reports "${newest#v}"
+          # The stable entry has to have moved with it. A binary that reports the new version while the
+          # link still names the old directory is one `rm` of the old version away from a broken install,
+          # and nothing about it looks wrong until then.
+          target="$(readlink "$dir/tapstate")"
+          case "$target" in
+            versions/"${newest#v}"/*) echo "the stable entry points at $target" ;;
+            *) echo "the stable entry still points at $target after upgrading to ${newest#v}" >&2; exit 1 ;;
+          esac
+          # And the representative path still works on the upgraded binary, from a directory the older
+          # version never touched.
+          mkdir -p "$dir/demo" && cd "$dir/demo"
+          "$dir/tapstate" new -y --kind source --id my_db --connector mysql
+          "$dir/tapstate" validate
 
   published-is-the-newest-release:
     # What the domain serves is a deployment, not a branch, so nothing about it is proven by reading
@@ -119,14 +163,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          tag="$(gh release list --limit 30 --exclude-drafts --json tagName \
-                   --jq 'first | .tagName')"
-          test -n "$tag" || { echo "no published release to compare the edge against" >&2; exit 1; }
+          tag="$(.github/scripts/latest-release-tag.sh)"
           echo "newest published release: $tag"
           git fetch --quiet origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null || true
           site="$(mktemp -d)"
-          git show "$tag:deploy/quickstart/quickstart.sh" > "$site/quickstart.sh"
-          git show "$tag:install/install.sh"              > "$site/install.sh"
+          # Assembled the way the publisher assembles it, never read straight out of the tag. The
+          # tree a release tag points at carries the PREVIOUS release's pins by construction -- the
+          # number is written inside the release runner, which never commits -- so a raw read
+          # compares the edge against the release before the one being announced. That is wrong in
+          # both directions and was wrong in both: it passed for a whole release cycle while the
+          # one-liner handed out a stale version, and it fails the moment the site is correct.
+          pinned="$(.github/scripts/site-from-tag.sh "$tag" "$site")"
+          echo "the newest release should be serving: $pinned"
           sh deploy/install-site/verify-published.sh https://install.tapstate.dev "$site"
 
   musl-refuses-loudly:

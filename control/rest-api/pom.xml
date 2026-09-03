@@ -70,4 +70,30 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
+
+  <build>
+    <resources>
+      <!-- This module's only resource is the version stamp, and it is useless unfiltered: an
+           unsubstituted placeholder is served to clients as though it were a version. -->
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>true</filtering>
+      </resource>
+    </resources>
+    <plugins>
+      <!-- The version this face reports over HTTP is filtered in from the reactor at build time, so it
+           tracks the single source of truth instead of being a second copy someone has to remember to
+           bump. Handing the same project version to the tests lets a guard assert the served value
+           against the build rather than against itself. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <systemPropertyVariables>
+            <tapstate.project.version>${project.version}</tapstate.project.version>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
 </project>

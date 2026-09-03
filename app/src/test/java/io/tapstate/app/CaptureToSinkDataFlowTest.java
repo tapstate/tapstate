@@ -42,6 +42,10 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
+import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.time.Duration;
 import java.util.Iterator;
@@ -130,6 +134,8 @@ class CaptureToSinkDataFlowTest {
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(
+                new SourceTable(TABLE, List.of(new SourceField("id", "INT")), List.of("id"), List.of())))));
 
         // Make the member SRS-capable and sink-capable, exactly as the assembly root does: bind the meta store
         // and a connector provisioner into the user context. The provisioner is never resolved here (the fake

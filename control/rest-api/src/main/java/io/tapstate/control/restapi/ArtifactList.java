@@ -1,6 +1,6 @@
 package io.tapstate.control.restapi;
 
-import io.tapstate.control.core.StoredArtifact;
+import io.tapstate.control.core.ArtifactListEntry;
 
 import java.util.List;
 
@@ -9,5 +9,5 @@ import java.util.List;
  * from the truth layer. A wrapper object rather than a bare array so the response can grow fields
  * (paging, a total) without changing the wire shape.
  */
-public record ArtifactList(List<StoredArtifact> artifacts) {
+public record ArtifactList(List<ArtifactListEntry> artifacts) {
 }

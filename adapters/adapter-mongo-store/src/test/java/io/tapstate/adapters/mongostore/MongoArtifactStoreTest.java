@@ -6,6 +6,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
@@ -153,6 +154,40 @@ class MongoArtifactStoreTest {
         TapstateException coded = (TapstateException) thrown;
         assertThat(coded.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
         assertThat(coded.args()).containsEntry("id", "orders");
+    }
+
+    @Test
+    void browseProjectionKeepsReadableAndUnreadableRowsVisible() {
+        String canonical = canonical(SOURCE);
+        StoredArtifactRecord readable = MongoArtifactStore.toStoredArtifactRecord(
+                MongoArtifactStore.toDocument(PARSER.parse(canonical)));
+        StoredArtifactRecord unreadable = MongoArtifactStore.toStoredArtifactRecord(
+                new Document("_id", "corrupt")
+                        .append("kind", "pipeline")
+                        .append("canonical", "not: [valid")
+                        .append("contentHash", "stale-hash"));
+
+        assertThat(readable)
+                .extracting(StoredArtifactRecord::id, StoredArtifactRecord::kind,
+                        StoredArtifactRecord::canonicalForm, StoredArtifactRecord::readable)
+                .containsExactly("orders", "source", canonical, true);
+        assertThat(unreadable)
+                .extracting(StoredArtifactRecord::id, StoredArtifactRecord::kind,
+                        StoredArtifactRecord::canonicalForm, StoredArtifactRecord::contentHash,
+                        StoredArtifactRecord::readable)
+                .containsExactly("corrupt", "pipeline", "not: [valid", "stale-hash", false);
+    }
+
+    @Test
+    void browseProjectionToleratesMissingOrNonTextMetadata() {
+        StoredArtifactRecord row = MongoArtifactStore.toStoredArtifactRecord(
+                new Document("_id", 42).append("canonical", 17));
+
+        assertThat(row.id()).isEqualTo("42");
+        assertThat(row.kind()).isEqualTo("unknown");
+        assertThat(row.canonicalForm()).isNull();
+        assertThat(row.contentHash()).isNull();
+        assertThat(row.readable()).isFalse();
     }
 
     /** Normalizes raw YAML to its canonical form (the form the store persists). */

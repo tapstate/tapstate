@@ -12,6 +12,7 @@ dist/
 .idea/
 .vscode/
 *.iml
+.claude/
 
 # Node (web tooling, if any)
 node_modules/

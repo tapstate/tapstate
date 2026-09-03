@@ -13,7 +13,9 @@ import java.util.Optional;
  * resources by that id as one atomic unit — either every one is stored or, on any failure, none is —
  * and the stored form is canonical; {@link #save} is the single-artifact case of it. {@link #get}
  * returns the stored resource for an id, or empty when none is stored. {@link #list} returns every
- * stored resource.
+ * stored resource. {@link #listStored} is the browse projection: an implementation may include rows
+ * whose body cannot be reconstructed, so a single damaged document does not make an inventory read
+ * unavailable.
  */
 public interface ArtifactStore {
 
@@ -89,4 +91,14 @@ public interface ArtifactStore {
 
     /** Lists every stored resource. */
     List<Resource> list();
+
+    /**
+     * Lists the stored rows without requiring every canonical body to reconstruct as a {@link Resource}.
+     * The default preserves the strict resource-list behaviour for stores that have no raw projection;
+     * stores backed by a persistent document format may override it to retain unreadable rows with
+     * {@code readable == false}.
+     */
+    default List<StoredArtifactRecord> listStored() {
+        return list().stream().map(StoredArtifactRecord::of).toList();
+    }
 }

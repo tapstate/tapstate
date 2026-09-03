@@ -6,12 +6,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -34,15 +30,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("a mode this repository declares reaches the packaged CLI")
 class OverlayDeclaredModesReachTheShippedCliIT {
 
-    /** Where the build wrote the classpath the CLI is launched from. */
-    private static final String CLI_CLASSPATH_PROPERTY = "tapstate.e2e.cli-classpath";
-
     @Test
     @DisplayName("a mode the declaration does not carry is refused, and the refusal names the ones it does")
     void refusesAModeTheDeclarationDoesNotCarry(@TempDir Path workspace) {
         write(workspace, "cdc");
 
-        CliRun run = runCli("validate", workspace.toString());
+        CliOnce.Run run = CliOnce.run("validate", workspace.toString());
 
         assertThat(run.exitCode()).as("validate must refuse, so it cannot exit 0").isNotZero();
         assertThat(run.stdout() + run.stderr())
@@ -55,7 +48,7 @@ class OverlayDeclaredModesReachTheShippedCliIT {
     void acceptsTheModeTheDeclarationCarries(@TempDir Path workspace) {
         write(workspace, "stream");
 
-        CliRun run = runCli("validate", workspace.toString());
+        CliOnce.Run run = CliOnce.run("validate", workspace.toString());
 
         assertThat(run.exitCode()).as("output was:\n%s%s", run.stdout(), run.stderr()).isZero();
         assertThat(run.stdout()).contains("valid");
@@ -70,46 +63,6 @@ class OverlayDeclaredModesReachTheShippedCliIT {
                     connector: kafka
                     mode: %s
                     """.formatted(mode));
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-    }
-
-    /** What one CLI process produced. */
-    private record CliRun(int exitCode, String stdout, String stderr) {
-    }
-
-    /** Launches the CLI as its own process on the classpath the build recorded, and waits for it. */
-    private static CliRun runCli(String... args) {
-        List<String> command = new ArrayList<>(List.of(
-                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                "-cp", cliClasspath(),
-                "io.tapstate.cli.Cli"));
-        command.addAll(List.of(args));
-        try {
-            Process process = new ProcessBuilder(command).start();
-            String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            String err = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
-            if (!process.waitFor(2, TimeUnit.MINUTES)) {
-                process.destroyForcibly();
-                throw new AssertionError("the CLI did not exit; output so far:\n" + out + err);
-            }
-            return new CliRun(process.exitValue(), out, err);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted waiting for the CLI", e);
-        }
-    }
-
-    private static String cliClasspath() {
-        String file = System.getProperty(CLI_CLASSPATH_PROPERTY);
-        assertThat(file)
-                .as("the build must set %s so the CLI can be launched", CLI_CLASSPATH_PROPERTY)
-                .isNotBlank();
-        try {
-            return Files.readString(Path.of(file)).trim();
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

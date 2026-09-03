@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/quickstart-online
+---
+
 # Quick start: the online runtime (preview)
 
 > **Preview / POC.** Tapstate's runtime is an early slice: a single-node, in-memory
@@ -332,17 +338,25 @@ Validate offline before going online (no server needed):
 ./tapstate-cli/bin/tapstate validate work       # expects: valid: 3 resources in work
 ```
 
-## 6. Go online and run
+## 6. Save a context, sign in, and run
 
-Start the interactive REPL and drive it. The connection is session state, so these
-run inside one REPL session. The REPL does not expand shell variables, so the address is
-written out below; type your own port instead if you moved it:
+Create a named context once, bind it to this workspace, and sign in from the same
+session. The password prompt is masked. The CLI does not accept a password option: use the prompt or
+`TAPSTATE_PASSWORD` for non-interactive use.
 
 ```console
 $ ./tapstate-cli/bin/tapstate -w work
-tapstate(offline:work)> connect http://127.0.0.1:8080
-tapstate(127.0.0.1:8080)> login admin
+tapstate(offline:work)> :ctx
+Context action: Create a context
+Context name: local
+Server URL: http://127.0.0.1:8080
+Verify TLS [Y]:
+Bind local to /.../work [Y]:
+created context local
+bound local to /.../work
+tapstate(offline:work)> auth login admin
 Password:                       # the admin password from step 2 (not echoed)
+signed in as admin (read, write, admin)
 tapstate(admin@127.0.0.1:8080)> register ../mysql-connector.jar
 tapstate(admin@127.0.0.1:8080)> register ../postgres-connector.jar
 tapstate(admin@127.0.0.1:8080)> register ../mongodb-connector.jar
@@ -353,6 +367,45 @@ tapstate(admin@127.0.0.1:8080)> discover-schema fulfillment_db
 tapstate(admin@127.0.0.1:8080)> apply
 tapstate(admin@127.0.0.1:8080)> start order_pipeline
 ```
+
+The context stores the server target and workspace binding. The CLI stores a revocable
+opaque session separately, never the password or access token. After a process restart,
+the workspace binding selects `local` and the first online command resumes that session:
+
+```console
+$ ./tapstate-cli/bin/tapstate -w work
+tapstate(offline:work)> ls pipeline
+resumed admin@local
+```
+
+Use `./tapstate-cli/bin/tapstate auth status --context local` to inspect the saved
+session and `./tapstate-cli/bin/tapstate auth logout --context local` to revoke it and
+remove the local cache. `connect` remains a temporary diagnostic connection: a later
+`connect` and `login` change only the current REPL process and do not update a context or
+save a session.
+
+The context definition is kept in `~/.tapstate/config.yaml`; its session cache is separate under
+`~/.tapstate/auth/` and is owner-only. Enter `:ctx` again to choose or edit a context, bind or
+unbind the current workspace, or delete a context. Deleting a context can leave its server-side
+session active, so run `auth logout` when you also want to revoke that session. Keep `Verify TLS` enabled for HTTPS endpoints; turn
+it off only for a deliberately local HTTP endpoint such as the loopback example above. If the
+configuration path or file is group/world-readable, the CLI refuses to read or overwrite it until
+you restore owner-only permissions.
+
+For automation, pass a machine token at launch with `--token TOKEN` or
+`TAPSTATE_TOKEN`. It wins over a cached human session for this process, is never read
+from or written to the human-session cache, and is not printed by CLI diagnostics. The
+CLI performs anonymous server discovery before attaching the bearer. Pair it with a
+temporary target when no context is selected:
+
+```console
+$ TAPSTATE_TOKEN=... ./tapstate-cli/bin/tapstate --connect http://127.0.0.1:8080 ls pipeline
+```
+
+In an interactive process, `auth status` reports that the machine token is selected and
+`auth logout` (or bare `logout`) only clears that in-process token; neither action
+requires a context or contacts the server. `auth login` is intentionally unavailable
+while a machine token is selected.
 
 - **`register`** uploads a connector jar to the server (content-addressed and
   idempotent; re-registering the same jar is a no-op). Its paths resolve against the
@@ -581,6 +634,40 @@ The pulled/built images remain — remove them with `docker image rm <image>` if
 want the machine back exactly as it was. The jars, `work/`, and `.env` you created
 here are just files; delete them as usual.
 
+## Upgrading to a newer release
+
+A newer release drops into the same directory. Your data lives in the named volumes,
+so the one thing not to do here is `down -v` — that is the teardown above, not an
+upgrade.
+
+Stop the stack, keeping its volumes:
+
+```sh
+docker compose down          # no -v: the store, MySQL and PostgreSQL data all stay
+```
+
+Point the compose file at the new version, and take the new CLI beside it:
+
+```sh
+sed -i.bak 's|ghcr.io/tapstate/tapstate:.*|ghcr.io/tapstate/tapstate:<new-version>|' docker-compose.yml
+curl -sSL https://install.tapstate.dev/cli | TAPSTATE_INSTALL_DIR=. TAPSTATE_VERSION=<new-version> sh
+```
+
+Then start it again:
+
+```sh
+docker compose up -d
+```
+
+The server reads the store it finds, so everything you registered — connectors,
+resources, pipelines — is still there and needs no re-applying, and a pipeline that
+was running is still recorded as running. There is nothing to `start` by hand;
+starting one that the store already calls running is refused.
+
+Upgrades are supported within one MAJOR line — `0.2.1` to `0.3.0` and onward. Check
+`./tapstate --version` afterwards: it is the CLI's own version, and it should be the
+one you just installed.
+
 ## Alternative: build and run the server from source
 
 Prefer to run the server process directly on the host — to attach a debugger, or to
@@ -688,5 +775,6 @@ This runtime is a preview. Known constraints in this slice:
   and is often sparse; full runtime detail is in the server process log.
 - **No CLI bootstrap verb.** The compose stack creates the first admin for you; on
   the from-source path it is the `curl` above.
-- **One-shot online verbs don't persist a session.** The online verbs are driven from
-  the REPL, where the connection is session state.
+- **Temporary connections and machine tokens are process-scoped.** A persistent human
+  session is created only by `auth login` against a named context; `connect`,
+  `--connect`, `--token`, and `TAPSTATE_TOKEN` never create or update that cache.

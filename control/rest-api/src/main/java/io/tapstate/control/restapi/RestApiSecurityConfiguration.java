@@ -96,7 +96,8 @@ class RestApiSecurityConfiguration {
                 .sessionManagement(sessions -> sessions.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(entryPoint))
                 .authorizeHttpRequests(authorize -> authorize
-                        .requestMatchers("/healthz", "/auth/login", "/auth/bootstrap", "/error").permitAll()
+                        .requestMatchers("/healthz", "/version", AuthWire.DISCOVERY_PATH, AuthWire.LOGIN_PATH,
+                                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, "/auth/bootstrap", "/error").permitAll()
                         .anyRequest().denyAll());
         return http.build();
     }

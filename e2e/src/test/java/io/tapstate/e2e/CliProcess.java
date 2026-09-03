@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 
@@ -51,7 +52,12 @@ final class CliProcess implements AutoCloseable {
 
     /** Starts the CLI with its output on a pipe - what a command in a script or a redirect gets. */
     static CliProcess onAPipe(String... args) {
-        return new CliProcess(start(command(args)));
+        return onAPipe(Map.of(), args);
+    }
+
+    /** Starts the CLI with its output on a pipe and the supplied process environment. */
+    static CliProcess onAPipe(Map<String, String> environment, String... args) {
+        return new CliProcess(start(command(args), environment));
     }
 
     /**
@@ -66,6 +72,11 @@ final class CliProcess implements AutoCloseable {
      * witness into a witness of something else.
      */
     static CliProcess onATerminal(String... args) {
+        return onATerminal(Map.of(), args);
+    }
+
+    /** Starts the CLI with a pseudo-terminal and the supplied process environment. */
+    static CliProcess onATerminal(Map<String, String> environment, String... args) {
         requireScript();
         List<String> command = command(args);
         boolean mac = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("mac");
@@ -80,7 +91,7 @@ final class CliProcess implements AutoCloseable {
             wrapped.add(shellWord(command));
             wrapped.add("/dev/null");
         }
-        return new CliProcess(start(wrapped));
+        return new CliProcess(start(wrapped, environment));
     }
 
     /** Everything the command has written so far. */
@@ -178,9 +189,11 @@ final class CliProcess implements AutoCloseable {
         return command;
     }
 
-    private static Process start(List<String> command) {
+    private static Process start(List<String> command, Map<String, String> environment) {
         try {
-            return new ProcessBuilder(command).redirectErrorStream(true).start();
+            ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
+            builder.environment().putAll(environment);
+            return builder.start();
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

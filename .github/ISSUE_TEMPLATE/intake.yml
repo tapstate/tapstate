@@ -36,10 +36,14 @@ body:
       render: shell
     validations:
       required: true
-  - type: input
+  - type: textarea
     id: version
     attributes:
-      label: Version
-      description: Output of `tapstate --version`, or the image tag / commit you ran.
+      label: Versions
+      description: >
+        Paste the output of `tapstate version`. It reports both the CLI and the server it is
+        connected to, which are separate installs and are often different builds. If you cannot
+        run it, the image tag or the commit you ran.
+      render: shell
     validations:
       required: true

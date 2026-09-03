@@ -203,7 +203,7 @@ thin jar for manual verification* - with its dependencies in `target/lib` beside
 ```sh
 cd <your-checkout>/tapstate
 java -jar cli/target/cli-0.2.1.jar --version        # -> tapstate 0.2.1
-java -jar cli/target/cli-0.2.1.jar -w ./work -c 127.0.0.1:8080 -u admin -p admin
+TAPSTATE_PASSWORD=admin java -jar cli/target/cli-0.2.1.jar -w ./work -c 127.0.0.1:8080 -u admin
 ```
 
 With no subcommand it opens a REPL - one session holding a workspace and a connection. With a
@@ -222,7 +222,8 @@ Worth a run configuration when you want to step through CLI code in a debugger, 
 | Name | `tapstate-cli` |
 | Module / classpath | `cli` |
 | Main class | `io.tapstate.cli.Cli` |
-| Program arguments | `-w ./work -c 127.0.0.1:8080 -u admin -p admin` |
+| Program arguments | `-w ./work -c 127.0.0.1:8080 -u admin` |
+| Environment variables | `TAPSTATE_PASSWORD=admin` |
 | Working directory | the parent of the directory holding your `.tap.yml` files |
 
 The IDE console is not a TTY, so JLine falls back to a dumb terminal and Tab completion is gone.
@@ -230,6 +231,43 @@ The IDE console is not a TTY, so JLine falls back to a dumb terminal and Tab com
 offered** - it is not present on every configuration type or IDE version, and it is not worth hunting
 for: if it is not there, run the CLI in a terminal and keep the IDE for the server. Nothing else about
 the CLI behaves differently between the two.
+
+### Use a saved context when you work on the same checkout repeatedly
+
+The launch above uses a temporary target and login. That is useful for a one-off debugging session,
+but it does not save the server or a session. To keep this workspace associated with the server, start
+the REPL with only its workspace and create a context from `:ctx`:
+
+```console
+$ java -jar cli/target/cli-0.2.1.jar -w ./work
+tapstate(offline:work)> :ctx
+Context action: Create a context
+Context name: ide
+Server URL: http://127.0.0.1:8080
+Verify TLS [Y]: n
+Bind ide to /.../work [Y]:
+created context ide
+bound ide to /.../work
+tapstate(offline:work)> auth login admin
+Password:                       # masked; TAPSTATE_PASSWORD also works for scripts
+signed in as admin; session saved
+```
+
+The context stores the server URL and workspace binding in `~/.tapstate/config.yaml`. The login stores
+an owner-only, revocable session file under `~/.tapstate/auth/`; it never stores the password or the
+short-lived access token. Start the same command again and the first online verb resumes that session:
+
+```console
+$ java -jar cli/target/cli-0.2.1.jar -w ./work
+tapstate(offline:work)> ls pipeline
+resumed admin@ide
+```
+
+Run `:ctx` again to choose, edit, bind, unbind, or delete a saved context. Use
+`auth status --context ide` to inspect its cached session and `auth logout --context ide` to revoke the
+server session and remove the local cache. `Verify TLS` should stay enabled for HTTPS; disable it only
+for a deliberately local HTTP endpoint such as the example above. The temporary `-c/-u` launch remains
+available, but it changes only that process and does not update the saved context.
 
 ### There are three rules for giving a workspace, and `--help` describes one
 
@@ -245,8 +283,9 @@ subcommand to the same line and the rule changes:
 | `tapstate … apply DIR` | accepted |
 | `TAPSTATE_WORKDIR=DIR tapstate … apply` | accepted by both kinds |
 
-`-c`, `-u` and `-p` before a subcommand are fine; `-w` is the only one that is not. `--help` lists them
-together as launch options, so following the help walks straight into it:
+`-c` and `-u` before a subcommand are fine; `-w` is the only one that is not. Set
+`TAPSTATE_PASSWORD` when a one-line launch needs a password. `--help` lists the launch options, so
+following the help walks straight into it:
 
 ```
 $ tapstate ... apply -w ./work

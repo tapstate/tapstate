@@ -48,6 +48,7 @@ public final class ControlApiSchema {
 
     private static Map<String, SchemaRef> refs() {
         Map<String, SchemaRef> refs = new LinkedHashMap<>();
+        bind(refs, "system.version", "SystemVersion");
         bind(refs, "connector.list", "ConnectorList");
         bind(refs, "connector.get", "ConnectorGet");
         bind(refs, "source.list", "SourceList");
@@ -86,6 +87,12 @@ public final class ControlApiSchema {
         Map<String, Object> opaque = object(List.of(), Map.of(), true);
         Map<String, Object> id = string("Tapstate resource identifier");
 
+        // Open rather than closed: the two reserved fields of the version answer are empty until what
+        // fills them lands, and a document that typed them would have to describe an absent value.
+        pair(defs, "SystemVersion", empty, object(
+                List.of("version"),
+                Map.of("version", string("Product release this server was built from")),
+                true));
         pair(defs, "ConnectorList", empty, opaque);
         pair(defs, "ConnectorGet", object(List.of("id"), Map.of("id", id), false), opaque);
         pair(defs, "SourceList", empty, opaque);

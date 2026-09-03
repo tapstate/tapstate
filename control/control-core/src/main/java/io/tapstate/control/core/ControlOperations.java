@@ -28,6 +28,15 @@ public final class ControlOperations {
     private static final Map<Frontend, Maturity> CLI_AND_MCP =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT);
 
+    // system domain
+    public static final Operation SYSTEM_VERSION = new Operation(
+            "system.version", Scope.READ, false, ControlApiSchema.ref("system.version"),
+            "Report which version of Tapstate this server is, plus the authoring grammar versions it "
+                    + "accepts and the schema version of its system data. Ask before reasoning about "
+                    + "what this server can do: a client and a server are installed by different paths "
+                    + "and are often different builds.",
+            CLI_AND_MCP);
+
     // artifact domain
     public static final Operation ARTIFACT_APPLY = mcp(
             "artifact.apply", Scope.WRITE, true,
@@ -217,6 +226,7 @@ public final class ControlOperations {
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
     private static final List<Operation> ALL = List.of(
+            SYSTEM_VERSION,
             ARTIFACT_APPLY,
             ARTIFACT_VALIDATE,
             ARTIFACT_GET,

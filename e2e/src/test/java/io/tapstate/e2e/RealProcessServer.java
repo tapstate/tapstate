@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.file.Files;
@@ -41,7 +42,9 @@ final class RealProcessServer implements ServerHandle {
     static RealProcessServer start(String storeUri) {
         Path jar = bootJar();
         int port = freePort();
-        URI baseUrl = URI.create("http://localhost:" + port);
+        // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
+        // launch below binds only the first.
+        URI baseUrl = URI.create("http://127.0.0.1:" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
         Process process = launch(jar, port, storeUri, workingDirectory, output);
@@ -80,6 +83,11 @@ final class RealProcessServer implements ServerHandle {
                 jar.toString(),
                 // The role the deliverable is documented to take; parsed by the product before Spring starts.
                 "--role=all",
+                // Bound to the loopback, which is where freePort() reserved it and where the probe and
+                // every case dial it. Left to itself the product binds the wildcard, and a wildcard bind
+                // does not own 127.0.0.1:<port> -- a process already holding that port on the loopback
+                // keeps receiving the requests, and this server answers none of them.
+                "--server.address=127.0.0.1",
                 "--server.port=" + port,
                 "--tapstate.store.mongo.enabled=true",
                 "--tapstate.store.mongo.uri=" + storeUri,
@@ -150,7 +158,14 @@ final class RealProcessServer implements ServerHandle {
         // The product cannot be asked for the port it chose from outside its JVM, so the port is chosen
         // here and handed to it. The socket is closed before the launch, which leaves a small window -
         // the alternative, a fixed port, turns any busy machine into a permanent failure instead.
-        try (ServerSocket socket = new ServerSocket(0)) {
+        //
+        // Reserved on the loopback specifically, because that is the address the server is launched on
+        // and the address every case dials. A wildcard reservation proves only that the port is free on
+        // some address: the allocator hands one out even when another local process already holds it on
+        // 127.0.0.1, and that holder is the one a loopback connection reaches. Asking on the same address
+        // is also what narrows the window above to a racer binding this exact address, rather than any
+        // holder that was already there before the reservation was made.
+        try (ServerSocket socket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         } catch (IOException e) {
             throw new UncheckedIOException("could not reserve a port for the server", e);

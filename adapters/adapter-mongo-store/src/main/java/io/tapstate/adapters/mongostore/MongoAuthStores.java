@@ -2,14 +2,16 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.spi.store.AuditStore;
+import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.TokenStore;
 import io.tapstate.spi.store.UserStore;
 
 import java.util.Objects;
 
 /**
- * The MongoDB implementation of the three standalone authentication ports — the user store, the machine
- * token store, and the append-only audit log — each bound to its own collection on the verified
+ * The MongoDB implementation of the standalone authentication ports — user, machine token, opaque session,
+ * append-only audit, and stable cluster identity — each bound to its own collection on the verified
  * connection's database. These are reached on their own rather than through the aggregate
  * {@link io.tapstate.spi.store.StorePort} (they mirror one another, not the artifact / state / catalog
  * surface), so this is their counterpart binding: the assembly root builds one of these over the store
@@ -21,15 +23,21 @@ public final class MongoAuthStores {
     public static final String USERS = "users";
     /** The collection holding one document per issued machine token (only the secret's hash). */
     public static final String TOKENS = "tokens";
+    /** The collection holding revocable opaque user sessions (only the secret's hash). */
+    public static final String SESSIONS = "sessions";
     /** The append-only collection holding one document per audited operation. */
     public static final String AUDIT = "audit";
+    /** The singleton document holding the stable server issuer input. */
+    public static final String CLUSTER_IDENTITY = "cluster_identity";
 
     private final UserStore users;
     private final TokenStore tokens;
+    private final SessionStore sessions;
     private final AuditStore audit;
+    private final ClusterIdentityStore clusterIdentity;
 
     /**
-     * Binds the three auth stores to their own collections on the verified connection's database. The
+     * Binds the authentication stores to their own collections on the verified connection's database. The
      * connection must have been verified first (its client opened); the stores share that one client and
      * are closed with it when the connection closes.
      */
@@ -38,7 +46,9 @@ public final class MongoAuthStores {
         MongoDatabase database = connection.database();
         this.users = new MongoUserStore(database.getCollection(USERS));
         this.tokens = new MongoTokenStore(database.getCollection(TOKENS));
+        this.sessions = new MongoSessionStore(database.getCollection(SESSIONS));
         this.audit = new MongoAuditStore(database.getCollection(AUDIT));
+        this.clusterIdentity = new MongoClusterIdentityStore(database.getCollection(CLUSTER_IDENTITY));
     }
 
     public UserStore users() {
@@ -49,7 +59,15 @@ public final class MongoAuthStores {
         return tokens;
     }
 
+    public SessionStore sessions() {
+        return sessions;
+    }
+
     public AuditStore audit() {
         return audit;
+    }
+
+    public ClusterIdentityStore clusterIdentity() {
+        return clusterIdentity;
     }
 }

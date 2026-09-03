@@ -78,6 +78,86 @@ class CliTest {
     }
 
     @Test
+    void authHelpIsUsefulThroughBothSupportedHelpForms() {
+        Run direct = run("auth", "--help");
+        Run helpCommand = run("help", "auth");
+
+        assertThat(direct.code()).isZero();
+        assertThat(helpCommand.code()).isZero();
+        assertThat(direct.out()).contains("tapstate auth <login|status|logout>").contains("--local-only");
+        assertThat(helpCommand.out()).contains("tapstate auth <login|status|logout>").contains("--local-only");
+    }
+
+    @Test
+    void rootHelpDocumentsProcessOnlyMachineTokenSelection() {
+        Run help = run("--help");
+
+        assertThat(help.code()).isZero();
+        assertThat(help.out()).contains("--token TOKEN")
+                .contains("TAPSTATE_TOKEN")
+                .contains("process only");
+        assertThat(help.err()).isEmpty();
+    }
+
+    @Test
+    void authMaySelectItsContextAfterTheAction() {
+        LaunchOptions login = LaunchOptions.parse("auth", "login", "alice", "--context", "dev");
+        LaunchOptions status = LaunchOptions.parse("auth", "status", "--context=dev");
+        LaunchOptions logout = LaunchOptions.parse("auth", "logout", "--context", "dev", "--local-only");
+        LaunchOptions unrelated = LaunchOptions.parse("connectors", "--context", "dev");
+
+        assertThat(login.context()).isEqualTo("dev");
+        assertThat(login.command()).containsExactly("auth", "login", "alice");
+        assertThat(status.context()).isEqualTo("dev");
+        assertThat(status.command()).containsExactly("auth", "status");
+        assertThat(logout.context()).isEqualTo("dev");
+        assertThat(logout.command()).containsExactly("auth", "logout", "--local-only");
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "--context", "dev", "status"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(unrelated.context()).isNull();
+        assertThat(unrelated.command()).containsExactly("connectors", "--context", "dev");
+    }
+
+    @Test
+    void authRejectsMalformedOrDuplicateTrailingContextsBeforeSessionDispatch() {
+        assertThatThrownBy(() -> LaunchOptions.parse("--context=", "auth", "status"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("--context", "", "auth", "logout"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "status", "--context"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "status", "--context="))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("auth", "login", "alice",
+                "--context", "dev", "--context", "production"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse("--context", "production",
+                "auth", "status", "--context", "dev"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void contextHelpIsAUsefulNarrowInteractiveSurface() {
+        Run direct = run("context", "--help");
+        Run helpCommand = run("help", "context");
+
+        assertThat(direct.code()).isZero();
+        assertThat(helpCommand.code()).isZero();
+        assertThat(direct.out()).contains("tapstate context")
+                .contains("Create, choose, edit, bind, unbind, or delete saved contexts.");
+        assertThat(helpCommand.out()).contains("tapstate context")
+                .contains("Create, choose, edit, bind, unbind, or delete saved contexts.");
+        assertThat(Cli.newCommandLine().getSubcommands().get("context").getSubcommands())
+                .doesNotContainKeys("add", "use", "list", "show", "bind", "unbind", "remove");
+    }
+
+    @Test
+    void liveViewVerbsAreOnlineLaunchesEvenThoughTheyProjectNoOperation() {
+        assertThat(Cli.LIVE_VIEW_VERBS).allSatisfy(verb ->
+                assertThat(Repl.isOnlineVerb(verb)).as(verb).isTrue());
+    }
+
+    @Test
     void mcpLauncherIsAOneShotMetaCommand() {
         Run help = run("mcp", "--help");
 
@@ -118,6 +198,30 @@ class CliTest {
         assertThat(r.code()).isZero();
         assertThat(r.out()).contains("Usage: tapstate " + verb);
         assertThat(r.err()).isEmpty();
+    }
+
+    @Test
+    void theVersionVerbNamesBothHalvesAndSaysWhenThereIsNoServer() {
+        // Offline it still prints two lines. A reader told to paste this output has no way to know the
+        // CLI and the server are separate builds, so the pair is the answer and a missing half is said
+        // out loud -- a blank where the second number belongs reads as "there is only one".
+        Run r = run("version");
+
+        assertThat(r.code()).isZero();
+        assertThat(r.out()).contains("cli").contains(Cli.VERSION_NUMBER);
+        assertThat(r.out()).contains("server").contains("not connected");
+    }
+
+    @Test
+    void versionKeepsItsOfflineFormButUsesASpecifiedServerTarget() {
+        // `version` has a useful offline answer, but it is also the one report that needs to reach a
+        // selected server. Keeping the choice at the process boundary ensures -c/-u is not silently
+        // discarded before session setup (the regression covered by the E2E version check).
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("version"))).isTrue();
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("-c", "http://node:8080",
+                "version"))).isFalse();
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("--context", "dev",
+                "version"))).isFalse();
     }
 
     @ParameterizedTest
@@ -197,6 +301,18 @@ class CliTest {
         // the dsl-domain error code surfaces, located at the offending file
         assertThat(r.all()).contains("dsl.unknown-field");
         assertThat(r.all()).contains("src_typo.tap.yml");
+    }
+
+    @Test
+    void aReportedProblemSaysWhichBuildsProducedIt() {
+        // The point of the stamp: pasting the error is enough. A reporter does not have to know the CLI
+        // and the server are separate installs, and nobody has to ask "which version are you on" -- the
+        // answer arrived with the complaint. Offline it says so rather than leaving the half blank.
+        Run r = run("validate", resource("ws-invalid").toString());
+
+        assertThat(r.code()).isEqualTo(1);
+        assertThat(r.all()).contains("cli " + Cli.VERSION_NUMBER);
+        assertThat(r.all()).contains("server not connected");
     }
 
     @Test
@@ -725,7 +841,15 @@ class CliTest {
     void versionFlagPrintsTheVersion() {
         Run r = run("--version");
         assertThat(r.code()).isZero();
-        assertThat(r.out()).contains("tapstate 0.3.0");
+        // The shape, not the number. Spelling the current release out here made this a seventh place
+        // that pins the version, and the only one nothing rewrites: every release wrote the new
+        // number into the six pins and left this line behind, so the pull request that carries a
+        // release into the default branch failed on arrival, every time, on an assertion that had
+        // nothing to say about the change. Which number is right is already held down by the check
+        // that makes all six pins agree with the project version, and it fails on exactly the defect
+        // a literal here was standing in for. What is left for this test is the part that check
+        // cannot see: that the flag runs, exits zero, and prints a version at all.
+        assertThat(r.out()).containsPattern("tapstate \\d+\\.\\d+\\.\\d+");
     }
 
     @Test
@@ -767,6 +891,49 @@ class CliTest {
         // the seed honours the flag with the option's own precedence
         assertThat(LaunchOptions.parse("-w", "foo").root()).isEqualTo(Path.of("foo"));
         assertThat(LaunchOptions.parse("--workdir=bar").root()).isEqualTo(Path.of("bar"));
+    }
+
+    @Test
+    void contextIsARootLaunchOptionAndConflictsWithTemporaryConnect() {
+        LaunchOptions selected = LaunchOptions.parse("--context", "dev", "ls");
+
+        assertThat(selected.context()).isEqualTo("dev");
+        assertThat(selected.command()).containsExactly("ls");
+        assertThat(selected.hasConflictingTargets()).isFalse();
+        assertThat(LaunchOptions.parse("--connect", "node:8080", "--context", "dev", "ls")
+                .hasConflictingTargets()).isTrue();
+    }
+
+    @Test
+    void machineTokenFallsBackToTheEnvironmentWithoutChangingTheCommand() {
+        LaunchOptions fromEnvironment = LaunchOptions.parse("ls")
+                .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
+
+        assertThat(fromEnvironment.machineToken()).isEqualTo("machine-from-env");
+        assertThat(fromEnvironment.command()).containsExactly("ls");
+        assertThat(LaunchOptions.parse("ls").withEnv(name -> null).machineToken()).isNull();
+        assertThat(LaunchOptions.parse("ls").withEnv(name -> "   ").machineToken()).isNull();
+    }
+
+    @Test
+    void explicitMachineTokenTakesPrecedenceOverTheEnvironment() {
+        LaunchOptions explicit = LaunchOptions.parse("--token", "machine-from-flag", "ls")
+                .withEnv(name -> "TAPSTATE_TOKEN".equals(name) ? "machine-from-env" : null);
+
+        assertThat(explicit.machineToken()).isEqualTo("machine-from-flag");
+        assertThat(explicit.command()).containsExactly("ls");
+        assertThatThrownBy(() -> LaunchOptions.parse("--token=", "ls"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void passwordAndTheLegacyShortFormAreRejectedAsLaunchOptions() {
+        assertThatThrownBy(() -> LaunchOptions.parse(
+                "--connect", "localhost:8080", "--user", "admin", "--password", "pw", "ls"))
+                .isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> LaunchOptions.parse(
+                "--connect", "localhost:8080", "--user", "admin", "-p", "pw", "ls"))
+                .isInstanceOf(RuntimeException.class);
     }
 
     @Test
