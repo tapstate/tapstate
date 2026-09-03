@@ -172,12 +172,14 @@ public final class MigrationRunner {
     /** Runs every changeset the store has not had yet, recording each as it succeeds. */
     private static void applyPending(MongoDatabase database, SystemMetaStore meta,
             List<ChangeSet> changeSets, long epoch) {
-        ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        // Closing waits for a heartbeat write already in flight to finish; shutdownNow() only interrupts
+        // it, and a Mongo write that has been dispatched still lands. Waiting here is what keeps a late
+        // heartbeat from re-stamping the lock the release below is giving up.
+        try (ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "system-data-migration-heartbeat");
             thread.setDaemon(true);
             return thread;
-        });
-        try {
+        })) {
             heartbeat.scheduleAtFixedRate(() -> meta.heartbeat(epoch, Instant.now()),
                     HEARTBEAT_INTERVAL.toMillis(), HEARTBEAT_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
             int installed = readVersion(meta.installedVersion().orElse(null));
@@ -188,7 +190,6 @@ public final class MigrationRunner {
                 runOne(database, meta, epoch, changeSet);
             }
         } finally {
-            heartbeat.shutdownNow();
             meta.release(epoch);
         }
     }
