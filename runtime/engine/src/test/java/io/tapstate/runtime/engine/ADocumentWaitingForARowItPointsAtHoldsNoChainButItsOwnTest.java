@@ -142,7 +142,13 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
     void aDocumentIsFinishedWhenTheRowItPointsAtArrives() {
         run(true);
 
-        await(() -> !DOCUMENTS.isEmpty() && DOCUMENTS.get(DOCUMENTS.size() - 1).get("customer") != null);
+        // The position too, not only the document. A document reaches the sink's writer before the sink
+        // has confirmed it, and it is the confirming that writes the position down - so waiting on the
+        // document alone and then reading what was written down reads a run that has not finished
+        // arriving.
+        await(() -> !DOCUMENTS.isEmpty()
+                && DOCUMENTS.get(DOCUMENTS.size() - 1).get("customer") != null
+                && acked().contains(acked(ORDERS, WAITING_ORDER_AT)));
 
         assertThat(DOCUMENTS.get(DOCUMENTS.size() - 1))
                 .describedAs("the row arrived after the document that names it, and the document was "
@@ -165,7 +171,15 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
         // that was long enough on a quiet machine. Under a full build the same run has taken several
         // times as long, and a fixed wait that runs out leaves every reading below saying what an
         // unstarted run says.
-        await(() -> acked().contains(acked(ORDERS, MOVING_ORDER_AT)));
+        //
+        // Both positions, not the one that usually lands last. They reach the sink by routes that are
+        // not ordered against each other - the order's inside the document that names the row it
+        // waited for, the unrelated customer's in a word of its own from the vertex that filed it -
+        // so waiting on one and then reading the other reads a run that has not finished arriving.
+        // Nothing is given away by waiting for both: a route that never delivers still spends the
+        // budget and still fails, naming the position that never came.
+        await(() -> acked().contains(acked(ORDERS, MOVING_ORDER_AT))
+                && acked().contains(acked(CUSTOMERS, UNRELATED_CUSTOMER_AT)));
 
         assertThat(DOCUMENTS)
                 .describedAs("the control: the run reached the state being asked about. One order's row "
@@ -192,6 +206,13 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
                         + "window for no gain. The moving order sits above the waiting one on that chain, "
                         + "so this says the frontier crossed it. What was written down: %s", acked())
                 .contains(acked(ORDERS, MOVING_ORDER_AT));
+
+        // Published once a second, and the wait above ends the instant the last of those positions
+        // lands - so the newest sample can still be the one taken while this chain was legitimately a
+        // few milliseconds behind, which reads here as a frontier that had stopped. Settled first, and
+        // the assertion below is still the judge: a frontier that really stopped never settles, so what
+        // it reads is the reading that says so.
+        settle(() -> new Engine(member).frontierStalls("nest-waiting-frontier").isEmpty());
 
         assertThat(new Engine(member).frontierStalls("nest-waiting-frontier"))
                 .describedAs("and nothing reports a stopped frontier, because nothing has stopped. This "
@@ -379,5 +400,21 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
     private void await(BooleanSupplier reached) {
         JobWatch.until(job, Duration.ofSeconds(90), reached,
                 () -> "acked: " + acked() + ", documents: " + List.copyOf(DOCUMENTS));
+    }
+
+    /**
+     * Waits for what should already be true and then gives up quietly, so that what is asserted is what
+     * is actually there rather than a wait's own verdict.
+     *
+     * <p>For a reading that lags what it reports rather than one that has yet to happen: a published
+     * metric is a sample of a moment that has passed, so the reading taken the instant a run reaches its
+     * end can be older than the end. Where {@link #await} fails on the budget because what it waits for
+     * is the case, this leaves the failing to the assertion, which has the reading to name.
+     */
+    private static void settle(BooleanSupplier reached) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (System.nanoTime() < deadline && !reached.getAsBoolean()) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(50));
+        }
     }
 }
