@@ -52,6 +52,31 @@ import org.junit.jupiter.api.Test;
 class StoppingOnePipelineDoesNotClearTheChainTest {
 
     @Test
+    void aStopAskedToKeepLeavesTheStoppingPipelinesOwnFinishedTables() {
+        Fixture fixture = new Fixture();
+        fixture.coordinator.startCapture("p");
+        fixture.coordinator.startCapture("q");
+        fixture.leaveACursorFor("p");
+        fixture.leaveACursorFor("q");
+        fixture.leaveWhatTheChainAccumulated();
+        fixture.leaveAFinishedTableFor("p");
+        fixture.leaveAFinishedTableFor("q");
+
+        fixture.coordinator.stopCapture("p", false);
+
+        SrsMeta chain = fixture.chainRecord().orElseThrow(
+                () -> new AssertionError("the chain was removed by a stop that was asked to keep"));
+        assertThat(chain.snapshotCompletedTables("p"))
+                .as("the tables the stopping pipeline had already loaded: it asked for its state to be "
+                        + "kept, and a table it no longer remembers finishing is one its next run reads "
+                        + "in full -- which is the whole of what keeping was asked to prevent")
+                .containsExactly("orders");
+        assertThat(chain.snapshotCompletedTables("q"))
+                .as("and the survivor's, which no stop of somebody else may touch")
+                .containsExactly("orders");
+    }
+
+    @Test
     void stoppingOneOfTwoLeavesEverythingTheChainItselfAccumulated() {
         Fixture fixture = new Fixture();
         fixture.coordinator.startCapture("p");
