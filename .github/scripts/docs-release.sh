@@ -4,6 +4,7 @@
 #
 #   docs-release.sh open <version>                          ask for the site to be published
 #   docs-release.sh settle <version> --notes-url <url>      after publishing: tag it, or ask again
+#   docs-release.sh retire <version>                        the attempt is over: withdraw the request
 #
 # Why this repository is not on the satellite list. The site is built by Netlify from two branches:
 # `next` is the preview and `main` is what the public sees. A release branch cut across that pair
@@ -17,6 +18,13 @@
 # tag because the work is done, or it asks again in a new issue and lets the release finish. That is
 # a deliberate asymmetry, and it is the reason this is a separate script from satellites.sh: that one
 # refuses on every failure, and mixing the two postures in one file is how one of them gets lost.
+#
+# Why `retire` exists. A release attempt is atomic: it either publishes or is thrown away whole. An
+# attempt that is thrown away has already asked for a version that is now not coming, and nothing
+# used to withdraw that request -- two abandoned attempts at one version left two open issues asking
+# for it side by side, and the person they are assigned to had no way to tell either from a real one.
+# It runs in the job that cleans up after every ending, so like `settle` it never refuses: a cleanup
+# step that can go red leaves the rest of the cleanup undone.
 #
 # What the two outcomes are, at `settle`:
 #
@@ -41,7 +49,7 @@ verb="${1:-}"
 [ $# -gt 0 ] && shift
 version=""
 case "$verb" in
-    open|settle)
+    open|settle|retire)
         case "${1:-}" in ""|--*) ;; *) version="$1"; shift ;; esac ;;
 esac
 
@@ -63,9 +71,9 @@ done
 die() { echo "docs-release.sh: $1" >&2; exit "${2:-2}"; }
 
 case "$verb" in
-    open|settle) ;;
-    "") die "no verb. Expected 'open' or 'settle'" ;;
-    *)  die "unknown verb '$verb'. Expected 'open' or 'settle'" ;;
+    open|settle|retire) ;;
+    "") die "no verb. Expected 'open', 'settle' or 'retire'" ;;
+    *)  die "unknown verb '$verb'. Expected 'open', 'settle' or 'retire'" ;;
 esac
 [ -n "$version" ] || die "$verb needs a version, as x.y.z"
 case "$version" in
@@ -105,9 +113,13 @@ Nothing here blocks the release. It does decide whether the tag is one less thin
     exit 0
 fi
 
-# settle
-state="$assume"
-if [ -z "$state" ]; then
+# Find the issue this version's `open` created, by its exact title -- the halves run in different
+# jobs and nothing carries a number between them. Sets `state` and, when there is exactly one,
+# `number`. Anything other than exactly one match is reported and treated as open, which is the
+# answer that costs a notification rather than a wrongly published tag.
+find_issue() {
+    state="$assume"
+    [ -z "$state" ] || return 0
     found="$(gh issue list --repo "$repo" --state all --limit 50 \
                --search "\"$title\" in:title" --json title,state,number 2>/dev/null || true)"
     n="$(printf '%s' "$found" | jq -r --arg t "$title" '[.[]|select(.title==$t)]|length' 2>/dev/null || echo 0)"
@@ -118,7 +130,70 @@ if [ -z "$state" ]; then
         echo "$repo  no single issue titled \"$title\" ($n found); treating as not done" >&2
         state="open"
     fi
+}
+
+# retire: the attempt that opened this request is over and did not publish, so the request is for a
+# version that is not coming. Nothing used to withdraw it -- two abandoned attempts at one version
+# left two open issues asking for it side by side, and the person they are assigned to had no way to
+# tell either from a real one.
+#
+# It never fails. This runs in the job that cleans up after every ending, including the ones that
+# ended badly, and a cleanup step that can go red is one that leaves the rest of the cleanup undone.
+if [ "$verb" = retire ]; then
+    find_issue
+    # One test, upstream of the --plan exit rather than repeated inside it. Written the other way --
+    # a --plan branch that decides for itself and a live branch that decides again -- the cases can
+    # only ever reach the first, and a mutation to the one that matters survives them all. Measured:
+    # it did.
+    if [ "$state" = closed ]; then
+        echo "$repo  request for $tag was already closed; leaving it alone"
+        exit 0
+    fi
+    if [ "$plan" = 1 ]; then
+        echo "$repo  withdraw the request \"$title\""
+        exit 0
+    fi
+    if [ -z "${number:-}" ]; then
+        echo "::warning::$repo may still hold an open request for $tag; withdraw it by hand"
+        echo "$repo  could not identify the request for $tag; withdraw it by hand if it is there"
+        exit 0
+    fi
+    # Every outcome below goes to stdout, and that is the fix rather than a detail. The caller tees
+    # stdout into the step summary; these failures used to go to stderr, which is teed nowhere -- so a
+    # retire that wrote nothing and a retire that worked left the same green step and the same empty
+    # summary. Measured on a real rejected release: neither the comment nor the close landed, and the
+    # only trace anywhere was a line nothing reads.
+    #
+    # gh's own error is kept rather than discarded. `>/dev/null 2>&1` is why the old message could say
+    # "could not" and never why, and whoever picks this up next needs the reason, not the fact.
+    if comment_err="$(gh issue comment "$number" --repo "$repo" --body \
+"Withdrawing this: the release attempt that opened it ended without publishing, so $tag is not
+coming from it. **No documentation work is owed from this issue.**
+
+When $tag is actually released, a new issue is opened here by that release, and that one is the real
+request. Nothing is carried over from this one." 2>&1 >/dev/null)"; then
+        commented=yes
+    else
+        commented=no
+    fi
+    if close_err="$(gh issue close "$number" --repo "$repo" --reason "not planned" 2>&1 >/dev/null)"; then
+        if [ "$commented" = yes ]; then
+            echo "$repo  withdrew the request for $tag (#$number)"
+        else
+            # Closed with no reason on it -- worse for the person it is assigned to than leaving it
+            # open, because the request leaves their queue with nothing saying why.
+            echo "::warning::$repo#$number was closed for $tag but the explanation could not be posted: $comment_err"
+            echo "$repo  withdrew the request for $tag (#$number), but the explanation did not post"
+        fi
+    else
+        echo "::warning::$repo#$number still asks for $tag, which is not coming -- withdraw it by hand: $close_err"
+        echo "$repo  could not close #$number -- withdraw it by hand: $close_err"
+    fi
+    exit 0
 fi
+
+# settle
+find_issue
 
 if [ "$state" = closed ]; then
     if [ "$plan" = 1 ]; then

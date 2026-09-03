@@ -101,21 +101,24 @@ group() {   # <heading> <entries>
   [ -n "$2" ] || return 0
   printf '## %s\n\n%s\n' "$1" "$2"
 }
+# Split rather than one block: what a reader came for goes above the disclosures, and the rest below.
+# Somebody opening a release wants "what changed for me" first; the limits and the known defects are
+# what they check before upgrading, and the download prose is reference they come back to, not news.
 grouped="$(group "What's new" "$news"; group "Fixes" "$fixes"; group "Other changes" "$other")"
 
 cat <<EOF
 Preview build — single-node, in-memory runtime, not for production.
 
-Native CLI binaries for macOS (arm64 / x64) and Linux (x64 / arm64). Verify a download against
-its \`.sha256\` or \`checksums.txt\` before use.
+<!-- Breaking changes: what somebody upgrading has to DO, not what we changed. Delete this
+     section if this release breaks nothing. A rolling 0.x minor is allowed to break
+     compatibility, which is exactly why its absence here cannot be assumed. -->
 
-${macos_req} ${glibc_req} (\`sw_vers -productVersion\` and \`ldd --version\` report what a machine
-has.) Both are measured from these binaries and follow the build machines, so they can move between
-releases; an older system may refuse to launch them. They are recommendations, not gates — the
-installer names them and carries on rather than blocking you. \`platform-minimums.txt\` carries the
-same numbers in machine-readable form.
+<!-- What's new: the harvested sentences are below. Promote anything worth reading out of the
+     generated list, rewrite it from the reader's seat, and leave that list alone — shortening
+     it puts back the omissions this whole arrangement exists to prevent. -->
 
-### Known limits in this preview
+${grouped}
+## Known limits in this preview
 
 These are disclosed rather than fixed, and no shipped scenario covers either one. For a change
 the connector has read, delivery is at-least-once — never exactly-once. The second limit below
@@ -127,20 +130,20 @@ is a change the connector never reads at all, which no delivery guarantee can co
   the snapshot runs and is not handed to the connector's stream read until afterwards, so a
   change written to the source inside that window can be missed.
 
-<!-- Breaking changes: what somebody upgrading has to DO, not what we changed. Delete this
-     section if this release breaks nothing. A rolling 0.x minor is allowed to break
-     compatibility, which is exactly why its absence here cannot be assumed. -->
-
-<!-- What's new: the harvested sentences are below. Promote anything worth reading out of the
-     generated list at the bottom, rewrite it from the reader's seat, and leave that list
-     alone — shortening it puts back the omissions this whole arrangement exists to prevent. -->
-
-${grouped}
 <!-- Known issues: paste the user-visible defects this release is knowingly shipping with, and
      delete this section if there are none. The list of them is not fetched for you and must not
      be: it lives outside this repository, and anything copied from it would name records that
      have no business in a public release body. Look it up where it is kept, and write only what
      a user of this build would recognise. -->
+
+Native CLI binaries for macOS (arm64 / x64) and Linux (x64 / arm64). Verify a download against
+its \`.sha256\` or \`checksums.txt\` before use.
+
+${macos_req} ${glibc_req} (\`sw_vers -productVersion\` and \`ldd --version\` report what a machine
+has.) Both are measured from these binaries and follow the build machines, so they can move between
+releases; an older system may refuse to launch them. They are recommendations, not gates — the
+installer names them and carries on rather than blocking you. \`platform-minimums.txt\` carries the
+same numbers in machine-readable form.
 
 ---
 

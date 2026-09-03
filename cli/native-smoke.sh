@@ -22,7 +22,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY=""
 DO_BUILD=0
-STARTUP_BUDGET_MS=200
+# Sized by the slowest runner in the matrix, not the fastest: a budget sized on a fast machine costs
+# a whole release each time a slow one is busy. Measured across the four release platforms once the
+# timer stopped charging its own startup to the binary, the slowest median is 55ms, so 200 already
+# carries 3.6x headroom. Widening it further only buys back discrimination we want: a startup
+# regression that matters -- reflection reaching into the image, a resource read moving to
+# class-init -- is a multiple, not a drift, and lands well outside this budget either way.
+STARTUP_BUDGET_MS=${STARTUP_BUDGET_MS:-200}
 
 for arg in "$@"; do
   case "$arg" in
@@ -171,19 +177,44 @@ bold "Native smoke — binary: $BINARY"
 CORPUS="$REPO_ROOT/core/core-dsl/src/test/resources/corpus"
 
 # --- timing helper: median of N runs of a command, in milliseconds -----------------------------
+#
+# One python process does the whole measurement, and it times only the child. Written the other way
+# -- a shell loop asking `python3` for the clock on either side of each run -- the second reading
+# cannot be taken until that interpreter has started, so every sample carried one python startup
+# inside the interval it was supposed to be measuring. That is tens of milliseconds on an idle
+# machine and a great deal more on a loaded one, and it is charged to the binary.
+#
+# The first run is discarded. It pays for whatever touching this binary costs the first time --
+# on macOS the signature assessment of a freshly built, unsigned image, and a cold page cache for
+# something this size -- and none of that is what a startup budget is about. Measured: on the same
+# runner label, `--version` (the first command to touch the binary) went 86ms -> 394ms between two
+# runs of identical code, while `validate`, which does strictly more work and runs second, went
+# 92ms -> 142ms.
 median_ms() {
-  local n=5 i t samples=()
-  for ((i=0; i<n; i++)); do
-    local start end
-    start=$(python3 -c 'import time; print(int(time.time()*1000))')
-    "$@" >/dev/null 2>&1 || true
-    end=$(python3 -c 'import time; print(int(time.time()*1000))')
-    samples+=( $((end-start)) )
-  done
-  printf '%s\n' "${samples[@]}" | sort -n | sed -n '3p'
+  python3 - "$@" <<'MEDIAN'
+import subprocess, sys, time
+cmd = sys.argv[1:]
+run = lambda: subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+run()  # discarded: first touch is not startup
+xs = []
+for _ in range(5):
+    t = time.time()
+    run()
+    xs.append(int((time.time() - t) * 1000))
+print(sorted(xs)[2])
+MEDIAN
 }
 
 # --- 1. startup budget --------------------------------------------------------------------------
+# The timer is checked before it is trusted. One that answered 0 -- or answered the wrong process --
+# would pass the budget below for ever while measuring nothing, and nothing else here would notice.
+TIMER_MS=$(median_ms sleep 0.3)
+if (( TIMER_MS >= 250 && TIMER_MS < 2000 )); then
+  ok "the timer measures the command it is given (sleep 0.3 read as ${TIMER_MS}ms)"
+else
+  bad "the timer read sleep 0.3 as ${TIMER_MS}ms; the budget below would mean nothing"
+fi
+
 bold "[1] startup time (<${STARTUP_BUDGET_MS}ms)"
 VERSION_MS=$(median_ms "$BINARY" --version)
 if (( VERSION_MS < STARTUP_BUDGET_MS )); then

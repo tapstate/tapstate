@@ -121,12 +121,21 @@ else
     echo "FAIL - publish-install-site.yml does not call site-from-tag.sh"
     failures=$((failures + 1))
 fi
+# Over every workflow, not just the publisher. This case was written against `$wf` alone, and a
+# second consumer in another file did the exact thing it forbids for a month: the nightly that holds
+# the edge to the newest release built its comparison with a raw read, so it agreed with the edge
+# only while the edge was stale. It passed through the whole cycle the one-liner served 0.3.0, then
+# reddened on the deployment that fixed it -- and said "the edge is serving an older deployment",
+# which was backwards. A rule that names one file is a rule about that file.
 # shellcheck disable=SC2016  # the literal text being searched for contains $tag
-if grep -qE '^\s*git show "\$tag:(install/install.sh|deploy/quickstart/quickstart.sh)"' "$wf"; then
-    echo "FAIL - publish-install-site.yml still reads a published script straight from the tag"
+raw="$(grep -rlE '^\s*git show "\$tag:(install/install.sh|deploy/quickstart/quickstart.sh)"' \
+       "$repo/.github/workflows/" 2>/dev/null || true)"
+if [ -n "$raw" ]; then
+    echo "FAIL - a workflow still reads a published script straight from the tag:"
+    echo "$raw"
     failures=$((failures + 1))
 else
-    echo "ok   - publish-install-site.yml keeps no copy of the old straight-from-the-tag read"
+    echo "ok   - no workflow reads a published script straight from the tag"
 fi
 
 rm -rf "$(dirname "$work")" "$(dirname "$old")" "$(dirname "$young")" "$out" "$out2" "$out3"
