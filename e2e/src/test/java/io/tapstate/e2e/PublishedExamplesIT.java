@@ -244,11 +244,24 @@ class PublishedExamplesIT {
             ProvisionedStores stores,
             Endpoints files) {
         if (envelope.setup().databases().isEmpty()) {
-            settled.forEach((alias, rows) -> assertThat(
-                            files.count(EndpointAddress.uri(targetDirectory.toString()), alias.table()))
-                    .as("%s settles on %s rows in %s, read there by the address it named; this reads the "
-                            + "target this run handed out, which it cannot name", specification, rows, alias)
-                    .isEqualTo(rows));
+            // Awaited rather than read once. The file connector rewrites a target whole on every batch -
+            // create, truncate, write - so a reader landing inside that window finds a header and no rows
+            // and reads back zero. The example's own awaits have already held, so the rows did arrive; what
+            // a one-shot read adds is a second chance to catch the file mid-rewrite, which is the run's
+            // load deciding the result rather than the product. Measured: a reader polling a file rewritten
+            // this way saw zero rows on 7334 of 67796 reads, and never saw a partial count - which is why
+            // the failure this replaces always read exactly zero rather than some number below the total.
+            // A bound cannot make a broken run pass: a target that never carries the rows still runs it out
+            // and still fails, reporting the last count read.
+            settled.forEach((alias, rows) -> {
+                EndpointAddress target = EndpointAddress.uri(targetDirectory.toString());
+                Await.until(
+                        ("%s to settle on %s rows in %s, read there by the address it named; this reads the "
+                                + "target this run handed out, which it cannot name")
+                                .formatted(specification, rows, alias),
+                        () -> files.count(target, alias.table()) == rows,
+                        () -> "rows at target = " + files.count(target, alias.table()));
+            });
         } else {
             theSettledCountIsInAStoreTheSeedNeverTouched(specification, envelope, settled, binding, stores);
         }
