@@ -1,5 +1,8 @@
 package io.tapstate.spi.store;
 
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -25,6 +28,38 @@ public interface KeyedStateStore {
 
     /** The state held under {@code key} in {@code namespace}, or empty if there is none. */
     Optional<byte[]> load(String namespace, String key);
+
+    /**
+     * The states held under {@code keys} in {@code namespace}, under the names they were asked for, with
+     * a key that has no state simply absent. Order is not part of the answer.
+     *
+     * <p><b>This is not the enumeration the class note forbids, and the difference is which side holds
+     * the keys.</b> The caller arrives already knowing every key it wants — they came off a reverse index
+     * or off a batch of changes — and asks for their states; it never asks what a namespace contains. A
+     * listing would answer a question nobody here can pose.
+     *
+     * <p><b>An implementation must not answer it by scanning</b>, for the reason {@link #count} must not
+     * either: a whole-collection read wearing the name of a keyed one is the same cost with none of the
+     * warning, and it would be paid per batch rather than once. It must also not answer it by looping over
+     * {@link #load} while <em>believing</em> it batched — the default below loops openly, so a store that
+     * cannot do better inherits the honest version and a store that overrides is saying it did better.
+     *
+     * <p>Its reason for existing is a caller that would otherwise ask for a million keys one at a time.
+     * Where the store is remote that is a million round trips: the same work as a few thousand batched
+     * ones, taking three orders of magnitude longer, with nothing anywhere reporting a problem — the run
+     * is merely slow, and the most natural diagnosis (the store is slow) points away from the cause.
+     *
+     * <p>An empty {@code keys} reaches the store not at all. A caller on the event path arrives with one
+     * routinely — a change touching only keys already in memory — so the round trip it would otherwise
+     * cost is paid in the common case rather than the odd one.
+     */
+    default Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
+        Map<String, byte[]> loaded = new LinkedHashMap<>();
+        for (String key : keys) {
+            load(namespace, key).ifPresent(state -> loaded.put(key, state));
+        }
+        return loaded;
+    }
 
     /**
      * Stores {@code state} under {@code key}, replacing whatever was there. It must have reached durable
