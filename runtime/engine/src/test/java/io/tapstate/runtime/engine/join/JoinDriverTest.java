@@ -518,6 +518,96 @@ class JoinDriverTest {
                 Map.entry(Op.INSERT, rowOf("order_id", 11L, "customer_name", "Ada")));
     }
 
+    /**
+     * A dimension key with a large fan-out under it means every one of those rows is rebuilt and
+     * written, which takes as long as it takes. Nothing shortens that; what this stops is it being
+     * <em>invisible</em>. Throughout, the job is running, the error count is zero and the target holds
+     * half the old value and half the new one - a state that reads exactly like a healthy steady one,
+     * so an operator has no way to tell "wait a minute" from "something is wrong".
+     *
+     * <p>Reported while it is going rather than at the end, which is the whole point: a number that
+     * arrives once the recompute is over describes a situation that is no longer happening. The first
+     * report goes out before a single row does.
+     */
+    @Test
+    @DisplayName("a recompute reports its progress while it runs, not only once it has finished")
+    void aRecomputeReportsProgressWhileItRuns() {
+        RecordingGauge gauge = new RecordingGauge();
+        Fixture fixture = new Fixture(JoinKind.LEFT, 2, gauge);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        for (long id = 10; id < 15; id++) {
+            fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        gauge.clear();
+
+        fixture.apply(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(gauge.done())
+                .as("progress is reported before any row goes out, and only ever advances")
+                .isNotEmpty()
+                .isSorted()
+                .startsWith(0L)
+                .endsWith(5L);
+        assertThat(gauge.keys()).containsOnly(fixture.dimensionKeyOf(1L));
+    }
+
+    /**
+     * The estimate the progress is measured against. Counting the fan-out exactly would mean walking
+     * every page before walking them again to rebuild, so it is read off the page count - and for a
+     * bucket that fits in one page that happens to be exact.
+     */
+    @Test
+    @DisplayName("a recompute says how many rows it expects, taken from the index rather than counted")
+    void aRecomputeReportsWhatItExpects() {
+        RecordingGauge gauge = new RecordingGauge();
+        Fixture fixture = new Fixture(JoinKind.LEFT, 100, gauge);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        for (long id = 10; id < 13; id++) {
+            fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        gauge.clear();
+
+        fixture.apply(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(gauge.expected()).containsOnly(3L);
+    }
+
+    /** Records what a join reported about its recomputes, in the order it reported them. */
+    private static final class RecordingGauge implements JoinGauge {
+
+        private final List<long[]> progress = new ArrayList<>();
+        private final List<String> keys = new ArrayList<>();
+
+        @Override
+        public void bucketWalked(String source, String dimensionKey, int pages) {
+        }
+
+        @Override
+        public void recomputing(String source, String dimensionKey, long rowsDone, long rowsExpected) {
+            keys.add(dimensionKey);
+            progress.add(new long[] {rowsDone, rowsExpected});
+        }
+
+        void clear() {
+            progress.clear();
+            keys.clear();
+        }
+
+        List<Long> done() {
+            return progress.stream().map(entry -> entry[0]).toList();
+        }
+
+        List<Long> expected() {
+            return progress.stream().map(entry -> entry[1]).toList();
+        }
+
+        List<String> keys() {
+            return keys;
+        }
+    }
+
     private static Map<String, Object> rowOf(String first, Object firstValue, String second,
             Object secondValue) {
         Map<String, Object> row = new LinkedHashMap<>();
@@ -566,6 +656,14 @@ class JoinDriverTest {
             this.withNote = true;
             this.stores = new CountingStores(pageSize);
             this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores);
+        }
+
+        /** As above, watching what the join reports about its recomputes. */
+        Fixture(JoinKind kind, int pageSize, JoinGauge gauge) {
+            this.withNote = true;
+            this.stores = new CountingStores(pageSize);
+            this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores,
+                    JoinDriver.DEFAULT_KEYS_PER_READ, gauge);
         }
 
         void apply(SourceChange change) {

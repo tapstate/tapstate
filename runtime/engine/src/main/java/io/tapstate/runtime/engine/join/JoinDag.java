@@ -174,8 +174,19 @@ public final class JoinDag {
             // Metered from here and nowhere else: this is the one place a job is what the state is
             // being bound for, and a reading can only be left from a thread running its processors.
             JoinStateStats stats = JoinStateStats.of(context.hazelcastInstance());
-            gauge = (source, dimensionKey, pages) ->
+            gauge = new JoinGauge() {
+                @Override
+                public void bucketWalked(String source, String dimensionKey, int pages) {
                     stats.widestBucket(JoinMaps.reverseIndex(pipelineId, stepId, source), pages);
+                }
+
+                @Override
+                public void recomputing(String source, String dimensionKey, long rowsDone,
+                        long rowsExpected) {
+                    stats.recomputing(JoinMaps.reverseIndex(pipelineId, stepId, source), dimensionKey,
+                            rowsDone, rowsExpected);
+                }
+            };
         }
 
         @Override

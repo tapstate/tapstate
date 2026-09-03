@@ -79,6 +79,52 @@ public final class JoinStateStats {
         return counters(namespace).widestBucket.get();
     }
 
+    /**
+     * How large a fan-out has to be before rebuilding it is worth showing anybody.
+     *
+     * <p><b>Without a threshold this number is noise, and noise is how a number like this comes to be
+     * ignored.</b> Every edit to any dimension row rebuilds something; reporting each one puts a
+     * constant stream in front of whoever is watching, and the one report that mattered arrives in the
+     * middle of it. Below this many rows a rebuild is over in well under a second, which is not a wait
+     * anybody has to be told about.
+     */
+    public static final long REPORT_FANOUT_ABOVE = 10_000L;
+
+    /**
+     * Records that a rebuild of {@code dimensionKey}'s fan-out has sent {@code rowsDone} rows of about
+     * {@code rowsExpected}, or ignores it as too small to be worth anyone's attention.
+     *
+     * <p>What this makes visible is a wait that otherwise looks like health: while a large fan-out is
+     * being rebuilt the job runs, nothing errors, and the target holds half the old value and half the
+     * new one. The threshold is applied here rather than where the number is produced, because which
+     * rebuilds are worth surfacing is a reporting decision and every carrier would otherwise write its
+     * own copy of it.
+     */
+    public void recomputing(String namespace, String dimensionKey, long rowsDone, long rowsExpected) {
+        if (rowsExpected < REPORT_FANOUT_ABOVE) {
+            return;
+        }
+        Counters counters = counters(namespace);
+        counters.recomputeKey = dimensionKey;
+        counters.recomputeExpected = rowsExpected;
+        counters.recomputeDone = rowsDone;
+    }
+
+    /** The dimension key of the last large rebuild reported for {@code namespace}, or null. */
+    public String recomputeKey(String namespace) {
+        return counters(namespace).recomputeKey;
+    }
+
+    /** How many rows that rebuild had sent when it last reported. */
+    public long recomputeDone(String namespace) {
+        return counters(namespace).recomputeDone;
+    }
+
+    /** About how many rows that rebuild has in total - an estimate, never a count. */
+    public long recomputeExpected(String namespace) {
+        return counters(namespace).recomputeExpected;
+    }
+
     /** How much reaching {@code namespace} has had, in keys. */
     public long accesses(String namespace) {
         return counters(namespace).accesses.sum();
@@ -110,5 +156,12 @@ public final class JoinStateStats {
         private final LongAdder trips = new LongAdder();
         private final LongAdder backfillNanos = new LongAdder();
         private final LongAccumulator widestBucket = new LongAccumulator(Long::max, 0L);
+        // Written from a processor thread and read from whoever is publishing metrics, so the three are
+        // volatile. They are read one at a time rather than as a set: a reader that caught the key of
+        // one rebuild beside the progress of the next would be reporting a row count against the wrong
+        // key, and the three are only ever meant as an indication that a large one is under way.
+        private volatile String recomputeKey;
+        private volatile long recomputeDone;
+        private volatile long recomputeExpected;
     }
 }

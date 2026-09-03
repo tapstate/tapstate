@@ -297,10 +297,25 @@ public final class JoinDriver {
      * check is one look at the index, against a walk that is skipped.
      */
     private void queueRecompute(Dimension dimension, String dimensionKey, long ts) {
-        if (stores.indexPageCount(dimension.source(), dimensionKey) == 0) {
+        int pages = stores.indexPageCount(dimension.source(), dimensionKey);
+        if (pages == 0) {
             return;
         }
-        pending.add(new Recompute(dimension, dimensionKey, 0, 0, ts));
+        pending.add(new Recompute(dimension, dimensionKey, 0, 0, ts,
+                estimateRows(dimension.source(), dimensionKey, pages)));
+    }
+
+    /**
+     * About how many fact rows one dimension key holds, read off the index rather than counted.
+     *
+     * <p>Counting exactly would mean walking every page before walking them again to rebuild, which
+     * doubles the cost of the thing being reported on. The first page's size is the page size wherever
+     * there is more than one page, so the product is an upper bound; where there is only one page it is
+     * the exact count, which is the small fan-out - the case where being wrong would show most.
+     */
+    private long estimateRows(String source, String dimensionKey, int pages) {
+        int first = stores.indexPage(source, dimensionKey, 0).size();
+        return pages == 1 ? first : (long) pages * first;
     }
 
     /**
@@ -339,6 +354,9 @@ public final class JoinDriver {
         // Reported from the walk because the walk is what has the number: measuring it anywhere else
         // would mean reading a bucket to find out how large it is, which is the cost it warns about.
         gauge.bucketWalked(source, dimensionKey, stores.indexPageCount(source, dimensionKey));
+        // Before a single row of this pass goes out, so that a rebuild is visible from its start rather
+        // than from whenever the first page happens to finish.
+        gauge.recomputing(source, dimensionKey, recompute.done(), recompute.expected());
         while (recompute.page() < stores.indexPageCount(source, dimensionKey)) {
             // Several pages at a time, not one. A page is sized by what one stored entry may hold; a
             // read is answered by every partition the keys fall across, each asking the layer beneath
@@ -402,7 +420,10 @@ public final class JoinDriver {
                 return false;
             }
             recompute.at(recompute.at() + 1);
+            recompute.done(recompute.done() + 1);
         }
+        gauge.recomputing(dimension.source(), recompute.dimensionKey(), recompute.done(),
+                recompute.expected());
         // Dropped once the page is done rather than as they are found: a removal compacts the page,
         // and compacting the list being walked is how a walk skips entries. Dropping them at all is
         // what keeps a bucket from growing for ever under a key nobody ever changes.
@@ -592,15 +613,33 @@ public final class JoinDriver {
         private final Dimension dimension;
         private final String dimensionKey;
         private final long ts;
+        private final long expected;
         private int page;
         private int at;
+        private long done;
 
-        private Recompute(Dimension dimension, String dimensionKey, int page, int at, long ts) {
+        private Recompute(Dimension dimension, String dimensionKey, int page, int at, long ts,
+                long expected) {
             this.dimension = dimension;
             this.dimensionKey = dimensionKey;
             this.page = page;
             this.at = at;
             this.ts = ts;
+            this.expected = expected;
+        }
+
+        /** About how many rows this rebuild has to send - an estimate, never a count. */
+        private long expected() {
+            return expected;
+        }
+
+        /** How many it has sent. Rows dropped as stale are not sent, so they are not counted. */
+        private long done() {
+            return done;
+        }
+
+        private void done(long done) {
+            this.done = done;
         }
 
         private Dimension dimension() {
