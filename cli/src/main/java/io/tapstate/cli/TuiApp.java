@@ -30,7 +30,9 @@ final class TuiApp {
     private static final int DEFAULT_WIDTH = 100;
     private static final int DEFAULT_HEIGHT = 24;
     private static final int READ_TIMEOUT_MILLIS = 50;
-    private static final int ESCAPE_SEQUENCE_START_TIMEOUT_MILLIS = 50;
+    // Terminal emulators may deliver ESC and the rest of an arrow sequence in separate input chunks.
+    // Keep standalone Escape responsive while allowing that split sequence to remain prompt-owned.
+    private static final int ESCAPE_SEQUENCE_START_TIMEOUT_MILLIS = 250;
     private static final int ESCAPE_SEQUENCE_BODY_TIMEOUT_MILLIS = 100;
     private static final long DASHBOARD_REFRESH_MILLIS = 5000L;
     private static final String PALETTE_NOTICE =
@@ -71,6 +73,7 @@ final class TuiApp {
     private String commandInput = "";
     private boolean suggestionsVisible;
     private int workspaceScroll;
+    private int pendingInputCode = Integer.MIN_VALUE;
     private java.nio.file.Path workspaceSnapshotRoot;
     private List<TuiDashboard.ResourceSummary> workspaceSnapshot = List.of();
 
@@ -244,7 +247,7 @@ final class TuiApp {
                 startDashboardRefreshIfNeeded(width);
                 nextDashboardRefresh = System.nanoTime() + Duration.ofMillis(DASHBOARD_REFRESH_MILLIS).toNanos();
             }
-            int code = reader.read(READ_TIMEOUT_MILLIS);
+            int code = readInputCode(READ_TIMEOUT_MILLIS);
             if (code == NonBlockingReader.READ_EXPIRED) {
                 if (System.nanoTime() >= nextDashboardRefresh) {
                     kernel.dispatch(new TuiEvent.Tick());
@@ -260,7 +263,7 @@ final class TuiApp {
                 return Cli.EXIT_OK;
             }
             if (code == TuiCommandBar.ESCAPE) {
-                EscapeKey key = readEscapeKey(reader);
+                EscapeKey key = readEscapeKey();
                 if (key == EscapeKey.UP || key == EscapeKey.DOWN) {
                     navigate(key);
                 } else {
@@ -804,10 +807,10 @@ final class TuiApp {
     private int readPromptCode() {
         try {
             while (true) {
-                int code = reader.read(READ_TIMEOUT_MILLIS);
+                int code = readInputCode(READ_TIMEOUT_MILLIS);
                 if (code != NonBlockingReader.READ_EXPIRED) {
                     if (code == TuiCommandBar.ESCAPE) {
-                        EscapeKey key = readEscapeKey(reader);
+                        EscapeKey key = readEscapeKey();
                         if (key == EscapeKey.UP) {
                             return EscapeCodes.UP;
                         }
@@ -1184,13 +1187,29 @@ final class TuiApp {
         }
     }
 
-    private static EscapeKey readEscapeKey(NonBlockingReader reader) throws IOException {
+    private int readInputCode(long timeout) throws IOException {
+        if (pendingInputCode != Integer.MIN_VALUE) {
+            int code = pendingInputCode;
+            pendingInputCode = Integer.MIN_VALUE;
+            return code;
+        }
+        return reader.read(timeout);
+    }
+
+    private EscapeKey readEscapeKey() throws IOException {
         int next = reader.peek(ESCAPE_SEQUENCE_START_TIMEOUT_MILLIS);
         if (next == NonBlockingReader.READ_EXPIRED || next < 0) {
             return EscapeKey.ESCAPE;
         }
+        if (next != '[' && next != 'O') {
+            rememberPendingInput(reader.read(ESCAPE_SEQUENCE_BODY_TIMEOUT_MILLIS));
+            return EscapeKey.ESCAPE;
+        }
         do {
             next = reader.read(ESCAPE_SEQUENCE_BODY_TIMEOUT_MILLIS);
+            if (next == NonBlockingReader.READ_EXPIRED || next < 0) {
+                return EscapeKey.ESCAPE;
+            }
         } while (next == '[' || next == 'O' || next == '?' || next == ';'
                 || (next >= '0' && next <= '9'));
         return switch (next) {
@@ -1200,6 +1219,12 @@ final class TuiApp {
             case 'D' -> EscapeKey.LEFT;
             default -> EscapeKey.ESCAPE;
         };
+    }
+
+    private void rememberPendingInput(int code) {
+        if (code >= 0) {
+            pendingInputCode = code;
+        }
     }
 
     static int movePromptSelection(int selected, int delta, int size) {

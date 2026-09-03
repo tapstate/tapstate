@@ -4,6 +4,7 @@ import dev.tamboui.buffer.Buffer;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.terminal.Frame;
 import io.tapstate.core.common.TapstateException;
+import org.jline.utils.NonBlockingReader;
 import io.tapstate.core.schema.SchemaNavigator;
 import org.junit.jupiter.api.Test;
 
@@ -82,6 +83,33 @@ class TuiRuntimeIntegrationTest {
         assertThat(TuiApp.isEnter(TuiCommandBar.ENTER)).isTrue();
         assertThat(TuiApp.isEnter(TuiCommandBar.CARRIAGE_RETURN)).isTrue();
         assertThat(TuiApp.isEnter(TuiCommandBar.ESCAPE)).isFalse();
+    }
+
+    @Test
+    void delayedArrowSequenceDoesNotBecomePromptCancel() throws Exception {
+        TuiApp app = new TuiApp(new Repl(CommandRegistry.standard(SchemaNavigator.bundled()).commandLine()),
+                new StringWriter(), new StringWriter(), null);
+        setField(app, "reader", new DelayedArrowReader());
+        Method readEscapeKey = TuiApp.class.getDeclaredMethod("readEscapeKey");
+        readEscapeKey.setAccessible(true);
+
+        Object decoded = readEscapeKey.invoke(app);
+
+        assertThat(decoded.toString()).isEqualTo("DOWN");
+    }
+
+    @Test
+    void nonSequenceInputObservedAfterEscapeIsReplayed() throws Exception {
+        TuiApp app = new TuiApp(new Repl(CommandRegistry.standard(SchemaNavigator.bundled()).commandLine()),
+                new StringWriter(), new StringWriter(), null);
+        setField(app, "reader", new NonSequenceReader());
+        Method readEscapeKey = TuiApp.class.getDeclaredMethod("readEscapeKey");
+        readEscapeKey.setAccessible(true);
+        Method readInputCode = TuiApp.class.getDeclaredMethod("readInputCode", long.class);
+        readInputCode.setAccessible(true);
+
+        assertThat(readEscapeKey.invoke(app).toString()).isEqualTo("ESCAPE");
+        assertThat(readInputCode.invoke(app, 1L)).isEqualTo(TuiCommandBar.CTRL_D);
     }
 
     @Test
@@ -601,5 +629,59 @@ class TuiRuntimeIntegrationTest {
         return new ResolvedContext.Named(name, new ContextDefinition(UUID.randomUUID(),
                 List.of(URI.create("http://127.0.0.1:8081")), new ContextTls(true), UUID.randomUUID()),
                 ResolvedContext.Source.WORKSPACE_BINDING);
+    }
+
+    private static final class DelayedArrowReader extends NonBlockingReader {
+        private int index;
+
+        @Override
+        public int peek(long timeout) {
+            return timeout < 100 ? READ_EXPIRED : '[';
+        }
+
+        @Override
+        public int read(long timeout) {
+            return index++ == 0 ? '[' : 'B';
+        }
+
+        @Override
+        protected int read(long timeout, boolean peek) {
+            return peek ? peek(timeout) : read(timeout);
+        }
+
+        @Override
+        public int readBuffered(char[] buffer, int offset, int length, long timeout) {
+            return 0;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    private static final class NonSequenceReader extends NonBlockingReader {
+        @Override
+        public int peek(long timeout) {
+            return TuiCommandBar.CTRL_D;
+        }
+
+        @Override
+        public int read(long timeout) {
+            return TuiCommandBar.CTRL_D;
+        }
+
+        @Override
+        protected int read(long timeout, boolean peek) {
+            return TuiCommandBar.CTRL_D;
+        }
+
+        @Override
+        public int readBuffered(char[] buffer, int offset, int length, long timeout) {
+            return 0;
+        }
+
+        @Override
+        public void close() {
+        }
     }
 }
