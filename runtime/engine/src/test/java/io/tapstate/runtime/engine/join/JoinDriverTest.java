@@ -13,7 +13,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -247,13 +246,13 @@ class JoinDriverTest {
         fixture.clear();
         // A bucket naming a row that points somewhere else: what a rebuild or a missed removal leaves.
         String bucket = fixture.dimensionKeyOf(1L);
-        new ReverseIndex(fixture.stores.index("c")).add(bucket, fixture.onlyFactKey());
+        fixture.stores.indexAdd("c", bucket, fixture.onlyFactKey());
 
         fixture.apply(dimension("c",
                 update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
 
         assertThat(fixture.published()).isEmpty();
-        assertThat(new ReverseIndex(fixture.stores.index("c")).pageCount(bucket))
+        assertThat(fixture.stores.indexPageCount("c", bucket))
                 .as("and it is gone, so the bucket does not grow for ever").isZero();
     }
 
@@ -294,8 +293,8 @@ class JoinDriverTest {
 
         assertThat(fixture.published()).singleElement().extracting(Map.Entry::getValue)
                 .isEqualTo(rowOf("order_id", 10L, "customer_name", null));
-        assertThat(fixture.stores.index("c")).as("and it is in no bucket, because it names none")
-                .isEmpty();
+        assertThat(fixture.stores.indexPageCount("c", fixture.dimensionKeyOf(1L)))
+                .as("and it is in no bucket, because it names none").isZero();
     }
 
     private static Map<String, Object> rowOf(String first, Object firstValue, String second,
@@ -329,7 +328,7 @@ class JoinDriverTest {
     /** One driver over plain maps, with a sink that can be told to stop taking rows. */
     private static final class Fixture {
 
-        private final CountingStores stores = new CountingStores();
+        private final CountingStores stores;
         private final RecordingSink sink = new RecordingSink();
         private final JoinDriver driver;
         private final boolean withNote;
@@ -340,8 +339,8 @@ class JoinDriverTest {
 
         Fixture(JoinKind kind, int pageSize) {
             this.withNote = true;
-            this.stores.pageSize = pageSize;
-            this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores, pageSize);
+            this.stores = new CountingStores(pageSize);
+            this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores);
         }
 
         void apply(SourceChange change) {
@@ -396,7 +395,11 @@ class JoinDriverTest {
         }
 
         String onlyFactKey() {
-            return stores.facts().keySet().iterator().next();
+            return factKeyOf(10L);
+        }
+
+        String factKeyOf(long id) {
+            return io.tapstate.core.sql.JoinKey.of(List.of(id)).name();
         }
     }
 
@@ -419,36 +422,72 @@ class JoinDriverTest {
                 Map.of("o", List.of("cust_id", "id", "note"), "c", List.of("id", "name")));
     }
 
-    /** Plain maps, plus a count of how the fact rows were asked for. */
+    /** The plain-map state, plus a count of how the fact rows were asked for. */
     private static final class CountingStores implements JoinStores {
 
-        private final Map<String, Map<String, Object>> facts = new LinkedHashMap<>();
-        private final Map<String, Map<String, Map<String, Object>>> dimensions = new HashMap<>();
-        private final Map<String, Map<ReverseBucket.At, ReverseBucket>> indexes = new HashMap<>();
-        private int pageSize = ReverseIndex.DEFAULT_PAGE_SIZE;
+        private final MapJoinStores held;
         private int batchReads;
         private int keysRead;
 
-        @Override
-        public Map<String, Map<String, Object>> facts() {
-            return facts;
+        CountingStores(int pageSize) {
+            this.held = new MapJoinStores(pageSize);
         }
 
         @Override
-        public Map<String, Map<String, Object>> dimension(String source) {
-            return dimensions.computeIfAbsent(source, ignored -> new LinkedHashMap<>());
+        public Map<String, Object> fact(String factKey) {
+            return held.fact(factKey);
         }
 
         @Override
-        public Map<ReverseBucket.At, ReverseBucket> index(String source) {
-            return indexes.computeIfAbsent(source, ignored -> new LinkedHashMap<>());
-        }
-
-        @Override
-        public Map<String, Map<String, Object>> factsUnder(Collection<String> keys) {
+        public Map<String, Map<String, Object>> factsUnder(Collection<String> factKeys) {
             batchReads++;
-            keysRead += keys.size();
-            return JoinStores.super.factsUnder(keys);
+            keysRead += factKeys.size();
+            return held.factsUnder(factKeys);
+        }
+
+        @Override
+        public void putFact(String factKey, Map<String, Object> row) {
+            held.putFact(factKey, row);
+        }
+
+        @Override
+        public void removeFact(String factKey) {
+            held.removeFact(factKey);
+        }
+
+        @Override
+        public Map<String, Object> dimensionRow(String source, String dimensionKey) {
+            return held.dimensionRow(source, dimensionKey);
+        }
+
+        @Override
+        public void putDimensionRow(String source, String dimensionKey, Map<String, Object> row) {
+            held.putDimensionRow(source, dimensionKey, row);
+        }
+
+        @Override
+        public void removeDimensionRow(String source, String dimensionKey) {
+            held.removeDimensionRow(source, dimensionKey);
+        }
+
+        @Override
+        public int indexPageCount(String source, String dimensionKey) {
+            return held.indexPageCount(source, dimensionKey);
+        }
+
+        @Override
+        public List<String> indexPage(String source, String dimensionKey, int page) {
+            return held.indexPage(source, dimensionKey, page);
+        }
+
+        @Override
+        public void indexAdd(String source, String dimensionKey, String factKey) {
+            held.indexAdd(source, dimensionKey, factKey);
+        }
+
+        @Override
+        public void indexRemove(String source, String dimensionKey, String factKey) {
+            held.indexRemove(source, dimensionKey, factKey);
         }
     }
 

@@ -65,7 +65,6 @@ public final class JoinDriver {
     private final List<String> factKeyColumns;
     private final List<Dimension> dimensions;
     private final Deque<Work> pending = new ArrayDeque<>();
-    private final int pageSize;
 
     /**
      * @param plan           what to match on and what to publish
@@ -78,13 +77,6 @@ public final class JoinDriver {
      */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores) {
-        this(plan, factKeyColumns, outputStream, stores, ReverseIndex.DEFAULT_PAGE_SIZE);
-    }
-
-    /** As above, with the reverse index's page size named - which is what a case needs to be small. */
-    public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
-            JoinStores stores, int pageSize) {
-        this.pageSize = pageSize;
         this.plan = Objects.requireNonNull(plan, "plan");
         this.stores = Objects.requireNonNull(stores, "stores");
         this.outputStream = Objects.requireNonNull(outputStream, "outputStream");
@@ -158,7 +150,7 @@ public final class JoinDriver {
                 return;
             }
             String key = factKeyOf(before);
-            Map<String, Object> mirrored = stores.facts().get(key);
+            Map<String, Object> mirrored = stores.fact(key);
             // The mirror where there is one: a connector's before image may hold the key columns
             // alone, and the published row is built from the whole row.
             Map<String, Object> row = mirrored != null ? mirrored : before;
@@ -167,7 +159,7 @@ public final class JoinDriver {
             return;
         }
         String key = factKeyOf(after);
-        Map<String, Object> previous = before != null ? before : stores.facts().get(key);
+        Map<String, Object> previous = before != null ? before : stores.fact(key);
         if (previous != null) {
             String previousKey = factKeyOf(previous);
             if (!previousKey.equals(key)) {
@@ -185,16 +177,16 @@ public final class JoinDriver {
                 continue;
             }
             if (was != null) {
-                index(dimension).remove(was, key);
+                stores.indexRemove(dimension.source(), was, key);
                 // The old bucket's row is a different published row wherever the identity carries the
                 // dimension key, so it is removed rather than overwritten.
                 queueRow(previous, event.ts(), true);
             }
             if (now != null) {
-                index(dimension).add(now, key);
+                stores.indexAdd(dimension.source(), now, key);
             }
         }
-        stores.facts().put(key, after);
+        stores.putFact(key, after);
         queueRow(after, event.ts(), false);
     }
 
@@ -214,7 +206,7 @@ public final class JoinDriver {
         if (before != null) {
             String was = keyOfDimensionRow(before, dimension);
             if (was != null && (after == null || !was.equals(keyOfDimensionRow(after, dimension)))) {
-                stores.dimension(dimension.source()).remove(was);
+                stores.removeDimensionRow(dimension.source(), was);
                 pending.add(new Recompute(dimension, was, 0, 0, event.ts()));
             }
         }
@@ -228,7 +220,7 @@ public final class JoinDriver {
             // can ever name.
             return;
         }
-        stores.dimension(dimension.source()).put(now, after);
+        stores.putDimensionRow(dimension.source(), now, after);
         pending.add(new Recompute(dimension, now, 0, 0, event.ts()));
     }
 
@@ -259,9 +251,8 @@ public final class JoinDriver {
      */
     private boolean advance(Recompute recompute, JoinSink sink) {
         Dimension dimension = recompute.dimension();
-        ReverseIndex index = index(dimension);
-        while (recompute.page() < index.pageCount(recompute.dimensionKey())) {
-            List<String> factKeys = index.page(recompute.dimensionKey(), recompute.page());
+        while (recompute.page() < stores.indexPageCount(dimension.source(), recompute.dimensionKey())) {
+            List<String> factKeys = stores.indexPage(dimension.source(), recompute.dimensionKey(), recompute.page());
             // One read for the page rather than one per row: the difference between the two is what
             // turns a large recompute from seconds into tens of minutes.
             Map<String, Map<String, Object>> rows = stores.factsUnder(factKeys);
@@ -291,7 +282,7 @@ public final class JoinDriver {
             // and compacting the list being walked is how a walk skips entries. Dropping them at all is
             // what keeps a bucket from growing for ever under a key nobody ever changes.
             for (String gone : stale) {
-                index.remove(recompute.dimensionKey(), gone);
+                stores.indexRemove(dimension.source(), recompute.dimensionKey(), gone);
             }
             recompute.page(recompute.page() + 1);
             recompute.at(0);
@@ -322,7 +313,7 @@ public final class JoinDriver {
         for (Dimension dimension : dimensions) {
             String key = dimensionKeyIn(factRow, dimension);
             Map<String, Object> dimensionRow =
-                    key == null ? null : stores.dimension(dimension.source()).get(key);
+                    key == null ? null : stores.dimensionRow(dimension.source(), key);
             if (dimensionRow == null && dimension.kind() == JoinKind.INNER && !removed) {
                 return null;
             }
@@ -342,14 +333,10 @@ public final class JoinDriver {
         for (Dimension dimension : dimensions) {
             String key = dimensionKeyIn(factRow, dimension);
             if (key != null) {
-                index(dimension).remove(key, factKey);
+                stores.indexRemove(dimension.source(), key, factKey);
             }
         }
-        stores.facts().remove(factKey);
-    }
-
-    private ReverseIndex index(Dimension dimension) {
-        return new ReverseIndex(stores.index(dimension.source()), pageSize);
+        stores.removeFact(factKey);
     }
 
     private Dimension dimensionNamed(String source) {
