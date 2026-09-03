@@ -75,8 +75,14 @@ class PipelineStreamRoundTripTest {
     @BeforeAll
     static void startServer() {
         context = new SpringApplicationBuilder(TestApp.class)
-                .properties("server.port=0", "tapstate.control.stream.poll-interval=PT0.05S")
-                .run();
+                .properties("tapstate.control.stream.poll-interval=PT0.05S")
+                // Both the address and the port are run arguments, not default properties: `properties(...)`
+                // populates the lowest-ranked source Spring has, and the product's own application
+                // configuration publishes 8080, so a port asked for there is silently overridden. The
+                // address is the other half -- a free port alone binds the wildcard, and a wildcard bind
+                // does not reserve 127.0.0.1:<port>, so a process already holding that port on the loopback
+                // keeps receiving what this test sends.
+                .run("--server.address=127.0.0.1", "--server.port=0");
         port = ((WebServerApplicationContext) context).getWebServer().getPort();
     }
 
@@ -94,7 +100,9 @@ class PipelineStreamRoundTripTest {
     }
 
     private URI baseUrl() {
-        return URI.create("http://localhost:" + port);
+        // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
+        // one of those is the address bound above.
+        return URI.create("http://127.0.0.1:" + port);
     }
 
     private String readToken() {
