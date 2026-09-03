@@ -78,21 +78,21 @@ class TransformWizardTest {
     }
 
     @Test
-    void buildsAJoinTransformWithDefaultEngineAndMultilineSql() {
-        // a blank engine reply takes the duckdb default; the SQL is a multi-line block
+    void buildsAJoinTransformWithTheOnlyEngineAndMultilineSql() {
+        // the wizard asks no engine question any more, so the replies are id, type and the SQL
         ScriptedPrompter p = new ScriptedPrompter(
-                "cust_wide", "join", "",
-                "SELECT c.id AS customer_id, count(*) AS n\nFROM c JOIN o ON o.customer_id = c.id GROUP BY c.id");
+                "cust_wide", "join",
+                "SELECT c.id AS customer_id, o.amount AS amount\nFROM c JOIN o ON o.customer_id = c.id");
         assertThat(yaml(new TransformWizard(p).run())).isEqualTo(
                 """
                 version: tapstate/v1
                 kind: transform
                 id: cust_wide
                 type: join
-                engine: duckdb
+                engine: builtin
                 sql: |
-                  SELECT c.id AS customer_id, count(*) AS n
-                  FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id
+                  SELECT c.id AS customer_id, o.amount AS amount
+                  FROM c JOIN o ON o.customer_id = c.id
                 """);
     }
 
@@ -297,7 +297,7 @@ class TransformWizardTest {
         assertFixedPoint(new ScriptedPrompter("mask_pii", "map", "ssn", "false", ""));
         assertFixedPoint(new ScriptedPrompter("parse", "js", "emit(after)"));
         assertFixedPoint(new ScriptedPrompter("merged", "union"));
-        assertFixedPoint(new ScriptedPrompter("wide", "join", "duckdb", "SELECT 1 FROM c"));
+        assertFixedPoint(new ScriptedPrompter("wide", "join", "SELECT 1 FROM c"));
         assertFixedPoint(new ScriptedPrompter("root_only", "nest", "customer", "customer_id", "(done)"));
         // a deep tree (root -> policy -> claim) round-trips, exercising recursive embed serialization
         assertFixedPoint(new ScriptedPrompter(

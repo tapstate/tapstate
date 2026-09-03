@@ -120,6 +120,8 @@ dsl.forbidden-field
 dsl.illegal-expression
 dsl.illegal-value
 dsl.invalid-config-value
+dsl.join-sql-not-parsable
+dsl.join-sql-unsupported
 dsl.malformed-interpolation
 dsl.malformed-yaml
 dsl.missing-reference

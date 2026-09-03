@@ -228,7 +228,7 @@ public final class CanonicalWriter {
                 b.put("root", nestRoot(n.root()));
             }
             case TransformBody.Join j -> {
-                b.scalar("engine", j.engine());
+                b.scalar("engine", j.engine().yaml());
                 b.literal("sql", j.sql());
             }
         }

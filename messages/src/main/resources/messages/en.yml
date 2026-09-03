@@ -237,6 +237,12 @@ dsl.config-required:
 dsl.invalid-config-value:
   message: "Config field '{field}' of connector '{connector}' at {path} has an invalid value '{value}'."
   solution: "Use one of the allowed values: {allowed}."
+dsl.join-sql-not-parsable:
+  message: "The join SQL at {path} is not valid SQL: {detail}"
+  solution: "Fix the SQL; the line and column in that message count from the start of the `sql:` block itself."
+dsl.join-sql-unsupported:
+  message: "The join SQL at {path} uses {shape} at line {line}, column {column}, which this release does not run."
+  solution: "A join is one SELECT over tables combined with equality conditions, publishing one row per match; it cannot filter, sort, cut, de-duplicate, aggregate or nest queries. Rewrite the SQL within that subset, or do the rest in a later step."
 dsl.malformed-yaml:
   message: "Malformed YAML: {detail}."
   solution: "Fix the YAML syntax; the line and column point at the problem."

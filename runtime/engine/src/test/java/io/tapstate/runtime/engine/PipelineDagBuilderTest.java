@@ -14,6 +14,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -444,7 +445,7 @@ class PipelineDagBuilderTest {
     }
 
     private static Step joinStep(String id, FromRef from) {
-        TransformBody body = new TransformBody.Join("duckdb", "SELECT 1");
+        TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN, "SELECT 1");
         return Step.inline(id, FromClause.aliases(Map.of("root", from)), body, null, null);
     }
 

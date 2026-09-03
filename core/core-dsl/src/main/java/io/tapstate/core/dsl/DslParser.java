@@ -7,6 +7,7 @@ import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestOrder;
 import io.tapstate.core.model.NestRoot;
@@ -48,12 +49,17 @@ import org.yaml.snakeyaml.nodes.ScalarNode;
 import org.yaml.snakeyaml.nodes.SequenceNode;
 import org.yaml.snakeyaml.representer.Representer;
 
+import io.tapstate.core.sql.SqlFrontEnd;
+import io.tapstate.core.sql.SqlFrontEndException;
+import io.tapstate.core.sql.Unsupported;
+
 import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -299,7 +305,12 @@ public final class DslParser {
                     positiveIntValue(s, "entries_in_memory"),
                     positiveIntValue(s, "max_elements_per_document"),
                     nestRoot(s.mapping("root")));
-            case "join" -> new TransformBody.Join(s.string("engine"), s.string("sql"));
+            case "join" -> {
+                JoinEngine engine = enumByYaml(JoinEngine.values(), JoinEngine::yaml, s, "engine");
+                String sql = s.string("sql");
+                checkJoinSql(s, sql);
+                yield new TransformBody.Join(engine, sql);
+            }
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
                     Map.of("value", type, "expected", "a known transform type (js, map, filter, union, nest, join)"));
         };
@@ -802,6 +813,55 @@ public final class DslParser {
             sb.append(yaml.apply(values[i]));
         }
         return sb.toString();
+    }
+
+    // ---- join SQL checking (§5.2) --------------------------------------------------
+
+    /**
+     * Refuses join SQL this release cannot run, while the artifact is being read rather than when
+     * a pipeline is assembled from it.
+     *
+     * <p>Everything refused here is valid SQL that type-checks; what it is not is expressible in
+     * the plan a carrier is handed. A carrier given a plan that dropped half of what the statement
+     * said does not fail -- it publishes rows that read exactly like the answer, and nothing
+     * downstream can tell the difference. So the refusal has to happen before anything runs, which
+     * is here.
+     *
+     * <p>The two outcomes stay separate deliberately. "This is not SQL" and "this release does not
+     * do that" send a reader to opposite places, and folding them into one code sends everyone who
+     * mistyped off to read a support matrix.
+     */
+    private static void checkJoinSql(YamlMap owner, String sql) {
+        if (sql == null) {
+            return;
+        }
+        Optional<Unsupported> refused;
+        try {
+            refused = SqlFrontEnd.unsupported(sql);
+        } catch (SqlFrontEndException e) {
+            throw owner.errorAt("sql", DslError.JOIN_SQL_NOT_PARSABLE,
+                    Map.of("detail", firstLine(e.getMessage())));
+        }
+        if (refused.isPresent()) {
+            Unsupported found = refused.get();
+            throw owner.errorAt("sql", DslError.JOIN_SQL_UNSUPPORTED, Map.of(
+                    "shape", found.shape(),
+                    "line", found.line(),
+                    "column", found.column()));
+        }
+    }
+
+    /**
+     * The parser's diagnosis is its first line; what follows is a dump of every token that would
+     * have been accepted, which is longer than the artifact and tells a reader nothing they can act
+     * on.
+     */
+    private static String firstLine(String message) {
+        if (message == null) {
+            return "";
+        }
+        int end = message.indexOf('\n');
+        return (end < 0 ? message : message.substring(0, end)).trim();
     }
 
     // ---- CEL expression checking (§12) --------------------------------------------

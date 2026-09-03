@@ -131,6 +131,16 @@
       "description": "An upstream reference: either a literal token (step id, table name, or source_id.table) or a /…/ regex matching multiple upstreams.",
       "type": "string"
     },
+    "JoinEngine": {
+      "type": "string",
+      "description": "The engine that runs the join.",
+      "oneOf": [
+        {
+          "const": "builtin",
+          "description": "The built-in join carrier, the only engine this release runs joins on."
+        }
+      ]
+    },
     "Metadata": {
       "type": "object",
       "description": "Optional annotation block: labels plus a free-text description. Never carries identity.",
@@ -996,8 +1006,8 @@
           "const": "join"
         },
         "engine": {
-          "description": "The query engine that runs the join, such as duckdb.",
-          "type": "string"
+          "description": "The engine that runs the join.",
+          "$ref": "#/$defs/JoinEngine"
         },
         "sql": {
           "description": "The SQL query that produces the joined wide table.",
