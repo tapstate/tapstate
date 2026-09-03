@@ -44,6 +44,15 @@ enum ActuationError implements TapstateErrorCode {
     /** A table object carries settings the current capture path does not implement; fields lists their names. */
     SOURCE_TABLE_SPEC_UNSUPPORTED("actuation.source-table-spec-unsupported", Set.of("source", "table", "fields")),
 
+    /**
+     * A join's driving source declares no key, so nothing identifies the row a change is about;
+     * {@code step} is the join step and {@code table} the table it is driven from. Every row a join
+     * mirrors and every entry in its reverse index is filed under that key, so without one two
+     * different rows land in one entry - which is not an error anywhere, it simply builds the wide row
+     * out of whichever of them was written last.
+     */
+    JOIN_SOURCE_KEY_MISSING("actuation.join-source-key-missing", Set.of("step", "table")),
+
     /** A serve.from regex is invalid; {@code regex} carries the expression. */
     FROM_REGEX_INVALID("actuation.from-regex-invalid", Set.of("regex")),
 

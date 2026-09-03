@@ -23,6 +23,8 @@ import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
+import io.tapstate.runtime.engine.join.JoinBinding;
+import io.tapstate.runtime.engine.join.JoinStoresBinding;
 import io.tapstate.runtime.engine.nest.NestBinding;
 import io.tapstate.runtime.engine.nest.NestClock;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -383,7 +385,8 @@ final class StoreBackedDagSource implements DagSource {
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> viewSink(pipeline, view, targets, viewStreams, sourceKeysById),
-                nestBinding(pipeline, sourceIdByTable(sourceVertices)));
+                nestBinding(pipeline, sourceIdByTable(sourceVertices)),
+                joinBinding(pipeline, sourceIdByTable(sourceVertices)));
     }
 
     /**
@@ -737,6 +740,101 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
         return new NestCapacity(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get),
                 PipelineDagBuilder.nestSettings(pipeline, byAlias::get, nestSettings));
+    }
+
+    /**
+     * What a join node needs that the engine will not work out: its SQL compiled into a plan, the key
+     * the driving source's rows are identified by, and where the state lives.
+     *
+     * <p>Compiled here rather than on the member, and once rather than per vertex. The library that
+     * parses and validates SQL is granted to one core module and the runtime ring cannot see it, so a
+     * plan built member-side would mean putting that library where the ring rules say it may not go -
+     * and building it twice would mean two answers to the same question with nothing comparing them.
+     *
+     * <p>A pipeline with no join step compiles nothing and asks nothing of the schema store.
+     */
+    private JoinBinding joinBinding(PipelineResource pipeline, Map<String, String> sourceIdByTable) {
+        Map<String, CompiledJoin> byStep = new LinkedHashMap<>();
+        if (pipeline.transforms() != null) {
+            for (Step step : pipeline.transforms()) {
+                if (step instanceof Step.Inline inline
+                        && inline.body() instanceof TransformBody.Join join) {
+                    byStep.put(step.id(), compileJoin(inline, join, sourceIdByTable));
+                }
+            }
+        }
+        return new JoinBinding(
+                step -> compiledJoin(byStep, step).plan(),
+                step -> compiledJoin(byStep, step).factKeyColumns(),
+                JoinStoresBinding.onTheCluster());
+    }
+
+    private static CompiledJoin compiledJoin(Map<String, CompiledJoin> byStep, Step step) {
+        CompiledJoin compiled = byStep.get(step.id());
+        if (compiled == null) {
+            throw new IllegalStateException("no join was compiled for step '" + step.id() + "'");
+        }
+        return compiled;
+    }
+
+    /**
+     * One join step's plan and the key its driving rows are filed under.
+     *
+     * <p>Each alias the step declares is registered under both the name the author aliased it to and
+     * the table it reads, because the SQL may name either: {@code FROM orders o} and {@code FROM o}
+     * are both written, and the plan's source name comes out as the alias in both spellings - which is
+     * what the graph then resolves the upstream vertex by.
+     *
+     * <p>Columns are reported nullable whatever the source said, because a discovered field carries no
+     * nullability. That widens the output row's declared types and never narrows them: claiming NOT
+     * NULL for a column that turns out to hold one is the direction that produces a wrong promise.
+     */
+    private CompiledJoin compileJoin(Step.Inline step, TransformBody.Join join,
+            Map<String, String> sourceIdByTable) {
+        Map<String, List<String>> keyByTable = new LinkedHashMap<>();
+        List<io.tapstate.core.sql.SourceTable> tables = new ArrayList<>();
+        if (step.from() instanceof FromClause.Aliases aliases) {
+            aliases.aliases().forEach((alias, ref) -> {
+                NestTable resolved = nestTable(ref, sourceIdByTable);
+                List<io.tapstate.core.sql.SourceColumn> columns =
+                        columnsOf(resolved.name(), sourceIdByTable);
+                keyByTable.put(resolved.name(), resolved.primaryKey());
+                keyByTable.put(alias, resolved.primaryKey());
+                tables.add(new io.tapstate.core.sql.SourceTable(alias, columns));
+                if (!alias.equals(resolved.name())) {
+                    tables.add(new io.tapstate.core.sql.SourceTable(resolved.name(), columns));
+                }
+            });
+        }
+        io.tapstate.core.sql.JoinPlan plan =
+                io.tapstate.core.sql.SqlFrontEnd.derive(join.sql(), List.copyOf(tables));
+        String driving = plan.factSource().table();
+        List<String> key = keyByTable.getOrDefault(driving, List.of());
+        if (key.isEmpty()) {
+            throw new TapstateException(ActuationError.JOIN_SOURCE_KEY_MISSING,
+                    Map.of("step", step.id(), "table", driving), null);
+        }
+        return new CompiledJoin(plan, key);
+    }
+
+    /** The columns of one table, in the shared type vocabulary the plan is derived against. */
+    private List<io.tapstate.core.sql.SourceColumn> columnsOf(String table,
+            Map<String, String> sourceIdByTable) {
+        String sourceId = sourceIdByTable.get(table);
+        if (sourceId == null) {
+            return List.of();
+        }
+        return storePort.schemas().get(sourceId)
+                .map(DiscoveredSourceModel::model)
+                .flatMap(model -> model.tables().stream()
+                        .filter(t -> t.name().equals(table)).findFirst())
+                .map(t -> t.fields().stream()
+                        .map(f -> new io.tapstate.core.sql.SourceColumn(f.name(), f.type(), true))
+                        .toList())
+                .orElse(List.of());
+    }
+
+    private record CompiledJoin(io.tapstate.core.sql.JoinPlan plan, List<String> factKeyColumns) {
     }
 
     private NestBinding nestBinding(PipelineResource pipeline, Map<String, String> sourceIdByTable) {

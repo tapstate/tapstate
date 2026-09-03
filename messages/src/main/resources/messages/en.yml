@@ -17,6 +17,9 @@ actuation.not-a-pipeline:
 actuation.source-schema-not-discovered:
   message: "Source `{source}` needs a discovered schema before its tables can be selected."
   solution: "Run schema discovery for the source, then apply or start the pipeline again."
+actuation.join-source-key-missing:
+  message: "Join `{step}` is driven from table `{table}`, which declares no primary key."
+  solution: "Give the table a primary key and run schema discovery again. A join files every row it holds under the driving row's key, so without one two different rows share an entry and the wide row is built from whichever was written last."
 actuation.view-key-missing:
   message: "View `{view}` declares no primary key."
   solution: "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."

@@ -11,6 +11,8 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
+import io.tapstate.runtime.engine.join.JoinMaps;
+import io.tapstate.runtime.engine.join.JoinStateMapStoreFactory;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -87,6 +89,11 @@ class HazelcastConfiguration {
         // with no store (mongo disabled) binds nothing, and its maps declare no store to resolve.
         if (nestStateStore != null) {
             NestStateMapStoreFactory.bindTo(member, nestStateStore);
+            // The same layer, bound again under the join's own key. One key shared between them would
+            // read as tidier and would make "these two are told about different layers" impossible to
+            // say - which is a thing a deployment may one day want to say, and a thing neither of them
+            // could then express without the other noticing.
+            JoinStateMapStoreFactory.bindTo(member, nestStateStore);
         }
         // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
         // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
@@ -189,6 +196,10 @@ class HazelcastConfiguration {
         // vertex ever asks for a state map.
         if (nestStateStore != null) {
             config.addMapConfig(nestSettings.backedStateMaps());
+            // Join state is held to the same bar and for the same reason: it is what lets a broken
+            // target table be rebuilt, so a map that keeps it in memory alone is not a smaller version
+            // of this but a way to lose it quietly.
+            config.addMapConfig(JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY));
         }
         return config;
     }
