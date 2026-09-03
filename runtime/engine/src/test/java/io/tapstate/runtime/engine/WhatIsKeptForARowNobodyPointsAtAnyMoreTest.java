@@ -110,6 +110,15 @@ class WhatIsKeptForARowNobodyPointsAtAnyMoreTest {
                         new Timed(List.of(customer(WALKED_AWAY_FROM, "Ada")),
                                 Duration.ofMillis(1000), null, true)))).join();
 
+        // The control, and it is not decoration: "does not contain" is true of an empty namespace, so a
+        // run that filed nothing at all - because the job never started, or the rows never arrived -
+        // satisfies the assertion below while proving none of it. Naming the row that must still be there
+        // is what separates "the deleted one went" from "nothing was ever here".
+        assertThat(rows(pipeline).keySet())
+                .describedAs("the row still pointed at is filed, so the namespace is populated and the "
+                        + "assertion below is about a deletion rather than about an empty run")
+                .contains(List.of(POINTED_AT_NOW));
+
         assertThat(rows(pipeline).keySet())
                 .describedAs("the deleted row is not kept once nothing names it. The record of a deletion "
                         + "exists to answer a document still pointing there - once none is, it answers "

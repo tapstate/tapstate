@@ -183,8 +183,16 @@ class ADeletedRowLeavesTheDocumentsThatPointedAtItWithoutItTest {
         assertThat(finalDocuments).hasSize(ORDERS);
         assertThat(finalDocuments.values())
                 .describedAs("the row pointed at from inside the array is gone from every line")
-                .allSatisfy(document -> assertThat(linesOf(document))
-                        .allSatisfy(line -> assertThat(line).doesNotContainKey("sku")));
+                .allSatisfy(document -> {
+                    // Non-empty first: "no line still has it" is true of a document with no lines, which
+                    // is what an array that never assembled looks like from here.
+                    assertThat(linesOf(document))
+                            .describedAs("the document still has its lines, so the assertion about them "
+                                    + "is about the deletion and not about an array that never arrived")
+                            .isNotEmpty();
+                    assertThat(linesOf(document))
+                            .allSatisfy(line -> assertThat(line).doesNotContainKey("sku"));
+                });
         assertThat(finalDocuments.values())
                 .describedAs("and the row pointed at from the root is gone from every document. This is the "
                         + "half that a tree carrying only one depth cannot tell apart from the other")
@@ -313,6 +321,10 @@ class ADeletedRowLeavesTheDocumentsThatPointedAtItWithoutItTest {
      * holds it, because that container is itself a field of the emission and is set whole.
      */
     private static void assertTheEmissionSaysTheFieldIsGone(Map<Object, Envelope> latest, String field) {
+        assertThat(latest)
+                .describedAs("there are emissions to judge at all - 'every one of them says it' is true of "
+                        + "no emissions, so without this a run that sent nothing passes")
+                .isNotEmpty();
         assertThat(latest.values())
                 .describedAs("every document says '%s' is gone, so a target holding the old value is told "
                         + "to drop it. Leaving it unsaid renders identically and never converges", field)
