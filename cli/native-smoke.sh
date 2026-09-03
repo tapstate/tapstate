@@ -22,11 +22,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY=""
 DO_BUILD=0
-# Sized by the slowest runner in the matrix, not the fastest. A startup regression that matters --
-# reflection reaching into the image, a resource read moving to class-init -- is a multiple, not a
-# drift, so the headroom costs no discrimination; a budget sized on a fast machine costs a whole
-# release each time a slow one is busy.
-STARTUP_BUDGET_MS=${STARTUP_BUDGET_MS:-300}
+# Sized by the slowest runner in the matrix, not the fastest: a budget sized on a fast machine costs
+# a whole release each time a slow one is busy. Measured across the four release platforms once the
+# timer stopped charging its own startup to the binary, the slowest median is 55ms, so 200 already
+# carries 3.6x headroom. Widening it further only buys back discrimination we want: a startup
+# regression that matters -- reflection reaching into the image, a resource read moving to
+# class-init -- is a multiple, not a drift, and lands well outside this budget either way.
+STARTUP_BUDGET_MS=${STARTUP_BUDGET_MS:-200}
 
 for arg in "$@"; do
   case "$arg" in

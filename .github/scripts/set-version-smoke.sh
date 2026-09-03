@@ -124,6 +124,46 @@ else
     failures=$((failures + 1))
 fi
 
+# --list prints the pins and nothing else. The admission gate reads this to tell a pull request that
+# only rewrites version pins from one that changes behaviour, so a pin that stops being listed would
+# quietly put that pull request back in scope -- and the gate would refuse every release's write-back
+# with a demand it cannot satisfy.
+listed="$("$script" --list)"
+if [ "$(printf '%s\n' "$listed" | wc -l | tr -d ' ')" = 6 ] \
+    && printf '%s\n' "$listed" | grep -qx 'pom.xml' \
+    && printf '%s\n' "$listed" | grep -qx 'cli/src/main/java/io/tapstate/cli/Cli.java'; then
+    echo "ok   - --list prints the six pinned files"
+else
+    echo "FAIL - --list did not print the six pinned files, it printed: $listed"
+    failures=$((failures + 1))
+fi
+
+# --list must not write. It is called from a gate on a checkout the gate does not own, and a mode
+# that edited the tree there would rewrite six files as a side effect of being asked a question.
+# Asked of a synthetic tree, like every case above: an earlier draft of this case copied the real
+# repository instead, and in a linked worktree `.git` is a file pointing back at the real git
+# directory -- so `git` inside the copy committed to the repository being tested. A case that builds
+# its own tree cannot reach anything it did not create.
+listing_dir="$(tree_at 9.9.9)"
+before="$(versions_in "$listing_dir")"
+( cd "$listing_dir" && "$script" --list >/dev/null )
+check "--list leaves the tree untouched" "$before" "$(versions_in "$listing_dir")"
+
+# The body the write-back opens its pull request with has to answer the sections the template check
+# requires. It is written here, once, and no human sees it before it is posted -- so a missing
+# section is not caught in review, it is caught by every release's write-back being red.
+body_sections="$(awk '/^  write-back:/ { inside = 1 } inside && /^  [a-z][a-z0-9_-]*:[ \t]*$/ && !/write-back/ { inside = 0 } inside' "$wf")"
+missing=""
+for section in "## Linked issue" "## Live verification scenario" "### Release note"; do
+    printf '%s\n' "$body_sections" | grep -qF "$section" || missing="$missing '$section'"
+done
+if [ -z "$missing" ]; then
+    echo "ok   - the write-back body answers every section the template check requires"
+else
+    echo "FAIL - the write-back body is missing:$missing"
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     echo "$failures case(s) failed" >&2
     exit 1

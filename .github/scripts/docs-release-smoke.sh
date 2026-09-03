@@ -186,6 +186,76 @@ for st in closed open; do
     else fail "settle exits 0 when the issue is $st" "exited $rc; a release must not stop for this"; fi
 done
 
+# --- retire's live path: what it says when the write does not land ------------------------------
+#
+# Every case above runs under --plan, which never reaches the branch where the write fails -- and
+# that branch is the one that was silent. Measured on a real rejected release: retire could neither
+# comment nor close, the step reported success, and the only trace was a line on stderr. The workflow
+# tees stdout into the step summary, so an outcome written to stderr is not merely quiet, it is
+# invisible in the one place anybody looks.
+#
+# gh is replaced for these. The stub is a real file on PATH and records every call: a PATH that does
+# not take would otherwise fall through to the real gh and write to somebody's repository, which is
+# not hypothetical. The guard below refuses rather than let that pass unnoticed.
+stub_dir="$(mktemp -d)"
+cat > "$stub_dir/gh" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$GH_STUB_LOG"
+case "$*" in
+  "issue list"*)
+    printf '[{"title":"%s","state":"OPEN","number":29}]\n' "$GH_STUB_TITLE"
+    exit 0 ;;
+  "issue comment"*) exit "${GH_STUB_COMMENT_RC:-0}" ;;
+  "issue close"*)   exit "${GH_STUB_CLOSE_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$stub_dir/gh"
+
+# stdout and stderr kept apart on purpose: which stream the outcome lands on is the whole subject.
+retire_live() {
+    GH_STUB_LOG="$1" \
+    GH_STUB_TITLE="Release 0.4.1: publish the documentation site" \
+    GH_STUB_COMMENT_RC="$2" GH_STUB_CLOSE_RC="$3" \
+    PATH="$stub_dir:$PATH" \
+    bash "$script" retire 0.4.1 2>/dev/null
+}
+
+log="$stub_dir/calls-close-fails"
+: > "$log"
+out="$(retire_live "$log" 0 1)"
+if ! grep -q 'issue list' "$log"; then
+    fail "the gh stub is the one that ran" "no calls recorded; the real gh may have been used"
+elif printf '%s' "$out" | grep -q '#29'; then
+    pass "a close that fails says so on stdout, naming the issue"
+else
+    fail "a close that fails says so on stdout, naming the issue" "stdout was: $out"
+fi
+
+log="$stub_dir/calls-comment-fails"
+: > "$log"
+out="$(retire_live "$log" 1 0)"
+# Not merely "#29 appears": the plain success line names the issue too, so asking only for the number
+# passed against the very code this case exists to change. A request that is closed with no reason on
+# it is worse for its owner than one still open, so the warning is the assertion.
+if printf '%s' "$out" | grep -q '::warning::' && printf '%s' "$out" | grep -q '#29'; then
+    pass "a closed request whose explanation did not land says so too"
+else
+    fail "a closed request whose explanation did not land says so too" "stdout was: $out"
+fi
+
+# The control: when both land, the summary says it withdrew the request and raises no warning.
+# Without it, a script that shouted on every run would pass both cases above while saying nothing.
+log="$stub_dir/calls-ok"
+: > "$log"
+out="$(retire_live "$log" 0 0)"
+if printf '%s' "$out" | grep -q 'withdrew' && ! printf '%s' "$out" | grep -q '::warning::'; then
+    pass "a withdrawal that lands reports plainly, with no warning"
+else
+    fail "a withdrawal that lands reports plainly, with no warning" "stdout was: $out"
+fi
+rm -rf "$stub_dir"
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "docs-release-smoke: all cases passed"

@@ -146,6 +146,36 @@ jobs:
             Worth reading in the ingest report diff rather than the entry diff: connectors that newly
             derive no capability at all, and connectors whose modes are derived with nothing declared
             behind them. Both are how a connector that stopped building looks.
+
+            ## Linked issue
+
+            none - nothing decided this pull request but the rebuild that opened it. What it carries,
+            and what makes it open at all, is `.github/workflows/catalog-refresh.yml`, whose header
+            holds the design.
+
+            ## End-to-end case
+
+            None, and none is possible: what changed here is generated data, and no end-to-end case
+            fails when a regenerated hash or a derived capability bit is reverted. The `no-e2e` label
+            is applied by this lane for that reason, which is why it is on a pull request nobody has
+            reviewed yet - the exception was decided once, in this workflow, rather than clicked on
+            each run. What does guard this diff runs in `build`: `CatalogArtifactTest` locks the
+            catalog byte-for-byte against a regeneration, and `CatalogConsistencyTest` reads the rows
+            back.
+
+            ## Live verification scenario
+
+            Run `sh scripts/refresh-catalog.sh` against an upstream checkout at the revision this
+            pull request names, and the three regenerated paths come back byte-identical to the diff
+            here. The ingest report's header is where to look first: `specSha` and `capabilitySha`
+            must be the same revision, which is the whole difference between this lane and the
+            specification-drift one.
+
+            ### Release note
+
+            none
+
           labels: |
             catalog
+            no-e2e
           delete-branch: false
