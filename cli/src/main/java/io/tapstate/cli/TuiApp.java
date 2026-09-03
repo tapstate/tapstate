@@ -33,6 +33,8 @@ final class TuiApp {
     private static final long DASHBOARD_REFRESH_MILLIS = 5000L;
     private static final String PALETTE_NOTICE =
             "commands: ↑/↓ choose · Enter select · Esc close";
+    private static final String SUGGESTIONS_NOTICE =
+            "suggestions · ↑/↓ choose · Enter select";
     private final Repl repl;
     private final StringWriter out;
     private final StringWriter err;
@@ -493,8 +495,7 @@ final class TuiApp {
             return;
         }
         suggestionsVisible = true;
-        uiState = reduce(new TuiAction.OpenPalette(completion.candidates(),
-                "suggestions · ↑/↓ choose · Enter select"));
+        uiState = reduce(new TuiAction.OpenPalette(completion.candidates(), SUGGESTIONS_NOTICE));
     }
 
     private void drainCommandCompletions() {
@@ -1126,7 +1127,9 @@ final class TuiApp {
         if (uiState.paletteOpen()) {
             uiState = reduce(
                     new TuiAction.MovePalette(key == EscapeKey.UP ? -1 : 1));
-            uiState = reduce(new TuiAction.SetNotice(PALETTE_NOTICE));
+            if (!suggestionsVisible) {
+                uiState = reduce(new TuiAction.SetNotice(PALETTE_NOTICE));
+            }
             return;
         }
         if (commandInput.isEmpty()) {

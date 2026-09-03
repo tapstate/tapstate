@@ -28,11 +28,12 @@ final class TamboDashboard {
 
     void render(Frame frame, TuiDashboard.State state, int workspaceScroll) {
         Rect screen = frame.area().inner(Margin.uniform(1));
+        int suggestionRows = inlineSuggestions(state) ? inlineSuggestionRows(state, screen.height()) : 0;
         List<Rect> vertical = Layout.vertical().constraints(
-                Constraint.length(2), Constraint.fill(), Constraint.length(5)).split(screen);
+                Constraint.length(2), Constraint.fill(), Constraint.length(5 + suggestionRows)).split(screen);
         renderStatus(frame, vertical.get(0), state);
-        renderWorkspace(frame, vertical.get(1), state, workspaceScroll);
-        renderCommandBar(frame, vertical.get(2), state);
+        renderWorkspace(frame, vertical.get(1), state, workspaceScroll, suggestionRows > 0);
+        renderCommandBar(frame, vertical.get(2), state, suggestionRows);
     }
 
     private void renderStatus(Frame frame, Rect area, TuiDashboard.State state) {
@@ -44,9 +45,10 @@ final class TamboDashboard {
                 .foreground(connectionColor(state.connection())).build(), area);
     }
 
-    private void renderWorkspace(Frame frame, Rect area, TuiDashboard.State state, int workspaceScroll) {
+    private void renderWorkspace(Frame frame, Rect area, TuiDashboard.State state, int workspaceScroll,
+                                 boolean inlineSuggestions) {
         List<String> lines = state.prompt() != null ? promptLines(state.prompt())
-                : !state.palette().isEmpty() ? paletteLines(state, area.height()) : contentLines(state);
+                : !state.palette().isEmpty() && !inlineSuggestions ? paletteLines(state, area.height()) : contentLines(state);
         boolean scrollable = state.prompt() == null && state.palette().isEmpty()
                 && state.resultPane() != null && lines.size() > area.height();
         Rect textArea = area;
@@ -83,19 +85,50 @@ final class TamboDashboard {
         }
     }
 
-    private void renderCommandBar(Frame frame, Rect area, TuiDashboard.State state) {
-        List<Rect> rows = Layout.vertical().constraints(Constraint.length(3), Constraint.fill()).split(area);
+    private void renderCommandBar(Frame frame, Rect area, TuiDashboard.State state, int suggestionRows) {
+        List<Rect> rows = suggestionRows > 0
+                ? Layout.vertical().constraints(Constraint.length(suggestionRows), Constraint.length(3), Constraint.fill()).split(area)
+                : Layout.vertical().constraints(Constraint.length(3), Constraint.fill()).split(area);
+        int inputRow = suggestionRows > 0 ? 1 : 0;
+        int hintRow = suggestionRows > 0 ? 2 : 1;
+        if (suggestionRows > 0) {
+            renderSuggestions(frame, rows.get(0), state);
+        }
+        renderComposer(frame, rows.get(inputRow), state);
+        frame.renderWidget(Paragraph.builder().text(Text.from(commandHint(state, rows.get(hintRow).width())))
+                .overflow(Overflow.WRAP_WORD)
+                .foreground(Color.GRAY).build(), rows.get(hintRow));
+    }
+
+    private void renderComposer(Frame frame, Rect area, TuiDashboard.State state) {
         String line = state.prompt() == null ? state.command() + "▌" : state.prompt().input() + "▌";
         Color composerBackground = Color.rgb(38, 40, 43);
         Block block = Block.builder().borders(Borders.ALL).borderType(BorderType.ROUNDED)
                 .borderColor(Color.GRAY).background(composerBackground).build();
-        frame.renderWidget(block, rows.get(0));
+        frame.renderWidget(block, area);
         frame.renderWidget(Paragraph.builder().text(Text.from(line))
                 .overflow(Overflow.WRAP_WORD)
-                .foreground(Color.LIGHT_CYAN).background(composerBackground).build(), block.inner(rows.get(0)));
-        frame.renderWidget(Paragraph.builder().text(Text.from(commandHint(state, rows.get(1).width())))
-                .overflow(Overflow.WRAP_WORD)
-                .foreground(Color.GRAY).build(), rows.get(1));
+                .foreground(Color.LIGHT_CYAN).background(composerBackground).build(), block.inner(area));
+    }
+
+    private void renderSuggestions(Frame frame, Rect area, TuiDashboard.State state) {
+        int visible = Math.min(area.height(), state.palette().size());
+        int start = Math.min(Math.max(0, state.paletteIndex() - visible + 1),
+                Math.max(0, state.palette().size() - visible));
+        for (int offset = 0; offset < visible; offset++) {
+            int index = start + offset;
+            String command = state.palette().get(index);
+            String summary = commandSummary(command);
+            String text = (index == state.paletteIndex() ? "› " : "  ") + command
+                    + (summary.isBlank() ? "" : "  " + summary);
+            Paragraph.Builder row = Paragraph.builder().text(Text.from(text)).overflow(Overflow.CLIP);
+            if (index == state.paletteIndex()) {
+                row.foreground(Color.BRIGHT_WHITE).background(Color.rgb(57, 57, 57));
+            } else {
+                row.foreground(Color.GRAY);
+            }
+            frame.renderWidget(row.build(), new Rect(area.x(), area.y() + offset, area.width(), 1));
+        }
     }
 
     private static List<String> contentLines(TuiDashboard.State state) {
@@ -158,11 +191,21 @@ final class TamboDashboard {
 
     private static String commandHint(TuiDashboard.State state, int width) {
         if (state.prompt() != null) return state.prompt().hint();
+        if (inlineSuggestions(state)) return "↑/↓ choose · Enter select · Esc clear";
         String compact = "Enter run · Type for suggestions · Ctrl-P commands";
         String full = compact + " · Esc clear · Ctrl-C cancel";
         return state.connection() == TuiDashboard.Connection.ONBOARDING || state.connection() == TuiDashboard.Connection.OFFLINE
                 ? (width >= 84 ? "Local: validate, new, explain, demo · Server: connect host:port · " + compact : compact)
                 : (width >= 84 ? full : compact);
+    }
+
+    private static boolean inlineSuggestions(TuiDashboard.State state) {
+        return state.prompt() == null && !state.palette().isEmpty()
+                && state.notice() != null && state.notice().startsWith("suggestions");
+    }
+
+    private static int inlineSuggestionRows(TuiDashboard.State state, int screenHeight) {
+        return Math.min(state.palette().size(), Math.min(6, Math.max(0, screenHeight - 8)));
     }
 
     private static Color connectionColor(TuiDashboard.Connection connection) {

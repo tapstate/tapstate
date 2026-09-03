@@ -368,8 +368,46 @@ class TuiRuntimeIntegrationTest {
         new TamboDashboard().render(Frame.forTesting(buffer), state);
 
         String rendered = buffer.toAnsiStringTrimmed();
-        assertThat(rendered).contains("Suggestions", "ls", "List workspace resources", "l▌");
+        assertThat(rendered).contains("ls", "List workspace resources", "l▌");
         assertThat(rendered).doesNotContain("[COMMAND]", "> ");
+    }
+
+    @Test
+    void liveSuggestionsSitImmediatelyAboveTheComposer() {
+        TuiDashboard.State state = new TuiDashboard.State(
+                Path.of("orders"), null, null, TuiDashboard.Connection.OFFLINE,
+                "suggestions · ↑/↓ choose · Enter select", "l", List.of("ls", "login"), 0, null);
+        Buffer buffer = Buffer.empty(new Rect(0, 0, 80, 16));
+
+        new TamboDashboard().render(Frame.forTesting(buffer), state);
+
+        int composerTop = rowContaining(buffer, "╭");
+        assertThat(composerTop).isGreaterThan(0);
+        assertThat(row(buffer, composerTop - 2)).contains("› ls");
+        assertThat(row(buffer, composerTop - 1)).contains("login");
+        assertThat(row(buffer, composerTop + 1)).contains("l▌");
+        assertThat(row(buffer, composerTop + 3)).contains("Enter select");
+    }
+
+    @Test
+    void movingThroughLiveSuggestionsKeepsTheInlineSurfaceOpen() throws Exception {
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+        TuiApp app = new TuiApp(new Repl(registry.commandLine()), new StringWriter(), new StringWriter(), null);
+        invokeReduce(app, new TuiAction.OpenPalette(List.of("ls", "login"),
+                "suggestions · ↑/↓ choose · Enter select"));
+        setField(app, "suggestionsVisible", true);
+
+        Class<?> escapeKey = java.util.Arrays.stream(TuiApp.class.getDeclaredClasses())
+                .filter(type -> type.getSimpleName().equals("EscapeKey"))
+                .findFirst().orElseThrow();
+        Method navigate = TuiApp.class.getDeclaredMethod("navigate", escapeKey);
+        navigate.setAccessible(true);
+        Object down = Enum.valueOf((Class) escapeKey, "DOWN");
+        navigate.invoke(app, down);
+
+        TuiAppState state = (TuiAppState) getField(app, "uiState");
+        assertThat(state.paletteIndex()).isEqualTo(1);
+        assertThat(state.notice()).startsWith("suggestions");
     }
 
     @Test
@@ -526,6 +564,23 @@ class TuiRuntimeIntegrationTest {
         Field field = TuiApp.class.getDeclaredField(name);
         field.setAccessible(true);
         field.set(app, value);
+    }
+
+    private static int rowContaining(Buffer buffer, String value) {
+        for (int y = 0; y < buffer.height(); y++) {
+            if (row(buffer, y).contains(value)) {
+                return y;
+            }
+        }
+        return -1;
+    }
+
+    private static String row(Buffer buffer, int y) {
+        StringBuilder value = new StringBuilder();
+        for (int x = 0; x < buffer.width(); x++) {
+            value.append(buffer.get(x, y).symbol());
+        }
+        return value.toString();
     }
 
     private static ResolvedContext.Named context(String name) {

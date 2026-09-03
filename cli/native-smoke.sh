@@ -371,6 +371,19 @@ else
   bad "TUI Tab completion failed (rc=$PTY_RC) or did not complete 'va'→'validate'; output:"; echo "$PTY_OUT"
 fi
 
+# Typing must also open the inline suggestion surface without waiting for Tab. Escape closes the
+# candidates, while the JVM reducer test covers Enter selecting the highlighted command.
+TAPSTATE_PTY_TUI=1 pty_session $'va\033\004'
+AUTO_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
+if (( PTY_RC == 0 )) \
+   && grep -q "validate" <<< "$AUTO_CLEAN" \
+   && grep -q "Enter sel" <<< "$AUTO_CLEAN" \
+   && ! grep -q 'Unmatched argument' <<< "$AUTO_CLEAN"; then
+  ok "TUI typing rendered inline suggestions with an Enter-select hint"
+else
+  bad "TUI inline suggestion rendering failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
+fi
+
 # --- 9. online TUI launch under a pty (HttpClient + issuer discovery reachable in the image) --------
 # Sections 1-8 never open a socket. Stand up a throwaway loopback
 # stub (healthz + issuer discovery), launch the TUI with a machine token, and confirm the dashboard sees
