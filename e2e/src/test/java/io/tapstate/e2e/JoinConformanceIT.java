@@ -109,7 +109,7 @@ class JoinConformanceIT {
             createSchema(db);
             try (JoinConformance conformance =
                          JoinConformance.of(db, LEFT_JOIN, List.of("order_id"), factory)) {
-                conformance.upsert("customers", customer(1L, 1L, "Ada"));
+                conformance.upsert("customers", customer(1L, 1L, "Ada", "unpublished"));
                 conformance.upsert("orders", order(10L, 1L, 2L, new BigDecimal("3.50")));
                 assertThat(conformance.differences()).isEmpty();
 
@@ -160,7 +160,8 @@ class JoinConformanceIT {
         }
         if (draw < 9) {
             long id = random.nextInt(CUSTOMERS);
-            Map<String, Object> row = customer(id, refOf(id), "name-" + random.nextInt(4));
+            Map<String, Object> row = customer(id, refOf(id, random), "name-" + random.nextInt(4),
+                    "note-" + random.nextInt(4));
             conformance.upsert("customers", row);
             return "upsert customers " + row;
         }
@@ -170,16 +171,27 @@ class JoinConformanceIT {
     }
 
     /**
-     * A customer's join column: its own id, or null for one in four.
+     * A customer's join column, drawn from three values that are its own alone: its id, its id in a
+     * disjoint range, or null.
      *
-     * <p>Null on this side is what makes a null key observable at all - see the class note. Derived
-     * from the id rather than drawn so that no two customers ever share a non-null one: the dimension
-     * mirror holds one row per join key, so two dimension rows under one key is a fan-out this release
-     * cannot state, and a sequence that produced one would be reporting a known limit rather than a
-     * defect.
+     * <p>Two things ride on this. <b>Null on this side is what makes a null key observable at all</b> -
+     * with nulls on the driving side only there is nothing for them to wrongly match, see the class
+     * note. <b>And a dimension row whose own join key moves is the case the admission filter is most
+     * dangerous around</b>: the published columns may be untouched while both buckets are wrong, so a
+     * filter reading those columns alone discards it and leaves rows joined to a customer they no
+     * longer match. Drawing between two ranges makes that move happen throughout the sequence.
+     *
+     * <p>The values are derived from the id rather than drawn freely so that no two customers ever
+     * share a non-null one: the dimension mirror holds one row per join key, so two dimension rows
+     * under one key is a fan-out this release cannot state, and a sequence that produced one would be
+     * reporting a known limit rather than a defect.
      */
-    private static Long refOf(long id) {
-        return id % 4 == 3 ? null : id;
+    private static Long refOf(long id, Random random) {
+        int draw = random.nextInt(4);
+        if (draw == 3) {
+            return null;
+        }
+        return draw == 2 ? id + 100 : id;
     }
 
     /**
@@ -202,11 +214,12 @@ class JoinConformanceIT {
         return row;
     }
 
-    private static Map<String, Object> customer(long id, Long ref, String name) {
+    private static Map<String, Object> customer(long id, Long ref, String name, String note) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("id", id);
         row.put("ref_no", ref);
         row.put("name", name);
+        row.put("note", note);
         return row;
     }
 
@@ -218,7 +231,8 @@ class JoinConformanceIT {
                     CREATE TABLE customers (
                       id BIGINT NOT NULL PRIMARY KEY,
                       ref_no BIGINT,
-                      name VARCHAR(64)
+                      name VARCHAR(64),
+                      note VARCHAR(64)
                     )""");
             statement.execute("""
                     CREATE TABLE orders (

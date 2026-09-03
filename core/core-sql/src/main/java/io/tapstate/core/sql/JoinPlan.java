@@ -1,8 +1,11 @@
 package io.tapstate.core.sql;
 
 import java.io.Serializable;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * What a join declaration means, in terms no execution carrier appears in.
@@ -22,6 +25,47 @@ import java.util.Map;
  */
 public record JoinPlan(List<OutputField> outputFields, JoinTree from,
                        Map<String, List<String>> readColumns) implements Serializable {
+
+    /**
+     * Every column of {@code source} that some published value is computed from.
+     *
+     * <p><b>This is deliberately narrower than {@link #readColumns()}, and the difference is the whole
+     * point.</b> A source is read for its join keys and for anything a condition mentions as well as
+     * for what it publishes, and those are routinely not projected. A carrier deciding whether a change
+     * to a dimension row can possibly alter the output has to ask about the published columns alone:
+     * asked about the read columns instead, every edit touches something and nothing is ever ruled out.
+     *
+     * <p>The columns are collected from the whole of each expression rather than its outermost form. A
+     * column reference sits at any depth - {@code UPPER(c.first || c.last)} publishes two of them - and
+     * a reader that looked only at the top level would report that expression as reading nothing, which
+     * is the answer that makes an edit to it disappear.
+     *
+     * @return the columns, sorted, empty for a source this plan publishes nothing from
+     */
+    public Set<String> outputColumns(String source) {
+        Set<String> columns = new TreeSet<>();
+        for (OutputField field : outputFields) {
+            collect(field.from(), source, columns);
+        }
+        return Collections.unmodifiableSet(columns);
+    }
+
+    private static void collect(Expr expression, String source, Set<String> into) {
+        switch (expression) {
+            case Expr.Column column -> {
+                if (column.ref().source().equals(source)) {
+                    into.add(column.ref().column());
+                }
+            }
+            case Expr.Literal ignored -> {
+            }
+            case Expr.Call call -> {
+                for (Expr argument : call.arguments()) {
+                    collect(argument, source, into);
+                }
+            }
+        }
+    }
 
     /**
      * The source rows are driven from: the leftmost leaf of the tree.

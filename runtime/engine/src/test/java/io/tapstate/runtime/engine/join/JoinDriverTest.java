@@ -410,6 +410,114 @@ class JoinDriverTest {
                 Map.entry(Op.DELETE, rowOf("order_id", 11L, "customer_name", null)));
     }
 
+    /**
+     * The filter that decides how often the expensive thing happens at all. A dimension key with a
+     * million fact rows under it means a million rows are rebuilt and written; a real workload edits
+     * customers constantly, and most of those edits touch a column the join never publishes. Without
+     * this every one of them is a full fan-out.
+     *
+     * <p>Asserted on what was queued rather than on what came out: a recompute that was enqueued and
+     * then found nothing to send publishes exactly as little as one that was never enqueued, so
+     * "nothing was published" cannot tell the two apart - and the whole cost being avoided is the walk,
+     * not the send.
+     */
+    @Test
+    @DisplayName("editing a dimension column the output never reads queues no work at all")
+    void anEditOutsideTheOutputIsDiscarded() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada", "address", "Rue A"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.absorbOnly(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada", "address", "Rue A"),
+                Map.of("id", 1L, "name", "Ada", "address", "Rue B"))));
+
+        assertThat(fixture.hasPending())
+                .as("an address the join does not publish cannot change a single byte of the output")
+                .isFalse();
+    }
+
+    /**
+     * The control group for the case above, and it is the only thing separating "the filter works"
+     * from "the filter drops everything". Both leave the same empty output on the case above.
+     */
+    @Test
+    @DisplayName("editing a dimension column the output does read still queues the recompute")
+    void anEditInsideTheOutputIsKept() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada", "address", "Rue A"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.absorbOnly(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada", "address", "Rue A"),
+                Map.of("id", 1L, "name", "Grace", "address", "Rue A"))));
+
+        assertThat(fixture.hasPending()).isTrue();
+        fixture.drainFully();
+        assertThat(fixture.published()).containsExactly(
+                Map.entry(Op.INSERT, Map.of("order_id", 10L, "customer_name", "Grace")));
+    }
+
+    /**
+     * Some connectors emit an event for {@code UPDATE ... SET x = x}, and some emit one when only a
+     * timestamp moved. The columns intersect the output and the values do not differ, so there is
+     * nothing to rebuild.
+     */
+    @Test
+    @DisplayName("a dimension event that repeats the values it already had queues no work")
+    void anEditThatChangesNothingIsDiscarded() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.absorbOnly(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Ada"))));
+
+        assertThat(fixture.hasPending()).isFalse();
+    }
+
+    /**
+     * Loading a dimension table before any facts arrive is the ordinary way a pipeline starts, and
+     * every one of those rows would otherwise queue a walk of a bucket that does not exist.
+     */
+    @Test
+    @DisplayName("a dimension row nothing points at queues no work, however it changed")
+    void anEditToARowWithNoFactsIsDiscarded() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+
+        fixture.absorbOnly(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+
+        assertThat(fixture.hasPending()).isFalse();
+    }
+
+    /**
+     * The case the filter above must not swallow, and the one that makes it dangerous. When the
+     * dimension row's own join key moves, the columns the output reads may be untouched - the name is
+     * the same - yet both buckets are wrong: the rows under the old key have lost their match and the
+     * rows under the new one have gained it. Filtering on the output's columns alone discards this, and
+     * what is left behind is a row still showing a customer it is no longer joined to.
+     */
+    @Test
+    @DisplayName("a dimension row whose own join key moves is recomputed under both keys")
+    void aMovedDimensionKeyRecomputesBothSides() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.apply(fact(insert(Map.of("id", 11L, "cust_id", 2L))));
+        fixture.clear();
+
+        // The name does not change; only the key does.
+        fixture.apply(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada"), Map.of("id", 2L, "name", "Ada"))));
+
+        assertThat(fixture.published()).containsExactlyInAnyOrder(
+                Map.entry(Op.INSERT, rowOf("order_id", 10L, "customer_name", null)),
+                Map.entry(Op.INSERT, rowOf("order_id", 11L, "customer_name", "Ada")));
+    }
+
     private static Map<String, Object> rowOf(String first, Object firstValue, String second,
             Object secondValue) {
         Map<String, Object> row = new LinkedHashMap<>();
@@ -478,6 +586,15 @@ class JoinDriverTest {
                 }
             }
             throw new AssertionError("the driver never finished with nothing arriving");
+        }
+
+        /** Takes the change in without sending anything - what a case about queuing has to see. */
+        void absorbOnly(SourceChange change) {
+            driver.absorb(List.of(change));
+        }
+
+        boolean hasPending() {
+            return driver.hasPending();
         }
 
         void clear() {

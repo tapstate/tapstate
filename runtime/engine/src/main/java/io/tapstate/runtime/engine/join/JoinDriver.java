@@ -237,25 +237,70 @@ public final class JoinDriver {
     private void absorbDimension(Dimension dimension, Envelope event) {
         Map<String, Object> after = event.after();
         Map<String, Object> before = event.before();
-        if (before != null) {
-            String was = keyOfDimensionRow(before, dimension);
-            if (was != null && (after == null || !was.equals(keyOfDimensionRow(after, dimension)))) {
-                stores.removeDimensionRow(dimension.source(), was);
-                pending.add(new Recompute(dimension, was, 0, 0, event.ts()));
-            }
+        String was = before == null ? null : keyOfDimensionRow(before, dimension);
+        String now = after == null ? null : keyOfDimensionRow(after, dimension);
+        boolean keyMoved = !Objects.equals(was, now);
+
+        if (was != null && keyMoved) {
+            stores.removeDimensionRow(dimension.source(), was);
+            queueRecompute(dimension, was, event.ts());
         }
-        if (after == null) {
-            return;
-        }
-        String now = keyOfDimensionRow(after, dimension);
-        if (now == null) {
+        if (after == null || now == null) {
             // A dimension row whose join key holds a null matches nothing, by the same rule that makes
             // a null key on the other side match nothing. Keeping it would give it a bucket no fact row
             // can ever name.
             return;
         }
         stores.putDimensionRow(dimension.source(), now, after);
-        pending.add(new Recompute(dimension, now, 0, 0, event.ts()));
+        if (keyMoved || publishedValuesDiffer(dimension, before, after)) {
+            queueRecompute(dimension, now, event.ts());
+        }
+    }
+
+    /**
+     * Whether this edit can alter a single byte of what is published for the rows under this key.
+     *
+     * <p><b>This is the filter that decides how often the expensive thing happens at all</b>, and it is
+     * worth more than making the expensive thing faster. A dimension key with a million fact rows under
+     * it means a million rows rebuilt and written - a minute or more, during which the target holds half
+     * the old value and half the new one while the job reports itself healthy. Real workloads edit
+     * customers constantly and most of those edits touch an address, a phone number or a timestamp this
+     * join never publishes; without this, every one of them buys that minute.
+     *
+     * <p>Two of the tests it was specified as are one comparison here, because they are the same
+     * question asked twice: whether the columns intersect at all, and whether the values under the
+     * intersection actually differ. Comparing the published columns alone answers both, and costs one
+     * pass over a handful of names rather than a set intersection followed by a second pass.
+     *
+     * <p>An absent before image reads as a difference. A connector that reports only key columns leaves
+     * every other one looking null, so this errs towards rebuilding - which costs time, where the other
+     * direction costs a target row that stays wrong with nothing reporting it.
+     */
+    private boolean publishedValuesDiffer(Dimension dimension, Map<String, Object> before,
+            Map<String, Object> after) {
+        if (before == null) {
+            return true;
+        }
+        for (String column : dimension.outputColumns()) {
+            if (!Objects.equals(before.get(column), after.get(column))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Queues the rebuild of one bucket, unless nothing points at it.
+     *
+     * <p>Loading a dimension table before any fact rows arrive is the ordinary way a pipeline starts,
+     * and every one of those rows would otherwise queue a walk of a bucket that does not exist. The
+     * check is one look at the index, against a walk that is skipped.
+     */
+    private void queueRecompute(Dimension dimension, String dimensionKey, long ts) {
+        if (stores.indexPageCount(dimension.source(), dimensionKey) == 0) {
+            return;
+        }
+        pending.add(new Recompute(dimension, dimensionKey, 0, 0, ts));
     }
 
     /**
@@ -514,13 +559,20 @@ public final class JoinDriver {
                     "'" + right.name() + "' is joined on nothing, which is every row against every row");
         }
         into.add(new Dimension(right.name(), join.kind(), List.copyOf(factColumns),
-                List.copyOf(dimensionColumns)));
+                List.copyOf(dimensionColumns), plan.outputColumns(right.name())));
         collect(join.left(), into);
     }
 
-    /** One source joined onto the driving one, and the columns either side is matched by. */
+    /**
+     * One source joined onto the driving one: the columns either side is matched by, and the columns
+     * of it any published value is computed from.
+     *
+     * <p>The last of those is not the same as the columns it is read for, and the difference is what
+     * makes the admission filter able to discard anything: a join key is read and routinely never
+     * published, so a filter asking about read columns would find every edit relevant.
+     */
     private record Dimension(String source, JoinKind kind, List<String> factColumns,
-            List<String> dimensionColumns) {
+            List<String> dimensionColumns, java.util.Set<String> outputColumns) {
     }
 
     private sealed interface Work permits Row, Recompute {
