@@ -545,7 +545,7 @@ final class TuiApp {
         }
         CommandResult safeResult = commandResult == null ? new CommandResult(true, Cli.EXIT_DIAGNOSTIC) : commandResult;
         uiState = reduce(new TuiAction.SetResultPane(TuiCommandBar.project(safeResult, result)));
-        workspaceScroll = 0;
+        workspaceScroll = TamboDashboard.maxWorkspaceScroll(state(), kernel.viewport().height());
         invalidateWorkspaceSnapshot();
         if (!result.isBlank()) {
             String marker = failure == null && safeResult.exitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";

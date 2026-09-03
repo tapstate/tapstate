@@ -73,16 +73,14 @@ final class TamboDashboard {
         }
         int maxScroll = Math.max(0, lines.size() - textArea.height());
         int scroll = Math.min(Math.max(0, workspaceScroll), maxScroll);
-        if (scroll > 0 && !lines.isEmpty()) {
-            lines = lines.subList(Math.min(scroll, lines.size() - 1), lines.size());
-        }
         Paragraph.Builder paragraph = Paragraph.builder()
                 .text(Text.from(String.join("\n", lines)))
+                .scroll(scroll)
                 .overflow(Overflow.WRAP_WORD);
         frame.renderWidget(paragraph.build(), textArea);
         if (scrollable) {
             ScrollbarState scrollbarState = new ScrollbarState()
-                    .contentLength(lines.size() + scroll)
+                    .contentLength(lines.size())
                     .viewportContentLength(textArea.height())
                     .position(scroll);
             frame.renderStatefulWidget(Scrollbar.builder()
