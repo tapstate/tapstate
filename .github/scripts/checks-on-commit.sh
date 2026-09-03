@@ -123,9 +123,17 @@ resolve_fallback() {
 # same name, which is the one that ships a bad release.
 #
 # So the runs for a name are ordered, not indexed -- by when they started, latest first, which is what
-# a re-run means and what the branch rules themselves read. Cancelled, skipped and neutral are left
-# out of that ordering entirely: they are not verdicts about the code, so they answer only when
-# nothing else does, and then they still refuse.
+# a re-run means and what the branch rules themselves read. Only verdicts take part in that ordering.
+#
+# A run still in flight is not one, and letting it answer while a finished verdict existed cost a
+# release attempt: someone cut a branch off the release commit four minutes in, that branch started
+# its own suite of the same names against the same sha, and the gate waited on it -- not for the ten
+# minutes that would have been tolerable, but fatally, because this runs inside a job that reads exit
+# 3 as a failure. Anyone branching off the release commit could stop the release. So in-flight answers
+# only when no verdict exists at all, which is the honest "nothing is known yet" this gate opened with.
+#
+# Cancelled, skipped and neutral rank below even that: they are not verdicts about the code and never
+# will be, so they answer last, and then they still refuse.
 #
 # Ranking by severity instead -- a failure outranking a success for the same name -- was tried here
 # first and is wrong, for a reason worth leaving written down: a required check can fail for something
@@ -140,10 +148,11 @@ resolve_fallback() {
 pick() { # $1 = tsv runs, $2 = name -> the one line that speaks for it, or empty
   awk -F'\t' -v want="$2" '
     $1 != want { next }
+    $2 != "completed" { if ($4 >= wait_at) { wait_at = $4; wait = $1 "\t" $2 "\t" $3 } ; next }
     $3 == "cancelled" || $3 == "skipped" || $3 == "neutral" \
                       { if ($4 >= moot_at) { moot_at = $4; moot = $1 "\t" $2 "\t" $3 } ; next }
                       { if ($4 >= said_at) { said_at = $4; said = $1 "\t" $2 "\t" $3 } }
-    END { print said ? said : moot }
+    END { print said ? said : (wait ? wait : moot) }
   ' <<<"$1"
 }
 
