@@ -96,7 +96,7 @@ class PipelineStreamApiTest {
     private WebSocket connect(String path, String token, FrameSink sink) {
         return HttpClient.newHttpClient().newWebSocketBuilder()
                 .header("Authorization", "Bearer " + token)
-                .buildAsync(URI.create("ws://localhost:" + port + path), sink)
+                .buildAsync(URI.create("ws://127.0.0.1:" + port + path), sink)
                 .join();
     }
 
@@ -177,7 +177,7 @@ class PipelineStreamApiTest {
     @Test
     void anUnauthenticatedHandshakeIsRefusedUnauthorized() {
         assertThatThrownBy(() -> HttpClient.newHttpClient().newWebSocketBuilder()
-                .buildAsync(URI.create("ws://localhost:" + port + "/api/pipelines/pl1/status/watch"), new FrameSink())
+                .buildAsync(URI.create("ws://127.0.0.1:" + port + "/api/pipelines/pl1/status/watch"), new FrameSink())
                 .join())
                 .hasCauseInstanceOf(WebSocketHandshakeException.class)
                 .cause()
@@ -193,7 +193,7 @@ class PipelineStreamApiTest {
         // carries an interceptor, so nothing else in the build would say a word.
         assertThatThrownBy(() -> HttpClient.newHttpClient().newWebSocketBuilder()
                 .buildAsync(URI.create(
-                        "ws://localhost:" + port + "/api/data-browser/views/order_state/tail"), new FrameSink())
+                        "ws://127.0.0.1:" + port + "/api/data-browser/views/order_state/tail"), new FrameSink())
                 .join())
                 .hasCauseInstanceOf(WebSocketHandshakeException.class)
                 .cause()
