@@ -12,11 +12,6 @@
 name: funnel capture
 
 on:
-  # TEMPORARY, remove before this branch merges. A schedule only ever fires on the default branch, so
-  # without this there is no way to exercise the job before merge -- and the one thing worth exercising
-  # is whether the app token really can read the traffic API.
-  push:
-    branches: ['ws/activation-funnel-distribution']
   schedule:
     # Weekly, comfortably inside the 14-day window so one missed run still loses nothing.
     - cron: '17 4 * * 1'
