@@ -59,11 +59,17 @@ import static org.assertj.core.api.Assertions.assertThat;
  * after two minutes, not the two that had gone through. A table's confirmation is published when the sink
  * has no batch in flight, so one held table withholds every table's confirmation, not its own.
  *
- * <p>What does produce the boundary is the selection. A chain is keyed by the physical source coordinate
- * and deliberately excludes the table subset, so two sources over one directory share one chain and one
- * record: a source reading two of the tables confirms exactly those two, and a source over the same
- * directory reading all three then finds the third owed and the first two not. The record is the subject
- * either way, and it is the only thing carried across the restart.
+ * <p>What does produce the boundary is widening the selection of a pipeline that is stopped with its
+ * state kept -- which is what adding a table to a pipeline is. It reads two tables and confirms them, is
+ * stopped without clearing anything, and comes back reading three: its own record names two of them, so
+ * the third is owed and the other two are not.
+ *
+ * <p>It used to be arranged with two pipelines instead, one reading two tables and one reading three, on
+ * the strength of their sharing a chain. That is no longer a boundary: completion is recorded against the
+ * pipeline that confirmed it, because it answers "are this pipeline's rows in this pipeline's target" and
+ * two pipelines on a chain write to targets of their own. The second pipeline there now owes all three
+ * tables, correctly -- so the old arrangement stopped producing the state this case is about, and the
+ * arrangement had to become one that happens inside a single pipeline.
  *
  * <p>Gated on Docker for the state store. Source and target are the harness's own file connector, so this
  * needs no directory of real connector jars and runs in the ordinary pull-request lane.
@@ -74,11 +80,9 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     private static final Duration POLL = Duration.ofMillis(250);
     private static final Duration SETTLE = Duration.ofSeconds(5);
 
-    private static final String NARROW_SOURCE = "src_confirmed";
-    private static final String WIDE_SOURCE = "src_all";
+    private static final String SOURCE = "src_files";
     private static final String TARGET_ID = "tgt_files";
-    private static final String NARROW_PIPELINE = "confirms_two";
-    private static final String WIDE_PIPELINE = "reads_what_is_owed";
+    private static final String PIPELINE = "reads_what_is_owed";
 
     /** Different row counts, so a count attributed to the wrong table cannot pass. */
     private static final String FIRST = "alpha";
@@ -139,11 +143,10 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, jar);
-            control.apply(resources());
-            control.discoverSchema(NARROW_SOURCE, E2eConnectorJar.CONNECTOR_ID, sourceSettings());
-            control.discoverSchema(WIDE_SOURCE, E2eConnectorJar.CONNECTOR_ID, sourceSettings());
+            control.apply(resources(FIRST + ", " + SECOND));
+            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, sourceSettings());
 
-            control.lifecycle(NARROW_PIPELINE, LifecycleVerb.START);
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
 
             // A durable synchronisation point rather than a sleep: the record itself is what says the two
             // tables are confirmed, and it is the only thing this test carries across the restart.
@@ -152,11 +155,13 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
                     .as("the third table is in no selection that has run, so nothing has confirmed it")
                     .doesNotContain(OWED);
 
-            confirmingRunReads = control.snapshotRowsRead(NARROW_PIPELINE);
+            confirmingRunReads = control.snapshotRowsRead(PIPELINE);
 
-            // Paused rather than left running, so the run that comes back after the restart is the only one
-            // reading, and the counts it publishes are unambiguously its own.
-            control.lifecycle(NARROW_PIPELINE, LifecycleVerb.PAUSE);
+            // Stopped without clearing: the pipeline has to be at rest before its selection can be widened,
+            // and what it confirmed has to survive that. A clearing stop would give its record back and the
+            // run that comes back would owe all three tables -- which is the correct answer to a different
+            // question, and would leave this case asserting nothing.
+            control.stop(PIPELINE, false);
         }
 
         assertThat(confirmingRunReads)
@@ -170,7 +175,14 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
             // bootstrapping again would be a different server, not the same one coming back.
             control.login("e2e", "e2e-password");
 
-            control.lifecycle(WIDE_PIPELINE, LifecycleVerb.START);
+            // The table is added the way an author adds one: same source, same pipeline, one more table
+            // in each. The chain is keyed by the physical coordinate and excludes the table subset, so this
+            // is the same chain and the same consumer record -- which is what makes the two confirmations
+            // still apply to it.
+            control.apply(resources(FIRST + ", " + SECOND + ", " + OWED));
+            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, sourceSettings());
+
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
             Map<String, Long> owedRunReads = awaitSettledReads(control);
 
             assertThat(owedRunReads)
@@ -225,7 +237,7 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
         Map<String, Long> last = Map.of();
         long unchangedSince = System.nanoTime();
         while (System.nanoTime() - deadline < 0) {
-            Map<String, Long> now = control.snapshotRowsRead(WIDE_PIPELINE);
+            Map<String, Long> now = control.snapshotRowsRead(PIPELINE);
             if (!now.equals(last)) {
                 last = now;
                 unchangedSince = System.nanoTime();
@@ -300,22 +312,19 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
         return Map.of("uri", sourceDirectory.toString());
     }
 
-    private Map<String, String> resources() {
+    /** The whole workspace over one table list -- applied once narrow, then once wider. */
+    private Map<String, String> resources(String tables) {
         Map<String, String> resources = new LinkedHashMap<>();
-        resources.put("src_confirmed.tap.yml", sourceYaml(NARROW_SOURCE, FIRST + ", " + SECOND));
-        resources.put("src_all.tap.yml", sourceYaml(WIDE_SOURCE, FIRST + ", " + SECOND + ", " + OWED));
+        resources.put("src_files.tap.yml", sourceYaml(SOURCE, tables));
         resources.put("tgt_files.tap.yml", targetYaml());
-        resources.put("confirms_two.tap.yml",
-                pipelineYaml(NARROW_PIPELINE, NARROW_SOURCE, FIRST + ", " + SECOND));
-        resources.put("reads_what_is_owed.tap.yml",
-                pipelineYaml(WIDE_PIPELINE, WIDE_SOURCE, FIRST + ", " + SECOND + ", " + OWED));
+        resources.put("reads_what_is_owed.tap.yml", pipelineYaml(PIPELINE, SOURCE, tables));
         return resources;
     }
 
     /**
-     * Two sources over one directory. Their settings are identical and only their table lists differ, which
-     * is what puts them on one chain: the chain is keyed by the physical coordinate and the table subset is
-     * deliberately not part of it.
+     * One source over the seeded directory. Widening its table list leaves its settings alone, which is
+     * what keeps the chain the same one: the chain is keyed by the physical coordinate and the table
+     * subset is deliberately not part of it.
      */
     private String sourceYaml(String id, String tables) {
         return """
