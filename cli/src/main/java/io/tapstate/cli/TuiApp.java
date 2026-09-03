@@ -30,6 +30,8 @@ final class TuiApp {
     private static final int DEFAULT_WIDTH = 100;
     private static final int DEFAULT_HEIGHT = 24;
     private static final int READ_TIMEOUT_MILLIS = 50;
+    private static final int ESCAPE_SEQUENCE_START_TIMEOUT_MILLIS = 50;
+    private static final int ESCAPE_SEQUENCE_BODY_TIMEOUT_MILLIS = 100;
     private static final long DASHBOARD_REFRESH_MILLIS = 5000L;
     private static final String PALETTE_NOTICE =
             "commands: ↑/↓ choose · Enter select · Esc close";
@@ -231,6 +233,8 @@ final class TuiApp {
             int height = dimension(size.height(), DEFAULT_HEIGHT);
             if (resizeRequested.getAndSet(false) || width != lastWidth || height != lastHeight) {
                 kernel.dispatch(new TuiEvent.Resize(width, height));
+                workspaceScroll = moveWorkspaceScroll(workspaceScroll, 0,
+                        TamboDashboard.maxWorkspaceScroll(state(), height));
                 draw(display, terminal);
                 lastWidth = width;
                 lastHeight = height;
@@ -1134,7 +1138,9 @@ final class TuiApp {
         }
         if (commandInput.isEmpty()) {
             if (uiState.resultPane() != null && !uiState.resultPane().lines().isEmpty()) {
-                workspaceScroll = Math.max(0, workspaceScroll + (key == EscapeKey.UP ? -1 : 1));
+                int delta = key == EscapeKey.UP ? -1 : 1;
+                workspaceScroll = moveWorkspaceScroll(workspaceScroll, delta,
+                        TamboDashboard.maxWorkspaceScroll(state(), kernel.viewport().height()));
                 return;
             }
             TuiNavigation navigation = navigation();
@@ -1179,9 +1185,12 @@ final class TuiApp {
     }
 
     private static EscapeKey readEscapeKey(NonBlockingReader reader) throws IOException {
-        int next;
+        int next = reader.peek(ESCAPE_SEQUENCE_START_TIMEOUT_MILLIS);
+        if (next == NonBlockingReader.READ_EXPIRED || next < 0) {
+            return EscapeKey.ESCAPE;
+        }
         do {
-            next = reader.read(15);
+            next = reader.read(ESCAPE_SEQUENCE_BODY_TIMEOUT_MILLIS);
         } while (next == '[' || next == 'O' || next == '?' || next == ';'
                 || (next >= '0' && next <= '9'));
         return switch (next) {
@@ -1198,6 +1207,12 @@ final class TuiApp {
             return 0;
         }
         return Math.max(0, Math.min(size - 1, selected + delta));
+    }
+
+    static int moveWorkspaceScroll(int current, int delta, int maximum) {
+        int upperBound = Math.max(0, maximum);
+        long next = (long) current + delta;
+        return (int) Math.max(0, Math.min(upperBound, next));
     }
 
     static boolean isEnter(int code) {

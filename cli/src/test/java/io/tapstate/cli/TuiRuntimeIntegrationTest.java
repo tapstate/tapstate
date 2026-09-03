@@ -71,6 +71,13 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
+    void workspaceScrollCannotAccumulatePastEitherViewportEdge() {
+        assertThat(TuiApp.moveWorkspaceScroll(0, -1, 7)).isZero();
+        assertThat(TuiApp.moveWorkspaceScroll(7, 1, 7)).isEqualTo(7);
+        assertThat(TuiApp.moveWorkspaceScroll(6, 1, 7)).isEqualTo(7);
+    }
+
+    @Test
     void completionSelectionAcceptsBothTerminalEnterCodes() {
         assertThat(TuiApp.isEnter(TuiCommandBar.ENTER)).isTrue();
         assertThat(TuiApp.isEnter(TuiCommandBar.CARRIAGE_RETURN)).isTrue();

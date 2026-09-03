@@ -384,6 +384,19 @@ else
   bad "TUI inline suggestion rendering failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
 fi
 
+# Selecting the first live candidate with Return must replace the draft before any command submit.
+# The deferred Escape/Ctrl-D clears that selected draft so the session can exit without executing it.
+TAPSTATE_PTY_TUI=1 pty_session $'l\r\004'
+SELECT_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
+if (( PTY_RC == 0 )) \
+   && grep -q "ls" <<< "$SELECT_CLEAN" \
+   && grep -q "Enter sel" <<< "$SELECT_CLEAN" \
+   && ! grep -q "Unmatched argument.*'l'" <<< "$SELECT_CLEAN"; then
+  ok "TUI Return selected the highlighted 'ls' candidate instead of submitting 'l'"
+else
+  bad "TUI Return submitted the incomplete candidate (rc=$PTY_RC); output:"; echo "$PTY_OUT"
+fi
+
 # macOS/JLine commonly reports the Return key as CR. Select an incomplete `:ctx` candidate with CR,
 # enter its choice prompt, move with Down, choose Quit with CR, and then leave the TUI. This catches
 # the event-loop branch that would otherwise submit `:ct` and the prompt path that could leak arrows.

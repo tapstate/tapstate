@@ -36,6 +36,18 @@ final class TamboDashboard {
         renderCommandBar(frame, vertical.get(2), state, suggestionRows);
     }
 
+    static int maxWorkspaceScroll(TuiDashboard.State state, int terminalHeight) {
+        if (state.prompt() != null || !state.palette().isEmpty()
+                || state.resultPane() == null || state.resultPane().lines().isEmpty()) {
+            return 0;
+        }
+        return Math.max(0, contentLines(state).size() - workspaceViewportHeight(terminalHeight));
+    }
+
+    private static int workspaceViewportHeight(int terminalHeight) {
+        return Math.max(1, terminalHeight - 9);
+    }
+
     private void renderStatus(Frame frame, Rect area, TuiDashboard.State state) {
         String context = state.context() == null ? "no context" : state.context();
         String principal = state.principal() == null || state.principal().isBlank() ? "" : " · " + state.principal();
