@@ -85,15 +85,65 @@ class LivePipelinesTest {
                 .containsEntry("pipelines", List.of("p1"));
     }
 
-    /** The same edit, refused for the state T12's own wording would have allowed. */
+    /**
+     * Paused is let through, and this is the case the change exists for.
+     *
+     * <p>The guard does not ask "is it stopped" -- that is {@link LivePipelines#isAtRest}, and paused is
+     * not. It asks whether an edit would take effect with nothing reporting the gap, and on a paused
+     * pipeline something does. Its only two exits both re-check: a resume is refused while the revision
+     * it paused against is no longer the latest, and a stop followed by a start assembles the run afresh
+     * from whatever is stored now. Neither can carry on against a definition it did not read.
+     *
+     * <p>Refusing here left an author who wanted to edit a paused pipeline and then carry on from its
+     * position with no route at all: the edit was refused, the resume was refused, and re-reading the
+     * whole source was the only way forward.
+     */
     @Test
-    void refusesTheChangeWhileTheOnlyReaderIsMerelyPaused() {
+    void allowsTheChangeWhileTheOnlyReaderIsMerelyPaused() {
         state.put("p1", PipelineState.PAUSED);
         desired.put("p1", PipelineState.PAUSED);
         List<Resource> stored = List.of(source("orders", true), pipeline("p1", "orders"));
 
+        live.refuseBufferingChangeWhileLive(source("orders", true), source("orders", false), stored);
+    }
+
+    /**
+     * A resume already asked for is refused, even though the pipeline is still sitting at paused.
+     *
+     * <p>The discriminating case for the rule above. Reading the actual state alone -- "it says paused,
+     * let it through" -- passes exactly this pipeline, which is on its way back up and will raise the
+     * held job onto whatever was changed underneath it. What makes paused safe is that its exits
+     * re-check, and this pipeline has already taken one.
+     */
+    @Test
+    void refusesTheChangeWhenAResumeHasAlreadyBeenAskedFor() {
+        state.put("p1", PipelineState.PAUSED);
+        desired.put("p1", PipelineState.RUNNING);
+        List<Resource> stored = List.of(source("orders", true), pipeline("p1", "orders"));
+
         assertThatThrownBy(() -> live.refuseBufferingChangeWhileLive(
                 source("orders", true), source("orders", false), stored))
+                .isInstanceOf(TapstateException.class);
+    }
+
+    /** The pipeline-side peer of the two above: paused is let through. */
+    @Test
+    void allowsAPipelineSideSwitchChangeWhileThePipelineIsMerelyPaused() {
+        state.put("p1", PipelineState.PAUSED);
+        desired.put("p1", PipelineState.PAUSED);
+
+        live.refuseBufferingChangeWhileLive(pipelineWithSwitch("p1", "orders", true),
+                pipelineWithSwitch("p1", "orders", false));
+    }
+
+    /** And the pipeline-side peer still refuses while the pipeline is actually running. */
+    @Test
+    void stillRefusesAPipelineSideSwitchChangeWhileThePipelineIsRunning() {
+        state.put("p1", PipelineState.RUNNING);
+        desired.put("p1", PipelineState.RUNNING);
+
+        assertThatThrownBy(() -> live.refuseBufferingChangeWhileLive(
+                pipelineWithSwitch("p1", "orders", true), pipelineWithSwitch("p1", "orders", false)))
                 .isInstanceOf(TapstateException.class);
     }
 
@@ -156,6 +206,11 @@ class LivePipelinesTest {
 
     private static PipelineResource pipeline(String id, String sourceId) {
         return new PipelineResource(id, null, List.of(SourceRef.bare(sourceId)), null, null, null, null, null);
+    }
+
+    private static PipelineResource pipelineWithSwitch(String id, String sourceId, boolean srs) {
+        return new PipelineResource(
+                id, null, List.of(SourceRef.spec(sourceId, srs)), null, null, null, null, null);
     }
 
 }

@@ -61,6 +61,32 @@ public final class LivePipelines {
         return RESTING.contains(actual) && !HEADED_UP.contains(intent);
     }
 
+    /**
+     * Whether changing how this pipeline is assembled would take effect with nothing reporting the gap.
+     *
+     * <p>Not the same question as {@link #isAtRest}, and the two disagree on exactly one state. At rest
+     * means "not executing"; this asks "could an edit land silently", and the answer turns on whether
+     * the pipeline has a way back up that re-reads the definition.
+     *
+     * <ul>
+     *   <li><strong>Running</strong> -- yes. It can go on indefinitely producing data from the assembly
+     *       it already holds, and no verb along the way compares that against what is stored.</li>
+     *   <li><strong>Paused</strong> -- no. Its only two exits both re-check: a resume is refused while
+     *       the revision it paused against is no longer the latest, and a stop followed by a start
+     *       assembles the run afresh. Neither can carry on against a definition it never read.</li>
+     *   <li><strong>At rest</strong> -- no. There is no run to disagree with.</li>
+     * </ul>
+     *
+     * <p>Paused is read off the <em>intent</em>, not the checkpoint. A pipeline sitting at paused whose
+     * resume has already been asked for is on its way back up, and reading the checkpoint alone would
+     * wave through the one pipeline that is about to raise a held job onto the change.
+     */
+    public boolean changeWouldGoUnreported(String pipelineId) {
+        PipelineState actual = actualStateOf(pipelineId);
+        PipelineState intent = intentOf(pipelineId);
+        return !isAtRest(actual, intent) && intent != PipelineState.PAUSED;
+    }
+
     /** What the pipeline is doing. A pipeline with no checkpoint has never run. */
     public PipelineState actualStateOf(String pipelineId) {
         return state.read(pipelineId)
@@ -90,7 +116,7 @@ public final class LivePipelines {
      */
     public void refuseBufferingChangeWhileLive(PipelineResource stored, PipelineResource replacement) {
         Objects.requireNonNull(replacement, "replacement");
-        if (stored == null || isAtRest(replacement.id())) {
+        if (stored == null || !changeWouldGoUnreported(replacement.id())) {
             return;
         }
         Map<String, Boolean> before = recordedSwitches(stored);
@@ -130,10 +156,18 @@ public final class LivePipelines {
      * artifact and the run that is executing disagree from that moment on, and nothing reports it. The
      * refusal is what turns that into something the author is told about while they can still act on it.
      *
-     * <p><strong>Paused counts as up, and that is the case this exists for.</strong> Pausing suspends
-     * the engine and nothing else: the capture keeps reading, the source connection stays held. It is
-     * the one state that looks stopped from the outside while the thing this guards is still running,
-     * so it is also the state an author is most likely to make this change from.
+     * <p><strong>Paused is let through, and it is the one state where that is not a hole.</strong>
+     * Pausing suspends the engine and nothing else -- the capture keeps reading, the source connection
+     * stays held -- so a paused pipeline is emphatically not at rest. What decides this guard is not
+     * that, though: it is whether the change could take effect unreported, and a paused pipeline has no
+     * way back up that fails to re-read the definition. A resume is refused while the revision it paused
+     * against is no longer the latest; a stop and a start assemble the run afresh.
+     *
+     * <p>This paragraph used to say the opposite, and gave "nothing reports it" as the reason. That
+     * reason is false here: something does report it, by name, at the moment it would matter. Refusing
+     * on top of that left an author wanting to edit a paused pipeline and carry on from its position
+     * with no route at all -- the edit refused, the resume refused, and re-reading the whole source the
+     * only way out.
      *
      * <p>Only pipelines are considered, and only ones that reference this source. A source nothing reads
      * has nothing to disturb, and a change from a source that did not previously exist is not a change.
@@ -152,7 +186,7 @@ public final class LivePipelines {
         List<String> live = ReferenceGraph.of(allStored).referencedBy(stored.id()).stream()
                 .map(ReferenceGraph.Edge::id)
                 .filter(pipelines::contains)
-                .filter(id -> !isAtRest(id))
+                .filter(this::changeWouldGoUnreported)
                 .sorted()
                 .toList();
         if (!live.isEmpty()) {
