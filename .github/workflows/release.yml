@@ -193,12 +193,6 @@ jobs:
       - name: ask for the documentation site to be published
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
-          # The assignment, and only the assignment, runs under this one: putting somebody on an
-          # issue in that repository takes more permission than opening the issue does, and the
-          # credential a release runs under has only the second. Measured across three releases --
-          # every request was opened and every one of them arrived unassigned. Unset, the script
-          # falls back to the ambient credential and says so when the assignment does not land.
-          DOCS_ASSIGN_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
         run: |
           bash .github/scripts/docs-release.sh open "${{ steps.next.outputs.version }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
@@ -806,7 +800,6 @@ jobs:
       - name: settle the documentation site
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
-          DOCS_ASSIGN_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
         run: |
           .github/scripts/docs-release.sh settle "${{ needs.version.outputs.version }}" \
             --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \

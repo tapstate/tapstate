@@ -102,10 +102,6 @@ tag="v$version"
 # Every outcome goes to stdout, and gh's own error is kept rather than discarded. The caller tees
 # stdout into the step summary; `>/dev/null 2>&1` is why three releases could say "could not" and
 # never why, and the reason is the only part that tells anybody what to change.
-#
-# The assignment runs under DOCS_ASSIGN_TOKEN when there is one: assigning somebody on that
-# repository takes more than opening an issue there does. Unset, it falls back to the ambient
-# credential and the outcome is reported either way.
 ask() {
     ask_title="$1"
     ask_body="$2"
@@ -118,8 +114,7 @@ ask() {
     # gh prints the URL on success; anything it says besides that is not the issue. Taking the last
     # line would hand a warning to the assignment and report the request as unassignable.
     ask_url="$(printf '%s\n' "$ask_out" | grep -oE 'https://[^[:space:]]+/issues/[0-9]+' | tail -1)"
-    if ask_err="$(GH_TOKEN="${DOCS_ASSIGN_TOKEN:-${GH_TOKEN:-}}" \
-                  gh issue edit "${ask_url##*/}" --repo "$repo" --add-assignee "$owner" 2>&1 >/dev/null)"; then
+    if ask_err="$(gh issue edit "${ask_url##*/}" --repo "$repo" --add-assignee "$owner" 2>&1 >/dev/null)"; then
         echo "$repo  $ask_done"
     else
         # The request exists and reaches nobody. It sits in a repository its owner does not watch,

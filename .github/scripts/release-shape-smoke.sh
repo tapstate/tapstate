@@ -180,14 +180,6 @@ fi
 has "the release pins its own commit"     version 'git/refs'
 has "and pins every satellite"            version 'satellites[.]sh branch'
 has "and asks the documentation site"     version 'docs-release[.]sh open'
-# The request is opened under the release credential and assigned under the documentation one,
-# because putting somebody on an issue in that repository takes more permission than opening the
-# issue does. Measured across three releases: every request was opened and every one of them arrived
-# unassigned -- a request that reaches nobody, in a repository its owner does not watch. Both call
-# sites are asserted, because losing the second credential is one deleted line and puts it straight
-# back to being invisible.
-has "and a credential that can assign it"  version    'DOCS_ASSIGN_TOKEN'
-has "the follow-up request is assignable too" satellites 'DOCS_ASSIGN_TOKEN'
 has "and refuses a branch that exists"    version 'already exists'
 
 # Gate 2 is the only one of the six with no step of its own: it is the smokes in `cli-native`, and it
