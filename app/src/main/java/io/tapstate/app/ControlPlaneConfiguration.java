@@ -32,7 +32,9 @@ import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
 import io.tapstate.control.core.PipelineLogQueryService;
+import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
@@ -443,6 +445,23 @@ class ControlPlaneConfiguration {
     PipelineObservationQueryService pipelineObservationQueryService(
             ArtifactQueryService artifactQueryService, StorePort storePort) {
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations());
+    }
+
+    /**
+     * Which chains a pipeline reads — the one part of the resume-point face that has to be resolved
+     * here, because a chain's identity comes from the connector config, the selected tables and the srs
+     * key, and this is where the sides that fill and read a chain both derive it.
+     */
+    @Bean
+    PipelineChains pipelineChains(StorePort storePort) {
+        return new StoreBackedPipelineChains(storePort);
+    }
+
+    @Bean
+    PipelinePositionService pipelinePositionService(PipelineChains pipelineChains, StorePort storePort,
+            LivePipelines livePipelines, AuditGate auditGate) {
+        return new PipelinePositionService(
+                pipelineChains, storePort.meta(), storePort.artifacts(), livePipelines, auditGate);
     }
 
     // ---- the node-local log tail: the sink, the appender that feeds it, and the read face over it ----

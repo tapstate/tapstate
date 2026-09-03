@@ -142,7 +142,9 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.status", "status"),
             Map.entry("pipeline.metrics", "metrics"),
             Map.entry("pipeline.snapshot", "snapshot"),
-            Map.entry("pipeline.logs", "logs"));
+            Map.entry("pipeline.logs", "logs"),
+            Map.entry("pipeline.position", "position"),
+            Map.entry("pipeline.set-position", "position"));
 
     /**
      * Verbs that chain several registered operations rather than projecting one ({@code run} is apply
@@ -246,6 +248,12 @@ public final class Cli implements Runnable {
                     "Show a pipeline's per-table snapshot progress.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
+            // "per chain" is the load-bearing half of this line. A pipeline's position is one value per
+            // mining chain, covering every table on it; the metrics face shows that value projected onto
+            // each table, and somebody reading only that would come here expecting to set two tables to
+            // two different places -- which is not a state the record can hold.
+            Map.entry("position", new VerbHelp("<pipeline-id> [-f <file>]",
+                    "Show where a pipeline resumes from, per chain; -f writes it back.")),
             // The summary is one line because picocli wraps a longer one, and a wrapped line is a line the
             // help guard cannot pin. The call grammar lives where it is needed instead: in the usage this
             // verb prints when it cannot read a call.

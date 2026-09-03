@@ -15,6 +15,9 @@ import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 
@@ -34,6 +37,7 @@ class MongoSrsMetaStoreIT {
 
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final String CHAIN = "orders@mysql-1";
+    private static final Instant WRITTEN_AT = Instant.parse("2026-09-03T10:12:44Z");
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
@@ -477,6 +481,83 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    @Test
+    void aWriteBackMovesTheOffsetBackWhereTheSameMoveThroughAnAdvanceWouldNot() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(3L, 900L), "gtid:aaa-3:900"));
+
+            // The control group, and the reason the write-back cannot share the reader's path: asked to
+            // go back through it, the store matches nothing and says nothing, because for a reader that
+            // is the ordinary case of a clamp to a consumer sitting behind.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 100L), "gtid:aaa-1:100"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-3:900");
+
+            store.rewindSourceReadOffset(CHAIN, "gtid:aaa-1:100");
+
+            // The token lands, and the order beside it goes: a written-back position names a spot in the
+            // source's own log, and no ring here ever gave that spot a coordinate.
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .isEqualTo(new ChainPosition(null, "gtid:aaa-1:100"));
+        });
+    }
+
+    @Test
+    void aWrittenBackOffsetAdmitsTheNextAdvanceWhateverGenerationItCarries() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(9L, 900L), "gtid:aaa-9:900"));
+
+            store.rewindSourceReadOffset(CHAIN, "gtid:aaa-1:100");
+
+            // The run that comes back opens a generation of its own and must not have to outrank the one
+            // the write-back displaced. Left in place, that order would pin the chain until generation 9
+            // came round again, with every advance in between silently dropped.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 105L), "gtid:aaa-1:105"));
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .isEqualTo(new ChainPosition(new SourceOrder(1L, 105L), "gtid:aaa-1:105"));
+        });
+    }
+
+    @Test
+    void writingBackAnOffsetOnAnUnseededChainIsAnOrderingError() {
+        withStore(store -> assertThatThrownBy(
+                () -> store.rewindSourceReadOffset("never_seeded", "gtid:aaa-1:1"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("never_seeded"));
+    }
+
+    @Test
+    void bothWritesToTheReadOffsetRecordWhenTheyHappened() {
+        withStoreAt(Clock.fixed(WRITTEN_AT, ZoneOffset.UTC), store -> {
+            store.create(CHAIN, null);
+            // A seeded chain has no offset, so there is no moment to report for one -- absence, not zero.
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadAt()).isNull();
+
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 5L), "gtid:aaa-1:5"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadAt()).isEqualTo(WRITTEN_AT);
+
+            store.rewindSourceReadOffset(CHAIN, "gtid:aaa-1:1");
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadAt()).isEqualTo(WRITTEN_AT);
+        });
+    }
+
+    @Test
+    void anOffsetStoredWithoutItsOrderReadsBackAsThePositionItIs() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            // The shape a record written before the order was stored carries, and the shape a write-back
+            // leaves behind. Read as "nothing has read this chain" it would send the tail to the snapshot
+            // seam and re-mine every change since, which is the loss the recorded token exists to stop.
+            collection.updateOne(new Document("_id", CHAIN),
+                    new Document("$set", new Document("sourceReadOffset", "gtid:aaa-1:77")));
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .isEqualTo(new ChainPosition(null, "gtid:aaa-1:77"));
+        });
+    }
+
     /** The single consumer cursor on the test chain — the shape the per-consumer advance tests read back. */
     private static ConsumerOffset onlyConsumer(MongoSrsMetaStore store) {
         List<ConsumerOffset> cursors = store.read(CHAIN).orElseThrow().consumerOffsets();
@@ -488,12 +569,30 @@ class MongoSrsMetaStoreIT {
         void run(MongoSrsMetaStore store) throws Exception;
     }
 
+    private interface CollectionTest {
+        void run(MongoSrsMetaStore store, MongoCollection<Document> collection) throws Exception;
+    }
+
     /** Runs a test body against a fresh meta store over a clean srs_meta collection on the replica-set. */
     private static void withStore(StoreTest test) {
+        withStoreAt(Clock.systemUTC(), test);
+    }
+
+    /** The same, with the clock the store stamps its writes from decided by the caller. */
+    private static void withStoreAt(Clock clock, StoreTest test) {
+        withCollection(clock, (store, collection) -> test.run(store));
+    }
+
+    /** The same again, handing over the collection too, for a case that has to write a raw document. */
+    private static void withCollection(CollectionTest test) {
+        withCollection(Clock.systemUTC(), test);
+    }
+
+    private static void withCollection(Clock clock, CollectionTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("srs_meta");
             collection.drop();
-            test.run(new MongoSrsMetaStore(collection));
+            test.run(new MongoSrsMetaStore(collection, clock), collection);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

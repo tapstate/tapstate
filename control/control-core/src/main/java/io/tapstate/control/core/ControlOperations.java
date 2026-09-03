@@ -193,6 +193,21 @@ public final class ControlOperations {
             "pipeline.logs", Scope.READ, false,
             "Read the bounded, secret-redacted log tail for a Pipeline.");
 
+    // Where a pipeline resumes from, read and written back. The read mutates nothing; the write moves
+    // durable state that outlives every run on the chain -- shared with any other pipeline reading it --
+    // so it is write-scoped and audited like the lifecycle verbs.
+    //
+    // Both stay off the model-facing surface, unlike the lifecycle writes beside them. Choosing where to
+    // resume from turns on whether a position is still inside the source's retention window, which
+    // nothing on this side can check and the store cannot answer. With the write not there, the read's
+    // own reason to be there mostly goes with it: the two things it adds over the metrics face -- who
+    // else reads the chain, and when the position was recorded -- are what you look at before editing.
+    // Where a pipeline stands is on that face already.
+    public static final Operation PIPELINE_POSITION = new Operation(
+            "pipeline.position", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_SET_POSITION = new Operation(
+            "pipeline.set-position", Scope.WRITE, true, null, CLI_ONLY);
+
     // security domain: all admin-scoped. The mutating ones are audited; the list queries are not.
     public static final Operation USER_CREATE = new Operation("user.create", Scope.ADMIN, true, null, CLI_ONLY);
     public static final Operation USER_PASSWD = new Operation("user.passwd", Scope.ADMIN, true, null, CLI_ONLY);
@@ -232,6 +247,8 @@ public final class ControlOperations {
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
+            PIPELINE_POSITION,
+            PIPELINE_SET_POSITION,
             USER_CREATE,
             USER_PASSWD,
             USER_LIST,

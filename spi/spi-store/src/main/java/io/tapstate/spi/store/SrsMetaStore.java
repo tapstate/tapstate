@@ -70,6 +70,27 @@ public interface SrsMetaStore {
     void advanceSourceReadOffset(String miningChainId, ChainPosition position);
 
     /**
+     * Puts the chain's source read offset at exactly {@code token}, forward or back, and drops the order
+     * recorded beside it.
+     *
+     * <p>The write-back path, and the only one that may move the offset backwards.
+     * {@link #advanceSourceReadOffset} carries its ordering condition inside its own filter, so handed an
+     * earlier position it matches nothing — silently, because for a reader that is the ordinary case of a
+     * clamp to a consumer that is behind. A rewind routed through it would report success and change
+     * nothing.
+     *
+     * <p>The order goes because there is no truthful value to put there. An order is where the engine
+     * observed that token in the ring; a written-back position names a spot in the source's own log,
+     * which was never observed here and may predate every ring this chain has had. Writing one anyway
+     * would put a made-up coordinate into the comparison that decides which changes are safe to forget.
+     * With none recorded the next advance is admitted whatever generation it carries, which is the state
+     * a fresh run comes back in regardless.
+     *
+     * <p>A mutate on an unseeded chain is a caller ordering error, as with every other mutator here.
+     */
+    void rewindSourceReadOffset(String miningChainId, String token);
+
+    /**
      * Inserts or replaces one consumer pipeline's cursor on the chain, keyed by its pipeline id. A
      * mutate on an unseeded chain is a caller ordering error.
      */

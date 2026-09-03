@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.event.ChainPosition;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -19,8 +20,14 @@ import java.util.List;
  * {@code schemaHistory} (the append-only versioned schema), {@code retention} (the retention
  * configuration passed through from the source; a config value only — the change ring is bounded by
  * its capacity and backpressure, not trimmed by this), {@code epoch} (the change ring's current
- * generation, zero until one is opened) and {@code snapshotEpoch} (the generation the recorded snapshot
- * began in, zero until a snapshot records its seam).
+ * generation, zero until one is opened), {@code snapshotEpoch} (the generation the recorded snapshot
+ * began in, zero until a snapshot records its seam) and {@code sourceReadAt} (when {@code sourceRead} was
+ * last written, absent on a record whose offset predates the stamp).
+ *
+ * <p>{@code sourceReadAt} is here for the reader, not for the run: nothing branches on it. What it answers
+ * is how old the recorded position is, which is the one thing that decides whether resuming from it is
+ * still possible at all -- a source retains its change log for a window, and a position older than that
+ * window is one no read can start from. An opaque token cannot be looked at and dated; this can.
  *
  * <p><strong>What is here is the chain's, and only the chain's.</strong> The line is which of the two
  * things a quantity answers for: the chain is one read of one source's change log, shared by everyone on
@@ -58,7 +65,8 @@ public record SrsMeta(
         List<SchemaVersion> schemaHistory,
         String retention,
         long epoch,
-        long snapshotEpoch) {
+        long snapshotEpoch,
+        Instant sourceReadAt) {
 
     public SrsMeta {
         if (miningChainId == null || miningChainId.isBlank()) {
@@ -108,5 +116,17 @@ public record SrsMeta(
             String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention) {
         this(miningChainId, sourceRead, consumerOffsets, cdcStartPosition, schemaHistory, retention,
                 0L, 0L);
+    }
+
+    /**
+     * The same record with no time recorded against its offset — the shape callers used before the stamp
+     * was added, and the one a record written by an earlier version reads back as. Backward compatible:
+     * {@code sourceReadAt} reads null, which is absence rather than a moment at the epoch.
+     */
+    public SrsMeta(String miningChainId, ChainPosition sourceRead, List<ConsumerOffset> consumerOffsets,
+            String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention,
+            long epoch, long snapshotEpoch) {
+        this(miningChainId, sourceRead, consumerOffsets, cdcStartPosition, schemaHistory, retention,
+                epoch, snapshotEpoch, null);
     }
 }

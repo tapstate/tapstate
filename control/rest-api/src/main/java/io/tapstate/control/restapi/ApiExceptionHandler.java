@@ -130,6 +130,15 @@ class ApiExceptionHandler {
             case "data-browser.invalid-limit", "data-browser.connector-not-browsable",
                  "data-browser.unorderable-field" ->
                     HttpStatus.BAD_REQUEST;
+            // A write-back refused because something on the chain is still up is a conflict with the state
+            // those pipelines are in, not with the request: the same document lands once they are down.
+            case "position.write-back-while-live" -> HttpStatus.CONFLICT;
+            // The other three are judgements on the document as written -- a chain this pipeline does not
+            // read, a reading sent back changed, and a request that asks for no move at all. Each is the
+            // caller's to fix by sending a different document, and left to the default each would come
+            // back as a 500 blaming the server for it.
+            case "position.chain-not-read", "position.field-not-editable", "position.nothing-to-write" ->
+                    HttpStatus.BAD_REQUEST;
             default -> switch (domainOf(code.code())) {
                 case "dsl" -> HttpStatus.BAD_REQUEST;
                 default -> HttpStatus.INTERNAL_SERVER_ERROR;

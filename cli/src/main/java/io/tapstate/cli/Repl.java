@@ -110,10 +110,11 @@ final class Repl {
     private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
     private static final String STOP_USAGE = "stop <pipeline-id> [--keep-state] [-y]";
     private static final String RESTART_USAGE = "restart <pipeline-id> [--rerun] [-y]";
+    private static final String POSITION_USAGE = "position <pipeline-id> [-f <file>]";
 
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
-            "snapshot", "logs", "test", "test-result", "discover-schema", "schema", "register",
+            "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
             "connectors", "token");
 
     private final CommandLine commandLine;
@@ -499,6 +500,13 @@ final class Repl {
         if (words.get(0).equals("stop")) {
             return stopOnline(words);
         }
+        // The write-back names the file it sends, so it parses its own line too. Its option carries a
+        // value rather than standing alone, which is the one shape the positional guard below cannot
+        // read: it would refuse the option, and left to the guard's fall-through the filename after it
+        // would be taken for the pipeline id.
+        if (words.get(0).equals("position")) {
+            return positionOnline(words);
+        }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
         for (int i = 1; i < words.size(); i++) {
@@ -517,6 +525,7 @@ final class Repl {
             case "metrics" -> metricsOnline(words);
             case "snapshot" -> snapshotOnline(words);
             case "logs" -> logsOnline(words);
+            case "position" -> positionOnline(words);
             default -> throw new IllegalStateException("not an online verb: " + words.get(0));
         };
     }
@@ -2808,6 +2817,85 @@ final class Repl {
             }
             case MetricsOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case MetricsOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /**
+     * {@code position <pipeline-id> [-f <file>]} — prints where the pipeline resumes from, one entry per
+     * mining chain, as the document the server holds; with {@code -f} it sends that document back, edited,
+     * and reports where each chain then stands.
+     *
+     * <p>The read prints json and nothing else, because what it prints is meant to be saved, edited and
+     * handed back — {@code position p > p.json}, change {@code resumeFrom.token}, {@code position p -f
+     * p.json}. A table would be a second rendering of the same thing that nothing could send back, and
+     * the values that must survive the trip unchanged are the ones a table would leave out.
+     *
+     * <p>The file is sent as its own bytes, unparsed. What the server compares against is what the server
+     * printed, so anything a reader and writer here changed on the way through would be a difference the
+     * author never made — and the server refuses each of those by name.
+     */
+    private int positionOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        String file = null;
+        List<String> operands = new ArrayList<>();
+        for (int i = 0; i < words.size(); i++) {
+            String word = words.get(i);
+            if (i > 0 && word.equals("-f")) {
+                if (i + 1 >= words.size()) {
+                    err.println("position: -f needs a file (usage: " + POSITION_USAGE + ")");
+                    err.flush();
+                    return Cli.EXIT_USAGE;
+                }
+                file = words.get(++i);
+            } else if (i > 0 && word.startsWith("-")) {
+                err.println("position: unknown option " + word + " (usage: " + POSITION_USAGE + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            } else {
+                operands.add(word);
+            }
+        }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("position: missing operand (usage: " + POSITION_USAGE + ")");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = operands.get(1);
+        String document = null;
+        if (file != null) {
+            try {
+                document = Files.readString(Path.of(file));
+            } catch (IOException | RuntimeException unreadable) {
+                err.println("position: cannot read " + file + " (" + unreadable.getMessage() + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        String body = document;
+        PositionOutcome outcome = withFailover(() -> body == null
+                        ? controlPlane.position(session.landingNode(), session.credential(), id)
+                        : controlPlane.setPosition(session.landingNode(), session.credential(), id, body),
+                o -> o instanceof PositionOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case PositionOutcome.Found found -> {
+                if (body == null) {
+                    out.println(found.document());
+                } else {
+                    out.println("position written back for " + id);
+                    // Where every chain now stands, and -- the part worth printing after the fact --
+                    // whose else those chains are. A write-back moves a chain for every pipeline on it,
+                    // and this is the last moment anybody is told which ones those were.
+                    found.chains().forEach(chain -> out.println("  " + chain.chainId() + "  ->  "
+                            + (chain.token() == null ? "(nothing recorded)" : chain.token())
+                            + (chain.sharedWith().isEmpty()
+                                    ? "" : "   also read by: " + String.join(", ", chain.sharedWith()))));
+                }
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case PositionOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case PositionOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
 

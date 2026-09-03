@@ -148,6 +148,10 @@ nest.state-far-exceeds-memory-budget
 nest.state-paths-changed
 nest.state-served-from-cold-layer
 nest.tombstone-limit-exceeded
+position.chain-not-read
+position.field-not-editable
+position.nothing-to-write
+position.write-back-while-live
 role.unsupported
 source.already-exists
 source.id-mismatch

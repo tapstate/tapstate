@@ -174,6 +174,26 @@ interface ControlPlaneClient extends AutoCloseable {
     MetricsOutcome metrics(URI baseUrl, String credential, String pipelineId);
 
     /**
+     * Reads where a pipeline resumes from via {@code GET {baseUrl}/api/pipelines/{pipelineId}/position},
+     * authenticated by the bearer {@code credential}: the document on success, a coded rejection when the
+     * server refuses, or unreachable on any I/O failure. Never throws.
+     */
+    PositionOutcome position(URI baseUrl, String credential, String pipelineId);
+
+    /**
+     * Moves where a pipeline's chains resume from via
+     * {@code PUT {baseUrl}/api/pipelines/{pipelineId}/position}, sending {@code document} as the body:
+     * the reading afterwards on success, a coded rejection when the server refuses, or unreachable on any
+     * I/O failure. Never throws.
+     *
+     * <p>{@code document} travels as the caller's own bytes and is not parsed on the way out. What the
+     * server compares the request against is what the server itself handed out, so a round trip through a
+     * reader and a writer here could only introduce differences the author never made — and each of those
+     * is something the server would then refuse by name.
+     */
+    PositionOutcome setPosition(URI baseUrl, String credential, String pipelineId, String document);
+
+    /**
      * Reads a pipeline's per-table initial-load progress via
      * {@code GET {baseUrl}/api/pipelines/{pipelineId}/snapshot}, authenticated by the bearer
      * {@code credential}: the per-table progress on success (empty outside a snapshot phase), a coded

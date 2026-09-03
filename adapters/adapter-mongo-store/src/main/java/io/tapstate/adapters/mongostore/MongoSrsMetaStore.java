@@ -18,6 +18,8 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.bson.Document;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -47,9 +49,16 @@ import java.util.Optional;
 public final class MongoSrsMetaStore implements SrsMetaStore {
 
     private final MongoCollection<Document> collection;
+    private final Clock clock;
 
     public MongoSrsMetaStore(MongoCollection<Document> collection) {
+        this(collection, Clock.systemUTC());
+    }
+
+    /** The same store reading a given clock, for a caller that needs the recorded time to be decidable. */
+    public MongoSrsMetaStore(MongoCollection<Document> collection, Clock clock) {
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     @Override
@@ -116,7 +125,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // exists to stop. It matches nothing when the recorded position already ranks at or after this one.
         long matched = StoreIo.call(() -> collection.updateOne(
                 sourceReadAdvanceFilter(miningChainId, position.order()),
-                new Document("$set", sourceReadFields(position))).getMatchedCount());
+                new Document("$set", sourceReadFields(position, Instant.now(clock)))).getMatchedCount());
         if (matched > 0) {
             return;
         }
@@ -124,6 +133,27 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // mutators raise too -- or "this position does not move the chain forward", which is ordinary and
         // silent. Only a second look tells them apart, and it runs on the path that changed nothing.
         requireSeeded(miningChainId);
+    }
+
+    @Override
+    public void rewindSourceReadOffset(String miningChainId, String token) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(token, "token");
+        // One unconditional update, and the unset is half of what it does. The order recorded beside the
+        // token says where the engine observed that token in the ring, and this token was not observed
+        // here at all -- leaving the old one in place would have the record claim the new position sits
+        // exactly where the old one did, in the comparison that decides what is safe to forget.
+        long matched = StoreIo.call(() -> collection.updateOne(
+                        new Document("_id", miningChainId),
+                        new Document("$set", new Document("sourceReadOffset", token)
+                                .append("sourceReadAt", Instant.now(clock).toEpochMilli()))
+                                .append("$unset", new Document("sourceReadEpoch", "")
+                                        .append("sourceReadSeq", "")))
+                .getMatchedCount());
+        if (matched == 0) {
+            // The filter names the chain and nothing else, so nothing matching can only mean no record.
+            requireSeeded(miningChainId);
+        }
     }
 
     /**
@@ -141,15 +171,22 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /**
-     * The fields one advance writes: the order it reached and, when the position carries one, the token.
-     * They move together — a token stored without its order can no longer be ranked, and an order without
-     * its token is nothing a read can resume from.
+     * The fields a write to the read offset lays down: the order it reached, the token, and when it was
+     * written. An advance carries both halves of the position — a token stored without its order can no
+     * longer be ranked, and an order without its token is nothing a read can resume from — so each part
+     * is written only when it is there, and after a rewind the order is the part that is not.
      */
-    private static Document sourceReadFields(ChainPosition position) {
-        Document fields = new Document("sourceReadEpoch", position.order().epoch())
-                .append("sourceReadSeq", position.order().seq());
+    private static Document sourceReadFields(ChainPosition position, Instant at) {
+        Document fields = new Document();
+        if (position.order() != null) {
+            fields.append("sourceReadEpoch", position.order().epoch())
+                    .append("sourceReadSeq", position.order().seq());
+        }
         if (position.token() != null) {
             fields.append("sourceReadOffset", position.token());
+        }
+        if (at != null) {
+            fields.append("sourceReadAt", at.toEpochMilli());
         }
         return fields;
     }
@@ -373,7 +410,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .append("consumerOffsets", consumers)
                 .append("schemaHistory", schemaHistory);
         if (meta.sourceRead() != null) {
-            document.putAll(sourceReadFields(meta.sourceRead()));
+            document.putAll(sourceReadFields(meta.sourceRead(), meta.sourceReadAt()));
         }
         if (meta.cdcStartPosition() != null) {
             document.append("cdcStartPosition", meta.cdcStartPosition());
@@ -430,7 +467,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         }
         return new SrsMeta(id, sourceReadFrom(document), consumers,
                 document.getString("cdcStartPosition"), schemaHistory, document.getString("retention"),
-                readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"));
+                readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"),
+                sourceReadAtFrom(document));
     }
 
     /** Reconstructs one consumer cursor from its stored sub-document, keyed by the pipeline id. */
@@ -494,19 +532,30 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * changes already read - the direction that keeps them re-minable at all.
      */
     /**
-     * How far the chain has read, or null when nothing has read it. A document written before this record
-     * carried an order has a token and no order: it reads back as nothing read, which costs re-mining
-     * changes already read rather than skipping changes that were not — the direction that loses nothing.
+     * How far the chain has read, or null when nothing has read it — the token, with the order beside it
+     * when one was recorded.
+     *
+     * <p>A token with no order is a real state and reads back as the position it is, not as absence.
+     * Two things produce it: a write-back, which names a spot in the source's log that no ring ever
+     * assigned a coordinate to, and a document written before the order was recorded at all. Reading
+     * either as nothing read would drop the one thing both of them do say — where to resume — and send
+     * the tail to the snapshot seam instead, re-mining every change since.
      */
     private static ChainPosition sourceReadFrom(Document document) {
+        String token = document.getString("sourceReadOffset");
         Object epoch = document.get("sourceReadEpoch");
         Object seq = document.get("sourceReadSeq");
         if (!(epoch instanceof Number) || !(seq instanceof Number)) {
-            return null;
+            return token == null ? null : new ChainPosition(null, token);
         }
         return new ChainPosition(
-                new SourceOrder(((Number) epoch).longValue(), ((Number) seq).longValue()),
-                document.getString("sourceReadOffset"));
+                new SourceOrder(((Number) epoch).longValue(), ((Number) seq).longValue()), token);
+    }
+
+    /** When the read offset was last written, or null on a record whose offset predates the stamp. */
+    private static Instant sourceReadAtFrom(Document document) {
+        Object at = document.get("sourceReadAt");
+        return at instanceof Number millis ? Instant.ofEpochMilli(millis.longValue()) : null;
     }
 
     private static ChainPosition sinkAckedFrom(Document document) {

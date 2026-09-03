@@ -375,6 +375,18 @@ engine.frontier-order-not-encodable:
 engine.frontier-pinned:
   message: "Chain {chain} has not advanced its durable position for {minutes} minutes ({cause}; the bound combined for it has run {gap} ahead)."
   solution: "The source keeps its log from that position onwards, so act before the log's retention passes it: if the chain is waiting on changes still pending upstream, find what is holding them; if it is starved of positions, the sink has nothing to advance to and the source must supply them."
+position.write-back-while-live:
+  message: "Chain {chain} is still being read by: {pipelines}."
+  solution: "Stop or pause every pipeline listed, then write the position back; moving it under a running read changes nothing now and everything at the next start."
+position.chain-not-read:
+  message: "Pipeline {pipeline} does not read chain {chain}; it reads: {known}."
+  solution: "Copy the chainId from what `position` printed for this pipeline, unedited."
+position.field-not-editable:
+  message: "Field {field} on chain {chain} is a reading, not a setting."
+  solution: "Change only resumeFrom.token and send the rest back as it was printed."
+position.nothing-to-write:
+  message: "Nothing to write back for pipeline {pipeline}."
+  solution: "Set resumeFrom.token on the chain you mean to move; a document sent back unchanged asks for no move."
 monitor.no-observation:
   message: "No observation is available for pipeline {pipeline}."
   solution: "Check the pipeline id for typos; a freshly started pipeline may take a moment to publish its first observation."

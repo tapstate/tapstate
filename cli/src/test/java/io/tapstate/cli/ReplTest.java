@@ -119,6 +119,7 @@ class ReplTest {
         final Map<String, LifecycleOutcome> lifecycleOutcomeByVerb = new HashMap<>();
         StatusOutcome statusOutcome = new StatusOutcome.Unreachable();
         MetricsOutcome metricsOutcome = new MetricsOutcome.Unreachable();
+        PositionOutcome positionOutcome = new PositionOutcome.Unreachable();
         SnapshotOutcome snapshotOutcome = new SnapshotOutcome.Unreachable();
         LogsOutcome logsOutcome = new LogsOutcome.Unreachable();
         /** The states a watch stream feeds, and the line batches a follow stream feeds, in order. */
@@ -142,6 +143,8 @@ class ReplTest {
         final List<String> lifecycleCalls = new ArrayList<>();
         final List<String> statusCalls = new ArrayList<>();
         final List<String> metricsCalls = new ArrayList<>();
+        final List<String> positionCalls = new ArrayList<>();
+        final List<String> positionBodies = new ArrayList<>();
         final List<String> snapshotCalls = new ArrayList<>();
         final List<String> logsCalls = new ArrayList<>();
         final List<String> watchCalls = new ArrayList<>();
@@ -321,6 +324,20 @@ class ReplTest {
         public MetricsOutcome metrics(URI baseUrl, String credential, String pipelineId) {
             metricsCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
             return healthy.contains(baseUrl) ? metricsOutcome : new MetricsOutcome.Unreachable();
+        }
+
+        @Override
+        public PositionOutcome position(URI baseUrl, String credential, String pipelineId) {
+            positionCalls.add("read " + credential + "@" + baseUrl + "/" + pipelineId);
+            return healthy.contains(baseUrl) ? positionOutcome : new PositionOutcome.Unreachable();
+        }
+
+        @Override
+        public PositionOutcome setPosition(
+                URI baseUrl, String credential, String pipelineId, String document) {
+            positionCalls.add("write " + credential + "@" + baseUrl + "/" + pipelineId);
+            positionBodies.add(document);
+            return healthy.contains(baseUrl) ? positionOutcome : new PositionOutcome.Unreachable();
         }
 
         @Override
@@ -3646,6 +3663,77 @@ class ReplTest {
         assertThat(h.repl().dispatch("status pl1")).isTrue();
 
         assertThat(h.sink().toString().substring(mark)).doesNotContain("engine.");
+    }
+
+    /**
+     * The read prints the server's document as it arrived, unchanged. It is the thing that gets saved,
+     * edited and sent back, and the write-back is refused for every difference from what the server
+     * holds — so a rendering of our own here would be refused edits nobody made.
+     */
+    @Test
+    void positionPrintsTheServersDocumentByteForByte() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        String document = "{\"pipelineId\":\"pl1\",\"chains\":[{\"chainId\":\"shop@mysql-1\","
+                + "\"resumeFrom\":{\"token\":\"mysql-bin.000004:154\"}}]}";
+        client.positionOutcome = new PositionOutcome.Found(document,
+                List.of(new PositionOutcome.Chain("shop@mysql-1", "mysql-bin.000004:154", List.of())));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains(document);
+        assertThat(client.positionCalls).containsExactly("read jwt-tok@http://node1:7900/pl1");
+    }
+
+    @Test
+    void positionWithAFileSendsItsBytesUnchangedAndReportsWhereEachChainStands() throws Exception {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.positionOutcome = new PositionOutcome.Found("{}",
+                List.of(new PositionOutcome.Chain(
+                        "shop@mysql-1", "mysql-bin.000001:4", List.of("orders_audit"))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        Path edited = Files.createTempFile("position", ".json");
+        String document = "{\"chains\":[{\"chainId\":\"shop@mysql-1\","
+                + "\"resumeFrom\":{\"token\":\"mysql-bin.000001:4\"}}]}";
+        Files.writeString(edited, document);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1 -f " + edited)).isTrue();
+
+        assertThat(client.positionBodies).containsExactly(document);
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("position written back for pl1").contains("mysql-bin.000001:4");
+        // The other pipeline on the chain moved too, and this is the last moment anybody is told.
+        assertThat(out).contains("also read by: orders_audit");
+    }
+
+    @Test
+    void positionRefusesAFileItCannotRead() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1 -f no/such/file.json")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("cannot read");
+        // Nothing was sent: a write-back the caller could not have meant is not attempted.
+        assertThat(client.positionCalls).isEmpty();
+    }
+
+    @Test
+    void positionRendersACodedRefusalRatherThanReportingSuccess() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.positionOutcome = new PositionOutcome.Rejected(
+                "position.write-back-while-live", "Chain shop@mysql-1 is still being read by: orders_sync.");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark))
+                .contains("position.write-back-while-live")
+                .contains("still being read by");
     }
 
     @Test

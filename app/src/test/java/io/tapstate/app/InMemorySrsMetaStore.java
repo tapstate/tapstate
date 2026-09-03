@@ -5,6 +5,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -33,6 +34,15 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             throw new IllegalStateException("mining chain already seeded: " + miningChainId);
         }
         records.put(miningChainId, new SrsMeta(miningChainId, null, List.of(), null, List.of(), retention));
+    }
+
+    @Override
+    public synchronized void rewindSourceReadOffset(String miningChainId, String token) {
+        SrsMeta m = require(miningChainId);
+        records.put(miningChainId, new SrsMeta(
+                m.miningChainId(), new ChainPosition(null, token), m.consumerOffsets(),
+                m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch(),
+                Instant.now()));
     }
 
     @Override

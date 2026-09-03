@@ -352,6 +352,12 @@ class CaptureRunUnitJetSmokeTest {
         }
 
         @Override
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            // No case on this double writes a position back; a call here is wiring, not a case.
+            throw new UnsupportedOperationException("rewindSourceReadOffset");
+        }
+
+        @Override
         public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(

@@ -164,6 +164,12 @@ class SourceReadOffsetOnlyMovesForwardTest {
         }
 
         @Override
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            // No test on this double writes a position back; a call here is a wiring mistake, not a case.
+            throw new UnsupportedOperationException("rewindSourceReadOffset");
+        }
+
+        @Override
         public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             advances.add(position.token());
             if (recorded != null && position.order().compareTo(recorded.order()) <= 0) {
