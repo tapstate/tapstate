@@ -17,7 +17,9 @@ import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlOrderBy;
+import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlSelect;
+import org.apache.calcite.sql.fun.SqlCase;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.apache.calcite.sql.parser.SqlParser;
@@ -147,7 +149,50 @@ public final class SqlFrontEnd {
             return at("WINDOW", windows);
         }
         Unsupported inFrom = fromItem(select.getFrom());
-        return inFrom != null ? inFrom : firstNonRowCall(select);
+        if (inFrom != null) {
+            return inFrom;
+        }
+        Unsupported nonRow = firstNonRowCall(select);
+        return nonRow != null ? nonRow : firstUnevaluableOperator(select);
+    }
+
+    /**
+     * The first operator in the select list that no carrier can work out.
+     *
+     * <p>The set it checks against is the same set the evaluation is written from, so the shapes
+     * admitted here and the shapes a carrier can compute cannot drift apart. Admitting one that is not
+     * evaluated would be a job that dies on whichever row first reaches that column, long after the SQL
+     * was accepted; evaluating one that is not admitted would be a capability nobody can reach.
+     *
+     * <p>Runs after the aggregate and window check so that {@code SUM} is reported as {@code SUM}
+     * rather than as an operator nothing evaluates - the two send a reader to different places.
+     */
+    private static Unsupported firstUnevaluableOperator(SqlSelect select) {
+        Unsupported[] found = new Unsupported[1];
+        for (SqlNode item : select.getSelectList()) {
+            selected(item).accept(new SqlBasicVisitor<Void>() {
+                @Override
+                public Void visit(SqlCall call) {
+                    if (found[0] == null) {
+                        String name = call.getOperator().getName().toUpperCase(Locale.ROOT);
+                        if (!Expressions.SUPPORTED.contains(name)) {
+                            found[0] = at(name.isEmpty() ? call.getKind().toString() : name, call);
+                        }
+                    }
+                    return super.visit(call);
+                }
+            });
+            if (found[0] != null) {
+                return found[0];
+            }
+        }
+        return null;
+    }
+
+    /** A select item with its alias stripped: what the column is computed from, not what it is called. */
+    private static SqlNode selected(SqlNode item) {
+        return item instanceof SqlBasicCall call && call.getOperator().getKind() == SqlKind.AS
+                ? call.operand(0) : item;
     }
 
     /** Each FROM item must be a table, an aliased table, or a join of those. */
@@ -285,20 +330,144 @@ public final class SqlFrontEnd {
             SqlNode parsed = planner.parse(sql);
             var validated = planner.validateAndGetType(parsed);
             RelDataType row = validated.right;
+            SqlSelect select = selectOf(validated.left);
+            JoinTree from = tree(select.getFrom());
+            List<Expr> computed = projected(select, from, tables);
+            if (computed.size() != row.getFieldCount()) {
+                throw new SqlFrontEndException("the select list works out to " + computed.size()
+                        + " columns but the statement's type has " + row.getFieldCount(), null);
+            }
             List<OutputField> fields = new ArrayList<>(row.getFieldCount());
+            int at = 0;
             for (RelDataTypeField f : row.getFieldList()) {
                 fields.add(new OutputField(f.getName(),
                         toTapstate(f.getType().getSqlTypeName()),
-                        f.getType().isNullable()));
+                        f.getType().isNullable(),
+                        computed.get(at++)));
             }
-            SqlSelect select = selectOf(validated.left);
-            JoinTree from = tree(select.getFrom());
             return new JoinPlan(List.copyOf(fields), from, readColumns(select, from));
         } catch (SqlFrontEndException e) {
             throw e;
         } catch (Exception e) {
             throw new SqlFrontEndException(e.getMessage(), e);
         }
+    }
+
+    /**
+     * How each column of the output row is computed, in the order the row publishes them.
+     *
+     * <p>Without this a plan says what the row is called and what each column's type is, and nothing
+     * at all about where the values come from - so a carrier can only guess, and the shape being right
+     * is what makes the guess invisible. A star is expanded here rather than left as a star: the
+     * expansion is "every column of every source, in the order the from clause names them", which is
+     * what SQL means by it, and doing it here is what lets a carrier hold one rule instead of two.
+     */
+    private static List<Expr> projected(SqlSelect select, JoinTree from, List<SourceTable> tables) {
+        Map<String, String> spellings = spellings(from);
+        List<Expr> computed = new ArrayList<>();
+        for (SqlNode item : select.getSelectList()) {
+            SqlNode value = selected(item);
+            if (value instanceof SqlIdentifier identifier && identifier.isStar()) {
+                expandStar(identifier, from, tables, spellings, computed);
+                continue;
+            }
+            computed.add(expression(value, from, tables, spellings));
+        }
+        return computed;
+    }
+
+    /** Every column a star stands for: one source's when it is qualified, all of them when it is not. */
+    private static void expandStar(SqlIdentifier star, JoinTree from, List<SourceTable> tables,
+            Map<String, String> spellings, List<Expr> into) {
+        List<String> names = star.names;
+        String only = names.size() > 1 ? spellings.get(names.get(names.size() - 2)) : null;
+        for (JoinTree.Source source : from.sources()) {
+            if (only != null && !only.equals(source.name())) {
+                continue;
+            }
+            for (SourceColumn column : columnsOf(source.table(), tables)) {
+                into.add(new Expr.Column(new JoinTree.ColumnRef(source.name(), column.name())));
+            }
+        }
+    }
+
+    /**
+     * One select item as an expression over the sources. A simple {@code CASE} - the one written with
+     * a value before the first {@code WHEN} - is turned into the searched form here, so that a carrier
+     * has one shape of CASE to evaluate rather than two.
+     */
+    private static Expr expression(SqlNode node, JoinTree from, List<SourceTable> tables,
+            Map<String, String> spellings) {
+        if (node instanceof SqlIdentifier identifier) {
+            JoinTree.ColumnRef ref = columnIn(identifier, spellings);
+            return new Expr.Column(ref != null ? ref
+                    : unqualified(lastName(identifier), from, tables));
+        }
+        if (node instanceof SqlLiteral literal) {
+            return new Expr.Literal(literalValue(literal));
+        }
+        if (node instanceof SqlCase branches) {
+            List<Expr> arguments = new ArrayList<>();
+            SqlNode subject = branches.getValueOperand();
+            for (SqlNode when : branches.getWhenOperands()) {
+                Expr test = expression(when, from, tables, spellings);
+                arguments.add(subject == null ? test : new Expr.Call("=",
+                        List.of(expression(subject, from, tables, spellings), test)));
+            }
+            for (SqlNode then : branches.getThenOperands()) {
+                arguments.add(expression(then, from, tables, spellings));
+            }
+            SqlNode otherwise = branches.getElseOperand();
+            arguments.add(otherwise == null ? new Expr.Literal(null)
+                    : expression(otherwise, from, tables, spellings));
+            return new Expr.Call("CASE", arguments);
+        }
+        if (node instanceof SqlCall call) {
+            List<Expr> arguments = new ArrayList<>();
+            for (SqlNode operand : call.getOperandList()) {
+                arguments.add(operand == null ? new Expr.Literal(null)
+                        : expression(operand, from, tables, spellings));
+            }
+            return new Expr.Call(call.getOperator().getName().toUpperCase(Locale.ROOT), arguments);
+        }
+        throw new SqlFrontEndException(
+                "a select item holds a form this front end does not read: " + node.getKind(), null);
+    }
+
+    /**
+     * Which source an unqualified column belongs to. Validation has already run, so a name that no
+     * source holds, or that more than one does, was refused before this - the first source holding it
+     * is therefore the only one.
+     */
+    private static JoinTree.ColumnRef unqualified(String column, JoinTree from,
+            List<SourceTable> tables) {
+        for (JoinTree.Source source : from.sources()) {
+            for (SourceColumn candidate : columnsOf(source.table(), tables)) {
+                if (candidate.name().equalsIgnoreCase(column)) {
+                    return new JoinTree.ColumnRef(source.name(), candidate.name());
+                }
+            }
+        }
+        throw new SqlFrontEndException("no source holds a column called " + column, null);
+    }
+
+    private static List<SourceColumn> columnsOf(String table, List<SourceTable> tables) {
+        for (SourceTable candidate : tables) {
+            if (candidate.name().equals(table)) {
+                return candidate.columns();
+            }
+        }
+        throw new SqlFrontEndException("the from clause names a table nobody described: " + table, null);
+    }
+
+    /**
+     * A literal as a plain Java value. The SQL library keeps its own wrappers for text and for exact
+     * numbers, and a carrier must not be handed one: it cannot see that library's types, and a value
+     * it cannot read is a column it cannot publish.
+     */
+    private static Object literalValue(SqlLiteral literal) {
+        Object value = literal.getValue();
+        return value instanceof org.apache.calcite.util.NlsString text ? text.getValue() : value;
     }
 
     private static AbstractTable asTable(SourceTable table) {

@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 
 /**
@@ -63,6 +64,26 @@ public final class JoinKey {
     /** Whether this key can match anything at all: false once a null column poisoned it. */
     public boolean matchable() {
         return encoded != null;
+    }
+
+    /**
+     * The name this key is filed under where state is kept by name rather than by object -- a store
+     * behind a map, an index bucket, a mirror entry.
+     *
+     * <p>Injective for the same reason equality is: the encoding above cannot let two different sets
+     * of column values produce one string, and the transcription below cannot let two different byte
+     * strings produce one either. Two keys sharing a name is one row reading and overwriting another's
+     * state, with the right shape and nothing reporting it.
+     *
+     * <p>A poisoned key has no name. It matches nothing by definition, so nothing about it is ever
+     * stored or looked up, and giving it one would be inventing an identity for a row that has none.
+     */
+    public String name() {
+        if (encoded == null) {
+            throw new IllegalStateException(
+                    "a key with a null column matches nothing, so it is never filed under a name");
+        }
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(encoded);
     }
 
     @Override
