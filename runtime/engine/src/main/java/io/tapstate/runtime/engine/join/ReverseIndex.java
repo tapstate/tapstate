@@ -30,8 +30,17 @@ import java.util.Objects;
 public final class ReverseIndex {
 
     /**
-     * How many fact keys one page holds. Aligned with the batch the cold layer reads in, so that
-     * walking a page is one round trip for its keys rather than one and a remainder.
+     * How many fact keys one page holds.
+     *
+     * <p><b>A page is not a round trip, and it was tempting to size it as though it were.</b> A read of
+     * many keys against the distributed map is split by the partition each key belongs to, and each
+     * partition asks the layer beneath for its own keys alone - so what a read costs is bounded by the
+     * partition count, not by one. A page far smaller than that count reaches the layer roughly once per
+     * key, which is the read this paging was meant to replace.
+     *
+     * <p>So the page size answers a different question: how large one entry may get before the store
+     * behind it refuses the document. Amortising the partitions is the reader's job - it batches the
+     * keys of several pages into one read - and the two numbers are deliberately not the same number.
      */
     public static final int DEFAULT_PAGE_SIZE = 1_000;
 
