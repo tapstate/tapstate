@@ -19,11 +19,15 @@ import java.util.List;
 final class TamboDashboard {
 
     void render(Frame frame, TuiDashboard.State state) {
+        render(frame, state, 0);
+    }
+
+    void render(Frame frame, TuiDashboard.State state, int workspaceScroll) {
         Rect screen = frame.area().inner(Margin.uniform(1));
         List<Rect> vertical = Layout.vertical().constraints(
                 Constraint.length(2), Constraint.fill(), Constraint.length(4)).split(screen);
         renderStatus(frame, vertical.get(0), state);
-        renderWorkspace(frame, vertical.get(1), state);
+        renderWorkspace(frame, vertical.get(1), state, workspaceScroll);
         renderCommandBar(frame, vertical.get(2), state);
     }
 
@@ -36,13 +40,18 @@ final class TamboDashboard {
                 .foreground(connectionColor(state.connection())).build(), area);
     }
 
-    private void renderWorkspace(Frame frame, Rect area, TuiDashboard.State state) {
+    private void renderWorkspace(Frame frame, Rect area, TuiDashboard.State state, int workspaceScroll) {
         List<String> lines = state.prompt() != null ? promptLines(state.prompt())
-                : !state.palette().isEmpty() ? paletteLines(state) : contentLines(state);
-        frame.renderWidget(Paragraph.builder()
+                : !state.palette().isEmpty() ? paletteLines(state, area.height()) : contentLines(state);
+        if (state.prompt() == null && state.palette().isEmpty() && state.resultPane() != null
+                && workspaceScroll > 0 && !lines.isEmpty()) {
+            int start = Math.min(workspaceScroll, lines.size() - 1);
+            lines = lines.subList(start, lines.size());
+        }
+        Paragraph.Builder paragraph = Paragraph.builder()
                 .text(Text.from(String.join("\n", lines)))
-                .overflow(Overflow.WRAP_WORD)
-                .build(), area);
+                .overflow(Overflow.WRAP_WORD);
+        frame.renderWidget(paragraph.build(), area);
     }
 
     private void renderCommandBar(Frame frame, Rect area, TuiDashboard.State state) {
@@ -64,7 +73,7 @@ final class TamboDashboard {
         if (state.connection() == TuiDashboard.Connection.ONBOARDING || state.connection() == TuiDashboard.Connection.OFFLINE) {
             return List.of("Ready to work locally.", "", "Try: validate ./work",
                     "     new --kind source --connector mysql --dry-run", "     explain source", "",
-                    "Connect to a server: connect host:port", "Use Tab for completion, Ctrl-P for all commands.");
+                    "Connect to a server: connect host:port", "Type to see suggestions · Ctrl-P all commands.");
         }
         List<String> lines = new ArrayList<>();
         lines.add(state.resources().isEmpty() ? "No resources yet." : "Resources");
@@ -78,10 +87,32 @@ final class TamboDashboard {
         return lines;
     }
 
-    private static List<String> paletteLines(TuiDashboard.State state) {
-        List<String> lines = new ArrayList<>(List.of("Commands", ""));
-        for (int index = 0; index < state.palette().size(); index++) lines.add((index == state.paletteIndex() ? "› " : "  ") + state.palette().get(index));
+    private static List<String> paletteLines(TuiDashboard.State state, int height) {
+        boolean suggestions = state.notice() != null && state.notice().startsWith("suggestions");
+        List<String> lines = new ArrayList<>(List.of(suggestions ? "Suggestions" : "Commands", ""));
+        int visible = Math.max(1, height - 2);
+        int start = Math.min(Math.max(0, state.paletteIndex() - visible + 1),
+                Math.max(0, state.palette().size() - visible));
+        int end = Math.min(state.palette().size(), start + visible);
+        for (int index = start; index < end; index++) {
+            String command = state.palette().get(index);
+            String summary = commandSummary(command);
+            String suffix = summary.isBlank() ? "" : "  " + summary;
+            lines.add((index == state.paletteIndex() ? "› " : "  ") + command + suffix);
+        }
         return lines;
+    }
+
+    private static String commandSummary(String command) {
+        String verb = command == null ? "" : command.split("\\s", 2)[0];
+        if (verb.equals("ls")) {
+            return "List workspace resources";
+        }
+        Cli.VerbHelp help = Cli.VERB_HELP.get(verb);
+        if (help == null) {
+            help = Cli.BUILTIN_HELP.get(verb);
+        }
+        return help == null ? "" : help.summary();
     }
 
     private static List<String> promptLines(TuiDashboard.Prompt prompt) {
@@ -95,8 +126,8 @@ final class TamboDashboard {
         if (state.prompt() != null) return state.prompt().hint();
         if (state.notice() != null && !state.notice().isBlank() && !state.notice().startsWith("ready")) return state.notice();
         return state.connection() == TuiDashboard.Connection.ONBOARDING || state.connection() == TuiDashboard.Connection.OFFLINE
-                ? "Local: validate, new, explain, demo · Server: connect host:port · Tab complete · Ctrl-P commands"
-                : "Enter run · Tab complete · Ctrl-P commands · Esc clear · Ctrl-C cancel";
+                ? "Local: validate, new, explain, demo · Server: connect host:port · Type for suggestions · Ctrl-P commands"
+                : "Enter run · Type for suggestions · Ctrl-P commands · Esc clear · Ctrl-C cancel";
     }
 
     private static Color connectionColor(TuiDashboard.Connection connection) {

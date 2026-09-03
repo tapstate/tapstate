@@ -3,8 +3,8 @@ package io.tapstate.cli;
 import dev.tamboui.buffer.Buffer;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.terminal.Frame;
-import io.tapstate.core.schema.SchemaNavigator;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.schema.SchemaNavigator;
 import org.junit.jupiter.api.Test;
 
 import java.io.StringWriter;
@@ -49,6 +49,25 @@ class TuiRuntimeIntegrationTest {
         assertThat(registry.completer().candidates(List.of("l"), 0)).contains("ls");
         assertThat(TuiCommandBar.complete(registry.completer(), new TuiCommandHistory(),
                 List.of("context", ""), 1).candidates()).containsExactly("list");
+    }
+
+    @Test
+    void suggestionsAreProjectedWhileTheCommandIsBeingTyped() {
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+
+        TuiCommandBar.Completion suggestions = TuiCommandBar.suggestions(
+                registry.completer(), new TuiCommandHistory(), List.of("l"), 0);
+
+        assertThat(suggestions.candidates()).contains("ls");
+        assertThat(TuiCommandBar.suggestions(registry.completer(), new TuiCommandHistory(),
+                List.of("ls"), 0).candidates()).doesNotContain("ls");
+    }
+
+    @Test
+    void promptArrowCodesOnlyMoveThePromptSelection() {
+        assertThat(TuiApp.movePromptSelection(0, 1, 2)).isEqualTo(1);
+        assertThat(TuiApp.movePromptSelection(1, 1, 2)).isEqualTo(1);
+        assertThat(TuiApp.movePromptSelection(1, -1, 2)).isZero();
     }
 
     @Test
@@ -202,7 +221,7 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
-    void offlineLsDoesNotLoseItsLocalPathToAnUnsafeContextConfig(@org.junit.jupiter.api.io.TempDir Path base)
+    void offlineLsRemainsLocalWhenTheContextConfigIsUnsafe(@org.junit.jupiter.api.io.TempDir Path base)
             throws Exception {
         Path workspace = Files.createDirectory(base.resolve("workspace"));
         Path sourceDirectory = Files.createDirectory(workspace.resolve("source"));
@@ -302,6 +321,35 @@ class TuiRuntimeIntegrationTest {
                 "permissions are too broad");
         assertThat(rendered).doesNotContain("[COMMAND]", "[PROMPT]");
         assertThat(rendered).doesNotContain("› ");
+    }
+
+    @Test
+    void dashboardScrollsTheResultViewport() {
+        TuiCommandBar.ResultPane result = TuiCommandBar.project(
+                new CommandResult(true, Cli.EXIT_OK), "line-0\nline-1\nline-2\nline-3");
+        TuiDashboard.State state = new TuiDashboard.State(
+                Path.of("orders"), null, null, TuiDashboard.Connection.OFFLINE,
+                null, "", List.of(), 0, null, null, null, null, List.of(), List.of(), List.of(), null, result);
+        Buffer buffer = Buffer.empty(new Rect(0, 0, 60, 10));
+
+        new TamboDashboard().render(Frame.forTesting(buffer), state, 4);
+
+        String rendered = buffer.toAnsiStringTrimmed();
+        assertThat(rendered).contains("line-2").doesNotContain("line-0", "line-1");
+    }
+
+    @Test
+    void dashboardRendersLiveSuggestionsAboveTheComposer() {
+        TuiDashboard.State state = new TuiDashboard.State(
+                Path.of("orders"), null, null, TuiDashboard.Connection.OFFLINE,
+                "suggestions · ↑/↓ choose · Enter select", "l", List.of("ls", "login"), 0, null);
+        Buffer buffer = Buffer.empty(new Rect(0, 0, 80, 16));
+
+        new TamboDashboard().render(Frame.forTesting(buffer), state);
+
+        String rendered = buffer.toAnsiStringTrimmed();
+        assertThat(rendered).contains("Suggestions", "ls", "List workspace resources", "l▌");
+        assertThat(rendered).doesNotContain("[COMMAND]", "> ");
     }
 
     @Test

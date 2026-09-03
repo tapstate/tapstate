@@ -128,6 +128,16 @@ final class TuiCommandBar {
         return new Completion(List.copyOf(merged), 0);
     }
 
+    /** Returns live suggestions for the current token, hiding the already-complete exact match. */
+    static Completion suggestions(TapstateCompleter completer, TuiCommandHistory history,
+                                  List<String> words, int wordIndex) {
+        Completion completion = complete(completer, history, words, wordIndex);
+        String current = words != null && wordIndex >= 0 && wordIndex < words.size()
+                ? words.get(wordIndex) : "";
+        return new Completion(completion.candidates().stream()
+                .filter(candidate -> !candidate.equals(current)).toList(), 0);
+    }
+
     static ResultPane project(CommandResult result, String output) {
         CommandResult safeResult = result == null ? new CommandResult(true, 0) : result;
         List<String> lines = safeDisplayLines(output);

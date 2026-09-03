@@ -29,7 +29,7 @@ final class TuiApp {
 
     private static final int DEFAULT_WIDTH = 100;
     private static final int DEFAULT_HEIGHT = 24;
-    private static final int READ_TIMEOUT_MILLIS = 250;
+    private static final int READ_TIMEOUT_MILLIS = 50;
     private static final long DASHBOARD_REFRESH_MILLIS = 5000L;
     private static final String PALETTE_NOTICE =
             "commands: ↑/↓ choose · Enter select · Esc close";
@@ -65,6 +65,10 @@ final class TuiApp {
     private long refreshSequence;
     private String pendingContextSelection;
     private String commandInput = "";
+    private boolean suggestionsVisible;
+    private int workspaceScroll;
+    private java.nio.file.Path workspaceSnapshotRoot;
+    private List<TuiDashboard.ResourceSummary> workspaceSnapshot = List.of();
 
     TuiApp(Repl repl, StringWriter out, StringWriter err, String initialContext) {
         this(repl, out, err, initialContext, null, null);
@@ -262,7 +266,7 @@ final class TuiApp {
             if (code == 9) {
                 List<String> words = wordsForCompletion(commandInput);
                 int wordIndex = Math.max(0, words.size() - 1);
-                TuiCommandBar.Completion completion = TuiCommandBar.complete(
+                TuiCommandBar.Completion completion = TuiCommandBar.suggestions(
                         repl.registry().completer(), history, words, wordIndex);
                 if (completion.candidates().size() == 1) {
                     commandInput = applyCompletion(commandInput, completion);
@@ -291,6 +295,7 @@ final class TuiApp {
             if (uiState.paletteOpen() && code == TuiCommandBar.ENTER) {
                 String selected = uiState.palette().get(uiState.paletteIndex());
                 commandInput = selected;
+                suggestionsVisible = false;
                 uiState = reduce(
                         new TuiAction.SelectPaletteCommand(selected, "selected: " + selected + " · Enter run"));
                 draw(display, terminal);
@@ -298,7 +303,9 @@ final class TuiApp {
             }
             if (uiState.paletteOpen() && (code == TuiCommandBar.BACKSPACE || code == TuiCommandBar.DELETE
                     || (code >= 32 && !Character.isISOControl(code)))) {
-                uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
+                if (!suggestionsVisible) {
+                    uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
+                }
             }
             switch (update.event()) {
                 case CANCEL -> cancelCurrentOperation();
@@ -312,7 +319,9 @@ final class TuiApp {
                     }
                 }
                 case NONE -> {
-                    // The changed command buffer is rendered below.
+                    if (isEditableInput(code)) {
+                        refreshSuggestions();
+                    }
                 }
             }
             draw(display, terminal);
@@ -341,6 +350,8 @@ final class TuiApp {
         }
         uiState = reduce(new TuiAction.ClearCommand());
         commandInput = "";
+        suggestionsVisible = false;
+        workspaceScroll = 0;
         if (operation == null) {
             uiState = reduce(new TuiAction.AppendActivity("command cleared"));
             uiState = reduce(new TuiAction.SetNotice("command cleared"));
@@ -354,6 +365,8 @@ final class TuiApp {
         }
         String line = commandInput.trim();
         commandInput = "";
+        suggestionsVisible = false;
+        workspaceScroll = 0;
         uiState = reduce(new TuiAction.ClearCommand());
         uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
         if (line.isEmpty()) {
@@ -455,6 +468,35 @@ final class TuiApp {
         return Set.of(":ctx", ":help", ":logout", ":quit").contains(line);
     }
 
+    private static boolean isEditableInput(int code) {
+        return code == TuiCommandBar.BACKSPACE || code == TuiCommandBar.DELETE
+                || (code >= 32 && !Character.isISOControl(code));
+    }
+
+    private void refreshSuggestions() {
+        if (commandInput.isBlank()) {
+            if (suggestionsVisible) {
+                suggestionsVisible = false;
+                uiState = reduce(new TuiAction.ClosePalette("ready"));
+            }
+            return;
+        }
+        List<String> words = wordsForCompletion(commandInput);
+        int wordIndex = Math.max(0, words.size() - 1);
+        TuiCommandBar.Completion completion = TuiCommandBar.suggestions(
+                repl.registry().completer(), history, words, wordIndex);
+        if (completion.candidates().isEmpty()) {
+            if (suggestionsVisible) {
+                suggestionsVisible = false;
+                uiState = reduce(new TuiAction.ClosePalette("ready"));
+            }
+            return;
+        }
+        suggestionsVisible = true;
+        uiState = reduce(new TuiAction.OpenPalette(completion.candidates(),
+                "suggestions · ↑/↓ choose · Enter select"));
+    }
+
     private void drainCommandCompletions() {
         TuiCommandExecution.Completion completion;
         while ((completion = commandCompletions.poll()) != null) {
@@ -498,6 +540,8 @@ final class TuiApp {
         }
         CommandResult safeResult = commandResult == null ? new CommandResult(true, Cli.EXIT_DIAGNOSTIC) : commandResult;
         uiState = reduce(new TuiAction.SetResultPane(TuiCommandBar.project(safeResult, result)));
+        workspaceScroll = 0;
+        invalidateWorkspaceSnapshot();
         if (!result.isBlank()) {
             String marker = failure == null && safeResult.exitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";
             uiState = reduce(new TuiAction.AppendActivity(marker + result));
@@ -519,7 +563,8 @@ final class TuiApp {
             return true;
         }
         String verb = words.getFirst();
-        return verb.equals("context") || verb.equals("new") || verb.equals(":ctx")
+        return verb.equals("ls") || verb.equals("pwd") || verb.equals("context") || verb.equals("new")
+                || verb.equals(":ctx")
                 || verb.equals("connect") || verb.equals("disconnect") || verb.equals("logout")
                 || verb.equals("cd") || (verb.equals("auth") && words.size() > 1 && words.get(1).equals("logout"));
     }
@@ -695,9 +740,9 @@ final class TuiApp {
                 }
                 EscapeKey key = escapeKeyFrom(code);
                 if (key == EscapeKey.UP) {
-                    selected = Math.max(0, selected - 1);
+                    selected = movePromptSelection(selected, -1, options.size());
                 } else if (key == EscapeKey.DOWN) {
-                    selected = Math.min(options.size() - 1, selected + 1);
+                    selected = movePromptSelection(selected, 1, options.size());
                 } else {
                     continue;
                 }
@@ -808,7 +853,7 @@ final class TuiApp {
     }
 
     private void draw(dev.tamboui.terminal.Terminal<JLineBackend> display, Terminal terminal) {
-        display.draw(frame -> dashboard.render(frame, state()));
+        display.draw(frame -> dashboard.render(frame, state(), workspaceScroll));
     }
 
     private void startDashboardRefreshIfNeeded(int width) {
@@ -978,7 +1023,7 @@ final class TuiApp {
                 session.landingNode() == null ? null : session.landingNode().toString(),
                 session.clusterName(), authStatus(contextSession, session), uiState.activity(),
                 uiState.resources().isEmpty() && uiState.lastRefreshAt() == null
-                        ? TuiWorkspaceSnapshot.scan(repl.workdir()) : uiState.resources(),
+                        ? localWorkspaceSnapshot() : uiState.resources(),
                 uiState.pipelines(), uiState.lastRefreshAt(), uiState.resultPane());
     }
 
@@ -1041,6 +1086,20 @@ final class TuiApp {
         err.getBuffer().setLength(0);
     }
 
+    private void invalidateWorkspaceSnapshot() {
+        workspaceSnapshotRoot = null;
+        workspaceSnapshot = List.of();
+    }
+
+    private List<TuiDashboard.ResourceSummary> localWorkspaceSnapshot() {
+        java.nio.file.Path root = repl.workdir().toAbsolutePath().normalize();
+        if (!root.equals(workspaceSnapshotRoot)) {
+            workspaceSnapshotRoot = root;
+            workspaceSnapshot = TuiWorkspaceSnapshot.scan(root);
+        }
+        return workspaceSnapshot;
+    }
+
     private static void addNonBlank(List<String> lines, String value) {
         for (String line : value.split("\\R")) {
             if (!line.isBlank()) {
@@ -1051,7 +1110,12 @@ final class TuiApp {
 
     private void togglePalette() {
         if (uiState.paletteOpen()) {
-            uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
+            if (suggestionsVisible) {
+                suggestionsVisible = false;
+                uiState = reduce(new TuiAction.OpenPalette(paletteCommands(repl.registry()), PALETTE_NOTICE));
+            } else {
+                uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
+            }
         } else {
             uiState = reduce(
                     new TuiAction.OpenPalette(paletteCommands(repl.registry()), PALETTE_NOTICE));
@@ -1066,6 +1130,11 @@ final class TuiApp {
             return;
         }
         if (commandInput.isEmpty()) {
+            if (uiState.resultPane() != null && !uiState.resultPane().lines().isEmpty()) {
+                workspaceScroll = Math.max(0, workspaceScroll + (key == EscapeKey.UP ? -1 : 1));
+                uiState = reduce(new TuiAction.SetNotice("scroll " + workspaceScroll));
+                return;
+            }
             TuiNavigation navigation = navigation();
             TuiNavigation next = navigation.move(key == EscapeKey.UP ? -1 : 1);
             uiState = reduce(new TuiAction.SetNavigation(next));
@@ -1080,7 +1149,7 @@ final class TuiApp {
 
     private TuiNavigation navigation() {
         List<String> items = uiState.resources().isEmpty() && uiState.lastRefreshAt() == null
-                ? TuiWorkspaceSnapshot.scan(repl.workdir()).stream().map(TuiDashboard.ResourceSummary::id).toList()
+                ? localWorkspaceSnapshot().stream().map(TuiDashboard.ResourceSummary::id).toList()
                 : uiState.resources().stream().map(TuiDashboard.ResourceSummary::id).toList();
         TuiNavigation navigation = uiState.navigation();
         return navigation.items().equals(items) ? navigation : TuiNavigation.initial(items);
@@ -1088,12 +1157,13 @@ final class TuiApp {
 
     private TuiDashboard.ResourceSummary selectedResource(String id) {
         List<TuiDashboard.ResourceSummary> resources = uiState.resources().isEmpty() && uiState.lastRefreshAt() == null
-                ? TuiWorkspaceSnapshot.scan(repl.workdir()) : uiState.resources();
+                ? localWorkspaceSnapshot() : uiState.resources();
         return resources.stream().filter(resource -> resource.id().equals(id)).findFirst().orElse(null);
     }
 
     private void closePaletteOrClearCommand() {
         if (uiState.paletteOpen()) {
+            suggestionsVisible = false;
             uiState = reduce(new TuiAction.ClosePalette("ready"));
         } else if (navigation().detailOpen()) {
             uiState = reduce(new TuiAction.SetNavigation(navigation().back()));
@@ -1107,17 +1177,25 @@ final class TuiApp {
     }
 
     private static EscapeKey readEscapeKey(NonBlockingReader reader) throws IOException {
-        int next = reader.read(15);
-        if (next != '[' && next != 'O') {
-            return EscapeKey.ESCAPE;
-        }
-        return switch (reader.read(15)) {
+        int next;
+        do {
+            next = reader.read(15);
+        } while (next == '[' || next == 'O' || next == '?' || next == ';'
+                || (next >= '0' && next <= '9'));
+        return switch (next) {
             case 'A' -> EscapeKey.UP;
             case 'B' -> EscapeKey.DOWN;
             case 'C' -> EscapeKey.RIGHT;
             case 'D' -> EscapeKey.LEFT;
             default -> EscapeKey.ESCAPE;
         };
+    }
+
+    static int movePromptSelection(int selected, int delta, int size) {
+        if (size <= 0) {
+            return 0;
+        }
+        return Math.max(0, Math.min(size - 1, selected + delta));
     }
 
     private enum EscapeKey {
