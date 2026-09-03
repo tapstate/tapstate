@@ -188,14 +188,23 @@ reset
 runs $'build\tcompleted\tcancelled\t2026-01-01T10:05:00Z' $'build\tcompleted\tsuccess\t2026-01-01T10:00:00Z'
 refute "and a cancelled twin is not reported as one"       "Earlier runs" --sha "$sha" --required build
 
-# In flight counts as the latest word when it is the latest: a newer run of a required check is about
-# to say something, and releasing before it does is the thing this gate exists to stop.
+# A run still in flight is not a verdict, so it does not displace one -- in either direction. Letting
+# it cost a release attempt: a branch cut off the release commit four minutes in started its own suite
+# of the same names against the same sha, and the gate waited on it inside a job that reads exit 3 as
+# a failure. Anyone branching off the release commit could stop the release.
 reset
 runs $'build\tcompleted\tsuccess\t2026-01-01T10:00:00Z' $'build\tin_progress\t\t2026-01-01T10:05:00Z'
-expect "a newer run still going holds the answer open"   3 "still running"    --sha "$sha" --required build
+expect "a newer run still going does not displace a verdict" 0 "clean:"        --sha "$sha" --required build
 reset
 runs $'build\tin_progress\t\t2026-01-01T10:00:00Z' $'build\tcompleted\tsuccess\t2026-01-01T10:05:00Z'
-expect "an older one still going does not"               0 "clean:"           --sha "$sha" --required build
+expect "nor does an older one"                              0 "clean:"        --sha "$sha" --required build
+
+# With no verdict at all it is still the answer, and the answer is "wait" -- which is what this gate
+# opened with and what stopped the release that was dispatched before its build had finished.
+reset
+runs $'build\tin_progress\t\t2026-01-01T10:00:00Z' $'build\tcompleted\tcancelled\t2026-01-01T10:05:00Z'
+expect "with nothing decided, in flight outranks cancelled" 3 "still running"  --sha "$sha" --required build
+refute "and that is not reported as a conclusion"             "concluded cancelled" --sha "$sha" --required build
 
 # --- the set read from the branch ruleset ----------------------------------------------------------
 reset
