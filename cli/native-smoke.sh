@@ -384,6 +384,21 @@ else
   bad "TUI inline suggestion rendering failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
 fi
 
+# macOS/JLine commonly reports the Return key as CR. Select an incomplete `:ctx` candidate with CR,
+# enter its choice prompt, move with Down, choose Quit with CR, and then leave the TUI. This catches
+# the event-loop branch that would otherwise submit `:ct` and the prompt path that could leak arrows.
+TAPSTATE_PTY_TUI=1 pty_session $':ct\r\r\033[B\r\004'
+CR_CTX_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
+if (( PTY_RC == 0 )) \
+   && grep -q "Contex" <<< "$CR_CTX_CLEAN" \
+   && grep -q "action" <<< "$CR_CTX_CLEAN" \
+   && grep -q "Quit" <<< "$CR_CTX_CLEAN" \
+   && ! grep -q 'Unmatched argument' <<< "$CR_CTX_CLEAN"; then
+  ok "TUI CR completion and :ctx arrow selection stayed inside the prompt"
+else
+  bad "TUI CR completion or :ctx arrow selection failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
+fi
+
 # --- 9. online TUI launch under a pty (HttpClient + issuer discovery reachable in the image) --------
 # Sections 1-8 never open a socket. Stand up a throwaway loopback
 # stub (healthz + issuer discovery), launch the TUI with a machine token, and confirm the dashboard sees

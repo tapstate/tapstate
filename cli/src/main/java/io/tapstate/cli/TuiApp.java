@@ -294,7 +294,7 @@ final class TuiApp {
                 draw(display, terminal);
                 continue;
             }
-            if (uiState.paletteOpen() && code == TuiCommandBar.ENTER) {
+            if (uiState.paletteOpen() && isEnter(code)) {
                 String selected = uiState.palette().get(uiState.paletteIndex());
                 commandInput = selected;
                 suggestionsVisible = false;
@@ -1198,6 +1198,10 @@ final class TuiApp {
             return 0;
         }
         return Math.max(0, Math.min(size - 1, selected + delta));
+    }
+
+    static boolean isEnter(int code) {
+        return code == TuiCommandBar.ENTER || code == TuiCommandBar.CARRIAGE_RETURN;
     }
 
     private enum EscapeKey {

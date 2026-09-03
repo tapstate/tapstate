@@ -71,6 +71,13 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
+    void completionSelectionAcceptsBothTerminalEnterCodes() {
+        assertThat(TuiApp.isEnter(TuiCommandBar.ENTER)).isTrue();
+        assertThat(TuiApp.isEnter(TuiCommandBar.CARRIAGE_RETURN)).isTrue();
+        assertThat(TuiApp.isEnter(TuiCommandBar.ESCAPE)).isFalse();
+    }
+
+    @Test
     void runtimeClassifiesOperationsWithoutChangingCommandSemantics() {
         assertThat(TuiApp.operationFor("status orders --watch", 1).kind())
                 .isEqualTo(TuiOperation.Kind.STREAM);
