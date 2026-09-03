@@ -337,6 +337,38 @@ class JoinDriverTest {
                 Map.entry(0L, "Ada"), Map.entry(1L, "Ada"), Map.entry(2L, "Ada"));
     }
 
+    /**
+     * The one number that makes this structure's worst shapes visible before they hurt. A bucket
+     * approaching what one stored entry may hold, an initial load quadratic in what one dimension key
+     * holds, a fan-out that takes minutes to recompute - none of them shows up in queue depth or in
+     * throughput until it is already happening, and the fan-out under one key is what says it is coming.
+     *
+     * <p>The deepest ever seen, not the last: the last is whichever key was walked most recently.
+     */
+    @Test
+    @DisplayName("the widest bucket walked is reported, and stays the widest")
+    void theWidestBucketIsReported() {
+        List<Integer> reported = new ArrayList<>();
+        MapJoinStores stores = new MapJoinStores(2);
+        JoinDriver driver = new JoinDriver(planOf(JoinKind.LEFT), List.of("id"), STREAM, stores, 4,
+                (source, dimensionKey, pages) -> reported.add(pages));
+        RecordingSink sink = new RecordingSink();
+        driver.apply(List.of(dimension("c", insert(Map.of("id", 1L, "name", "Ada")))), sink);
+        for (long id = 0; id < 5; id++) {
+            driver.apply(List.of(fact(insert(Map.of("id", id, "cust_id", 1L)))), sink);
+        }
+        driver.apply(List.of(dimension("c", insert(Map.of("id", 2L, "name", "Grace")))), sink);
+        driver.apply(List.of(fact(insert(Map.of("id", 99L, "cust_id", 2L)))), sink);
+        reported.clear();
+
+        driver.apply(List.of(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Ada2")))), sink);
+        driver.apply(List.of(dimension("c",
+                update(Map.of("id", 2L, "name", "Grace"), Map.of("id", 2L, "name", "Grace2")))), sink);
+
+        assertThat(reported).as("five keys in pages of two, then one key").containsExactly(3, 1);
+    }
+
     @Test
     @DisplayName("a null in a join key matches nothing, on either side")
     void aNullJoinKeyMatchesNothing() {

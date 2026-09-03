@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAccumulator;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
@@ -64,6 +65,20 @@ public final class JoinStateStats {
         counters.backfillNanos.add(nanos);
     }
 
+    /**
+     * Marks that one dimension key of {@code namespace} was found to hold {@code pages} pages of fact
+     * keys. What is kept is the deepest ever reported rather than the last: the last is whichever key
+     * happened to be walked most recently, and says nothing about the one that is large.
+     */
+    public void widestBucket(String namespace, long pages) {
+        counters(namespace).widestBucket.accumulate(pages);
+    }
+
+    /** The most pages any one dimension key of {@code namespace} has been found to hold. */
+    public long widestBucket(String namespace) {
+        return counters(namespace).widestBucket.get();
+    }
+
     /** How much reaching {@code namespace} has had, in keys. */
     public long accesses(String namespace) {
         return counters(namespace).accesses.sum();
@@ -94,5 +109,6 @@ public final class JoinStateStats {
         private final LongAdder keysFromCold = new LongAdder();
         private final LongAdder trips = new LongAdder();
         private final LongAdder backfillNanos = new LongAdder();
+        private final LongAccumulator widestBucket = new LongAccumulator(Long::max, 0L);
     }
 }

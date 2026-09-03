@@ -70,6 +70,7 @@ public final class JoinDriver {
     private final List<Dimension> dimensions;
     private final Deque<Work> pending = new ArrayDeque<>();
     private final int keysPerRead;
+    private final JoinGauge gauge;
 
     /**
      * @param plan           what to match on and what to publish
@@ -82,12 +83,19 @@ public final class JoinDriver {
      */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores) {
-        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ);
+        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ, JoinGauge.NONE);
     }
 
     /** As above, with the size of one read named - which is what a case needs to be small. */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores, int keysPerRead) {
+        this(plan, factKeyColumns, outputStream, stores, keysPerRead, JoinGauge.NONE);
+    }
+
+    /** As above, reporting the widest bucket it walks to {@code gauge}. */
+    public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
+            JoinStores stores, int keysPerRead, JoinGauge gauge) {
+        this.gauge = Objects.requireNonNull(gauge, "gauge");
         if (keysPerRead < 1) {
             throw new IllegalArgumentException("a read carries at least one key");
         }
@@ -283,6 +291,9 @@ public final class JoinDriver {
         Dimension dimension = recompute.dimension();
         String source = dimension.source();
         String dimensionKey = recompute.dimensionKey();
+        // Reported from the walk because the walk is what has the number: measuring it anywhere else
+        // would mean reading a bucket to find out how large it is, which is the cost it warns about.
+        gauge.bucketWalked(source, dimensionKey, stores.indexPageCount(source, dimensionKey));
         while (recompute.page() < stores.indexPageCount(source, dimensionKey)) {
             // Several pages at a time, not one. A page is sized by what one stored entry may hold; a
             // read is answered by every partition the keys fall across, each asking the layer beneath

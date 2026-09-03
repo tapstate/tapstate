@@ -155,6 +155,7 @@ public final class JoinDag {
         private final Map<Integer, String> sourceByOrdinal;
         private final JoinStoresBinding binding;
         private transient JoinStores stores;
+        private transient JoinGauge gauge;
 
         private JoinVertexSupplier(JoinPlan plan, String pipelineId, String stepId,
                 List<String> factKeyColumns, Map<Integer, String> sourceByOrdinal,
@@ -170,14 +171,19 @@ public final class JoinDag {
         @Override
         public void init(Context context) {
             stores = binding.bind(context.hazelcastInstance(), pipelineId, stepId);
+            // Metered from here and nowhere else: this is the one place a job is what the state is
+            // being bound for, and a reading can only be left from a thread running its processors.
+            JoinStateStats stats = JoinStateStats.of(context.hazelcastInstance());
+            gauge = (source, dimensionKey, pages) ->
+                    stats.widestBucket(JoinMaps.reverseIndex(pipelineId, stepId, source), pages);
         }
 
         @Override
         public Collection<? extends Processor> get(int count) {
             List<Processor> processors = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
-                processors.add(new JoinProcessor(
-                        new JoinDriver(plan, factKeyColumns, stepId, stores), sourceByOrdinal));
+                processors.add(new JoinProcessor(new JoinDriver(plan, factKeyColumns, stepId, stores,
+                        JoinDriver.DEFAULT_KEYS_PER_READ, gauge), sourceByOrdinal));
             }
             return processors;
         }
