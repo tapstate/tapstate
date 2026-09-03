@@ -256,6 +256,115 @@ else
 fi
 rm -rf "$stub_dir"
 
+# --- open's live path: a request nobody is assigned to arrives nowhere --------------------------
+#
+# The same shape as the retire cases above, measured three releases running: `gh issue create
+# --assignee` opened the issue and then failed on the assignment, so one exit code stood for two
+# opposite states -- no request at all, and a request that reaches nobody. The `||` branch picked the
+# first and said the issue could not be opened, while it sat there unassigned and `settle` found it
+# again by title. Splitting the create from the assignment is what makes the two states nameable,
+# and these cases are what hold them apart.
+stub_dir="$(mktemp -d)"
+cat > "$stub_dir/gh" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$GH_STUB_LOG"
+case "$*" in
+  "issue list"*)
+    printf '[{"title":"%s","state":"OPEN","number":29}]\n' "$GH_STUB_TITLE"
+    exit 0 ;;
+  "issue create"*)
+    if [ "${GH_STUB_CREATE_RC:-0}" != 0 ]; then
+      echo "GraphQL: Resource not accessible by personal access token (createIssue)" >&2
+      exit "$GH_STUB_CREATE_RC"
+    fi
+    echo "https://github.com/tapstate/docs/issues/41"
+    exit 0 ;;
+  "issue edit"*)
+    if [ "${GH_STUB_EDIT_RC:-0}" != 0 ]; then
+      echo "GraphQL: Resource not accessible by personal access token (addAssignees)" >&2
+      exit "$GH_STUB_EDIT_RC"
+    fi
+    exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$stub_dir/gh"
+
+# stdout and stderr kept apart, for the reason the retire cases keep them apart: which stream the
+# outcome lands on is half of what is being tested. The workflow tees stdout into the step summary.
+live() {
+    verb="$1"; log="$2"; create_rc="$3"; edit_rc="$4"; shift 4
+    GH_STUB_LOG="$log" \
+    GH_STUB_TITLE="Release 0.4.1: publish the documentation site" \
+    GH_STUB_CREATE_RC="$create_rc" GH_STUB_EDIT_RC="$edit_rc" \
+    PATH="$stub_dir:$PATH" \
+    bash "$script" "$verb" 0.4.1 "$@" 2>/dev/null
+}
+
+# The control first: when both calls land, it says what it did and raises nothing. Without it, a
+# script that warned on every run would pass every case below while being useless.
+log="$stub_dir/open-ok"; : > "$log"
+out="$(live open "$log" 0 0)"
+if ! grep -q 'issue create' "$log"; then
+    fail "the gh stub is the one that ran" "no calls recorded; the real gh may have been used"
+elif printf '%s' "$out" | grep -q 'asked heywalter' && ! printf '%s' "$out" | grep -q '::warning::'; then
+    pass "a request that lands reports plainly, with no warning"
+else
+    fail "a request that lands reports plainly, with no warning" "stdout was: $out"
+fi
+
+# The measured state, and the one the old code named backwards: the issue exists, unassigned.
+# Asserting the warning is not enough -- the wrong half of the old message is the claim that no issue
+# was opened, so the absence of that claim is the assertion that discriminates.
+log="$stub_dir/open-assign-fails"; : > "$log"
+out="$(live open "$log" 0 1)"
+if printf '%s' "$out" | grep -q '::warning::' \
+   && printf '%s' "$out" | grep -q '41' \
+   && ! printf '%s' "$out" | grep -q 'could not open'; then
+    pass "an issue that could not be assigned is reported as open and unassigned"
+else
+    fail "an issue that could not be assigned is reported as open and unassigned" "stdout was: $out"
+fi
+
+# gh's reason travels with it. `>/dev/null 2>&1` on the old call is why three releases said "could
+# not" and never why, and the reason is the only part that tells anybody what to change.
+if printf '%s' "$out" | grep -q 'addAssignees'; then
+    pass "and gh's own reason comes with it"
+else
+    fail "and gh's own reason comes with it" "stdout was: $out"
+fi
+
+# The other state, which the old message was describing and which does happen: nothing was opened.
+log="$stub_dir/open-create-fails"; : > "$log"
+out="$(live open "$log" 1 0)"
+if printf '%s' "$out" | grep -q 'could not open' && printf '%s' "$out" | grep -q 'createIssue'; then
+    pass "a create that fails says the request is not there, and why"
+else
+    fail "a create that fails says the request is not there, and why" "stdout was: $out"
+fi
+
+# The shape that produced the conflation. With --assignee back on the create, a rejected assignment
+# fails the create again and the two states collapse into one exit code -- which is exactly the bug,
+# not a style point.
+if grep -q 'issue create' "$stub_dir/open-ok" && ! grep 'issue create' "$stub_dir/open-ok" | grep -q -- '--assignee'; then
+    pass "the create carries no --assignee, so a rejected assignment cannot fail it"
+else
+    fail "the create carries no --assignee, so a rejected assignment cannot fail it" \
+         "recorded: $(grep 'issue create' "$stub_dir/open-ok" | head -1)"
+fi
+
+# The second call site has the same defect and needs the same answer: settle opens a follow-up issue
+# when the site was not published in time, and that one is assigned too. It is reached with the
+# lookup answering "open", which is what the stub's `issue list` says.
+log="$stub_dir/settle-assign-fails"; : > "$log"
+out="$(live settle "$log" 0 1 --notes-url "$url")"
+if printf '%s' "$out" | grep -q '::warning::' && printf '%s' "$out" | grep -q '41'; then
+    pass "the follow-up issue is reported the same way when it cannot be assigned"
+else
+    fail "the follow-up issue is reported the same way when it cannot be assigned" "stdout was: $out"
+fi
+rm -rf "$stub_dir"
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "docs-release-smoke: all cases passed"
