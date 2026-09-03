@@ -4,6 +4,7 @@ import dev.tamboui.buffer.Buffer;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.terminal.Frame;
 import io.tapstate.core.schema.SchemaNavigator;
+import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 
 import java.io.StringWriter;
@@ -11,7 +12,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.URI;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -37,6 +40,15 @@ class TuiRuntimeIntegrationTest {
 
         assertThat(registry.completer().candidates(List.of("context", ""), 1))
                 .containsExactly("list");
+    }
+
+    @Test
+    void localLsIsAvailableFromTheSharedTuiCompleter() {
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+
+        assertThat(registry.completer().candidates(List.of("l"), 0)).contains("ls");
+        assertThat(TuiCommandBar.complete(registry.completer(), new TuiCommandHistory(),
+                List.of("context", ""), 1).candidates()).containsExactly("list");
     }
 
     @Test
@@ -138,6 +150,85 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
+    void asynchronousCommandsUseTheSameReplDispatcherAsUiThreadCommands() throws Exception {
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+        StringWriter output = new StringWriter();
+        registry.commandLine().setOut(new java.io.PrintWriter(output));
+        Repl repl = new Repl(registry.commandLine(), Path.of("orders"));
+        TuiApp app = new TuiApp(repl, output, new StringWriter(), null);
+        setField(app, "commandInput", "pwd");
+
+        Method submit = TuiApp.class.getDeclaredMethod("submit");
+        submit.setAccessible(true);
+        assertThat((boolean) submit.invoke(app)).isTrue();
+
+        TuiCommandExecution execution = (TuiCommandExecution) getField(app, "commandExecution");
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (execution.isRunning() && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(execution.isRunning()).isFalse();
+
+        Method drain = TuiApp.class.getDeclaredMethod("drainCommandCompletions");
+        drain.setAccessible(true);
+        drain.invoke(app);
+        TuiAppState state = (TuiAppState) getField(app, "uiState");
+        assertThat(state.resultPane().lines()).containsExactly("orders");
+    }
+
+    @Test
+    void offlineLsRemainsLocalWhenTheTuiHasAContextResolver(@org.junit.jupiter.api.io.TempDir Path base)
+            throws Exception {
+        Path workspace = Files.createDirectory(base.resolve("workspace"));
+        Path sourceDirectory = Files.createDirectory(workspace.resolve("source"));
+        Files.writeString(sourceDirectory.resolve("orders.tap.yml"),
+                "kind: source\nid: orders\nconnector: mysql\nmode: cdc\n");
+        ContextConfigStore store = ContextConfigStore.underHome(base.resolve("home"));
+        ContextResolver resolver = new ContextResolver(store, name -> null);
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+        StringWriter output = new StringWriter();
+        registry.commandLine().setOut(new java.io.PrintWriter(output));
+        registry.commandLine().setErr(new java.io.PrintWriter(output));
+        Repl repl = new Repl(registry.commandLine(), workspace, new HttpControlPlaneClient(),
+                null, name -> null, resolver, null, null, new ContextManager(store));
+        TuiApp app = new TuiApp(repl, output, new StringWriter(), null, resolver, null);
+        Method dispatch = TuiApp.class.getDeclaredMethod("dispatchOnUiThread", String.class);
+        dispatch.setAccessible(true);
+
+        CommandResult result = (CommandResult) dispatch.invoke(app, "ls");
+
+        assertThat(result.exitCode()).isZero();
+        assertThat(output.toString()).contains("orders");
+    }
+
+    @Test
+    void offlineLsDoesNotLoseItsLocalPathToAnUnsafeContextConfig(@org.junit.jupiter.api.io.TempDir Path base)
+            throws Exception {
+        Path workspace = Files.createDirectory(base.resolve("workspace"));
+        Path sourceDirectory = Files.createDirectory(workspace.resolve("source"));
+        Files.writeString(sourceDirectory.resolve("orders.tap.yml"),
+                "kind: source\nid: orders\nconnector: mysql\nmode: cdc\n");
+        ContextResolver resolver = new ContextResolver(() -> {
+            throw new TapstateException(CliError.CONTEXT_CONFIG_PERMISSIONS, Map.of(
+                    "path", base.resolve(".tapstate"), "reason", "POSIX mode is not owner-only"), null);
+        }, name -> null);
+        CommandRegistry registry = CommandRegistry.standard(SchemaNavigator.bundled());
+        StringWriter output = new StringWriter();
+        registry.commandLine().setOut(new java.io.PrintWriter(output));
+        registry.commandLine().setErr(new java.io.PrintWriter(output));
+        Repl repl = new Repl(registry.commandLine(), workspace, new HttpControlPlaneClient(),
+                null, name -> null, resolver, null, null, null);
+        TuiApp app = new TuiApp(repl, output, new StringWriter(), null, resolver, null);
+        Method dispatch = TuiApp.class.getDeclaredMethod("dispatchOnUiThread", String.class);
+        dispatch.setAccessible(true);
+
+        CommandResult result = (CommandResult) dispatch.invoke(app, "ls");
+
+        assertThat(result.exitCode()).isZero();
+        assertThat(output.toString()).contains("orders");
+    }
+
+    @Test
     void completionReplacesOnlyTheCurrentWord() {
         TuiCommandBar.Completion completion = new TuiCommandBar.Completion(
                 List.of("validate", "version"), 0);
@@ -187,8 +278,30 @@ class TuiRuntimeIntegrationTest {
 
         new TamboDashboard().render(Frame.forTesting(buffer), state);
 
-        assertThat(buffer.toAnsiString()).contains("TAPSTATE", "Try: validate ./work", "[COMMAND]");
+        assertThat(buffer.toAnsiString()).contains("TAPSTATE", "Try: validate ./work")
+                .doesNotContain("[COMMAND]");
         assertThat(buffer.toAnsiString()).doesNotContain("ACTIVITY", "WORKSPACE", "WELCOME");
+    }
+
+    @Test
+    void dashboardKeepsResultLinesReadableAndComposerUnlabelled() {
+        String output = "error: cli.context-config-permissions\n"
+                + "The context directory permissions are too broad. Run chmod 700 on the directory.";
+        TuiCommandBar.ResultPane result = TuiCommandBar.project(
+                new CommandResult(false, Cli.EXIT_DIAGNOSTIC), output);
+        TuiDashboard.State state = new TuiDashboard.State(
+                Path.of("orders"), null, null, TuiDashboard.Connection.OFFLINE,
+                null, "", List.of(), 0, null, null, null, null, List.of(), List.of(),
+                List.of(), null, result);
+        Buffer buffer = Buffer.empty(new Rect(0, 0, 60, 16));
+
+        new TamboDashboard().render(Frame.forTesting(buffer), state);
+
+        String rendered = buffer.toAnsiStringTrimmed();
+        assertThat(rendered).contains("error: cli.context-config-permissions",
+                "permissions are too broad");
+        assertThat(rendered).doesNotContain("[COMMAND]", "[PROMPT]");
+        assertThat(rendered).doesNotContain("› ");
     }
 
     @Test

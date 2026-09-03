@@ -17,7 +17,9 @@ final class TuiActivity {
     private static final Pattern TOKEN_OUTPUT_SECRET = Pattern.compile(
             "(?i)(\\btoken\\s+)(?!revoke\\b)([^\\s,;]+)");
     private static final Pattern ANSI_SEQUENCE = Pattern.compile(
-            "\\u001B(?:\\\\[[0-?]*[ -/]*[@-~]|\\\\][^\\u0007]*(?:\\u0007|\\\\u001B\\\\\\\\))");
+            "\\u001B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\u0007]*(?:\\u0007|\\u001B\\\\))");
+    private static final Pattern RESIDUAL_ANSI_SEQUENCE = Pattern.compile(
+            "\\[(?:[0-9;]*[ -/]*[A-Za-z])");
 
     private TuiActivity() {
     }
@@ -52,6 +54,7 @@ final class TuiActivity {
             return "";
         }
         String stripped = ANSI_SEQUENCE.matcher(value).replaceAll("");
+        stripped = RESIDUAL_ANSI_SEQUENCE.matcher(stripped).replaceAll("");
         StringBuilder safe = new StringBuilder(stripped.length());
         stripped.codePoints().forEach(codePoint -> {
             if (!Character.isISOControl(codePoint) || Character.isWhitespace(codePoint)) {

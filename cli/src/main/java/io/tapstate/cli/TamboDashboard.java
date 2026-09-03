@@ -5,6 +5,7 @@ import dev.tamboui.layout.Layout;
 import dev.tamboui.layout.Margin;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.style.Color;
+import dev.tamboui.style.Overflow;
 import dev.tamboui.terminal.Frame;
 import dev.tamboui.text.Text;
 import dev.tamboui.widgets.block.Block;
@@ -38,15 +39,19 @@ final class TamboDashboard {
     private void renderWorkspace(Frame frame, Rect area, TuiDashboard.State state) {
         List<String> lines = state.prompt() != null ? promptLines(state.prompt())
                 : !state.palette().isEmpty() ? paletteLines(state) : contentLines(state);
-        frame.renderWidget(Paragraph.builder().text(Text.from(String.join("\n", lines))).build(), area);
+        frame.renderWidget(Paragraph.builder()
+                .text(Text.from(String.join("\n", lines)))
+                .overflow(Overflow.WRAP_WORD)
+                .build(), area);
     }
 
     private void renderCommandBar(Frame frame, Rect area, TuiDashboard.State state) {
-        String line = state.prompt() == null ? "[COMMAND]  › " + state.command()
-                : "[PROMPT]  " + state.prompt().question() + "  › " + state.prompt().input();
+        String line = state.prompt() == null ? state.command() + "▌"
+                : state.prompt().question() + "  " + state.prompt().input();
         Block block = Block.builder().borders(Borders.ALL).borderColor(Color.DARK_GRAY).build();
         frame.renderWidget(block, area);
         frame.renderWidget(Paragraph.builder().text(Text.from(line + "\n" + commandHint(state)))
+                .overflow(Overflow.WRAP_WORD)
                 .foreground(Color.BRIGHT_WHITE).build(), block.inner(area));
     }
 

@@ -45,4 +45,27 @@ class TuiCommandBarTest {
         assertThat(update.value()).isEmpty();
         assertThat(update.event()).isEqualTo(TuiCommandBar.Event.NONE);
     }
+
+    @Test
+    void projectsAnsiDiagnosticsAsReadableLines() {
+        TuiCommandBar.ResultPane pane = TuiCommandBar.project(
+                new CommandResult(false, Cli.EXIT_DIAGNOSTIC),
+                "\u001b[1m\u001b[31merror:\u001b[39m\u001b[0m cli.server-required\n"
+                        + "Connect to a server before running ls.");
+
+        assertThat(pane.lines()).containsExactly("error: cli.server-required",
+                "Connect to a server before running ls.");
+    }
+
+    @Test
+    void removesResidualAnsiMarkersWhenTheEscapeByteWasLost() {
+        TuiCommandBar.ResultPane pane = TuiCommandBar.project(
+                new CommandResult(false, Cli.EXIT_DIAGNOSTIC),
+                "[1m [31merror: [39m [0m cli.server-required");
+
+        assertThat(pane.lines()).singleElement()
+                .satisfies(line -> assertThat(line)
+                        .contains("error:", "cli.server-required")
+                        .doesNotContain("[1m", "[31m", "[39m", "[0m"));
+    }
 }

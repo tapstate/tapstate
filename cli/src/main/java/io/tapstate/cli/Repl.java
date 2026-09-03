@@ -589,7 +589,7 @@ final class Repl {
             return true;
         }
         if (!session.isConnected() && ONLINE_VERBS.contains(words.get(0)) && contextResolver != null) {
-            int resolved = resolveTarget(words);
+            int resolved = resolveTarget(words, words.get(0).equals("ls"));
             if (resolved != Cli.EXIT_OK) {
                 lastExitCode = resolved;
                 return true;
@@ -632,11 +632,18 @@ final class Repl {
 
     /** Resolves and reaches a target only after dispatch has established that the verb is online. */
     private int resolveTarget(List<String> words) {
+        return resolveTarget(words, false);
+    }
+
+    private int resolveTarget(List<String> words, boolean allowMissingForLocalListing) {
         String verb = words.get(0);
         try {
             Optional<ResolvedContext> resolution = contextResolver.resolve(null, explicitContext,
                     workspaceFor(words));
             if (resolution.isEmpty()) {
+                if (allowMissingForLocalListing) {
+                    return Cli.EXIT_OK;
+                }
                 Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
                 return Cli.EXIT_VERB_UNAVAILABLE;
             }
@@ -653,6 +660,9 @@ final class Repl {
             }
             return connected;
         } catch (io.tapstate.core.common.TapstateException error) {
+            if (allowMissingForLocalListing && error.code() == CliError.CONTEXT_CONFIG_PERMISSIONS) {
+                return Cli.EXIT_OK;
+            }
             Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
             return Cli.EXIT_DIAGNOSTIC;
         }

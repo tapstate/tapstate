@@ -43,6 +43,7 @@ final class TuiApp {
     private final TuiResourceRefresh resourceRefresh;
     private final AtomicBoolean interrupted = new AtomicBoolean();
     private final AtomicBoolean terminationRequested = new AtomicBoolean();
+    private final AtomicBoolean resizeRequested = new AtomicBoolean();
     private final ConcurrentLinkedQueue<TuiCommandExecution.Completion> commandCompletions =
             new ConcurrentLinkedQueue<>();
 
@@ -95,6 +96,7 @@ final class TuiApp {
             backend.enterAlternateScreen();
             backend.hideCursor();
             this.display = new dev.tamboui.terminal.Terminal<>(backend);
+            backend.onResize(() -> resizeRequested.set(true));
             terminal.handle(Terminal.Signal.INT, signal -> {
                 interrupted.set(true);
                 repl.cancelStream();
@@ -218,9 +220,10 @@ final class TuiApp {
                 draw(display, terminal);
                 continue;
             }
-            int width = dimension(terminal.getWidth(), DEFAULT_WIDTH);
-            int height = dimension(terminal.getHeight(), DEFAULT_HEIGHT);
-            if (width != lastWidth || height != lastHeight) {
+            dev.tamboui.layout.Size size = display.size();
+            int width = dimension(size.width(), DEFAULT_WIDTH);
+            int height = dimension(size.height(), DEFAULT_HEIGHT);
+            if (resizeRequested.getAndSet(false) || width != lastWidth || height != lastHeight) {
                 kernel.dispatch(new TuiEvent.Resize(width, height));
                 draw(display, terminal);
                 lastWidth = width;
@@ -420,7 +423,7 @@ final class TuiApp {
         if (async) {
             commandExecution.start(operation.id(),
                     loginInput == null
-                            ? () -> repl.registry().dispatch(repl, repl.registry().invocation(line))
+                            ? () -> dispatchOnWorker(line)
                             : () -> new CommandResult(true,
                                     repl.tuiLogin(loginInput.username(), loginInput.password())),
                     this::consumeOutput);
@@ -431,6 +434,15 @@ final class TuiApp {
     }
 
     private CommandResult dispatchOnUiThread(String line) {
+        try {
+            boolean keepRunning = repl.dispatch(line);
+            return new CommandResult(keepRunning, repl.lastExitCode());
+        } catch (Throwable failure) {
+            return new CommandResult(true, Cli.EXIT_DIAGNOSTIC);
+        }
+    }
+
+    private CommandResult dispatchOnWorker(String line) {
         try {
             boolean keepRunning = repl.dispatch(line);
             return new CommandResult(keepRunning, repl.lastExitCode());
@@ -1021,7 +1033,7 @@ final class TuiApp {
         if (lines.isEmpty()) {
             return "";
         }
-        return TuiActivity.result(String.join("\n", lines));
+        return String.join("\n", lines);
     }
 
     private void clearOutput() {
