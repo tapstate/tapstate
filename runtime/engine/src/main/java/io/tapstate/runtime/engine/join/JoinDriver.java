@@ -38,10 +38,14 @@ import java.util.Objects;
  *       way through has the new value emitted first and the queued old one after it, so the target
  *       table settles on the older value and stays there. Re-reading makes both interleavings settle
  *       on the current one; the worst case is the same row sent twice with the same value.
- *   <li><b>The fact rows of a page are read in one go.</b> A recompute reads one fact row per row it
- *       re-emits, and asking for a million of them one at a time is a million round trips to a store
- *       that answers a page in one - three orders of magnitude, invisible except as slowness, with the
- *       store looking like the culprit.
+ *   <li><b>Fact rows are read many pages at a time.</b> A recompute reads one fact row per row it
+ *       re-emits, and asking for a million of them one at a time is a million round trips - three
+ *       orders of magnitude, invisible except as slowness, with the store looking like the culprit.
+ *       One page at a time is barely better, and that is the trap: a read is answered by every
+ *       partition its keys fall across, each asking the layer beneath separately, so a read smaller
+ *       than the partition count is a call per key wearing the batch's name. Measured: eight keys
+ *       reached the layer as eight calls. So pages are gathered until a read is far larger than the
+ *       partition count, and how large a stored page may be stays a separate question.
  * </ul>
  *
  * <p><b>What the index says is checked against what the fact row says.</b> The index is derived; the
@@ -65,6 +69,7 @@ public final class JoinDriver {
     private final List<String> factKeyColumns;
     private final List<Dimension> dimensions;
     private final Deque<Work> pending = new ArrayDeque<>();
+    private final int keysPerRead;
 
     /**
      * @param plan           what to match on and what to publish
@@ -77,6 +82,16 @@ public final class JoinDriver {
      */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores) {
+        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ);
+    }
+
+    /** As above, with the size of one read named - which is what a case needs to be small. */
+    public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
+            JoinStores stores, int keysPerRead) {
+        if (keysPerRead < 1) {
+            throw new IllegalArgumentException("a read carries at least one key");
+        }
+        this.keysPerRead = keysPerRead;
         this.plan = Objects.requireNonNull(plan, "plan");
         this.stores = Objects.requireNonNull(stores, "stores");
         this.outputStream = Objects.requireNonNull(outputStream, "outputStream");
@@ -251,44 +266,81 @@ public final class JoinDriver {
      */
     private boolean advance(Recompute recompute, JoinSink sink) {
         Dimension dimension = recompute.dimension();
-        while (recompute.page() < stores.indexPageCount(dimension.source(), recompute.dimensionKey())) {
-            List<String> factKeys = stores.indexPage(dimension.source(), recompute.dimensionKey(), recompute.page());
-            // One read for the page rather than one per row: the difference between the two is what
-            // turns a large recompute from seconds into tens of minutes.
-            Map<String, Map<String, Object>> rows = stores.factsUnder(factKeys);
-            List<String> stale = new ArrayList<>();
-            while (recompute.at() < factKeys.size()) {
-                String factKey = factKeys.get(recompute.at());
-                Map<String, Object> factRow = rows.get(factKey);
-                // The index is derived; the fact row's own foreign key is the truth. A bucket may name
-                // a row that has gone or that now points elsewhere - emitting either would publish it
-                // against a dimension row it has nothing to do with, and the row would look ordinary.
-                if (factRow == null
-                        || !recompute.dimensionKey().equals(dimensionKeyIn(factRow, dimension))) {
-                    stale.add(factKey);
-                    recompute.at(recompute.at() + 1);
-                    continue;
-                }
-                Envelope event = rowEvent(factRow, recompute.ts(), false);
-                if (event != null && !sink.offer(event)) {
-                    // Nothing has been removed yet, so the entries found stale on this pass are simply
-                    // found again on the next one. Removing them mid-walk would move the positions the
-                    // bookmark below is written in.
+        String source = dimension.source();
+        String dimensionKey = recompute.dimensionKey();
+        while (recompute.page() < stores.indexPageCount(source, dimensionKey)) {
+            // Several pages at a time, not one. A page is sized by what one stored entry may hold; a
+            // read is answered by every partition the keys fall across, each asking the layer beneath
+            // for its own share. A read the size of a page is therefore a handful of keys per partition
+            // - measured, one key per call on a small enough page - which is the key-at-a-time read
+            // wearing the batch's name. Reading far more keys than there are partitions is what turns
+            // it back into a batch.
+            int through = recompute.page();
+            List<String> gathered = new ArrayList<>();
+            int pages = stores.indexPageCount(source, dimensionKey);
+            while (through < pages && gathered.size() < keysPerRead) {
+                gathered.addAll(stores.indexPage(source, dimensionKey, through));
+                through++;
+            }
+            Map<String, Map<String, Object>> rows = stores.factsUnder(gathered);
+            while (recompute.page() < through) {
+                if (!emit(recompute, dimension, rows, sink)) {
                     return false;
                 }
-                recompute.at(recompute.at() + 1);
             }
-            // Dropped once the page is done rather than as they are found: a removal compacts the page,
-            // and compacting the list being walked is how a walk skips entries. Dropping them at all is
-            // what keeps a bucket from growing for ever under a key nobody ever changes.
-            for (String gone : stale) {
-                stores.indexRemove(dimension.source(), recompute.dimensionKey(), gone);
-            }
-            recompute.page(recompute.page() + 1);
-            recompute.at(0);
         }
         return true;
     }
+
+    /**
+     * Walks what is left of one page, emitting from {@code rows} - which was read for this page and
+     * several after it. Returns false when the sink refused, leaving the bookmark where it stopped.
+     */
+    private boolean emit(Recompute recompute, Dimension dimension,
+            Map<String, Map<String, Object>> rows, JoinSink sink) {
+        List<String> factKeys =
+                stores.indexPage(dimension.source(), recompute.dimensionKey(), recompute.page());
+        List<String> stale = new ArrayList<>();
+        while (recompute.at() < factKeys.size()) {
+            String factKey = factKeys.get(recompute.at());
+            Map<String, Object> factRow = rows.get(factKey);
+            // The index is derived; the fact row's own foreign key is the truth. A bucket may name a
+            // row that has gone or that now points elsewhere - emitting either would publish it
+            // against a dimension row it has nothing to do with, and the row would look ordinary.
+            if (factRow == null
+                    || !recompute.dimensionKey().equals(dimensionKeyIn(factRow, dimension))) {
+                stale.add(factKey);
+                recompute.at(recompute.at() + 1);
+                continue;
+            }
+            Envelope event = rowEvent(factRow, recompute.ts(), false);
+            if (event != null && !sink.offer(event)) {
+                // Nothing has been removed yet, so the entries found stale on this pass are simply
+                // found again on the next one. Removing them mid-walk would move the positions the
+                // bookmark below is written in.
+                return false;
+            }
+            recompute.at(recompute.at() + 1);
+        }
+        // Dropped once the page is done rather than as they are found: a removal compacts the page,
+        // and compacting the list being walked is how a walk skips entries. Dropping them at all is
+        // what keeps a bucket from growing for ever under a key nobody ever changes.
+        for (String gone : stale) {
+            stores.indexRemove(dimension.source(), recompute.dimensionKey(), gone);
+        }
+        recompute.page(recompute.page() + 1);
+        recompute.at(0);
+        return true;
+    }
+
+    /**
+     * How many fact keys one read gathers before it goes out. Far more than the substrate's partition
+     * count, because a read is split across the partitions its keys fall in and each of those asks the
+     * layer beneath separately: a read smaller than the partition count is a call per key by another
+     * name. Pages are gathered until this is reached, so a page's size and a read's size stay two
+     * numbers rather than one.
+     */
+    static final int DEFAULT_KEYS_PER_READ = 8_000;
 
     /** Queues the published row for {@code factRow}, or its removal. */
     private void queueRow(Map<String, Object> factRow, long ts, boolean removed) {

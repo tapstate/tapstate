@@ -257,18 +257,21 @@ class JoinDriverTest {
     }
 
     /**
-     * A million keys asked one at a time against a remote store is a million round trips; asked in
-     * pages it is a few thousand. Neither answers differently, so nothing but the clock says which is
-     * happening - which is why this counts the asking.
+     * A million keys asked one at a time against a remote store is a million round trips. One page at a
+     * time is barely better: a read is answered by every partition its keys fall across, so a read the
+     * size of a small page is a call per key wearing the batch's name. Neither answers differently from
+     * the other, so nothing but the clock says which is happening - which is why this counts the asking.
      */
     @Test
-    @DisplayName("a page of fact rows is read in one go rather than one row at a time")
-    void aPageIsReadInOneBatch() {
+    @DisplayName("fact rows are read across pages in one go, not a page at a time")
+    void factRowsAreReadAcrossPagesInOneBatch() {
         Fixture fixture = new Fixture(JoinKind.LEFT, 4);
         fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
         for (long id = 0; id < 8; id++) {
             fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
         }
+        assertThat(fixture.stores.indexPageCount("c", fixture.dimensionKeyOf(1L)))
+                .as("two pages, so a page-at-a-time read is visible as two") .isEqualTo(2);
         fixture.stores.batchReads = 0;
         fixture.stores.keysRead = 0;
 
@@ -276,8 +279,8 @@ class JoinDriverTest {
                 update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
 
         assertThat(fixture.stores.keysRead).isEqualTo(8);
-        assertThat(fixture.stores.batchReads).as("two pages of four, so two reads and not eight")
-                .isEqualTo(2);
+        assertThat(fixture.stores.batchReads).as("both pages in one read, not one read each")
+                .isEqualTo(1);
     }
 
     @Test
