@@ -1,5 +1,6 @@
 package io.tapstate.core.sql;
 
+import java.io.Serializable;
 import io.tapstate.core.common.TapstateType;
 
 /**
@@ -7,5 +8,6 @@ import io.tapstate.core.common.TapstateType;
  * database's own spelling. The front end never discovers these: whoever knows what the sources
  * hold hands them in, so the same SQL text derives the same plan wherever it is checked.
  */
-public record SourceColumn(String name, TapstateType type, boolean nullable) {
+public record SourceColumn(String name, TapstateType type, boolean nullable)
+        implements Serializable {
 }

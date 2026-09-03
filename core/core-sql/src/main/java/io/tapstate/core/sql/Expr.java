@@ -1,5 +1,6 @@
 package io.tapstate.core.sql;
 
+import java.io.Serializable;
 import java.util.List;
 import java.util.Objects;
 
@@ -15,7 +16,7 @@ import java.util.Objects;
  * refused by name while the SQL is still text, so that the set a carrier must evaluate and the set the
  * front end admits are the same set rather than two lists that drift.
  */
-public sealed interface Expr {
+public sealed interface Expr extends Serializable {
 
     /** A column of one of the joined sources, under the name the plan calls that source by. */
     record Column(JoinTree.ColumnRef ref) implements Expr {

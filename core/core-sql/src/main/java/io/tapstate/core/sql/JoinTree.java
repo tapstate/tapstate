@@ -1,5 +1,6 @@
 package io.tapstate.core.sql;
 
+import java.io.Serializable;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -11,14 +12,14 @@ import java.util.stream.Stream;
  * produced it -- a consumer able to see those types ends up depending on them, and swapping the
  * execution carrier stops being possible.
  */
-public sealed interface JoinTree {
+public sealed interface JoinTree extends Serializable {
 
     /** One column of one source, under the name the rest of the SQL refers to that source by. */
-    record ColumnRef(String source, String column) {
+    record ColumnRef(String source, String column) implements Serializable {
     }
 
     /** One equality a join matches on: the left side's column, then the right side's. */
-    record KeyPair(ColumnRef left, ColumnRef right) {
+    record KeyPair(ColumnRef left, ColumnRef right) implements Serializable {
     }
 
     /**

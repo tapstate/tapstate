@@ -1,5 +1,6 @@
 package io.tapstate.core.sql;
 
+import java.io.Serializable;
 import io.tapstate.core.common.TapstateType;
 
 /**
@@ -15,5 +16,6 @@ import io.tapstate.core.common.TapstateType;
  * carrier knows the row's shape and nothing about where the values come from, and a row of the right
  * shape holding the wrong values is the one failure nothing downstream can see.
  */
-public record OutputField(String name, TapstateType type, boolean nullable, Expr from) {
+public record OutputField(String name, TapstateType type, boolean nullable, Expr from)
+        implements Serializable {
 }

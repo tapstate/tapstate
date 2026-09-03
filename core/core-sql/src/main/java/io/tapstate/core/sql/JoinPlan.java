@@ -1,5 +1,6 @@
 package io.tapstate.core.sql;
 
+import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
 
@@ -20,7 +21,7 @@ import java.util.Map;
  *                     ordinary output
  */
 public record JoinPlan(List<OutputField> outputFields, JoinTree from,
-                       Map<String, List<String>> readColumns) {
+                       Map<String, List<String>> readColumns) implements Serializable {
 
     /**
      * The source rows are driven from: the leftmost leaf of the tree.

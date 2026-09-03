@@ -13,6 +13,8 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.runtime.engine.join.JoinDag;
 import io.tapstate.runtime.engine.nest.NestDag;
 import io.tapstate.runtime.engine.nest.NestFrontier;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -147,6 +149,15 @@ public final class PipelineDagBuilder {
         return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest ? nest : null;
     }
 
+    /**
+     * The join this step declares, or {@code null} where the step is anything else. One place answers
+     * it so that everything walking a pipeline's transforms agrees on what a join is.
+     */
+    private static TransformBody.Join joinOf(Step step) {
+        return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
+                ? join : null;
+    }
+
     /** Builds the Jet DAG for a validated pipeline against the given leaf and reference bindings. */
     public static DAG build(PipelineResource pipeline, DagBindings bindings) {
         return build(pipeline, bindings, null);
@@ -236,6 +247,26 @@ public final class PipelineDagBuilder {
                     assembled = true;
                     continue;
                 }
+                if (joinOf(step) != null) {
+                    Step.Inline inline = (Step.Inline) step;
+                    // A join draws its own vertex and its own edges: one edge per source it reads, each
+                    // partitioned by the key of the state that edge is about to change.
+                    if (bindings.join() == null) {
+                        throw new IllegalStateException("transform step '" + step.id()
+                                + "' is a join, but no join binding was supplied to the builder");
+                    }
+                    JoinPlan plan = bindings.join().plans().apply(step);
+                    byKey.put(step.id(), JoinDag.attach(dag, plan, pipeline.id(), step.id(),
+                            bindings.join().factKeyColumns().apply(step),
+                            alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
+                            vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
+                            bindings.join().stores()));
+                    if (chains != null) {
+                        chains.derived(step.id(), nestUpstream(inline.from(), bindings));
+                    }
+                    assembled = true;
+                    continue;
+                }
                 List<String> upstream = resolveClause(step.from(), bindings);
                 Vertex vertex = transformVertex(dag, step, bindings, axes,
                         chains == null ? null : chains.perOrdinal(upstream));
@@ -317,9 +348,9 @@ public final class PipelineDagBuilder {
      * topology, not a transform - a passthrough vertex whose several inbound edges are the merge, so
      * the transform-port binding is never asked for one; every other stateless step (filter / map / a
      * scripted row transform) runs the one generic adapter over the port the binding supplies. A
-     * {@code nest} never reaches here: it draws a sub-graph of its own instead of a single vertex. A
-     * {@code join} or an unresolved {@code use:} reference is out of this builder's scope and is
-     * refused; extending to them replaces the refusal, not the seam.
+     * {@code nest} never reaches here: it draws a sub-graph of its own instead of a single vertex, and
+     * neither does a {@code join}, for the same reason. An unresolved {@code use:} reference is out of
+     * this builder's scope and is refused.
      */
     private static Vertex transformVertex(DAG dag, Step step, DagBindings bindings, ChainAxes axes,
             Map<Integer, List<String>> chainsByOrdinal) {
@@ -328,11 +359,6 @@ public final class PipelineDagBuilder {
                     "transform step '" + step.id() + "' is a use-reference; resolve it to an inline step first");
         }
         TransformBody body = inline.body();
-        if (body instanceof TransformBody.Join) {
-            throw new IllegalArgumentException(
-                    "transform step '" + step.id() + "' is a stateful " + body.type()
-                            + "; the linear DAG builder does not carry it");
-        }
         if (body instanceof TransformBody.Union) {
             // The merge is the topology, so nothing is transformed here - but the frontier still has to be
             // worked out per edge. The combined bound the engine would forward is never delivered at all

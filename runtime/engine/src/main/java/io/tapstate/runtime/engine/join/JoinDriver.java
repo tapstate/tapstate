@@ -124,10 +124,21 @@ public final class JoinDriver {
      *         at all if none are arriving, which is the only way a large recompute ever finishes
      */
     public boolean apply(List<SourceChange> changes, JoinSink sink) {
+        absorb(changes);
+        return drain(sink);
+    }
+
+    /**
+     * Takes {@code changes} into the state and queues what they mean, sending nothing.
+     *
+     * <p>Separate from {@link #drain} because a caller that is refused part way must be able to offer
+     * the rest without taking the same change in a second time - and the two are indistinguishable from
+     * inside {@link #apply}, which is why the caller that needs to tell them apart is given both.
+     */
+    public void absorb(List<SourceChange> changes) {
         for (SourceChange change : changes) {
             absorb(change);
         }
-        return drain(sink);
     }
 
     /** Whether anything is still waiting to be sent. */
@@ -239,8 +250,12 @@ public final class JoinDriver {
         pending.add(new Recompute(dimension, now, 0, 0, event.ts()));
     }
 
-    /** Pushes queued work until the sink refuses or there is none left. */
-    private boolean drain(JoinSink sink) {
+    /**
+     * Pushes queued work until the sink refuses or there is none left.
+     *
+     * @return whether nothing is left to send
+     */
+    public boolean drain(JoinSink sink) {
         while (!pending.isEmpty()) {
             Work work = pending.peek();
             if (work instanceof Row row) {
