@@ -198,9 +198,14 @@ public final class CaptureRunUnit {
                 //
                 // It attaches as a consumer for the same reason a buffered tail does: it is using the chain,
                 // and a teardown that could not see it would tear the chain out from under a live reader.
-                coordinator.attachConsumer(chainId, spec.pipelineId());
+                // Stated rather than relied on: a direct tail is `tail && !sharedRing`, so reaching here
+                // means the branch forty lines up already resolved the chain. That is a fact about a
+                // record's accessor, which is exactly the kind nothing downstream can see.
+                MiningChainId directChainId =
+                        Objects.requireNonNull(chainId, "a tail resolves its chain before it runs");
+                coordinator.attachConsumer(directChainId, spec.pipelineId());
                 consumerAttached = true;
-                String directChain = chainId.value();
+                String directChain = directChainId.value();
                 long directEpoch = epoch;
                 Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
                 AtomicLong forwarded = new AtomicLong();

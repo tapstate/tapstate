@@ -35,7 +35,11 @@ class RestartDidNotBecomeAFifthVerbTest {
         // The second place it would have to be declared. A verb can exist in the registry without a
         // matching enum constant -- that is what every non-lifecycle operation is -- so the enum check
         // above does not cover this one, and a registry entry is what would put it on the wire faces.
+        // isNotEmpty first, and it is not decoration: doesNotContain holds over an empty list, so a
+        // registry that answered nothing would satisfy a case whose entire subject is what is absent
+        // from it. The two readings are indistinguishable without this line.
         assertThat(ControlOperations.all()).extracting(Operation::id)
+                .isNotEmpty()
                 .doesNotContain("pipeline.restart");
     }
 }
