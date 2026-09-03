@@ -306,7 +306,33 @@ main() {
     # empty directory and starts a database with no demo data in it, which then fails much later as a
     # pipeline that reads nothing.
     mkdir -p mysql-init postgres-init connectors
-    [ -f ./docker-compose.yml ]              || fetch "${qbase}/deploy/quickstart/docker-compose.yml" ./docker-compose.yml
+    # Fetched from the tag, then pinned to this script's own version. A release tag's tree carries the
+    # previous release's pins by construction: the number is written into the tree inside the release
+    # runner, which never commits, so the tag lands on the commit CI validated and that tree still says
+    # the release before this one. The two files the install site serves are rewritten on the way out,
+    # which is why the CLI installs correctly -- everything fetched from the tag afterwards is not, and
+    # the compose file is the one of those that carries a version.
+    #
+    # Left as it shipped, the one-liner brings up the previous release's server under this release's
+    # CLI. Measured on 0.4.1: a 0.4.1 CLI against a 0.3.0 server, whose discovery endpoint the newer
+    # CLI cannot use, so the demo could not log in at all.
+    #
+    # An existing file is never rewritten -- a re-run keeps the stack it already has, and a compose the
+    # user edited is theirs.
+    if [ ! -f ./docker-compose.yml ]; then
+        fetch "${qbase}/deploy/quickstart/docker-compose.yml" ./docker-compose.yml
+        sed "s|image: ghcr.io/tapstate/tapstate:[^[:space:]]*|image: ghcr.io/tapstate/tapstate:${CLI_VERSION}|g" \
+            ./docker-compose.yml > ./docker-compose.yml.pinned \
+            && mv ./docker-compose.yml.pinned ./docker-compose.yml
+        # The substitution is checked, not assumed. A compose file that writes the image reference any
+        # other way leaves this a silent no-op, and a silent no-op here is the whole defect coming back
+        # -- with a stack that starts, reports healthy, and runs the wrong server.
+        left="$(grep -c "image: ghcr.io/tapstate/tapstate:${CLI_VERSION}" ./docker-compose.yml || true)"
+        other="$(grep -c "image: ghcr.io/tapstate/tapstate:" ./docker-compose.yml || true)"
+        if [ "$left" = 0 ] || [ "$left" != "$other" ]; then
+            die "the compose file does not pin the server image the way this script expects; it would have started a server other than ${CLI_VERSION}"
+        fi
+    fi
     [ -f ./mysql-init/01-orders.sql ]        || fetch "${qbase}/deploy/quickstart/mysql-init/01-orders.sql" ./mysql-init/01-orders.sql
     [ -f ./postgres-init/01-shipments.sql ]  || fetch "${qbase}/deploy/quickstart/postgres-init/01-shipments.sql" ./postgres-init/01-shipments.sql
 
@@ -423,8 +449,14 @@ main() {
     # the one failure that cascades -- every verb after it reports cli.not-authenticated, so the real
     # cause ends up at the top of a screen of consequences.
     admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
+    repl_status=0
     repl_out="$(printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nregister ../mysql-connector.jar\nregister ../mongodb-connector.jar\nregister ../postgres-connector.jar\napply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' "$admin_pw" \
-        | ./tapstate -w work 2>&1)"
+        | ./tapstate -w work 2>&1)" || repl_status=$?
+    # The status is taken beside the output rather than being left to `set -e`. As the bare assignment
+    # it was, a CLI that exits non-zero ends the script AT this line: the print below never runs, the
+    # `case` below it never runs, and everything the CLI said -- a refusal, a stack trace, ten frames of
+    # it -- reaches the exit code and nowhere else. The one report of that shape blamed the CPU, and the
+    # same silence was reproduced later on hardware where that could not be the cause.
     printf '%s\n' "$repl_out"
     case "$repl_out" in
         *control.auth-failed*|*cli.not-authenticated*)
@@ -450,6 +482,13 @@ main() {
                     die "the CLI could not log in, so no verb after it ran; inspect it with: docker compose logs bootstrap" ;;
             esac ;;
     esac
+    # Anything else the CLI failed on. Without this the two named cases are the only failures that stop
+    # the script, and every other one -- including a crash -- falls through to the row-count wait, which
+    # then reports an empty target half a minute later and sends the reader to the server log to
+    # investigate a pipeline that was never started.
+    if [ "$repl_status" -ne 0 ]; then
+        die "the CLI exited $repl_status before the pipeline was started; its output is above"
+    fi
 
     # Snapshot verification, printed automatically: the demo's payoff is a real row count in the target,
     # not an "it should have worked". A fresh snapshot of the seeded rows is quick, but the read still
