@@ -139,6 +139,45 @@ else
   printf '  FAIL  %s\n        gh was called as: %s\n' "and the request names that sha" "$(cat "$scratch/gh-log")"; failed=$((failed + 1))
 fi
 
+# --- one name, several runs ------------------------------------------------------------------------
+# Asking by sha narrows the question to one commit, but a commit is not owned by one branch: anyone
+# who branches off it starts a second suite of the same names against the same sha. So the same name
+# comes back more than once here too, and taking whichever the API happened to list first decides a
+# release by the order of a response body. Both directions of that have been live: a cancelled run
+# from someone else's branch refusing a commit whose own build was green, and -- the one that ships a
+# bad release -- a green listed ahead of a red for the same name.
+#
+# The verdicts are ranked instead. A failure outranks a success for the same name, which is the whole
+# content of "checked, not checked once"; a success outranks a run still in flight, because the one
+# that finished did check this tree; and cancelled, skipped or neutral rank last because they are not
+# verdicts about the code at all -- they only answer when nothing else does.
+reset
+runs $'build\tcompleted\tcancelled' $'build\tcompleted\tsuccess'
+expect "a cancelled twin does not refuse a green check"  0 "clean:" --sha "$sha" --required build
+reset
+runs $'build\tcompleted\tsuccess' $'build\tcompleted\tcancelled'
+expect "and the answer does not depend on their order"   0 "clean:" --sha "$sha" --required build
+
+# The mirror, and the more expensive one to get wrong: a green twin must not bury a red.
+reset
+runs $'build\tcompleted\tsuccess' $'build\tcompleted\tfailure'
+expect "a green twin does not bury a red one"            1 "concluded failure" --sha "$sha" --required build
+reset
+runs $'build\tcompleted\tfailure' $'build\tcompleted\tsuccess'
+expect "in either order"                                 1 "concluded failure" --sha "$sha" --required build
+
+# Ranking last is not the same as being ignored: with nothing else to go on, a cancelled run is still
+# the answer, and it still refuses.
+reset
+runs $'build\tcompleted\tcancelled'
+expect "a cancelled run alone still refuses"             1 "concluded cancelled" --sha "$sha" --required build
+
+# A finished green says this tree was checked. A second run of the same name still going says nothing
+# yet, and waiting on it would let anyone hold a release open by branching off the release commit.
+reset
+runs $'build\tin_progress\t' $'build\tcompleted\tsuccess'
+expect "a green is not held up by a twin still running"  0 "clean:" --sha "$sha" --required build
+
 # --- the set read from the branch ruleset ----------------------------------------------------------
 reset
 ruleset $'build\nno-cjk'

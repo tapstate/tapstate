@@ -115,17 +115,41 @@ resolve_fallback() {
   fallback_head="$head"
 }
 
+# One name can carry several runs on one commit. Asking by sha narrows the question to one commit, but
+# a commit is not owned by one branch: anyone who branches off it starts a second suite of the same
+# names against the same sha, and a re-run adds another. Taking whichever the API listed first decides
+# a release by the order of a response body, and both directions of that are live -- someone else's
+# cancelled run refusing a commit whose own build was green, and a green listed ahead of a red for the
+# same name, which is the one that ships a bad release.
+#
+# So the runs for a name are ranked, not indexed. A failure outranks a success, which is the whole
+# content of "checked, not checked once". A success outranks a run still in flight, because the one
+# that finished did check this tree, and waiting on the other would let anyone hold a release open by
+# branching off the release commit. Cancelled, skipped and neutral rank last: they are not verdicts
+# about the code, so they answer only when nothing else does -- and then they still refuse.
+pick() { # $1 = tsv runs, $2 = name -> the one line that speaks for it, or empty
+  awk -F'\t' -v want="$2" '
+    $1 != want                                                 { next }
+    $2 != "completed"                        { if (!wait) wait = $0; next }
+    $3 == "success"                          { if (!ok)   ok   = $0; next }
+    $3 == "cancelled" || $3 == "skipped" || $3 == "neutral" \
+                                             { if (!moot) moot = $0; next }
+                                             { if (!bad)  bad  = $0 }
+    END { print bad ? bad : (ok ? ok : (wait ? wait : moot)) }
+  ' <<<"$1"
+}
+
 fail=0
 unsettled=0
 borrowed=""
 while IFS= read -r name; do
   [ -n "$name" ] || continue
-  line="$(printf '%s\n' "$observed" | awk -F'\t' -v want="$name" '$1 == want { print; exit }')"
+  line="$(pick "$observed" "$name")"
   answered_on="$sha"
   if [ -z "$line" ]; then
     resolve_fallback
     if [ -n "$fallback_head" ]; then
-      line="$(printf '%s\n' "$fallback_runs" | awk -F'\t' -v want="$name" '$1 == want { print; exit }')"
+      line="$(pick "$fallback_runs" "$name")"
       if [ -n "$line" ]; then
         answered_on="$fallback_head"
         borrowed="${borrowed}${borrowed:+, }${name}"
