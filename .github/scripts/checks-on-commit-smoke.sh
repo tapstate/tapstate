@@ -139,6 +139,64 @@ else
   printf '  FAIL  %s\n        gh was called as: %s\n' "and the request names that sha" "$(cat "$scratch/gh-log")"; failed=$((failed + 1))
 fi
 
+# --- one name, several runs ------------------------------------------------------------------------
+# Asking by sha narrows the question to one commit, but a commit is not owned by one branch: anyone
+# who branches off it starts a second suite of the same names against the same sha. So the same name
+# comes back more than once here too, and taking whichever the API happened to list first decides a
+# release by the order of a response body. Both directions of that have been live: a cancelled run
+# from someone else's branch refusing a commit whose own build was green, and -- the one that ships a
+# bad release -- a green listed ahead of a red for the same name.
+#
+# The verdicts are ranked instead. A failure outranks a success for the same name, which is the whole
+# content of "checked, not checked once"; a success outranks a run still in flight, because the one
+# that finished did check this tree; and cancelled, skipped or neutral rank last because they are not
+# verdicts about the code at all -- they only answer when nothing else does.
+# The incident this comes from: the cancelled one is the NEWER of the two, so "take the latest" alone
+# would still refuse. Cancelled is left out of the ordering rather than ranked inside it.
+reset
+runs $'build\tcompleted\tcancelled\t2026-01-01T10:05:00Z' $'build\tcompleted\tsuccess\t2026-01-01T10:00:00Z'
+expect "a newer cancelled twin does not refuse a green"  0 "clean:" --sha "$sha" --required build
+reset
+runs $'build\tcompleted\tsuccess\t2026-01-01T10:00:00Z' $'build\tcompleted\tcancelled\t2026-01-01T10:05:00Z'
+expect "and the answer does not depend on their order"   0 "clean:" --sha "$sha" --required build
+
+# Ranking last is not being ignored: with nothing else to go on, a cancelled run is still the answer,
+# and it still refuses.
+reset
+runs $'build\tcompleted\tcancelled\t2026-01-01T10:00:00Z'
+expect "a cancelled run alone still refuses"             1 "concluded cancelled" --sha "$sha" --required build
+
+# Among real verdicts the latest wins, in both directions. Severity ranking was tried instead and is
+# wrong: two of the required checks judge the pull request's body, so a commit whose body was fixed
+# would be refused for ever, with nothing anyone could do to it.
+reset
+runs $'build\tcompleted\tfailure\t2026-01-01T10:05:00Z' $'build\tcompleted\tsuccess\t2026-01-01T10:00:00Z'
+expect "a newer red overrules an older green"            1 "concluded failure" --sha "$sha" --required build
+reset
+runs $'build\tcompleted\tfailure\t2026-01-01T10:00:00Z' $'build\tcompleted\tsuccess\t2026-01-01T10:05:00Z'
+expect "a newer green overrules an older red"            0 "clean:" --sha "$sha" --required build
+
+# ...but it is said out loud. "The latest run was green" is a weaker sentence than "this commit is
+# green", and nothing else in the output would show the reader the gap.
+expect "and the earlier red is named anyway"             0 "failure at 2026-01-01T10:00:00Z" --sha "$sha" --required build
+expect "and it says which check it was"                  0 "build:" --sha "$sha" --required build
+reset
+runs $'build\tcompleted\tsuccess\t2026-01-01T10:00:00Z'
+refute "a green with no earlier run says nothing extra"    "Earlier runs" --sha "$sha" --required build
+# A cancelled twin is not an earlier red -- reporting it as one would train the reader to skip the line.
+reset
+runs $'build\tcompleted\tcancelled\t2026-01-01T10:05:00Z' $'build\tcompleted\tsuccess\t2026-01-01T10:00:00Z'
+refute "and a cancelled twin is not reported as one"       "Earlier runs" --sha "$sha" --required build
+
+# In flight counts as the latest word when it is the latest: a newer run of a required check is about
+# to say something, and releasing before it does is the thing this gate exists to stop.
+reset
+runs $'build\tcompleted\tsuccess\t2026-01-01T10:00:00Z' $'build\tin_progress\t\t2026-01-01T10:05:00Z'
+expect "a newer run still going holds the answer open"   3 "still running"    --sha "$sha" --required build
+reset
+runs $'build\tin_progress\t\t2026-01-01T10:00:00Z' $'build\tcompleted\tsuccess\t2026-01-01T10:05:00Z'
+expect "an older one still going does not"               0 "clean:"           --sha "$sha" --required build
+
 # --- the set read from the branch ruleset ----------------------------------------------------------
 reset
 ruleset $'build\nno-cjk'

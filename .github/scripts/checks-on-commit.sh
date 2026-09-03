@@ -70,7 +70,7 @@ else
 fi
 
 if ! observed="$(gh api --paginate "repos/${repo}/commits/${sha}/check-runs" \
-    --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv' 2>&1)"; then
+    --jq '.check_runs[] | [.name, .status, .conclusion, .started_at] | @tsv' 2>&1)"; then
   echo "::error::could not read the checks on ${sha}: ${observed}" >&2
   exit 1
 fi
@@ -110,24 +110,67 @@ resolve_fallback() {
     return 0
   fi
   fallback_runs="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" \
-      --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv' 2>/dev/null)"
+      --jq '.check_runs[] | [.name, .status, .conclusion, .started_at] | @tsv' 2>/dev/null)"
   [ -n "$fallback_runs" ] || return 0
   fallback_head="$head"
+}
+
+# One name can carry several runs on one commit. Asking by sha narrows the question to one commit, but
+# a commit is not owned by one branch: anyone who branches off it starts a second suite of the same
+# names against the same sha, and a re-run adds another. Taking whichever the API listed first decides
+# a release by the order of a response body, and both directions of that are live -- someone else's
+# cancelled run refusing a commit whose own build was green, and a green listed ahead of a red for the
+# same name, which is the one that ships a bad release.
+#
+# So the runs for a name are ordered, not indexed -- by when they started, latest first, which is what
+# a re-run means and what the branch rules themselves read. Cancelled, skipped and neutral are left
+# out of that ordering entirely: they are not verdicts about the code, so they answer only when
+# nothing else does, and then they still refuse.
+#
+# Ranking by severity instead -- a failure outranking a success for the same name -- was tried here
+# first and is wrong, for a reason worth leaving written down: a required check can fail for something
+# that is not in the commit at all. Two of the ones this gate reads judge the pull request's body. Fix
+# the body, the check re-runs green, and under a severity rank that commit is refused for ever, with
+# nothing anyone can do to it. The same holds for any check re-run after an outage.
+#
+# But "the latest run was green" is a weaker sentence than "this commit is green", and the gap between
+# them is where a release gets cut over a lane that failed and was re-run until it did not. So an
+# earlier disagreeing run is not silently dropped: it is named on the way past, and judging it is the
+# reader's, which is the only place that judgement can live.
+pick() { # $1 = tsv runs, $2 = name -> the one line that speaks for it, or empty
+  awk -F'\t' -v want="$2" '
+    $1 != want { next }
+    $3 == "cancelled" || $3 == "skipped" || $3 == "neutral" \
+                      { if ($4 >= moot_at) { moot_at = $4; moot = $1 "\t" $2 "\t" $3 } ; next }
+                      { if ($4 >= said_at) { said_at = $4; said = $1 "\t" $2 "\t" $3 } }
+    END { print said ? said : moot }
+  ' <<<"$1"
+}
+
+# Earlier runs of this name that concluded something other than success, when a later one did not.
+overruled() { # $1 = tsv runs, $2 = name -> one "<conclusion> at <time>" per line
+  awk -F'\t' -v want="$2" '
+    $1 == want && $2 == "completed" && $3 != "success" \
+      && $3 != "cancelled" && $3 != "skipped" && $3 != "neutral" { print $3 " at " $4 }
+  ' <<<"$1"
 }
 
 fail=0
 unsettled=0
 borrowed=""
+overruled_note=""
 while IFS= read -r name; do
   [ -n "$name" ] || continue
-  line="$(printf '%s\n' "$observed" | awk -F'\t' -v want="$name" '$1 == want { print; exit }')"
+  line="$(pick "$observed" "$name")"
   answered_on="$sha"
+  answered_runs="$observed"
   if [ -z "$line" ]; then
     resolve_fallback
     if [ -n "$fallback_head" ]; then
-      line="$(printf '%s\n' "$fallback_runs" | awk -F'\t' -v want="$name" '$1 == want { print; exit }')"
+      line="$(pick "$fallback_runs" "$name")"
       if [ -n "$line" ]; then
         answered_on="$fallback_head"
+        answered_runs="$fallback_runs"
         borrowed="${borrowed}${borrowed:+, }${name}"
       fi
     fi
@@ -149,6 +192,15 @@ while IFS= read -r name; do
   elif [ "$conclusion" != "success" ]; then
     echo "::error::'${name}' concluded ${conclusion} on ${answered_on}"
     fail=1
+  else
+    # Green now, red earlier. Not a refusal -- the latest run is the verdict -- but the reader is the
+    # only one who can tell "the body was fixed and it re-ran" from "it was re-run until it passed",
+    # and that second one is how a release gets cut over a lane that failed.
+    earlier="$(overruled "$answered_runs" "$name")"
+    if [ -n "$earlier" ]; then
+      overruled_note="${overruled_note}${overruled_note:+
+}  ${name}: ${earlier//$'\n'/, } (superseded by a later run that passed)"
+    fi
   fi
 done <<EOF
 $names
@@ -164,6 +216,11 @@ if [ "$unsettled" -ne 0 ]; then
 fi
 
 echo "clean: $(printf '%s\n' "$names" | wc -l | tr -d ' ') named check(s) ran on ${sha} and are green."
+if [ -n "$overruled_note" ]; then
+  echo "Earlier runs of these names did not pass, and a later run of each did:"
+  echo "$overruled_note"
+  echo "Read them before releasing: a check re-run until it passes is not a commit that was checked."
+fi
 if [ -n "$borrowed" ]; then
   # Said rather than left to be noticed. A borrowed answer is a weaker statement than a check that
   # ran here, and a reader has to be able to tell which one they are being given.
