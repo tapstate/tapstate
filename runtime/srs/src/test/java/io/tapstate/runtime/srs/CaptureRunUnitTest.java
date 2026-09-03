@@ -114,6 +114,12 @@ class CaptureRunUnitTest {
                 config(), mode, srsKey, srsEnabled, "src-1", "pipe-1", startFrom, null, 0L);
     }
 
+    /** A run spec for a named consumer pipeline on an explicitly keyed chain. */
+    private static CaptureRunSpec specFor(String pipelineId, ReadMode mode, String srsKey) {
+        return new CaptureRunSpec(
+                config(), mode, srsKey, true, "src-1", pipelineId, StartFrom.earliest(), null, 0L);
+    }
+
     private CaptureRunUnit runUnit(CapturePort port, SrsMetaStore meta) {
         return new CaptureRunUnit(port, new SrsCoordinator(meta), meta, hz);
     }
@@ -162,7 +168,7 @@ class CaptureRunUnitTest {
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(change(10)));
         CaptureRun firstRun =
                 runUnit(first, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-resume"), e -> { });
-        meta.markSnapshotComplete(firstRun.chainId().orElseThrow().value(), "orders");
+        meta.markSnapshotComplete(firstRun.chainId().orElseThrow().value(), "pipe-1", "orders");
 
         FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(change(11)));
         CaptureRun second = runUnit(restarted, meta)
@@ -202,7 +208,7 @@ class CaptureRunUnitTest {
         // The read drained every row of the table, and no sink confirmed any of them.
         assertThat(firstRun.snapshotCount()).isEqualTo(2);
         assertThat(meta.read(chainId)).get()
-                .extracting(SrsMeta::snapshotCompletedTables)
+                .extracting(record -> record.snapshotCompletedTables("pipe-1"))
                 .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.list(String.class))
                 .isEmpty();
 
@@ -213,6 +219,86 @@ class CaptureRunUnitTest {
         assertThat(second.snapshotCount())
                 .as("no sink confirmed the table, so the full load is owed and read again")
                 .isEqualTo(2);
+    }
+
+    /**
+     * A pipeline new to a chain reads its own full load, whatever the pipelines already on that chain
+     * have finished.
+     *
+     * <p>Completion answers "are this pipeline's rows in this pipeline's target", and every pipeline on a
+     * chain has a target of its own. A chain is keyed by the source connection alone -- the table subset
+     * is deliberately not part of it -- so two pipelines reading one database share a chain by
+     * construction, and a mark left by the first answers the second's question with the first's answer.
+     *
+     * <p>What a chain shares is the mining: the source's change log is read once for everyone on it. The
+     * initial load is not part of that. A new pipeline's target starts empty, so its rows can only come
+     * from a read of its own, and a second read of the source is what that costs.
+     *
+     * <p>Asserted on the per-table counts rather than the total, because the two failures differ: a run
+     * that never entered the snapshot phase reports an empty map, and a run that read an empty table
+     * reports a zero. Only the first is this defect, and a total of zero cannot tell them apart.
+     */
+    @Test
+    void aPipelineNewToAChainReadsItsOwnFullLoad() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(change(10)));
+        CaptureRun firstRun = runUnit(first, meta)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-shared"), e -> { });
+        String chainId = firstRun.chainId().orElseThrow().value();
+        // Stands in for pipe-a's sink confirming the table -- the only thing that ever marks one done.
+        meta.markSnapshotComplete(chainId, "pipe-a", "orders");
+
+        FakeSource second = new FakeSource(List.of(row(1), row(2)), List.of(change(11)));
+        CaptureRun secondRun = runUnit(second, meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-shared"), e -> { });
+
+        assertThat(secondRun.snapshotCounts())
+                .as("pipe-b's target is empty, so it owes itself every row of the table pipe-a finished")
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 2L));
+    }
+
+    /**
+     * A pipeline told to re-read everything does, on a chain another pipeline is still using -- and the
+     * other one is not made to re-read anything.
+     *
+     * <p>Giving back this pipeline's own record is the whole of what a clearing stop does while somebody
+     * else is on the chain, and the tables it had finished are part of that record. They used to be the
+     * chain's, so there was nowhere to clear them from without deciding it on every other consumer's
+     * behalf -- they were left alone, and the next run skipped the load the operator had just asked for.
+     * The command reported success and the target kept whatever it had.
+     *
+     * <p>Both halves are asserted because each fails on its own, and each failure is silent. A rerun that
+     * still reads nothing is the defect this closes; a rerun that made its neighbour re-read its whole
+     * source is the one the chain-level record was avoiding.
+     */
+    @Test
+    void aPipelineToldToRereadEverythingDoesSoWithoutDisturbingItsChainNeighbour() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1), row(2)), List.of(change(10)));
+        CaptureRun aRun = runUnit(port, meta)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-rerun"), e -> { });
+        String chainId = aRun.chainId().orElseThrow().value();
+        runUnit(new FakeSource(List.of(row(1), row(2)), List.of(change(11))), meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-rerun"), e -> { });
+        // Both sinks confirmed the table, which is what makes a plain restart read nothing.
+        meta.markSnapshotComplete(chainId, "pipe-a", "orders");
+        meta.markSnapshotComplete(chainId, "pipe-b", "orders");
+
+        // What a clearing stop leaves behind on a chain somebody else is still reading: this pipeline's
+        // own record, gone; everything shared, untouched.
+        meta.detachConsumer(chainId, "pipe-a");
+
+        CaptureRun reran = runUnit(new FakeSource(List.of(row(1), row(2)), List.of(change(12))), meta)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-rerun"), e -> { });
+        assertThat(reran.snapshotCounts())
+                .as("the pipeline that asked to re-read everything reads its whole table again")
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 2L));
+
+        CaptureRun neighbour = runUnit(new FakeSource(List.of(row(1), row(2)), List.of(change(13))), meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-rerun"), e -> { });
+        assertThat(neighbour.snapshotCounts())
+                .as("and the pipeline that asked for nothing still owes nothing")
+                .isEmpty();
     }
 
     @Test
@@ -712,7 +798,16 @@ class CaptureRunUnitTest {
 
         @Override
         public void detachConsumer(String miningChainId, String pipelineId) {
-            throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
+            SrsMeta m = records.get(miningChainId);
+            if (m == null) {
+                return;
+            }
+            List<ConsumerOffset> kept = m.consumerOffsets().stream()
+                    .filter(c -> !c.pipelineId().equals(pipelineId))
+                    .toList();
+            records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), kept,
+                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(),
+                    m.snapshotEpoch()));
         }
 
         final List<String> created = new ArrayList<>();
@@ -752,7 +847,7 @@ class CaptureRunUnitTest {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), position, m.consumerOffsets(), m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
@@ -763,7 +858,7 @@ class CaptureRunUnitTest {
             next.add(offset);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
@@ -784,7 +879,7 @@ class CaptureRunUnitTest {
             next.add(new ConsumerOffset(pipelineId, perTable, ack));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
@@ -803,7 +898,7 @@ class CaptureRunUnitTest {
             next.add(new ConsumerOffset(pipelineId, perTable, position));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
@@ -811,7 +906,7 @@ class CaptureRunUnitTest {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(), cdcStartPosition,
-                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), snapshotEpoch));
+                    m.schemaHistory(), m.retention(), m.epoch(), snapshotEpoch));
         }
 
         @Override
@@ -820,7 +915,7 @@ class CaptureRunUnitTest {
             long opened = m.epoch() + 1;
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), opened, m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), opened, m.snapshotEpoch()));
             return opened;
         }
 
@@ -831,20 +926,33 @@ class CaptureRunUnitTest {
             next.add(version);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
-                    next, m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                    next, m.retention(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             SrsMeta m = require(miningChainId);
-            if (m.snapshotCompletedTables().contains(table)) {
-                return;
+            // Per pipeline, not per chain: the mark says this pipeline's sink took the table, and the
+            // pipelines sharing a chain each write somewhere of their own.
+            List<ConsumerOffset> consumers = new ArrayList<>();
+            ConsumerOffset mine = null;
+            for (ConsumerOffset consumer : m.consumerOffsets()) {
+                if (consumer.pipelineId().equals(pipelineId)) {
+                    mine = consumer;
+                } else {
+                    consumers.add(consumer);
+                }
             }
-            List<String> next = new ArrayList<>(m.snapshotCompletedTables());
-            next.add(table);
-            records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), next, m.epoch(), m.snapshotEpoch()));
+            List<String> completed =
+                    new ArrayList<>(mine == null ? List.of() : mine.snapshotCompletedTables());
+            if (!completed.contains(table)) {
+                completed.add(table);
+            }
+            consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
+                    mine == null ? null : mine.sinkAcked(), completed));
+            records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
+                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(),
+                    m.snapshotEpoch()));
         }
 
         private SrsMeta require(String miningChainId) {

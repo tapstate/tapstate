@@ -12,15 +12,24 @@ import java.util.List;
  * <p>Fields — {@code miningChainId} (the chain this record is keyed by), {@code sourceRead} (how far the
  * chain has read: the source's own position paired with the order the engine assigned it; absent until
  * the first cdc read; its durable advance is bounded by the slowest consumer's acked position, and it
- * only ever moves forward), {@code consumerOffsets} (one
- * cursor per consumer pipeline), {@code cdcStartPosition} (the opaque position the cdc tail starts from,
+ * only ever moves forward), {@code consumerOffsets} (one record per consumer pipeline — see
+ * {@link ConsumerOffset} — carrying that pipeline's cursor, its acked position and which tables it has
+ * finished loading), {@code cdcStartPosition} (the opaque position the cdc tail starts from,
  * recorded at the snapshot-to-cdc seam; absent until a snapshot seam or start point resolves it),
  * {@code schemaHistory} (the append-only versioned schema), {@code retention} (the retention
  * configuration passed through from the source; a config value only — the change ring is bounded by
- * its capacity and backpressure, not trimmed by this), {@code snapshotCompletedTables} (the tables
- * whose snapshot rows a sink has confirmed), {@code epoch} (the change ring's current
+ * its capacity and backpressure, not trimmed by this), {@code epoch} (the change ring's current
  * generation, zero until one is opened) and {@code snapshotEpoch} (the generation the recorded snapshot
  * began in, zero until a snapshot records its seam).
+ *
+ * <p><strong>What is here is the chain's, and only the chain's.</strong> The line is which of the two
+ * things a quantity answers for: the chain is one read of one source's change log, shared by everyone on
+ * it, so how far that read has got, where its tail joins, and what the source's schema has been are the
+ * chain's. Anything that answers for one pipeline's target belongs to that pipeline and lives in its
+ * {@link ConsumerOffset} — the acked position, the read cursor, and which tables it has finished loading.
+ * The last of those used to be recorded here, as one list for the whole chain, and a second pipeline on
+ * the chain then read the first one's answer and skipped a load it had never done, leaving its target
+ * short of every row of those tables with the run healthy and nothing logged.
  *
  * <p>The two generations are separate because a snapshot outlives the ring it started under. Every
  * restart or re-mine opens a new generation, and orders compare generation first — so a snapshot that
@@ -31,23 +40,15 @@ import java.util.List;
  * only record that a snapshot began, so a snapshot that resumes would otherwise have no way to know
  * what to pin its rows to.
  *
- * <p>Snapshot completion is tracked per table while the read offset is a chain-level scalar, and the
- * asymmetry is deliberate. A chain is keyed by the physical source coordinate and deliberately excludes
- * the table subset, so sources reading different tables of one database share this record: the cdc tail
- * is one log read with one offset, but each table is snapshotted by its own capture run and finishes at
- * its own time. A chain-level completion flag could not say which table it meant.
- *
- * <p>A table is listed once a sink has confirmed its snapshot rows — <em>written</em>, not merely read,
- * and certainly not merely started, which is what {@code cdcStartPosition} means. The distinction is the
- * whole value of the field: a table read and never written looks finished to whoever read it, and a run
- * that skipped it on that basis would leave every row of it that has not changed since absent from the
- * target for good, because the tail only replays what changed after the seam. So the mark is the sink's
- * to make and no reader's, and a reader that also made it would be a second voice on the one question it
- * cannot answer. Membership is a set: marking a table that is already listed changes nothing.
- *
  * <p>The field set is append-only: a field may be added but never removed or repurposed, so an older
- * reader stays forward-compatible. The lists are unmodifiable defensive copies. A pure value over
- * {@code java..} only (rule R2): positions travel as opaque tokens, never as a connector type.
+ * reader stays forward-compatible. That rule was broken once, deliberately and on the record, to move
+ * snapshot completion out to {@link ConsumerOffset}: the guarantee protects readers of already-written
+ * data, this product has not shipped, and so the set it protected was empty. Keeping the field as well
+ * would have left two places recording one fact, which is the shape the defect above had. The rule holds
+ * for every field named here, and the next removal needs its own argument.
+ *
+ * <p>The lists are unmodifiable defensive copies. A pure value over {@code java..} only (rule R2):
+ * positions travel as opaque tokens, never as a connector type.
  */
 public record SrsMeta(
         String miningChainId,
@@ -56,7 +57,6 @@ public record SrsMeta(
         String cdcStartPosition,
         List<SchemaVersion> schemaHistory,
         String retention,
-        List<String> snapshotCompletedTables,
         long epoch,
         long snapshotEpoch) {
 
@@ -75,12 +75,8 @@ public record SrsMeta(
         if (schemaHistory == null) {
             throw new IllegalArgumentException("srs meta schemaHistory must be set");
         }
-        if (snapshotCompletedTables == null) {
-            throw new IllegalArgumentException("srs meta snapshotCompletedTables must be set");
-        }
         consumerOffsets = List.copyOf(consumerOffsets);
         schemaHistory = List.copyOf(schemaHistory);
-        snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
     }
 
     /**
@@ -91,18 +87,26 @@ public record SrsMeta(
         return sourceRead == null ? null : sourceRead.token();
     }
 
-    /** A record with no table marked snapshot-complete — the shape every producer predating the mark builds. */
-    public SrsMeta(String miningChainId, ChainPosition sourceRead, List<ConsumerOffset> consumerOffsets,
-            String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention) {
-        this(miningChainId, sourceRead, consumerOffsets, cdcStartPosition, schemaHistory, retention,
-                List.of());
+    /**
+     * The tables {@code pipelineId} has finished loading, empty when it has finished none or is not on
+     * this chain — the one reading of snapshot completion, taken from that pipeline's own record.
+     *
+     * <p>An absent consumer answers "none" rather than refusing, because that is the same answer for the
+     * same reason: a pipeline with no record here has confirmed nothing, and a pipeline new to the chain
+     * owes every table it selected.
+     */
+    public List<String> snapshotCompletedTables(String pipelineId) {
+        return consumerOffsets.stream()
+                .filter(consumer -> consumer.pipelineId().equals(pipelineId))
+                .findFirst()
+                .map(ConsumerOffset::snapshotCompletedTables)
+                .orElse(List.of());
     }
 
     /** A record with no generation opened and no snapshot pinned — the shape a freshly seeded chain has. */
     public SrsMeta(String miningChainId, ChainPosition sourceRead, List<ConsumerOffset> consumerOffsets,
-            String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention,
-            List<String> snapshotCompletedTables) {
+            String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention) {
         this(miningChainId, sourceRead, consumerOffsets, cdcStartPosition, schemaHistory, retention,
-                snapshotCompletedTables, 0L, 0L);
+                0L, 0L);
     }
 }

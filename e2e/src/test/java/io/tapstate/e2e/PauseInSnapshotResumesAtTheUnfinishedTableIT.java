@@ -93,6 +93,7 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     }
 
     private static final String SRS_META = "srs_meta";
+    private static final String CONSUMERS = "consumerOffsets";
     private static final String COMPLETED = "snapshotCompletedTables";
 
     @TempDir
@@ -278,8 +279,17 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
             String database = new ConnectionString(storeUri).getDatabase();
             List<String> tables = new ArrayList<>();
             for (Document chain : client.getDatabase(database).getCollection(SRS_META).find()) {
-                if (chain.get(COMPLETED) instanceof List<?> entries) {
-                    entries.forEach(entry -> tables.add(String.valueOf(entry)));
+                // Completion is recorded against the pipeline that confirmed it, under its own consumer
+                // entry: a chain-level list would hand every pipeline on the chain the first one's answer.
+                // One pipeline runs here, so gathering every consumer's marks is the same set.
+                if (!(chain.get(CONSUMERS) instanceof Document byPipeline)) {
+                    continue;
+                }
+                for (String pipelineId : byPipeline.keySet()) {
+                    if (byPipeline.get(pipelineId) instanceof Document record
+                            && record.get(COMPLETED) instanceof List<?> entries) {
+                        entries.forEach(entry -> tables.add(String.valueOf(entry)));
+                    }
                 }
             }
             return tables;

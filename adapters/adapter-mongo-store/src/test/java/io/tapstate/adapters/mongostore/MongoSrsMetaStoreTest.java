@@ -39,14 +39,13 @@ class MongoSrsMetaStoreTest {
                 "orders@mysql-1",
                 new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"),
                 List.of(
-                        new ConsumerOffset("p1", Map.of("orders", 42L), new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100")),
+                        new ConsumerOffset("p1", Map.of("orders", 42L), new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100"), List.of("orders")),
                         new ConsumerOffset("p2", new LinkedHashMap<>(Map.of("orders", 7L, "items", 3L)), null)),
                 "binlog.000042:1024",
                 List.of(
                         new SchemaVersion(0, Map.of("id", "int"), 0),
                         new SchemaVersion(1, new LinkedHashMap<>(Map.of("id", "int", "name", "string")), 12)),
-                "7d",
-                List.of("orders"));
+                "7d");
 
         Document document = MongoSrsMetaStore.toDocument(meta);
 
@@ -54,35 +53,66 @@ class MongoSrsMetaStoreTest {
         assertThat(document.getString("sourceReadOffset")).isEqualTo("gtid:aaa-1:900");
         assertThat(document.getString("cdcStartPosition")).isEqualTo("binlog.000042:1024");
         assertThat(document.getString("retention")).isEqualTo("7d");
-        // consumer cursors keyed by pipeline id, so a per-consumer set targets one path
+        // consumer records keyed by pipeline id, so a per-consumer set targets one path
         assertThat(document.get("consumerOffsets", Document.class)).containsOnlyKeys("p1", "p2");
-        // snapshot completion is per table: this chain has drained orders but not items
-        assertThat(document.getList("snapshotCompletedTables", String.class)).containsExactly("orders");
+        // Snapshot completion is per table and per pipeline: p1 has drained orders, p2 has drained
+        // nothing -- and a consumer that has drained nothing carries no such field at all.
+        assertThat(document.get("consumerOffsets", Document.class)
+                .get("p1", Document.class)
+                .getList("snapshotCompletedTables", String.class)).containsExactly("orders");
+        assertThat(document.get("consumerOffsets", Document.class).get("p2", Document.class))
+                .doesNotContainKey("snapshotCompletedTables");
+        assertThat(document).doesNotContainKey("snapshotCompletedTables");
         assertThat(MongoSrsMetaStore.toMeta(document)).isEqualTo(meta);
     }
 
     @Test
     void snapshotCompleteAddsToSetSoARepeatedMarkDoesNotDuplicateTheTable() {
-        Document update = MongoSrsMetaStore.snapshotCompleteUpdate("orders");
+        Document update = MongoSrsMetaStore.snapshotCompleteUpdate("p1", "orders");
 
         // $addToSet, not $push: a re-run of a table's snapshot (a restart mid-backfill, a replay) marks the
         // same table again, and the mark is a set membership question -- "has this table drained?" -- so a
         // second mark must be a no-op rather than a second entry.
-        assertThat(update).isEqualTo(new Document("$addToSet", new Document("snapshotCompletedTables", "orders")));
+        //
+        // The path is scoped to the marking pipeline. Writing it at the document root instead is what let a
+        // second pipeline on the same chain read the first one's answer, skip a load it had never done, and
+        // leave its target short of every row of that table with nothing thrown and nothing logged.
+        assertThat(update).isEqualTo(new Document("$addToSet",
+                new Document("consumerOffsets.p1.snapshotCompletedTables", "orders")));
     }
 
     @Test
-    void toMetaOnADocumentWrittenBeforeSnapshotCompletionExistedReadsBackAsNoTableCompleted() {
-        // The meta field set is append-only and a newer reader must stay compatible with a document written
-        // before the field existed. Absence is not corruption here: it reads as "no table has been marked",
-        // which is exactly what a chain snapshotted by an older build had recorded.
+    void toMetaOnAConsumerWithNoCompletionFieldReadsBackAsNoTableCompleted() {
+        // A consumer record is created by whichever of its three writers gets there first, and the two
+        // position writers create it without this field. Absence is not corruption: it reads as "this
+        // pipeline has marked nothing", which is what a consumer that has only ever read records.
         Document old = new Document("_id", "chain")
-                .append("consumerOffsets", new Document())
+                .append("consumerOffsets", new Document("p1", new Document("perTableSeq", new Document())))
                 .append("schemaHistory", List.of());
 
         SrsMeta meta = MongoSrsMetaStore.toMeta(old);
 
-        assertThat(meta.snapshotCompletedTables()).isEmpty();
+        assertThat(meta.snapshotCompletedTables("p1")).isEmpty();
+        assertThat(meta.snapshotCompletedTables("never-a-consumer")).isEmpty();
+    }
+
+    /**
+     * A consumer's completion set round-trips on its own, without any position beside it.
+     *
+     * <p>The three writers of a consumer record are independent, so the shape where only this one has
+     * written is real rather than hypothetical: a sink can confirm a snapshot table before the reader has
+     * published any per-table cursor and before any change has been acked.
+     */
+    @Test
+    void aConsumerWithOnlyCompletionMarksRoundTrips() {
+        SrsMeta meta = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset("p1", Map.of(), null, List.of("orders", "items"))),
+                null, List.of(), null);
+
+        SrsMeta back = MongoSrsMetaStore.toMeta(MongoSrsMetaStore.toDocument(meta));
+
+        assertThat(back.snapshotCompletedTables("p1")).containsExactly("orders", "items");
+        assertThat(back).isEqualTo(meta);
     }
 
     @Test

@@ -884,7 +884,7 @@ class ArtifactMutationServiceTest {
             // default the snapshot-complete tables and both generations away, which a detach does not do.
             chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceRead(), kept,
                     chain.cdcStartPosition(), chain.schemaHistory(), chain.retention(),
-                    chain.snapshotCompletedTables(), chain.epoch(), chain.snapshotEpoch()));
+                    chain.epoch(), chain.snapshotEpoch()));
         }
 
         @Override
@@ -918,7 +918,7 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             throw new UnsupportedOperationException("the delete path never advances a chain");
         }
 

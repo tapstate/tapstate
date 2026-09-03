@@ -66,6 +66,12 @@ class SrsMetaHotPathCostBench {
     /** Tables per consumer offset: the per-table cursor map each consumer carries. */
     private static final int TABLES = 8;
 
+    /**
+     * The table count a wide pipeline reads. Snapshot completion is a table name per finished table, so
+     * this is the axis along which the marks grow -- and the per-table read cursor grows along it too.
+     */
+    private static final int WIDE_TABLES = 100;
+
     private static final int WARMUP = 20;
     private static final int RUNS = 200;
 
@@ -93,8 +99,22 @@ class SrsMetaHotPathCostBench {
                     measureShape(store, collection, 1, ddls);
                 }
             }
-            // The shape a long-lived shared chain actually reaches, both axes at once.
-            measureShape(store, collection, 16, 500);
+            // The shape a long-lived shared chain actually reaches, both axes at once -- and the A/B for
+            // moving snapshot completion onto the consumer record. The hot path reads the consumers and
+            // nothing else, so the marks ride along on a read that never looks at them: the pair below
+            // differs in that one thing and in nothing else, which is the only way to say what carrying
+            // them costs. Read the two `read-projected` rows against each other -- not against a number
+            // from another machine or another day.
+            measureShape(store, collection, 16, 500, 0);
+            measureShape(store, collection, 16, 500, TABLES);
+
+            // The same A/B at the table count where the marks could actually start to matter. They are a
+            // table name each, so what they cost grows with how many tables a pipeline reads -- and the
+            // per-table cursor beside them grows the same way, which is why both arms carry the wide
+            // cursor and only the marks differ. Without this pair the reading would hold at eight tables
+            // and say nothing about a hundred, which is the size this product is aimed at.
+            measureShape(store, collection, 16, 0, 0, WIDE_TABLES);
+            measureShape(store, collection, 16, 0, WIDE_TABLES, WIDE_TABLES);
         }
     }
 
@@ -105,8 +125,24 @@ class SrsMetaHotPathCostBench {
      */
     private static void measureShape(
             MongoSrsMetaStore store, MongoCollection<Document> collection, int consumers, int ddls) {
-        String chain = "bench-c" + consumers + "-d" + ddls;
-        seed(store, chain, consumers, ddls);
+        measureShape(store, collection, consumers, ddls, 0);
+    }
+
+    /**
+     * The same, over a record whose consumers each carry {@code completed} finished tables. Completion is
+     * recorded per pipeline, on the consumer's own record, so it grows the very sub-document the hot path
+     * projects -- and what that costs is a measurement, not a deduction.
+     */
+    private static void measureShape(MongoSrsMetaStore store, MongoCollection<Document> collection,
+            int consumers, int ddls, int completed) {
+        measureShape(store, collection, consumers, ddls, completed, TABLES);
+    }
+
+    /** The same again, over consumers whose per-table cursor covers {@code tables} tables. */
+    private static void measureShape(MongoSrsMetaStore store, MongoCollection<Document> collection,
+            int consumers, int ddls, int completed, int tables) {
+        String chain = "bench-c" + consumers + "-d" + ddls + "-k" + completed + "-t" + tables;
+        seed(store, chain, consumers, ddls, completed, tables);
         long bytes = documentBytes(collection, chain);
 
         report(consumers, ddls, bytes, "read", read(store, chain));
@@ -174,16 +210,21 @@ class SrsMetaHotPathCostBench {
      * so what is measured is the shape production actually produces — including how the driver
      * serialises it — and not a hand-rolled approximation of it.
      */
-    private static void seed(MongoSrsMetaStore store, String chain, int consumers, int ddls) {
+    private static void seed(
+            MongoSrsMetaStore store, String chain, int consumers, int ddls, int completed, int tables) {
         store.create(chain, "P7D");
         for (int c = 0; c < consumers; c++) {
             Map<String, Long> perTable = new LinkedHashMap<>();
-            for (int t = 0; t < TABLES; t++) {
+            for (int t = 0; t < tables; t++) {
                 perTable.put("table_" + t, (long) (t * 1000 + c));
             }
             store.upsertConsumerOffset(chain, new ConsumerOffset(
                     "pipeline-" + c, perTable,
                     new ChainPosition(new SourceOrder(1L, c), "acked-token-" + c)));
+            // Through the real mutator, so what is measured is the document the sink actually leaves.
+            for (int t = 0; t < completed; t++) {
+                store.markSnapshotComplete(chain, "pipeline-" + c, "table_" + t);
+            }
         }
         for (int d = 0; d < ddls; d++) {
             store.appendSchemaVersion(chain, new SchemaVersion(d + 1, columns(), d + 1));

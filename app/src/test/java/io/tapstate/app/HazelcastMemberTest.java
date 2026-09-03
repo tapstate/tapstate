@@ -366,7 +366,7 @@ class HazelcastMemberTest {
             throw new UnsupportedOperationException();
         }
 
-        @Override public void markSnapshotComplete(String miningChainId, String table) {
+        @Override public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             throw new UnsupportedOperationException();
         }
     }

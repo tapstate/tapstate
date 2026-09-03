@@ -302,7 +302,7 @@ class SrsCoordinatorTest {
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             mutations.add("snapshotComplete:" + miningChainId + "/" + table);
         }
 

@@ -46,6 +46,9 @@ class ATableReadButNotAckedIsNotCompleteTest {
 
     private static final String CHAIN = "chain";
 
+    /** The consumer pipeline these runs belong to: snapshot completion is recorded against it. */
+    private static final String PIPE = "pipe";
+
     private static CaptureConfig config() {
         return new CaptureConfig("mysql", Map.of(), List.of("orders"));
     }
@@ -59,21 +62,21 @@ class ATableReadButNotAckedIsNotCompleteTest {
         ReadBackMeta meta = new ReadBackMeta();
         RereadablePort port = new RereadablePort(List.of(row(1), row(2)), "binlog.000042:1024");
 
-        long first = SnapshotPhase.run(port, config(), CHAIN, List.of("orders"), 1L, meta, e -> { });
+        long first = SnapshotPhase.run(port, config(), CHAIN, PIPE, List.of("orders"), 1L, meta, e -> { });
 
         // The read finished: every row of the table went downstream, and the batch reported its seam.
         assertThat(first).isEqualTo(2);
         // No sink confirmed those rows, so the one question this phase cannot answer stays unanswered.
         // Presence in this set means written, never merely read.
         assertThat(meta.read(CHAIN)).get()
-                .extracting(SrsMeta::snapshotCompletedTables)
+                .extracting(record -> record.snapshotCompletedTables(PIPE))
                 .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.list(String.class))
                 .isEmpty();
 
         // A restart: the durable record survives, the ring it ran under does not, so a new generation is
         // opened. The table is owed, so the run is a resume and keeps the generation its rows were pinned
         // to rather than taking the one running now.
-        long second = SnapshotPhase.run(port, config(), CHAIN, List.of("orders"), 2L, meta, e -> { });
+        long second = SnapshotPhase.run(port, config(), CHAIN, PIPE, List.of("orders"), 2L, meta, e -> { });
 
         // The whole of what this case is for: a table read and never written is read again. A run that
         // skipped it here would drop every row of it that has not changed since -- silently, and for good.
@@ -88,12 +91,12 @@ class ATableReadButNotAckedIsNotCompleteTest {
         ReadBackMeta meta = new ReadBackMeta();
         RereadablePort port = new RereadablePort(List.of(row(1), row(2)), "binlog.000042:1024");
 
-        SnapshotPhase.run(port, config(), CHAIN, List.of("orders"), 1L, meta, e -> { });
+        SnapshotPhase.run(port, config(), CHAIN, PIPE, List.of("orders"), 1L, meta, e -> { });
         // Standing in for the sink: these runs have no sink of their own, and confirming the write is its
         // act, made where the frontier reaches that table's rows.
-        meta.markSnapshotComplete(CHAIN, "orders");
+        meta.markSnapshotComplete(CHAIN, PIPE, "orders");
 
-        long second = SnapshotPhase.run(port, config(), CHAIN, List.of("orders"), 2L, meta, e -> { });
+        long second = SnapshotPhase.run(port, config(), CHAIN, PIPE, List.of("orders"), 2L, meta, e -> { });
 
         // Not redoing the load is the whole of what resuming means. Without this half, a phase that never
         // resumed anything would pass the case above.
@@ -192,20 +195,32 @@ class ATableReadButNotAckedIsNotCompleteTest {
         public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
             SrsMeta m = of(miningChainId);
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                    cdcStartPosition, m.schemaHistory(), m.retention(), m.snapshotCompletedTables(),
-                    m.epoch(), snapshotEpoch));
+                    cdcStartPosition, m.schemaHistory(), m.retention(), m.epoch(), snapshotEpoch));
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             SrsMeta m = of(miningChainId);
-            if (m.snapshotCompletedTables().contains(table)) {
-                return;
+            // Per pipeline, not per chain: the mark says this pipeline's sink took the table, and the
+            // pipelines sharing a chain each write somewhere of their own.
+            List<ConsumerOffset> consumers = new ArrayList<>();
+            ConsumerOffset mine = null;
+            for (ConsumerOffset consumer : m.consumerOffsets()) {
+                if (consumer.pipelineId().equals(pipelineId)) {
+                    mine = consumer;
+                } else {
+                    consumers.add(consumer);
+                }
             }
-            List<String> next = new ArrayList<>(m.snapshotCompletedTables());
-            next.add(table);
-            records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), next, m.epoch(),
+            List<String> completed =
+                    new ArrayList<>(mine == null ? List.of() : mine.snapshotCompletedTables());
+            if (!completed.contains(table)) {
+                completed.add(table);
+            }
+            consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
+                    mine == null ? null : mine.sinkAcked(), completed));
+            records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
+                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(),
                     m.snapshotEpoch()));
         }
 

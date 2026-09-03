@@ -299,15 +299,62 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            store.markSnapshotComplete(CHAIN, "orders");
-            store.markSnapshotComplete(CHAIN, "order_items");
-            store.markSnapshotComplete(CHAIN, "orders");
+            store.markSnapshotComplete(CHAIN, "p1", "orders");
+            store.markSnapshotComplete(CHAIN, "p1", "order_items");
+            store.markSnapshotComplete(CHAIN, "p1", "orders");
 
             // One chain carries many tables, each snapshotted by its own capture run, so the mark is per
             // table. The re-mark exercises $addToSet against the real driver: set membership, so a replayed
             // or re-run snapshot of a table that is already marked adds nothing.
-            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables())
+            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables("p1"))
                     .containsExactly("orders", "order_items");
+        });
+    }
+
+    /**
+     * Two pipelines on one chain keep separate completion sets against the real driver.
+     *
+     * <p>The dotted update path has to create the second consumer's entry rather than reach into the
+     * first's, and a document-root write would satisfy the single-pipeline case above while failing this
+     * one. That failure is the defect this exists for: a pipeline new to a shared chain reads another
+     * pipeline's answer, skips a load it never did, and leaves its target short of every row of that
+     * table -- run healthy, nothing logged.
+     */
+    @Test
+    void markSnapshotCompleteIsPerPipelineAgainstTheRealStore() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+
+            store.markSnapshotComplete(CHAIN, "p1", "orders");
+            store.markSnapshotComplete(CHAIN, "p1", "order_items");
+            store.markSnapshotComplete(CHAIN, "p2", "orders");
+
+            SrsMeta record = store.read(CHAIN).orElseThrow();
+            assertThat(record.snapshotCompletedTables("p1")).containsExactly("orders", "order_items");
+            assertThat(record.snapshotCompletedTables("p2")).containsExactly("orders");
+            assertThat(record.snapshotCompletedTables("never-a-consumer")).isEmpty();
+        });
+    }
+
+    /**
+     * Detaching a consumer takes its completion marks with it and leaves every other consumer's alone.
+     *
+     * <p>This is what makes a pipeline asked to re-read everything actually re-read it while others stay on
+     * the chain. Before completion moved onto the consumer there was nowhere to clear it from without
+     * deciding it on every other consumer's behalf, so it was left alone and the re-read never happened.
+     */
+    @Test
+    void detachingAConsumerClearsOnlyItsOwnCompletionMarks() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.markSnapshotComplete(CHAIN, "leaving", "orders");
+            store.markSnapshotComplete(CHAIN, "staying", "orders");
+
+            store.detachConsumer(CHAIN, "leaving");
+
+            SrsMeta record = store.read(CHAIN).orElseThrow();
+            assertThat(record.snapshotCompletedTables("leaving")).isEmpty();
+            assertThat(record.snapshotCompletedTables("staying")).containsExactly("orders");
         });
     }
 
@@ -343,7 +390,7 @@ class MongoSrsMetaStoreIT {
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.appendSchemaVersion("nope", new SchemaVersion(0, Map.of(), 0)))
                     .isInstanceOf(IllegalStateException.class);
-            assertThatThrownBy(() -> store.markSnapshotComplete("nope", "orders"))
+            assertThatThrownBy(() -> store.markSnapshotComplete("nope", "p1", "orders"))
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.openEpoch("nope"))
                     .isInstanceOf(IllegalStateException.class);

@@ -135,15 +135,26 @@ public interface SrsMetaStore {
     void appendSchemaVersion(String miningChainId, SchemaVersion version);
 
     /**
-     * Marks one table's bounded snapshot read as drained to completion on the chain. The caller marks a
-     * table only once that table's snapshot has finished, so a reader may take the mark as "every row of
-     * this table has been through" — a distinct question from the one {@link #setCdcStart}
-     * answers, which is where the tail resumes and is written before the snapshot begins. Completion is
-     * per table because one chain carries many, each snapshotted by its own capture run. Marking is
-     * idempotent (set membership): a table already marked stays marked once, so a re-run or replay of a
-     * table's snapshot is safe. A mutate on an unseeded chain is a caller ordering error.
+     * Marks one table's bounded snapshot read as drained to completion <em>for one consumer pipeline</em>.
+     * The caller marks a table only once that pipeline's sink has confirmed that table's rows, so a reader
+     * may take the mark as "every row of this table is in this pipeline's target" — a distinct question
+     * from the one {@link #setCdcStart} answers, which is where the tail resumes and is written before the
+     * snapshot begins.
+     *
+     * <p>Per table because one chain carries many, each snapshotted by its own capture run; per pipeline
+     * because each pipeline writes to a target of its own. A chain excludes the table subset from its
+     * identity, so two pipelines reading one database share a chain by construction — and a mark recorded
+     * against the chain alone would answer the second pipeline's question with the first one's answer. It
+     * would then skip a load it had never done and leave its target short of every row of that table, with
+     * the run healthy and nothing logged.
+     *
+     * <p>It creates the consumer entry when the pipeline has none yet, and it touches only the completion
+     * set, so it never clobbers the {@code perTableSeq} the pipeline's reader writes or the
+     * {@code sinkAckedSrcpos} its sink writes to the same record. Marking is idempotent (set membership):
+     * a table already marked stays marked once, so a re-run or replay of a table's snapshot is safe. A
+     * mutate on an unseeded chain is a caller ordering error.
      */
-    void markSnapshotComplete(String miningChainId, String table);
+    void markSnapshotComplete(String miningChainId, String pipelineId, String table);
 
     /**
      * Lists the id of every mining chain that carries a cursor for {@code pipelineId} — exactly the
@@ -164,6 +175,10 @@ public interface SrsMetaStore {
      * write headroom over every consumer's read cursor — and a consumer that will never advance again
      * pins both, permanently and silently, for every other pipeline on the shared chain.
      *
+     * <p>It removes the whole of that consumer's record, the tables it had finished loading included. That
+     * is what makes a pipeline asked to re-read everything actually re-read it while others stay on the
+     * chain: its completion marks are its own, so clearing them decides nothing on anybody else's behalf.
+     *
      * <p>Unlike the other mutators, this one is idempotent rather than an ordering error on an unseeded
      * chain: a detach states the end condition "this consumer holds nothing here", which an absent chain
      * and an absent cursor already satisfy. Refusing them would let one benign race abort a removal
@@ -173,16 +188,11 @@ public interface SrsMetaStore {
     void detachConsumer(String miningChainId, String pipelineId);
 
     /**
-     * Removes a mining chain's whole record — the read offset, the seam the tail resumes from, the
-     * schema history, and which tables have finished their initial load. Only the last pipeline to
-     * leave a chain may call this: what it removes is shared, and taking it away while another pipeline
-     * reads the chain would have that pipeline read its whole source again with nothing anywhere saying
-     * why.
-     *
-     * <p>It follows that a pipeline asked to re-read everything, on a chain somebody else is still on,
-     * does not get its tables' completion marks cleared -- those are the chain's, not its own. That is
-     * the answer rather than a shortfall: one consumer cannot make a shared chain forget what it has
-     * read without deciding it on every other consumer's behalf.
+     * Removes a mining chain's whole record — the read offset, the seam the tail resumes from, the schema
+     * history, and every consumer's cursor with it. Only the last pipeline to leave a chain may call this:
+     * what it removes is shared, and taking it away while another pipeline reads the chain would have that
+     * pipeline read its whole source again with nothing anywhere saying why. A pipeline leaving a chain
+     * others are still on gives back its own record instead — {@link #detachConsumer}.
      *
      * <p>Idempotent rather than an ordering error on an absent chain, for the reason
      * {@link #detachConsumer} is: this states the end condition "there is no record for this chain",

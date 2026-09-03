@@ -129,10 +129,13 @@ public final class CaptureRunUnit {
 
             long snapshotCount = 0;
             Map<String, Long> snapshotCounts = new LinkedHashMap<>();
-            // Which tables a resuming run still owes is asked once, by the snapshot phase, of the durable
-            // record -- so it survives the process that answered it last, and a run that owes none reads
-            // nothing. Asking the coarser "is the whole load done" here as well put the same question to
-            // the same record twice, and two readings of one fact are two things that can disagree.
+            // Which tables a resuming run still owes is asked once, by the snapshot phase, of this
+            // pipeline's own record on the chain -- so it survives the process that answered it last, and a
+            // run that owes none reads nothing. Asking the coarser "is the whole load done" here as well
+            // put the same question to the same record twice, and two readings of one fact are two things
+            // that can disagree. It is the pipeline's question and not the chain's: a chain excludes the
+            // table subset from its identity, so a second pipeline on it would otherwise inherit the
+            // first's answer and skip a load it never did.
             if (plan.snapshot()) {
                 Consumer<Envelope> snapshotPassthrough = event -> {
                     snapshotCounts.merge(event.src(), 1L, Long::sum);
@@ -141,8 +144,8 @@ public final class CaptureRunUnit {
                 // A chainless read has no ring and so no generation to order its rows against: they carry no
                 // order at all, which a stateful node downstream rejects rather than guesses at.
                 snapshotCount = chainId != null
-                        ? SnapshotPhase.run(port, spec.config(), chainId.value(), tables, epoch,
-                                meta, snapshotPassthrough)
+                        ? SnapshotPhase.run(port, spec.config(), chainId.value(), spec.pipelineId(),
+                                tables, epoch, meta, snapshotPassthrough)
                         : SnapshotPhase.drain(port, spec.config(), snapshotPassthrough);
             }
 

@@ -4,7 +4,9 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.event.ChainPosition;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -44,6 +46,48 @@ class ConsumerOffsetTest {
         ConsumerOffset offset = new ConsumerOffset("p", Map.of("orders", 1L), null);
         assertThatThrownBy(() -> offset.perTableSeq().put("items", 2L))
                 .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void holdsTheTablesThisPipelineHasFinishedLoading() {
+        ConsumerOffset offset = new ConsumerOffset(
+                "orders-pipeline", Map.of("orders", 42L), null, List.of("orders", "order_items"));
+        assertThat(offset.snapshotCompletedTables()).containsExactly("orders", "order_items");
+    }
+
+    /**
+     * The three-argument shape leaves the completion set empty rather than absent.
+     *
+     * <p>It is the shape a consumer has before its sink confirms anything, and the two writers that create
+     * a consumer record -- the read cursor and the sink-ack -- both use it. Empty is the correct reading
+     * for them: a pipeline that has confirmed nothing owes every table it selected.
+     */
+    @Test
+    void theThreeArgConstructorLeavesNoTableFinished() {
+        ConsumerOffset offset = new ConsumerOffset("p", Map.of("orders", 5L), null);
+        assertThat(offset.snapshotCompletedTables()).isEmpty();
+    }
+
+    @Test
+    void copiesTheCompletedTablesSoALaterMutationDoesNotLeakIn() {
+        List<String> live = new ArrayList<>();
+        live.add("orders");
+        ConsumerOffset offset = new ConsumerOffset("p", Map.of(), null, live);
+        live.clear();
+        assertThat(offset.snapshotCompletedTables()).containsExactly("orders");
+    }
+
+    @Test
+    void rejectsMutationOfTheReturnedCompletedTables() {
+        ConsumerOffset offset = new ConsumerOffset("p", Map.of(), null, List.of("orders"));
+        assertThatThrownBy(() -> offset.snapshotCompletedTables().add("items"))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void rejectsANullCompletedTables() {
+        assertThatThrownBy(() -> new ConsumerOffset("p", Map.of(), null, null))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

@@ -75,8 +75,14 @@ class StoreBackedSinkAckFactoryTest {
         // it finished reading, which is a different question: a table read and never written looks done to
         // it, and the next run skips it. What the tail then replays is only what changed after the snapshot
         // began -- a row that never changed again is simply absent from the target, for good.
-        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables())
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
                 .containsExactly("orders");
+        // The mark is this pipeline's, and only this pipeline's. A chain is keyed by the source connection
+        // and excludes the table subset, so another pipeline reading the same database shares this record
+        // -- and would otherwise be told its own initial load was done and skip it, leaving its target
+        // short of every row of the table with the run healthy and nothing logged.
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("another-pipeline"))
+                .isEmpty();
     }
 
     @Test
@@ -92,7 +98,7 @@ class StoreBackedSinkAckFactoryTest {
         // A change acked at a spot in the stream proves the sink wrote that change, not that it wrote a
         // snapshot. A cdc-only read has no snapshot at all, and marking one done here would let a later run
         // skip a full load that never ran.
-        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables()).isEmpty();
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1")).isEmpty();
     }
 
     @Test

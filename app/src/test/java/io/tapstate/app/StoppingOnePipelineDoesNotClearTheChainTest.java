@@ -38,10 +38,15 @@ import org.junit.jupiter.api.Test;
  * a shared record away from whoever is still reading it. What that costs the survivor is not an error
  * either: it reads its whole source again, successfully and quietly.
  *
- * <p>All four of the chain's own fields are asserted rather than one standing in for the rest. They are
- * written by four different paths, and the two that decide whether a re-read happens at all -- the seam
- * the tail resumes from, and which tables have finished their initial load -- are the two a partial
- * clearing is most likely to leave behind.
+ * <p>All three of the chain's own fields are asserted rather than one standing in for the rest. They are
+ * written by three different paths, and the one that decides whether a re-read happens at all -- the seam
+ * the tail resumes from -- is the one a partial clearing is most likely to leave behind.
+ *
+ * <p>Which tables have finished their initial load is asserted separately and in both directions, because
+ * it is not the chain's: it answers "are this pipeline's rows in this pipeline's target", and the
+ * pipelines sharing a chain each write somewhere of their own. A stop therefore takes exactly one
+ * pipeline's marks -- keeping the survivor's is what stops it re-reading its whole source, and dropping
+ * the leaving one's is what makes its next run redo the load it asked to redo.
  */
 class StoppingOnePipelineDoesNotClearTheChainTest {
 
@@ -53,6 +58,8 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         fixture.leaveACursorFor("p");
         fixture.leaveACursorFor("q");
         fixture.leaveWhatTheChainAccumulated();
+        fixture.leaveAFinishedTableFor("p");
+        fixture.leaveAFinishedTableFor("q");
 
         fixture.coordinator.stopCapture("p", true);
 
@@ -65,12 +72,19 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
                 .as("the seam its tail resumes from -- losing this is what makes a survivor re-read")
                 .isEqualTo("seam-1");
         assertThat(chain.schemaHistory()).as("the schema the chain saw").hasSize(1);
-        assertThat(chain.snapshotCompletedTables())
-                .as("which tables finished their initial load -- the other half of a silent re-read")
-                .containsExactly("orders");
         assertThat(fixture.consumersOnTheChain())
                 .as("and only the leaving pipeline's own cursor was given back")
                 .containsExactly("q");
+        // Which tables finished their initial load is each pipeline's own answer, so a stop takes exactly
+        // one pipeline's marks. Both halves are asserted because each fails on its own: keeping the
+        // survivor's is what stops it re-reading its whole source for no reason, and dropping the leaving
+        // one's is what makes that pipeline's next run actually redo the load it asked to redo.
+        assertThat(chain.snapshotCompletedTables("q"))
+                .as("the survivor keeps what it finished -- the other half of a silent re-read")
+                .containsExactly("orders");
+        assertThat(chain.snapshotCompletedTables("p"))
+                .as("and the pipeline that asked for its state to be cleared no longer looks finished")
+                .isEmpty();
     }
 
     @Test
@@ -142,13 +156,21 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
             store.meta().upsertConsumerOffset(chainId(), new ConsumerOffset(pipelineId, Map.of(), null));
         }
 
-        /** All four of the chain's own fields, each written by the path that really writes it. */
+        /** The chain's own three fields, each written by the path that really writes it. */
         void leaveWhatTheChainAccumulated() {
             store.meta().advanceSourceReadOffset(
                     chainId(), new ChainPosition(new SourceOrder(1L, 500L), "token-500"));
             store.meta().setCdcStart(chainId(), "seam-1", 1L);
             store.meta().appendSchemaVersion(chainId(), new SchemaVersion(0, Map.of("id", "int"), 0));
-            store.meta().markSnapshotComplete(chainId(), "orders");
+        }
+
+        /**
+         * One pipeline's finished table, which is that pipeline's and not the chain's. Seeded only for
+         * pipelines that are actually on the chain: the mark creates the consumer entry when there is
+         * none, so marking for an absent pipeline would put it on the chain.
+         */
+        void leaveAFinishedTableFor(String pipelineId) {
+            store.meta().markSnapshotComplete(chainId(), pipelineId, "orders");
         }
 
         Optional<SrsMeta> chainRecord() {

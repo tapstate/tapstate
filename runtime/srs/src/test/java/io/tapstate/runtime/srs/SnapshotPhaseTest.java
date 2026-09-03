@@ -36,6 +36,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class SnapshotPhaseTest {
 
+    /** The consumer pipeline these runs belong to: snapshot completion is recorded against it. */
+    private static final String PIPE = "pipe";
+
     private static CaptureConfig config() {
         return new CaptureConfig("mysql", Map.of(), List.of("orders"));
     }
@@ -65,7 +68,7 @@ class SnapshotPhaseTest {
         List<Envelope> sink = new ArrayList<>();
 
         long count = SnapshotPhase.run(
-                port, config(), "chain", List.of("orders"),
+                port, config(), "chain", PIPE, List.of("orders"),
                 1L, new RecordingMeta(new ArrayList<>()), sink::add);
 
         // Straight through in batch order, each row stamped with the generation and otherwise untouched.
@@ -103,7 +106,7 @@ class SnapshotPhaseTest {
         FakeBatch batch = new FakeBatch(List.of(row(1)), "p0");
 
         SnapshotPhase.run(
-                new FakePort(batch), config(), "chain", List.of("orders"),
+                new FakePort(batch), config(), "chain", PIPE, List.of("orders"),
                 1L, new RecordingMeta(new ArrayList<>()), e -> {});
 
         assertThat(batch.closed).isTrue();
@@ -116,7 +119,7 @@ class SnapshotPhaseTest {
         Consumer<Envelope> sink = e -> trace.add("event");
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1), row(2)), "binlog.000042:1024")), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(row(1), row(2)), "binlog.000042:1024")), config(), "chain", PIPE, List.of("orders"),
                 1L, meta, sink);
 
         // The cdc-start position is the source log position sampled at snapshot start: recorded before the
@@ -138,7 +141,7 @@ class SnapshotPhaseTest {
         RecordingMeta meta = new RecordingMeta(new ArrayList<>());
 
         assertThatThrownBy(() -> SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)))), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(row(1)))), config(), "chain", PIPE, List.of("orders"),
                 1L, meta, e -> { }))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .extracting(e -> ((io.tapstate.core.common.TapstateException) e).code())
@@ -152,7 +155,7 @@ class SnapshotPhaseTest {
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1), row(2)), "p0")), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(row(1), row(2)), "p0")), config(), "chain", PIPE, List.of("orders"),
                 4L, new RecordingMeta(new ArrayList<>()), sink::add);
 
         // A snapshot row has no position in the change stream, so nothing else can say where it sits
@@ -168,7 +171,7 @@ class SnapshotPhaseTest {
         RecordingMeta meta = new RecordingMeta(new ArrayList<>());
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), config(), "chain", PIPE, List.of("orders"),
                 4L, meta, e -> { });
 
         assertThat(meta.cdcStart).isEqualTo("binlog.000042:1024");
@@ -179,13 +182,12 @@ class SnapshotPhaseTest {
     void aSnapshotThatNeverDrainedKeepsItsGenerationWhenItRerunsUnderANewRing() {
         // The chain recorded a seam under generation 1 and this table never finished draining, so the ring
         // that is running now is a rebuild -- generation 2. The rerun's rows must stay on generation 1.
-        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null,
-                List.of(), 2L, 1L);
+        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null, 2L, 1L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), config(), "chain", PIPE, List.of("orders"),
                 2L, meta, sink::add);
 
         // This is the whole reason the two generations are kept apart. Rows of a rerun that took the
@@ -199,12 +201,11 @@ class SnapshotPhaseTest {
     void aSnapshotThatNeverDrainedResumesFromTheSeamItRecordedRatherThanTheOneSampledNow() {
         // The same interruption as above, but the source has moved on: the batch this rerun opens samples
         // a later seam than the one the interrupted run recorded.
-        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null,
-                List.of(), 2L, 1L);
+        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null, 2L, 1L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000099:1")), config(), "chain",
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000099:1")), config(), "chain", PIPE,
                 List.of("orders"), 2L, meta, e -> { });
 
         // Overwriting the recorded seam with this run's would move where the tail begins forward over the
@@ -219,13 +220,14 @@ class SnapshotPhaseTest {
     @Test
     void readsNothingWhenEverySelectedTableIsAlreadyRecordedAsWritten() {
         // Same recorded seam, and the one selected table is recorded as written.
-        SrsMeta written = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null,
-                List.of("orders"), 2L, 1L);
+        SrsMeta written = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"))),
+                "binlog.000042:1024", List.of(), null, 2L, 1L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), written);
         FakePort port = new FakePort(new FakeBatch(List.of(row(1)), "binlog.000099:1"));
         List<Envelope> sink = new ArrayList<>();
 
-        long count = SnapshotPhase.run(port, config(), "chain", List.of("orders"), 2L, meta, sink::add);
+        long count = SnapshotPhase.run(port, config(), "chain", PIPE, List.of("orders"), 2L, meta, sink::add);
 
         // Nothing is owed, so nothing is read and nothing is written down -- not even a seam. Reading the
         // table again here would be a re-mine, and a re-mine is not something a resume decides to do on its
@@ -240,13 +242,12 @@ class SnapshotPhaseTest {
 
     @Test
     void aChainThatRecordedNoSeamHasNoSnapshotToResumeAndTakesTheGenerationRunningNow() {
-        SrsMeta neverSnapshotted = new SrsMeta("chain", null, List.of(), null, List.of(), null,
-                List.of(), 2L, 0L);
+        SrsMeta neverSnapshotted = new SrsMeta("chain", null, List.of(), null, List.of(), null, 2L, 0L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), neverSnapshotted);
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)), "p0")), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(row(1)), "p0")), config(), "chain", PIPE, List.of("orders"),
                 2L, meta, sink::add);
 
         assertThat(sink).extracting(event -> event.position().order()).containsOnly(SourceOrder.snapshotRow(2L));
@@ -259,7 +260,7 @@ class SnapshotPhaseTest {
         Consumer<Envelope> sink = e -> trace.add("event");
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1), row(2)), "binlog.000042:1024")), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(row(1), row(2)), "binlog.000042:1024")), config(), "chain", PIPE, List.of("orders"),
                 1L, meta, sink);
 
         // The cdc-start position is the one thing this phase writes, and it goes down before the drain: it
@@ -278,7 +279,7 @@ class SnapshotPhaseTest {
                 "customers", new FakeBatch(List.of(row("customers", 1)), "p0")));
         RecordingMeta meta = new RecordingMeta(new ArrayList<>());
 
-        SnapshotPhase.run(port, multiTableConfig(), "chain",
+        SnapshotPhase.run(port, multiTableConfig(), "chain", PIPE,
                 List.of("orders", "customers"), 1L, meta, e -> { });
 
         // Nothing in the record shows either table as written, so both are owed and both are read -- one
@@ -301,7 +302,7 @@ class SnapshotPhaseTest {
         };
 
         assertThatThrownBy(() -> SnapshotPhase.run(
-                port, threeTableConfig(), "chain", List.of("orders", "customers", "invoices"),
+                port, threeTableConfig(), "chain", PIPE, List.of("orders", "customers", "invoices"),
                 1L, meta, failingOnCustomers))
                 .isInstanceOf(IllegalStateException.class);
 
@@ -323,7 +324,7 @@ class SnapshotPhaseTest {
                 "customers", new FakeBatch(List.of(row("customers", 1)), "binlog.000042:9999")));
         RecordingMeta meta = new RecordingMeta(trace);
 
-        SnapshotPhase.run(port, multiTableConfig(), "chain", List.of("orders", "customers"),
+        SnapshotPhase.run(port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"),
                 1L, meta, e -> { });
 
         // Every table of one round joins the tail at the same seam. Each bounded read samples one of its
@@ -339,13 +340,14 @@ class SnapshotPhaseTest {
     void oneTableOfTheSelectionStillUndrainedKeepsTheGenerationForAllOfThem() {
         // The seam was recorded under generation 1 and the ring running now is a rebuild -- generation 2.
         // One of the two selected tables drained before the interruption; the other did not.
-        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null,
-                List.of("orders"), 2L, 1L);
+        SrsMeta interrupted = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"))),
+                "binlog.000042:1024", List.of(), null, 2L, 1L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
         List<Envelope> sink = new ArrayList<>();
 
         SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), multiTableConfig(), "chain",
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000042:1024")), multiTableConfig(), "chain", PIPE,
                 List.of("orders", "customers"), 2L, meta, sink::add);
 
         // The whole selection is re-read by the one drain, the already-drained table included. Judging the
@@ -360,15 +362,16 @@ class SnapshotPhaseTest {
     void readsOnlyTheTablesTheRecordDoesNotShowAsWritten() {
         // The seam was recorded under generation 1 and the ring running now is a rebuild -- generation 2.
         // One of the two selected tables is recorded as written; the other is not.
-        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null,
-                List.of("orders"), 2L, 1L);
+        SrsMeta interrupted = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"))),
+                "binlog.000042:1024", List.of(), null, 2L, 1L);
         FakePort port = new FakePort(Map.of(
                 "orders", new FakeBatch(List.of(row("orders", 1)), "binlog.000042:1024"),
                 "customers", new FakeBatch(List.of(row("customers", 1)), "binlog.000042:1024")));
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
         List<Envelope> sink = new ArrayList<>();
 
-        long count = SnapshotPhase.run(port, multiTableConfig(), "chain",
+        long count = SnapshotPhase.run(port, multiTableConfig(), "chain", PIPE,
                 List.of("orders", "customers"), 2L, meta, sink::add);
 
         // Not redoing the load is the whole of what resuming means: a table already written is not read
@@ -394,7 +397,7 @@ class SnapshotPhaseTest {
         RecordingMeta meta = new RecordingMeta(new ArrayList<>());
 
         assertThatThrownBy(() -> SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(row(1), row(2)), "p0")), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(row(1), row(2)), "p0")), config(), "chain", PIPE, List.of("orders"),
                 1L, meta, failingOnSecond))
                 .isInstanceOf(IllegalStateException.class);
 
@@ -413,7 +416,7 @@ class SnapshotPhaseTest {
         };
 
         assertThatThrownBy(() -> SnapshotPhase.run(
-                new FakePort(batch), config(), "chain", List.of("orders"),
+                new FakePort(batch), config(), "chain", PIPE, List.of("orders"),
                 1L, new RecordingMeta(new ArrayList<>()), failing))
                 .isInstanceOf(IllegalStateException.class);
 
@@ -426,7 +429,7 @@ class SnapshotPhaseTest {
         List<String> trace = new ArrayList<>();
 
         assertThatThrownBy(() -> SnapshotPhase.run(
-                new FakePort(new FakeBatch(List.of(), "p0")), config(), "chain", List.of("orders"),
+                new FakePort(new FakeBatch(List.of(), "p0")), config(), "chain", PIPE, List.of("orders"),
                 1L, new RecordingMeta(trace), null))
                 .isInstanceOf(NullPointerException.class);
 
@@ -564,8 +567,8 @@ class SnapshotPhaseTest {
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
-            completed.add(miningChainId + "/" + table);
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
+            completed.add(miningChainId + "/" + pipelineId + "/" + table);
             trace.add("snapshot-complete");
         }
 

@@ -31,11 +31,12 @@ import java.util.Optional;
  * chain id (as {@code _id}); each facet is advanced by its own atomic update, so a consumer that sets
  * its own cursor never clobbers another consumer's concurrent set or the chain's offset advance.
  *
- * <p>The consumer cursors are stored as a sub-document keyed by pipeline id — a resource id, which the
- * grammar forbids from containing a dot, so the id is a safe update path and one consumer's cursor is
- * set at {@code consumerOffsets.<pipelineId>} independently. The schema history is an append-only array
- * advanced by {@code $push}. The nullable positions are stored only when present, never as explicit
- * nulls.
+ * <p>Each consumer's own state is stored as a sub-document keyed by pipeline id — a resource id, which
+ * the grammar forbids from containing a dot, so the id is a safe update path and one consumer is updated
+ * at {@code consumerOffsets.<pipelineId>} independently. That sub-document holds everything belonging to
+ * one pipeline rather than to the chain: its read cursor, its acked position, and the tables whose initial
+ * load its sink has confirmed. The schema history is an append-only array advanced by {@code $push}. The
+ * nullable positions are stored only when present, never as explicit nulls.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A re-seed of an existing chain (which would discard its accumulated truth) and a mutate of
@@ -256,19 +257,27 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public void markSnapshotComplete(String miningChainId, String table) {
-        update(miningChainId, snapshotCompleteUpdate(table));
+    public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
+        update(miningChainId, snapshotCompleteUpdate(pipelineId, table));
     }
 
     /**
-     * The update that marks one table's snapshot drained: an {@code $addToSet} on
-     * {@code snapshotCompletedTables}. A set add, not a push — the mark answers "has this table drained?",
-     * so re-marking a table (a replay, a re-run of the snapshot) must be a no-op rather than a duplicate
-     * entry.
+     * The update that marks one table's snapshot drained for one consumer: an {@code $addToSet} on
+     * {@code consumerOffsets.<pipelineId>.snapshotCompletedTables}. A set add, not a push — the mark
+     * answers "has this table landed in this pipeline's target?", so re-marking a table (a replay, a
+     * re-run of the snapshot) must be a no-op rather than a duplicate entry.
+     *
+     * <p>Scoped under the consumer for the same reason its cursor is: the pipeline id is a resource id the
+     * grammar forbids a dot in, so the dotted path addresses exactly one consumer's set and cannot reach a
+     * neighbour's. Recording it against the chain instead is what let a pipeline new to a shared chain read
+     * another pipeline's answer and skip a load it had never done. The path creates the consumer entry when
+     * the pipeline has none yet, and touches nothing else in it.
      */
-    static Document snapshotCompleteUpdate(String table) {
+    static Document snapshotCompleteUpdate(String pipelineId, String table) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(table, "table");
-        return new Document("$addToSet", new Document("snapshotCompletedTables", table));
+        return new Document("$addToSet",
+                new Document("consumerOffsets." + pipelineId + ".snapshotCompletedTables", table));
     }
 
     @Override
@@ -362,8 +371,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // appended only when set, so a seed reads back as a seed rather than as corruption.
         Document document = new Document("_id", meta.miningChainId())
                 .append("consumerOffsets", consumers)
-                .append("schemaHistory", schemaHistory)
-                .append("snapshotCompletedTables", List.copyOf(meta.snapshotCompletedTables()));
+                .append("schemaHistory", schemaHistory);
         if (meta.sourceRead() != null) {
             document.putAll(sourceReadFields(meta.sourceRead()));
         }
@@ -420,19 +428,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         for (Object entry : entries) {
             schemaHistory.add(schemaFromDocument(asDocument(entry, id), id));
         }
-        // Absent snapshotCompletedTables is not corruption, unlike the two structural fields above: the
-        // meta field set is append-only and this field is newer than the collection, so a document written
-        // by an older build simply has no table marked.
-        Object completedRaw = document.get("snapshotCompletedTables");
-        List<String> snapshotCompletedTables = new ArrayList<>();
-        if (completedRaw instanceof List<?> completedEntries) {
-            for (Object entry : completedEntries) {
-                snapshotCompletedTables.add(String.valueOf(entry));
-            }
-        }
         return new SrsMeta(id, sourceReadFrom(document), consumers,
                 document.getString("cdcStartPosition"), schemaHistory, document.getString("retention"),
-                snapshotCompletedTables, readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"));
+                readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"));
     }
 
     /** Reconstructs one consumer cursor from its stored sub-document, keyed by the pipeline id. */
@@ -450,7 +448,24 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             // empty cursor rather than as corruption.
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId), null);
         }
-        return new ConsumerOffset(pipelineId, perTableSeq, sinkAckedFrom(document));
+        return new ConsumerOffset(
+                pipelineId, perTableSeq, sinkAckedFrom(document), snapshotCompletedFrom(document));
+    }
+
+    /**
+     * The tables one consumer has finished loading, empty when it has finished none. Absent is not
+     * corruption: a consumer entry is created by whichever of its three writers gets there first, and the
+     * two position writers create it without this field.
+     */
+    private static List<String> snapshotCompletedFrom(Document document) {
+        Object raw = document.get("snapshotCompletedTables");
+        List<String> completed = new ArrayList<>();
+        if (raw instanceof List<?> entries) {
+            for (Object entry : entries) {
+                completed.add(String.valueOf(entry));
+            }
+        }
+        return completed;
     }
 
     /** Reconstructs one schema version from its stored sub-document. */
@@ -505,13 +520,20 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 document.getString("sinkAckedSrcpos"));
     }
 
-    /** Maps one consumer cursor to its stored sub-document (the per-table read cursor plus the acked position). */
+    /**
+     * Maps one consumer's record to its stored sub-document: the per-table read cursor, the tables it has
+     * finished loading (omitted while it has finished none, so a cursor-only consumer stays a cursor-only
+     * consumer) and the acked position.
+     */
     private static Document consumerToDocument(ConsumerOffset offset) {
         Document perTable = new Document();
         for (Map.Entry<String, Long> entry : offset.perTableSeq().entrySet()) {
             perTable.append(entry.getKey(), entry.getValue());
         }
         Document document = new Document("perTableSeq", perTable);
+        if (!offset.snapshotCompletedTables().isEmpty()) {
+            document.append("snapshotCompletedTables", List.copyOf(offset.snapshotCompletedTables()));
+        }
         if (offset.sinkAcked() != null) {
             document.append("sinkAckedEpoch", offset.sinkAcked().order().epoch())
                     .append("sinkAckedSeq", offset.sinkAcked().order().seq());

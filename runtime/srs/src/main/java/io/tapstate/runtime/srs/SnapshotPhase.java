@@ -33,8 +33,10 @@ public final class SnapshotPhase {
      * {@code sink} with every row stamped with the generation this snapshot belongs to. Returns the number
      * of events passed through.
      *
-     * <p>A table at a time, and only the tables still owed. Which those are is read from the record: a
-     * table is owed until the sink is recorded as having written it. That is a different question from
+     * <p>A table at a time, and only the tables still owed. Which those are is read from this pipeline's
+     * own record on the chain: a table is owed until this pipeline's sink is recorded as having written
+     * it. Another pipeline on the same chain having finished it says nothing -- it wrote to its target,
+     * not to this one. That is a different question from
      * whether it was read, and only the first is safe to skip on -- a table read and never written, skipped
      * on the way back, leaves every one of its rows that has not changed since absent from the target for
      * good, because the tail only replays what changed after the seam.
@@ -74,6 +76,7 @@ public final class SnapshotPhase {
             CapturePort port,
             CaptureConfig config,
             String miningChainId,
+            String pipelineId,
             List<String> tables,
             long ringEpoch,
             SrsMetaStore meta,
@@ -81,6 +84,7 @@ public final class SnapshotPhase {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(tables, "tables");
         Objects.requireNonNull(meta, "meta");
         Objects.requireNonNull(sink, "sink");
@@ -89,7 +93,7 @@ public final class SnapshotPhase {
         }
 
         Optional<SrsMeta> record = meta.read(miningChainId);
-        List<String> owed = stillOwed(record, tables);
+        List<String> owed = stillOwed(record, pipelineId, tables);
         Optional<SrsMeta> resumed = resumedSnapshot(record, owed);
         long epoch = resumed.map(SrsMeta::snapshotEpoch).orElse(ringEpoch);
         SourceOrder order = SourceOrder.snapshotRow(epoch);
@@ -122,12 +126,21 @@ public final class SnapshotPhase {
     }
 
     /**
-     * The selected tables this run still owes a read: the ones the record does not show as written. A table
-     * is owed until the sink has confirmed it, however far its read got -- reading is not writing, and the
-     * only one of the two that is safe to skip a table on is the second.
+     * The selected tables this run still owes a read: the ones this pipeline's own record does not show as
+     * written. A table is owed until this pipeline's sink has confirmed it, however far its read got --
+     * reading is not writing, and the only one of the two that is safe to skip a table on is the second.
+     *
+     * <p>Read against the pipeline and not the chain. A chain is keyed by the source connection and
+     * excludes the table subset, so pipelines reading one database share a chain by construction while
+     * writing to targets of their own -- and a chain-level reading hands a pipeline new to the chain the
+     * answer another pipeline produced. It then owes nothing, enters no snapshot phase at all, and its
+     * target keeps none of the rows that were there before it started, with the run healthy and nothing
+     * logged.
      */
-    private static List<String> stillOwed(Optional<SrsMeta> record, List<String> tables) {
-        List<String> written = record.map(SrsMeta::snapshotCompletedTables).orElse(List.of());
+    private static List<String> stillOwed(
+            Optional<SrsMeta> record, String pipelineId, List<String> tables) {
+        List<String> written =
+                record.map(stored -> stored.snapshotCompletedTables(pipelineId)).orElse(List.of());
         return tables.stream().filter(table -> !written.contains(table)).toList();
     }
 

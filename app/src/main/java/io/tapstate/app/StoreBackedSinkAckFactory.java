@@ -56,7 +56,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             String token = position.token() != null ? position.token() : cdcStart(meta, miningChainId);
             meta.advanceSinkAcked(miningChainId, pipelineId, new ChainPosition(position.order(), token));
             if (isSnapshotOf(position)) {
-                meta.markSnapshotComplete(miningChainId, chain);
+                meta.markSnapshotComplete(miningChainId, pipelineId, chain);
             }
         };
     }
@@ -66,9 +66,11 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
      * snapshot carries, beneath every change of its generation. A frontier that has reached it has confirmed
      * the whole of that table's snapshot, because there is nothing of the snapshot above it left to wait on.
      *
-     * <p>This is the only moment anyone learns that a table's rows are in the target. The read side knows
-     * when it finished reading, which is a different question: a table read and never written looks finished
-     * to it, and a run that trusted that would skip the table on its way back. The tail only replays what
+     * <p>This is the only moment anyone learns that a table's rows are in <em>this pipeline's</em> target,
+     * which is why the mark is recorded against the pipeline and not the chain -- every pipeline on a chain
+     * writes somewhere of its own. The read side knows when it finished reading, which is a different
+     * question again: a table read and never written looks finished to it, and a run that trusted that would
+     * skip the table on its way back. The tail only replays what
      * changed after the snapshot began, so a row that never changed again would be absent from the target
      * for good -- nothing thrown, nothing logged.
      */
