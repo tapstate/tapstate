@@ -91,7 +91,7 @@ class RestartResumesTheTailIT {
                 Map<String, String> resources = new LinkedHashMap<>();
                 resources.put("src_mysql.tap.yml", sourceYaml(source));
                 resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
-                resources.put("pipeline.tap.yml", pipelineYaml());
+                resources.put("pipeline.tap.yml", pipelineYaml(PIPELINE_ID));
                 control.apply(resources);
                 control.discoverSchema("src_mysql", "mysql", source);
                 control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
@@ -140,6 +140,56 @@ class RestartResumesTheTailIT {
                         .isZero();
             }
         }
+    }
+
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void aRerunReadsTheWholeTableAgain(Tiers tier) throws Exception {
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        String pipelineId = "restart_verb_rerun";
+        Map<String, Object> source = SharedMySql.settings("restart_rerun_src_" + suffix);
+        seed(source);
+        String storeUri = SharedMongo.replicaSetUrl("restart_rerun_state_" + suffix);
+        String targetUri = SharedMongo.replicaSetUrl("restart_rerun_target_" + suffix);
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+
+        try (MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storeUri)) {
+            ControlPlane control = startedPipeline(server, source, targetUri, pipelineId);
+
+            awaitCount(mongo, target, SEEDED_ROWS, "the snapshot of the seeded rows");
+            update(source, 1, BEFORE_STOP);
+            awaitName(mongo, target, 1, BEFORE_STOP, "the change the first run captured");
+
+            // The pair `restart --rerun` composes: the stop clears, so there is nothing to carry on from.
+            control.stop(pipelineId, true);
+            control.lifecycle(pipelineId, LifecycleVerb.START);
+
+            // The count itself is the liveness here: nought would mean the run never started, and the
+            // whole table is the only reading that says it really read the table again.
+            assertThat(settledRowsRead(control, pipelineId))
+                    .as("rows the rerun read from %s: it was told to read everything, so it reads every "
+                            + "seeded row", TABLE)
+                    .isEqualTo(SEEDED_ROWS);
+        }
+    }
+
+    /** Everything up to and including the start, which the three cases here do identically. */
+    private static ControlPlane startedPipeline(
+            ServerHandle server, Map<String, Object> source, String targetUri, String pipelineId) {
+        ControlPlane control = new ControlPlane(server.baseUrl());
+        control.bootstrapAndLogin("e2e", "e2e-password");
+        control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+        control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+
+        Map<String, String> resources = new LinkedHashMap<>();
+        resources.put("src_mysql.tap.yml", sourceYaml(source));
+        resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
+        resources.put("pipeline.tap.yml", pipelineYaml(pipelineId));
+        control.apply(resources);
+        control.discoverSchema("src_mysql", "mysql", source);
+        control.lifecycle(pipelineId, LifecycleVerb.START);
+        return control;
     }
 
     /**
@@ -255,11 +305,11 @@ class RestartResumesTheTailIT {
                 .formatted(targetUri);
     }
 
-    private static String pipelineYaml() {
+    private static String pipelineYaml(String pipelineId) {
         return """
                 version: tapstate/v1
                 kind: pipeline
-                id: restart_tail
+                id: %s
                 source: src_mysql
                 settings: { read_mode: snapshot_and_cdc }
                 transforms:
@@ -268,7 +318,30 @@ class RestartResumesTheTailIT {
                   from: all_rows
                   sync:
                     - source: tgt_mongo
-                """;
+                """
+                .formatted(pipelineId);
+    }
+
+    /**
+     * What the run has read from the table once that reading stops moving. A single sample is the last
+     * collection rather than the current total, and low is the direction that would make the plain-restart
+     * case pass for the wrong reason.
+     */
+    private static long settledRowsRead(ControlPlane control, String pipelineId) {
+        long deadline = System.nanoTime() + TIMEOUT.toNanos();
+        long last = -1;
+        long unchangedSince = System.nanoTime();
+        while (System.nanoTime() - deadline < 0) {
+            long now = control.snapshotRowsRead(pipelineId).getOrDefault(TABLE, 0L);
+            if (now != last) {
+                last = now;
+                unchangedSince = System.nanoTime();
+            } else if (System.nanoTime() - unchangedSince > SETTLE.toNanos()) {
+                return last;
+            }
+            sleep();
+        }
+        return last;
     }
 
     private static void sleep() {
