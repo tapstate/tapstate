@@ -372,7 +372,7 @@ class SourceApiTest {
     }
 
     private static String base() {
-        return "http://localhost:" + port;
+        return "http://127.0.0.1:" + port;
     }
 
     private static String sourceJson(String id, String description) {

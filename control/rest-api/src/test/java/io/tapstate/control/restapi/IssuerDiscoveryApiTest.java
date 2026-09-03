@@ -42,7 +42,7 @@ class IssuerDiscoveryApiTest {
 
     @Test
     void anonymousGetReturnsTheExactDiscoveryJsonWithoutAnAuthorizationHeader() {
-        String body = RestClient.create("http://localhost:" + port).get()
+        String body = RestClient.create("http://127.0.0.1:" + port).get()
                 .uri(AuthWire.DISCOVERY_PATH)
                 .retrieve()
                 .body(String.class);

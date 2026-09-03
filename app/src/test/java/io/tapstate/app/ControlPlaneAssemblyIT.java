@@ -72,7 +72,7 @@ class ControlPlaneAssemblyIT {
     @Test
     void assemblesAuthenticatedArtifactAndStructuredSourceFlowsOverTheSingletonStore() {
         int port = start();
-        RestClient client = RestClient.create("http://localhost:" + port);
+        RestClient client = RestClient.create("http://127.0.0.1:" + port);
 
         assertThat(context.getBeansOfType(ConnectorCatalogView.class)).hasSize(1);
         assertThat(context.getBeansOfType(SourceRepresentation.class)).hasSize(1);
@@ -208,7 +208,7 @@ class ControlPlaneAssemblyIT {
     @Test
     void connectionTestIsWiredThroughToTheConnectorRegistryOverARealStore() {
         int port = start();
-        RestClient client = RestClient.create("http://localhost:" + port);
+        RestClient client = RestClient.create("http://127.0.0.1:" + port);
 
         // Bootstrap the first admin over loopback and sign in; the admin session covers the write verb.
         client.post().uri("/auth/bootstrap").contentType(MediaType.APPLICATION_JSON)
@@ -236,7 +236,7 @@ class ControlPlaneAssemblyIT {
     @Test
     void schemaDiscoveryIsWiredThroughToTheConnectorRegistryOverARealStore() {
         int port = start();
-        RestClient client = RestClient.create("http://localhost:" + port);
+        RestClient client = RestClient.create("http://127.0.0.1:" + port);
 
         client.post().uri("/auth/bootstrap").contentType(MediaType.APPLICATION_JSON)
                 .body(Map.of("username", "admin", "password", "s3cret")).retrieve().toBodilessEntity();
@@ -277,7 +277,7 @@ class ControlPlaneAssemblyIT {
         Files.write(seedDir.resolve("broken.jar"), new byte[] {0x13, 0x37});
 
         int port = start("tapstate.connectors.seed-dir=" + seedDir);
-        RestClient client = RestClient.create("http://localhost:" + port);
+        RestClient client = RestClient.create("http://127.0.0.1:" + port);
 
         String health = client.get().uri("/healthz").retrieve().body(String.class);
         assertThat(health).isEqualTo("ok");
@@ -286,7 +286,7 @@ class ControlPlaneAssemblyIT {
     @Test
     void connectorRegisterIsWiredThroughToTheIntrospectorAndStoreOverARealStore() throws IOException {
         int port = start();
-        RestClient client = RestClient.create("http://localhost:" + port);
+        RestClient client = RestClient.create("http://127.0.0.1:" + port);
 
         // Bootstrap the first admin over loopback and sign in; the admin session covers the write verb.
         client.post().uri("/auth/bootstrap").contentType(MediaType.APPLICATION_JSON)
@@ -314,7 +314,7 @@ class ControlPlaneAssemblyIT {
     @Test
     void connectorListIsWiredOverARealStoreAndReturnsTheBundledCatalog() {
         int port = start();
-        RestClient client = RestClient.create("http://localhost:" + port);
+        RestClient client = RestClient.create("http://127.0.0.1:" + port);
 
         client.post().uri("/auth/bootstrap").contentType(MediaType.APPLICATION_JSON)
                 .body(Map.of("username", "admin", "password", "s3cret")).retrieve().toBodilessEntity();
@@ -358,7 +358,6 @@ class ControlPlaneAssemblyIT {
         // first-admin bootstrap of one method never closes the bootstrap channel for the next.
         String database = "assembly_" + Long.toUnsignedString(System.nanoTime(), 16);
         List<String> properties = new ArrayList<>(List.of(
-                "server.port=0",
                 "tapstate.store.mongo.enabled=true",
                 "tapstate.store.mongo.uri=" + REPLICA_SET.getReplicaSetUrl(database),
                 // the container speaks plaintext; TLS is opt-in, so no flag is needed here
@@ -366,7 +365,13 @@ class ControlPlaneAssemblyIT {
         properties.addAll(List.of(extraProperties));
         context = new SpringApplicationBuilder(AssemblyApp.class)
                 .properties(properties.toArray(String[]::new))
-                .run("--server.port=0");
+                // Both the address and the port are run arguments, not default properties: `properties(...)`
+                // populates the lowest-ranked source Spring has, and the product's own application
+                // configuration publishes 8080, so a port asked for there is silently overridden. The
+                // address is the other half -- a free port alone binds the wildcard, and a wildcard bind
+                // does not reserve 127.0.0.1:<port>, so a process already holding that port on the loopback
+                // keeps receiving what this test sends.
+                .run("--server.address=127.0.0.1", "--server.port=0");
         return ((WebServerApplicationContext) context).getWebServer().getPort();
     }
 
