@@ -27,10 +27,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * re-reading costs the table. So the discriminating reading is the restarted run's own record count,
  * and it is asserted to stay below the seeded row count.
  *
- * <p>The count is read per run: it comes from the live job, so a restarted pipeline starts a fresh one
- * and the second reading is not a continuation of the first. It counts writes rather than source reads
- * -- the reading a witness of the read side actually wants does not exist on this face yet -- but a
- * snapshot that re-runs writes every row it re-reads, so the two are not separable here by accident.
+ * <p>Both counts are read per run: they come from the live job, so a restarted pipeline starts a fresh
+ * one and the second reading is not a continuation of the first. The write count is the cheaper signal
+ * and the read count is the claim: "it did not read the table again" is a statement about reads, and a
+ * run that re-read four rows of five and wrote them satisfies "wrote fewer than were seeded" while
+ * being exactly what this case says did not happen. So the rows-read reading is asserted at the value
+ * the claim names -- zero -- and the write count stays beside it.
  *
  * <p>A liveness gate runs before the assertion. An observation outliving the server it observes is the
  * standing failure of a restart witness: the pipeline reads RUNNING, every await passes against values
@@ -128,6 +130,14 @@ class RestartResumesTheTailIT {
                         .as("records the restarted run wrote: resuming costs the downtime change and the "
                                 + "liveness row, re-reading the table costs %d more", SEEDED_ROWS)
                         .isLessThan(SEEDED_ROWS);
+
+                // The claim itself. A resumed run reads no snapshot rows at all, so the entry is either
+                // absent or zero -- both say the table was not read again, and which of the two it is
+                // depends on whether the run published a snapshot face for a phase it never entered.
+                assertThat(control.snapshotRowsRead(PIPELINE_ID).getOrDefault(TABLE, 0L))
+                        .as("rows the restarted run read from %s: it resumes from a recorded position, "
+                                + "so the table is not read again at all", TABLE)
+                        .isZero();
             }
         }
     }
