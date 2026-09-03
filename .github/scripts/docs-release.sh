@@ -90,12 +90,52 @@ esac
 title="Release $version: publish the documentation site"
 tag="v$version"
 
+# Open a request in the documentation repository and put it in front of the person it is for.
+#
+# The create and the assignment are two calls on purpose. With `--assignee` on the create, a
+# rejected assignment failed the whole command *after* the issue had already been opened, so a
+# single exit code stood for two opposite states -- no request at all, and a request that reaches
+# nobody -- and the message named the wrong one. Measured across three releases: the issue existed
+# every time, unassigned, while the step said it could not be opened and settle then found it again
+# by title and counted it as one of four.
+#
+# Every outcome goes to stdout, and gh's own error is kept rather than discarded. The caller tees
+# stdout into the step summary; `>/dev/null 2>&1` is why three releases could say "could not" and
+# never why, and the reason is the only part that tells anybody what to change.
+#
+# The assignment runs under DOCS_ASSIGN_TOKEN when there is one: assigning somebody on that
+# repository takes more than opening an issue there does. Unset, it falls back to the ambient
+# credential and the outcome is reported either way.
+ask() {
+    ask_title="$1"
+    ask_body="$2"
+    ask_done="$3"
+    if ! ask_out="$(gh issue create --repo "$repo" --title "$ask_title" --body "$ask_body" 2>&1)"; then
+        echo "::warning::$repo holds no request for $tag -- ask $owner by hand: $ask_out"
+        echo "$repo  could not open \"$ask_title\" -- ask $owner by hand: $ask_out"
+        return 0
+    fi
+    # gh prints the URL on success; anything it says besides that is not the issue. Taking the last
+    # line would hand a warning to the assignment and report the request as unassignable.
+    ask_url="$(printf '%s\n' "$ask_out" | grep -oE 'https://[^[:space:]]+/issues/[0-9]+' | tail -1)"
+    if ask_err="$(GH_TOKEN="${DOCS_ASSIGN_TOKEN:-${GH_TOKEN:-}}" \
+                  gh issue edit "${ask_url##*/}" --repo "$repo" --add-assignee "$owner" 2>&1 >/dev/null)"; then
+        echo "$repo  $ask_done"
+    else
+        # The request exists and reaches nobody. It sits in a repository its owner does not watch,
+        # nothing else in the release mentions it, and the release goes out either way -- so this
+        # warning is the only thing between a silent request and a person.
+        echo "::warning::$ask_url asks for $tag but could not be assigned to $owner -- tell them by hand: $ask_err"
+        echo "$repo  opened $ask_url for $tag, unassigned -- tell $owner by hand: $ask_err"
+    fi
+}
+
 if [ "$verb" = open ]; then
     if [ "$plan" = 1 ]; then
         echo "$repo  open issue \"$title\", assigned to $owner"
         exit 0
     fi
-    gh issue create --repo "$repo" --title "$title" --assignee "$owner" --body \
+    ask "$title" \
 "tapstate $tag is being released. The site is published from \`main\`, so publishing this release's
 documentation means merging \`next\` into \`main\`.
 
@@ -107,9 +147,7 @@ publishes:
   issue asking you to finish and then create \`$tag\` yourself.
 
 Nothing here blocks the release. It does decide whether the tag is one less thing for you to do." \
-        >/dev/null 2>&1 \
-        && echo "$repo  asked $owner to publish the site for $tag" \
-        || echo "$repo  could not open the release issue -- ask $owner by hand" >&2
+        "asked $owner to publish the site for $tag"
     exit 0
 fi
 
@@ -221,8 +259,7 @@ if [ "$plan" = 1 ]; then
     echo "$repo  site not published yet: open a second issue asking $owner to finish and tag $tag"
     exit 0
 fi
-gh issue create --repo "$repo" --title "Still to do: publish the documentation for $tag" \
-   --assignee "$owner" --body \
+ask "Still to do: publish the documentation for $tag" \
 "tapstate $tag has been released. The documentation for it has not been published yet -- the earlier
 issue asking for \`next\` to be merged into \`main\` is still open, and the release did not wait for
 it, by design.
@@ -237,7 +274,5 @@ The tag is yours this time rather than ours because the release has already gone
 going to create it after the fact.
 
 The tapstate release: $notes_url" \
-   >/dev/null 2>&1 \
-   && echo "$repo  site not published in time; asked $owner to finish and tag $tag themselves" \
-   || echo "$repo  could not open the follow-up issue -- tell $owner by hand" >&2
+   "site not published in time; asked $owner to finish and tag $tag themselves"
 exit 0
