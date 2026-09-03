@@ -459,6 +459,58 @@ class PipelineConvergerTest {
         assertThat(actuator.calls()).containsExactly("stop:p1:keep");
     }
 
+    /**
+     * An intent asking to be re-assembled tears the held job down and submits a fresh one, in one pass.
+     *
+     * <p>Both halves here rather than as two intents: this side reads the latest intent rather than
+     * consuming every one written, so a stop written and immediately overwritten by a start is never
+     * observed at all -- neither half would happen, and the pipeline would carry on with the assembly it
+     * already had while the store said otherwise.
+     */
+    @Test
+    @DisplayName("an intent that asks to be re-assembled stops the held job and starts a fresh one")
+    void reassemblingFromPausedStopsThenStarts() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+
+        desired.save(new DesiredState("p1", RUNNING, "rev-2", false, "assembly-1", true));
+        converger.converge("p1");
+
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep", "start:p1");
+    }
+
+    /**
+     * And it keeps everything the pipeline has. Clearing would be the opposite of what was asked for: the
+     * point of re-assembling rather than re-reading is to carry on from the recorded position. A `:purge`
+     * here would look like success and silently make the next run read the whole source again.
+     */
+    @Test
+    @DisplayName("re-assembling never clears what the pipeline has")
+    void reassemblingKeepsThePosition() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+
+        desired.save(new DesiredState("p1", RUNNING, "rev-2", false, "assembly-1", true));
+        converger.converge("p1");
+
+        assertThat(actuator.calls()).doesNotContain("stop:p1:purge");
+    }
+
+    /** Without it, a resume is still a resume -- the held job is continued, not rebuilt. */
+    @Test
+    @DisplayName("an ordinary resume still continues the held job rather than rebuilding it")
+    void anOrdinaryResumeStillResumes() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+
+        converge(RUNNING);
+
+        assertThat(actuator.calls()).containsExactly("resume:p1");
+    }
+
     private void converge(io.tapstate.core.lifecycle.PipelineState target) {
         desired.save(new DesiredState("p1", target, REV));
         converger.converge("p1");

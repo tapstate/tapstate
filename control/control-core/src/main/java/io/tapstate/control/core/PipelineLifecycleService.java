@@ -72,7 +72,12 @@ public final class PipelineLifecycleService {
         return apply(principal, pipelineId, LifecycleVerb.PAUSE, false);
     }
 
-    /** Resumes the paused pipeline, provided its paused revision is still the latest applied one. */
+    /**
+     * Resumes the paused pipeline. When its paused revision is still the latest applied one it carries on
+     * as it was. When the definition was edited while it was paused, and everything that changed is safe
+     * to build the run again against, it carries on from its recorded position with the run assembled
+     * afresh; anything else is still {@code incompatible-revision}.
+     */
     public DesiredState resume(String principal, String pipelineId) {
         return apply(principal, pipelineId, LifecycleVerb.RESUME, false);
     }
@@ -90,15 +95,52 @@ public final class PipelineLifecycleService {
         PipelineState current = prior.map(DesiredState::targetState).orElse(PipelineState.NEW);
         PipelineState target = LifecycleMachine.transition(current, verb);
 
+        // What the latest artifact would be assembled from, alongside what it hashes to. Both are read off
+        // the same canonical text, so a field that moves one moves the other and the two cannot drift into
+        // disagreeing about what changed.
+        String latestAssembly = artifacts.assemblyIdentityOf(pipelineId).orElse(null);
+
         // The revision the verb runs at: a fresh start adopts the latest; the other verbs carry forward the
         // revision the pipeline is already at. A run verb (start / resume) must run at the latest applied.
         String runRevision = verb == LifecycleVerb.START ? latest : prior.map(DesiredState::revision).orElse(latest);
-        if ((verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME) && !runRevision.equals(latest)) {
+
+        // A resume over an edit made while the pipeline was paused. The refusal is right whenever carrying
+        // on would run the pipeline as it was against a definition that has moved; it is wrong only when
+        // everything that moved is re-read by building the run again, and then the answer is to build it
+        // again rather than to refuse -- the author asked to carry on from the position, and re-reading the
+        // whole source is not that.
+        boolean reassemble = verb == LifecycleVerb.RESUME
+                && !runRevision.equals(latest)
+                && latestAssembly != null
+                && latestAssembly.equals(prior.map(DesiredState::assemblyRevision).orElse(null));
+
+        if ((verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME)
+                && !runRevision.equals(latest) && !reassemble) {
             throw new TapstateException(
                     LifecycleError.INCOMPATIBLE_REVISION, Map.of("requested", runRevision, "latest", latest), null);
         }
+        // Having decided to re-assemble, the intent runs at the definition it will be built from.
+        if (reassemble) {
+            runRevision = latest;
+        }
 
-        DesiredState next = new DesiredState(pipelineId, target, runRevision, purgeState);
+        // The assembly this intent describes follows the revision it runs at: a run verb adopts what it is
+        // about to be built from, and the others carry forward what the pipeline is already running, so a
+        // pause does not quietly re-point a paused pipeline at an edit made after it.
+        //
+        // An intent that recorded no assembly carries forward nothing rather than adopting the latest.
+        // Adopting it would be a claim about a run this process never saw start: the pipeline is running
+        // whatever it was built from, the stored definition may have moved since -- not every edit to a
+        // running pipeline is refused, only one that moves a buffering switch -- and writing the current
+        // artifact's assembly here would state that the run matches a definition nobody checked it
+        // against. The next resume would then find the two equal and rebuild over a change that is not
+        // safe to rebuild over. Unknown stays unknown, which costs a refusal that a start clears.
+        String runAssembly = verb == LifecycleVerb.START || reassemble
+                ? latestAssembly
+                : prior.map(DesiredState::assemblyRevision).orElse(null);
+
+        DesiredState next =
+                new DesiredState(pipelineId, target, runRevision, purgeState, runAssembly, reassemble);
         return auditGate.dispatch(OPERATIONS.get(verb), new AuditContext(principal, pipelineId), () -> {
             desired.save(next);
             return next;

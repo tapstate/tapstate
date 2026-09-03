@@ -40,6 +40,7 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.model.canonical.AssemblyIdentity;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.runtime.probe.ConnectionProbe;
@@ -157,7 +158,8 @@ class PipelineApiTest {
                 .header("Authorization", "Bearer " + machineToken(Scope.WRITE))
                 .retrieve().toEntity(DesiredState.class).getBody();
 
-        assertThat(body).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, revisionOf(PIPELINE_V1)));
+        assertThat(body).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), false));
         assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).contains(body);
     }
 
@@ -166,14 +168,18 @@ class PipelineApiTest {
         String token = machineToken(Scope.WRITE);
         String rev = revisionOf(PIPELINE_V1);
 
-        assertThat(verb(token, "pl1", "start")).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev));
-        assertThat(verb(token, "pl1", "pause")).isEqualTo(new DesiredState("pl1", PipelineState.PAUSED, rev));
-        assertThat(verb(token, "pl1", "resume")).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev));
+        String assembly = assemblyOf(PIPELINE_V1);
+        assertThat(verb(token, "pl1", "start"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev, false, assembly, false));
+        assertThat(verb(token, "pl1", "pause"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.PAUSED, rev, false, assembly, false));
+        assertThat(verb(token, "pl1", "resume"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev, false, assembly, false));
         assertThat(stop(token, "pl1", false))
-                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false));
+                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false, assembly, false));
 
         assertThat(context.getBean(FakeDesiredStore.class).read("pl1"))
-                .contains(new DesiredState("pl1", PipelineState.STOPPED, rev, false));
+                .contains(new DesiredState("pl1", PipelineState.STOPPED, rev, false, assembly, false));
     }
 
     // ---- a stop must say what becomes of the pipeline's state, and the three answers differ ----
@@ -185,7 +191,8 @@ class PipelineApiTest {
         verb(token, "pl1", "start");
 
         assertThat(stop(token, "pl1", true))
-                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, true));
+                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, true,
+                        assemblyOf(PIPELINE_V1), false));
     }
 
     @Test
@@ -197,7 +204,8 @@ class PipelineApiTest {
         // Its pair above is what makes this an assertion rather than a restatement of the default: both
         // answers reach STOPPED, and only the field tells them apart.
         assertThat(stop(token, "pl1", false))
-                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false));
+                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false,
+                        assemblyOf(PIPELINE_V1), false));
     }
 
     @Test
@@ -392,6 +400,11 @@ class PipelineApiTest {
     /** The revision of a pipeline is the content hash of its canonical form — the value apply stamps. */
     private static String revisionOf(String dsl) {
         return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+    }
+
+    /** What an artifact's run is assembled from: the same canonical text, with whitelisted fields erased. */
+    private static String assemblyOf(String dsl) {
+        return AssemblyIdentity.of(parse(dsl));
     }
 
     private void seedUser(String username, String password, String role) {

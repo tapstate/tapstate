@@ -50,6 +50,7 @@ public final class PipelineConverger {
         // a source that ran out, a job that died -- drives the same verb with this false, because
         // nobody asked for those and a run that ends on its own still has somewhere to carry on from.
         boolean purgeState = intent.get().purgeState();
+        boolean reassemble = intent.get().reassemble();
         Optional<CheckpointDoc> actualDoc = state.read(pipelineId);
         PipelineState actual = actualDoc.map(doc -> StateJson.parse(doc.stateJson())).orElse(null);
 
@@ -98,7 +99,7 @@ public final class PipelineConverger {
             return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
-        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState);
+        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, reassemble);
     }
 
     /**
@@ -109,12 +110,19 @@ public final class PipelineConverger {
      * or a later convergence pass would drive its actual state back toward a non-terminal desired target.
      */
     public ConvergeResult markCompleted(String pipelineId) {
-        return driveTo(pipelineId, PipelineState.COMPLETED, false, state.read(pipelineId).orElse(null), false);
+        return driveTo(
+                pipelineId, PipelineState.COMPLETED, false, state.read(pipelineId).orElse(null), false, false);
     }
 
     private ConvergeResult driveTo(
             String pipelineId, PipelineState target, boolean seedIfAbsent, CheckpointDoc current,
             boolean purgeState) {
+        return driveTo(pipelineId, target, seedIfAbsent, current, purgeState, false);
+    }
+
+    private ConvergeResult driveTo(
+            String pipelineId, PipelineState target, boolean seedIfAbsent, CheckpointDoc current,
+            boolean purgeState, boolean reassemble) {
         String targetJson = StateJson.of(target);
         if (current == null) {
             if (!seedIfAbsent) {
@@ -133,7 +141,7 @@ public final class PipelineConverger {
                 // Record first, then actuate: the store is the source of truth and Jet is subordinate, so the
                 // fenced write lands the intent durably before the job side is driven to match it.
                 try {
-                    actuate(pipelineId, from, target, purgeState);
+                    actuate(pipelineId, from, target, purgeState, reassemble);
                 } catch (TapstateException refused) {
                     // The job side refused with a diagnosis. Record it the way a job that died is recorded,
                     // because to everyone reading the product they are the same event: the pipeline is not
@@ -164,14 +172,29 @@ public final class PipelineConverger {
      * the held job (resume), reached from anywhere else begins a fresh run (start). A pipeline seeded at
      * NEW is never a transition target here, so it drives nothing.
      *
+     * <p>An intent that asks to be re-assembled overrides the first of those: the held job is torn down
+     * and a fresh one submitted, keeping everything the pipeline has. That is what makes an edit made
+     * while paused take effect, and it happens here rather than as two intents because this side samples
+     * the latest intent instead of consuming every one written.
+     *
      * <p>{@code purgeState} reaches only the stop, and only ever carries what a user's own stop asked
      * for. A pipeline that completed or failed arrives at the same verb, and arrives with it false: an
      * ending nobody asked for is not permission to throw away where it had got to.
      */
-    private void actuate(String pipelineId, PipelineState from, PipelineState target, boolean purgeState) {
+    private void actuate(
+            String pipelineId, PipelineState from, PipelineState target, boolean purgeState,
+            boolean reassemble) {
         switch (target) {
             case RUNNING -> {
-                if (from == PipelineState.PAUSED) {
+                if (from == PipelineState.PAUSED && reassemble) {
+                    // Both halves here, in one pass, because they cannot be two intents: this side reads
+                    // the latest intent rather than consuming a queue of them, so a stop written and
+                    // immediately overwritten by a start is never observed and neither half happens.
+                    // Nothing is cleared -- carrying on from the recorded position is the whole point of
+                    // re-assembling rather than re-reading the source.
+                    actuator.stop(pipelineId, false);
+                    actuator.start(pipelineId);
+                } else if (from == PipelineState.PAUSED) {
                     actuator.resume(pipelineId);
                 } else {
                     actuator.start(pipelineId);
