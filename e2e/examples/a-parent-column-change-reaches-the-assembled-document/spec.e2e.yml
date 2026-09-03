@@ -14,10 +14,17 @@
 #   the array on the way, because a rebuild driven by the parent's own stream has no child rows in hand.
 #   So the array is read in the same breath as the changed column: three elements before, three after.
 #
-# - The first assertion is the control. It holds the document to the old value before the change is
-#   made, so a run where the change never reached the source at all - the driver refusing, the table
-#   never seeded - cannot be mistaken for a run where the product propagated it. Without it, an
-#   assertion that the value is now 'hopper' would also pass on a document that always said 'hopper'.
+# - The first read is the control. It holds the document to the old value before the change is made,
+#   so a run where the change never reached the source at all - the driver refusing, the table never
+#   seeded - cannot be mistaken for a run where the product propagated it. Without it, a read that the
+#   value is now 'hopper' would also pass on a document that always said 'hopper'.
+#
+#   It is awaited rather than asserted, and the count above is why: reaching two documents does not
+#   mean the children are on them, because the roots are written when they arrive and the arrays fill
+#   as the child rows are placed. A one-shot read on that instant passes while this example runs alone
+#   and fails once another real-connector example runs beside it, which is load deciding the result
+#   rather than the product. The control loses nothing - a run that never assembles still runs the
+#   bound out and fails on the array.
 #
 # Every name here is this example's own - tables, pipeline, view - rather than the names its sibling
 # uses. The two examples run against the same MySQL server, and a table name is not private to a
@@ -54,6 +61,6 @@ seed:
 steps:
   - start
   - await: { count: { views.ripple_state: 2 } }
-  - assert: { doc: { views.ripple_state: { where: { id: 1 }, expect: { customer: ada }, size: { items: 3 } } } }
+  - await:  { doc: { views.ripple_state: { where: { id: 1 }, expect: { customer: ada }, size: { items: 3 } } } }
   - cdc: { src_ripple_orders.ripple_orders: { update: { where: { id: 1 }, set: { customer: hopper } } } }
   - await: { doc: { views.ripple_state: { where: { id: 1 }, expect: { customer: hopper }, size: { items: 3 } } } }

@@ -78,7 +78,7 @@ public final class Cli implements Runnable {
      * declaration, and the version is wanted on a path that must not depend on either. The build pins it
      * to the project version, so the string here cannot quietly drift from what was released.
      */
-    static final String VERSION = "tapstate 0.3.0";
+    static final String VERSION = "tapstate 0.4.1";
 
     /**
      * Just the number out of {@link #VERSION}, for the places that print it beside another version and

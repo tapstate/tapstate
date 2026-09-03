@@ -687,9 +687,28 @@ jobs:
     needs: [version, draft, approve]
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # publishing the draft is what creates the tag
+      contents: read    # the draft is published with the app token below, never with this one
       packages: write   # push the image to GHCR under the repository's own namespace
     steps:
+      # Not GITHUB_TOKEN, and that single word is why the install site went stale for two releases.
+      # An event caused by GITHUB_TOKEN starts no workflow run -- the same rule the write-back job
+      # below already works around for `pull_request`, applied here to `release`. Publishing the draft
+      # with it delivers `release: published` to nobody, so the deployment that puts the new installer
+      # on the domain the README tells people to pipe into sh simply never runs. Nothing goes red:
+      # the release is correct, this run is green, and the site keeps handing out the previous version.
+      #
+      # Measured over this repository's last 100 workflow runs, 2026-09-03: runs triggered by
+      # github-actions[bot], 0; runs triggered by this app, 15 (pull_request, pull_request_target,
+      # push). The one release that ever did reach the site was published by a person clicking the
+      # button, which is what made a workflow-published release look like the same act and is not.
+      #
+      # Minted before the image push, deliberately: it is the only step in this job that can fail on a
+      # credential, and every step after it does something that cannot be taken back.
+      - id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
@@ -730,7 +749,7 @@ jobs:
       # orphan draft outlived the run, and the version was spent.
       - name: publish the draft, and move the floating pointer only if this is the newest line
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           published="$(gh api -X PATCH \
             "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}" \

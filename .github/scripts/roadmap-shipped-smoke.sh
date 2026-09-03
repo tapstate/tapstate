@@ -44,6 +44,11 @@ cat > "$stub_dir/gh" <<'STUB'
 #!/bin/sh
 echo "$*" >> "$GH_STUB_LOG"
 case "$*" in
+  "pr view"*"--json number"*)
+    # Is this number a pull request? Asked only once the issue lookup has already come back empty.
+    [ "${GH_STUB_TARGET:-issue}" = pr ] || exit 1
+    echo '{"number":42}'
+    exit 0 ;;
   "pr view"*)
     echo "Refs #42"
     exit 0 ;;
@@ -55,11 +60,20 @@ case "$*" in
 JSON
     exit 0 ;;
   *"repository(owner:"*)
-    # Empty stands for both readings the script cannot tell apart: no such issue, or a credential
-    # that cannot see issues.
-    [ "${GH_STUB_NO_ISSUE:-0}" = 1 ] || echo "I_42"
-    exit 0 ;;
+    # A lookup that finds no issue is not an empty capture. gh writes the response body to stdout
+    # even when the query errored and exits non-zero, so a stub that answers with nothing tests a
+    # shape the real gh never produces -- and hides the one that put a JSON blob through as a node
+    # id. 'missing' and 'pr' are identical here on purpose: this query cannot tell them apart.
+    if [ "${GH_STUB_TARGET:-issue}" = issue ]; then echo "I_42"; exit 0; fi
+    echo '{"data":{"repository":{"issue":null}},"errors":[{"type":"NOT_FOUND","path":["repository","issue"],"message":"Could not resolve to an Issue with the number of 42."}]}'
+    exit 1 ;;
   *addProjectV2ItemById*)
+    # A credential that can read the board and not write it. Same shape as the failed issue lookup:
+    # the body lands on stdout, so an unguarded capture carries it forward as an item id.
+    if [ "${GH_STUB_ADD_FAILS:-0}" = 1 ]; then
+      echo '{"data":{"addProjectV2ItemById":null},"errors":[{"type":"FORBIDDEN","message":"Resource not accessible by personal access token"}]}'
+      exit 1
+    fi
     echo "PVTI_1"
     exit 0 ;;
   *updateProjectV2ItemFieldValue*)
@@ -79,12 +93,13 @@ exit 0
 STUB
 chmod +x "$stub_dir/gh"
 
-run() {   # first-read-status  later-read-status  no-issue -> stdout+stderr, sets RC and LOG
+run() {   # first-read-status  later-read-status  target(issue|pr|missing)  add-fails -> OUT, RC, LOG
     LOG="$tmp/calls.$$.$RANDOM"; : > "$LOG"
     : > "$tmp/reads"
     set +e
     OUT="$(cd "$repo" && GH_STUB_LOG="$LOG" GH_STUB_READS="$tmp/reads" \
-        GH_STUB_FIRST="$1" GH_STUB_LATER="$2" GH_STUB_NO_ISSUE="${3:-0}" \
+        GH_STUB_FIRST="$1" GH_STUB_LATER="$2" GH_STUB_TARGET="${3:-issue}" \
+        GH_STUB_ADD_FAILS="${4:-0}" \
         GITHUB_REPOSITORY=tapstate/tapstate PATH="$stub_dir:$PATH" \
         bash "$script" --version 0.4.0 --base v0 --sha "$sha" 2>&1)"
     RC=$?
@@ -127,11 +142,39 @@ fi
 
 # A Refs line whose issue cannot be resolved: a wrong number, or a credential without issue access.
 # Passing over it in silence is how a run with no issues permission reports success and moves none.
-if run Shipped Shipped 1; then
+if run Shipped Shipped missing; then
     if [ "$RC" != 0 ] && printf '%s' "$OUT" | grep -q '#42'; then
         pass "an unresolvable Refs target fails, naming the issue"
     else
         fail "an unresolvable Refs target fails, naming the issue" "rc=$RC: $OUT"
+    fi
+fi
+
+# A Refs target that is a pull request. It gets there honestly -- a release pull request saying
+# `Refs #N` about the write-back pull request before it is accurate prose -- and the board is a list
+# of work items, so the reference is passed over and said out loud. Two ways to be wrong, so both
+# are asserted: red here reddens the roadmap job on every release carrying such a reference, and a
+# board write here puts a pull request on the roadmap as noise that nobody removes.
+if run Shipped Shipped pr; then
+    if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q '#42' \
+        && [ "$(writes)" = 0 ] && ! grep -q addProjectV2ItemById "$LOG"; then
+        pass "a Refs target that is a pull request is passed over, and nothing is written"
+    else
+        fail "a Refs target that is a pull request is passed over, and nothing is written" \
+             "rc=$RC writes=$(writes) added=$(grep -c addProjectV2ItemById "$LOG" || true): $OUT"
+    fi
+fi
+
+# The item could not be put on the board at all. The failure has to be reported as that, and the
+# field writes that follow must not happen: an unguarded capture sends six mutations against an item
+# id that is an error body, and the run then blames the board for a value it was never asked to hold.
+if run Shipped Shipped issue 1; then
+    if [ "$RC" != 0 ] && printf '%s' "$OUT" | grep -q 'could not be put on the board' \
+        && [ "$(writes)" = 0 ]; then
+        pass "an item the board refuses is reported as that, with no field writes after it"
+    else
+        fail "an item the board refuses is reported as that, with no field writes after it" \
+             "rc=$RC writes=$(writes): $OUT"
     fi
 fi
 

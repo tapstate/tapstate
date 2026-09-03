@@ -757,6 +757,56 @@ else
   bad "docker-compose.dev.yml missing or carries no build: — the from-source path would have no way to build"
 fi
 
+# --- a compose fetched from a stale tree is pinned to this script's own version ----------------------
+# The stub above serves the repository's own compose, which is in sync with the script, so nothing here
+# could tell a script that pins from one that does not. Reality is the opposite: the script fetches this
+# file from a release tag, and a tag's tree carries the PREVIOUS release's pins by construction -- the
+# number is written inside the release runner, which never commits. So the case seeds exactly that and
+# asks what reaches the demo directory.
+#
+# Shipped, this was a 0.4.1 CLI starting a 0.3.0 server. Nothing reported it: the file was present, the
+# version it named existed, every container came up healthy, and the demo then could not log in.
+STALE_STUB="$(mktemp -d)"
+cp -R "$QS_STUB/." "$STALE_STUB/"
+sed 's|image: ghcr.io/tapstate/tapstate:[^[:space:]]*|image: ghcr.io/tapstate/tapstate:0.0.1-stale|g' \
+    "$QS_STUB/deploy/quickstart/docker-compose.yml" > "$STALE_STUB/deploy/quickstart/docker-compose.yml"
+# The seed is checked before it is used. A substitution that quietly matched nothing would leave the
+# stub in sync with the script, and the case would pass having tested the situation it exists to avoid.
+if grep -q '0\.0\.1-stale' "$STALE_STUB/deploy/quickstart/docker-compose.yml"; then
+  REAL_STUB="$QS_STUB"; QS_STUB="$STALE_STUB"
+  run_prepare Linux x86_64 glibc
+  QS_STUB="$REAL_STUB"
+  if grep -q "image: ghcr.io/tapstate/tapstate:$VERSION" "$DEMO/docker-compose.yml" \
+     && ! grep -q '0\.0\.1-stale' "$DEMO/docker-compose.yml"; then
+    ok "a compose fetched from a stale tree is pinned to this script's version ($VERSION)"
+  else
+    bad "the fetched compose still names $(sed -n 's|.*image: ghcr.io/tapstate/tapstate:\([^[:space:]]*\).*|\1|p' "$DEMO/docker-compose.yml" | head -1) — the demo would run a server other than $VERSION"
+  fi
+else
+  bad "could not seed a stale compose, so the pinning was never exercised"
+fi
+rm -rf "$STALE_STUB"
+
+# --- the CLI's own words survive a CLI that fails ---------------------------------------------------
+# Text, not behaviour: this smoke stops before Docker, and the line in question runs only against a live
+# stack. It is checked at all because of what its absence looks like -- the script runs under `set -e`,
+# and as a bare assignment `repl_out="$(... )"` ends the script AT that line when the CLI exits
+# non-zero. The print and the diagnosis below it never run, and everything the CLI said, up to and
+# including a stack trace, reaches the exit status and nowhere else. That shape was reported once as a
+# CPU-specific fault and reproduced later on hardware where that could not be the cause.
+if grep -qE '\|\| repl_status=\$\?' "$QUICKSTART_SH"; then
+  ok "a failing CLI does not end the script before its output is printed"
+else
+  bad "the REPL capture is a bare assignment again — under set -e the CLI's output would be discarded"
+fi
+# And a failure the two named cases do not recognise still stops the run, rather than falling through to
+# the row-count wait, which reports an empty target and sends the reader to a pipeline never started.
+if grep -qE 'repl_status" -ne 0' "$QUICKSTART_SH"; then
+  ok "a CLI failure the named cases do not match still stops the run"
+else
+  bad "nothing answers a non-zero CLI exit that is neither auth-failed nor not-authenticated"
+fi
+
 # --- the install event, seen from the path a first-time user actually takes -------------------------
 # install-smoke.sh covers the installer in isolation. These three cover what only the composed flow can
 # show: the quickstart calls install.sh TWICE (the platform gate, then the real install) and it drops
