@@ -119,5 +119,32 @@ echo changed >> app/src/main/java/App.java
 git add -A && git commit -qm product
 expect "a case already on the base branch does not admit it" 1 "brings no end-to-end case"
 
+# The release's own write-back changes a version pin that lives under src/main, so the gate sees
+# product source and demands a case the change cannot carry: a version constant has no behaviour to
+# witness. Left alone, every release opens a pull request that is red on arrival and can only be
+# merged by waiving a gate -- which is a maintainer's act, performed on a bot's mechanical edit.
+# Scope is decided by what changed, not by who or which branch: a pin list is not spoofable.
+fresh_repo
+mkdir -p cli/src/main/java/io/tapstate/cli
+echo 'VERSION = "tapstate 0.0.0"' > cli/src/main/java/io/tapstate/cli/Cli.java
+git add -A && git commit -qm "pin exists"
+git update-ref refs/remotes/origin/main HEAD
+echo 'VERSION = "tapstate 0.4.1"' > cli/src/main/java/io/tapstate/cli/Cli.java
+git add -A && git commit -qm "write the version in"
+expect "a pull request that only rewrites version pins is out of scope" 0 "only version pins"
+
+# The control, and the reason the exemption is by path set rather than by branch: the same pull
+# request carrying one more product file is in scope again. Without this, "it touched a pin" would
+# be a way to smuggle any change past the gate.
+fresh_repo
+mkdir -p cli/src/main/java/io/tapstate/cli
+echo 'VERSION = "tapstate 0.0.0"' > cli/src/main/java/io/tapstate/cli/Cli.java
+git add -A && git commit -qm "pin exists"
+git update-ref refs/remotes/origin/main HEAD
+echo 'VERSION = "tapstate 0.4.1"' > cli/src/main/java/io/tapstate/cli/Cli.java
+echo changed >> app/src/main/java/App.java
+git add -A && git commit -qm "a version pin and something else"
+expect "a version pin next to any other product change is still in scope" 1 "brings no end-to-end case"
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

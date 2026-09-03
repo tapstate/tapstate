@@ -47,7 +47,7 @@ on:
         options: [minor, patch, major]
         required: true
       commit:
-        description: "Which commit ships. Leave empty for the tip of the branch this is dispatched from."
+        description: "Which commit ships. Leave empty for the tip of the default branch."
         type: string
         required: false
 
@@ -56,7 +56,24 @@ permissions:
 
 jobs:
   version:
+    # The pin, and the whole of the freeze. Merging to the default branch stops when this is
+    # dispatched and may resume the moment this job goes green. That it is a job and not a step is the
+    # point: a person watching the run sees it finish, rather than having to find one step inside a
+    # long-running one to know the freeze is over.
+    #
+    # Everything here is a read plus four ref creations -- the conclusions already recorded on the
+    # commit, the version its ancestry implies, the documentation follow-ups for the range, whether
+    # the token reaches the satellites. No build, no test, no image. That is what keeps the freeze
+    # short, and it is why a commit whose checks are still running is refused rather than waited for.
+    #
+    # An attempt is atomic. What this pins is what the attempt releases or throws away; no branch
+    # outlives the attempt that made it, and nothing is carried by hand from one attempt to the next.
+    # A fix for a failed attempt goes to the default branch, and the next attempt picks it up by
+    # starting from there.
+    name: pin (the freeze lasts exactly this long)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # this repository's own release branch
     outputs:
       version: ${{ steps.next.outputs.version }}
       tag: ${{ steps.next.outputs.tag }}
@@ -74,7 +91,33 @@ jobs:
           ref: ${{ inputs.commit || github.ref }}
           fetch-depth: 0
       - id: sha
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          default='${{ github.event.repository.default_branch }}'
+          # Asked for by name rather than assumed to be present: checking out an explicit commit does
+          # not guarantee a remote-tracking ref for the default branch, and the ancestry test below
+          # would then fail for the wrong reason.
+          git fetch --no-tags origin "+refs/heads/$default:refs/remotes/origin/$default"
+          sha="$(git rev-parse HEAD)"
+          # A commit that is not on the default branch has not been through the merge-result build, so
+          # "its checks are green" would be answering about something else.
+          if ! git merge-base --is-ancestor "$sha" "origin/$default"; then
+            echo "$sha is not an ancestor of the default branch; it has not been built as a merge result." >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Let the script's own exit code fail the step. It explains its refusal in its own words --
+      # including the difference between a check still running and one that has concluded red, which
+      # need different answers from a person -- and a wrapper here would restate that less well.
+      - name: the required checks are green on that commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/checks-on-commit.sh \
+            --sha "${{ steps.sha.outputs.sha }}" \
+            --from-ruleset "${{ github.event.repository.default_branch }}"
+
       - id: next
         run: .github/scripts/next-version.sh "${{ inputs.bump }}" HEAD >> "$GITHUB_OUTPUT"
       # A patch is cherry-picked onto a line that has been overtaken, and a changeset riding along on
@@ -88,13 +131,85 @@ jobs:
       - name: a patch ships the same changesets as the release it patches
         if: inputs.bump == 'patch'
         run: .github/scripts/changeset-parity.sh "${{ steps.next.outputs.base }}" HEAD
+
+      # The pages for this release have to be written and merged before it starts. That is the same
+      # gate the release itself runs, asked here because here it is cheap to act on -- nothing has
+      # been created yet, so finishing the pages and dispatching again costs nothing. Asked later it
+      # is a release sitting at its first gate with three branches already cut.
+      #
+      # This is about the pages for what is shipping. Publishing the site is a separate thing, asked
+      # for below in an issue, and it deliberately does not gate anything.
+      - name: the documentation for this range has landed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/docs-gate.sh \
+            --base "${{ steps.next.outputs.base }}" \
+            --sha "${{ steps.sha.outputs.sha }}" \
+            --bump "${{ inputs.bump }}"
+
+      - name: the satellite token reaches every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Before any branch exists, not after. A token that cannot reach one of them is worth finding
+          # out about while nothing has been created, rather than with three of four repositories pinned.
+          bash .github/scripts/satellites.sh reach | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: pin this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="ws/release-${{ steps.next.outputs.version }}"
+          # An existing branch is refused rather than moved. Moving it is the one operation that would
+          # silently change what a release ships after somebody has already looked at it. Nothing
+          # legitimately leaves one behind any more -- the cleanup job retires them however an attempt
+          # ends -- so one standing here means an attempt is still running, or one died in a way worth
+          # looking at before starting another.
+          if gh api "repos/${{ github.repository }}/git/ref/heads/$branch" >/dev/null 2>&1; then
+            echo "$branch already exists. An attempt for this version is running, or one ended without cleaning up." >&2
+            exit 1
+          fi
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f "ref=refs/heads/$branch" -f "sha=${{ steps.sha.outputs.sha }}" >/dev/null
+          echo "${{ github.repository }}  $branch created at ${{ steps.sha.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: pin every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/satellites.sh branch "${{ steps.next.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The documentation site is not pinned and gets no branch: Netlify builds it from `next` as the
+      # preview and `main` as what the public sees, so a third branch across that pair would publish
+      # nothing or publish the wrong thing. What the release needs from it is a person merging `next`
+      # into `main`, so it is asked for in an issue. It gates nothing -- see the script for what
+      # happens when it is not done by the time the release publishes, and for what happens to the
+      # request when the attempt is abandoned instead.
+      - name: ask for the documentation site to be published
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          bash .github/scripts/docs-release.sh open "${{ steps.next.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: say what this run is about to make
         run: |
           {
-            echo "### Releasing ${{ steps.next.outputs.tag }}"
+            echo "### Releasing ${{ steps.next.outputs.tag }} -- start merging again"
             echo
             echo "* commit: \`${{ steps.sha.outputs.sha }}\`"
             echo "* newest line: ${{ steps.next.outputs.is_latest }} (decides whether the floating \`latest\` marker moves here)"
+            echo
+            echo "The freeze is over: the default branch is free to carry on, and nothing merged from here is in this release."
+            echo "The expensive half runs next, against \`ws/release-${{ steps.next.outputs.version }}\`, and the default branch is not part of it."
+            echo
+            echo "If this attempt does not publish, everything it created is retired and nothing is carried forward."
+            echo "A fix goes to the default branch, and the next attempt starts from there."
           } >> "$GITHUB_STEP_SUMMARY"
 
   cli-native:
@@ -418,6 +533,16 @@ jobs:
             platform-minimums.txt
           if-no-files-found: error
 
+      # Before the tag exists, deliberately. Publishing is irreversible, and a token that turns out not
+      # to reach one of the satellites afterwards leaves a released tapstate whose documentation
+      # repository never got the tag -- and there the tag is not bookkeeping, it is what makes the
+      # documentation public. This is the only gate here about a credential rather than about the code.
+      - name: 7. the satellite token reaches every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/satellites.sh reach
+
       - name: what the gate decided
         run: |
           {
@@ -431,6 +556,7 @@ jobs:
             echo "| 4 | documentation for the range has landed | this job |"
             echo "| 5 | release notes assemble | this job |"
             echo "| 6 | real-connector lane green on that commit | this job |"
+            echo "| 7 | satellite token reaches every satellite | this job |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   draft:
@@ -440,6 +566,10 @@ jobs:
       contents: write   # create the draft release
     outputs:
       url: ${{ steps.create.outputs.url }}
+      # The handle everything downstream uses. A release's tag name is not one: the approver is asked
+      # to edit this draft's body, and an edit that does not re-send `tag_name` blanks it to
+      # `untagged-<hex>`, after which a lookup by tag misses a release sitting right there.
+      id: ${{ steps.create.outputs.id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -557,9 +687,28 @@ jobs:
     needs: [version, draft, approve]
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # publishing the draft is what creates the tag
+      contents: read    # the draft is published with the app token below, never with this one
       packages: write   # push the image to GHCR under the repository's own namespace
     steps:
+      # Not GITHUB_TOKEN, and that single word is why the install site went stale for two releases.
+      # An event caused by GITHUB_TOKEN starts no workflow run -- the same rule the write-back job
+      # below already works around for `pull_request`, applied here to `release`. Publishing the draft
+      # with it delivers `release: published` to nobody, so the deployment that puts the new installer
+      # on the domain the README tells people to pipe into sh simply never runs. Nothing goes red:
+      # the release is correct, this run is green, and the site keeps handing out the previous version.
+      #
+      # Measured over this repository's last 100 workflow runs, 2026-09-03: runs triggered by
+      # github-actions[bot], 0; runs triggered by this app, 15 (pull_request, pull_request_target,
+      # push). The one release that ever did reach the site was published by a person clicking the
+      # button, which is what made a workflow-published release look like the same act and is not.
+      #
+      # Minted before the image push, deliberately: it is the only step in this job that can fail on a
+      # credential, and every step after it does something that cannot be taken back.
+      - id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
@@ -589,15 +738,32 @@ jobs:
       # passed: whoever reviewed the draft may have edited the body, and re-sending the assembled body
       # would silently put their edit back the way it was.
       #
-      # `--latest` is the floating pointer, and it is the reason a fix to an older line is worked out
-      # from that line's own history. Publishing 0.5.1 after 0.6.0 must not point new installs at 0.5.1.
+      # `make_latest` is the floating pointer, and it is the reason a fix to an older line is worked
+      # out from that line's own history. Publishing 0.5.1 after 0.6.0 must not point new installs at
+      # 0.5.1.
+      #
+      # By release id, and `tag_name` sent rather than inherited. The draft is reached by the one
+      # handle the approval point cannot change: an edit to the body that omits `tag_name` blanks it
+      # to `untagged-<hex>`, and both this step and the cleanup meant to catch it then look for a
+      # release by a name it no longer answers to. Measured 2026-09-02 -- the publish failed, the
+      # orphan draft outlived the run, and the version was spent.
       - name: publish the draft, and move the floating pointer only if this is the newest line
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
-          gh release edit "${{ needs.version.outputs.tag }}" \
-            --draft=false \
-            --latest=${{ needs.version.outputs.is_latest }}
+          published="$(gh api -X PATCH \
+            "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}" \
+            -F draft=false \
+            -f tag_name="${{ needs.version.outputs.tag }}" \
+            -f make_latest="${{ needs.version.outputs.is_latest }}" \
+            --jq '.tag_name')"
+          # The one field that changed silently the day this went wrong, so it is the one read back.
+          # Publishing under a blanked tag would put `untagged-<hex>` on a real release and a real
+          # git tag -- worse than the failure it replaced, because that one at least stopped.
+          if [ "$published" != "${{ needs.version.outputs.tag }}" ]; then
+            echo "published as '$published', expected '${{ needs.version.outputs.tag }}'" >&2
+            exit 1
+          fi
       - name: what went out
         run: |
           {
@@ -606,6 +772,39 @@ jobs:
             echo "* image: \`ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}\`"
             echo "* floating \`latest\` marker moved here: ${{ needs.version.outputs.is_latest }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  satellites:
+    # Tagged only after tapstate's own release is published, never alongside it. A satellite release
+    # points at the tapstate release, so one tagged first would link to a page that does not exist yet;
+    # and for the documentation repository the tag is not bookkeeping but the thing that makes the
+    # documentation public, which must not happen ahead of the release it documents.
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # deleting tapstate's own release branch at the end
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: tag and release every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/satellites.sh release "${{ needs.version.outputs.version }}" \
+            --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      # Not pinned, not gated, and not allowed to stop this. The site is published by a person merging
+      # one branch into another, which was asked for when the release started; this either finds that
+      # done and creates the tag, or asks again in a new issue. It exits 0 either way -- a release
+      # that stopped here would be hostage to one person's morning.
+      - name: settle the documentation site
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/docs-release.sh settle "${{ needs.version.outputs.version }}" \
+            --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
 
   roadmap:
     # The board says what shipped, and in which release. Nothing else does: the execution issue for a
@@ -717,6 +916,18 @@ jobs:
             which is why the tag points at a tree still pinning the previous release and why this
             pull request exists.
 
+            ## Linked issue
+
+            none -- this pull request is not work anybody asked for. It is opened by the release run
+            that has just published, and its whole content is the version that run took.
+
+            ## Live verification scenario
+
+            Check out this branch and run `.github/scripts/set-version.sh` with no argument: it makes
+            every pin agree with `pom.xml`, so on this branch it must produce no diff at all. Then
+            `mvn -q -pl cli -am package && java -jar cli/target/tapstate.jar --version` prints the
+            same version this pull request writes.
+
             ## Documentation impact
 
             - **Draft in this repository:** none
@@ -726,27 +937,132 @@ jobs:
 
             none -- version pins only, no user-visible change.
 
-  discard:
-    # Rejected, timed out, or failed on the way. A draft left on the Releases page is the one thing a
-    # rejection can leave behind that still looks publishable -- one click and it goes out having gone
-    # round everything above.
-    needs: [version, draft, publish]
-    if: always() && needs.draft.result == 'success' && needs.publish.result != 'success'
+  cleanup:
+    # However the attempt ended. An attempt is atomic: what it pinned is either released or thrown
+    # away, and no branch outlives it -- a leftover one is not a pin anybody still needs, it is the
+    # thing that refuses the next attempt. Measured twice in one day: a run died in `cli-native`,
+    # before a draft existed, and the cleanup was conditional on a draft having been assembled, so it
+    # never started; three branches in three repositories were deleted by hand both times.
+    #
+    # The condition carries the one exception rather than leaving it to a reader. A release that
+    # published while its satellites were not finished being tagged still owes them those tags, and
+    # their branches are the only remaining record of what the tags were meant to point at. Deleting
+    # them there turns a half-finished release into one nobody can finish.
+    #
+    # Guarded on the version output rather than on the pin job's result: a pin that failed part way
+    # through creating four refs is exactly the case with orphans to clear, and its job result is
+    # `failure`. The output exists as soon as the version was computed, which is before any ref.
+    needs: [version, draft, publish, satellites, roadmap, write-back]
+    if: >-
+      always()
+      && needs.version.outputs.version != ''
+      && !(needs.publish.result == 'success' && needs.satellites.result != 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write   # retire the image this attempt pushed, if it did not publish
     steps:
       - uses: actions/checkout@v4
+
       - name: delete the draft that was not published
+        if: needs.publish.result != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # An attempt that died before the draft was assembled has none to collect, and saying so is
+          # not the same as saying it found a published release and left it alone. Both have happened.
+          if [ -z "${{ needs.draft.outputs.id }}" ]; then
+            echo "No draft was assembled, so there is none to delete." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # Only ever a draft. Publish creates the tag and makes the release public one step before
           # its last, and `always()` fires on cancellation too, so a half-finished publish can leave a
           # real release here -- deleting that one keeps the tag and spends the version for good.
-          if [ "$(gh release view "${{ needs.version.outputs.tag }}" --json isDraft --jq '.isDraft' 2>/dev/null)" != true ]; then
+          #
+          # By id, for the reason the publish is: the body edit that blanks a draft's tag orphans it
+          # from every lookup by name, and this is the step that was supposed to collect it.
+          if [ "$(gh api "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}" --jq '.draft' 2>/dev/null)" != true ]; then
             echo "${{ needs.version.outputs.tag }} is not an unpublished draft; leaving it alone." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          gh release delete "${{ needs.version.outputs.tag }}" --yes
+          gh api -X DELETE "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}"
           echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. No tag was created, no image was pushed." >> "$GITHUB_STEP_SUMMARY"
+
+      # The third thing an abandoned attempt leaves behind, and the one nothing used to collect. The
+      # design enumerated two endings after the approval -- everything goes out, or nothing is left
+      # -- and in neither of them does an image exist without a release, so no step was ever written
+      # for it. There is a third ending: approved, image pushed, and the publish that follows it in
+      # the same job fails. Measured 2026-09-02, when `:0.4.1` sat in the registry with no release,
+      # no tag, and nothing anywhere that would have removed it.
+      #
+      # The push stays ahead of the publish. Publishing fires the install-site deployment and the
+      # clean-environment smoke, and both pull the image the moment the release exists; pushing
+      # afterwards would redden those on a release that is fine. So the window is closed from this
+      # end instead.
+      - name: retire the image this attempt pushed
+        if: needs.publish.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          image="ghcr.io/${{ github.repository }}:$version"
+          pkg="${GITHUB_REPOSITORY#*/}"
+          # `gh`'s own errors are left on stderr rather than redirected away. The other step in this
+          # job that hid them reported success while doing nothing at all, and the only way anyone
+          # found out was by opening the thing it claimed to have retired.
+          id="$(gh api --paginate \
+                  "/orgs/${{ github.repository_owner }}/packages/container/$pkg/versions" \
+                  --jq ".[] | select(.metadata.container.tags[]? == \"$version\") | .id" | head -1)"
+          if [ -z "$id" ]; then
+            # Nothing to do is the normal case: most attempts end before the push. It is reported
+            # rather than passed over silently, because "never pushed" and "could not look" arrive
+            # here as the same empty string.
+            echo "::warning::found no image version tagged $version. If $image exists, delete it by hand."
+            echo "$image  no version found to delete" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Not allowed to fail the run: the image is already pushed either way, and a red cleanup
+          # undoes nothing while telling whoever reads it to re-run a release they must not re-run.
+          # The warning is the signal, and it names what a person has to go and do.
+          if gh api -X DELETE \
+               "/orgs/${{ github.repository_owner }}/packages/container/$pkg/versions/$id"; then
+            echo "$image  deleted (package version $id)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::could not delete $image (package version $id). Delete it by hand before the next attempt at $version."
+            echo "$image  NOT deleted -- delete it by hand" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The documentation site was asked, in an issue, to publish a version that is now not coming.
+      # Nothing used to retire that request: two abandoned attempts at one version left two open
+      # issues asking for it, side by side, and the person they are assigned to had no way to tell
+      # either of them from a real one.
+      - name: tell the documentation site this version is not coming
+        if: needs.publish.result != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/docs-release.sh retire "${{ needs.version.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Unconditional within this job, which is what the `if` above is for. Both of these are
+      # idempotent: a branch that is already gone is reported and passes.
+      - name: retire the satellite release branches
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/satellites.sh unbranch "${{ needs.version.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: retire this repository's own release branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="ws/release-${{ needs.version.outputs.version }}"
+          # On the published path the tag is the anchor from here on, and unlike a branch it cannot be
+          # moved: a later patch for this line starts from the tag, so deleting this loses nothing.
+          if gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$branch" >/dev/null 2>&1; then
+            echo "${{ github.repository }}  $branch deleted" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "${{ github.repository }}  $branch was already gone" >> "$GITHUB_STEP_SUMMARY"
+          fi

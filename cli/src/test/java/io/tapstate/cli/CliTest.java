@@ -836,7 +836,15 @@ class CliTest {
     void versionFlagPrintsTheVersion() {
         Run r = run("--version");
         assertThat(r.code()).isZero();
-        assertThat(r.out()).contains("tapstate 0.3.0");
+        // The shape, not the number. Spelling the current release out here made this a seventh place
+        // that pins the version, and the only one nothing rewrites: every release wrote the new
+        // number into the six pins and left this line behind, so the pull request that carries a
+        // release into the default branch failed on arrival, every time, on an assertion that had
+        // nothing to say about the change. Which number is right is already held down by the check
+        // that makes all six pins agree with the project version, and it fails on exactly the defect
+        // a literal here was standing in for. What is left for this test is the part that check
+        // cannot see: that the flag runs, exits zero, and prints a version at all.
+        assertThat(r.out()).containsPattern("tapstate \\d+\\.\\d+\\.\\d+");
     }
 
     @Test

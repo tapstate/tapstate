@@ -1,0 +1,21 @@
+# Repositories that are pinned on a release branch and tagged alongside a tapstate release.
+#
+# Read twice per release, by two different workflows: once to create the release branch in each, and
+# once -- after tapstate's own release is published -- to tag that branch. Keeping the list here
+# rather than in either workflow is what stops the two from disagreeing; a repository present in one
+# reader and absent from the other gets a branch and never gets a tag, and nothing reports it.
+#
+# `docs` is deliberately NOT here, and its absence is a decision rather than an oversight. That site
+# is built by Netlify from two branches -- `next` is the preview, `main` is what is published -- so a
+# third branch cut across them would either publish nothing or publish the wrong thing. Documentation
+# is coordinated through an issue instead, by .github/scripts/docs-release.sh, and it never blocks a
+# release: see that script for what happens when it is not finished in time.
+#
+# A satellite release carries no notes of its own. Its body links to the tapstate release, which is
+# where what changed is written.
+#
+# One owner/repo per line. Blank lines and # comments are ignored. An empty list is refused rather
+# than treated as "there are none".
+
+tapstate/tapstate-skills
+tapstate/tapstate-web

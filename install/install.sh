@@ -26,7 +26,7 @@ set -eu
 # prerelease that lookup finds nothing and a bare run would die on a clean machine. Pinning also makes
 # the promise reproducible -- the same script installs the same build. TAPSTATE_VERSION overrides for
 # a one-off; releases update this line, and the smoke fails the build if it drifts from pom.xml.
-PINNED_VERSION="0.3.0"
+PINNED_VERSION="0.4.1"
 
 die() {
     printf 'install: %s\n' "$1" >&2

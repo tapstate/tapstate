@@ -2,7 +2,8 @@
 # The release workflow's shape, checked as a text.
 #
 # What this holds down is the one property the whole arrangement rests on and that nothing else can
-# see: the three acts that cannot be taken back -- creating the tag, publishing, pushing the image --
+# see: the acts that cannot be taken back -- creating the tag, publishing, pushing the image, and
+# tagging the satellite repositories --
 # are all downstream of the pause a person approves, and none of them happens before it. Every one of
 # them is one line away from moving. A `push: true` on the image build, a second release action after
 # the approval, a job that stops needing `approve`: each is a small, plausible edit, each leaves the
@@ -48,15 +49,38 @@ hasnt()  { if grep -qE -- "$3" <<<"$(job "$2")"; then bad "$1" "job '$2' still m
 # --- the approval is upstream of everything irreversible -------------------------------------------
 has "the publish job waits on the approval" publish 'needs:.*approve'
 
+# Tagging three other repositories is the fourth act that cannot be taken back, and the one furthest
+# from the approval -- it happens in repositories this workflow cannot see the inside of, so nothing
+# on this side would notice it having gone out early. It is allowed to do that only downstream of the
+# publish it announces: a satellite tagged first links to a release page that does not exist, and for
+# the documentation repository the tag is what makes the documentation public.
+has "the satellite job waits on the publish it announces" satellites 'needs:.*publish'
+# One job retires the branches, and it runs however the attempt ended. An attempt is atomic: nothing
+# is carried from one to the next, so a branch left behind is never a pin somebody still needs -- it
+# is only something in the way of the next attempt, which refuses a branch of that name. Measured
+# twice in one day: a release died before a draft existed, the cleanup was conditional on a draft
+# having been assembled, and so it never ran; three refs in three repositories were deleted by hand.
+has "the branches are retired by one job whatever happened" cleanup 'satellites[.]sh unbranch'
+# shellcheck disable=SC2016  # the workflow's own text is `$branch`; expanding it here would search for ours
+has "including this repository's own"                       cleanup 'refs/heads/\$branch'
+has "and it runs even when the run failed"                  cleanup 'always\('
+# The one state where the pin is still owed to somebody: the release published and the satellites did
+# not finish being tagged. Their branches are then the only record of what they were meant to point
+# at, and deleting them turns a half-finished release into one nobody can finish by hand.
+has "except while a published release still owes its satellites" cleanup 'needs[.]satellites[.]result'
+# Not in the satellite job any more, and not conditional on a draft. Those were the two shapes that
+# between them left every failed attempt's branches standing.
+hasnt "the publish path retires no branches of its own" satellites 'unbranch'
+
 # Anything that pushes an image, publishes a release, or moves the floating pointer, in a job that
 # does not need the approval, is the failure this file exists for. Checked over every job there is,
 # so a new one is covered without this list being edited.
 for j in $jobs_list; do
-  case "$j" in publish) continue ;; esac
+  case "$j" in publish|satellites) continue ;; esac
   body="$(job "$j")"
-  if grep -qE 'imagetools create|docker push|push: true|--draft=false|--latest=' <<<"$body"; then
+  if grep -qE 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
     bad "no irreversible act in '$j'" \
-        "$(grep -E 'imagetools create|docker push|push: true|--draft=false|--latest=' <<<"$body" | head -1)"
+        "$(grep -E 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body" | head -1)"
   else
     ok "no irreversible act in '$j'"
   fi
@@ -70,15 +94,93 @@ hasnt "the image is not rebuilt after approval" publish      'build-push-action'
 
 # C6. The publish step edits the existing release; it never re-sends a body. Re-running the action
 # that assembled the draft would overwrite whatever the approver wrote, and nothing would say so.
-has   "publishing edits the draft that was reviewed" publish 'gh release edit'
+#
+# It reaches that release by its id, which nothing can change, and never by its tag name, which the
+# approver can. Editing a draft's body through the API without re-sending `tag_name` blanks the tag
+# to `untagged-<hex>`, and editing that body at the approval point is one of the four things the
+# design asks the approver to do. Measured 2026-09-02: one such edit took out the publish and the
+# cleanup meant to catch it in the same run, because both looked the release up by a name it no
+# longer answered to. It left an orphan draft nothing would collect, and spent the version.
+has   "publishing edits the draft that was reviewed" publish 'releases/\$\{\{ needs\.draft\.outputs\.id \}\}'
+hasnt "and never by the tag the approver can blank"  publish 'gh release (edit|view|delete)'
+# Addressing by id alone would be worse than the bug it fixes: it finds the release and publishes it
+# under `untagged-<hex>` -- a real tag on a real release, instead of a run that failed loudly. So the
+# publish states the tag it means, and a blanked one is repaired on the way out.
+# The field as sent, not the word: the step also reads `.tag_name` back out of the response, and a
+# case matching the bare word was satisfied by that readback while the field itself was gone.
+has   "and states the tag it means"                  publish '\-f tag_name='
 hasnt "publishing re-sends no body"                  publish '\-\-notes|body_path|body:'
 hasnt "and does not run the release action again"    publish 'action-gh-release'
 
+# C16. Publishing is what the rest of the release is supposed to hear about, and the credential
+# decides whether anybody hears it. An event caused by GITHUB_TOKEN starts no workflow run, so a
+# draft published with it delivers `release: published` to nothing -- and the deployment that puts
+# the newly released installer on the domain the README tells people to pipe into sh is triggered by
+# exactly that event. Measured 2026-09-03: two releases went out that way and the site kept serving
+# the version before them, with every run green, every pin correct, and nothing red anywhere. The one
+# release that did reach it had been published by a person.
+#
+# So the token is pinned in both directions. Asserting only the app token would pass on a step that
+# had both; asserting only the absence would pass on a step with no token at all, which fails in a
+# way that at least stops.
+hasnt "publishing does not use the credential GitHub makes inert" publish 'GH_TOKEN: \$\{\{ github\.token \}\}'
+has   "and uses one whose events are delivered"                   publish 'GH_TOKEN: \$\{\{ steps\.token\.outputs\.token \}\}'
+has   "minted in this job"                                        publish 'create-github-app-token'
+# And minted before the image push, which is the first act in this job that cannot be taken back. A
+# credential that cannot be minted is the one failure this job can still have, and having it after
+# the push leaves an image in the registry for a release that never happened. Ordering inside a job
+# is invisible to every other case here, and moving a step is the tidy-up that would do it.
+tok_at="$(job publish | grep -n 'create-github-app-token' | head -1 | cut -d: -f1)"
+push_at="$(job publish | grep -n 'imagetools create' | head -1 | cut -d: -f1)"
+if [ -n "$tok_at" ] && [ -n "$push_at" ] && [ "$tok_at" -lt "$push_at" ]; then
+  ok "and minted before anything irreversible"
+else
+  bad "and minted before anything irreversible" \
+      "token step at line ${tok_at:-none} of the job, image push at ${push_at:-none}"
+fi
+
 # C7. Rejected, timed out, or failed on the way: the draft is the one thing a rejection can leave
-# behind that still looks publishable.
-has "a rejected run deletes its draft"        discard 'gh release delete'
-has "and it runs even when the run failed"    discard 'always\(\)'
-has "and only when nothing was published"     discard "publish.result != 'success'"
+# behind that still looks publishable. By id for the same reason publishing is: the edit that blanks
+# the tag orphans the draft, and this is the step that was supposed to collect it.
+has "a rejected run deletes its draft"        cleanup '\-X DELETE .*releases/\$\{\{ needs\.draft\.outputs\.id \}\}'
+hasnt "and not by the tag either"             cleanup 'gh release (view|delete)'
+has "and only when nothing was published"     cleanup "publish.result != 'success'"
+# The documentation site was asked, in an issue, to publish a version that is now not being released.
+# Nothing retired that request: two abandoned attempts at one version left two open issues asking for
+# it, and the person they are assigned to had no way to tell either from a real one.
+has "and retires the request it made of the documentation site" cleanup 'docs-release[.]sh retire'
+# And the image, which is the third thing an abandoned attempt leaves behind and the one nothing
+# used to collect. The design enumerated two endings after the approval -- everything goes out, or
+# nothing is left -- and in neither of them does an image exist without a release, so no step was
+# written for it. There is a third: approved, image pushed, and the publish that follows it in the
+# same job fails. Measured 2026-09-02 -- `ghcr.io/<repo>:0.4.1` sat in the registry for hours with
+# no release, no tag, and nothing anywhere that would ever have removed it.
+#
+# The image is pushed BEFORE the release is published and stays that way: publishing fires the
+# install-site deployment and the clean-environment smoke, and both pull the image the moment the
+# release exists. Pushing afterwards would redden those on a release that is actually fine. So the
+# ordering stands, and the attempt is made atomic from the other end instead.
+has "and retires the image it pushed"         cleanup 'packages/container/.*versions'
+has "and holds the permission to do that"     cleanup 'packages: write'
+# Every one of the three is guarded on nothing having been published, and the image is the one where
+# getting that wrong deletes the image out from under a release that DID go out. A step-level `if:`
+# is invisible to a grep over the whole job, so what is pinned is that there are three of them: drop
+# the guard from the new step and this is 2.
+if [ "$(job cleanup | grep -cE "publish[.]result != 'success'")" = 3 ]; then
+  ok "each of the three is guarded on nothing having been published"
+else
+  bad "each of the three is guarded on nothing having been published" \
+      "wanted 3 (draft, documentation request, image), got $(job cleanup | grep -cE "publish[.]result != 'success'")"
+fi
+
+# --- one dispatch: the pin is this workflow's own first job ----------------------------------------
+# There is no separate workflow to dispatch first. The freeze lasts exactly as long as this job, which
+# is why it builds nothing; a person watching the run sees a job go green rather than having to watch
+# a step list inside a long one.
+has "the release pins its own commit"     version 'git/refs'
+has "and pins every satellite"            version 'satellites[.]sh branch'
+has "and asks the documentation site"     version 'docs-release[.]sh open'
+has "and refuses a branch that exists"    version 'already exists'
 
 # Gate 2 is the only one of the six with no step of its own: it is the smokes in `cli-native`, and it
 # blocks by being something the gate needs. Both halves are asserted, because either one going away

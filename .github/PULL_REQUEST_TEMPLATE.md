@@ -8,8 +8,11 @@ See CONTRIBUTING.md, "Language".
 ## Linked issue
 
 <!--
-Which issue this belongs to, and where its design is written: `Refs #123` — not `Fixes`, which
+Which issue this belongs to, and where its design is written: Refs #123 — not `Fixes`, which
 would close the issue on merge and take with it whatever else is still in flight under it.
+
+Write it bare, the way it is written above. Inside backticks it is a code span, and GitHub does
+not autolink inside one: the number renders as text and the reader has nothing to click.
 
 For an external contribution this is the only context a reviewer has, so say which part of the
 issue holds the design. A change that genuinely has no issue behind it (documentation, build and

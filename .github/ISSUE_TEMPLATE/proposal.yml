@@ -14,7 +14,8 @@ body:
 
         **Write the design here, in full.** This issue is the only context a reviewer will have —
         our own planning documents are not public, so nothing outside this issue is going to explain
-        what you meant. Link the pull request back with `Refs #<this issue>`, not `Fixes`.
+        what you meant. Link the pull request back with Refs #<this issue>, not `Fixes` — and write
+        it bare, not in backticks, which would stop GitHub linking it.
 
         Opening this issue does not mean we have agreed to merge it. If it changes product behaviour
         in a direction we are not going, we would rather say so here than at review time — so a
