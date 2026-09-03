@@ -50,6 +50,31 @@ public record JoinPlan(List<OutputField> outputFields, JoinTree from,
         return Collections.unmodifiableSet(columns);
     }
 
+    /**
+     * The output column that publishes {@code source}.{@code column} verbatim, or null where none
+     * does.
+     *
+     * <p><b>Only a bare column reference publishes a column.</b> One an expression is computed from
+     * is read, not published: {@code UPPER(o.id) AS order_id} makes the output value a function of
+     * the key rather than the key itself, and a function need not be injective - two rows whose keys
+     * differ only in case come out under one value. A caller asking this in order to identify a row
+     * would be handed a name that identifies fewer rows than it appears to, which is the failure that
+     * looks most like success.
+     *
+     * <p>The first match wins where the same column is published twice under different names. Either
+     * would identify the row equally; picking the first keeps the answer a function of the SQL text.
+     */
+    public String publishedAs(String source, String column) {
+        for (OutputField field : outputFields) {
+            if (field.from() instanceof Expr.Column reference
+                    && reference.ref().source().equals(source)
+                    && reference.ref().column().equals(column)) {
+                return field.name();
+            }
+        }
+        return null;
+    }
+
     private static void collect(Expr expression, String source, Set<String> into) {
         switch (expression) {
             case Expr.Column column -> {

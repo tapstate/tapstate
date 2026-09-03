@@ -5,6 +5,7 @@
 # removing one = a breaking change to an external contract (review + major version).
 actuation.from-regex-empty
 actuation.from-regex-invalid
+actuation.join-output-key-not-published
 actuation.join-source-key-missing
 actuation.not-a-pipeline
 actuation.pipeline-not-found

@@ -53,6 +53,17 @@ enum ActuationError implements TapstateErrorCode {
      */
     JOIN_SOURCE_KEY_MISSING("actuation.join-source-key-missing", Set.of("step", "table")),
 
+    /**
+     * A join's SELECT does not publish the driving table's key, so nothing identifies a result row;
+     * {@code step} is the join step, {@code table} the driving table and {@code column} the key column
+     * missing from the projection. A target keyed on anything less collapses rows the SQL says are
+     * distinct, and the collapse is invisible: the write succeeds and the target holds fewer rows than
+     * it should with no error anywhere. A column reaching the output only through an expression does
+     * not publish it - the value is a function of the key, and a function need not be injective.
+     */
+    JOIN_OUTPUT_KEY_NOT_PUBLISHED("actuation.join-output-key-not-published",
+            Set.of("step", "table", "column")),
+
     /** A serve.from regex is invalid; {@code regex} carries the expression. */
     FROM_REGEX_INVALID("actuation.from-regex-invalid", Set.of("regex")),
 

@@ -20,6 +20,9 @@ actuation.source-schema-not-discovered:
 actuation.join-source-key-missing:
   message: "Join `{step}` is driven from table `{table}`, which declares no primary key."
   solution: "Give the table a primary key and run schema discovery again. A join files every row it holds under the driving row's key, so without one two different rows share an entry and the wide row is built from whichever was written last."
+actuation.join-output-key-not-published:
+  message: "Join `{step}` does not publish column `{column}` of its driving table `{table}`, so nothing identifies a row of its result."
+  solution: "Add `{column}` to the SELECT as a plain column, for example `SELECT t.{column} AS {column}, ...`. It has to be the column itself and not an expression over it: a computed value need not be unique where the column is, so rows the query says are distinct would be written over one another."
 actuation.view-key-missing:
   message: "View `{view}` declares no primary key."
   solution: "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."
