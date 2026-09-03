@@ -386,6 +386,30 @@ class JoinDriverTest {
                 .as("and it is in no bucket, because it names none").isZero();
     }
 
+    /**
+     * Found by comparing a run against a real database rather than by picturing it: an inner join
+     * published its rows, the dimension row was deleted, and every one of those rows stayed in the
+     * target. A recompute asks what each row is now, and for an inner join whose dimension row has gone
+     * the answer is "no row at all" - which arrived as nothing to send rather than as a removal, so the
+     * old row was never taken back. Nothing reports it: the rows are the ones the join really did
+     * publish a moment ago, and they go on looking like the join's own output.
+     */
+    @Test
+    @DisplayName("an inner join takes back what it published once the dimension row is deleted")
+    void anInnerJoinRetractsRowsWhoseDimensionRowIsDeleted() {
+        Fixture fixture = new Fixture(JoinKind.INNER);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.apply(fact(insert(Map.of("id", 11L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.apply(dimension("c", delete(Map.of("id", 1L, "name", "Ada"))));
+
+        assertThat(fixture.published()).containsExactlyInAnyOrder(
+                Map.entry(Op.DELETE, rowOf("order_id", 10L, "customer_name", null)),
+                Map.entry(Op.DELETE, rowOf("order_id", 11L, "customer_name", null)));
+    }
+
     private static Map<String, Object> rowOf(String first, Object firstValue, String second,
             Object secondValue) {
         Map<String, Object> row = new LinkedHashMap<>();

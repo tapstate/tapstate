@@ -340,7 +340,17 @@ public final class JoinDriver {
                 continue;
             }
             Envelope event = rowEvent(factRow, recompute.ts(), false);
-            if (event != null && !sink.offer(event)) {
+            if (event == null) {
+                // This row does not qualify any more - an inner join whose dimension row has gone.
+                // Having no row to send is not the same as having nothing to do: it was published
+                // while it did qualify, so leaving it alone means the target keeps a row the join no
+                // longer produces, and that row looks exactly like the join's own output because a
+                // moment ago it was. A removal goes out whether or not this particular row was ever
+                // published, which is the trade the removal path already makes: a no-op at an
+                // idempotent sink, against a row that otherwise stays for ever.
+                event = rowEvent(factRow, recompute.ts(), true);
+            }
+            if (!sink.offer(event)) {
                 // Nothing has been removed yet, so the entries found stale on this pass are simply
                 // found again on the next one. Removing them mid-walk would move the positions the
                 // bookmark below is written in.
