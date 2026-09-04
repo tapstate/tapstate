@@ -989,22 +989,6 @@ public final class AssemblerProcessor extends AbstractProcessor {
     }
 
     /**
-     * Stores every document this drain touched and emits each one once, in the state it now stands in.
-     *
-     * <p>A document goes out as a whole row and is applied by upserting it on its key, which is what makes
-     * a resend harmless and lets any idempotent sink take it unchanged. It is deliberately not sent as a
-     * change: there is no before image to offer - the elements that moved came from other rows entirely -
-     * and a sink handed a change with no before image matches nothing, so it writes nothing and reports
-     * nothing wrong.
-     *
-     * <p>A document going out is also what releases the changes it carried, and it goes out saying which
-     * chains it drew on and how far - the only thing that ever leaves here, so a sink that is told nothing
-     * can never ack a chain that ran through a nest. A deleted root's key row says the same of the deletion
-     * alone: it carries no element, so an element absorbed alongside that deletion has still been shown to
-     * nobody and goes on holding the frontier back. The state is stored after that, so what is written down
-     * is what is still owed rather than what has just been paid.
-     */
-    /**
      * Fetches the rows every document in this drain points at, one reach per namespace for all of them at
      * once. Gathered across the whole drain rather than per document: the documents of one drain overlap in
      * what they point at far more often than not - that is what a reference is - so a shared batch asks for
@@ -1023,14 +1007,8 @@ public final class AssemblerProcessor extends AbstractProcessor {
                     needed.computeIfAbsent(namespace, name -> new LinkedHashSet<>()).addAll(keys));
         }
         Map<String, Map<Object, Map<String, Object>>> resolved = new LinkedHashMap<>();
-        needed.forEach((namespace, keys) -> {
-            NestStore<Map<String, Object>> store = referenced.get(namespace);
-            if (store == null) {
-                throw new IllegalStateException(
-                        "a slot points at " + namespace + ", which this vertex was given no store for");
-            }
-            resolved.put(namespace, store.loadAll(new LinkedHashSet<>(keys)));
-        });
+        needed.forEach((namespace, keys) ->
+                resolved.put(namespace, storeOf(namespace).loadAll(new LinkedHashSet<>(keys))));
         return resolved;
     }
 
@@ -1041,10 +1019,41 @@ public final class AssemblerProcessor extends AbstractProcessor {
         }
         Map<String, Map<Object, Map<String, Object>>> resolved = new LinkedHashMap<>();
         assembly.referencesNeeded(slots).forEach((namespace, keys) ->
-                resolved.put(namespace, referenced.get(namespace).loadAll(new LinkedHashSet<>(keys))));
+                resolved.put(namespace, storeOf(namespace).loadAll(new LinkedHashSet<>(keys))));
         return resolved;
     }
 
+    /**
+     * Where the rows of one namespace are read from. Named rather than dereferenced at each call site,
+     * because the two callers had two different failures for the same wiring mistake - one said which
+     * namespace had no store and the other dereferenced null, on a path a window reaches and a drain
+     * does not.
+     */
+    private NestStore<Map<String, Object>> storeOf(String namespace) {
+        NestStore<Map<String, Object>> store = referenced.get(namespace);
+        if (store == null) {
+            throw new IllegalStateException(
+                    "a slot points at " + namespace + ", which this vertex was given no store for");
+        }
+        return store;
+    }
+
+    /**
+     * Stores every document this drain touched and emits each one once, in the state it now stands in.
+     *
+     * <p>A document goes out as a whole row and is applied by upserting it on its key, which is what makes
+     * a resend harmless and lets any idempotent sink take it unchanged. It is deliberately not sent as a
+     * change: there is no before image to offer - the elements that moved came from other rows entirely -
+     * and a sink handed a change with no before image matches nothing, so it writes nothing and reports
+     * nothing wrong.
+     *
+     * <p>A document going out is also what releases the changes it carried, and it goes out saying which
+     * chains it drew on and how far - the only thing that ever leaves here, so a sink that is told nothing
+     * can never ack a chain that ran through a nest. A deleted root's key row says the same of the deletion
+     * alone: it carries no element, so an element absorbed alongside that deletion has still been shown to
+     * nobody and goes on holding the frontier back. The state is stored after that, so what is written down
+     * is what is still owed rather than what has just been paid.
+     */
     private void settle(Map<Object, Touched> touched) {
         Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
         touched.forEach((key, document) -> {
@@ -1257,11 +1266,6 @@ public final class AssemblerProcessor extends AbstractProcessor {
     }
 
     /**
-     * The lowest position on {@code chain} that a window is holding back, or null when none is. This is the
-     * whole of what this level keeps the frontier below: everything else it holds is written through with
-     * the state and comes back out on its own.
-     */
-    /**
      * Queues on, for each chain, the position a lookup said owes nothing, once this level holds nothing
      * lower on that chain.
      *
@@ -1301,6 +1305,11 @@ public final class AssemblerProcessor extends AbstractProcessor {
         return flush();
     }
 
+    /**
+     * The lowest position on {@code chain} that a window is holding back, or null when none is. This is the
+     * whole of what this level keeps the frontier below: everything else it holds is written through with
+     * the state and comes back out on its own.
+     */
     private SourceOrder lowestUnsentOn(String chain) {
         SourceOrder lowest = null;
         for (Window window : windows.values()) {

@@ -84,8 +84,15 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         }
 
         // The root is a level like any other: what identifies one of its rows is asked of the same four
-        // places, so a root over a table that declares a key need not repeat it.
-        List<String> rootKey = keyOf(root.from(), root.key(), ROOT_NAMESPACE, tables);
+        // places, so a root over a table that declares a key need not repeat it. What differs is the
+        // ending. A root nothing identifies is the author's own missing declaration and says so; the
+        // refusal an embed gets names an array key and a path, neither of which a root has - it would
+        // arrive carrying the internal name of the root's own namespace in the slot meant for a path.
+        List<String> rootKey = keyOrNone(root.from(), root.key(), ROOT_NAMESPACE, tables);
+        if (rootKey == null) {
+            throw new TapstateException(NestError.ROOT_KEY_REQUIRED,
+                    Map.of("rootAlias", root.from()), null);
+        }
         List<Node> top = new ArrayList<>();
         for (Embed embed : declared) {
             top.add(node(embed, List.of(), root.from(), rootKey));
@@ -469,16 +476,6 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     }
 
     /**
-     * Refuses a level whose children join onto a column that does not identify its rows. What a child names
-     * is not a column to look the parent up by; it is the declaration of what the level is keyed on, and the
-     * level is partitioned by it. Name one many rows share and they collapse into a single identity, taking
-     * whichever row got there and leaving the rest with nothing - quietly, since every count stays at zero.
-     *
-     * <p>Siblings catch this by disagreeing with each other. An only child has nobody to disagree with, which
-     * is why the level's own key has to be asked. Only a declared key can say whether a column identifies a
-     * row, so a level whose table declares none is left alone rather than guessed at.
-     */
-    /**
      * The children that say something about the identity of the level they hang under. A child the level
      * points at says nothing about it: the column is a reference the level's rows carry, and reading it as
      * the level's identity would regroup those rows by whatever they happen to refer to.
@@ -511,7 +508,14 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         Set<String> childSide = new LinkedHashSet<>(node.embed().on().keySet());
         Set<String> parentSide = new LinkedHashSet<>(node.embed().on().values());
         List<String> parentKey =
-                keyOf(node.parentAlias(), node.parentKey(), render(node.parentPathId()), tables);
+                keyOrNone(node.parentAlias(), node.parentKey(), render(node.parentPathId()), tables);
+        if (parentKey == null) {
+            // Nothing identifies the level above, so neither side of this join can be read as pointing at
+            // it and there is no direction to infer. The tree keeps the one it has always had rather than
+            // being refused for want of an answer it never needed - which is where every level a source
+            // discovered nothing about lands, an embed under a level fed by an earlier step among them.
+            return false;
+        }
         // The parent side alone settles the existing direction, so the embed's own key is not asked for
         // unless it has to be. Asking anyway would refuse a tree that is already answered - over a stream
         // nothing discovered, say - for want of something the answer does not depend on.
@@ -549,11 +553,6 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     }
 
     /**
-     * The element identity for one embed: what it declares, or the key its table declares when it declares
-     * none. A table the caller cannot resolve at all is a wiring bug rather than an authoring error, and
-     * bare-throws; a table that resolves but declares no key is the author's to fix.
-     */
-    /**
      * What tells one element of this embed apart from the others in the same array. It is allowed to be
      * unique only within that array - an order's line numbers are the everyday case - so it is asked for
      * separately from the row identity, and falls back to it when the author wrote nothing.
@@ -587,6 +586,26 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      */
     private static List<String> keyOf(String alias, List<String> declared, String owner,
             Function<String, NestTable> tables) {
+        List<String> key = keyOrNone(alias, declared, owner, tables);
+        if (key == null) {
+            throw new TapstateException(NestError.ARRAY_KEY_UNRESOLVABLE,
+                    Map.of("embedPath", owner, "table", tables.apply(alias).name()), null);
+        }
+        return key;
+    }
+
+    /**
+     * The same four places, with the fourth answered rather than refused: null where nothing identifies a
+     * row here. Two callers want the two different endings. Carrying an unknown identity into the assembly
+     * is not something a level may do, so asking for one is a refusal; asking which way a join points is a
+     * question that simply has no answer without a key, and the tree that raised it was never relying on
+     * one - refusing there would turn every level a source discovered nothing about into a broken artifact.
+     *
+     * <p>An ambiguous key stays a refusal on both paths. Absence is a question with no answer; two answers
+     * is a choice, and nothing here is entitled to make it on the author's behalf.
+     */
+    private static List<String> keyOrNone(String alias, List<String> declared, String owner,
+            Function<String, NestTable> tables) {
         if (declared != null && !declared.isEmpty()) {
             return declared;
         }
@@ -610,8 +629,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                     Map.of("embedPath", owner, "table", table.name(),
                             "candidates", String.join(", ", candidates)), null);
         }
-        throw new TapstateException(NestError.ARRAY_KEY_UNRESOLVABLE,
-                Map.of("embedPath", owner, "table", table.name()), null);
+        return null;
     }
 
     /**

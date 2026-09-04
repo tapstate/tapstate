@@ -342,6 +342,12 @@ final class LookupProcessor extends AbstractProcessor {
      * What tells them apart is the two keys differing, and for a row that stayed put they do not - it landed
      * beside its twin, which has already recorded it where it still belongs.
      *
+     * <p><b>Its own identity counts as one of those keys.</b> A row that kept its reference and changed the
+     * column identifying it is recorded by the twin under the new identity and, if only the reference were
+     * compared, left recorded under the old one as well - in the same bucket, for the life of the job. That
+     * stale identity is woken on every edit to the row pointed at, addressed to a document that does not
+     * exist, and counts for ever against the ceiling on how many rows may point at one.
+     *
      * <p>A deletion falls out of that same test rather than needing one of its own, and has to: what a
      * deletion carries as the row it was and what it carries as its row are one and the same, so the keys
      * are equal and nothing happens here. Taking a deleted row out belongs to the other edge, where it
@@ -353,10 +359,11 @@ final class LookupProcessor extends AbstractProcessor {
             return;
         }
         List<Object> left = NestKeys.valuesOf(was, lookup.referenceFields());
-        if (left.equals(NestKeys.valuesOf(row, lookup.referenceFields()))) {
+        List<Object> referrer = NestKeys.valuesOf(was, lookup.referrerIdentity());
+        if (left.equals(NestKeys.valuesOf(row, lookup.referenceFields()))
+                && referrer.equals(NestKeys.valuesOf(row, lookup.referrerIdentity()))) {
             return;
         }
-        List<Object> referrer = NestKeys.valuesOf(was, lookup.referrerIdentity());
         references.remove(NestLookup.bucketKey(left, NestLookup.bucketOf(referrer)), referrer);
     }
 

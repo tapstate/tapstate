@@ -169,6 +169,30 @@ class ANestReadsWhichWayAJoinPointsFromTheKeysTest {
         assertThat(rowEdgesInto(topology, List.of())).contains(List.of("rows"));
     }
 
+    /**
+     * And the same holds when the level nothing identifies is the one being hung under, which is the half
+     * the case above does not reach: there the unanswerable side is the embed's own, and the parent's key
+     * settles the direction before it is ever asked for. Here the parent is the unanswerable one, so the
+     * question is put to a level that cannot answer it at all.
+     *
+     * <p><b>Reading a direction is not a reason to demand a key that was never needed.</b> A level fed by
+     * an earlier step of the pipeline carries no primary key and no index - nothing discovered one - and
+     * embeds have always been allowed to hang under it. Asking such a level to identify its rows before
+     * any embed below it may compile turns every one of those artifacts into a refusal, and the refusal
+     * names an array key, which is not what the author got wrong.
+     */
+    @Test
+    void anEmbedUnderALevelNothingIdentifiesKeepsTheDirectionItAlwaysHad() {
+        Embed owner = embed("customer", "customer_id", "customer_id", EmbedAs.OBJECT, "owner", null);
+        NestTopology topology = compile(nest("order", List.of("order_id"),
+                embed("keyless", "order_id", "order_id", EmbedAs.ARRAY, "rows", List.of("some_id"), owner)));
+
+        assertThat(rowEdgesInto(topology, List.of("rows")))
+                .describedAs("the embed under it is a child level as it always was - its rows arrive at "
+                        + "the level above, which is what the other direction would not do")
+                .contains(List.of("rows", "owner"));
+    }
+
     @Test
     void anOrderLinePointingAtAProductIsReadTheSameWayAtAnyDepth() {
         // The deep case walks the same two questions with a different parent: the level above an embed is

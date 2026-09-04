@@ -49,13 +49,20 @@ class NestTreeWellFormednessTest {
     void refusesARootWithNoDeclaredKeyAndNoTableKeyToTakeOneFrom() {
         // Nothing identifies a root row, so its documents have no identity to be grouped under and
         // nothing to partition the assembled documents by.
+        //
+        // And it is refused as a root rather than as a level. Asking the root the same question as every
+        // other level is what lets a root over a keyed table stay silent, but the refusal at the end of
+        // that question is written for an embed: it names an array key the author never wrote and a path,
+        // and a root has no path - the slot would carry the internal name of the root's own namespace.
+        // So the code that names the root and its alias is the one thrown, which is also the only thing
+        // keeping it reachable at all.
         TransformBody.Nest tree = nest("keyless", null,
                 embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies", List.of("policy_no")));
 
         assertThatThrownBy(() -> compile(tree))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.array-key-unresolvable")
-                .hasMessageContaining("table=keyless_rows");
+                .hasMessageContaining("nest.root-key-required")
+                .hasMessageContaining("rootAlias=keyless");
     }
 
     @Test
