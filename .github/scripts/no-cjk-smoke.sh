@@ -57,7 +57,7 @@ expect() { # expect <name> <mode> <want code> <want text>
   local name="$1" mode="$2" want_code="$3" want_text="$4" out code
   out="$(bash "$gate" "$mode" 2>&1)"
   code=$?
-  if [ "$code" = "$want_code" ] && printf '%s' "$out" | grep -qF "$want_text"; then
+  if [ "$code" = "$want_code" ] && grep -qF "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"
     passed=$((passed + 1))
   else
@@ -70,7 +70,7 @@ expect() { # expect <name> <mode> <want code> <want text>
 refute() { # refute <name> <mode> <unwanted text>
   local name="$1" mode="$2" unwanted="$3" out
   out="$(bash "$gate" "$mode" 2>&1)"
-  if printf '%s' "$out" | grep -qF "$unwanted"; then
+  if grep -qF "$unwanted" <<<"$out"; then
     printf '  FAIL  %s\n        did not want %s, got: %s\n' "$name" "$unwanted" "$out"
     failed=$((failed + 1))
   else
@@ -505,7 +505,7 @@ fresh_repo
 expect "an unknown mode is refused rather than assumed" bogus 1 "needs a mode"
 expect "the mode that read the pull request body is gone" pr-body 1 "needs a mode"
 out="$(bash "$gate" 2>&1)"; code=$?
-if [ "$code" = 1 ] && printf '%s' "$out" | grep -qF "needs a mode"; then
+if [ "$code" = 1 ] && grep -qF "needs a mode" <<<"$out"; then
   printf '  ok    %s\n' "no mode at all is refused"
   passed=$((passed + 1))
 else
@@ -521,7 +521,7 @@ fi
 mkdir -p "$scratch/norepo" && cd "$scratch/norepo" || exit 1
 printf 'a %s b\n' "$han" > doc.md
 out="$(CHARSET_ALLOWLIST="$real_allowlist" bash "$gate" files 2>&1)"; code=$?
-if [ "$code" = 1 ] && printf '%s' "$out" | grep -qF "could not run"; then
+if [ "$code" = 1 ] && grep -qF "could not run" <<<"$out"; then
   printf '  ok    %s\n' "a scan that could not run is refused, not reported clean"
   passed=$((passed + 1))
 else

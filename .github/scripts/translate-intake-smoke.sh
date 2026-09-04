@@ -101,7 +101,7 @@ check() { # check <name> <0 = must hold> ; caller supplies the condition via `if
 
 # `--` on both: every needle below that names a gh flag starts with `--`, and without it grep reads
 # the needle as its own option - which fails the way an absent match fails.
-has()     { printf '%s' "$1" | grep -qiF -- "$2"; }
+has()     { grep -qiF -- "$2" <<<"$1"; }
 in_file() { [ -f "$1" ] && grep -qiF -- "$2" "$1"; }
 
 # A report that reads as foreign, and doubly so: `\xC3\xA0` is the French a-grave (U+00E0), which is
