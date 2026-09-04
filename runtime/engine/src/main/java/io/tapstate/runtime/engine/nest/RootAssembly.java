@@ -1037,11 +1037,28 @@ public final class RootAssembly implements Serializable {
                 // the row has anyway, so pointing at something costs the document no bytes of its own.
                 List<Object> key = NestKeys.valuesOf(document, slot.referenceFields());
                 Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
-                // An empty row is one that has been deleted, and it renders as no field at all - the same
-                // as an object embed with no live element. Frozen at its last value is the one thing it
-                // must not be: the source no longer has that row, so neither may the document.
-                if (row != null && !row.isEmpty()) {
-                    document.put(slot.path(), new LinkedHashMap<>(row));
+                // A row that is not filed at all has not been fetched; one filed and empty has been
+                // deleted. Neither is something to render, and frozen at its last value is the one thing
+                // it must not be: the source no longer has that row, so neither may the document.
+                boolean live = row != null && !row.isEmpty();
+                // The shape is whatever `as` says, here exactly as for a gathered embed. Which side of the
+                // join carries the other's identity decides where a row is read from - it does not decide,
+                // and is not decided by, what the row looks like once it is in. An array holds the one row
+                // pointed at and stays an empty array when there is none; an object goes missing instead,
+                // which is the whole of the difference between the two shapes.
+                switch (slot.as()) {
+                    case ARRAY -> {
+                        List<Map<String, Object>> pointedAt = new ArrayList<>();
+                        if (live) {
+                            pointedAt.add(new LinkedHashMap<>(row));
+                        }
+                        document.put(slot.path(), pointedAt);
+                    }
+                    case OBJECT -> {
+                        if (live) {
+                            document.put(slot.path(), new LinkedHashMap<>(row));
+                        }
+                    }
                 }
                 continue;
             }

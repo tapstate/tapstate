@@ -192,4 +192,49 @@ class ATreeMayCarryAllThreeShapesAtOnceTest {
                         + "document ends up carrying another row's customer")
                 .isEqualTo(Map.of(CUSTOMER_LOOKUP, java.util.Set.of(List.of(7))));
     }
+
+    /** The same tree, with the pointed-at row asked for as an array instead of an object. */
+    private static final List<EmbedSlot> POINTED_AT_AS_ARRAY = List.of(
+            new EmbedSlot(ITEMS, EmbedAs.ARRAY, List.of()),
+            new EmbedSlot(PROFILE, EmbedAs.OBJECT, List.of()),
+            new EmbedSlot(CUSTOMER, EmbedAs.ARRAY, List.of("cust_ref"), CUSTOMER_LOOKUP, List.of()));
+
+    /** What a fetch answers with once the pointed-at row has been deleted: filed, and empty. */
+    private static Map<String, Map<Object, Map<String, Object>>> customerDeleted() {
+        return Map.of(CUSTOMER_LOOKUP, Map.<Object, Map<String, Object>>of(List.of(7), Map.of()));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> arrayAt(Map<String, Object> document, String path) {
+        return (List<Map<String, Object>>) document.get(path);
+    }
+
+    @Test
+    @DisplayName("a pointed-at row asked for as an array renders as one, single row and all")
+    void aPointedAtRowTakesTheShapeItWasAskedFor() {
+        Map<String, Object> document =
+                assembled().render(POINTED_AT_AS_ARRAY, customerNamed("Ada")).orElseThrow();
+
+        assertThat(arrayAt(document, CUSTOMER))
+                .describedAs("what an embed looks like in the document is what `as` says and nothing "
+                        + "else - it does not also decide, or get decided by, which side of the join "
+                        + "carries the other's identity. A document that renders an object where its "
+                        + "author asked for an array is one no target can be configured against")
+                .containsExactly(row("customer_id", 7, "name", "Ada"));
+    }
+
+    @Test
+    @DisplayName("a pointed-at array whose row is gone is an empty array, not a missing field")
+    void aPointedAtArrayWithNothingLeftToPutInItIsEmptyRatherThanAbsent() {
+        Map<String, Object> document =
+                assembled().render(POINTED_AT_AS_ARRAY, customerDeleted()).orElseThrow();
+
+        assertThat(document)
+                .describedAs("an array embed always occupies its field and says it holds nothing, which "
+                        + "is what the gathered arrays beside it already do; only an object embed goes "
+                        + "missing when there is nothing live, and that is the difference the two shapes "
+                        + "are for. Reading the deleted row as an absent field here would tell the target "
+                        + "to drop a field the author declared as always present")
+                .containsEntry(CUSTOMER, List.of());
+    }
 }
