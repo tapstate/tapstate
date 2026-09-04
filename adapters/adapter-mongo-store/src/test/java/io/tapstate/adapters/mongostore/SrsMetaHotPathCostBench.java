@@ -1,5 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -8,16 +10,22 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
 import io.tapstate.testsupport.RequiresDocker;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Measures what one cdc run pays the coordination record against a real endpoint, so that making the
@@ -326,5 +334,87 @@ class SrsMetaHotPathCostBench {
                 "%d,%d,%d,%s,%d,%d,%d,%d%n",
                 consumers, ddls, bytes, path, p50 / 1_000, p99 / 1_000, max / 1_000,
                 1_000_000_000L / Math.max(p99, 1));
+    }
+
+    /**
+     * The one thing in here that fails rather than prints: reading what every consumer has acked costs the
+     * same however many of them there are.
+     *
+     * <p>The rest of this file is an instrument. It reports times, and a time is the wrong thing to assert
+     * on -- a threshold in microseconds passes or fails on how busy the machine is, and the figure it would
+     * be compared against is from another day and another machine. What the design actually claims is
+     * structural: the slowest consumer is found in one round trip to the record, not in one per consumer.
+     * That is a count, it is the same everywhere, and an implementation that asked per consumer shows
+     * sixteen against one.
+     *
+     * <p>Counted at the driver rather than inside the store, because the store is the thing under test:
+     * asking it how many times it went to the endpoint would be taking its own word for it. Only read
+     * commands are counted -- the connection's own chatter is not a trip this code chose to make.
+     *
+     * <p>A first call is made and discarded before each count, or the first shape pays for whatever the
+     * driver does once per collection and the comparison is between a cold read and a warm one.
+     */
+    @Test
+    void takingTheSlowestConsumerCostsOneRoundTripHoweverManyThereAre() {
+        CountingReads counting = new CountingReads();
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(counting)
+                .build();
+        try (MongoClient client = MongoClients.create(settings)) {
+            MongoCollection<Document> collection =
+                    client.getDatabase("tapstate").getCollection("srs_meta");
+            MongoSrsMetaStore store = new MongoSrsMetaStore(collection);
+
+            long forOne = readsFor(counting, store, "count-c1", 1);
+            long forSixteen = readsFor(counting, store, "count-c16", 16);
+
+            assertThat(forOne)
+                    .as("reads the hot path makes for a chain with one consumer -- the bound it needs is a "
+                            + "function of the consumer offsets, and they are one record")
+                    .isEqualTo(1);
+            assertThat(forSixteen)
+                    .as("and for a chain with sixteen: the same, because the slowest is found in the record "
+                            + "rather than by asking each consumer. An implementation that asked per "
+                            + "consumer reads sixteen here and one above -- the shape this catches and no "
+                            + "timing on one machine reliably would")
+                    .isEqualTo(forOne);
+        }
+    }
+
+    /** The read commands one hot-path read costs, over a chain seeded with the given consumer count. */
+    private static long readsFor(
+            CountingReads counting, MongoSrsMetaStore store, String chain, int consumers) {
+        seed(store, chain, consumers, 0, 0, TABLES);
+        store.consumerOffsets(chain);
+        counting.reset();
+        store.consumerOffsets(chain);
+        return counting.count();
+    }
+
+    /**
+     * Counts the driver's read commands. Monitoring and handshake traffic is left out: that is the
+     * connection keeping itself alive, not a trip this code asked for.
+     */
+    private static final class CountingReads implements CommandListener {
+
+        private static final Set<String> READS = Set.of("find", "aggregate", "getMore", "count");
+
+        private final AtomicLong seen = new AtomicLong();
+
+        @Override
+        public void commandStarted(CommandStartedEvent event) {
+            if (READS.contains(event.getCommandName())) {
+                seen.incrementAndGet();
+            }
+        }
+
+        void reset() {
+            seen.set(0);
+        }
+
+        long count() {
+            return seen.get();
+        }
     }
 }
