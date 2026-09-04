@@ -191,7 +191,11 @@ final class LookupProcessor extends AbstractProcessor {
         List<Object> key = NestKeys.valuesOf(row, lookup.partitionKey());
         // Left standing as an empty row rather than taken out. A document pointing at a row that is not
         // here has to know which kind of not-here it is: one that has not arrived is worth waiting for and
-        // one that has been deleted never will be, and an absent entry cannot say which.
+        // one that has been deleted never will be, and an absent entry cannot say which. And never taken
+        // away afterwards, on any path: which documents name a row is a statement about the ones seen so
+        // far and never about the ones to come, so a record dropped because nothing wanted it at that
+        // moment is the answer missing for the next document that does - and that document waits for an
+        // arrival already in the past, for the life of the job, with nothing thrown and no count moved.
         store.save(key, NestKeys.isDeletion(event) ? NestLookup.gone() : row);
         wake(key, event);
     }
@@ -279,7 +283,6 @@ final class LookupProcessor extends AbstractProcessor {
         Object bucket = NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer));
         if (NestKeys.isDeletion(event)) {
             references.remove(bucket, referrer);
-            reclaimIfNothingPointsAtIt(referenced);
             return;
         }
         references.add(bucket, referrer);
@@ -355,36 +358,6 @@ final class LookupProcessor extends AbstractProcessor {
         }
         List<Object> referrer = NestKeys.valuesOf(was, lookup.referrerIdentity());
         references.remove(NestLookup.bucketKey(left, NestLookup.bucketOf(referrer)), referrer);
-        reclaimIfNothingPointsAtIt(left);
-    }
-
-    /**
-     * Drops the record that a row was deleted, once no document points at it any longer.
-     *
-     * <p>That record is kept for one purpose - answering a document that still names the row, so it renders
-     * without the field and goes, rather than waiting for ever on an arrival that has already happened. Once
-     * nothing names it there is nobody left to answer, and kept anyway every deletion the source ever makes
-     * leaves one behind for as long as the job runs.
-     *
-     * <p><b>A row that is still there is deliberately not dropped, and that is a departure from the shape
-     * this was first written as.</b> "Nothing points at it" is a statement about the documents seen so far,
-     * never about the ones still to come. A source sends a row once and then only when it changes, so a copy
-     * let go of because it was unwanted at that moment is a copy nothing can ask for again: the next document
-     * naming it renders with the field simply missing, which is indistinguishable from a document that has
-     * none, and no count anywhere moves. What keeping it costs is one entry per row of a table this tree was
-     * already holding one entry per row of.
-     *
-     * <p>Only reached from a re-point, and only after a single read that ends it for a row that is still
-     * there - so the sweep of all the buckets is paid on the rare edit that leaves a deleted row behind.
-     */
-    private void reclaimIfNothingPointsAtIt(List<Object> key) {
-        Map<String, Object> filed = store.load(key);
-        if (filed == null || !filed.isEmpty()) {
-            return;
-        }
-        if (references.loadAll(bucketsOf(key)).isEmpty()) {
-            store.remove(key);
-        }
     }
 
     /**

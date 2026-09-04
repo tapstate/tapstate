@@ -46,30 +46,31 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * That the record of a pointed-at row has an end, and that the end is only reached by a row that was
- * already deleted.
+ * That what is held for a pointed-at row is never let go of - the row itself while it is still there, and
+ * the record that it was deleted once it is not - however few documents are left pointing at it.
  *
- * <p><b>Both halves are needed and they pull in opposite directions.</b> Keeping every row a document ever
- * pointed at, for as long as the job runs, is a leak nothing reports: the documents are right, the counts
- * are right, and what grows is one entry per row of a table nobody is looking at. Letting go of a row the
- * moment nothing points at it fixes that and introduces something worse - "nothing points at it" is a
- * statement about the documents seen so far and never about the ones to come, and a source sends a row
- * once, so a live row let go of is a row no later document can be given. Such a document renders with the
- * field simply missing, which is what a document with no such row looks like. Neither failure moves a
- * count, so each half needs its own case.
+ * <p><b>Both halves are the same sentence and they were arrived at from opposite ends.</b> Keeping every
+ * row a document ever pointed at, for as long as the job runs, is a leak nothing reports: the documents are
+ * right, the counts are right, and what grows is one entry per row of a table nobody is looking at. Letting
+ * go of a row the moment nothing points at it fixes that and introduces something worse - "nothing points
+ * at it" is a statement about the documents seen so far and never about the ones to come, and a source
+ * sends a row once, so a live row let go of is a row no later document can be given. Such a document
+ * renders with the field simply missing, which is what a document with no such row looks like.
  *
- * <p>The end that does exist is for a row whose deletion has already been recorded. That record exists to
- * answer documents still naming the row - so they render without the field and go, rather than waiting for
- * an arrival that is in the past - and once no document names it there is nobody left to answer.
+ * <p><b>That sentence holds for a row already deleted at least as hard, which is the half this used to get
+ * wrong.</b> The record of a deletion is what tells a document naming the row that it is not coming, so it
+ * renders without the field and goes. Taken away because nothing happened to point at it in that moment,
+ * the next document naming the row finds nothing where that answer was - and an absent entry reads as one
+ * that has not arrived yet, so the document waits for an arrival already in the past, for the life of the
+ * job. Neither failure moves a count, so each half needs its own case.
  *
  * <p><b>The pair beside this one asks the same two questions through the other door, and that is why both
  * exist.</b> There, the last document stops pointing at the row by being <em>re-pointed</em> somewhere
  * else; here, by being <em>deleted</em>. Those are two separate places in the code that reach the same
  * decision, added at different times for different reasons, and either one can be right while the other
- * does nothing at all - a reclaim wired only to the re-point leaves every deleted document's row standing
- * for the life of the job, and no case driven by re-pointing can see it.
+ * does nothing at all - so a case driven by re-pointing cannot see what the deletion path does.
  */
-class WhatNothingPointsAtIsLetGoOfOnlyIfItIsAlreadyGoneTest {
+class WhatIsKeptWhenTheLastReferrerIsDeletedTest {
 
     private static final String STEP = "order_doc";
     private static final int CUSTOMER = 7;
@@ -109,8 +110,8 @@ class WhatNothingPointsAtIsLetGoOfOnlyIfItIsAlreadyGoneTest {
     }
 
     @Test
-    @DisplayName("a deleted row is let go of once the last document pointing at it is deleted too")
-    void theRecordOfADeletedRowEndsWhenNothingPointsAtItAnyMore() {
+    @DisplayName("the record of a deleted row outlives the last document that pointed at it")
+    void theRecordOfADeletedRowOutlivesTheLastDocumentPointingAtIt() {
         String pipeline = "reclaim-gone";
         member.getJet().newJob(ordersPointingAtOneCustomer(pipeline, true)).join();
 
@@ -120,11 +121,12 @@ class WhatNothingPointsAtIsLetGoOfOnlyIfItIsAlreadyGoneTest {
                         + "reclamation that could not have happened rather than one that did")
                 .isZero();
         assertThat(rowsHeldIn(pipeline))
-                .describedAs("the record of the deleted customer is still there with nothing pointing at "
-                        + "it. It is kept for one purpose - answering a document that still names the "
-                        + "row - and there is nobody left to answer, so every deletion a source ever "
-                        + "makes would otherwise leave one of these behind for the life of the job")
-                .isEmpty();
+                .describedAs("the deletion is still on record, as an empty row, with nothing pointing at "
+                        + "it. It is the only thing that can ever tell the next order naming this customer "
+                        + "that the row is not coming: an entry taken away instead is indistinguishable "
+                        + "from one that has not arrived, and that order's document then waits for the "
+                        + "life of the job with nothing thrown and no count moved")
+                .containsExactly(Map.entry(List.of(CUSTOMER), Map.of()));
     }
 
     @Test

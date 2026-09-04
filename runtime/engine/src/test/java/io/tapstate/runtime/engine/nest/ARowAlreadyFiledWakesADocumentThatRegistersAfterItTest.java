@@ -127,6 +127,36 @@ class ARowAlreadyFiledWakesADocumentThatRegistersAfterItTest {
                 .hasSize(1);
     }
 
+    /**
+     * The same answer, after the row's last referrer has itself gone. A deletion is filed as an empty row
+     * so a document naming the row afterwards is told it is never coming; taking that record away puts the
+     * row back to indistinguishable from not-yet-arrived, and the next document naming it waits for ever
+     * with the job running and nothing to see.
+     *
+     * <p>The case above is this one without the referrer ever leaving, and it passes - so a word there and
+     * none here isolates the reclaim rather than the fixture.
+     */
+    @Test
+    void aRegistrationArrivingAfterTheLastReferrerLeftIsStillToldTheRowIsGone() throws Exception {
+        TestOutbox outbox = new TestOutbox(1024);
+        LookupProcessor processor = lookup(outbox);
+
+        feed(processor, LookupProcessor.ROWS, deletedCustomer(100));
+        feed(processor, LookupProcessor.REGISTRATIONS, order(1, 100));
+        woken(outbox);
+
+        feed(processor, LookupProcessor.REGISTRATIONS, deletedOrder(1, 100));
+        woken(outbox);
+
+        feed(processor, LookupProcessor.REGISTRATIONS, order(2, 100));
+
+        assertThat(woken(outbox))
+                .describedAs("the deletion is still the only answer this second order will ever get - "
+                        + "the source sent it once, and an unrelated order going away does not make it "
+                        + "deliverable again")
+                .hasSize(1);
+    }
+
     private LookupProcessor lookup(TestOutbox outbox) throws Exception {
         LookupProcessor processor = new LookupProcessor(CUSTOMERS, rows, references, PLENTY, null);
         processor.init(outbox, new TestProcessorContext());
@@ -160,6 +190,11 @@ class ARowAlreadyFiledWakesADocumentThatRegistersAfterItTest {
     private static Envelope customer(int customerId, String name) {
         return Envelope.insert(customerId, "customer", row("customer_id", customerId, "name", name), null)
                 .withOrder(at(customerId));
+    }
+
+    private static Envelope deletedOrder(long orderId, int customerId) {
+        return Envelope.delete(orderId, "order", row("order_id", orderId, "cust_ref", customerId), null)
+                .withOrder(at(orderId));
     }
 
     private static Envelope deletedCustomer(int customerId) {

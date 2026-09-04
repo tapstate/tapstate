@@ -48,17 +48,21 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * What is kept for a row once the last document pointing at it has walked away, and what is let go.
+ * What is kept for a row once the last document pointing at it has walked away - which is all of it,
+ * whether what is held is the row or only the record that the row was deleted.
  *
  * <p>Two different things are held per pointed-at row and only one of them is the row. There is the record
- * that it was deleted, which exists to answer a document that still names it - and once nothing names it,
- * that answer is for nobody. And there is the row itself, which is this tree's only copy of it.
+ * that it was deleted, which exists to answer a document naming it - so that document renders without the
+ * field and goes, rather than waiting on an arrival that is in the past. And there is the row itself, which
+ * is this tree's only copy of it.
  *
- * <p><b>Letting go of the second is what these two cases are here to keep apart.</b> Nothing points at a
- * row is a statement about the documents seen so far, never about the ones still to come: rows are read
- * once and then only when they change, so a row dropped because it happened to be unwanted at that moment
- * cannot be got back - and the document that names it next renders without it, correct-looking and wrong,
- * with no error anywhere. Which is why only the first case lets anything go.
+ * <p><b>Neither may be let go of on the strength of nothing pointing at it, and these two cases hold one
+ * half of that each.</b> Nothing points at a row is a statement about the documents seen so far, never
+ * about the ones still to come: rows are read once and then only when they change, so anything dropped
+ * because it happened to be unwanted in that moment cannot be got back. For the row, the document naming it
+ * next renders without it, correct-looking and wrong, with no error anywhere. For the record of a deletion
+ * it is worse - an absent entry is read as one that has not arrived yet, so that document does not render
+ * at all and waits for the life of the job.
  */
 class WhatIsKeptForARowNobodyPointsAtAnyMoreTest {
 
@@ -96,8 +100,8 @@ class WhatIsKeptForARowNobodyPointsAtAnyMoreTest {
     }
 
     @Test
-    @DisplayName("the record of a deleted row goes once nothing points at it any more")
-    void theRecordOfADeletedRowGoesOnceNothingPointsAtItAnyMore() {
+    @DisplayName("the record of a deleted row is kept once nothing points at it any more")
+    void theRecordOfADeletedRowIsKeptOnceNothingPointsAtItAnyMore() {
         String pipeline = "p-reclaim";
         member.getJet().newJob(orders(pipeline, List.of(
                 new Timed(List.of(row("order_id", 1, "cust_ref", WALKED_AWAY_FROM)),
@@ -110,21 +114,22 @@ class WhatIsKeptForARowNobodyPointsAtAnyMoreTest {
                         new Timed(List.of(customer(WALKED_AWAY_FROM, "Ada")),
                                 Duration.ofMillis(1000), null, true)))).join();
 
-        // The control, and it is not decoration: "does not contain" is true of an empty namespace, so a
-        // run that filed nothing at all - because the job never started, or the rows never arrived -
-        // satisfies the assertion below while proving none of it. Naming the row that must still be there
-        // is what separates "the deleted one went" from "nothing was ever here".
+        // No longer the control it was written as: the assertion below is now a positive one, and an
+        // empty run fails that on its own. What it still says is that the walk-away this case rests on
+        // actually happened - the order moved to the other customer rather than going nowhere.
         assertThat(rows(pipeline).keySet())
-                .describedAs("the row still pointed at is filed, so the namespace is populated and the "
-                        + "assertion below is about a deletion rather than about an empty run")
+                .describedAs("the customer the order was re-pointed to is filed, so the first customer "
+                        + "really is one nothing points at any more")
                 .contains(List.of(POINTED_AT_NOW));
 
         assertThat(rows(pipeline).keySet())
-                .describedAs("the deleted row is not kept once nothing names it. The record of a deletion "
-                        + "exists to answer a document still pointing there - once none is, it answers "
-                        + "nobody, and kept anyway every deletion the source ever makes leaves one behind "
-                        + "for the life of the job")
-                .doesNotContain(List.of(WALKED_AWAY_FROM));
+                .describedAs("the record of the deletion is kept even though the one order naming that "
+                        + "customer has been re-pointed away. Which documents name a row is a statement "
+                        + "about the ones seen so far, so this record is what the next order pointing "
+                        + "here is owed: taken away, it cannot be told the row is gone, and an entry that "
+                        + "is not there reads as one that has not arrived - so that document waits for "
+                        + "ever instead of rendering without the field")
+                .contains(List.of(WALKED_AWAY_FROM));
     }
 
     @Test
