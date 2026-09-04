@@ -8,6 +8,13 @@
 # which stops before Docker. A fake `uname` (and, for the musl case, a fake `ldd`) placed first on PATH
 # drives the platform each run sees. Exit 0 iff every check passes.
 set -uo pipefail
+# Every case here runs the real installer, and the installer's default event endpoint is the
+# production one. A harness that forgets to override it posts a forged install for each case it runs
+# -- 21 from one run of this file -- into the very denominator that endpoint exists to collect, and
+# not one of them is distinguishable from a real install afterwards. Point the default at a port
+# nothing listens on: the send is refused instantly and the installer swallows it, exactly as it does
+# for a user who is offline. A case that wants to observe an event still sets its own URL.
+export TAPSTATE_TELEMETRY_URL="${TAPSTATE_TELEMETRY_URL:-http://127.0.0.1:1/e}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"          # deploy/quickstart -> repo root
@@ -987,6 +994,15 @@ PYEOF
   rm -f "$qs_out" "$qs_err"
   kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null
 fi
+
+# --- the harness itself must not report installs -----------------------------------------------------
+# The subject of this case is one line at the top of this file, and losing that line is silent: the
+# suite stays green while every case in it posts a forged install to the production endpoint.
+case "${TAPSTATE_TELEMETRY_URL:-}" in
+  "")             bad "the suite runs the installer with no endpoint override -- every case posts a real install event" ;;
+  *tapstate.dev*) bad "the suite points the installer at the production endpoint: $TAPSTATE_TELEMETRY_URL" ;;
+  *)              ok  "the suite's own install events go nowhere near the production endpoint" ;;
+esac
 
 # --- summary ----------------------------------------------------------------------------------------
 echo
