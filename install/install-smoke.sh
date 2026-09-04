@@ -7,6 +7,13 @@
 # and an idempotent re-run. A fake `uname` (and, for the musl case, a fake `ldd`) placed first on PATH
 # drives the platform each run sees. Exit 0 iff every check passes.
 set -uo pipefail
+# Every case here runs the real installer, and the installer's default event endpoint is the
+# production one. A harness that forgets to override it posts a forged install for each case it runs
+# -- 29 from one run of this file -- into the very denominator that endpoint exists to collect, and
+# not one of them is distinguishable from a real install afterwards. Point the default at a port
+# nothing listens on: the send is refused instantly and the installer swallows it, exactly as it does
+# for a user who is offline. A case that wants to observe an event still sets its own URL.
+export TAPSTATE_TELEMETRY_URL="${TAPSTATE_TELEMETRY_URL:-http://127.0.0.1:1/e}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_SH="$HERE/install.sh"
@@ -505,6 +512,144 @@ else
   bad "staged alias stranded or the abort was not detected rc=$RC stranded=$STRANDED: $OUT"
 fi
 rm -rf "$shim"
+
+# --- the install event: what it carries, when it fires, and when it must not ------------------------
+# A local sink stands in for the endpoint, so these run with no network and no credentials. Each case
+# asserts on what actually arrived, not on what the script claims it sends.
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "install event: python3 is needed for the local sink"
+else
+  BEACON_DIR="$(mktemp -d)"
+  : > "$BEACON_DIR/log"
+  python3 - "$BEACON_DIR" <<'PYEOF' &
+import http.server, os, sys
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(n).decode('utf-8', 'replace')
+        with open(os.path.join(d, 'log'), 'a') as fh:
+            fh.write(body + "\n")
+        self.send_response(204); self.end_headers()
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+with open(os.path.join(d, 'port'), 'w') as fh:
+    fh.write(str(srv.server_address[1]))
+srv.serve_forever()
+PYEOF
+  BEACON_PID=$!
+  for _ in $(seq 1 50); do [ -s "$BEACON_DIR/port" ] && break; sleep 0.1; done
+  BEACON_URL="http://127.0.0.1:$(cat "$BEACON_DIR/port")/e"
+
+  # A second stub version, so "which version did it report" has two possible answers. With only the
+  # pinned one in the tree the assertion cannot fail, and the field it guards is what makes the funnel
+  # per-version at all.
+  OTHER_VERSION=9.9.9
+  _real_version="$VERSION"; VERSION="$OTHER_VERSION"; make_asset darwin-arm64; VERSION="$_real_version"
+
+  beacon_reset() { : > "$BEACON_DIR/log"; }
+  beacon_count() { grep -c . "$BEACON_DIR/log" 2>/dev/null | tr -d ' '; }
+  beacon_field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$BEACON_DIR/log" | head -1; }
+
+  # run the installer with an explicit version and arbitrary args, capturing stderr separately
+  # $1 install_dir  $2 version  $3 stderr_file  $4 stdout_file  rest: args to install.sh
+  # Extra environment goes through `env` on purpose. Writing ${EV_ENV} among the assignment prefixes
+  # does not work: bash parses assignments before expanding, so the expanded text becomes the command
+  # name and the run dies -- which is a failure shaped exactly like "nothing was sent".
+  ev_run() {
+    local idir="$1" fver="$2" errf="$3" outf="$4"; shift 4
+    local shim; shim="$(mktemp -d)"
+    # shellcheck disable=SC2016
+    printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; *) echo unknown ;; esac\n' > "$shim/uname"
+    chmod +x "$shim/uname"
+    # shellcheck disable=SC2086
+    env ${EV_ENV:-} \
+      PATH="$shim:$PATH" \
+      TAPSTATE_VERSION="$fver" \
+      TAPSTATE_BASE_URL="file://$STUB" \
+      TAPSTATE_INSTALL_DIR="$idir" \
+      TAPSTATE_TELEMETRY_URL="$BEACON_URL" \
+      sh "$INSTALL_SH" "$@" >"$outf" 2>"$errf"
+    rm -rf "$shim"
+  }
+
+  ev_err="$(mktemp)"
+  ev_out="$(mktemp)"
+
+  # version fidelity: the event carries what was actually installed, not the script's own pin. An
+  # implementation reporting PINNED_VERSION is byte-identical on a default run, so only an explicit
+  # TAPSTATE_VERSION separates the two -- and the per-version funnel rests entirely on this field.
+  d1="$(mktemp -d)/bin"
+  beacon_reset; ev_run "$d1" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  got="$(beacon_field version)"
+  if [ "$got" = "$OTHER_VERSION" ]; then ok "install event carries the resolved version ($got)"
+  else bad "install event version: expected $OTHER_VERSION, got '$got'"; fi
+  if [ "$(beacon_field entrypoint)" = cli ]; then ok "install event defaults entrypoint=cli"
+  else bad "install event entrypoint: got '$(beacon_field entrypoint)'"; fi
+  first_id="$(beacon_field installation_id)"
+
+  # idempotence: the same installation root keeps its id, so a reinstall is not a second install --
+  # and the denominator is exactly "installs", so regenerating here inflates it.
+  beacon_reset; ev_run "$d1" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  second_id="$(beacon_field installation_id)"
+  if [ -n "$first_id" ] && [ "$first_id" = "$second_id" ]; then ok "installation_id survives a reinstall in place"
+  else bad "installation_id changed on reinstall: '$first_id' -> '$second_id'"; fi
+
+  # isolation: another installation root is another installation. This pins the semantics -- an id
+  # written to a fixed $HOME path would hand back the same value here.
+  d2="$(mktemp -d)/bin"
+  beacon_reset; ev_run "$d2" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  other_id="$(beacon_field installation_id)"
+  if [ -n "$other_id" ] && [ "$other_id" != "$first_id" ]; then ok "a second installation root gets its own id"
+  else bad "second installation root reused the first id ('$other_id')"; fi
+
+  # opt-out: nothing sent AND nothing written. Skipping only the request still leaves an identifier on
+  # the user's disk, and no network assertion would ever notice.
+  d3="$(mktemp -d)/bin"
+  beacon_reset; EV_ENV="TAPSTATE_TELEMETRY=off" ev_run "$d3" "$OTHER_VERSION" "$ev_err" "$ev_out"; EV_ENV=""
+  if [ ! -x "$d3/tapstate" ]; then
+    bad "TAPSTATE_TELEMETRY=off: the install itself did not happen, so this case proves nothing"
+  elif [ "$(beacon_count)" = 0 ]; then ok "TAPSTATE_TELEMETRY=off sends nothing (install did complete)"
+  else bad "TAPSTATE_TELEMETRY=off still sent $(beacon_count) event(s)"; fi
+  if find "$d3" -name '*installation*id*' 2>/dev/null | grep -q .; then
+    bad "TAPSTATE_TELEMETRY=off still wrote an id file"
+  else ok "TAPSTATE_TELEMETRY=off writes no id file"; fi
+
+  # the platform gate stays side-effect free: quickstart.sh calls it before every install, so a beacon
+  # hung at script entry would double every install this ever measures.
+  # The directory must already exist, which is the quickstart's real shape (TAPSTATE_INSTALL_DIR=$PWD,
+  # the demo directory it is standing in). With a not-yet-created directory an unrelated guard inside
+  # the sender also happens to suppress the event, and the case would pass while the defect it exists
+  # to catch -- an event fired from the platform gate -- was present.
+  d4="$(mktemp -d)/bin"; mkdir -p "$d4"
+  beacon_reset; ev_run "$d4" "$OTHER_VERSION" "$ev_err" "$ev_out" --print-platform
+  if [ "$(beacon_count)" = 0 ]; then ok "--print-platform sends no event"
+  else bad "--print-platform sent $(beacon_count) event(s)"; fi
+
+  # disclosure on stderr: quickstart.sh runs the installer with stdout dropped, so a disclosure written
+  # to stdout is invisible on the path most first-time users take -- while a stdout-based test passes.
+  d5="$(mktemp -d)/bin"
+  beacon_reset; ev_run "$d5" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if ! grep -qi 'anonymous install event' "$ev_err"; then
+    bad "disclosure not on stderr; a quickstart user would never see it"
+  elif ! grep -qi 'TAPSTATE_TELEMETRY=off' "$ev_err"; then
+    bad "disclosure on stderr does not say how to turn it off"
+  elif grep -qiE 'anonymous install event|TAPSTATE_TELEMETRY=off' "$ev_out"; then
+    bad "part of the disclosure went to stdout, which the quickstart drops"
+  else ok "the whole disclosure is on stderr, none of it on stdout"; fi
+
+  rm -f "$ev_err" "$ev_out"
+  kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null
+fi
+
+# --- the harness itself must not report installs -----------------------------------------------------
+# The subject of this case is one line at the top of this file, and losing that line is silent: the
+# suite stays green while every case in it posts a forged install to the production endpoint.
+case "${TAPSTATE_TELEMETRY_URL:-}" in
+  "")             bad "the suite runs the installer with no endpoint override -- every case posts a real install event" ;;
+  *tapstate.dev*) bad "the suite points the installer at the production endpoint: $TAPSTATE_TELEMETRY_URL" ;;
+  *)              ok  "the suite's own install events go nowhere near the production endpoint" ;;
+esac
 
 # --- summary ----------------------------------------------------------------------------------------
 echo

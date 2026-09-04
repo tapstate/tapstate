@@ -132,7 +132,18 @@ jobs:
             echo "routing: $tag predates the checked-in routing; using this checkout's vercel.json"
             cp deploy/install-site/vercel.json "$site/vercel.json"
           fi
-          ls -l "$site"
+          # The event receiver travels with the routing, from the tag when the tag has it. Without this
+          # the site deploys with a /e rewrite and nothing behind it: the route 404s, the installer's
+          # report fails silently by design, and no signal anywhere says the endpoint was never
+          # published. A missing function and a quiet week look identical downstream.
+          mkdir -p "$site/api"
+          if git show "$tag:deploy/install-site/api/event.js" > "$site/api/event.js" 2>/dev/null; then
+            echo "receiver: from $tag"
+          else
+            echo "receiver: $tag predates the checked-in receiver; using this checkout's copy"
+            cp deploy/install-site/api/event.js "$site/api/event.js"
+          fi
+          ls -lR "$site"
           echo "dir=$site" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to production
@@ -188,3 +199,37 @@ jobs:
             echo "not yet serving the new deployment; retrying in 15s"
             sleep 15
           done
+
+          # The receiver is a route, not content, so the byte comparison above cannot see it. Two
+          # probes, neither of which stores anything.
+          #
+          # First: a GET. The handler answers 405 to anything but POST, so 405 proves the route
+          # resolves to the function. A 404 means the site published with a /e rewrite pointing at
+          # nothing.
+          code="$(curl -s -o /dev/null -w '%{http_code}' "https://$SITE_DOMAIN/e")"
+          if [ "$code" = "405" ]; then
+            echo "ok: the event receiver is live (GET /e -> 405, as it should be)"
+          else
+            echo "the event receiver is not live: GET /e answered $code, expected 405" >&2
+            exit 1
+          fi
+
+          # Second: a POST the receiver must refuse. 400 proves the handler BODY ran -- the validator
+          # executed and rejected -- rather than only that a route exists, which is all 405 shows. A
+          # rewrite pointing at a stale or broken function can still answer 405 for a GET.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+                    -X POST -H 'Content-Type: application/json' \
+                    -d '{"installation_id":"no"}' "https://$SITE_DOMAIN/e")"
+          if [ "$code" = "400" ]; then
+            echo "ok: the receiver validates (POST of a malformed event -> 400)"
+          else
+            echo "the receiver did not validate: malformed POST answered $code, expected 400" >&2
+            exit 1
+          fi
+
+          # What is deliberately NOT probed here: a successful write. The only POST that reaches
+          # storage is a well-formed event, and sending one would fabricate an install in the very
+          # denominator this endpoint exists to measure -- a probe that corrupts its own measurement.
+          # A broken credential surfaces two other ways instead: the handler answers 500 rather than
+          # 204 when a store fails, so the platform's own function metrics show it, and the weekly
+          # report warns when distribution signals are non-zero while the install count is not.

@@ -8,6 +8,13 @@
 # which stops before Docker. A fake `uname` (and, for the musl case, a fake `ldd`) placed first on PATH
 # drives the platform each run sees. Exit 0 iff every check passes.
 set -uo pipefail
+# Every case here runs the real installer, and the installer's default event endpoint is the
+# production one. A harness that forgets to override it posts a forged install for each case it runs
+# -- 21 from one run of this file -- into the very denominator that endpoint exists to collect, and
+# not one of them is distinguishable from a real install afterwards. Point the default at a port
+# nothing listens on: the send is refused instantly and the installer swallows it, exactly as it does
+# for a user who is offline. A case that wants to observe an event still sets its own URL.
+export TAPSTATE_TELEMETRY_URL="${TAPSTATE_TELEMETRY_URL:-http://127.0.0.1:1/e}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"          # deploy/quickstart -> repo root
@@ -885,6 +892,117 @@ else
   CURL_SHIM=""
 fi
 rm -rf "$DROP_DIR"
+
+# --- the install event, seen from the path a first-time user actually takes -------------------------
+# install-smoke.sh covers the installer in isolation. These three cover what only the composed flow can
+# show: the quickstart calls install.sh TWICE (the platform gate, then the real install) and it drops
+# the installer's stdout. Both facts are invisible from install.sh alone.
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "quickstart install event: python3 is needed for the local sink"
+else
+  QBD="$(mktemp -d)"; : > "$QBD/log"
+  python3 - "$QBD" <<'PYEOF' &
+import http.server, os, sys
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        with open(os.path.join(d, 'log'), 'a') as fh:
+            fh.write(self.rfile.read(n).decode('utf-8', 'replace') + "\n")
+        self.send_response(204); self.end_headers()
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+with open(os.path.join(d, 'port'), 'w') as fh:
+    fh.write(str(srv.server_address[1]))
+srv.serve_forever()
+PYEOF
+  QB_PID=$!
+  for _ in $(seq 1 50); do [ -s "$QBD/port" ] && break; sleep 0.1; done
+  QB_URL="http://127.0.0.1:$(cat "$QBD/port")/e"
+
+  # like run_prepare, but keeps stdout and stderr apart -- the disclosure case is about which stream
+  # a message lands on, so merging them would make that case unable to fail.
+  qs_run() {   # $1 stdout file  $2 stderr file
+    local outf="$1" errf="$2" shim
+    DEMO="$(mktemp -d)/tapstate-demo"; mkdir -p "$DEMO"; cp "$QUICKSTART_SH" "$DEMO/quickstart.sh"
+    # A sandboxed HOME, so "the installer wrote nothing outside the demo directory" is a claim that
+    # can be checked at all. install.sh's default install directory is $HOME/.tapstate/bin, and the
+    # quickstart's TAPSTATE_INSTALL_DIR="$PWD" is the only thing keeping the identifier out of it.
+    QS_HOME="$(mktemp -d)"
+    shim="$(mktemp -d)"
+    # shellcheck disable=SC2016
+    printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; *) echo unknown ;; esac\n' > "$shim/uname"
+    chmod +x "$shim/uname"
+    printf '#!/bin/sh\nexit 0\n' > "$shim/xattr"; chmod +x "$shim/xattr"
+    ( cd "$DEMO" && PATH="$shim:$PATH" \
+      HOME="$QS_HOME" \
+      TAPSTATE_VERSION="$VERSION" \
+      TAPSTATE_BASE_URL="file://$CLI_STUB" \
+      TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
+      TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
+      TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
+      TAPSTATE_TELEMETRY_URL="$QB_URL" \
+      sh "$DEMO/quickstart.sh" >"$outf" 2>"$errf" )
+    rm -rf "$shim"
+  }
+
+  qs_out="$(mktemp)"; qs_err="$(mktemp)"
+  : > "$QBD/log"
+  qs_run "$qs_out" "$qs_err"
+  n_events="$(grep -c . "$QBD/log" 2>/dev/null | tr -d ' ')"
+
+  # exactly one. The platform gate runs install.sh before the install does, so an event fired from
+  # anywhere but the completed-install path doubles every quickstart install ever measured -- and the
+  # doubling is invisible unless something counts the events of one whole run.
+  if [ "$n_events" = "1" ]; then ok "a whole quickstart run produces exactly one install event"
+  else bad "quickstart produced $n_events install event(s), expected exactly 1"; fi
+
+  # the entry point must be distinguishable, or the two front doors cannot be compared at all
+  if grep -q '"entrypoint":"quickstart"' "$QBD/log"; then ok "the event is tagged entrypoint=quickstart"
+  else bad "event not tagged as quickstart: $(cat "$QBD/log")"; fi
+
+  # the disclosure has to survive quickstart.sh dropping the installer's stdout. A disclosure written
+  # to stdout disappears exactly here, on the path most first-time users take, while install-smoke's
+  # own stderr case would still pass.
+  if grep -qi 'anonymous install event' "$qs_err"; then
+    ok "the disclosure survives the quickstart's dropped stdout"
+  else
+    bad "the disclosure never reached the user through the quickstart path"
+  fi
+
+  # the id lives in the demo directory, so the documented cleanup really does forget the installation
+  id_here="$(find "$DEMO" -name '.installation-id' 2>/dev/null | head -1)"
+  if [ -n "$id_here" ]; then ok "the installation id is inside the demo directory"
+  else bad "no installation id under the demo directory -- it was written somewhere rm -rf will not reach"; fi
+
+  # and it is the ONLY one: nothing was written where the documented cleanup cannot reach. Searched in
+  # the sandboxed HOME, which is where install.sh puts things when the quickstart's
+  # TAPSTATE_INSTALL_DIR seam is absent. The previous form of this case searched the demo directory
+  # AFTER rm -rf had removed it, so it could never return anything and therefore could never fail --
+  # it passed identically whether the product behaved or not.
+  stray="$(find "$QS_HOME" -name '*installation*' 2>/dev/null | head -1)"
+  if [ -z "$stray" ]; then ok "the installer writes no identifier outside the demo directory"
+  else bad "an identifier was written outside the demo directory, where rm -rf will not reach: $stray"; fi
+
+  demo_parent="$(dirname "$DEMO")"
+  rm -rf "$demo_parent"
+  left="$(find "$demo_parent" "$QS_HOME" -name '*installation*' 2>/dev/null | head -1)"
+  if [ -z "$left" ]; then ok "rm -rf of the demo directory leaves no identifier anywhere"
+  else bad "an identifier survived rm -rf of the demo directory: $left"; fi
+  rm -rf "$QS_HOME"
+
+  rm -f "$qs_out" "$qs_err"
+  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null
+fi
+
+# --- the harness itself must not report installs -----------------------------------------------------
+# The subject of this case is one line at the top of this file, and losing that line is silent: the
+# suite stays green while every case in it posts a forged install to the production endpoint.
+case "${TAPSTATE_TELEMETRY_URL:-}" in
+  "")             bad "the suite runs the installer with no endpoint override -- every case posts a real install event" ;;
+  *tapstate.dev*) bad "the suite points the installer at the production endpoint: $TAPSTATE_TELEMETRY_URL" ;;
+  *)              ok  "the suite's own install events go nowhere near the production endpoint" ;;
+esac
 
 # --- summary ----------------------------------------------------------------------------------------
 echo
