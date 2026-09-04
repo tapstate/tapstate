@@ -55,7 +55,7 @@ import org.junit.jupiter.api.Test;
  * elsewhere, and wall-clock numbers do not belong in a build gate. Its name keeps it out of the
  * default surefire selection, so it costs a build nothing and is run deliberately:
  *
- * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestCascadeCostBench -DfailIfNoTests=false}</pre>
+ * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestCascadeCostBench -Dsurefire.failIfNoSpecifiedTests=false}</pre>
  *
  * <p>Latency is read off the row itself rather than off the job: a stamp travels in the deepest leaf
  * row and is read again when the document carrying it reaches the sink, so what is measured is one

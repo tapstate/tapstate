@@ -152,12 +152,15 @@ nest.capacity-estimate-incomplete
 nest.chain-axis-limit-exceeded
 nest.embed-path-conflict
 nest.embed-target-not-parent-key
+nest.key-ambiguous
 nest.key-change-tracking-requires-before-image
 nest.memory-budget-below-partition-count
 nest.memory-budget-changed-while-running
 nest.migration-parking-limit-exceeded
 nest.parent-absent
 nest.pending-limit-exceeded
+nest.reference-fanout-limit-exceeded
+nest.referenced-level-carries-embeds
 nest.resolver-vertex-limit-exceeded
 nest.root-fanout-limit-exceeded
 nest.root-key-required

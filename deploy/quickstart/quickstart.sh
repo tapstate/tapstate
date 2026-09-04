@@ -366,7 +366,11 @@ main() {
     # removes it. install.sh's own stdout (a PATH hint that does not apply in place) is dropped; its
     # errors still surface and abort under set -e.
     if [ ! -x ./tapstate ]; then
+        # TAPSTATE_ENTRYPOINT tells the install event which of the two front doors this was, so the
+        # two paths can be compared. stdout stays dropped; the installer's disclosure is on stderr and
+        # still reaches the user.
         TAPSTATE_INSTALL_DIR="$PWD" TAPSTATE_VERSION="${TAPSTATE_VERSION:-$CLI_VERSION}" \
+            TAPSTATE_ENTRYPOINT=quickstart \
             sh "$work/install.sh" >/dev/null
         # A binary fetched by a browser carries macOS's quarantine attribute, which blocks it from running
         # until cleared; install.sh's atomic move preserves it. Strip it -- only on macOS, only if xattr
