@@ -374,8 +374,13 @@ class CaptureToSinkAckFrontierTest {
         actuator.start(PIPELINE);
         actuator.start(DIRECT_PIPELINE);
         try {
-            gatedSource.feed(change(0));
-            awaitSinkSize(2);
+            // Fed until both have delivered rather than once. A start returns before the pipeline it
+            // started is reading, and the directly-read one reads the source live -- so a change made
+            // before it attached is not late for it, it is before its beginning and it never sees one.
+            // With a single change fed, that pipeline waits for a second that is never made: measured at
+            // roughly one run in three, and the run that passes is the one where both happened to be
+            // attached first.
+            awaitBothSinksFed(gatedSource);
             awaitConsumers(meta, chainId, 2);
 
             assertThat(meta.consumerOffsets(chainId))
@@ -450,6 +455,27 @@ class CaptureToSinkAckFrontierTest {
 
     private static Envelope change(int id) {
         return Envelope.insert(id, TABLE, Map.of("id", (long) id), Map.of());
+    }
+
+    /**
+     * Feeds changes until every sink on the chain has delivered one, and no fewer.
+     *
+     * <p>Two pipelines read this source, so two deliveries are what "both are running" looks like. What
+     * this does not do is assume the two starts finished: it keeps making changes until the second one
+     * shows up, which is the only thing that distinguishes a pipeline that has attached from one that is
+     * about to.
+     */
+    private void awaitBothSinksFed(GatedSource source) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        int id = 0;
+        while (CapturingSinkWriter.collected().size() < 2) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("timed out waiting for both pipelines to deliver a change, got "
+                        + CapturingSinkWriter.collected() + " after feeding " + id + " of them");
+            }
+            source.feed(change(id++));
+            park();
+        }
     }
 
     private void awaitSinkSize(int size) {
