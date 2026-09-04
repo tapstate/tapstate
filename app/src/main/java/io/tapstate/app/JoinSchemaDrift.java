@@ -92,6 +92,27 @@ final class JoinSchemaDrift {
     }
 
     /**
+     * Records what a join step produces now as the shape to hold it to from here, whatever it was
+     * recorded producing before. This is the way past a refusal, and it exists as its own method rather
+     * than as a flag on the one above because the two are different acts: one is a machine checking,
+     * the other is a person having looked and said to carry on.
+     *
+     * <p>It goes through this class rather than writing to the store directly so that what is accepted
+     * is byte-for-byte what the next start will compute. A second renderer of the same columns would
+     * drift from this one eventually, and the shape that takes is an accept that does not clear the
+     * refusal it was run for.
+     */
+    void record(String pipelineId, String stepId, String sql, JoinPlan plan, List<SourceTable> tables) {
+        records.record(pipelineId, stepId, columnsOf(plan), fingerprintOf(sql), fingerprintOf(tables),
+                DERIVED_BY);
+    }
+
+    /** How one derived column's type is written down, on every side that writes one down. */
+    static String declaredType(OutputField field) {
+        return field.type() + (field.nullable() ? " NULL" : " NOT NULL");
+    }
+
+    /**
      * The refusal, attributed. The two codes carry the same difference because the difference is the
      * same; what differs is who has to act on it, and that is what the code says.
      */
@@ -119,7 +140,7 @@ final class JoinSchemaDrift {
     private static Map<String, String> columnsOf(JoinPlan plan) {
         Map<String, String> columns = new LinkedHashMap<>();
         for (OutputField field : plan.outputFields()) {
-            columns.put(field.name(), field.type() + (field.nullable() ? " NULL" : " NOT NULL"));
+            columns.put(field.name(), declaredType(field));
         }
         return columns;
     }

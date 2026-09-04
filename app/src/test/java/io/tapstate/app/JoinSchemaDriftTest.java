@@ -176,6 +176,41 @@ class JoinSchemaDriftTest {
     }
 
     @Test
+    @DisplayName("accepting clears the refusal, and the next start goes through")
+    void acceptingClearsTheRefusal() {
+        // The gate is unshippable without this. A refusal with no way past it does not protect anybody -
+        // it strands a pipeline on a version, and in this release there is no second route: pinning the
+        // old shape by casting in the SELECT is not available, the SQL subset refuses CAST outright.
+        List<SourceTable> before = tables(TapstateType.DECIMAL);
+        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, before), before);
+        List<SourceTable> after = tables(TapstateType.DOUBLE);
+        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, after), after))
+                .isInstanceOf(TapstateException.class);
+
+        drift.record("flow", "widen", SQL, plan(SQL, after), after);
+
+        assertThatCode(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, after), after))
+                .doesNotThrowAnyException();
+        assertThat(records.latest("flow", "widen").orElseThrow().schema())
+                .containsEntry("o_total", "DOUBLE NOT NULL");
+    }
+
+    @Test
+    @DisplayName("accepting spends a version, so the history says the shape moved")
+    void acceptingIsRecordedAsAChangeNotAsARefresh() {
+        // The version count answers "how many times has this step's shape changed". An accept that
+        // overwrote in place would leave a history claiming the shape never moved, which is the one
+        // thing this record is kept for.
+        List<SourceTable> before = tables(TapstateType.DECIMAL);
+        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, before), before);
+        List<SourceTable> after = tables(TapstateType.DOUBLE);
+
+        drift.record("flow", "widen", SQL, plan(SQL, after), after);
+
+        assertThat(records.latest("flow", "widen").orElseThrow().version()).isEqualTo(1L);
+    }
+
+    @Test
     @DisplayName("two joins of one pipeline are held apart")
     void twoStepsAreHeldApart() {
         List<SourceTable> before = tables(TapstateType.DECIMAL);

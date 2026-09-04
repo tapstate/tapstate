@@ -369,7 +369,7 @@ final class StoreBackedDagSource implements DagSource {
     private TargetTable joinTarget(Step step, CompiledJoin compiled,
             Map<String, TargetTable> bySourceTable) {
         io.tapstate.core.sql.JoinPlan plan = compiled.plan();
-        String factTable = factTableOf(compiled);
+        String factTable = compiled.factTable();
         List<String> key = publishedFactKey(compiled);
         List<TargetField> fields = new ArrayList<>();
         for (String name : key) {
@@ -455,17 +455,12 @@ final class StoreBackedDagSource implements DagSource {
             String missing = unpublishedFactKeyColumn(compiled);
             if (missing != null) {
                 throw new TapstateException(ActuationError.JOIN_OUTPUT_KEY_NOT_PUBLISHED,
-                        Map.of("step", stream, "table", factTableOf(compiled), "column", missing),
+                        Map.of("step", stream, "table", compiled.factTable(), "column", missing),
                         null);
             }
         }
     }
 
-    /** The real table behind the name the plan calls the driving source by. */
-    private static String factTableOf(CompiledJoin compiled) {
-        String factName = compiled.plan().factSource().name();
-        return compiled.tableByName().getOrDefault(factName, compiled.plan().factSource().table());
-    }
 
     /** The declared type of the column one output field publishes verbatim, or null where it computes one. */
     private static String joinFieldType(CompiledJoin compiled, String output,
@@ -941,6 +936,21 @@ final class StoreBackedDagSource implements DagSource {
                 JoinStoresBinding.onTheCluster());
     }
 
+    /**
+     * Every join step of a stored pipeline, compiled exactly the way a start compiles it, keyed by step
+     * id; empty where the pipeline has no join.
+     *
+     * <p>Offered rather than reimplemented next door on purpose. Whoever reports what a join produces
+     * has to be answering the same question a start answers, and a second implementation of a
+     * derivation is two answers with nothing comparing them - which here would mean a report saying the
+     * columns are fine and a start refusing them, or the reverse.
+     */
+    Map<String, CompiledJoin> compiledJoinsOf(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return compiledJoins(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+    }
+
     /** Every join step of this pipeline, compiled, keyed by step id; empty where there is no join. */
     private Map<String, CompiledJoin> compiledJoins(
             PipelineResource pipeline, Map<String, String> sourceIdByTable) {
@@ -1036,9 +1046,15 @@ final class StoreBackedDagSource implements DagSource {
      * input and the world's kept apart - an edited query producing new columns is what the author asked
      * for, while an untouched query producing new columns is the world having moved under it.
      */
-    private record CompiledJoin(io.tapstate.core.sql.JoinPlan plan, List<String> factKeyColumns,
+    record CompiledJoin(io.tapstate.core.sql.JoinPlan plan, List<String> factKeyColumns,
             Map<String, String> tableByName, String sql,
             List<io.tapstate.core.sql.SourceTable> tables) {
+
+        /** The real table the join is driven from, under its own name rather than the SQL's alias. */
+        String factTable() {
+            String name = plan.factSource().name();
+            return tableByName.getOrDefault(name, plan.factSource().table());
+        }
     }
 
     private NestBinding nestBinding(PipelineResource pipeline, Map<String, String> sourceIdByTable) {
