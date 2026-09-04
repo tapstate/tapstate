@@ -37,7 +37,7 @@ import java.util.function.Function;
  *        decides how the assembler sends rather than what it assembles.
  */
 public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, List<EmbedSlot> slots,
-        boolean foldingAllowed) implements Serializable {
+        List<NestLookup> lookups, boolean foldingAllowed) implements Serializable {
 
     /**
      * How many resolver vertices one nest may compile to. Each takes a thread of its own rather than
@@ -56,6 +56,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         vertices = List.copyOf(vertices);
         streams = List.copyOf(streams);
         slots = List.copyOf(slots);
+        lookups = List.copyOf(lookups);
     }
 
     /** Compiles the tree against the default vertex limit. */
@@ -79,35 +80,58 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         if (declared.isEmpty()) {
             // A passthrough assembles nothing and so sends nothing of its own: how a document would be
             // folded is not a question it has.
-            return new NestTopology(List.of(), List.of(), List.of(), true);
+            return new NestTopology(List.of(), List.of(), List.of(), List.of(), true);
         }
 
-        List<Node> top = new ArrayList<>();
-        for (Embed embed : declared) {
-            top.add(node(embed, List.of()));
-        }
-        List<Node> all = flatten(top);
-
-        List<String> rootKey = root.key() == null ? List.of() : root.key();
-        if (rootKey.isEmpty()) {
+        // The root is a level like any other: what identifies one of its rows is asked of the same four
+        // places, so a root over a table that declares a key need not repeat it. What differs is the
+        // ending. A root nothing identifies is the author's own missing declaration and says so; the
+        // refusal an embed gets names an array key and a path, neither of which a root has - it would
+        // arrive carrying the internal name of the root's own namespace in the slot meant for a path.
+        List<String> rootKey = keyOrNone(root.from(), root.key(), ROOT_NAMESPACE, tables);
+        if (rootKey == null) {
             throw new TapstateException(NestError.ROOT_KEY_REQUIRED,
                     Map.of("rootAlias", root.from()), null);
         }
+        List<Node> top = new ArrayList<>();
+        for (Embed embed : declared) {
+            top.add(node(embed, List.of(), root.from(), rootKey));
+        }
+        List<Node> all = flatten(top);
+
         checkPaths(top);
         for (Node node : all) {
             checkPaths(node.children());
         }
-        List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, top);
+        // Which way each embed points, before anything asks: the readers below all branch on it, and an
+        // embed the level points at is not one of the things naming that level's identity.
+        for (Node node : all) {
+            node.referenced(referenced(node, tables));
+        }
+        List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, claimants(top));
         for (Node node : all) {
             if (!node.children().isEmpty()) {
-                List<String> identity = identityOf(render(node.pathId()), null, node.children());
-                checkIdentifiesItsOwnRows(node, identity, tables);
-                node.identity(identity);
+                List<Node> claiming = claimants(node.children());
+                // A level every child points at is identified by what those children agree on. A level
+                // none of them points at is identified by what identifies one of its own rows: it is
+                // still a level, it just has nobody naming it from below.
+                //
+                // What identifies a row, and never what the author wrote to tell its elements apart inside
+                // one document. The two are different keys and the difference only shows when this level
+                // points at something: what is recorded about who points where is written against this
+                // identity, and a number that restarts at one in every parent is the same value in every
+                // document - so the record of two elements in two documents is one entry, and an edit to
+                // the row they both name reaches whichever of them wrote that entry last. Every document
+                // is right until the moment such a row is edited, and then one of them silently is not.
+                node.identity(claiming.isEmpty()
+                        ? rowKeyOf(node, tables)
+                        : identityOf(render(node.pathId()), null, claiming));
             }
         }
         for (Node node : all) {
             node.arrayKey(resolveArrayKey(node, tables));
         }
+        checkReferencedLevelsAreLeaves(all, tables);
         checkAppendMode(root, all);
         checkVertexCount(all, resolverVertexLimit);
 
@@ -149,6 +173,17 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      */
     public Set<String> stateNamespaces() {
         Set<String> namespaces = new LinkedHashSet<>();
+        // The rows a level points at are state exactly as much as the documents holding them, and are the
+        // one namespace here nothing else would take down: no vertex is named for it, so a tree dropped
+        // without naming it would leave every row it ever pointed at behind, under a name that is now
+        // reachable from nothing.
+        for (NestLookup lookup : lookups) {
+            namespaces.add(lookup.mapName());
+            // And which rows point at each of them, which grows with the fanout where the rows themselves
+            // do not. It is the one namespace here on no functional path at all - nothing reads it to
+            // render a document - so it is also the one a set built from what a run touches would miss.
+            namespaces.add(lookup.referencesMapName());
+        }
         for (NestVertex vertex : vertices) {
             namespaces.add(vertex.mapName());
             // Where a subtree sits while it moves between documents. Named here as well because it is state
@@ -218,7 +253,26 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                         Boolean.TRUE.equals(root.trackKeyChanges()), tables)));
 
         streams.add(new NestStream(root.from(), List.of(), 0, assemblerName, null));
+        List<NestLookup> lookups = new ArrayList<>();
         for (Node node : all) {
+            if (node.referenced()) {
+                // A row the level points at goes to a place of its own rather than into any document: it
+                // is one row shared by however many documents name it, so it enters the tree once and is
+                // read from there. It takes no hops - nothing cascades from it, and the read that finds it
+                // happens where the document is rendered rather than on the way in.
+                NestVertex pointing = vertexAt(vertices, node.parentPathId());
+                NestLookup lookup = new NestLookup(node.pathId(), node.embed().from(),
+                        lookupName(nodeId, node.pathId()), mapName(pipelineId, nodeId, node.pathId()),
+                        referenceIdentity(node.embed()), node.parentAlias(),
+                        referenceFields(node.embed()), identities.get(node.parentPathId()),
+                        node.parentPathId(), touchOrdinal(pointing, node),
+                        // Read off the edge that level's own rows arrive on rather than off the tree again:
+                        // it is the same switch, and asking it twice is how the two answers start to differ.
+                        pointing.inbound().get(0).tracksKeyChanges());
+                lookups.add(lookup);
+                streams.add(new NestStream(node.embed().from(), node.pathId(), 0, lookup.name(), null));
+                continue;
+            }
             boolean leaf = node.children().isEmpty();
             int depth = node.pathId().size();
             String entry = leaf
@@ -227,8 +281,76 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             streams.add(new NestStream(node.embed().from(), node.pathId(), leaf ? depth - 1 : depth,
                     entry, node.arrayKey()));
         }
-        return new NestTopology(vertices, streams, slotsOf(top),
+        return new NestTopology(vertices, streams, slotsOf(pipelineId, nodeId, top), lookups,
                 !WriteMode.APPEND.yaml().equals(root.mode()));
+    }
+
+    /**
+     * Which inbound ordinal of the level doing the pointing carries word that {@code referenced} has been
+     * edited. Read back off the edge the compiler already built rather than counted again here: an ordinal
+     * worked out twice is an ordinal that can disagree with itself, and the disagreement would land the
+     * word on some other edge's handling with nothing to say so.
+     */
+    private static int touchOrdinal(NestVertex pointing, Node referenced) {
+        for (NestInbound edge : pointing.inbound()) {
+            if (edge.carriesTouches() && edge.pathId().equals(referenced.pathId())) {
+                return edge.ordinal();
+            }
+        }
+        throw new IllegalStateException("no edge into the level above " + referenced.pathId()
+                + " carries word that it was edited");
+    }
+
+    /** The compiled vertex serving {@code pathId}. Every level a reference hangs off has one. */
+    private static NestVertex vertexAt(List<NestVertex> vertices, List<String> pathId) {
+        for (NestVertex vertex : vertices) {
+            if (vertex.pathId().equals(pathId)) {
+                return vertex;
+            }
+        }
+        throw new IllegalStateException("no vertex was built for " + pathId);
+    }
+
+    /**
+     * Refuses a level the document points at that carries embeds of its own. Such a row belongs to no one
+     * document - the same row sits under however many point at it - so there is no document its children
+     * could be gathered under, and nothing says which of them a change beneath it should reach.
+     *
+     * <p>Refused rather than left to compile. The two directions are written identically, so this is an
+     * ordinary thing to write by accident; and left alone it builds a level whose rows are filed where the
+     * pointed-at rows themselves are kept, one namespace holding two unrelated kinds of state, while every
+     * document still goes out looking complete.
+     */
+    private static void checkReferencedLevelsAreLeaves(List<Node> all, Function<String, NestTable> tables) {
+        for (Node node : all) {
+            if (!node.referenced() || node.children().isEmpty()) {
+                continue;
+            }
+            List<String> beneath = new ArrayList<>();
+            for (Node child : node.children()) {
+                beneath.add(child.embed().path());
+            }
+            NestTable table = tables.apply(node.embed().from());
+            throw new TapstateException(NestError.REFERENCED_LEVEL_CARRIES_EMBEDS,
+                    Map.of("embedPath", render(node.pathId()),
+                            "table", table == null ? node.embed().from() : table.name(),
+                            "children", String.join(", ", beneath)), null);
+        }
+    }
+
+    /**
+     * The columns identifying the row an embed points at, in the order its {@code on} map wrote them. Both
+     * sides of the reference build their key by walking that same order - the row being pointed at off
+     * these columns, the level pointing at it off the ones they are mapped to - so neither side has to know
+     * anything about the other's table for the two keys to match.
+     */
+    private static List<String> referenceIdentity(Embed embed) {
+        return List.copyOf(embed.on().keySet());
+    }
+
+    /** The columns on the pointing level that hold the reference, in that same order. */
+    private static List<String> referenceFields(Embed embed) {
+        return List.copyOf(embed.on().values());
     }
 
     private static NestVertex vertexOf(String pipelineId, String nodeId, Node node, List<String> parentIdentity,
@@ -253,6 +375,13 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         edges.add(new NestInbound(0, ownAlias, ownPathId, identity, ownElementKey, ownTracksKeyChanges,
                 tableBehind(ownAlias, ownTracksKeyChanges, tables)));
         for (Node child : children) {
+            if (child.referenced()) {
+                // A child the level points at does not arrive here. Its rows are not grouped under this
+                // level - one of them can sit under thousands of levels at once - so there is no field
+                // pairing to key an edge by, and routing the document to it would be routing it to every
+                // holder of the same reference. It is read by key where the document is rendered.
+                continue;
+            }
             boolean tracked = Boolean.TRUE.equals(child.embed().trackKeyChanges());
             edges.add(child.children().isEmpty()
                     ? new NestInbound(edges.size(), child.embed().from(), child.pathId(),
@@ -269,6 +398,16 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         for (NestInbound edge : List.copyOf(edges)) {
             if (edge.tracksKeyChanges()) {
                 edges.add(NestInbound.departuresOf(edges.size(), edge));
+            }
+        }
+        // Last of all, one per level this one points at: the edge it is told on that such a row has been
+        // edited. It is the pointed-at row's only way back to a document - the row belongs to no document,
+        // so a change to it routes itself nowhere - and it arrives from the vertex filing those rows rather
+        // than from a source, which is why it is drawn separately from every edge above.
+        for (Node child : children) {
+            if (child.referenced()) {
+                edges.add(NestInbound.touchesOf(edges.size(), child.embed().from(), child.pathId(),
+                        identity));
             }
         }
         return edges;
@@ -337,28 +476,59 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     }
 
     /**
-     * Refuses a level whose children join onto a column that does not identify its rows. What a child names
-     * is not a column to look the parent up by; it is the declaration of what the level is keyed on, and the
-     * level is partitioned by it. Name one many rows share and they collapse into a single identity, taking
-     * whichever row got there and leaving the rest with nothing - quietly, since every count stays at zero.
-     *
-     * <p>Siblings catch this by disagreeing with each other. An only child has nobody to disagree with, which
-     * is why the level's own key has to be asked. Only a declared key can say whether a column identifies a
-     * row, so a level whose table declares none is left alone rather than guessed at.
+     * The children that say something about the identity of the level they hang under. A child the level
+     * points at says nothing about it: the column is a reference the level's rows carry, and reading it as
+     * the level's identity would regroup those rows by whatever they happen to refer to.
      */
-    private static void checkIdentifiesItsOwnRows(Node node, List<String> identity,
-            Function<String, NestTable> tables) {
-        NestTable table = tables.apply(node.embed().from());
-        if (table == null || table.primaryKey().isEmpty()) {
-            return;
+    private static List<Node> claimants(List<Node> children) {
+        List<Node> claiming = new ArrayList<>();
+        for (Node child : children) {
+            if (!child.referenced()) {
+                claiming.add(child);
+            }
         }
-        if (new LinkedHashSet<>(identity).equals(new LinkedHashSet<>(table.primaryKey()))) {
-            return;
+        return claiming;
+    }
+
+    /**
+     * Which side of an embed's join carries the other's identity, read off the keys rather than declared.
+     *
+     * <p>The two directions are written identically - a pair of column names either way - so the question
+     * cannot be answered from the pair alone. It can be answered from what identifies a row: the side that
+     * names its own table's key is the side being pointed at, because a column that identifies a row names
+     * one row, and a column that does not names however many share it.
+     *
+     * <p>Both sides being keys is a one-to-one join read either way. It renders the same document both
+     * times, so the existing direction is taken and nothing about such a tree changes. Neither side being
+     * a key is the case with no answer at all, and it is refused: the tree would otherwise assemble
+     * documents grouped on a column many rows share, with every count where it should be and the contents
+     * wrong.
+     */
+    private static boolean referenced(Node node, Function<String, NestTable> tables) {
+        Set<String> childSide = new LinkedHashSet<>(node.embed().on().keySet());
+        Set<String> parentSide = new LinkedHashSet<>(node.embed().on().values());
+        List<String> parentKey =
+                keyOrNone(node.parentAlias(), node.parentKey(), render(node.parentPathId()), tables);
+        if (parentKey == null) {
+            // Nothing identifies the level above, so neither side of this join can be read as pointing at
+            // it and there is no direction to infer. The tree keeps the one it has always had rather than
+            // being refused for want of an answer it never needed - which is where every level a source
+            // discovered nothing about lands, an embed under a level fed by an earlier step among them.
+            return false;
+        }
+        // The parent side alone settles the existing direction, so the embed's own key is not asked for
+        // unless it has to be. Asking anyway would refuse a tree that is already answered - over a stream
+        // nothing discovered, say - for want of something the answer does not depend on.
+        if (parentSide.equals(new LinkedHashSet<>(parentKey))) {
+            return false;
+        }
+        if (childSide.equals(new LinkedHashSet<>(rowKeyOf(node, tables)))) {
+            return true;
         }
         throw new TapstateException(NestError.EMBED_TARGET_NOT_PARENT_KEY,
                 Map.of("embedPath", render(node.pathId()),
-                        "fields", String.join(", ", identity),
-                        "parentKey", String.join(", ", table.primaryKey())), null);
+                        "fields", String.join(", ", parentSide),
+                        "parentKey", String.join(", ", parentKey)), null);
     }
 
     /**
@@ -383,25 +553,83 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     }
 
     /**
-     * The element identity for one embed: what it declares, or the key its table declares when it declares
-     * none. A table the caller cannot resolve at all is a wiring bug rather than an authoring error, and
-     * bare-throws; a table that resolves but declares no key is the author's to fix.
+     * What tells one element of this embed apart from the others in the same array. It is allowed to be
+     * unique only within that array - an order's line numbers are the everyday case - so it is asked for
+     * separately from the row identity, and falls back to it when the author wrote nothing.
      */
     private static List<String> resolveArrayKey(Node node, Function<String, NestTable> tables) {
         List<String> declared = node.embed().arrayKey();
         if (declared != null && !declared.isEmpty()) {
             return declared;
         }
-        String alias = node.embed().from();
+        return rowKeyOf(node, tables);
+    }
+
+    /** What identifies one row of this embed's stream, wherever else that row may also appear. */
+    private static List<String> rowKeyOf(Node node, Function<String, NestTable> tables) {
+        return keyOf(node.embed().from(), node.embed().key(), render(node.pathId()), tables);
+    }
+
+    /**
+     * What identifies one row of a level, asked of four places in order: the key the level declares, the
+     * table's primary key, its one unique index, and then nothing - which refuses the tree rather than
+     * carrying an unknown identity into the assembly.
+     *
+     * <p>A declared key is taken as written and the schema is never consulted to second-guess it. A
+     * business identity and a physical primary key are allowed to differ, and only the author knows
+     * whether they do here; a check would have to call one of them wrong without being able to tell.
+     *
+     * <p>Two unique indexes are refused rather than resolved. Both identify a row equally well, so any
+     * rule for choosing settles the identity of a whole level on which index the source reported first -
+     * silently, and differently on a catalog that changes. The refusal names both and the level, because
+     * the rung that settles it is the first one and it is one line to write.
+     */
+    private static List<String> keyOf(String alias, List<String> declared, String owner,
+            Function<String, NestTable> tables) {
+        List<String> key = keyOrNone(alias, declared, owner, tables);
+        if (key == null) {
+            throw new TapstateException(NestError.ARRAY_KEY_UNRESOLVABLE,
+                    Map.of("embedPath", owner, "table", tables.apply(alias).name()), null);
+        }
+        return key;
+    }
+
+    /**
+     * The same four places, with the fourth answered rather than refused: null where nothing identifies a
+     * row here. Two callers want the two different endings. Carrying an unknown identity into the assembly
+     * is not something a level may do, so asking for one is a refusal; asking which way a join points is a
+     * question that simply has no answer without a key, and the tree that raised it was never relying on
+     * one - refusing there would turn every level a source discovered nothing about into a broken artifact.
+     *
+     * <p>An ambiguous key stays a refusal on both paths. Absence is a question with no answer; two answers
+     * is a choice, and nothing here is entitled to make it on the author's behalf.
+     */
+    private static List<String> keyOrNone(String alias, List<String> declared, String owner,
+            Function<String, NestTable> tables) {
+        if (declared != null && !declared.isEmpty()) {
+            return declared;
+        }
         NestTable table = tables.apply(alias);
         if (table == null) {
             throw new IllegalStateException("nest alias '" + alias + "' resolves to no table");
         }
-        if (table.primaryKey().isEmpty()) {
-            throw new TapstateException(NestError.ARRAY_KEY_UNRESOLVABLE,
-                    Map.of("embedPath", render(node.pathId()), "table", table.name()), null);
+        if (!table.primaryKey().isEmpty()) {
+            return table.primaryKey();
         }
-        return table.primaryKey();
+        List<List<String>> unique = table.uniqueIndexes();
+        if (unique.size() == 1) {
+            return unique.get(0);
+        }
+        if (unique.size() > 1) {
+            List<String> candidates = new ArrayList<>(unique.size());
+            for (List<String> index : unique) {
+                candidates.add("(" + String.join(", ", index) + ")");
+            }
+            throw new TapstateException(NestError.KEY_AMBIGUOUS,
+                    Map.of("embedPath", owner, "table", table.name(),
+                            "candidates", String.join(", ", candidates)), null);
+        }
+        return null;
     }
 
     /**
@@ -424,16 +652,22 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         }
     }
 
+    /**
+     * How many vertices of its own this tree compiles to, against the limit. A level the document points at
+     * is counted alongside the levels that resolve one: it takes a vertex, and that vertex is not
+     * cooperative either, so it costs a thread by exactly the same measure. Counting only the resolvers
+     * would leave a tree pointing at forty tables paying for forty threads the limit never saw.
+     */
     private static void checkVertexCount(List<Node> all, int limit) {
-        int resolvers = 0;
+        int vertices = 0;
         for (Node node : all) {
-            if (!node.children().isEmpty()) {
-                resolvers++;
+            if (node.referenced() || !node.children().isEmpty()) {
+                vertices++;
             }
         }
-        if (resolvers > limit) {
+        if (vertices > limit) {
             throw new TapstateException(NestError.RESOLVER_VERTEX_LIMIT_EXCEEDED,
-                    Map.of("vertices", resolvers, "limit", limit), null);
+                    Map.of("vertices", vertices, "limit", limit), null);
         }
     }
 
@@ -442,17 +676,30 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * absent one shows as an empty array or not at all. It is a property of the declared tree and not of
      * the data, which is why it is settled here rather than remembered per document.
      */
-    private static List<EmbedSlot> slotsOf(List<Node> nodes) {
+    private static List<EmbedSlot> slotsOf(String pipelineId, String nodeId, List<Node> nodes) {
         List<EmbedSlot> slots = new ArrayList<>();
         for (Node node : nodes) {
             Embed embed = node.embed();
-            slots.add(new EmbedSlot(embed.path(), embed.as(), slotsOf(node.children())));
+            slots.add(node.referenced()
+                    ? new EmbedSlot(embed.path(), embed.as(), referenceFields(embed),
+                            mapName(pipelineId, nodeId, node.pathId()),
+                            slotsOf(pipelineId, nodeId, node.children()))
+                    : new EmbedSlot(embed.path(), embed.as(), slotsOf(pipelineId, nodeId, node.children())));
         }
         return slots;
     }
 
     private static String vertexName(String nodeId, List<String> pathId) {
         return pathId.isEmpty() ? "nest:" + nodeId : "nest:" + nodeId + ":" + render(pathId);
+    }
+
+    /**
+     * The name of the vertex that files away the rows one level points at. Suffixed rather than sharing the
+     * name a resolver at that path would take: the two are different jobs over the same path, and a graph
+     * refusing a duplicate name is the only thing that would say so.
+     */
+    private static String lookupName(String nodeId, List<String> pathId) {
+        return vertexName(nodeId, pathId) + ":lookup";
     }
 
     private static String mapName(String pipelineId, String nodeId, List<String> pathId) {
@@ -476,14 +723,16 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         return embeds == null ? List.of() : embeds;
     }
 
-    private static Node node(Embed embed, List<String> parentPathId) {
+    private static Node node(Embed embed, List<String> parentPathId, String parentAlias,
+            List<String> parentKey) {
         List<String> pathId = new ArrayList<>(parentPathId);
         pathId.add(embed.path());
         List<Node> children = new ArrayList<>();
         for (Embed child : childrenOf(embed.embed())) {
-            children.add(node(child, pathId));
+            children.add(node(child, pathId, embed.from(), embed.key()));
         }
-        return new Node(embed, List.copyOf(pathId), parentPathId, List.copyOf(children));
+        return new Node(embed, List.copyOf(pathId), parentPathId, parentAlias, parentKey,
+                List.copyOf(children));
     }
 
     /** Every node of the tree, deepest first, so a vertex is built after everything that cascades into it. */
@@ -502,15 +751,40 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         private final Embed embed;
         private final List<String> pathId;
         private final List<String> parentPathId;
+        // The level this embed hangs under, named the way the compiler can ask about its key: the root is
+        // an alias and a declared key just as an enclosing embed is, so the deep case needs no second path.
+        private final String parentAlias;
+        private final List<String> parentKey;
         private final List<Node> children;
         private List<String> identity = List.of();
         private List<String> arrayKey;
+        private boolean referenced;
 
-        private Node(Embed embed, List<String> pathId, List<String> parentPathId, List<Node> children) {
+        private Node(Embed embed, List<String> pathId, List<String> parentPathId, String parentAlias,
+                List<String> parentKey, List<Node> children) {
             this.embed = embed;
             this.pathId = pathId;
             this.parentPathId = parentPathId;
+            this.parentAlias = parentAlias;
+            this.parentKey = parentKey;
             this.children = children;
+        }
+
+        private String parentAlias() {
+            return parentAlias;
+        }
+
+        private List<String> parentKey() {
+            return parentKey;
+        }
+
+        /** Whether the level above points at this embed's rows, rather than its rows naming that level. */
+        private boolean referenced() {
+            return referenced;
+        }
+
+        private void referenced(boolean settled) {
+            this.referenced = settled;
         }
 
         private Embed embed() {

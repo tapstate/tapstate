@@ -9,9 +9,11 @@ import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.PassthroughProcessor;
 import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.ReplayFloorFactory;
+import io.tapstate.runtime.engine.SettledPositions;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -73,7 +75,98 @@ public final class NestDag {
             }
             assembler = vertex;
         }
+        // Drawn after the assembler and never mistaken for it: a lookup takes no part in assembly, and the
+        // vertex the rest of the pipeline reads from is the one that renders documents.
+        for (NestLookup lookup : topology.lookups()) {
+            attachLookup(dag, lookup, built, upstream, binding, nextOutbound, frontier);
+        }
         return assembler;
+    }
+
+    /**
+     * Draws the vertex that files away the rows one level points at, fed by that level's own stream and
+     * partitioned by what identifies those rows. Partitioning by the same key the entries are filed under
+     * is what makes one member the only writer of each of them, which is the premise the read from the
+     * assembler rests on.
+     *
+     * <p>One outbound edge, back into the level doing the pointing. A row arriving here reaches no document
+     * by arriving - which documents refer to it is not something the row says - so what leaves is worked out
+     * from what was recorded about who points where, and is addressed by the pointing row's own identity so
+     * it climbs to the document exactly as that row would. That is also the only edge over which the
+     * pointed-at stream's chain reaches a document at all, which is what lets a bound on it ever be worked
+     * out. It closes no cycle: everything that arrives here comes from a source, never from the assembler.
+     *
+     * <p>Two edges in, from two different streams. The rows themselves arrive on the first; the second
+     * carries the rows of the level doing the pointing, delivered a second time and keyed by the row they
+     * name rather than by their own identity, so that each of them is recorded here against what it points
+     * at. <b>That second delivery leaves from the same source vertex the assembly one does.</b> Having the
+     * vertex that assembles documents register them instead is the obvious reading and the one that cannot
+     * be built: the changes to a pointed-at row have to reach that vertex, so an edge back into this one
+     * closes a cycle, and Jet refuses the whole job at submission rather than the edge at drawing.
+     */
+    private static void attachLookup(DAG dag, NestLookup lookup, Map<List<String>, Vertex> built,
+            Function<String, List<Vertex>> upstream, NestBinding binding,
+            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
+        List<Vertex> sources = upstream.apply(lookup.alias());
+        if (sources == null || sources.isEmpty()) {
+            throw new IllegalStateException("nest alias '" + lookup.alias() + "' resolved to no vertex");
+        }
+        Vertex vertex = dag.newVertex(lookup.name(), ProcessorMetaSupplier.of(
+                new NestLookupSupplier(lookup, binding.stores(),
+                        binding.settings().referrersAllowedIn(lookup.mapName()),
+                        frontier == null ? null : frontier.axes(), chainsIntoLookup(lookup, frontier))));
+        Vertex source = sources.size() == 1
+                ? sources.get(0)
+                : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
+        draw(dag, source, vertex, LookupProcessor.ROWS, fieldKey(lookup.partitionKey()), nextOutbound);
+
+        List<Vertex> referrers = upstream.apply(lookup.referrerAlias());
+        if (referrers == null || referrers.isEmpty()) {
+            throw new IllegalStateException(
+                    "nest alias '" + lookup.referrerAlias() + "' resolved to no vertex");
+        }
+        Vertex referrer = referrers.size() == 1
+                ? referrers.get(0)
+                : gatheredInto(dag, vertex, lookup.referrerAlias(), referrers, nextOutbound, frontier);
+        draw(dag, referrer, vertex, LookupProcessor.REGISTRATIONS,
+                fieldKey(lookup.referenceFields()), nextOutbound);
+        if (lookup.referrerTracksKeyChanges()) {
+            // The same rows a second time, keyed by what they pointed at before, so a row that now names
+            // something else lands where the entry recording the old one is held. Only drawn where those
+            // rows carry what they replace - without that there is nothing to key this copy by.
+            draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
+                    leavingKey(lookup.referenceFields()), nextOutbound);
+        }
+
+        Vertex pointing = built.get(lookup.referrerPathId());
+        if (pointing == null) {
+            throw new IllegalStateException("nothing was built for the level pointing at "
+                    + lookup.pathId() + ", so word of an edit has nowhere to go");
+        }
+        draw(dag, vertex, pointing, lookup.touchOrdinal(), routedKey(), nextOutbound);
+    }
+
+    /**
+     * Which chains arrive on each edge into a lookup vertex. Only the rows' own edge is named: what it is
+     * allowed to promise is about the stream it files, and the stream pointing at it is spoken for on the
+     * path that stream takes to its own document. A vertex told to promise about both would be answering
+     * twice for the second, into a level compiled to hear that answer once.
+     */
+    private static Map<Integer, List<String>> chainsIntoLookup(NestLookup lookup, NestFrontier frontier) {
+        return frontier == null ? null
+                : Map.of(LookupProcessor.ROWS, frontier.chainsOfAlias(lookup.alias()));
+    }
+
+    /** One passthrough gathering several producers of an alias, so the vertex below sees a single edge. */
+    private static Vertex gatheredInto(DAG dag, Vertex destination, String alias, List<Vertex> sources,
+            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
+        Vertex merge = dag.newVertex(destination.getName() + ":" + alias,
+                gathering(frontier, alias, sources.size()));
+        int ordinal = 0;
+        for (Vertex source : sources) {
+            dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(merge, ordinal++));
+        }
+        return merge;
     }
 
     /**
@@ -112,6 +205,11 @@ public final class NestDag {
     private static void connect(DAG dag, Vertex destination, NestInbound edge, Map<List<String>, Vertex> built,
             Function<String, List<Vertex>> upstream, ToIntFunction<Vertex> nextOutbound,
             NestFrontier frontier) {
+        if (edge.carriesTouches()) {
+            // Drawn with the vertex that sends it, which does not exist yet: lookups are built after every
+            // assembly vertex, so that the vertex a word of an edit lands on is already there to draw to.
+            return;
+        }
         if (edge.isCascade()) {
             Vertex source = built.get(edge.pathId());
             if (source == null) {
@@ -192,7 +290,59 @@ public final class NestDag {
                 ? NestSendPolicy.within(binding.settings().sendWindowIn(spec.mapName()))
                 : NestSendPolicy.everyChange();
         return ProcessorMetaSupplier.of(new NestVertexSupplier(spec, slots, stores, deadLetter, outputStream,
-                axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending));
+                axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending,
+                topology.lookups()));
+    }
+
+    /**
+     * Supplies the processors of one lookup vertex. Separate from the one that supplies assembly vertices
+     * because it needs none of what that one binds: no replay floor, no dead letter, no parking, no clock -
+     * a row is filed under its key and that is the whole of it.
+     */
+    private static final class NestLookupSupplier implements ProcessorSupplier {
+
+        private static final long serialVersionUID = 1L;
+
+        private final NestLookup lookup;
+        private final NestBinding.NestStores stores;
+
+        /**
+         * How many rows may point at one of these. Carried as the one number rather than as the settings it
+         * was read out of: what is decided where the job is assembled has to travel to the member that
+         * enforces it, and this vertex wants nothing else from them.
+         */
+        private final long referrersAllowed;
+
+        private final ChainAxes axes;
+        private final Map<Integer, List<String>> chainsByOrdinal;
+        private transient NestBinding.NestStores bound;
+
+        private NestLookupSupplier(NestLookup lookup, NestBinding.NestStores stores, long referrersAllowed,
+                ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal) {
+            this.lookup = lookup;
+            this.stores = stores;
+            this.referrersAllowed = referrersAllowed;
+            this.axes = axes;
+            this.chainsByOrdinal = chainsByOrdinal;
+        }
+
+        @Override
+        public void init(Context context) {
+            bound = stores.bind(context.hazelcastInstance(), JetNestStateGauge::new);
+        }
+
+        @Override
+        public Collection<? extends Processor> get(int count) {
+            List<Processor> processors = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                // A level's bounds are worked out per instance, so each processor gets its own: sharing
+                // one would combine what different partitions have seen into a single promise.
+                processors.add(new LookupProcessor(lookup, bound.forLookup(lookup),
+                        bound.forReferences(lookup), referrersAllowed, axes == null ? null
+                                : new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING)));
+            }
+            return processors;
+        }
     }
 
     /** Reads the key off the fields a row carries it in. */
@@ -214,10 +364,33 @@ public final class NestDag {
         };
     }
 
-    /** Reads the key an upstream vertex already resolved and routed by. */
+    /**
+     * Reads the key an upstream vertex already resolved and routed by. Two things travel keyed that way and
+     * both answer to this: a change climbing towards the document it belongs in, and word that a row one
+     * level points at was edited, climbing the very same way. The second is why this asks what it is holding
+     * rather than casting - a cascade carries whatever its level sends up, and one level's own rows are no
+     * longer all of that.
+     */
     private static FunctionEx<Object, Object> routedKey() {
-        return item -> ((KeyedElement) item).key();
+        return item -> {
+            if (item instanceof NestTouch word) {
+                return word.key();
+            }
+            // Word that a chain got past some rows with nothing to deliver for them belongs to no document,
+            // so there is no key it could be routed on and any one instance will do. A constant sends every
+            // one of them to the same instance, which is what makes it a hand-off rather than a broadcast:
+            // it is passed straight up to the sink, and a copy per instance would be a copy per instance of
+            // the same claim. It is one word per drain of a lookup, so the instance it lands on is not
+            // carrying a share of the stream's volume.
+            if (item instanceof SettledPositions) {
+                return SETTLED_POSITIONS_LANE;
+            }
+            return ((KeyedElement) item).key();
+        };
     }
+
+    /** The one key every {@link SettledPositions} is routed on; see {@link #routedKey()}. */
+    private static final String SETTLED_POSITIONS_LANE = "settled-positions";
 
     /**
      * Supplies one nest vertex's processors on one member. It exists rather than a plain supplier because
@@ -244,6 +417,7 @@ public final class NestDag {
         private final NestSettings settings;
         private final NestClock clock;
         private final NestSendPolicy sending;
+        private final List<NestLookup> lookups;
         private transient ReplayFloor floor;
         private transient NestBinding.NestStores bound;
         private transient NestDeadLetter boundDeadLetter;
@@ -251,7 +425,8 @@ public final class NestDag {
         private NestVertexSupplier(NestVertex spec, List<EmbedSlot> slots, NestBinding.NestStores stores,
                 NestDeadLetter deadLetter, String outputStream, ChainAxes axes,
                 Map<Integer, List<String>> chainsByOrdinal, ReplayFloorFactory replayFloor,
-                NestSettings settings, NestClock clock, NestSendPolicy sending) {
+                NestSettings settings, NestClock clock, NestSendPolicy sending, List<NestLookup> lookups) {
+            this.lookups = lookups;
             this.clock = clock;
             this.sending = sending;
             this.spec = spec;
@@ -283,11 +458,24 @@ public final class NestDag {
                 processors.add(spec.isAssembler()
                         ? new AssemblerProcessor(spec, slots, bound.forAssembler(spec), outputStream,
                                 axes, chainsByOrdinal, floor, settings, clock, sending,
-                                bound.forParking(spec), boundDeadLetter)
+                                bound.forParking(spec), boundDeadLetter, referenced())
                         : new ResolverProcessor(spec, bound.forResolver(spec), boundDeadLetter, axes,
                                 chainsByOrdinal, floor, clock, settings, bound.forParking(spec)));
             }
             return processors;
+        }
+
+        /**
+         * The stores holding the rows this tree's levels point at, by the namespace a slot names. Bound
+         * here rather than reached for while rendering: what a distributed store is reached through does
+         * not travel with the graph, and a render that looked one up per document would pay for it there.
+         */
+        private Map<String, NestStore<Map<String, Object>>> referenced() {
+            Map<String, NestStore<Map<String, Object>>> byNamespace = new LinkedHashMap<>();
+            for (NestLookup lookup : lookups) {
+                byNamespace.put(lookup.mapName(), bound.forLookup(lookup));
+            }
+            return byNamespace;
         }
     }
 }

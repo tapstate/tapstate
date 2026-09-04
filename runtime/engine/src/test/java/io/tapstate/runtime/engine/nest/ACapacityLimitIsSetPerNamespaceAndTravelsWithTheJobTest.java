@@ -80,6 +80,33 @@ class ACapacityLimitIsSetPerNamespaceAndTravelsWithTheJobTest {
     }
 
     @Test
+    void aNamespaceNobodyConfiguredTakesTheDefaultReferenceFanout() {
+        assertThat(NestSettings.defaults().referrersAllowedIn(CUSTOMERS))
+                .isEqualTo(NestSettings.DEFAULT_REFERENCE_FANOUT_LIMIT);
+    }
+
+    /**
+     * The one number here that is not about what fits. How wide a document may grow and how much may wait
+     * are both quantities something has to hold; how many rows point at one row is refused although what
+     * records them divides across buckets and stores perfectly well - what it bounds is how many documents
+     * one edit rewrites. Two limits about different things have to be settable apart, or a deployment
+     * widening a table it knows is wide would be loosening a guard on something else.
+     */
+    @Test
+    void howManyMayPointAtARowIsSetApartFromHowWideADocumentMayGrow() {
+        NestSettings settings = NestSettings.defaults().withReferenceFanoutLimit(CUSTOMERS, 7L);
+
+        assertThat(settings.referrersAllowedIn(CUSTOMERS)).isEqualTo(7L);
+        assertThat(settings.referrersAllowedIn(ORDERS))
+                .describedAs("filed under the namespace that set it, like every other number here")
+                .isEqualTo(NestSettings.DEFAULT_REFERENCE_FANOUT_LIMIT);
+        assertThat(settings.elementsAllowedIn(CUSTOMERS))
+                .isEqualTo(NestSettings.DEFAULT_ELEMENT_LIMIT);
+        assertThat(NestSettings.defaults().withElementLimit(CUSTOMERS, 12L).referrersAllowedIn(CUSTOMERS))
+                .isEqualTo(NestSettings.DEFAULT_REFERENCE_FANOUT_LIMIT);
+    }
+
+    @Test
     void aNamespaceNobodyConfiguredTakesTheDefaultSendWindow() {
         assertThat(NestSettings.defaults().sendWindowIn(CUSTOMERS))
                 .isEqualTo(NestSettings.DEFAULT_SEND_WINDOW_MILLIS);
@@ -132,7 +159,8 @@ class ACapacityLimitIsSetPerNamespaceAndTravelsWithTheJobTest {
         NestSettings settings = NestSettings.defaults()
                 .withElementLimit(CUSTOMERS, 12L).withElementLimit(ORDERS, 34L)
                 .withPendingLimit(CUSTOMERS, 56L).withPendingLimit(ORDERS, 78L)
-                .withSendWindow(CUSTOMERS, 200L).withSendWindow(ORDERS, 10L);
+                .withSendWindow(CUSTOMERS, 200L).withSendWindow(ORDERS, 10L)
+                .withReferenceFanoutLimit(CUSTOMERS, 90L).withReferenceFanoutLimit(ORDERS, 91L);
 
         NestSettings arrived = roundTripped(settings);
 
@@ -142,6 +170,8 @@ class ACapacityLimitIsSetPerNamespaceAndTravelsWithTheJobTest {
         assertThat(arrived.pendingAllowedIn(ORDERS)).isEqualTo(78L);
         assertThat(arrived.sendWindowIn(CUSTOMERS)).isEqualTo(200L);
         assertThat(arrived.sendWindowIn(ORDERS)).isEqualTo(10L);
+        assertThat(arrived.referrersAllowedIn(CUSTOMERS)).isEqualTo(90L);
+        assertThat(arrived.referrersAllowedIn(ORDERS)).isEqualTo(91L);
     }
 
     /** What the job submission does to anything the vertices are configured with, and nothing more. */

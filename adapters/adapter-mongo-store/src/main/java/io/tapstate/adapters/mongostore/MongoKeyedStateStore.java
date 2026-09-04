@@ -8,6 +8,11 @@ import org.bson.types.Binary;
 import org.bson.types.MaxKey;
 import org.bson.types.MinKey;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -59,6 +64,36 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
         }
         Binary state = document.get(STATE, Binary.class);
         return state == null ? Optional.empty() : Optional.of(state.getData());
+    }
+
+    /**
+     * One query for however many keys were asked for. The ids are matched with {@code $in} on {@code _id}
+     * itself rather than on a path inside it, for the reason {@link #count} matches a range of it: the
+     * index is on the id, and a filter naming {@code _id.ns} would read the whole collection instead.
+     *
+     * <p>What comes back is keyed by the key half of each id, so a caller gets back the names it asked
+     * with. Entries that are not there are simply not in the cursor, which is the same absence the
+     * per-key form reports as an empty answer.
+     */
+    @Override
+    public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
+        Objects.requireNonNull(namespace, "namespace");
+        if (keys.isEmpty()) {
+            return Map.of();
+        }
+        List<Document> ids = new ArrayList<>(keys.size());
+        for (String key : keys) {
+            ids.add(id(namespace, key));
+        }
+        Map<String, byte[]> found = new LinkedHashMap<>();
+        StoreIo.run(() -> collection.find(new Document("_id", new Document("$in", ids)))
+                .forEach(document -> {
+                    Binary state = document.get(STATE, Binary.class);
+                    if (state != null) {
+                        found.put(document.get("_id", Document.class).getString(KEY), state.getData());
+                    }
+                }));
+        return found;
     }
 
     @Override

@@ -86,7 +86,7 @@ public final class DslParser {
     private static final Set<String> NEST_ROOT_KEYS =
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
     private static final Set<String> EMBED_KEYS = Set.of(
-            "from", "on", "as", "path", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
+            "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
     private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", "primary_key", "storage", "schema");
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> STORAGE_KEYS = Set.of("hot", "warm", "cold");
@@ -355,6 +355,7 @@ public final class DslParser {
                     stringMap(e, "on"),
                     enumByYaml(EmbedAs.values(), EmbedAs::yaml, e, "as"),
                     e.string("path"),
+                    scalarList(e.seq("key"), "key"),
                     scalarList(e.seq("arrayKey"), "arrayKey"),
                     boolValue(e, "ignoreUpdates"),
                     boolValue(e, "trackKeyChanges"),

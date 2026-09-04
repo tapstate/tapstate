@@ -20,7 +20,12 @@ public record Embed(
         EmbedAs as,
         @Doc(value = "Target field path under the parent where the embedded child is placed.", required = true)
         String path,
-        @Doc(value = "Fields that uniquely identify an element within an embedded array.",
+        @Doc(value = "Fields that identify one row of this embed's stream. Absent means the stream's own "
+                + "declared key is used, and a stream that declares none is refused.",
+                key = "key")
+        List<String> key,
+        @Doc(value = "Fields that tell one element apart from the others in the same array, which may be "
+                + "unique only within that array. Absent means the row identity above is used.",
                 key = "arrayKey")
         List<String> arrayKey,
         @Doc(value = "When true, updates to the child rows are not propagated into the parent.",
@@ -35,12 +40,23 @@ public record Embed(
         @Doc("Further children embedded beneath this one, forming a nested tree.")
         List<Embed> embed) {
 
+    /**
+     * An embed that names no row identity of its own, which is what every embed written before this field
+     * existed is: the identity comes from what the stream declares. What was not written stays out of the
+     * canonical form, where it would otherwise change the identity of artifacts nobody edited.
+     */
+    public Embed(String from, Map<String, String> on, EmbedAs as, String path, List<String> arrayKey,
+            Boolean ignoreUpdates, Boolean trackKeyChanges, List<Embed> embed) {
+        this(from, on, as, path, null, arrayKey, ignoreUpdates, trackKeyChanges, embed);
+    }
+
     public Embed {
         Objects.requireNonNull(from, "from");
         Objects.requireNonNull(on, "on");
         Objects.requireNonNull(as, "as");
         Objects.requireNonNull(path, "path");
         on = Collections.unmodifiableMap(new LinkedHashMap<>(on));
+        key = key == null ? null : List.copyOf(key);
         arrayKey = arrayKey == null ? null : List.copyOf(arrayKey);
         embed = embed == null ? null : List.copyOf(embed);
     }

@@ -3,7 +3,9 @@ package io.tapstate.runtime.engine;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.jet.core.test.TestSupport;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.transform.TransformPort;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +44,23 @@ class TransformProcessorTest {
         TestSupport.verifyProcessor(() -> new TransformProcessor(dropAll))
                 .input(List.of(event(1), event(2)))
                 .expectOutput(List.of());
+    }
+
+    /**
+     * Word that a chain got past changes with nothing to deliver for them is not a change, and a port is a
+     * pure function over rows - so it is passed on rather than handed to one. A nest may be followed by a
+     * transform, which is where such a word meets this adapter; handing it over casts it to an envelope and
+     * kills the job, and dropping it leaves the frontier of whatever sent it standing still for the whole
+     * run. The port here drops everything, so what comes out is the word and only because it was passed on.
+     */
+    @Test
+    void word_about_a_chain_is_passed_on_rather_than_transformed() {
+        TransformPort dropAll = e -> List.of();
+        SettledPositions word = new SettledPositions(
+                Map.of("orders", new ChainPosition(new SourceOrder(1, 7), "p7")));
+        TestSupport.verifyProcessor(() -> new TransformProcessor(dropAll))
+                .input(List.of(event(1), word, event(2)))
+                .expectOutput(List.of(word));
     }
 
     @Test

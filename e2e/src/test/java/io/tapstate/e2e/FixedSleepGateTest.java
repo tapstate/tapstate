@@ -89,6 +89,7 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/NestMiddleRowDeleteDoesNotDropWaitingIT.java", 1L),
             entry("test/java/io/tapstate/e2e/NestMigratesSubtreeOnAncestorReparentIT.java", 1L),
             entry("test/java/io/tapstate/e2e/NestPendingLimitFailsTheJobIT.java", 1L),
+            entry("test/java/io/tapstate/e2e/NestPointedAtRowDeleteLeavesTheTargetWithoutItIT.java", 1L),
             entry("test/java/io/tapstate/e2e/NestReparentMovesTheChildIT.java", 1L),
             entry("test/java/io/tapstate/e2e/NestResolvesFourLevelDeepIT.java", 1L),
             entry("test/java/io/tapstate/e2e/NestRootFanoutLimitFailsTheJobIT.java", 1L),

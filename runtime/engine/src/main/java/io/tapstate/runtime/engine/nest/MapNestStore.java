@@ -3,8 +3,11 @@ package io.tapstate.runtime.engine.nest;
 import com.hazelcast.map.EntryProcessor;
 import com.hazelcast.map.IMap;
 import java.io.Serializable;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * A nest store over one distributed map - the map the vertex's own name resolves to.
@@ -61,6 +64,27 @@ final class MapNestStore<S> implements NestStore<S> {
     }
 
     /**
+     * One reach for however many keys were asked for, which is what makes resolving a document's references
+     * cost the same whether it holds one or two hundred. {@code getAll} is the map's own batch: it groups
+     * the keys by the member owning them and asks each once, so this is one trip per member rather than one
+     * per key - and where the entries are not resident, the layer behind the map is asked for the whole
+     * missing set at once too.
+     *
+     * <p>Counted as a single access for the same reason it is made as one. Counting per key would report a
+     * batch of two hundred as two hundred reaches and hide the very thing the batch was for.
+     */
+    @Override
+    public Map<Object, S> loadAll(Collection<Object> keys) {
+        if (keys.isEmpty()) {
+            return Map.of();
+        }
+        countAccess();
+        Map<Object, S> loaded = map.getAll(new LinkedHashSet<>(keys));
+        publishReading();
+        return loaded;
+    }
+
+    /**
      * Leaves the namespace's current readings, after whatever changed them. Every state operation does it,
      * rather than a sample taken on a clock: how full the state is only ever changes when one of these
      * runs, so a reading left by the last of them is current for as long as no further one happens - where
@@ -97,6 +121,30 @@ final class MapNestStore<S> implements NestStore<S> {
     public void save(Object key, S state) {
         countAccess();
         map.executeOnKey(key, new Carried<>(state));
+        publishReading();
+    }
+
+    /**
+     * Grows the set at its own key rather than across the map, the same way a state is written: what
+     * travels is the one element being added, so registering a row costs the same whether it is the first
+     * to point at that row or the thousandth. One reach, not the read-then-write pair the default is.
+     */
+    @Override
+    public void add(Object key, Object element) {
+        countAccess();
+        map.executeOnKey(key, new Grown<>(element));
+        publishReading();
+    }
+
+    /**
+     * Shrinks the set at its own key, the mirror of {@link #add} and one reach like it. The default reads
+     * the set back to find out whether it holds the element - which is the read-then-write pair this whole
+     * namespace is shaped to avoid, and it carries every identity in the set to do it.
+     */
+    @Override
+    public void remove(Object key, Object element) {
+        countAccess();
+        map.executeOnKey(key, new Shrunk<>(element));
         publishReading();
     }
 
@@ -157,6 +205,76 @@ final class MapNestStore<S> implements NestStore<S> {
         @Override
         public Void process(Map.Entry<Object, S> entry) {
             entry.setValue(state);
+            return null;
+        }
+
+        @Override
+        public EntryProcessor<Object, S, Void> getBackupProcessor() {
+            return null;
+        }
+    }
+
+    /**
+     * Adds one element to the set at a key, where the set already is. It answers nothing for the reason
+     * {@link Carried} does not, and it has no backup form for the same reason either.
+     *
+     * <p>The set is replaced rather than mutated in place. What an entry processor is handed on an
+     * object-format map is the stored instance itself, so adding to it directly would change what other
+     * readers hold without the entry ever being written back - correct only by accident, and only until
+     * the format or the layer behind the map changes underneath it.
+     */
+    private static final class Grown<S> implements EntryProcessor<Object, S, Void>, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final Object element;
+
+        Grown(Object element) {
+            this.element = element;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Void process(Map.Entry<Object, S> entry) {
+            Set<Object> held = (Set<Object>) entry.getValue();
+            Set<Object> grown = held == null ? new LinkedHashSet<>() : new LinkedHashSet<>(held);
+            if (grown.add(element)) {
+                entry.setValue((S) grown);
+            }
+            return null;
+        }
+
+        @Override
+        public EntryProcessor<Object, S, Void> getBackupProcessor() {
+            return null;
+        }
+    }
+
+    /**
+     * Takes one element out of the set at a key, and takes the entry with it once it holds nothing. The
+     * same copy-then-replace as {@link Grown} and for the same reason, and it answers nothing and has no
+     * backup form for the reasons {@link Carried} does not.
+     */
+    private static final class Shrunk<S> implements EntryProcessor<Object, S, Void>, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final Object element;
+
+        Shrunk(Object element) {
+            this.element = element;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Void process(Map.Entry<Object, S> entry) {
+            Set<Object> held = (Set<Object>) entry.getValue();
+            if (held == null || !held.contains(element)) {
+                return null;
+            }
+            Set<Object> left = new LinkedHashSet<>(held);
+            left.remove(element);
+            entry.setValue(left.isEmpty() ? null : (S) left);
             return null;
         }
 

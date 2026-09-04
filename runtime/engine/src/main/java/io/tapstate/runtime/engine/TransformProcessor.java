@@ -101,6 +101,13 @@ public final class TransformProcessor extends AbstractProcessor {
 
     @Override
     protected boolean tryProcess(int ordinal, Object item) {
+        // Word that a chain got past some changes with nothing to deliver for them is not a change, so
+        // there is nothing here for a pure function over rows to do to it - and dropping it would leave
+        // the frontier of whatever sent it standing still for as long as the job ran. Passed on as it
+        // stands, which also keeps it behind the records already emitted ahead of it.
+        if (item instanceof SettledPositions) {
+            return tryEmit(item);
+        }
         try {
             return flatMapper.tryProcess((Envelope) item);
         } catch (RuntimeException | Error failure) {
