@@ -12,6 +12,7 @@ import io.tapstate.spi.store.DesiredStore;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * The pipeline lifecycle write side: the four user verbs start / stop / pause / resume, each turning an
@@ -44,11 +45,22 @@ public final class PipelineLifecycleService {
     private final ArtifactQueryService artifacts;
     private final DesiredStore desired;
     private final AuditGate auditGate;
+    /**
+     * One question about the actual state, and no way to ask another: where the pipeline's fencing
+     * epoch stands, empty where it has no checkpoint yet. A start superseding a stop nobody has read
+     * yet is an instruction carried out once rather than a wish held true, and this is the mark it is
+     * stamped with. Narrow on purpose -- writing actual state is the converge loop's alone, and this
+     * side is not handed a store it could write.
+     */
+    private final Function<String, Optional<Long>> actualStateEpoch;
 
-    public PipelineLifecycleService(ArtifactQueryService artifacts, DesiredStore desired, AuditGate auditGate) {
+    public PipelineLifecycleService(
+            ArtifactQueryService artifacts, DesiredStore desired, AuditGate auditGate,
+            Function<String, Optional<Long>> actualStateEpoch) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
+        this.actualStateEpoch = Objects.requireNonNull(actualStateEpoch, "actualStateEpoch");
     }
 
     /** Starts the pipeline (from NEW / STOPPED / COMPLETED), running it at the latest applied revision. */
@@ -114,6 +126,25 @@ public final class PipelineLifecycleService {
                 && latestAssembly != null
                 && latestAssembly.equals(prior.map(DesiredState::assemblyRevision).orElse(null));
 
+        // A start written while a stop is still the pipeline's intent is not two things happening in
+        // turn. There is one slot for the intent and the converge side samples it rather than
+        // consuming a queue, so a stop overwritten this quickly is never read by anything: without
+        // this, neither half happens, the pipeline carries on untouched, and every face reports
+        // success. Said as one instruction instead -- run, having first torn down what runs now --
+        // stamped with where the actual state stands, which is what makes it an instruction carried
+        // out once instead of a wish held true.
+        //
+        // The stop's own answer about clearing rides along. That answer is the one thing only the
+        // user can give, and losing it is the difference between reading the whole source again --
+        // which is what was asked for -- and quietly carrying on as if nothing had been said. It is
+        // not the clearing leaking forward: it is spent by the very instruction that supersedes the
+        // stop, and whatever is written after that one carries none.
+        boolean rebuildAfterStop = verb == LifecycleVerb.START
+                && prior.map(DesiredState::targetState).orElse(null) == PipelineState.STOPPED;
+        boolean clears =
+                purgeState || (rebuildAfterStop && prior.map(DesiredState::purgeState).orElse(false));
+        Long stampedAt = rebuildAfterStop ? actualStateEpoch.apply(pipelineId).orElse(null) : null;
+
         if ((verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME)
                 && !runRevision.equals(latest) && !reassemble) {
             throw new TapstateException(
@@ -139,8 +170,8 @@ public final class PipelineLifecycleService {
                 ? latestAssembly
                 : prior.map(DesiredState::assemblyRevision).orElse(null);
 
-        DesiredState next =
-                new DesiredState(pipelineId, target, runRevision, purgeState, runAssembly, reassemble);
+        DesiredState next = new DesiredState(pipelineId, target, runRevision, clears, runAssembly,
+                reassemble || rebuildAfterStop, stampedAt);
         return auditGate.dispatch(OPERATIONS.get(verb), new AuditContext(principal, pipelineId), () -> {
             desired.save(next);
             return next;

@@ -68,6 +68,7 @@ import io.tapstate.runtime.probe.DelegatingSchemaDiscoveryProbe;
 import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.DataBrowser;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -470,7 +471,8 @@ class ControlPlaneConfiguration {
     @Bean
     PipelineLifecycleService pipelineLifecycleService(
             ArtifactQueryService artifactQueryService, StorePort storePort, AuditGate auditGate) {
-        return new PipelineLifecycleService(artifactQueryService, storePort.desired(), auditGate);
+        return new PipelineLifecycleService(artifactQueryService, storePort.desired(), auditGate,
+                pipelineId -> storePort.state().read(pipelineId).map(CheckpointDoc::epoch));
     }
 
     @Bean

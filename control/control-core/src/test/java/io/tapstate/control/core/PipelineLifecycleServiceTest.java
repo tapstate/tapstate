@@ -44,8 +44,11 @@ class PipelineLifecycleServiceTest {
     private final FakeArtifactStore artifacts = new FakeArtifactStore();
     private final FakeDesiredStore desired = new FakeDesiredStore();
     private final RecordingAuditStore audit = new RecordingAuditStore();
-    private final PipelineLifecycleService service =
-            new PipelineLifecycleService(new ArtifactQueryService(artifacts), desired, new AuditGate(audit, FIXED_CLOCK));
+    /** Where the pipeline's fencing epoch stands, as the lifecycle service is allowed to see it. */
+    private Optional<Long> stateEpoch = Optional.of(7L);
+    private final PipelineLifecycleService service = new PipelineLifecycleService(
+            new ArtifactQueryService(artifacts), desired, new AuditGate(audit, FIXED_CLOCK),
+            pipelineId -> stateEpoch);
 
     @Test
     void startFromNewWritesRunningDesiredAtTheLatestRevision() {
@@ -123,7 +126,7 @@ class PipelineLifecycleServiceTest {
     void aFailedAuditRefusesTheWriteSoNoDesiredStateIsPersisted() {
         artifacts.save(PIPELINE_V1);
         PipelineLifecycleService gated = new PipelineLifecycleService(
-                new ArtifactQueryService(artifacts), desired, new AuditGate(new FailingAuditStore(), FIXED_CLOCK));
+                new ArtifactQueryService(artifacts), desired, new AuditGate(new FailingAuditStore(), FIXED_CLOCK), pipelineId -> stateEpoch);
 
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> gated.start("alice", "pl1"));
 
@@ -185,6 +188,59 @@ class PipelineLifecycleServiceTest {
         assertThat(written).isEqualTo(
                 new DesiredState("pl1", PipelineState.STOPPED, rev, true, assemblyOf(PIPELINE_V1), false));
         assertThat(desired.read("pl1")).contains(written);
+    }
+
+    @Test
+    void aStartWrittenStraightAfterAStopAsksForTheRunToBeBuiltAgain() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.stop("alice", "pl1", false);
+
+        DesiredState written = service.start("alice", "pl1");
+
+        // The two verbs are one instruction by the time they are stored, because there is one slot and
+        // the converge side samples it: a stop overwritten this quickly is never read, and a start that
+        // did not say so would leave both halves undone with nothing anywhere saying they were skipped.
+        assertThat(written.reassemble())
+                .as("the run has to be torn down before it is built again, or nothing happens at all")
+                .isTrue();
+        assertThat(written.purgeState())
+                .as("a stop that kept what the pipeline has does not become one that clears")
+                .isFalse();
+        // Stamped, and that is what makes it an instruction rather than a wish: carrying it out moves
+        // this epoch on, so it cannot be read a second time and cycle the pipeline once a second.
+        assertThat(written.rebuiltAtStateEpoch())
+                .as("it is carried out once, against the state it was written for")
+                .isEqualTo(7L);
+    }
+
+    @Test
+    void aStartWrittenStraightAfterAClearingStopKeepsTheClearing() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.stop("alice", "pl1", true);
+
+        DesiredState written = service.start("alice", "pl1");
+
+        assertThat(written.reassemble()).isTrue();
+        // The one answer only the user can give. Losing it here is the difference between reading the
+        // whole source again -- which is what was asked for -- and carrying on as if nothing was said.
+        assertThat(written.purgeState())
+                .as("the clearing survives the start that supersedes the stop asking for it")
+                .isTrue();
+        assertThat(written.rebuiltAtStateEpoch()).isEqualTo(7L);
+    }
+
+    @Test
+    void aPlainStartIsNotStampedAndSoIsNotCarriedOutTwice() {
+        artifacts.save(PIPELINE_V1);
+
+        DesiredState written = service.start("alice", "pl1");
+
+        // Nothing was superseded, so there is nothing to carry out once. A stamp here would make an
+        // ordinary start tear down whatever was running, which is the opposite of what it means.
+        assertThat(written.reassemble()).isFalse();
+        assertThat(written.rebuiltAtStateEpoch()).isNull();
     }
 
     @Test

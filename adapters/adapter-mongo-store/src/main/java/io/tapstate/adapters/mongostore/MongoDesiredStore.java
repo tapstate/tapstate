@@ -77,7 +77,8 @@ public final class MongoDesiredStore implements DesiredStore {
                 .append("revision", desired.revision())
                 .append("purgeState", desired.purgeState())
                 .append("assemblyRevision", desired.assemblyRevision())
-                .append("reassemble", desired.reassemble());
+                .append("reassemble", desired.reassemble())
+                .append("rebuiltAtStateEpoch", desired.rebuiltAtStateEpoch());
     }
 
     /** Reconstructs a desired state from its stored document. */
@@ -102,7 +103,8 @@ public final class MongoDesiredStore implements DesiredStore {
         // refusal may be skipped -- so unknown keeps the refusal.
         return new DesiredState(
                 id, parseState(targetState, id), revision, document.getBoolean("purgeState", false),
-                document.getString("assemblyRevision"), document.getBoolean("reassemble", false));
+                document.getString("assemblyRevision"), document.getBoolean("reassemble", false),
+                document.get("rebuiltAtStateEpoch") instanceof Number epoch ? epoch.longValue() : null);
     }
 
     /** A stored target state this version does not recognize is corruption, not a bare enum-valueOf crash. */

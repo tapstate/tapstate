@@ -731,7 +731,9 @@ class PipelineApiTest {
         @Bean
         PipelineLifecycleService pipelineLifecycleService(
                 ArtifactQueryService artifacts, DesiredStore desired, AuditGate auditGate) {
-            return new PipelineLifecycleService(artifacts, desired, auditGate);
+            // Nothing converges in this bundle, so the pipeline has no fencing epoch to read.
+            return new PipelineLifecycleService(
+                    artifacts, desired, auditGate, pipelineId -> java.util.Optional.empty());
         }
 
         @Bean

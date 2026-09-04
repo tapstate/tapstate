@@ -144,6 +144,43 @@ class RestartResumesTheTailIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
+    void thePlainRestartCarriesOnWithoutReadingTheTableAgain(Tiers tier) throws Exception {
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        String pipelineId = "restart_verb_keep";
+        Map<String, Object> source = SharedMySql.settings("restart_keep_src_" + suffix);
+        seed(source);
+        String storeUri = SharedMongo.replicaSetUrl("restart_keep_state_" + suffix);
+        String targetUri = SharedMongo.replicaSetUrl("restart_keep_target_" + suffix);
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+
+        try (MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storeUri)) {
+            ControlPlane control = startedPipeline(server, source, targetUri, pipelineId);
+
+            awaitCount(mongo, target, SEEDED_ROWS, "the snapshot of the seeded rows");
+            // A change after the snapshot, so the run ends with a recorded position rather than only a
+            // finished snapshot: carrying on has to have something to carry on from.
+            update(source, 1, BEFORE_STOP);
+            awaitName(mongo, target, 1, BEFORE_STOP, "the change the first run captured");
+
+            // The pair the terminal composes for `restart`: a stop that keeps, then a start.
+            control.stop(pipelineId, false);
+            control.lifecycle(pipelineId, LifecycleVerb.START);
+
+            // Liveness before the count. A run that has not begun its snapshot has read nought too, so
+            // without a row that actually crosses after the restart the assertion below is vacuous.
+            insert(source, LIVENESS_ID, LIVENESS_ROW);
+            awaitName(mongo, target, LIVENESS_ID, LIVENESS_ROW, "a row written after the restart");
+
+            assertThat(settledRowsRead(control, pipelineId))
+                    .as("rows the restarted run read from %s: the plain word carries on, so the table is "
+                            + "not read again", TABLE)
+                    .isZero();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
     void aRerunReadsTheWholeTableAgain(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         String pipelineId = "restart_verb_rerun";
