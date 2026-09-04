@@ -69,6 +69,10 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
     private static final int ROOTS = 2;
     private static final int CHILDREN_PER_ROOT = 2;
 
+    /** The child added after the restart, under a root the run before it had already assembled. */
+    private static final int LATE_CHILD_ID = 99;
+    private static final String LATE_CHILD_SKU = "sku-after-the-stop";
+
     @BeforeAll
     static void requireDockerAndRealConnectors() {
         DockerGate.require();
@@ -121,6 +125,86 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
         }
     }
 
+
+    /**
+     * A stop that was asked to keep leaves the assembly state alone, and the run that follows it assembles
+     * as though nothing had happened.
+     *
+     * <p>The mirror of the case above, and it needs the other half of the claim to mean anything. That the
+     * entries are still in the store after a keeping stop is checkable and is checked -- but on its own it
+     * says only that something was left behind, not that what was left is usable. A run that kept the
+     * bytes and could no longer read them would pass that and lose data silently.
+     *
+     * <p>Measured while witnessing this: the stop notes a teardown and then acts on the note, and only the
+     * second of those decides anything. Making the note unconditional leaves both cases here green -- the
+     * note is written and nothing reads it on a keeping stop. Making the act unconditional as well reddens
+     * this case on both tiers and leaves the clearing one alone. The two guards are not a repetition.
+     *
+     * <p>So the reading is taken on the target. After the restart a new child is written under a root the
+     * earlier run had already assembled, and the document that root became has to gain it. That is what a
+     * run which never stopped would have done. An implementation that let the assembly state go has no
+     * root to attach the child to: the change arrives, nothing is assembled from it, and every other face
+     * is silent about the document that never grew.
+     */
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void aKeepingStopLeavesTheAssemblyStateUsableByTheRunAfterIt(Tiers tier) throws Exception {
+        String suffix = "nest_keep_" + tier.name().toLowerCase(Locale.ROOT);
+        Map<String, Object> source = SharedMySql.settings(suffix + "_src");
+        seed(source);
+
+        String targetUri = SharedMongo.replicaSetUrl(suffix + "_tgt");
+        String storeUri = SharedMongo.replicaSetUrl(suffix + "_state");
+        String assemblyStateUri = SharedMongo.assemblyStateUrl();
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+
+        try (MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storeUri)) {
+
+            ControlPlane control = start(server, suffix, source, targetUri);
+
+            Await.until("the assembled documents to reach the target", TIMEOUT,
+                    () -> mongo.count(target, PARENT_TABLE) == ROOTS,
+                    () -> "%d of %d documents in %s"
+                            .formatted(mongo.count(target, PARENT_TABLE), ROOTS, PARENT_TABLE));
+            Await.until("the assembly state of %s to be there before the stop".formatted(suffix), TIMEOUT,
+                    () -> !heldBy(mongo, assemblyStateUri, suffix).isEmpty(),
+                    () -> "the shared state store held " + mongo.collections(assemblyStateUri));
+
+            control.stop(suffix, false);
+            awaitState(control, suffix, PipelineState.STOPPED);
+
+            assertThat(heldBy(mongo, assemblyStateUri, suffix))
+                    .as("the assembly state this pipeline held, after a stop that was asked to keep -- the "
+                            + "half that is checkable here, and not on its own the claim")
+                    .isNotEmpty();
+
+            control.lifecycle(suffix, LifecycleVerb.START);
+            awaitState(control, suffix, PipelineState.RUNNING);
+
+            // The claim. A child added under a root the earlier run assembled has to reach that root's
+            // document, which only a run that can still read what it kept is able to do.
+            addChild(source, LATE_CHILD_ID, 1, LATE_CHILD_SKU);
+            Await.until("the late child to be assembled into the root the earlier run had built", TIMEOUT,
+                    () -> assembled(mongo, target).stream()
+                            .anyMatch(document -> document.contains(LATE_CHILD_SKU)),
+                    () -> "the target held " + assembled(mongo, target));
+        }
+    }
+
+    /** Everything the target's documents say, as text -- what a reader would see rather than a field. */
+    private static List<String> assembled(MongoEndpoints mongo, EndpointAddress target) {
+        return mongo.documents(target, PARENT_TABLE).stream().map(String::valueOf).toList();
+    }
+
+    private static void addChild(Map<String, Object> settings, int id, int rootId, String sku)
+            throws Exception {
+        try (Connection connection = SharedMySql.connect(settings);
+                Statement statement = connection.createStatement()) {
+            statement.execute("INSERT INTO " + CHILD_TABLE + " (id, order_id, sku) VALUES ("
+                    + id + ", " + rootId + ", '" + sku + "')");
+        }
+    }
     /**
      * What the shared state store holds for this pipeline.
      *
