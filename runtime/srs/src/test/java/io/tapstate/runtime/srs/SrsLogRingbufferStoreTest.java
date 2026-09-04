@@ -28,6 +28,9 @@ class SrsLogRingbufferStoreTest {
 
     private static final String RING = "srs.mc-1.orders";
 
+    /** The ring the harness builds. Named rather than repeated: one case writes past it on purpose. */
+    private static final int CAPACITY = 16;
+
     @Test
     @DisplayName("writes a change down before it is in the ring, so the ring never holds an unwritten one")
     void writesThroughBeforeAdmitting() {
@@ -99,6 +102,46 @@ class SrsLogRingbufferStoreTest {
         });
     }
 
+    /**
+     * The read-back half, and it is the one the log exists for. Every other case here says a change was
+     * written down; none of them says anybody can get it back once the ring no longer holds it, which is
+     * the whole of what a durable log behind a bounded buffer buys.
+     *
+     * <p>A consumer that is not reading -- paused, or between runs -- is not counted by the write-side
+     * headroom gate, so writes carry on past it and the ring overwrites what it had not reached. When it
+     * comes back its cursor names a sequence the ring dropped. Without the log that change is gone from
+     * here and, if the source has since aged its own retention out, gone everywhere.
+     */
+    @Test
+    @DisplayName("hands back a change the ring has overwritten, so a consumer that fell behind loses nothing")
+    void readsBackAChangeTheRingNoLongerHolds() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> {
+            for (int i = 0; i < CAPACITY * 2; i++) {
+                member.getRingbuffer(RING).add(item("change-" + i, i));
+            }
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+
+            // The precondition, asserted rather than assumed: a ring that had somehow kept everything would
+            // answer the read below out of memory, and the case would pass having witnessed nothing.
+            assertThat(ring.headSequence())
+                    .as("the oldest sequence still in memory after writing twice the ring's capacity -- "
+                            + "sequence 0 has to be behind it for the read below to mean anything")
+                    .isGreaterThan(0L);
+
+            SrsItem readBack = ring.readOne(0L);
+            assertThat(readBack)
+                    .as("a change from before the ring's head: the ring asks the log behind it, so a "
+                            + "consumer that fell behind by more than the ring holds still gets what it "
+                            + "missed, and gets it without the source being asked again")
+                    .isNotNull();
+            assertThat(readBack.srcPos().token())
+                    .as("and it is the change that was written at that sequence, not some other one the "
+                            + "ring happened to still hold there")
+                    .isEqualTo("change-0");
+        });
+    }
+
     private static SrsItem item(String token, long ts) {
         return new SrsItem(new SourcePosition(token), Op.INSERT, ts, null, Map.of("id", ts), 0L);
     }
@@ -113,7 +156,7 @@ class SrsLogRingbufferStoreTest {
                 .setTypeClass(SrsItem.class)
                 .setImplementation(new SrsItemSerializer()));
         config.addRingBufferConfig(new RingbufferConfig("srs.*")
-                .setCapacity(16)
+                .setCapacity(CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
                 .setBackupCount(0)
