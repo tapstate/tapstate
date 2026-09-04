@@ -30,7 +30,7 @@ final class TuiApp {
 
     private static final int DEFAULT_WIDTH = 100;
     private static final int DEFAULT_HEIGHT = 24;
-    private static final int INLINE_DISPLAY_HEIGHT = 14;
+    private static final int INLINE_DISPLAY_HEIGHT = 16;
     private static final int READ_TIMEOUT_MILLIS = 50;
     // Terminal emulators may deliver ESC and the rest of an arrow sequence in separate input chunks.
     // Keep standalone Escape responsive while allowing that split sequence to remain prompt-owned.
@@ -74,7 +74,6 @@ final class TuiApp {
     private String pendingContextSelection;
     private String commandInput = "";
     private boolean suggestionsVisible;
-    private int workspaceScroll;
     private int pendingInputCode = Integer.MIN_VALUE;
     private java.nio.file.Path workspaceSnapshotRoot;
     private List<TuiDashboard.ResourceSummary> workspaceSnapshot = List.of();
@@ -241,8 +240,6 @@ final class TuiApp {
             int height = dimension(size.height(), DEFAULT_HEIGHT);
             if (resizeRequested.getAndSet(false) || width != lastWidth || height != lastHeight) {
                 kernel.dispatch(new TuiEvent.Resize(width, height));
-                workspaceScroll = moveWorkspaceScroll(workspaceScroll, 0,
-                        TamboDashboard.maxWorkspaceScroll(state(), height));
                 draw(display, terminal);
                 lastWidth = width;
                 lastHeight = height;
@@ -296,6 +293,15 @@ final class TuiApp {
                 draw(display, terminal);
                 continue;
             }
+            if (uiState.paletteOpen() && isEnter(code)) {
+                String selected = uiState.palette().get(uiState.paletteIndex());
+                commandInput = selected;
+                suggestionsVisible = false;
+                uiState = reduce(
+                        new TuiAction.SelectPaletteCommand(selected, "selected: " + selected + " · Enter run"));
+                draw(display, terminal);
+                continue;
+            }
             TuiCommandBar.Update update = TuiCommandBar.accept(commandInput, code);
             commandInput = update.value();
             kernel.dispatch(new TuiEvent.Key(code));
@@ -303,15 +309,6 @@ final class TuiApp {
             uiState = reduce(new TuiAction.SetCommand(commandInput));
             if (uiState.paletteOpen() && code == TuiCommandBar.CTRL_P) {
                 uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
-                draw(display, terminal);
-                continue;
-            }
-            if (uiState.paletteOpen() && isEnter(code)) {
-                String selected = uiState.palette().get(uiState.paletteIndex());
-                commandInput = selected;
-                suggestionsVisible = false;
-                uiState = reduce(
-                        new TuiAction.SelectPaletteCommand(selected, "selected: " + selected + " · Enter run"));
                 draw(display, terminal);
                 continue;
             }
@@ -365,7 +362,6 @@ final class TuiApp {
         uiState = reduce(new TuiAction.ClearCommand());
         commandInput = "";
         suggestionsVisible = false;
-        workspaceScroll = 0;
         if (operation == null) {
             uiState = reduce(new TuiAction.AppendActivity("command cleared"));
             uiState = reduce(new TuiAction.SetNotice("command cleared"));
@@ -380,7 +376,6 @@ final class TuiApp {
         String line = commandInput.trim();
         commandInput = "";
         suggestionsVisible = false;
-        workspaceScroll = 0;
         uiState = reduce(new TuiAction.ClearCommand());
         uiState = reduce(new TuiAction.ClosePalette(uiState.notice()));
         if (line.isEmpty()) {
@@ -393,6 +388,7 @@ final class TuiApp {
                         : resource.id() + "\n" + resource.kind() + "\n" + resource.detail();
                 uiState = reduce(new TuiAction.SetResultPane(TuiCommandBar.project(
                         new CommandResult(true, Cli.EXIT_OK), output)));
+                printToScrollback(output);
                 uiState = reduce(new TuiAction.SetNotice("details: " + detail.selected()));
                 return true;
             }
@@ -553,7 +549,7 @@ final class TuiApp {
         }
         CommandResult safeResult = commandResult == null ? new CommandResult(true, Cli.EXIT_DIAGNOSTIC) : commandResult;
         uiState = reduce(new TuiAction.SetResultPane(TuiCommandBar.project(safeResult, result)));
-        workspaceScroll = TamboDashboard.maxWorkspaceScroll(state(), kernel.viewport().height());
+        printToScrollback(result, safeResult);
         invalidateWorkspaceSnapshot();
         if (!result.isBlank()) {
             String marker = failure == null && safeResult.exitCode() == Cli.EXIT_OK ? "✓ " : "✕ ";
@@ -568,6 +564,30 @@ final class TuiApp {
             uiState = reduce(new TuiAction.SetNotice(message));
         }
         commandExitRequested = !safeResult.keepRunning();
+    }
+
+    /** Appends command output to terminal scrollback instead of keeping a second virtual viewport. */
+    private void printToScrollback(String output, CommandResult result) {
+        if (display == null) {
+            return;
+        }
+        TuiCommandBar.ResultPane pane = TuiCommandBar.project(result, output);
+        String text = String.join("\n", pane.lines());
+        if (text.isBlank()) {
+            text = pane.success() ? "ready" : "command failed (exit " + pane.exitCode() + ")";
+        }
+        display.println(text);
+    }
+
+    private void printToScrollback(String output) {
+        if (display == null) {
+            return;
+        }
+        String text = String.join("\n", TuiCommandBar.project(
+                new CommandResult(true, Cli.EXIT_OK), output).lines());
+        if (!text.isBlank()) {
+            display.println(text);
+        }
     }
 
     static boolean requiresUiThread(String line) {
@@ -736,26 +756,22 @@ final class TuiApp {
         try {
             while (true) {
                 int code = readPromptCode();
-                if (code < 0 || code == TuiCommandBar.CTRL_C) {
+                if (code == TuiCommandBar.CTRL_C || code == TuiCommandBar.ESCAPE) {
                     return options.getLast();
-                }
-                if (code == TuiCommandBar.ESCAPE) {
-                    return options.getLast();
-                }
-                if (code == TuiCommandBar.ENTER || code == TuiCommandBar.CARRIAGE_RETURN) {
-                    return options.get(selected);
-                }
-                if (code == '1' && options.size() >= 1) {
-                    return options.getFirst();
-                }
-                if (code >= '2' && code <= '9' && code - '1' < options.size()) {
-                    return options.get(code - '1');
                 }
                 EscapeKey key = escapeKeyFrom(code);
                 if (key == EscapeKey.UP) {
                     selected = movePromptSelection(selected, -1, options.size());
                 } else if (key == EscapeKey.DOWN) {
                     selected = movePromptSelection(selected, 1, options.size());
+                } else if (code < 0) {
+                    return options.getLast();
+                } else if (code == TuiCommandBar.ENTER || code == TuiCommandBar.CARRIAGE_RETURN) {
+                    return options.get(selected);
+                } else if (code == '1' && options.size() >= 1) {
+                    return options.getFirst();
+                } else if (code >= '2' && code <= '9' && code - '1' < options.size()) {
+                    return options.get(code - '1');
                 } else {
                     continue;
                 }
@@ -867,9 +883,10 @@ final class TuiApp {
 
     private void draw(InlineDisplay display, Terminal terminal) {
         int height = Math.min(INLINE_DISPLAY_HEIGHT,
-                Math.max(8, terminal.getHeight() > 0 ? terminal.getHeight() : DEFAULT_HEIGHT));
+                Math.max(9, TamboDashboard.displayHeight(state(),
+                        terminal.getHeight() > 0 ? terminal.getHeight() : DEFAULT_HEIGHT)));
         display.render((area, buffer) -> dashboard.render(
-                dev.tamboui.terminal.Frame.forTesting(buffer), state(), workspaceScroll), height, -1, -1);
+                dev.tamboui.terminal.Frame.forTesting(buffer), state()), height, -1, -1);
     }
 
     private void startDashboardRefreshIfNeeded(int width) {
@@ -1148,12 +1165,6 @@ final class TuiApp {
             return;
         }
         if (commandInput.isEmpty()) {
-            if (uiState.resultPane() != null && !uiState.resultPane().lines().isEmpty()) {
-                int delta = key == EscapeKey.UP ? -1 : 1;
-                workspaceScroll = moveWorkspaceScroll(workspaceScroll, delta,
-                        TamboDashboard.maxWorkspaceScroll(state(), kernel.viewport().height()));
-                return;
-            }
             TuiNavigation navigation = navigation();
             TuiNavigation next = navigation.move(key == EscapeKey.UP ? -1 : 1);
             uiState = reduce(new TuiAction.SetNavigation(next));
@@ -1205,12 +1216,12 @@ final class TuiApp {
     }
 
     private EscapeKey readEscapeKey() throws IOException {
-        int next = reader.peek(ESCAPE_SEQUENCE_START_TIMEOUT_MILLIS);
+        int next = reader.read(ESCAPE_SEQUENCE_START_TIMEOUT_MILLIS);
         if (next == NonBlockingReader.READ_EXPIRED || next < 0) {
             return EscapeKey.ESCAPE;
         }
         if (next != '[' && next != 'O') {
-            rememberPendingInput(reader.read(ESCAPE_SEQUENCE_BODY_TIMEOUT_MILLIS));
+            rememberPendingInput(next);
             return EscapeKey.ESCAPE;
         }
         do {
@@ -1240,12 +1251,6 @@ final class TuiApp {
             return 0;
         }
         return Math.max(0, Math.min(size - 1, selected + delta));
-    }
-
-    static int moveWorkspaceScroll(int current, int delta, int maximum) {
-        int upperBound = Math.max(0, maximum);
-        long next = (long) current + delta;
-        return (int) Math.max(0, Math.min(upperBound, next));
     }
 
     static boolean isEnter(int code) {

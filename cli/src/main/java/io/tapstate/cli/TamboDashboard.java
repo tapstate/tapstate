@@ -12,9 +12,6 @@ import dev.tamboui.widgets.block.Block;
 import dev.tamboui.widgets.block.BorderType;
 import dev.tamboui.widgets.block.Borders;
 import dev.tamboui.widgets.paragraph.Paragraph;
-import dev.tamboui.widgets.scrollbar.Scrollbar;
-import dev.tamboui.widgets.scrollbar.ScrollbarOrientation;
-import dev.tamboui.widgets.scrollbar.ScrollbarState;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -23,29 +20,18 @@ import java.util.List;
 final class TamboDashboard {
 
     void render(Frame frame, TuiDashboard.State state) {
-        render(frame, state, 0);
-    }
-
-    void render(Frame frame, TuiDashboard.State state, int workspaceScroll) {
         Rect screen = frame.area().inner(Margin.uniform(1));
-        int suggestionRows = inlineSuggestions(state) ? inlineSuggestionRows(state, screen.height()) : 0;
+        int suggestionRows = inlineSuggestions(state) ? inlineSuggestionRows(state, frame.area().height()) : 0;
         List<Rect> vertical = Layout.vertical().constraints(
                 Constraint.length(2), Constraint.fill(), Constraint.length(5 + suggestionRows)).split(screen);
         renderStatus(frame, vertical.get(0), state);
-        renderWorkspace(frame, vertical.get(1), state, workspaceScroll, suggestionRows > 0);
+        renderWorkspace(frame, vertical.get(1), state, suggestionRows > 0);
         renderCommandBar(frame, vertical.get(2), state, suggestionRows);
     }
 
-    static int maxWorkspaceScroll(TuiDashboard.State state, int terminalHeight) {
-        if (state.prompt() != null || !state.palette().isEmpty()
-                || state.resultPane() == null || state.resultPane().lines().isEmpty()) {
-            return 0;
-        }
-        return Math.max(0, contentLines(state).size() - workspaceViewportHeight(terminalHeight));
-    }
-
-    private static int workspaceViewportHeight(int terminalHeight) {
-        return Math.max(1, terminalHeight - 9);
+    static int displayHeight(TuiDashboard.State state, int terminalHeight) {
+        int suggestions = inlineSuggestions(state) ? inlineSuggestionRows(state, terminalHeight) : 0;
+        return Math.min(16, Math.max(9, 9 + suggestions));
     }
 
     private void renderStatus(Frame frame, Rect area, TuiDashboard.State state) {
@@ -57,42 +43,13 @@ final class TamboDashboard {
                 .foreground(connectionColor(state.connection())).build(), area);
     }
 
-    private void renderWorkspace(Frame frame, Rect area, TuiDashboard.State state, int workspaceScroll,
-                                 boolean inlineSuggestions) {
+    private void renderWorkspace(Frame frame, Rect area, TuiDashboard.State state, boolean inlineSuggestions) {
         List<String> lines = state.prompt() != null ? promptLines(state.prompt())
                 : !state.palette().isEmpty() && !inlineSuggestions ? paletteLines(state, area.height()) : contentLines(state);
-        boolean scrollable = state.prompt() == null && state.palette().isEmpty()
-                && state.resultPane() != null && lines.size() > area.height();
-        Rect textArea = area;
-        Rect scrollbarArea = Rect.ZERO;
-        if (scrollable) {
-            List<Rect> horizontal = Layout.horizontal().constraints(
-                    Constraint.fill(), Constraint.length(1)).split(area);
-            textArea = horizontal.get(0);
-            scrollbarArea = horizontal.get(1);
-        }
-        int maxScroll = Math.max(0, lines.size() - textArea.height());
-        int scroll = Math.min(Math.max(0, workspaceScroll), maxScroll);
         Paragraph.Builder paragraph = Paragraph.builder()
                 .text(Text.from(String.join("\n", lines)))
-                .scroll(scroll)
                 .overflow(Overflow.WRAP_WORD);
-        frame.renderWidget(paragraph.build(), textArea);
-        if (scrollable) {
-            ScrollbarState scrollbarState = new ScrollbarState()
-                    .contentLength(lines.size())
-                    .viewportContentLength(textArea.height())
-                    .position(scroll);
-            frame.renderStatefulWidget(Scrollbar.builder()
-                    .orientation(ScrollbarOrientation.VERTICAL_RIGHT)
-                    .thumbSymbol("┃")
-                    .trackSymbol("┊")
-                    .beginSymbol("")
-                    .endSymbol("")
-                    .thumbColor(Color.LIGHT_CYAN)
-                    .trackColor(Color.DARK_GRAY)
-                    .build(), scrollbarArea, scrollbarState);
-        }
+        frame.renderWidget(paragraph.build(), area);
     }
 
     private void renderCommandBar(Frame frame, Rect area, TuiDashboard.State state, int suggestionRows) {
@@ -143,9 +100,7 @@ final class TamboDashboard {
 
     private static List<String> contentLines(TuiDashboard.State state) {
         if (state.resultPane() != null && !state.resultPane().lines().isEmpty()) {
-            List<String> lines = new ArrayList<>(List.of("Last command", ""));
-            lines.addAll(state.resultPane().lines());
-            return lines;
+            return List.of();
         }
         if (state.connection() == TuiDashboard.Connection.ONBOARDING || state.connection() == TuiDashboard.Connection.OFFLINE) {
             return List.of("Ready to work locally.", "", "Try: validate ./work",

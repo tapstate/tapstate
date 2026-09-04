@@ -606,16 +606,18 @@ else
   bad "native tui visual contract failed; output:"; echo "$TUI_CLEAN"
 fi
 
-# Picocli help is deliberately long enough to exercise the workspace viewport. The scrollbar belongs
-# to that result area, not to the command composer, and must remain a glyph rather than a status label.
+# Picocli help is deliberately long enough to exercise terminal scrollback. The workbench does not
+# own a second result viewport, so long output must stay readable without a custom scrollbar.
 TAPSTATE_PTY_TUI=1 pty_session $'help\n\004' -w "$TUI_WORKSPACE"
 TUI_SCROLL_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && grep -Fq '┃' <<< "$TUI_SCROLL_CLEAN" \
+   && grep -Fq 'Usage:' <<< "$TUI_SCROLL_CLEAN" \
+   && ! grep -Fq '┃' <<< "$TUI_SCROLL_CLEAN" \
+   && ! grep -Fq '┊' <<< "$TUI_SCROLL_CLEAN" \
    && ! grep -qE 'scroll [0-9]+' <<< "$TUI_SCROLL_CLEAN"; then
-  ok "native tui rendered a workspace scrollbar for long command output"
+  ok "native tui kept long command output in terminal scrollback without a custom scrollbar"
 else
-  bad "native tui scrollbar contract failed; output:"; echo "$TUI_SCROLL_CLEAN"
+  bad "native tui scrollback contract failed; output:"; echo "$TUI_SCROLL_CLEAN"
 fi
 
 # --- summary ------------------------------------------------------------------------------------

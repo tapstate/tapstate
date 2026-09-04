@@ -1,9 +1,13 @@
 package io.tapstate.cli;
 
 import dev.tamboui.buffer.Buffer;
+import dev.tamboui.backend.jline3.JLineBackend;
+import dev.tamboui.inline.InlineDisplay;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.terminal.Frame;
 import io.tapstate.core.common.TapstateException;
+import org.jline.terminal.Terminal;
+import org.jline.terminal.TerminalBuilder;
 import org.jline.utils.NonBlockingReader;
 import io.tapstate.core.schema.SchemaNavigator;
 import org.junit.jupiter.api.Test;
@@ -72,13 +76,6 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
-    void workspaceScrollCannotAccumulatePastEitherViewportEdge() {
-        assertThat(TuiApp.moveWorkspaceScroll(0, -1, 7)).isZero();
-        assertThat(TuiApp.moveWorkspaceScroll(7, 1, 7)).isEqualTo(7);
-        assertThat(TuiApp.moveWorkspaceScroll(6, 1, 7)).isEqualTo(7);
-    }
-
-    @Test
     void completionSelectionAcceptsBothTerminalEnterCodes() {
         assertThat(TuiApp.isEnter(TuiCommandBar.ENTER)).isTrue();
         assertThat(TuiApp.isEnter(TuiCommandBar.CARRIAGE_RETURN)).isTrue();
@@ -96,6 +93,38 @@ class TuiRuntimeIntegrationTest {
         Object decoded = readEscapeKey.invoke(app);
 
         assertThat(decoded.toString()).isEqualTo("DOWN");
+    }
+
+    @Test
+    void promptReaderConvertsArrowSequenceToPromptOwnedCode() throws Exception {
+        TuiApp app = new TuiApp(new Repl(CommandRegistry.standard(SchemaNavigator.bundled()).commandLine()),
+                new StringWriter(), new StringWriter(), null);
+        setField(app, "reader", new PromptArrowReader());
+        Method readPromptCode = TuiApp.class.getDeclaredMethod("readPromptCode");
+        readPromptCode.setAccessible(true);
+
+        assertThat((int) readPromptCode.invoke(app)).isEqualTo(-1002);
+    }
+
+    @Test
+    void contextPromptKeepsArrowNavigationInsideThePrompt() throws Exception {
+        TuiApp app = new TuiApp(new Repl(CommandRegistry.standard(SchemaNavigator.bundled()).commandLine()),
+                new StringWriter(), new StringWriter(), null);
+        try (Terminal terminal = TerminalBuilder.builder().dumb(true).build()) {
+            InlineDisplay display = InlineDisplay.withBackend(5, new JLineBackend(terminal));
+            try {
+                setField(app, "terminal", terminal);
+                setField(app, "display", display);
+                setField(app, "reader", new PromptChoiceReader());
+                Method promptChoice = TuiApp.class.getDeclaredMethod("promptChoice", String.class, List.class);
+                promptChoice.setAccessible(true);
+
+                assertThat(promptChoice.invoke(app, "Context action", List.of("Create a context", "Quit")))
+                        .isEqualTo("Quit");
+            } finally {
+                display.release();
+            }
+        }
     }
 
     @Test
@@ -345,28 +374,28 @@ class TuiRuntimeIntegrationTest {
     }
 
     @Test
-    void dashboardKeepsResultLinesReadableAndComposerUnlabelled() {
+    void dashboardLeavesCommandOutputToTerminalScrollback() {
         String output = "error: cli.context-config-permissions\n"
                 + "The context directory permissions are too broad. Run chmod 700 on the directory.";
         TuiCommandBar.ResultPane result = TuiCommandBar.project(
                 new CommandResult(false, Cli.EXIT_DIAGNOSTIC), output);
         TuiDashboard.State state = new TuiDashboard.State(
                 Path.of("orders"), null, null, TuiDashboard.Connection.OFFLINE,
-                null, "", List.of(), 0, null, null, null, null, List.of(), List.of(),
+                null, "ls", List.of(), 0, null, null, null, null, List.of(), List.of(),
                 List.of(), null, result);
         Buffer buffer = Buffer.empty(new Rect(0, 0, 60, 16));
 
         new TamboDashboard().render(Frame.forTesting(buffer), state);
 
         String rendered = buffer.toAnsiStringTrimmed();
-        assertThat(rendered).contains("error: cli.context-config-permissions",
-                "permissions are too broad");
-        assertThat(rendered).doesNotContain("[COMMAND]", "[PROMPT]");
+        assertThat(rendered).contains("ls▌");
+        assertThat(rendered).doesNotContain("error: cli.context-config-permissions",
+                "permissions are too broad", "[COMMAND]", "[PROMPT]");
         assertThat(rendered).doesNotContain("› ");
     }
 
     @Test
-    void dashboardScrollsTheResultViewport() {
+    void dashboardDoesNotRenderAWorkspaceScrollbar() {
         TuiCommandBar.ResultPane result = TuiCommandBar.project(
                 new CommandResult(true, Cli.EXIT_OK), "line-0\nline-1\nline-2\nline-3");
         TuiDashboard.State state = new TuiDashboard.State(
@@ -374,14 +403,14 @@ class TuiRuntimeIntegrationTest {
                 null, "", List.of(), 0, null, null, null, null, List.of(), List.of(), List.of(), null, result);
         Buffer buffer = Buffer.empty(new Rect(0, 0, 60, 10));
 
-        new TamboDashboard().render(Frame.forTesting(buffer), state, 4);
+        new TamboDashboard().render(Frame.forTesting(buffer), state);
 
         String rendered = buffer.toAnsiStringTrimmed();
-        assertThat(rendered).contains("line-2").doesNotContain("line-0", "line-1");
+        assertThat(rendered).doesNotContain("line-0", "line-1", "line-2", "line-3", "┃", "┊");
     }
 
     @Test
-    void dashboardUsesAQuietRoundedComposerAndVisibleWorkspaceScrollbar() {
+    void dashboardUsesAQuietRoundedComposerWithoutAWorkspaceScrollbar() {
         List<String> output = java.util.stream.IntStream.range(0, 12)
                 .mapToObj(index -> "line-" + index)
                 .toList();
@@ -393,10 +422,11 @@ class TuiRuntimeIntegrationTest {
                 List.of(), null, result);
         Buffer buffer = Buffer.empty(new Rect(0, 0, 60, 16));
 
-        new TamboDashboard().render(Frame.forTesting(buffer), state, 3);
+        new TamboDashboard().render(Frame.forTesting(buffer), state);
 
         String rendered = buffer.toAnsiStringTrimmed();
-        assertThat(rendered).contains("╭", "╮", "╰", "╯", "┃", "ls▌")
+        assertThat(rendered).contains("╭", "╮", "╰", "╯", "ls▌")
+                .doesNotContain("┃", "┊")
                 .doesNotContain("scroll 3");
     }
 
@@ -642,6 +672,64 @@ class TuiRuntimeIntegrationTest {
         @Override
         public int read(long timeout) {
             return index++ == 0 ? '[' : 'B';
+        }
+
+        @Override
+        protected int read(long timeout, boolean peek) {
+            return peek ? peek(timeout) : read(timeout);
+        }
+
+        @Override
+        public int readBuffered(char[] buffer, int offset, int length, long timeout) {
+            return 0;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    private static final class PromptArrowReader extends NonBlockingReader {
+        private final int[] codes = {TuiCommandBar.ESCAPE, '[', 'B'};
+        private int index;
+
+        @Override
+        public int peek(long timeout) {
+            return index < codes.length ? codes[index] : READ_EXPIRED;
+        }
+
+        @Override
+        public int read(long timeout) {
+            return index < codes.length ? codes[index++] : READ_EXPIRED;
+        }
+
+        @Override
+        protected int read(long timeout, boolean peek) {
+            return peek ? peek(timeout) : read(timeout);
+        }
+
+        @Override
+        public int readBuffered(char[] buffer, int offset, int length, long timeout) {
+            return 0;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    private static final class PromptChoiceReader extends NonBlockingReader {
+        private final int[] codes = {TuiCommandBar.ESCAPE, '[', 'B', TuiCommandBar.CARRIAGE_RETURN};
+        private int index;
+
+        @Override
+        public int peek(long timeout) {
+            return index < codes.length ? codes[index] : READ_EXPIRED;
+        }
+
+        @Override
+        public int read(long timeout) {
+            return index < codes.length ? codes[index++] : READ_EXPIRED;
         }
 
         @Override
