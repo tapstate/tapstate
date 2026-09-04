@@ -51,22 +51,31 @@ step() {
 }
 
 has() {   # $1 = description, $2 = text, $3 = extended regex
-  if printf '%s' "$2" | grep -qE "$3"; then ok "$1"; else bad "$1"; fi
+  if grep -qE "$3" <<<"$2"; then ok "$1"; else bad "$1"; fi
 }
 
 hasnt() {   # $1 = description, $2 = text, $3 = extended regex
-  if printf '%s' "$2" | grep -qE "$3"; then bad "$1"; else ok "$1"; fi
+  if grep -qE "$3" <<<"$2"; then bad "$1"; else ok "$1"; fi
 }
 
 lacks() { # $1 = description, $2 = text, $3 = extended regex
-  if printf '%s' "$2" | grep -qE "$3"; then bad "$1"; else ok "$1"; fi
+  if grep -qE "$3" <<<"$2"; then bad "$1"; else ok "$1"; fi
 }
+
+# The helpers themselves, before anything leans on them. A `|` into `grep -q` under `pipefail` reports
+# the pipeline, not the match: grep stops at the first hit without draining, the writer left mid-write
+# takes an EPIPE, and a case whose pattern *did* match comes back FAIL. It needs a text that outruns a
+# pipe buffer -- which the jobs below are -- so on a small one the broken shape and the sound one read
+# alike. This seeds one big enough to tell them apart.
+big_text="the needle$(printf '\n%*s' 200000 '')"
+has "a match is still a match when the text outruns a pipe buffer" "$big_text" '^the needle$'
+unset big_text
 
 # Vacuity first. Every case below reads a job or a step by name, and a rename would empty all of them
 # at once -- silently, and in the direction that reports success.
 jobs_list="$(awk '/^  [a-z][a-z0-9_-]*:[ \t]*$/ { gsub(/[ :]/, ""); print }' "$workflow")"
 for want in quickstart-live quickstart-upgrade; do
-  if printf '%s\n' "$jobs_list" | grep -qx "$want"; then
+  if grep -qx "$want" <<<"$jobs_list"; then
     ok "the $want job is here"
   else
     bad "no $want job in the workflow -- every case about it below would pass over nothing"

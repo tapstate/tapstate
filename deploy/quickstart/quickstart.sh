@@ -36,7 +36,7 @@ set -eu
 # nothing and install.sh refuses, which would strand the quickstart at the CLI step on a clean machine.
 # Pin it here instead, the same way the demo connector jars are pinned to a published tag. This must
 # match the version in pom.xml; quickstart-smoke.sh fails the build when the two drift apart.
-CLI_VERSION="0.4.1"
+CLI_VERSION="0.4.3"
 
 die() {
     printf 'quickstart: %s\n' "$1" >&2
@@ -44,14 +44,39 @@ die() {
 }
 
 # Download $1 to the file $2 with whichever of curl / wget is present.
+#
+# The transfer lands in $2.part and is moved into place only once it has completed, so an interrupted
+# one leaves nothing at the real path. That matters more than it reads: callers guard on existence
+# alone, so a partial file sitting at the real path is read as "already have it" by every later run,
+# and the corrupt result surfaces steps downstream with nothing naming the cause.
+#
+# Attempts resume the partial rather than restarting it -- a link that drops once on a 50 MB download
+# tends to drop again, and restarting from zero each time can make no progress at all. The last
+# attempt starts clean instead, which is the only way past a server that cannot serve ranges, or a
+# .part that is already complete because a run was killed between the transfer and the move.
+#
+# It reports and returns non-zero rather than exiting, so the caller decides: under `set -e` an
+# unguarded call ends the run exactly as it did before, and a caller that can do without the file
+# keeps its own `|| ...`.
 fetch() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" -o "$2"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$1" -O "$2"
-    else
-        die "neither curl nor wget is available to download $1."
-    fi
+    _part="$2.part"
+    _try=0
+    while [ "$_try" -lt 3 ]; do
+        _try=$((_try + 1))
+        [ "$_try" -lt 3 ] || rm -f "$_part"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 2 -C - "$1" -o "$_part" && { mv -f "$_part" "$2"; return 0; }
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -c "$1" -O "$_part" && { mv -f "$_part" "$2"; return 0; }
+        else
+            die "neither curl nor wget is available to download $1."
+        fi
+    done
+    printf 'quickstart: could not download %s -- %s attempts, the last from scratch.\n' "$1" "$_try" >&2
+    # Only when there is one. A transfer that never opened leaves no .part, and promising a
+    # resume of a file that is not there sends the reader looking for it.
+    [ ! -f "$_part" ] || printf 'quickstart: what did arrive is kept at %s, so a later run resumes it.\n' "$_part" >&2
+    return 1
 }
 
 # One number read out of the managed store, as a plain integer. A read that fails, or answers anything

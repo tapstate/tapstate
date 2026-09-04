@@ -30,7 +30,7 @@ set -eu
 # prerelease that lookup finds nothing and a bare run would die on a clean machine. Pinning also makes
 # the promise reproducible -- the same script installs the same build. TAPSTATE_VERSION overrides for
 # a one-off; releases update this line, and the smoke fails the build if it drifts from pom.xml.
-PINNED_VERSION="0.4.1"
+PINNED_VERSION="0.4.3"
 
 # Kept in the installation directory, so removing that directory forgets the installation.
 ID_FILE=".installation-id"
@@ -99,14 +99,40 @@ $platform
 }
 
 # Download $1 to the file $2 with whichever of curl / wget is present.
+#
+# Attempts resume the partial rather than restarting it -- a link that drops once on a large download
+# tends to drop again, and restarting from zero each time can make no progress at all. The transfer
+# lands in $2.part and is moved into place only once it has completed, so an interrupted one leaves
+# nothing at the real path. The last attempt starts clean, which is the only way past a server that
+# cannot serve ranges, or a .part that is already complete because a run was killed between the
+# transfer and the move.
+#
+# The quickstart carries this function verbatim, deliberately: the two are halves of one documented
+# install path, and a transfer that survives a dropped link in one half but not the other is the same
+# dead install to whoever ran the one-liner.
+#
+# It reports and returns non-zero rather than exiting, so the caller decides: under `set -e` an
+# unguarded call ends the run exactly as it did before, and a caller that can do without the file
+# keeps its own `|| ...`.
 fetch() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" -o "$2"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$1" -O "$2"
-    else
-        die "neither curl nor wget is available to download $1."
-    fi
+    _part="$2.part"
+    _try=0
+    while [ "$_try" -lt 3 ]; do
+        _try=$((_try + 1))
+        [ "$_try" -lt 3 ] || rm -f "$_part"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 2 -C - "$1" -o "$_part" && { mv -f "$_part" "$2"; return 0; }
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -c "$1" -O "$_part" && { mv -f "$_part" "$2"; return 0; }
+        else
+            die "neither curl nor wget is available to download $1."
+        fi
+    done
+    printf 'install: could not download %s -- %s attempts, the last from scratch.\n' "$1" "$_try" >&2
+    # Only when there is one. A transfer that never opened leaves no .part, and promising a
+    # resume of a file that is not there sends the reader looking for it.
+    [ ! -f "$_part" ] || printf 'install: what did arrive is kept at %s, so a later run resumes it.\n' "$_part" >&2
+    return 1
 }
 
 # The version to install: the caller's override, or the pin above. The /releases/latest redirect is
@@ -164,7 +190,9 @@ version_ge() {
 # requirement this installer does not know, an unreadable version -- says nothing at all, because a
 # check that did not happen must not masquerade as one that passed.
 note_recommended_platform() {
-    fetch "${base_url}/download/v${version}/platform-minimums.txt" "$tmp/minimums" || return 0
+    # Stderr is dropped rather than shown: this file is optional, every word fetch would say about
+    # failing to get it describes a normal install of a release that does not publish one.
+    fetch "${base_url}/download/v${version}/platform-minimums.txt" "$tmp/minimums" 2>/dev/null || return 0
     [ -s "$tmp/minimums" ] || return 0
     kind="$(awk -v p="$platform" '$1 == p { print $2; exit }' "$tmp/minimums")"
     need="$(awk -v p="$platform" '$1 == p { print $3; exit }' "$tmp/minimums")"
