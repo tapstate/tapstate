@@ -175,6 +175,12 @@ enum CliError implements TapstateErrorCode {
     /** A seed answered discovery with fields that cannot identify a Tapstate cluster. */
     ISSUER_DISCOVERY_INVALID("cli.issuer-discovery-invalid", Set.of("seed", "reason")),
 
+    /**
+     * A seed refused anonymous discovery outright; {@code reason} carries what it said. A server older
+     * than this CLI does not serve the discovery endpoint, and answers this way every time.
+     */
+    ISSUER_DISCOVERY_REJECTED("cli.issuer-discovery-rejected", Set.of("seed", "reason")),
+
     /** A cached issuer or another seed differs from the anonymously discovered issuer. */
     AUTH_ISSUER_MISMATCH("cli.auth-issuer-mismatch", Set.of("expected", "actual", "seed")),
 

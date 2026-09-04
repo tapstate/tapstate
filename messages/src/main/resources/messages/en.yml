@@ -606,6 +606,9 @@ cli.issuer-discovery-failed:
 cli.issuer-discovery-invalid:
   message: "Server seed {seed} returned an invalid cluster identity ({reason})."
   solution: "Check that the URL targets a compatible Tapstate server and has not been replaced by another service."
+cli.issuer-discovery-rejected:
+  message: "Server seed {seed} refused anonymous issuer discovery: {reason}"
+  solution: "A server older than this CLI does not serve /.well-known/tapstate; upgrade the server, or use a CLI matching its version."
 cli.auth-issuer-mismatch:
   message: "Server seed {seed} reports issuer {actual}, but {expected} was required."
   solution: "Check the context seeds and sign in again only after confirming that this is the intended cluster."

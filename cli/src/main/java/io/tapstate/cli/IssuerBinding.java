@@ -35,24 +35,33 @@ final class IssuerBinding {
         DiscoveryOutcome.Discovered agreed = null;
         URI selected = null;
         for (URI seed : seeds) {
-            DiscoveryOutcome outcome = client.discover(seed);
-            if (outcome instanceof DiscoveryOutcome.Invalid invalid) {
-                throw failure(CliError.ISSUER_DISCOVERY_INVALID,
+            // Switched over the sealed outcome rather than tested and cast: a variant added later is a
+            // compile error here instead of a ClassCastException in front of a user.
+            switch (client.discover(seed)) {
+                case DiscoveryOutcome.Invalid invalid -> throw failure(CliError.ISSUER_DISCOVERY_INVALID,
                         Map.of("seed", seed.toString(), "reason", invalid.reason()));
-            }
-            if (outcome instanceof DiscoveryOutcome.Unreachable) {
-                continue;
-            }
-            DiscoveryOutcome.Discovered discovered = (DiscoveryOutcome.Discovered) outcome;
-            validate(seed, discovered);
-            if (agreed == null) {
-                agreed = discovered;
-                selected = seed;
-            } else if (!agreed.issuer().equals(discovered.issuer())) {
-                throw mismatch(agreed.issuer(), discovered.issuer(), seed);
-            }
-            if (expectedIssuer != null && !expectedIssuer.equals(discovered.issuer())) {
-                throw mismatch(expectedIssuer, discovered.issuer(), seed);
+                // A reachable seed that refuses the gate has given a definite answer, not a flake - a
+                // server older than this CLI does not serve the endpoint at all and refuses every time.
+                // Refusing here carries what it said, which is the only part a reader can act on.
+                case DiscoveryOutcome.Rejected refused -> throw failure(CliError.ISSUER_DISCOVERY_REJECTED,
+                        Map.of("seed", seed.toString(), "reason", refused.code().isBlank()
+                                ? refused.message()
+                                : refused.code() + ": " + refused.message()));
+                case DiscoveryOutcome.Unreachable ignored -> {
+                    // No answer from this seed; a later one may still carry the cluster.
+                }
+                case DiscoveryOutcome.Discovered discovered -> {
+                    validate(seed, discovered);
+                    if (agreed == null) {
+                        agreed = discovered;
+                        selected = seed;
+                    } else if (!agreed.issuer().equals(discovered.issuer())) {
+                        throw mismatch(agreed.issuer(), discovered.issuer(), seed);
+                    }
+                    if (expectedIssuer != null && !expectedIssuer.equals(discovered.issuer())) {
+                        throw mismatch(expectedIssuer, discovered.issuer(), seed);
+                    }
+                }
             }
         }
         if (agreed == null) {
