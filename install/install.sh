@@ -121,8 +121,10 @@ fetch() {
             die "neither curl nor wget is available to download $1."
         fi
     done
-    printf 'install: could not download %s -- %s attempts, the last from scratch. Whatever arrived is\n' "$1" "$_try" >&2
-    printf 'install: kept at %s, so a later run resumes it rather than starting over.\n' "$_part" >&2
+    printf 'install: could not download %s -- %s attempts, the last from scratch.\n' "$1" "$_try" >&2
+    # Only when there is one. A transfer that never opened leaves no .part, and promising a
+    # resume of a file that is not there sends the reader looking for it.
+    [ ! -f "$_part" ] || printf 'install: what did arrive is kept at %s, so a later run resumes it.\n' "$_part" >&2
     return 1
 }
 
@@ -181,7 +183,9 @@ version_ge() {
 # requirement this installer does not know, an unreadable version -- says nothing at all, because a
 # check that did not happen must not masquerade as one that passed.
 note_recommended_platform() {
-    fetch "${base_url}/download/v${version}/platform-minimums.txt" "$tmp/minimums" || return 0
+    # Stderr is dropped rather than shown: this file is optional, every word fetch would say about
+    # failing to get it describes a normal install of a release that does not publish one.
+    fetch "${base_url}/download/v${version}/platform-minimums.txt" "$tmp/minimums" 2>/dev/null || return 0
     [ -s "$tmp/minimums" ] || return 0
     kind="$(awk -v p="$platform" '$1 == p { print $2; exit }' "$tmp/minimums")"
     need="$(awk -v p="$platform" '$1 == p { print $3; exit }' "$tmp/minimums")"

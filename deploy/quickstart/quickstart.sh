@@ -72,8 +72,10 @@ fetch() {
             die "neither curl nor wget is available to download $1."
         fi
     done
-    printf 'quickstart: could not download %s -- %s attempts, the last from scratch. Whatever arrived is\n' "$1" "$_try" >&2
-    printf 'quickstart: kept at %s, so a later run resumes it rather than starting over.\n' "$_part" >&2
+    printf 'quickstart: could not download %s -- %s attempts, the last from scratch.\n' "$1" "$_try" >&2
+    # Only when there is one. A transfer that never opened leaves no .part, and promising a
+    # resume of a file that is not there sends the reader looking for it.
+    [ ! -f "$_part" ] || printf 'quickstart: what did arrive is kept at %s, so a later run resumes it.\n' "$_part" >&2
     return 1
 }
 

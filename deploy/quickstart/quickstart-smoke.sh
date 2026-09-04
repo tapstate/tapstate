@@ -856,7 +856,7 @@ else
   CURL_SHIM="$DROP_DIR/curl"; echo 1 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
   run_prepare Linux x86_64 glibc
   DROP1="$DEMO"
-  if [ "$RC" -eq 0 ] && [ "$(wc -c < "$DROP1/postgres-connector.jar" | tr -d ' ')" = "$JAR_BYTES" ]; then
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP1/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
     ok "a transfer that drops once is retried, and the run completes on its own"
   else
     bad "one dropped transfer ended the run (rc=$RC, jar=$(wc -c < "$DROP1/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes)"
@@ -877,7 +877,7 @@ else
   # link, no manual deletion. Under the old guard the stump was read as "already have it" forever.
   CURL_SHIM=""
   run_prepare Linux x86_64 glibc "$DROP2"
-  if [ "$RC" -eq 0 ] && [ "$(wc -c < "$DROP2/postgres-connector.jar" | tr -d ' ')" = "$JAR_BYTES" ]; then
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP2/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
     ok "re-running after a failed transfer re-fetches the jar instead of accepting the stump"
   else
     bad "the re-run did not recover the jar (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes): $OUT"
