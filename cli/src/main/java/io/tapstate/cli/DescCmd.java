@@ -199,7 +199,7 @@ final class DescCmd implements Callable<Integer> {
                 m.put("tables", tableNames(s.tables()));
             }
         } else if (r instanceof PipelineResource p) {
-            m.put("sources", List.copyOf(p.sources()));
+            m.put("sources", List.copyOf(p.sourceIds()));
             m.put("transforms", p.transforms() == null ? 0 : p.transforms().size());
             m.put("view", p.view() != null);
             m.put("serve", p.serve() != null);

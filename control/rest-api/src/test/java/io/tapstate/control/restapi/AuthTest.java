@@ -58,6 +58,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.spi.store.SessionRecord;
 import io.tapstate.spi.store.SessionStore;
 import io.tapstate.core.model.PipelineResource;
@@ -717,6 +718,7 @@ class AuthTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
+            PipelinePositionTestConfiguration.class,
             AuditedSourceServiceTestConfiguration.class})
     static class TestApp {
 
@@ -982,7 +984,9 @@ class AuthTest {
         @Bean
         PipelineLifecycleService pipelineLifecycleService(
                 ArtifactQueryService artifacts, DesiredStore desired, AuditGate auditGate) {
-            return new PipelineLifecycleService(artifacts, desired, auditGate);
+            // Nothing converges in this bundle, so the pipeline has no fencing epoch to read.
+            return new PipelineLifecycleService(
+                    artifacts, desired, auditGate, pipelineId -> java.util.Optional.empty());
         }
 
         @Bean
@@ -1294,7 +1298,7 @@ class AuthTest {
 
             @Override
             public Optional<Resource> get(String id) {
-                return Optional.of(new PipelineResource(id, null, List.of("src_x"), null, null, null, null, null));
+                return Optional.of(new PipelineResource(id, null, List.of(SourceRef.bare("src_x")), null, null, null, null, null));
             }
 
             @Override

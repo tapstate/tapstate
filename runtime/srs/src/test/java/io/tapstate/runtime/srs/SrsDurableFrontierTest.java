@@ -35,7 +35,7 @@ class SrsDurableFrontierTest {
     void advancesToTheReaderCandidateWhenItTrailsEveryConsumer() {
         List<ConsumerOffset> consumers = List.of(acked("p1", at(5)), acked("p2", at(8)));
         // The reader has read up to 4, behind the slowest consumer's ack (5) -> its full progress is safe.
-        assertThat(SrsDurableFrontier.safeAdvance(at(4), consumers)).hasValue(at(4).token());
+        assertThat(SrsDurableFrontier.safeAdvance(at(4), consumers)).hasValue(at(4));
     }
 
     @Test
@@ -44,7 +44,7 @@ class SrsDurableFrontierTest {
         // The reader has read up to 10, but the slowest consumer has only acked 5. Persisting 10 would let
         // a restart re-mine from 10 and lose 6..9 (only ever in the volatile ring). The offset is clamped
         // to 5, so a restart re-mines 6..10 -> replayable, none lost.
-        assertThat(SrsDurableFrontier.safeAdvance(at(10), consumers)).hasValue(at(5).token());
+        assertThat(SrsDurableFrontier.safeAdvance(at(10), consumers)).hasValue(at(5));
     }
 
     @Test
@@ -53,6 +53,24 @@ class SrsDurableFrontierTest {
         // p2 has sunk nothing, so its acked frontier is below the origin: the offset must not advance at
         // all, or a restart would strand every change p2 has yet to land.
         assertThat(SrsDurableFrontier.safeAdvance(at(10), consumers)).isEmpty();
+    }
+
+    /**
+     * A consumer whose acked position carries no order is refused by name, not ranked.
+     *
+     * <p>An absent order cannot reach here from anything legitimate: every path that records one supplies
+     * it. So this is a wiring defect upstream, and the two ways it could pass quietly are both worse than
+     * a crash -- dereferenced, it dies two frames down naming nothing; treated as "acked nothing", it
+     * pins the whole chain's offset forever and looks exactly like a slow consumer.
+     */
+    @Test
+    void refusesAConsumerPositionCarryingNoOrderRatherThanRankingIt() {
+        List<ConsumerOffset> consumers = List.of(acked("p1", new ChainPosition(null, "w5")));
+
+        assertThatThrownBy(() -> SrsDurableFrontier.safeAdvance(at(10), consumers))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("p1")
+                .hasMessageContaining("cannot be ranked");
     }
 
     @Test
@@ -64,7 +82,7 @@ class SrsDurableFrontierTest {
     @Test
     void boundsByTheSingleConsumersAck() {
         assertThat(SrsDurableFrontier.safeAdvance(at(10), List.of(acked("p1", at(7)))))
-                .hasValue(at(7).token());
+                .hasValue(at(7));
     }
 
     @Test
@@ -77,7 +95,7 @@ class SrsDurableFrontierTest {
         ChainPosition ahead = new ChainPosition(new SourceOrder(1, 100), "w900");
         ChainPosition behind = new ChainPosition(new SourceOrder(1, 9), "w991");
         assertThat(SrsDurableFrontier.safeAdvance(ahead, List.of(acked("p1", behind))))
-                .hasValue("w991");
+                .hasValue(behind);
     }
 
     @Test
@@ -95,9 +113,9 @@ class SrsDurableFrontierTest {
         ChainPosition rebuilt = new ChainPosition(new SourceOrder(2, 0), "w2000");
         ChainPosition older = new ChainPosition(new SourceOrder(1, 900), "w1900");
         assertThat(SrsDurableFrontier.safeAdvance(rebuilt, List.of(acked("p1", older))))
-                .hasValue("w1900");
+                .hasValue(older);
         assertThat(SrsDurableFrontier.safeAdvance(older, List.of(acked("p1", rebuilt))))
-                .hasValue("w1900");
+                .hasValue(older);
     }
 
     @Test

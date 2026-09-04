@@ -118,6 +118,12 @@ public class CsvConnector implements TapConnector {
                         consumer.accept(snapshot(context, table.getId()), null))
                 .supportStreamRead((context, tables, offset, size, consumer) ->
                         tail(context, tables, consumer))
+                // A streaming source states where its stream stands, and this one does the same. A snapshot
+                // samples it before reading its first row and hands it on as the seam the tail joins at; a
+                // source that names no position leaves that join to guesswork, which a snapshot followed by
+                // a tail refuses rather than papers over. Every stream-capable connector the ecosystem ships
+                // declares this -- the only ones that do not are its own benchmark fixtures.
+                .supportTimestampToStreamOffset((context, startTime) -> highWaterMarks(context))
                 .supportWriteRecord((context, events, table, consumer) ->
                         consumer.accept(write(context, events, table)))
                 // The three the read face drives. Registering them is what lets a specification exercise
@@ -229,6 +235,27 @@ public class CsvConnector implements TapConnector {
             }
         }
         consumer.streamReadEnded();
+    }
+
+    /**
+     * Where each table's tail stands right now: the highest ordering column value the file currently
+     * holds, and zero for a table with no rows yet. Serializable on purpose -- a recorded position is
+     * written down and read back by a later run, so it outlives the process that sampled it.
+     *
+     * <p>This connector does not yet resume from one: its tail re-reads from the beginning and the sink
+     * absorbs the overlap, so the value is honest about where the stream stood without being acted on.
+     * Making the tail start here is what a resume witness needs, and it belongs with that witness.
+     */
+    private static LinkedHashMap<String, Long> highWaterMarks(TapConnectionContext context) {
+        LinkedHashMap<String, Long> marks = new LinkedHashMap<>();
+        for (String table : tableNames(context)) {
+            long high = 0;
+            for (Map<String, Object> row : rows(file(context, table))) {
+                high = Math.max(high, idOf(row));
+            }
+            marks.put(table, high);
+        }
+        return marks;
     }
 
     /**

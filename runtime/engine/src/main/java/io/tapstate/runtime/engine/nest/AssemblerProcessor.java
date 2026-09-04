@@ -938,12 +938,13 @@ public final class AssemblerProcessor extends AbstractProcessor {
                         if (isOwedAHandOver(key)) {
                             return;
                         }
-                        if (mayGoOutNow(key)) {
+                        Map<String, ChainPosition> unsent = document.assembly.lowestUnsentByChain();
+                        if (mayGoOutNow(key, unsent)) {
                             outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
                                     .withPositions(document.assembly.covered()));
                             document.assembly.documentSent();
                         } else {
-                            windows.get(key).holds(document.ts, document.assembly.lowestUnsentByChain());
+                            windows.get(key).holds(document.ts, unsent);
                         }
                     },
                     () -> {
@@ -1009,7 +1010,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * behind it, so a root changing less often than the window pays nothing for it at all. Trailing edge
      * would delay every change by the window to merge the ones that mostly are not there.
      */
-    private boolean mayGoOutNow(Object key) {
+    private boolean mayGoOutNow(Object key, Map<String, ChainPosition> unsent) {
         if (sending.windowMillis() <= 0) {
             return true;
         }
@@ -1019,11 +1020,36 @@ public final class AssemblerProcessor extends AbstractProcessor {
             windows.put(key, new Window(now));
             return true;
         }
-        if (now - window.openedAt < sending.windowMillis()) {
+        if (now - window.openedAt < sending.windowMillis() && !theBoundIsAlreadyPast(unsent)) {
             return false;
         }
         window.reopen(now);
         return true;
+    }
+
+    /**
+     * Whether this level has already let the frontier past something this version is carrying. Folding is a
+     * delay, and a delay is free only while the frontier is still behind what is being delayed.
+     *
+     * <p>A change waiting for an ancestor is deliberately not counted among what this level holds the
+     * frontier below - it is in this level's state, it comes back out when its ancestor arrives, and
+     * counting it would pin a source on a foreign key pointing at a row that never comes. So the bound on
+     * its chain goes on climbing past it. When the ancestor does arrive, the change joins its document, and
+     * a document that has changed and not gone out <em>is</em> counted: the same change crosses into the
+     * held set underneath a bound already published past it. Folded from there, no restart replays it - the
+     * source resumes above it - and no later version sends it either, because none is due for that root. It
+     * goes out now instead, which is the only moment left at which anything can.
+     */
+    private boolean theBoundIsAlreadyPast(Map<String, ChainPosition> unsent) {
+        if (bounds == null) {
+            return false;
+        }
+        for (Map.Entry<String, ChainPosition> held : unsent.entrySet()) {
+            if (bounds.hasPassed(held.getKey(), held.getValue().order())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

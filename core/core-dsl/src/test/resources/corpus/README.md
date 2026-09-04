@@ -99,6 +99,7 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `g11-config-enum-violation` | invalid-config-value | `mysql.deploymentMode` set to `cluster`, outside the declared enum |
 | `g12-snapshot-only-on-stream` | mode-mismatch | `settings.read_mode: snapshot_only` over a pure stream source (no one-shot read) |
 | `g13-start-from-without-tail` | mode-mismatch | `settings.start_from` on a bounded read (api source, no incremental tail) |
+| `g14-start-from-on-snapshot-only-cdc` | mode-mismatch | `settings.start_from` on a cdc source read `snapshot_only` (the read_mode removed the tail, so the reported mode is the read_mode) |
 
 Connector-dimension variants (capability matrix, config field checks) are validated against the
 bundled catalog by plan task C3. The catalog's mode signal is trusted only where it is reliable —

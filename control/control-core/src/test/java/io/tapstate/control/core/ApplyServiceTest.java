@@ -6,6 +6,7 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -75,6 +76,158 @@ class ApplyServiceTest {
             connector: mysql
             config: { host: 10.30.0.5, username: writer, password: My_2026 }
             """;
+
+    /**
+     * The refusal is reached through apply, which is the path an edit to a stored Source usually takes.
+     *
+     * <p>Guarding only the other write path would be a guard in name: the two services write through
+     * different calls, so a check on one of them leaves the other wide open, and the open one here is
+     * the one the command line uses.
+     */
+    @Test
+    void applyRefusesToTurnTheReplayStoreOffWhileAPipelineReadingItIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", PipelineState.RUNNING);
+        actual.put("p1", PipelineState.RUNNING);
+        ApplyService guarded = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+
+        assertThatThrownBy(() -> guarded.apply("author", List.of(draft(UNBUFFERED_SRC))))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    /** The same edit lands once the pipeline reading the source is stopped. */
+    @Test
+    void applyAllowsTheChangeOnceThePipelineReadingItIsStopped() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", PipelineState.STOPPED);
+        actual.put("p1", PipelineState.STOPPED);
+        ApplyService guarded = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+
+        guarded.apply("author", List.of(draft(UNBUFFERED_SRC)));
+
+        assertThat(stored("orders_src")).contains("enabled: false");
+    }
+
+    /** A cdc source whose changes are buffered through the shared replay store. */
+    private static final String BUFFERED_SRC = """
+            version: tapstate/v1
+            kind: source
+            id: orders_src
+            connector: mysql
+            mode: cdc
+            config: { host: 10.30.0.5, username: writer, password: My_2026 }
+            tables: [orders]
+            srs: { enabled: true }
+            """;
+
+    /** The same source with the buffering turned off -- the one field the guard watches. */
+    private static final String UNBUFFERED_SRC = BUFFERED_SRC.replace("enabled: true", "enabled: false");
+
+    /**
+     * The peer of the two cases above, for the half of the same switch that lives on the pipeline.
+     *
+     * <p>Guarding only the source side would now be a guard in name: after the switch moved, the value
+     * the capture path actually reads is the pipeline's own, so an author who edits it there reaches
+     * exactly the state the source-side refusal exists to prevent, by the shorter route.
+     */
+    @Test
+    void applyRefusesToChangeAPipelinesOwnBufferingSwitchWhileThatPipelineIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatThrownBy(() -> guarded.apply(
+                "author", List.of(draft(BUFFERED_SRC), draft(PINNED_OFF_PIPELINE))))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    /** And it lands once that pipeline is stopped -- the refusal is about timing, not about the edit. */
+    @Test
+    void theSameEditToAPipelinesOwnSwitchLandsOnceItIsStopped() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.STOPPED);
+
+        guarded.apply("author", List.of(draft(BUFFERED_SRC), draft(PINNED_OFF_PIPELINE)));
+
+        assertThat(stored("p1")).contains("srs: false");
+    }
+
+    /**
+     * A live pipeline whose switch did not move is left alone. Without this, the guard could be
+     * satisfied by refusing every edit to a running pipeline, which is a different rule and one this
+     * layer does not make.
+     */
+    @Test
+    void aLivePipelineEditedAnywhereElseIsNotRefused() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatCode(() -> guarded.apply("author", List.of(
+                draft(BUFFERED_SRC), draft(READER_PIPELINE.replace("op != 'd'", "op != 'u'")))))
+                .doesNotThrowAnyException();
+    }
+
+    /**
+     * Recording a switch for the first time is materialization, not an edit: it is how the value gets
+     * onto the artifact at all, so a pipeline that is already up must not be refused for it. This is the
+     * case a guard written as "the stored and incoming switches differ" gets wrong, because before the
+     * first apply the stored one is absent rather than equal.
+     */
+    @Test
+    void aFirstRecordingOnALivePipelineIsNotRefused() {
+        // Land a pipeline with no switch recorded at all, the way one stored before this field existed
+        // reads, then bring it up and re-apply the same text.
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        store.landDirectly(new DslParser().parse(READER_PIPELINE));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatCode(() -> guarded.apply(
+                "author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE))))
+                .doesNotThrowAnyException();
+    }
+
+    private ApplyService guardedWith(PipelineState state) {
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", state);
+        actual.put("p1", state);
+        return new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+    }
+
+    /** A pipeline reading that source, in the minimal valid shape. */
+    private static final String READER_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: p1
+            source: orders_src
+            transforms:
+              - id: selected
+                type: filter
+                from: [orders]
+                expr: "op != 'd'"
+            view:
+              id: orders_view
+              from: selected
+              primary_key: id
+              storage:
+                warm:
+                  collection: orders_view
+            """;
+
+    /** The same pipeline with its own switch for that source written off. */
+    private static final String PINNED_OFF_PIPELINE =
+            READER_PIPELINE.replace("source: orders_src", "source: [ { id: orders_src, srs: false } ]");
 
     private static ArtifactDraft draft(String content) {
         return new ArtifactDraft(null, content);

@@ -13,6 +13,7 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -34,8 +35,10 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetField;
@@ -51,6 +54,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -125,7 +129,7 @@ class UpsertOverlapIdempotencyTest {
         try {
             awaitKeyPresent("5");
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         assertThat(UpsertSink.keys()).containsExactlyInAnyOrder("1", "2", "3", "4", "5");
@@ -150,7 +154,7 @@ class UpsertOverlapIdempotencyTest {
         try {
             awaitTotalAtLeast(9);
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         // Nine rows delivered (three snapshot, six cdc including the three re-delivered), yet the keyed upsert
@@ -166,7 +170,7 @@ class UpsertOverlapIdempotencyTest {
         artifacts.save(new SourceResource(SOURCE_ID, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(TABLE)), null, null, null));
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SOURCE_ID),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE_ID, true)),
                 List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
                         new TransformBody.Filter("true"), null, null)),
                 null,
@@ -255,9 +259,9 @@ class UpsertOverlapIdempotencyTest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             for (Envelope change : changes) {
-                listener.onEvent(change);
+                listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }
             return () -> { };
         }
@@ -290,6 +294,13 @@ class UpsertOverlapIdempotencyTest {
         @Override
         public Envelope next() {
             return rows.next();
+        }
+
+        @Override
+        public Optional<SourcePosition> seam() {
+            // Sampled by the source before its first row. The run refuses to start a tail without one,
+            // because a tail that begins wherever it likes loses every change made while the snapshot ran.
+            return Optional.of(new SourcePosition("seam-0"));
         }
 
         @Override

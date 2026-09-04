@@ -258,7 +258,9 @@ class PipelineStreamRoundTripTest {
                         return java.util.Optional.empty();
                     }
                     return java.util.Optional.of(
-                            new PipelineResource(id, null, java.util.List.of("src_x"), null, null, null, null, null));
+                            new PipelineResource(id, null,
+                                    java.util.List.of(io.tapstate.core.model.SourceRef.bare("src_x")),
+                                    null, null, null, null, null));
                 }
 
                 @Override

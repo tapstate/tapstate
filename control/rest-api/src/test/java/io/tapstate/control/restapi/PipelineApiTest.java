@@ -43,6 +43,7 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.model.canonical.AssemblyIdentity;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.runtime.probe.ConnectionProbe;
@@ -60,6 +61,7 @@ import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
@@ -163,7 +165,8 @@ class PipelineApiTest {
                 .header("Authorization", "Bearer " + machineToken(Scope.WRITE))
                 .retrieve().toEntity(DesiredState.class).getBody();
 
-        assertThat(body).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, revisionOf(PIPELINE_V1)));
+        assertThat(body).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), false));
         assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).contains(body);
     }
 
@@ -172,18 +175,96 @@ class PipelineApiTest {
         String token = machineToken(Scope.WRITE);
         String rev = revisionOf(PIPELINE_V1);
 
-        assertThat(verb(token, "pl1", "start")).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev));
-        assertThat(verb(token, "pl1", "pause")).isEqualTo(new DesiredState("pl1", PipelineState.PAUSED, rev));
-        assertThat(verb(token, "pl1", "resume")).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev));
-        assertThat(verb(token, "pl1", "stop")).isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev));
+        String assembly = assemblyOf(PIPELINE_V1);
+        assertThat(verb(token, "pl1", "start"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev, false, assembly, false));
+        assertThat(verb(token, "pl1", "pause"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.PAUSED, rev, false, assembly, false));
+        assertThat(verb(token, "pl1", "resume"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev, false, assembly, false));
+        assertThat(stop(token, "pl1", false))
+                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false, assembly, false));
 
         assertThat(context.getBean(FakeDesiredStore.class).read("pl1"))
-                .contains(new DesiredState("pl1", PipelineState.STOPPED, rev));
+                .contains(new DesiredState("pl1", PipelineState.STOPPED, rev, false, assembly, false));
+    }
+
+    // ---- a stop must say what becomes of the pipeline's state, and the three answers differ ----
+
+    @Test
+    void aStopThatAsksToClearWritesThatIntent() {
+        String token = machineToken(Scope.WRITE);
+        String rev = revisionOf(PIPELINE_V1);
+        verb(token, "pl1", "start");
+
+        assertThat(stop(token, "pl1", true))
+                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, true,
+                        assemblyOf(PIPELINE_V1), false));
+    }
+
+    @Test
+    void aStopThatAsksToKeepWritesThatIntent() {
+        String token = machineToken(Scope.WRITE);
+        String rev = revisionOf(PIPELINE_V1);
+        verb(token, "pl1", "start");
+
+        // Its pair above is what makes this an assertion rather than a restatement of the default: both
+        // answers reach STOPPED, and only the field tells them apart.
+        assertThat(stop(token, "pl1", false))
+                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false,
+                        assemblyOf(PIPELINE_V1), false));
+    }
+
+    @Test
+    void aStopThatSaysNothingIsRefusedWithACodedBodyAndWritesNoIntent() {
+        String token = machineToken(Scope.WRITE);
+        verb(token, "pl1", "start");
+        DesiredState running = context.getBean(FakeDesiredStore.class).read("pl1").orElseThrow();
+
+        ApiError body = client().post().uri("/api/pipelines/pl1:stop")
+                .header("Authorization", "Bearer " + token)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("lifecycle.purge-state-not-stated");
+        assertThat(body.params()).containsEntry("pipeline", "pl1");
+        // The refusal is worth nothing if the stop happened anyway: this is the assertion that says the
+        // pipeline is untouched, not merely that the caller was told off.
+        assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).contains(running);
+    }
+
+    @Test
+    void aStopWhoseBodyCarriesNoAnswerIsRefusedTheSameWay() {
+        String token = machineToken(Scope.WRITE);
+        verb(token, "pl1", "start");
+
+        // An empty object is a body, so it reaches the handler where a missing body does not. Both have
+        // to refuse: telling them apart would make one of the two ways of saying nothing mean something.
+        ApiError body = client().post().uri("/api/pipelines/pl1:stop")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{}")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("lifecycle.purge-state-not-stated");
     }
 
     private DesiredState verb(String token, String id, String verb) {
         return client().post().uri("/api/pipelines/" + id + ":" + verb)
                 .header("Authorization", "Bearer " + token)
+                .retrieve().toEntity(DesiredState.class).getBody();
+    }
+
+    private DesiredState stop(String token, String id, boolean purgeState) {
+        return client().post().uri("/api/pipelines/" + id + ":stop")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"purgeState\":" + purgeState + "}")
                 .retrieve().toEntity(DesiredState.class).getBody();
     }
 
@@ -310,11 +391,22 @@ class PipelineApiTest {
         });
 
         assertThat(projectedPipelineVerbs)
-                .as("the full pipeline surface — four lifecycle writes and four observation reads — projects "
-                        + "onto the authenticated /api surface (this test boots the whole face bundle)")
+                .as("the full pipeline surface — four lifecycle writes, four observation reads and the two "
+                        + "position verbs — projects onto the authenticated /api surface (this test boots "
+                        + "the whole face bundle)")
                 .containsExactlyInAnyOrder(
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
-                        "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs");
+                        "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
+                        "pipeline.position", "pipeline.set-position");
+
+        // The other direction, and it is the one that was missing. Above, every projected verb is checked
+        // to be a registered one; nothing checked that every registered one is projected. A controller
+        // that exists, is tested, and is simply never mounted answers 404 in the product while its own
+        // tests pass -- which is what happened to the two position verbs, and what this closes.
+        assertThat(projectedPipelineVerbs)
+                .as("every pipeline verb the registry exposes to the terminal has a route: a controller "
+                        + "left out of the face bundle is invisible except as a 404 nobody is testing for")
+                .containsAll(cliExposed.stream().filter(id -> id.startsWith("pipeline.")).toList());
     }
 
     // ---- fixtures ----
@@ -326,6 +418,11 @@ class PipelineApiTest {
     /** The revision of a pipeline is the content hash of its canonical form — the value apply stamps. */
     private static String revisionOf(String dsl) {
         return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+    }
+
+    /** What an artifact's run is assembled from: the same canonical text, with whitelisted fields erased. */
+    private static String assemblyOf(String dsl) {
+        return AssemblyIdentity.of(parse(dsl));
     }
 
     private void seedUser(String username, String password, String role) {
@@ -373,6 +470,7 @@ class PipelineApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
+            PipelinePositionTestConfiguration.class,
             AuditedSourceServiceTestConfiguration.class})
     static class TestApp {
 
@@ -645,7 +743,9 @@ class PipelineApiTest {
         @Bean
         PipelineLifecycleService pipelineLifecycleService(
                 ArtifactQueryService artifacts, DesiredStore desired, AuditGate auditGate) {
-            return new PipelineLifecycleService(artifacts, desired, auditGate);
+            // Nothing converges in this bundle, so the pipeline has no fencing epoch to read.
+            return new PipelineLifecycleService(
+                    artifacts, desired, auditGate, pipelineId -> java.util.Optional.empty());
         }
 
         @Bean
@@ -878,7 +978,7 @@ class PipelineApiTest {
 
             @Override
             public Optional<Resource> get(String id) {
-                return Optional.of(new PipelineResource(id, null, List.of("src_x"), null, null, null, null, null));
+                return Optional.of(new PipelineResource(id, null, List.of(SourceRef.bare("src_x")), null, null, null, null, null));
             }
 
             @Override

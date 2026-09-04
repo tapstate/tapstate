@@ -28,6 +28,8 @@ artifact.reclaim-incomplete
 artifact.version-conflict
 boot.hazelcast-unavailable
 capture.event-table-not-selected
+capture.snapshot-reports-no-seam
+capture.start-from-outside-window
 capture.start-from-unparsable
 cli.alias-install-dir-unknown
 cli.alias-link-failed
@@ -44,6 +46,7 @@ cli.auth-logout-unreachable
 cli.auth-session-rejected
 cli.auth-session-unreachable
 cli.auth-usage
+cli.confirmation-needs-a-terminal
 cli.connect-failed
 cli.connector-not-official
 cli.context-already-exists
@@ -87,6 +90,8 @@ connector.no-connector-class
 connector.not-found
 connector.not-official
 connector.not-registered
+connector.position-unreadable
+connector.position-unrenderable
 connector.projection-failed
 connector.read-abandoned
 connector.read-failed
@@ -140,6 +145,7 @@ io.store-unauthorized
 io.store-unavailable
 lifecycle.illegal-transition
 lifecycle.incompatible-revision
+lifecycle.purge-state-not-stated
 lifecycle.unknown-pipeline
 mcp.connector-spec-unavailable
 mcp.environment-missing
@@ -166,12 +172,17 @@ nest.state-far-exceeds-memory-budget
 nest.state-paths-changed
 nest.state-served-from-cold-layer
 nest.tombstone-limit-exceeded
+position.chain-not-read
+position.field-not-editable
+position.nothing-to-write
+position.write-back-while-live
 role.unsupported
 source.already-exists
 source.id-mismatch
 source.in-use
 source.not-found
 source.precondition-required
+source.srs-change-while-running
 source.version-conflict
 store.invalid-uri
 store.not-replica-set

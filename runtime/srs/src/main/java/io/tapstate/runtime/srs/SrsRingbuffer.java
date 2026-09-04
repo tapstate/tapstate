@@ -1,8 +1,11 @@
 package io.tapstate.runtime.srs;
 
+import com.hazelcast.ringbuffer.OverflowPolicy;
 import com.hazelcast.ringbuffer.Ringbuffer;
 
+import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CompletionException;
 
 /**
  * The per-table change ring: the in-memory hot buffer holding one mining chain's cdc changes for one
@@ -44,6 +47,33 @@ public final class SrsRingbuffer {
     public long append(SrsItem item) {
         Objects.requireNonNull(item, "item");
         return ringbuffer.add(item);
+    }
+
+    /**
+     * Appends a run of changes in one act and returns the sequence the ring assigned the last of them; the
+     * run occupies the sequences ending there, one per change. A raw write, like {@link #append}: the
+     * caller guards against overwriting an unread change before calling.
+     *
+     * <p>One act rather than one call per change, because that is what a store behind the ring is offered
+     * as one write. The overflow policy is the same one a single append carries -- the headroom precheck
+     * is what stops an overwrite, not a policy that refuses to write.
+     */
+    public long appendAll(List<SrsItem> items) {
+        Objects.requireNonNull(items, "items");
+        if (items.isEmpty()) {
+            throw new IllegalArgumentException("an append of no changes has no sequence to report");
+        }
+        try {
+            return ringbuffer.addAllAsync(items, OverflowPolicy.OVERWRITE).toCompletableFuture().join();
+        } catch (CompletionException e) {
+            // The ring reports a store failure through the future. Unwrap it so the caller sees what the
+            // store said rather than the plumbing that carried it -- a change the store refused is not in
+            // the ring, which is the outcome that has to reach the caller intact.
+            if (e.getCause() instanceof RuntimeException cause) {
+                throw cause;
+            }
+            throw e;
+        }
     }
 
     /**

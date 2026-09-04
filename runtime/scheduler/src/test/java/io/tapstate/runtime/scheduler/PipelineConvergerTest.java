@@ -210,7 +210,7 @@ class PipelineConvergerTest {
         converge(RUNNING);
         converge(STOPPED);
 
-        assertThat(actuator.calls()).containsExactly("start:p1", "stop:p1");
+        assertThat(actuator.calls()).containsExactly("start:p1", "stop:p1:keep");
     }
 
     @Test
@@ -220,7 +220,7 @@ class PipelineConvergerTest {
         converge(STOPPED);
         converge(RUNNING);
 
-        assertThat(actuator.calls()).containsExactly("start:p1", "stop:p1", "start:p1");
+        assertThat(actuator.calls()).containsExactly("start:p1", "stop:p1:keep", "start:p1");
     }
 
     @Test
@@ -242,7 +242,9 @@ class PipelineConvergerTest {
 
         converger.markCompleted("p1");
 
-        assertThat(actuator.calls()).containsExactly("stop:p1");
+        // :keep, and that is the assertion. A source running out is not somebody asking for the
+        // pipeline's progress to be thrown away, and the completed pipeline is startable again.
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
     }
 
     @Test
@@ -293,8 +295,9 @@ class PipelineConvergerTest {
         assertThat(result.status()).isEqualTo(ConvergeStatus.FAILED);
         assertThat(result.failure()).contains(cause);
         assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
-        // The dead job's capture is torn down: driving to FAILED actuates a stop over it.
-        assertThat(actuator.calls()).containsExactly("stop:p1");
+        // The dead job's capture is torn down: driving to FAILED actuates a stop over it -- and with
+        // :keep, so the position it died at is still there for the run that recovers from this.
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
     }
 
     /**
@@ -413,11 +416,108 @@ class PipelineConvergerTest {
         converge(STOPPED); // user stop: desired -> STOPPED
 
         assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(STOPPED));
-        assertThat(actuator.calls()).containsExactly("stop:p1");
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+    }
+
+    @Test
+    @DisplayName("a stop that asked to clear the pipeline's state drives the stop with that answer")
+    void aStopAskedToPurgeDrivesItThrough() {
+        converge(RUNNING);
+        actuator.reset();
+
+        convergeStopping(true);
+
+        assertThat(actuator.calls()).containsExactly("stop:p1:purge");
+    }
+
+    @Test
+    @DisplayName("what the user asked reaches the actuator, and nothing else decides it")
+    void aStopAskedToKeepDrivesTheKeepingAnswer() {
+        converge(RUNNING);
+        actuator.reset();
+
+        convergeStopping(false);
+
+        // The pair is the point. Both land the pipeline in STOPPED and both actuate a stop, so a case
+        // asserting one alone would pass over an actuator that ignored the answer and always did one.
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+    }
+
+    @Test
+    @DisplayName("a job dying under a stop that asked to clear does not carry that answer into the failure")
+    void aDeadJobIsDrivenToFailedWithoutPurgingWhateverTheLastIntentSaid() {
+        converge(RUNNING);
+        // The intent now says RUNNING with nothing to purge, but a stop-with-purge earlier in this
+        // pipeline's life must not leak into the converge-side transition below.
+        desired.save(new DesiredState("p1", RUNNING, REV, true));
+        actuator.reset();
+        actuator.failWith(new RuntimeException("sink write failed"));
+
+        converger.converge("p1");
+
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+    }
+
+    /**
+     * An intent asking to be re-assembled tears the held job down and submits a fresh one, in one pass.
+     *
+     * <p>Both halves here rather than as two intents: this side reads the latest intent rather than
+     * consuming every one written, so a stop written and immediately overwritten by a start is never
+     * observed at all -- neither half would happen, and the pipeline would carry on with the assembly it
+     * already had while the store said otherwise.
+     */
+    @Test
+    @DisplayName("an intent that asks to be re-assembled stops the held job and starts a fresh one")
+    void reassemblingFromPausedStopsThenStarts() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+
+        desired.save(new DesiredState("p1", RUNNING, "rev-2", false, "assembly-1", true));
+        converger.converge("p1");
+
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep", "start:p1");
+    }
+
+    /**
+     * And it keeps everything the pipeline has. Clearing would be the opposite of what was asked for: the
+     * point of re-assembling rather than re-reading is to carry on from the recorded position. A `:purge`
+     * here would look like success and silently make the next run read the whole source again.
+     */
+    @Test
+    @DisplayName("re-assembling never clears what the pipeline has")
+    void reassemblingKeepsThePosition() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+
+        desired.save(new DesiredState("p1", RUNNING, "rev-2", false, "assembly-1", true));
+        converger.converge("p1");
+
+        assertThat(actuator.calls()).doesNotContain("stop:p1:purge");
+    }
+
+    /** Without it, a resume is still a resume -- the held job is continued, not rebuilt. */
+    @Test
+    @DisplayName("an ordinary resume still continues the held job rather than rebuilding it")
+    void anOrdinaryResumeStillResumes() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+
+        converge(RUNNING);
+
+        assertThat(actuator.calls()).containsExactly("resume:p1");
     }
 
     private void converge(io.tapstate.core.lifecycle.PipelineState target) {
         desired.save(new DesiredState("p1", target, REV));
+        converger.converge("p1");
+    }
+
+    private void convergeStopping(boolean purgeState) {
+        desired.save(new DesiredState("p1", STOPPED, REV, purgeState));
         converger.converge("p1");
     }
     /** A code whose only job is to carry a name: this test is about the path, not the catalog. */

@@ -172,6 +172,7 @@ public final class E2eExecutor {
                     case RESUME -> heldStreams.remove(stream.sourceId());
                 }
             }
+            case Step.Composed composed -> binding.restart(pipelineId, composed.verb().rereadsEverything());
             case Step.Cdc cdc -> {
                 switch (cdc.change()) {
                     case Step.Change.Generated generated ->

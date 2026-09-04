@@ -138,7 +138,23 @@ final class HttpTierBinding implements TierBinding {
 
     @Override
     public void drive(String pipelineId, LifecycleVerb verb) {
+        if (verb == LifecycleVerb.STOP) {
+            // The declarative word "stop" is the product's stop, and the product's stop clears. A step
+            // that means to stop and keep what the pipeline has is a different word, not this one with
+            // a quietly different answer behind it.
+            control.stop(pipelineId, true);
+            return;
+        }
         control.lifecycle(pipelineId, verb);
+    }
+
+    @Override
+    public void restart(String pipelineId, boolean rereadEverything) {
+        // Exactly what the terminal composes, in the same order and with the same answer: a stop
+        // that keeps or clears, then a start. Sending the two verbs is the point -- the product has
+        // no restart to call, and a harness that pretended otherwise would be testing itself.
+        control.stop(pipelineId, rereadEverything);
+        control.lifecycle(pipelineId, LifecycleVerb.START);
     }
 
     @Override

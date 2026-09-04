@@ -1,8 +1,10 @@
 package io.tapstate.app;
 
 import com.hazelcast.jet.core.DAG;
+import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.runtime.engine.nest.NestSettings;
 
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -30,13 +32,21 @@ interface DagSource {
     DAG dagFor(String pipelineId);
 
     /**
-     * The state namespaces {@code pipelineId} keeps its operator state in, empty where it keeps none.
+     * What {@code pipelineId}'s topology keeps state in — for each component that keeps any, what to call
+     * it, whose it is, and the namespaces it is kept under. Empty where the pipeline keeps none.
      *
      * <p>Deliberately not a defaulted method. An implementation that quietly answered "none" would leave
      * every namespace it owns unrecorded, and nothing about that announces itself: the pipeline stops, the
      * state stays, and the next run reads it as its own.
+     *
+     * <p>One answer rather than two, because a stop reads both halves of it: what it clears is the
+     * namespaces named here, and what it says it is about to clear is the labels named here. A second list
+     * written out by hand would agree with this one only for as long as somebody kept checking, and the
+     * disagreement it eventually produces is a stop reporting it cleared everything while leaving
+     * something behind. It is also what lets a component that starts keeping state arrive as a
+     * declaration and nothing else: named here, it is dropped and spoken about without an edit anywhere.
      */
-    Set<String> stateNamespacesOf(String pipelineId);
+    List<PipelineStateHolding> stateHeldBy(String pipelineId);
 
     /**
      * What {@code pipelineId}'s nests are held to, and the map namespaces those numbers apply to.
@@ -45,7 +55,7 @@ interface DagSource {
      * compiled tree. Numbers applied to namespaces worked out separately would hold maps nothing writes to
      * and leave the ones that are written to on somebody else's number.
      *
-     * <p>The namespaces here are the ones that are maps, which is fewer than {@link #stateNamespacesOf}
+     * <p>The namespaces here are the ones that are maps, which is fewer than {@link #stateHeldBy}
      * returns - that one also names where the tree's shape is written down, which lives in the store alone
      * and has no map to configure.
      */

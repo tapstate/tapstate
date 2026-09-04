@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameCase;
 import io.tapstate.core.model.RenameSpec;
@@ -51,7 +52,7 @@ class StoreBackedDagSourceTargetModelTest {
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
                 "mongodb", Map.of("uri", "u"), null, null, null, null, null));
-        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src"), null,
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
                 null, null, null));
         List<Map<String, TargetTable>> bound = new ArrayList<>();
@@ -73,7 +74,7 @@ class StoreBackedDagSourceTargetModelTest {
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
                 "mongodb", Map.of("uri", "u"), null, null, null, null, null));
-        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src"), null,
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
                 null, null, null));
         List<TargetTable> bound = new ArrayList<>();
@@ -152,7 +153,7 @@ class StoreBackedDagSourceTargetModelTest {
     @Test
     void does_not_require_an_undiscovered_view_source_when_sync_reads_another_source() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("address_src"));
-        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src", "address_src"), null,
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src"), SourceRef.bare("address_src")), null,
                 new ViewBlock.Inline("orders_view", FromRef.literal("orders_src"), "id", null, null),
                 new ServeBlock.Inline(null, FromRef.literal("address_src"), List.of(new SyncElement(
                         "sync_1", "orders_dest", null, null, null, null)), null, null),
@@ -171,7 +172,7 @@ class StoreBackedDagSourceTargetModelTest {
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
                 "mongodb", Map.of("uri", "u"), null, null, null, null, null));
-        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src"), null,
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src")), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
                 null, null, null));
 
@@ -301,7 +302,7 @@ class StoreBackedDagSourceTargetModelTest {
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
         store.artifacts().save(new SourceResource("orders_dest", null, "mongodb", Map.of("uri", "u"),
                 null, null, null, null, null));
-        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src"), null, null,
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("orders_src"),
                         List.of(syncElements), null, null),
                 null, null));
@@ -327,7 +328,7 @@ class StoreBackedDagSourceTargetModelTest {
 
     /** That pipeline on its own: two sources, and one sink renaming {@code PlayerAddress}. */
     private static PipelineResource pipelineOf(FromRef serveFrom, Step... transforms) {
-        return new PipelineResource("p", null, List.of("orders_src", "address_src"),
+        return new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true), SourceRef.spec("address_src", true)),
                 transforms.length == 0 ? null : List.of(transforms), null,
                 new ServeBlock.Inline(null, serveFrom, List.of(new SyncElement(
                         "sync_1", "orders_dest", null,

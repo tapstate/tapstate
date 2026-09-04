@@ -4,7 +4,9 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.DataBrowser;
@@ -37,6 +39,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.StringJoiner;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -197,14 +200,23 @@ public final class PdkDataBrowser implements DataBrowser {
         try {
             Subscription stream = capture.cdc(
                     new CaptureConfig(config.connectorId(), config.settings(), List.of(request.collection())),
+                    // Somebody is watching a view of rows right now, so the follow starts where they
+                    // are looking. It keeps no position and resumes nothing: closing the view ends it.
+                    CaptureStart.present(),
                     new CaptureListener() {
                         @Override
-                        public void onEvent(Envelope event) {
-                            DataBrowserChange change = project(event);
-                            // A stream also carries schema changes, which are not a row changing and
-                            // have nowhere to go in a view of rows.
-                            if (change != null) {
-                                listener.onChange(change);
+                        public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                            // The position is ignored on purpose: this follow records nothing and resumes
+                            // nothing, so there is no later run for a position to be of use to. The run is
+                            // unrolled here because somebody is watching rows arrive, and a viewer has no
+                            // use for the grouping the source read them in.
+                            for (Envelope event : events) {
+                                DataBrowserChange change = project(event);
+                                // A stream also carries schema changes, which are not a row changing and
+                                // have nowhere to go in a view of rows.
+                                if (change != null) {
+                                    listener.onChange(change);
+                                }
                             }
                         }
 

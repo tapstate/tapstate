@@ -244,6 +244,12 @@ public final class EnvelopeParser {
 
     private static Step step(Object element) {
         if (element instanceof String verb) {
+            String spelled = verb.toLowerCase(Locale.ROOT);
+            for (ComposedVerb composed : ComposedVerb.values()) {
+                if (composed.word().equals(spelled)) {
+                    return new Step.Composed(composed);
+                }
+            }
             return new Step.Lifecycle(lifecycleVerb(verb));
         }
         Map<String, Object> mapping = mapping(element, "step");
@@ -270,7 +276,7 @@ public final class EnvelopeParser {
         if (!Vocabulary.LIFECYCLE_STEPS.contains(verb.toLowerCase(Locale.ROOT))) {
             throw new EnvelopeException(
                     "unknown step verb: " + verb + "; a step on its own is one of "
-                            + Vocabulary.LIFECYCLE_STEPS);
+                            + Vocabulary.LIFECYCLE_STEPS + " or " + Vocabulary.COMPOSED_STEPS);
         }
         return LifecycleVerb.valueOf(verb.toUpperCase(Locale.ROOT));
     }

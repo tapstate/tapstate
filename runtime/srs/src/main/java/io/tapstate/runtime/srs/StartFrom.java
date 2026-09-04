@@ -12,8 +12,14 @@ import java.util.Objects;
  * Where a pipeline starts consuming a mining chain's incremental tail — the typed reading of its
  * {@code start_from} setting. Three forms: {@link Earliest} replays every change still buffered,
  * {@link Latest} takes only changes from now on, and {@link At} starts from the first change at or after
- * an instant. It positions this one pipeline's consumer cursor into the change ring; it never moves the
- * shared mining chain's own read offset.
+ * an instant.
+ *
+ * <p>What it points into depends on whether this pipeline buffers through the shared replay ring.
+ * Buffered, it positions this one pipeline's consumer cursor into the ring and never moves the shared
+ * mining chain's own read offset -- the chain is mined once and each consumer finds its own start in
+ * what was mined. Read directly, there is no ring to point into, so it names a position in the
+ * source's own log and the tail begins there. Either way it decides a first run only: a recorded
+ * position outranks it, or a restart would re-read the same stretch every time.
  *
  * <p>The authoring layer holds {@code start_from} as a free string and does not constrain its format, so
  * an unrecognized value is caught here at consumption time rather than by the validate layer.
@@ -52,7 +58,14 @@ public sealed interface StartFrom extends Serializable permits StartFrom.Earlies
 
     /**
      * Parses a {@code start_from} value: the keyword {@code earliest} or {@code latest}, or an ISO-8601
-     * instant. A value that is neither keyword nor a parseable instant is rejected.
+     * instant carrying the offset it was written with. A value that is neither keyword nor an instant this
+     * build can address is rejected, with the value that was written.
+     *
+     * <p>An offset is required rather than assumed, which is what the instant form inherits by being read
+     * as an instant: a bare local reading like {@code 2026-09-01T10:00:00} is refused instead of being
+     * taken as the server's own zone, so one pipeline cannot begin at two different points depending on
+     * which machine parsed it. The same moment written in two zones is the same instant and so the same
+     * start.
      */
     static StartFrom parse(String raw) {
         Objects.requireNonNull(raw, "raw");
@@ -63,8 +76,15 @@ public sealed interface StartFrom extends Serializable permits StartFrom.Earlies
                 return latest();
             default:
                 try {
-                    return at(Instant.parse(raw));
-                } catch (DateTimeParseException e) {
+                    Instant instant = Instant.parse(raw);
+                    // Range check, and it has to happen here. An instant spans years far beyond the epoch
+                    // milliseconds every consumer of a start addresses it by, so a value can parse cleanly
+                    // and then overflow at the point of use -- which is a bare arithmetic failure on
+                    // whichever member ran the read, naming neither the setting nor the value that caused
+                    // it. Converting here turns that into a refusal holding the text the author wrote.
+                    instant.toEpochMilli();
+                    return at(instant);
+                } catch (DateTimeParseException | ArithmeticException e) {
                     throw new TapstateException(CaptureError.START_FROM_UNPARSABLE, Map.of("value", raw), e);
                 }
         }

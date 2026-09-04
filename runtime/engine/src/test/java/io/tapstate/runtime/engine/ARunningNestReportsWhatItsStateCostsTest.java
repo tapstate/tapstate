@@ -20,6 +20,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -177,7 +178,7 @@ class ARunningNestReportsWhatItsStateCostsTest {
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
         PipelineResource pipeline = new PipelineResource(PIPELINE, null,
-                List.of("orders", "order_items"), List.of(step), null,
+                List.of(SourceRef.bare("orders"), SourceRef.bare("order_items")), List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
                 null, null);

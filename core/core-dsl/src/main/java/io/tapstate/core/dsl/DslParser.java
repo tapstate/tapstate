@@ -23,6 +23,7 @@ import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceMode;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.SrsSchemaEvolution;
@@ -96,6 +97,7 @@ public final class DslParser {
     private static final Set<String> VIEW_SCHEMA_KEYS = Set.of("enforce", "evolution");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
+    private static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
     private static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "options");
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
@@ -209,18 +211,31 @@ public final class DslParser {
                 m.freeMap("experimental"));
     }
 
-    private static List<String> sources(YamlMap m) {
+    private static List<SourceRef> sources(YamlMap m) {
         Node n = m.node("source");
         if (n instanceof ScalarNode sc) {
-            return List.of(sc.getValue());
+            return List.of(SourceRef.bare(sc.getValue()));
         }
-        List<String> ids = new ArrayList<>();
+        List<SourceRef> refs = new ArrayList<>();
         if (n instanceof SequenceNode seq) {
             for (Node item : seq.getValue()) {
-                ids.add(YamlMap.requireScalar(item, "source"));
+                refs.add(sourceRef(item));
             }
         }
-        return ids;
+        return refs;
+    }
+
+    private static SourceRef sourceRef(Node item) {
+        if (item instanceof ScalarNode sc) {
+            return SourceRef.bare(sc.getValue());
+        }
+        YamlMap ref = YamlMap.requireMapping(item, "source");
+        ref.requireOnly(SOURCE_REF_KEYS);
+        Boolean srs = boolValue(ref, "srs");
+        // An object written without the switch says exactly what a bare id says, so it normalizes
+        // to one: keeping both spellings of one state would let the same pipeline canonicalize two
+        // ways, and the materialization rule reads "has a switch" off this distinction.
+        return srs == null ? SourceRef.bare(ref.string("id")) : SourceRef.spec(ref.string("id"), srs);
     }
 
     // ---- transforms ---------------------------------------------------------------

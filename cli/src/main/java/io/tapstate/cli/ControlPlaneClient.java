@@ -186,7 +186,8 @@ interface ControlPlaneClient extends AutoCloseable {
      * refuses (an unknown pipeline, a forbidden transition, or a stale revision), or unreachable on any I/O
      * failure. Never throws.
      */
-    LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb);
+    LifecycleOutcome lifecycle(
+            URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState);
 
     /**
      * Reads a pipeline's lifecycle state via {@code GET {baseUrl}/api/pipelines/{pipelineId}/status},
@@ -202,6 +203,26 @@ interface ControlPlaneClient extends AutoCloseable {
      * yet), a coded rejection when the server refuses, or unreachable on any I/O failure. Never throws.
      */
     MetricsOutcome metrics(URI baseUrl, String credential, String pipelineId);
+
+    /**
+     * Reads where a pipeline resumes from via {@code GET {baseUrl}/api/pipelines/{pipelineId}/position},
+     * authenticated by the bearer {@code credential}: the document on success, a coded rejection when the
+     * server refuses, or unreachable on any I/O failure. Never throws.
+     */
+    PositionOutcome position(URI baseUrl, String credential, String pipelineId);
+
+    /**
+     * Moves where a pipeline's chains resume from via
+     * {@code PUT {baseUrl}/api/pipelines/{pipelineId}/position}, sending {@code document} as the body:
+     * the reading afterwards on success, a coded rejection when the server refuses, or unreachable on any
+     * I/O failure. Never throws.
+     *
+     * <p>{@code document} travels as the caller's own bytes and is not parsed on the way out. What the
+     * server compares the request against is what the server itself handed out, so a round trip through a
+     * reader and a writer here could only introduce differences the author never made — and each of those
+     * is something the server would then refuse by name.
+     */
+    PositionOutcome setPosition(URI baseUrl, String credential, String pipelineId, String document);
 
     /**
      * Reads a pipeline's per-table initial-load progress via

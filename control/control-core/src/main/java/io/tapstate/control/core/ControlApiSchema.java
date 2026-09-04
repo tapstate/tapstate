@@ -65,6 +65,8 @@ public final class ControlApiSchema {
         bind(refs, "artifact.get", "ArtifactGet");
         bind(refs, "pipeline.start", "PipelineStart");
         bind(refs, "pipeline.stop", "PipelineStop");
+        bind(refs, "pipeline.pause", "PipelinePause");
+        bind(refs, "pipeline.resume", "PipelineResume");
         bind(refs, "pipeline.status", "PipelineStatus");
         bind(refs, "pipeline.metrics", "PipelineMetrics");
         bind(refs, "pipeline.snapshot", "PipelineSnapshot");
@@ -185,7 +187,16 @@ public final class ControlApiSchema {
 
         Map<String, Object> pipelineId = object(List.of("id"), Map.of("id", id), false);
         pair(defs, "PipelineStart", pipelineId, opaque);
-        pair(defs, "PipelineStop", pipelineId, opaque);
+        Map<String, Object> stopRequest = object(
+                List.of("id", "purgeState"),
+                Map.of("id", id, "purgeState", Map.of("type", "boolean", "description",
+                        "Clear this pipeline's resume position and operator state as it stops. "
+                                + "Required: there is no default, because the next run either continues "
+                                + "from where this one stopped or reads the whole source again.")),
+                false);
+        pair(defs, "PipelineStop", stopRequest, opaque);
+        pair(defs, "PipelinePause", pipelineId, opaque);
+        pair(defs, "PipelineResume", pipelineId, opaque);
         pair(defs, "PipelineStatus", pipelineId, opaque);
         pair(defs, "PipelineMetrics", pipelineId, opaque);
         pair(defs, "PipelineSnapshot", pipelineId, opaque);

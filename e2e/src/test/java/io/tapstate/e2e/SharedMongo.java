@@ -47,6 +47,18 @@ final class SharedMongo {
             client.getDatabase(NEST_STATE_DATABASE).drop();
         }
     }
+    /**
+     * The URL of the one database above, for a case whose subject is what lives in it.
+     *
+     * <p>Named here rather than spelled out at the call site, because the point of the constant it reads
+     * is that this name is fixed by the deployment and not by whoever is looking -- a case that wrote the
+     * name out again would keep working after the deployment changed it, and would be asserting about a
+     * database nothing uses.
+     */
+    static synchronized String assemblyStateUrl() {
+        return replicaSetUrl(NEST_STATE_DATABASE);
+    }
+
 
     /** The URL of a database on the shared replica set; the caller's name keeps its data its own. */
     static synchronized String replicaSetUrl(String database) {

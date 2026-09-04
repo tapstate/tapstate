@@ -732,6 +732,12 @@ class E2eExecutorTest {
         }
 
         @Override
+        public void restart(String pipelineId, boolean rereadEverything) {
+            drivenPipelineIds.add(pipelineId);
+            calls.add("restart:" + (rereadEverything ? "rerun" : "carry-on"));
+        }
+
+        @Override
         public void cdc(TableAlias table, CdcOp op, long rows) {
             calls.add("cdc:" + table + "=" + op + " x" + rows);
         }

@@ -4,6 +4,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastException;
@@ -17,8 +18,10 @@ import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -56,14 +59,21 @@ class HazelcastConfiguration {
     HazelcastInstance hazelcastMember(HazelcastProperties properties, @Nullable SrsMetaStore srsMetaStore,
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
             @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
-            @Nullable NestDeadLetterStore nestDeadLetterStore) {
-        Config config = memberConfig(properties, nestStateStore, nestSettings);
+            @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore) {
+        Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         HazelcastInstance member = startMember(() -> Hazelcast.newHazelcastInstance(config));
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
         // Jet source and resolved member-side -- can reach it through the user context and publish durable
         // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
         if (srsMetaStore != null) {
             member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, srsMetaStore);
+        }
+        // Bind the change log too, so the capture runtime can cut it back at the durable frontier. The
+        // rings already reach it through their own configuration; this is the same store, reached the way
+        // everything else the runtime resolves member-side is reached. A run with no store binds nothing,
+        // and nothing is cut -- because nothing was written down either.
+        if (srsLogStore != null) {
+            member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, srsLogStore);
         }
         // Bind the connector provisioner onto the member so a sink-writer factory -- carried onto the Jet
         // sink vertex and resolved member-side -- can reach it and open its target connector. A run with no
@@ -132,7 +142,13 @@ class HazelcastConfiguration {
 
     /** Builds the single-member config with the default limits, for a caller configuring none. */
     static Config memberConfig(HazelcastProperties properties, @Nullable KeyedStateStore nestStateStore) {
-        return memberConfig(properties, nestStateStore, NestSettings.defaults());
+        return memberConfig(properties, nestStateStore, NestSettings.defaults(), null);
+    }
+
+    /** As above, with nest settings but no change log -- the shape a caller that has no store gets. */
+    static Config memberConfig(HazelcastProperties properties, @Nullable KeyedStateStore nestStateStore,
+            NestSettings nestSettings) {
+        return memberConfig(properties, nestStateStore, nestSettings, null);
     }
 
     /**
@@ -141,7 +157,7 @@ class HazelcastConfiguration {
      * installed.
      */
     static Config memberConfig(HazelcastProperties properties, @Nullable KeyedStateStore nestStateStore,
-            NestSettings nestSettings) {
+            NestSettings nestSettings, @Nullable SrsLogStore srsLogStore) {
         Config config = new Config();
         config.setClusterName(properties.getClusterName());
         // Member logs flow through the same operational logging setup as the rest of the process.
@@ -172,11 +188,25 @@ class HazelcastConfiguration {
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(SrsItem.class)
                 .setImplementation(new SrsItemSerializer()));
-        config.addRingBufferConfig(new RingbufferConfig("srs.*")
+        RingbufferConfig rings = new RingbufferConfig("srs.*")
                 .setCapacity(SRS_RING_CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
+                .setBackupCount(0);
+        // Put the change log behind them when there is one. The ring writes through it before admitting a
+        // change, so every change in the ring is already written down and a restart has something to replay
+        // -- without it the ring is the only copy and a stop loses whatever it held.
+        //
+        // A factory rather than a single store: the ring's store hook is told a sequence and an item but
+        // never which ring is asking, and only the factory call is given the name. A live instance is
+        // allowed here because this configuration is built before the member starts; a configuration added
+        // to a running member is written down and broadcast, which no live object survives.
+        if (srsLogStore != null) {
+            rings.setRingbufferStoreConfig(new RingbufferStoreConfig()
+                    .setEnabled(true)
+                    .setFactoryImplementation(new SrsLogRingbufferStoreFactory(srsLogStore)));
+        }
+        config.addRingBufferConfig(rings);
         // Make the member nest-capable. A nest vertex's state map is created on demand, by the name the
         // compiled topology gave that vertex, so what those maps are has to be declared before any of them
         // exists. The engine owns their shape -- the assembly root only installs it here, next to the ring

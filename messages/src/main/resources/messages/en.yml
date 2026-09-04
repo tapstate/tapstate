@@ -66,9 +66,15 @@ boot.hazelcast-unavailable:
 capture.start-from-unparsable:
   message: "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp."
   solution: "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."
+capture.start-from-outside-window:
+  message: "Cannot start consuming at `{requested}`; the replay buffer only goes back to `{earliest}`, and its retention is `{retention}`."
+  solution: "Start at or after that point, widen the source's srs retention and let the buffer refill, or read the source directly instead."
 capture.event-table-not-selected:
   message: "The capture stream emitted table `{table}`, which this pipeline did not select."
   solution: "Update the source table selection or verify the connector emits the configured table names."
+capture.snapshot-reports-no-seam:
+  message: "The snapshot of chain `{chain}` reported no position for the change tail to resume from."
+  solution: "This source cannot hand its full load over to an incremental tail; read it as snapshot only, or use a connector build that reports a stream position."
 cli.alias-install-dir-unknown:
   message: "No installed `tapstate` was found in `{path}`."
   solution: "Run this where tapstate is installed, or set TAPSTATE_INSTALL_DIR to that directory - the same variable the installer honours."
@@ -120,6 +126,9 @@ cli.repl-builtin-only:
 cli.mcp-unavailable:
   message: "The MCP sidecar is unavailable: {reason}."
   solution: "Install the complete Tapstate CLI bundle, including libexec/tapstate-mcp, and retry."
+cli.confirmation-needs-a-terminal:
+  message: "`{verb}` clears what the pipeline accumulated, and there is no terminal here to confirm at."
+  solution: "Add `-y` to go ahead without being asked, or run `stop <pipeline-id> --keep-state` to stop it and keep everything it has."
 cli.watch-needs-a-terminal:
   message: "`watch` redraws one row in place, which needs a terminal; here its output is a pipe or a file."
   solution: "Use `tail <source>.<collection>` for a stream you can pipe, or `<source>.<collection>.find(...)` for a one-shot look."
@@ -252,6 +261,9 @@ lifecycle.illegal-transition:
 lifecycle.incompatible-revision:
   message: "The pipeline's revision {requested} is not compatible with the latest applied revision {latest}."
   solution: "Re-apply the pipeline so its revision matches the latest applied one, then retry."
+lifecycle.purge-state-not-stated:
+  message: "Stopping pipeline {pipeline} did not say whether to clear what it has accumulated."
+  solution: "Send purgeState true to stop and clear this pipeline's resume position and operator state, or purgeState false to stop and keep them; there is no default because the next run either continues or reads the whole source again."
 lifecycle.unknown-pipeline:
   message: "No pipeline named {pipeline} is applied."
   solution: "Apply the pipeline before acting on it or reading its status, and check the id for typos."
@@ -324,6 +336,12 @@ connector.projection-failed:
 connector.capture-failed:
   message: "Connector '{connector}' failed while reading: {detail}."
   solution: "Check the source is reachable and the connection settings are correct."
+connector.position-unrenderable:
+  message: "Connector '{connector}' produced a stream position that could not be recorded: {detail}."
+  solution: "Without a recordable position this source can only be read from the present; report the connector build that produced it."
+connector.position-unreadable:
+  message: "Connector '{connector}' could not read back the recorded stream position: {detail}."
+  solution: "Read the source from the beginning again, or set an explicit start point, so a fresh position is recorded."
 connector.discover-failed:
   message: "Connector '{connector}' could not discover its schema: {detail}."
   solution: "The connector failed while discovering the source model; check the source is reachable and the connection settings are correct."
@@ -417,6 +435,18 @@ engine.frontier-order-not-encodable:
 engine.frontier-pinned:
   message: "Chain {chain} has not advanced its durable position for {minutes} minutes ({cause}; the bound combined for it has run {gap} ahead)."
   solution: "The source keeps its log from that position onwards, so act before the log's retention passes it: if the chain is waiting on changes still pending upstream, find what is holding them; if it is starved of positions, the sink has nothing to advance to and the source must supply them."
+position.write-back-while-live:
+  message: "Chain {chain} is still being read by: {pipelines}."
+  solution: "Stop or pause every pipeline listed, then write the position back; moving it under a running read changes nothing now and everything at the next start."
+position.chain-not-read:
+  message: "Pipeline {pipeline} does not read chain {chain}; it reads: {known}."
+  solution: "Copy the chainId from what `position` printed for this pipeline, unedited."
+position.field-not-editable:
+  message: "Field {field} on chain {chain} is a reading, not a setting."
+  solution: "Change only resumeFrom.token and send the rest back as it was printed."
+position.nothing-to-write:
+  message: "Nothing to write back for pipeline {pipeline}."
+  solution: "Set resumeFrom.token on the chain you mean to move; a document sent back unchanged asks for no move."
 monitor.no-observation:
   message: "No observation is available for pipeline {pipeline}."
   solution: "Check the pipeline id for typos; a freshly started pipeline may take a moment to publish its first observation."
@@ -453,6 +483,9 @@ source.not-found:
 source.precondition-required:
   message: "Source '{id}' requires its current ETag for this operation."
   solution: "Read the Source, then retry with its ETag in If-Match."
+source.srs-change-while-running:
+  message: "Source '{id}' cannot change srs.enabled while these pipelines are still reading it: {pipelines}."
+  solution: "Stop those pipelines, then change srs.enabled. Pausing is not enough: a paused pipeline has only suspended its engine, and its capture is still reading the source."
 source.version-conflict:
   message: "Source '{id}' changed after it was read."
   solution: "Read the current Source and retry the operation with its new ETag."

@@ -5,6 +5,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.AssemblyIdentity;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
@@ -43,8 +44,11 @@ class PipelineLifecycleServiceTest {
     private final FakeArtifactStore artifacts = new FakeArtifactStore();
     private final FakeDesiredStore desired = new FakeDesiredStore();
     private final RecordingAuditStore audit = new RecordingAuditStore();
-    private final PipelineLifecycleService service =
-            new PipelineLifecycleService(new ArtifactQueryService(artifacts), desired, new AuditGate(audit, FIXED_CLOCK));
+    /** Where the pipeline's fencing epoch stands, as the lifecycle service is allowed to see it. */
+    private Optional<Long> stateEpoch = Optional.of(7L);
+    private final PipelineLifecycleService service = new PipelineLifecycleService(
+            new ArtifactQueryService(artifacts), desired, new AuditGate(audit, FIXED_CLOCK),
+            pipelineId -> stateEpoch);
 
     @Test
     void startFromNewWritesRunningDesiredAtTheLatestRevision() {
@@ -52,7 +56,8 @@ class PipelineLifecycleServiceTest {
 
         DesiredState written = service.start("alice", "pl1");
 
-        assertThat(written).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, revisionOf(PIPELINE_V1)));
+        assertThat(written).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), false));
         assertThat(desired.read("pl1")).contains(written);
     }
 
@@ -99,7 +104,8 @@ class PipelineLifecycleServiceTest {
                 .containsEntry("latest", revisionOf(PIPELINE_V2));
         assertThat(desired.read("pl1"))
                 .as("the refused resume leaves the paused desired state untouched")
-                .contains(new DesiredState("pl1", PipelineState.PAUSED, revisionOf(PIPELINE_V1)));
+                .contains(new DesiredState("pl1", PipelineState.PAUSED,
+                        revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), false));
     }
 
     @Test
@@ -120,7 +126,7 @@ class PipelineLifecycleServiceTest {
     void aFailedAuditRefusesTheWriteSoNoDesiredStateIsPersisted() {
         artifacts.save(PIPELINE_V1);
         PipelineLifecycleService gated = new PipelineLifecycleService(
-                new ArtifactQueryService(artifacts), desired, new AuditGate(new FailingAuditStore(), FIXED_CLOCK));
+                new ArtifactQueryService(artifacts), desired, new AuditGate(new FailingAuditStore(), FIXED_CLOCK), pipelineId -> stateEpoch);
 
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> gated.start("alice", "pl1"));
 
@@ -136,11 +142,17 @@ class PipelineLifecycleServiceTest {
         artifacts.save(PIPELINE_V1);
         String rev = revisionOf(PIPELINE_V1);
 
-        assertThat(service.start("alice", "pl1")).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev));
-        assertThat(service.pause("alice", "pl1")).isEqualTo(new DesiredState("pl1", PipelineState.PAUSED, rev));
-        assertThat(service.resume("alice", "pl1")).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev));
-        assertThat(service.stop("alice", "pl1")).isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev));
-        assertThat(desired.read("pl1")).contains(new DesiredState("pl1", PipelineState.STOPPED, rev));
+        String assembly = assemblyOf(PIPELINE_V1);
+        assertThat(service.start("alice", "pl1"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev, false, assembly, false));
+        assertThat(service.pause("alice", "pl1"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.PAUSED, rev, false, assembly, false));
+        assertThat(service.resume("alice", "pl1"))
+                .isEqualTo(new DesiredState("pl1", PipelineState.RUNNING, rev, false, assembly, false));
+        assertThat(service.stop("alice", "pl1", false))
+                .isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev, false, assembly, false));
+        assertThat(desired.read("pl1"))
+                .contains(new DesiredState("pl1", PipelineState.STOPPED, rev, false, assembly, false));
         // each verb is audited under its own operation — pins the whole verb->operation map, not just start.
         assertThat(audit.records).extracting(AuditRecord::operationId)
                 .containsExactly("pipeline.start", "pipeline.pause", "pipeline.resume", "pipeline.stop");
@@ -153,17 +165,222 @@ class PipelineLifecycleServiceTest {
         service.start("alice", "pl1");
         service.pause("alice", "pl1");
 
-        DesiredState written = service.stop("alice", "pl1");
+        DesiredState written = service.stop("alice", "pl1", false);
 
-        assertThat(written).isEqualTo(new DesiredState("pl1", PipelineState.STOPPED, rev));
+        assertThat(written).isEqualTo(
+                new DesiredState("pl1", PipelineState.STOPPED, rev, false, assemblyOf(PIPELINE_V1), false));
         assertThat(desired.read("pl1")).contains(written);
         assertThat(audit.records.get(audit.records.size() - 1).operationId()).isEqualTo("pipeline.stop");
+    }
+
+    @Test
+    void theAnswerAStopWasGivenIsWhatGetsWrittenDown() {
+        artifacts.save(PIPELINE_V1);
+        String rev = revisionOf(PIPELINE_V1);
+        service.start("alice", "pl1");
+
+        DesiredState written = service.stop("alice", "pl1", true);
+
+        // The intent is the only place this answer survives the call that gave it: the converge side runs
+        // later, in another process, and reads it from here. Written wrong, the pipeline is either cleared
+        // against its owner's wishes or left holding state they asked to be rid of, and both look like a
+        // normal stop until the next run either continues or reads its whole source again.
+        assertThat(written).isEqualTo(
+                new DesiredState("pl1", PipelineState.STOPPED, rev, true, assemblyOf(PIPELINE_V1), false));
+        assertThat(desired.read("pl1")).contains(written);
+    }
+
+    @Test
+    void aStartWrittenStraightAfterAStopAsksForTheRunToBeBuiltAgain() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.stop("alice", "pl1", false);
+
+        DesiredState written = service.start("alice", "pl1");
+
+        // The two verbs are one instruction by the time they are stored, because there is one slot and
+        // the converge side samples it: a stop overwritten this quickly is never read, and a start that
+        // did not say so would leave both halves undone with nothing anywhere saying they were skipped.
+        assertThat(written.reassemble())
+                .as("the run has to be torn down before it is built again, or nothing happens at all")
+                .isTrue();
+        assertThat(written.purgeState())
+                .as("a stop that kept what the pipeline has does not become one that clears")
+                .isFalse();
+        // Stamped, and that is what makes it an instruction rather than a wish: carrying it out moves
+        // this epoch on, so it cannot be read a second time and cycle the pipeline once a second.
+        assertThat(written.rebuiltAtStateEpoch())
+                .as("it is carried out once, against the state it was written for")
+                .isEqualTo(7L);
+    }
+
+    @Test
+    void aStartWrittenStraightAfterAClearingStopKeepsTheClearing() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.stop("alice", "pl1", true);
+
+        DesiredState written = service.start("alice", "pl1");
+
+        assertThat(written.reassemble()).isTrue();
+        // The one answer only the user can give. Losing it here is the difference between reading the
+        // whole source again -- which is what was asked for -- and carrying on as if nothing was said.
+        assertThat(written.purgeState())
+                .as("the clearing survives the start that supersedes the stop asking for it")
+                .isTrue();
+        assertThat(written.rebuiltAtStateEpoch()).isEqualTo(7L);
+    }
+
+    @Test
+    void aPlainStartIsNotStampedAndSoIsNotCarriedOutTwice() {
+        artifacts.save(PIPELINE_V1);
+
+        DesiredState written = service.start("alice", "pl1");
+
+        // Nothing was superseded, so there is nothing to carry out once. A stamp here would make an
+        // ordinary start tear down whatever was running, which is the opposite of what it means.
+        assertThat(written.reassemble()).isFalse();
+        assertThat(written.rebuiltAtStateEpoch()).isNull();
+    }
+
+    @Test
+    void everyOtherVerbWritesAnIntentThatClearsNothing() {
+        artifacts.save(PIPELINE_V1);
+
+        // Asserted over all three rather than trusting the field's default, because they are the verbs a
+        // pipeline passes through on its way to a stop: an intent left saying "clear" by a pause would be
+        // acted on by whichever stop came next, and nothing in between would say so.
+        assertThat(service.start("alice", "pl1").purgeState()).isFalse();
+        assertThat(service.pause("alice", "pl1").purgeState()).isFalse();
+        assertThat(service.resume("alice", "pl1").purgeState()).isFalse();
     }
 
     // ---- fixtures ----
 
     private static Resource parse(String dsl) {
         return new DslParser().parse(dsl);
+    }
+
+    /**
+     * The case this exists for: the definition was edited while the pipeline was paused, and everything
+     * that changed is re-read by building the run again. Carrying on is what the author asked for, so the
+     * resume goes through and says the run must be assembled afresh.
+     */
+    @Test
+    void resumeAfterAWhitelistedEditReassemblesAtTheLatestRevision() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.pause("alice", "pl1");
+        artifacts.save(PIPELINE_V1_SWITCHED);
+
+        DesiredState written = service.resume("alice", "pl1");
+
+        assertThat(written.targetState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(written.revision())
+                .as("the run is assembled from the definition it will actually be built from")
+                .isEqualTo(revisionOf(PIPELINE_V1_SWITCHED));
+        assertThat(written.reassemble()).as("the held job must not simply be resumed").isTrue();
+        assertThat(written.purgeState())
+                .as("re-assembling keeps the position; clearing it is the opposite of carrying on")
+                .isFalse();
+        assertThat(desired.read("pl1")).contains(written);
+    }
+
+    /**
+     * The discriminating peer of the case above. An implementation that re-assembles whenever the
+     * revision moved is green there and wrong here: a changed setting is not re-read by building the run
+     * again, because data already written to the target went through the old one.
+     */
+    @Test
+    void resumeAfterAnEditOutsideTheWhitelistIsStillRefused() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.pause("alice", "pl1");
+        artifacts.save(PIPELINE_V2);
+
+        TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
+
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+    }
+
+    /**
+     * A whitelisted change beside one that is not whitelisted is refused, not laundered by the one that
+     * would have been allowed on its own.
+     */
+    @Test
+    void aWhitelistedEditBesideOneThatIsNotIsStillRefused() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.pause("alice", "pl1");
+        artifacts.save(PIPELINE_V2_SWITCHED);
+
+        TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
+
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+    }
+
+    /** An ordinary resume, nothing edited: it carries on, and asks for no re-assembly. */
+    @Test
+    void anOrdinaryResumeDoesNotAskToBeReassembled() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.pause("alice", "pl1");
+
+        DesiredState written = service.resume("alice", "pl1");
+
+        assertThat(written.reassemble()).isFalse();
+        assertThat(written.revision()).isEqualTo(revisionOf(PIPELINE_V1));
+    }
+
+    /**
+     * An intent stored before the assembly was recorded reads as unknown, and unknown keeps the refusal.
+     * The alternative -- treating absence as "nothing changed" -- would re-assemble a pipeline over an
+     * edit nobody checked.
+     */
+    @Test
+    void aPausedIntentThatRecordsNoAssemblyIsStillRefused() {
+        artifacts.save(PIPELINE_V1);
+        desired.save(new DesiredState("pl1", PipelineState.PAUSED, revisionOf(PIPELINE_V1)));
+        artifacts.save(PIPELINE_V1_SWITCHED);
+
+        TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
+
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+    }
+
+    /**
+     * An intent that recorded no assembly must not pick one up on the way past, because doing so states
+     * that a run matches a definition nobody checked it against.
+     *
+     * <p>The sequence is reachable: not every edit to a running pipeline is refused -- only one that moves
+     * a buffering switch is -- so a running pipeline's stored definition can move underneath it. If the
+     * pause then wrote down the current artifact's assembly, the resume after it would find the two equal
+     * and rebuild the run over a change that is not safe to rebuild over, silently.
+     */
+    @Test
+    void anIntentThatRecordedNoAssemblyDoesNotAdoptOneItWasNeverCheckedAgainst() {
+        artifacts.save(PIPELINE_V1);
+        desired.save(new DesiredState("pl1", PipelineState.RUNNING, revisionOf(PIPELINE_V1)));
+        // A change outside the whitelist lands while the pipeline runs.
+        artifacts.save(PIPELINE_V2);
+
+        DesiredState paused = service.pause("alice", "pl1");
+
+        assertThat(paused.assemblyRevision())
+                .as("nothing is known about what the running job was built from, so nothing is claimed")
+                .isNull();
+
+        TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
+        assertThat(thrown).as("and the resume after it is still refused").isNotNull();
+        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+    }
+
+    /** What an artifact's run is assembled from: the same canonical text, with whitelisted fields erased. */
+    private static String assemblyOf(String dsl) {
+        return AssemblyIdentity.of(parse(dsl));
     }
 
     /** The revision of an artifact is the content hash of its canonical form — the same value apply stamps. */
@@ -192,6 +409,38 @@ class PipelineLifecycleServiceTest {
             kind: pipeline
             id: pl1
             source: src_x
+            settings: { read_mode: cdc_only }
+            serve:
+              from: /.*/
+              sync:
+                - id: sink1
+                  source: tgt_x
+                  write_mode: upsert
+                  ddl: apply
+            """;
+
+    /** The same pipeline with only this pipeline's own srs switch written on its source reference. */
+    private static final String PIPELINE_V1_SWITCHED = """
+            version: tapstate/v1
+            kind: pipeline
+            id: pl1
+            source: [{ id: src_x, srs: false }]
+            settings: { read_mode: snapshot_and_cdc }
+            serve:
+              from: /.*/
+              sync:
+                - id: sink1
+                  source: tgt_x
+                  write_mode: upsert
+                  ddl: apply
+            """;
+
+    /** A whitelisted change and a non-whitelisted one at once: the switch moved and so did read_mode. */
+    private static final String PIPELINE_V2_SWITCHED = """
+            version: tapstate/v1
+            kind: pipeline
+            id: pl1
+            source: [{ id: src_x, srs: false }]
             settings: { read_mode: cdc_only }
             serve:
               from: /.*/

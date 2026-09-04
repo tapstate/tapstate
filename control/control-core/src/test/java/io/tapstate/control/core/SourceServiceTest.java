@@ -3,8 +3,10 @@ package io.tapstate.control.core;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.model.Metadata;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -250,6 +252,66 @@ class SourceServiceTest {
                 Map.of("id", "orders"));
     }
 
+    /**
+     * The refusal is reached through the path an edit actually takes, not only implemented behind it.
+     *
+     * <p>A guard exercised only by calling it directly stays green when nothing calls it, and "nothing
+     * calls it" is the failure it exists to prevent. So this goes in through replace(), the way an edit
+     * to a stored Source does.
+     */
+    @Test
+    void replaceRefusesToTurnTheReplayStoreOffWhileAPipelineReadingItIsUp() {
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", PipelineState.RUNNING);
+        actual.put("p1", PipelineState.RUNNING);
+        InMemoryArtifactStore guardedStore = new InMemoryArtifactStore();
+        SourceService guarded = new SourceService(
+                catalog, guardedStore, new SourceRepresentation(catalog),
+                DataBrowserFollows.NONE, new LivePipelines(desired, actual));
+        SourceView created = guarded.create(cdcDraft("orders", true));
+        guardedStore.create(validShapePipeline("p1", "orders"));
+
+        assertSourceError(
+                () -> guarded.replace("orders", created.contentHash(), cdcDraft("orders", false)),
+                SourceError.SRS_CHANGE_WHILE_RUNNING,
+                Map.of("id", "orders", "pipelines", List.of("p1")));
+    }
+
+    /** The same edit goes through once the pipeline reading it is stopped. */
+    @Test
+    void replaceAllowsTheChangeOnceThePipelineReadingItIsStopped() {
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", PipelineState.STOPPED);
+        actual.put("p1", PipelineState.STOPPED);
+        InMemoryArtifactStore guardedStore = new InMemoryArtifactStore();
+        SourceService guarded = new SourceService(
+                catalog, guardedStore, new SourceRepresentation(catalog),
+                DataBrowserFollows.NONE, new LivePipelines(desired, actual));
+        SourceView created = guarded.create(cdcDraft("orders", true));
+        guardedStore.create(validShapePipeline("p1", "orders"));
+
+        SourceView replaced = guarded.replace("orders", created.contentHash(), cdcDraft("orders", false));
+
+        assertThat(replaced.id()).isEqualTo("orders");
+    }
+
+    /** A cdc Source whose replay store is explicitly on or off -- the one field the guard watches. */
+    private static SourceDraft cdcDraft(String id, boolean srsEnabled) {
+        return new SourceDraft(
+                id,
+                new Metadata(Map.of("team", "data"), "buffered=" + srsEnabled),
+                "mysql",
+                validConfig(),
+                "cdc",
+                List.of(new SourceTableDraft("literal", "orders", null, null, null, null)),
+                Map.of(),
+                new SourceDraft.SourceSrs(null, null, null, null, srsEnabled),
+                Map.of(),
+                List.of());
+    }
+
     private static SourceDraft draft(String id, String mode, String description) {
         return draft(id, "mysql", mode, validConfig(), description);
     }
@@ -289,7 +351,7 @@ class SourceServiceTest {
     }
 
     private static PipelineResource pipeline(String id, String sourceId) {
-        return new PipelineResource(id, null, List.of(sourceId), null, null, null, null, null);
+        return new PipelineResource(id, null, List.of(SourceRef.bare(sourceId)), null, null, null, null, null);
     }
 
     private static PipelineResource validShapePipeline(String id, String sourceId) {

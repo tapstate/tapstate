@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -54,7 +55,27 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             }
             String token = position.token() != null ? position.token() : cdcStart(meta, miningChainId);
             meta.advanceSinkAcked(miningChainId, pipelineId, new ChainPosition(position.order(), token));
+            if (isSnapshotOf(position)) {
+                meta.markSnapshotComplete(miningChainId, pipelineId, chain);
+            }
         };
+    }
+
+    /**
+     * Whether {@code position} is where a table's snapshot sits: the one reserved position every row of a
+     * snapshot carries, beneath every change of its generation. A frontier that has reached it has confirmed
+     * the whole of that table's snapshot, because there is nothing of the snapshot above it left to wait on.
+     *
+     * <p>This is the only moment anyone learns that a table's rows are in <em>this pipeline's</em> target,
+     * which is why the mark is recorded against the pipeline and not the chain -- every pipeline on a chain
+     * writes somewhere of its own. The read side knows when it finished reading, which is a different
+     * question again: a table read and never written looks finished to it, and a run that trusted that would
+     * skip the table on its way back. The tail only replays what
+     * changed after the snapshot began, so a row that never changed again would be absent from the target
+     * for good -- nothing thrown, nothing logged.
+     */
+    private static boolean isSnapshotOf(ChainPosition position) {
+        return position.order() != null && position.order().seq() == SourceOrder.SNAPSHOT_SEQ;
     }
 
     /**

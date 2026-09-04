@@ -678,10 +678,29 @@ final class ControlPlane {
     /**
      * Records a lifecycle intent. The verb's own spelling comes from the product's enum, so the wire
      * word cannot drift from the word the product accepts.
+     *
+     * <p>A stop does not come through here. The product refuses one that does not say what becomes of
+     * the pipeline's state, and a harness that picked an answer on the caller's behalf would be the one
+     * place in the system where that question has a default -- so {@link #stop} takes it and every
+     * caller has to say. The refusal below is for a caller who reached for the wrong one.
      */
     void lifecycle(String pipelineId, LifecycleVerb verb) {
+        if (verb == LifecycleVerb.STOP) {
+            throw new IllegalArgumentException(
+                    "a stop says what becomes of the pipeline's state: call stop(pipelineId, purgeState)");
+        }
         expect(send(authed("/api/pipelines/" + pipelineId + ":" + verb.id(), "")),
                 200, verb.id() + " " + pipelineId);
+    }
+
+    /**
+     * Stops the pipeline, saying whether stopping also clears what it has accumulated -- its resume
+     * position and its operators' state.
+     */
+    void stop(String pipelineId, boolean purgeState) {
+        expect(send(authed("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.STOP.id(),
+                        "{\"purgeState\":" + purgeState + "}")),
+                200, LifecycleVerb.STOP.id() + " " + pipelineId);
     }
 
     /**
@@ -936,6 +955,38 @@ final class ControlPlane {
         return interpretRecordCount(response.statusCode(), response.body(), pipelineId);
     }
 
+    /**
+     * How many rows each selected table's full load has read <em>on the run that is live now</em>, keyed by
+     * table. Empty when the pipeline has no live run.
+     *
+     * <p>The per-run scope is the whole reason a witness reads this rather than the target: a resumed run
+     * that skips a table reports zero for it, while the target still holds every row the earlier run put
+     * there, so the target cannot tell a skipped table from a re-read one. Every selected table appears --
+     * one that was not read reports zero rather than going absent -- so a missing key is a broken reading
+     * and not a table that was skipped.
+     */
+    Map<String, Long> snapshotRowsRead(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Map.of();
+        }
+        if (response.statusCode() != 200) {
+            throw new AssertionError("could not read the snapshot progress of " + pipelineId
+                    + ": expected HTTP 200, got " + response.statusCode() + " - " + response.body());
+        }
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                || !(map.get("snapshot") instanceof Map<?, ?> snapshot)) {
+            throw new AssertionError("snapshot answer carried no snapshot: " + response.body());
+        }
+        Map<String, Long> read = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : snapshot.entrySet()) {
+            if (entry.getValue() instanceof Map<?, ?> table && table.get("rowsDone") instanceof Number done) {
+                read.put(String.valueOf(entry.getKey()), done.longValue());
+            }
+        }
+        return read;
+    }
+
     static Optional<Long> interpretRecordCount(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
             return Optional.empty();
@@ -954,6 +1005,47 @@ final class ControlPlane {
         return metrics.get("recordCount") instanceof Number count
                 ? Optional.of(count.longValue())
                 : Optional.empty();
+    }
+
+    /**
+     * The resume point this pipeline would start from, reduced to the two things a caller may hand back:
+     * the chain and the token it is standing at. Keyed {@code chainId} and {@code token}, empty when the
+     * face reports no chain yet.
+     *
+     * <p>Reduced rather than carried whole, because the product refuses its own rendering verbatim and is
+     * right to: the document it hands out also carries readings -- when the point was recorded, among
+     * others -- and setting one of those is meaningless, so a write-back that names one is answered with a
+     * coded refusal naming the field. What the round trip is a question about is the token's coordinate
+     * system, not the envelope it arrives in.
+     */
+    Map<String, String> resumePoint(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        expect(response, 200, "read the resume point of " + pipelineId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> document)
+                || !(document.get("chains") instanceof List<?> chains) || chains.isEmpty()
+                || !(chains.getFirst() instanceof Map<?, ?> chain)) {
+            return Map.of();
+        }
+        if (!(chain.get("resumeFrom") instanceof Map<?, ?> point)
+                || !(point.get("token") instanceof String token)) {
+            return Map.of();
+        }
+        return Map.of("chainId", String.valueOf(chain.get("chainId")), "token", token);
+    }
+
+    /**
+     * Puts a chain back at a token, and answers what the product says the pipeline now stands at.
+     *
+     * <p>Only the two settable parts are sent. A body carrying anything the face reports as a reading is
+     * refused, so composing the smallest document that names a point is what a caller has to do.
+     */
+    String writeBackPosition(String pipelineId, String chainId, String token) {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", pipelineId,
+                "chains", List.of(Map.of("chainId", chainId, "resumeFrom", Map.of("token", token)))));
+        HttpResponse<String> response = send(authedPut("/api/pipelines/" + pipelineId + "/position", body));
+        expect(response, 200, "write back the resume point of " + pipelineId);
+        return response.body();
     }
 
     /**
@@ -1082,6 +1174,16 @@ final class ControlPlane {
                 .timeout(TIMEOUT)
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+    }
+
+    /** The same request as a replacement rather than a submission, for the one face that takes a PUT. */
+    private HttpRequest authedPut(String path, String body) {
+        return HttpRequest.newBuilder(baseUrl.resolve(path))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + requireCredential())
+                .PUT(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
     }
 

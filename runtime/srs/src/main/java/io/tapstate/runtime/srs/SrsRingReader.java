@@ -1,5 +1,9 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.TapstateException;
+
+import java.time.Instant;
+import java.util.Map;
 import java.util.Objects;
 import java.util.function.LongConsumer;
 import java.util.function.ObjLongConsumer;
@@ -50,9 +54,9 @@ public final class SrsRingReader {
      * A reader positioned by a {@code start} point resolved against the ring: {@code earliest} at the head
      * (replay everything buffered), {@code latest} just past the tail (only changes appended from now on),
      * and an instant at the first change whose event time is at or after it. An instant older than every
-     * buffered change clamps to the head — the earliest still available — since the bounded ring cannot
-     * replay history it no longer holds; an instant newer than every buffered change starts past the tail.
-     * It reports no read progress.
+     * buffered change is refused rather than served from the head, since coming up at the head would stream
+     * a different stretch than the one asked for with nothing saying so; an instant newer than every
+     * buffered change starts past the tail. It reports no read progress.
      */
     public static SrsRingReader from(SrsRingbuffer ring, StartFrom start) {
         return from(ring, start, seq -> { });
@@ -61,23 +65,59 @@ public final class SrsRingReader {
     /** A reader positioned by {@code start} (as {@link #from(SrsRingbuffer, StartFrom)}) that reports its
      * read progress to {@code onAdvance}. */
     public static SrsRingReader from(SrsRingbuffer ring, StartFrom start, LongConsumer onAdvance) {
-        Objects.requireNonNull(ring, "ring");
-        Objects.requireNonNull(start, "start");
-        return new SrsRingReader(ring, resolveStartSeq(ring, start), onAdvance);
+        return from(ring, start, onAdvance, null);
     }
 
-    private static long resolveStartSeq(SrsRingbuffer ring, StartFrom start) {
+    /**
+     * As the three-argument form, with the chain's retention setting carried in so a start the buffer
+     * can no longer reach can say how far back it is configured to go. The setting is only ever quoted
+     * back in that refusal; it never decides where the reader begins.
+     */
+    public static SrsRingReader from(
+            SrsRingbuffer ring, StartFrom start, LongConsumer onAdvance, String retention) {
+        Objects.requireNonNull(ring, "ring");
+        Objects.requireNonNull(start, "start");
+        return new SrsRingReader(ring, resolveStartSeq(ring, start, retention), onAdvance);
+    }
+
+    private static long resolveStartSeq(SrsRingbuffer ring, StartFrom start, String retention) {
         return switch (start) {
             case StartFrom.Earliest ignored -> ring.headSequence();
             case StartFrom.Latest ignored -> ring.tailSequence() + 1;
-            case StartFrom.At at -> firstSeqAtOrAfter(ring, at.instant().toEpochMilli());
+            case StartFrom.At at -> firstSeqAtOrAfter(ring, at.instant(), retention);
         };
     }
 
-    /** The first sequence whose change is at or after {@code targetMillis}, or just past the tail if none is. */
-    private static long firstSeqAtOrAfter(SrsRingbuffer ring, long targetMillis) {
+    /**
+     * The first sequence whose change is at or after {@code target}, or just past the tail when every
+     * buffered change is older than it.
+     *
+     * <p>An instant the buffer can no longer reach is refused rather than served from the head. Serving
+     * the head is silent: the reader comes up healthy and streams a different stretch than the one asked
+     * for, and how different depends on how much the buffer happened to still hold, which moves with
+     * load. A refusal names what was asked for, what is still held and the retention that decides how far
+     * back that goes, so the caller can widen the retention, pick a reachable start, or read the source
+     * directly.
+     *
+     * <p>An empty buffer is deliberately not refused. Nothing has been buffered yet, which is not the
+     * same as having buffered it and dropped it -- refusing here would turn a fresh chain into a race
+     * against its own miner. What such a reader misses instead depends on where mining began, which is
+     * decided elsewhere and is not visible from here.
+     */
+    private static long firstSeqAtOrAfter(SrsRingbuffer ring, Instant target, String retention) {
+        long head = ring.headSequence();
         long tail = ring.tailSequence();
-        for (long seq = ring.headSequence(); seq <= tail; seq++) {
+        long targetMillis = target.toEpochMilli();
+        if (head <= tail) {
+            long oldest = ring.readOne(head).ts();
+            if (oldest > targetMillis) {
+                throw new TapstateException(CaptureError.START_FROM_OUTSIDE_WINDOW, Map.of(
+                        "requested", target.toString(),
+                        "earliest", Instant.ofEpochMilli(oldest).toString(),
+                        "retention", retention == null ? "unset" : retention), null);
+            }
+        }
+        for (long seq = head; seq <= tail; seq++) {
             if (ring.readOne(seq).ts() >= targetMillis) {
                 return seq;
             }

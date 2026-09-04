@@ -24,6 +24,12 @@ import java.util.Objects;
  *
  * <p>An immutable value. The source position travels as its opaque token across any persistence
  * boundary, never as a connector object.
+ *
+ * <p>{@code srcPos} is null on a change the source stated no position at. A source names one position
+ * for a run of changes, meaning "everything up to here has been handed over", so only the change that
+ * closes such a run carries one. Filling the others in with it would say a change had been read that had
+ * not, and a run interrupted between them would resume past changes it never delivered. Nothing here
+ * ranks by the position anyway: ordering is the ring's own sequence paired with its generation.
  */
 public record SrsItem(
         SourcePosition srcPos,
@@ -34,7 +40,6 @@ public record SrsItem(
         long schemaVer) {
 
     public SrsItem {
-        Objects.requireNonNull(srcPos, "srcPos");
         Objects.requireNonNull(op, "op");
         if (op == Op.READ) {
             throw new IllegalArgumentException("a snapshot read (op r) never enters the change ring");

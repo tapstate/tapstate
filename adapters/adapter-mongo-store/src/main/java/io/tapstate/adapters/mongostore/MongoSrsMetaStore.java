@@ -18,6 +18,8 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.bson.Document;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,11 +33,12 @@ import java.util.Optional;
  * chain id (as {@code _id}); each facet is advanced by its own atomic update, so a consumer that sets
  * its own cursor never clobbers another consumer's concurrent set or the chain's offset advance.
  *
- * <p>The consumer cursors are stored as a sub-document keyed by pipeline id — a resource id, which the
- * grammar forbids from containing a dot, so the id is a safe update path and one consumer's cursor is
- * set at {@code consumerOffsets.<pipelineId>} independently. The schema history is an append-only array
- * advanced by {@code $push}. The nullable positions are stored only when present, never as explicit
- * nulls.
+ * <p>Each consumer's own state is stored as a sub-document keyed by pipeline id — a resource id, which
+ * the grammar forbids from containing a dot, so the id is a safe update path and one consumer is updated
+ * at {@code consumerOffsets.<pipelineId>} independently. That sub-document holds everything belonging to
+ * one pipeline rather than to the chain: its read cursor, its acked position, and the tables whose initial
+ * load its sink has confirmed. The schema history is an append-only array advanced by {@code $push}. The
+ * nullable positions are stored only when present, never as explicit nulls.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A re-seed of an existing chain (which would discard its accumulated truth) and a mutate of
@@ -46,9 +49,16 @@ import java.util.Optional;
 public final class MongoSrsMetaStore implements SrsMetaStore {
 
     private final MongoCollection<Document> collection;
+    private final Clock clock;
 
     public MongoSrsMetaStore(MongoCollection<Document> collection) {
+        this(collection, Clock.systemUTC());
+    }
+
+    /** The same store reading a given clock, for a caller that needs the recorded time to be decidable. */
+    public MongoSrsMetaStore(MongoCollection<Document> collection, Clock clock) {
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     @Override
@@ -56,6 +66,40 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", miningChainId)).first());
         return document == null ? Optional.empty() : Optional.of(toMeta(document));
+    }
+
+    /**
+     * Fetches the consumer cursors alone, asking the endpoint for that field and no other.
+     *
+     * <p>This exists because of what it does not carry back. The record's schema history grows by one
+     * entry per DDL and is never trimmed, and the cdc write path -- which reads this on every run of
+     * changes -- never looks at it. Measured against a real endpoint on a chain with 500 DDLs behind it,
+     * the whole record is 671 KB and reads at 6.4 ms, while this projection reads at 0.5 ms and does not
+     * move as the history grows.
+     *
+     * <p>It cannot go through the shared reconstruction: that one requires the schema history to be
+     * present and reports a document without it as corruption, which is the right reading there and the
+     * wrong one here, where its absence was asked for.
+     */
+    @Override
+    public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Document document = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("consumerOffsets"))
+                .first());
+        if (document == null) {
+            return List.of();
+        }
+        String id = String.valueOf(document.get("_id"));
+        Object consumersRaw = document.get("consumerOffsets");
+        if (!(consumersRaw instanceof Document consumersDoc)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id), null);
+        }
+        List<ConsumerOffset> consumers = new ArrayList<>();
+        for (Map.Entry<String, Object> entry : consumersDoc.entrySet()) {
+            consumers.add(consumerFromDocument(entry.getKey(), asDocument(entry.getValue(), id)));
+        }
+        return List.copyOf(consumers);
     }
 
     @Override
@@ -71,9 +115,89 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
-        Objects.requireNonNull(sourceReadOffset, "sourceReadOffset");
-        update(miningChainId, new Document("$set", new Document("sourceReadOffset", sourceReadOffset)));
+    public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        // Two updates, and the split is the guard. The first carries the ordering condition in its own
+        // filter, so the comparison and the write are one atomic act: a read-then-write would let a second
+        // member land its advance in between and be overwritten by this one, which is the rewind this
+        // exists to stop. It matches nothing when the recorded position already ranks at or after this one.
+        long matched = StoreIo.call(() -> collection.updateOne(
+                sourceReadAdvanceFilter(miningChainId, position.order()),
+                new Document("$set", sourceReadFields(position, Instant.now(clock)))).getMatchedCount());
+        if (matched > 0) {
+            return;
+        }
+        // Nothing matched, which is either "the chain is not seeded" -- a caller ordering error the other
+        // mutators raise too -- or "this position does not move the chain forward", which is ordinary and
+        // silent. Only a second look tells them apart, and it runs on the path that changed nothing.
+        requireSeeded(miningChainId);
+    }
+
+    @Override
+    public void rewindSourceReadOffset(String miningChainId, String token) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(token, "token");
+        // One unconditional update, and the unset is half of what it does. The order recorded beside the
+        // token says where the engine observed that token in the ring, and this token was not observed
+        // here at all -- leaving the old one in place would have the record claim the new position sits
+        // exactly where the old one did, in the comparison that decides what is safe to forget.
+        long matched = StoreIo.call(() -> collection.updateOne(
+                        new Document("_id", miningChainId),
+                        new Document("$set", new Document("sourceReadOffset", token)
+                                .append("sourceReadAt", Instant.now(clock).toEpochMilli()))
+                                .append("$unset", new Document("sourceReadEpoch", "")
+                                        .append("sourceReadSeq", "")))
+                .getMatchedCount());
+        if (matched == 0) {
+            // The filter names the chain and nothing else, so nothing matching can only mean no record.
+            requireSeeded(miningChainId);
+        }
+    }
+
+    /**
+     * The filter that admits an advance: this chain, and a recorded position strictly before {@code order}
+     * — no record yet, or a lower generation, or the same generation and a lower sequence. Positions are
+     * ranked by generation first because a rebuilt ring numbers its sequences from zero again, so a
+     * sequence alone is only meaningful within the ring that assigned it.
+     */
+    static Document sourceReadAdvanceFilter(String miningChainId, SourceOrder order) {
+        return new Document("_id", miningChainId).append("$or", List.of(
+                new Document("sourceReadEpoch", new Document("$exists", false)),
+                new Document("sourceReadEpoch", new Document("$lt", order.epoch())),
+                new Document("sourceReadEpoch", order.epoch())
+                        .append("sourceReadSeq", new Document("$lt", order.seq()))));
+    }
+
+    /**
+     * The fields a write to the read offset lays down: the order it reached, the token, and when it was
+     * written. An advance carries both halves of the position — a token stored without its order can no
+     * longer be ranked, and an order without its token is nothing a read can resume from — so each part
+     * is written only when it is there, and after a rewind the order is the part that is not.
+     */
+    private static Document sourceReadFields(ChainPosition position, Instant at) {
+        Document fields = new Document();
+        if (position.order() != null) {
+            fields.append("sourceReadEpoch", position.order().epoch())
+                    .append("sourceReadSeq", position.order().seq());
+        }
+        if (position.token() != null) {
+            fields.append("sourceReadOffset", position.token());
+        }
+        if (at != null) {
+            fields.append("sourceReadAt", at.toEpochMilli());
+        }
+        return fields;
+    }
+
+    /** Raises the caller ordering error the advancing mutators share when a chain has no record. */
+    private void requireSeeded(String miningChainId) {
+        Document existing = StoreIo.call(() -> collection.find(new Document("_id", miningChainId)).first());
+        if (existing == null) {
+            throw new IllegalStateException("srs meta mutate on an unseeded mining chain: " + miningChainId
+                    + " (create must seed it first)");
+        }
     }
 
     @Override
@@ -170,19 +294,27 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public void markSnapshotComplete(String miningChainId, String table) {
-        update(miningChainId, snapshotCompleteUpdate(table));
+    public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
+        update(miningChainId, snapshotCompleteUpdate(pipelineId, table));
     }
 
     /**
-     * The update that marks one table's snapshot drained: an {@code $addToSet} on
-     * {@code snapshotCompletedTables}. A set add, not a push — the mark answers "has this table drained?",
-     * so re-marking a table (a replay, a re-run of the snapshot) must be a no-op rather than a duplicate
-     * entry.
+     * The update that marks one table's snapshot drained for one consumer: an {@code $addToSet} on
+     * {@code consumerOffsets.<pipelineId>.snapshotCompletedTables}. A set add, not a push — the mark
+     * answers "has this table landed in this pipeline's target?", so re-marking a table (a replay, a
+     * re-run of the snapshot) must be a no-op rather than a duplicate entry.
+     *
+     * <p>Scoped under the consumer for the same reason its cursor is: the pipeline id is a resource id the
+     * grammar forbids a dot in, so the dotted path addresses exactly one consumer's set and cannot reach a
+     * neighbour's. Recording it against the chain instead is what let a pipeline new to a shared chain read
+     * another pipeline's answer and skip a load it had never done. The path creates the consumer entry when
+     * the pipeline has none yet, and touches nothing else in it.
      */
-    static Document snapshotCompleteUpdate(String table) {
+    static Document snapshotCompleteUpdate(String pipelineId, String table) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(table, "table");
-        return new Document("$addToSet", new Document("snapshotCompletedTables", table));
+        return new Document("$addToSet",
+                new Document("consumerOffsets." + pipelineId + ".snapshotCompletedTables", table));
     }
 
     @Override
@@ -195,6 +327,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .projection(Projections.include("_id"))
                 .map(document -> document.getString("_id"))
                 .into(new ArrayList<>()));
+    }
+
+    @Override
+    public void dropChain(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        // deleteOne on a missing _id removes nothing and reports so without failing, which is the no-op
+        // an absent chain is meant to be.
+        StoreIo.run(() -> collection.deleteOne(new Document("_id", miningChainId)));
     }
 
     @Override
@@ -268,10 +408,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // appended only when set, so a seed reads back as a seed rather than as corruption.
         Document document = new Document("_id", meta.miningChainId())
                 .append("consumerOffsets", consumers)
-                .append("schemaHistory", schemaHistory)
-                .append("snapshotCompletedTables", List.copyOf(meta.snapshotCompletedTables()));
-        if (meta.sourceReadOffset() != null) {
-            document.append("sourceReadOffset", meta.sourceReadOffset());
+                .append("schemaHistory", schemaHistory);
+        if (meta.sourceRead() != null) {
+            document.putAll(sourceReadFields(meta.sourceRead(), meta.sourceReadAt()));
         }
         if (meta.cdcStartPosition() != null) {
             document.append("cdcStartPosition", meta.cdcStartPosition());
@@ -326,19 +465,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         for (Object entry : entries) {
             schemaHistory.add(schemaFromDocument(asDocument(entry, id), id));
         }
-        // Absent snapshotCompletedTables is not corruption, unlike the two structural fields above: the
-        // meta field set is append-only and this field is newer than the collection, so a document written
-        // by an older build simply has no table marked.
-        Object completedRaw = document.get("snapshotCompletedTables");
-        List<String> snapshotCompletedTables = new ArrayList<>();
-        if (completedRaw instanceof List<?> completedEntries) {
-            for (Object entry : completedEntries) {
-                snapshotCompletedTables.add(String.valueOf(entry));
-            }
-        }
-        return new SrsMeta(id, document.getString("sourceReadOffset"), consumers,
+        return new SrsMeta(id, sourceReadFrom(document), consumers,
                 document.getString("cdcStartPosition"), schemaHistory, document.getString("retention"),
-                snapshotCompletedTables, readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"));
+                readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"),
+                sourceReadAtFrom(document));
     }
 
     /** Reconstructs one consumer cursor from its stored sub-document, keyed by the pipeline id. */
@@ -356,7 +486,24 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             // empty cursor rather than as corruption.
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId), null);
         }
-        return new ConsumerOffset(pipelineId, perTableSeq, sinkAckedFrom(document));
+        return new ConsumerOffset(
+                pipelineId, perTableSeq, sinkAckedFrom(document), snapshotCompletedFrom(document));
+    }
+
+    /**
+     * The tables one consumer has finished loading, empty when it has finished none. Absent is not
+     * corruption: a consumer entry is created by whichever of its three writers gets there first, and the
+     * two position writers create it without this field.
+     */
+    private static List<String> snapshotCompletedFrom(Document document) {
+        Object raw = document.get("snapshotCompletedTables");
+        List<String> completed = new ArrayList<>();
+        if (raw instanceof List<?> entries) {
+            for (Object entry : entries) {
+                completed.add(String.valueOf(entry));
+            }
+        }
+        return completed;
     }
 
     /** Reconstructs one schema version from its stored sub-document. */
@@ -384,6 +531,33 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * nothing acked: that pins a source-read advance where it stands, which only ever costs re-mining
      * changes already read - the direction that keeps them re-minable at all.
      */
+    /**
+     * How far the chain has read, or null when nothing has read it — the token, with the order beside it
+     * when one was recorded.
+     *
+     * <p>A token with no order is a real state and reads back as the position it is, not as absence.
+     * Two things produce it: a write-back, which names a spot in the source's log that no ring ever
+     * assigned a coordinate to, and a document written before the order was recorded at all. Reading
+     * either as nothing read would drop the one thing both of them do say — where to resume — and send
+     * the tail to the snapshot seam instead, re-mining every change since.
+     */
+    private static ChainPosition sourceReadFrom(Document document) {
+        String token = document.getString("sourceReadOffset");
+        Object epoch = document.get("sourceReadEpoch");
+        Object seq = document.get("sourceReadSeq");
+        if (!(epoch instanceof Number) || !(seq instanceof Number)) {
+            return token == null ? null : new ChainPosition(null, token);
+        }
+        return new ChainPosition(
+                new SourceOrder(((Number) epoch).longValue(), ((Number) seq).longValue()), token);
+    }
+
+    /** When the read offset was last written, or null on a record whose offset predates the stamp. */
+    private static Instant sourceReadAtFrom(Document document) {
+        Object at = document.get("sourceReadAt");
+        return at instanceof Number millis ? Instant.ofEpochMilli(millis.longValue()) : null;
+    }
+
     private static ChainPosition sinkAckedFrom(Document document) {
         Object epoch = document.get("sinkAckedEpoch");
         Object seq = document.get("sinkAckedSeq");
@@ -395,13 +569,20 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 document.getString("sinkAckedSrcpos"));
     }
 
-    /** Maps one consumer cursor to its stored sub-document (the per-table read cursor plus the acked position). */
+    /**
+     * Maps one consumer's record to its stored sub-document: the per-table read cursor, the tables it has
+     * finished loading (omitted while it has finished none, so a cursor-only consumer stays a cursor-only
+     * consumer) and the acked position.
+     */
     private static Document consumerToDocument(ConsumerOffset offset) {
         Document perTable = new Document();
         for (Map.Entry<String, Long> entry : offset.perTableSeq().entrySet()) {
             perTable.append(entry.getKey(), entry.getValue());
         }
         Document document = new Document("perTableSeq", perTable);
+        if (!offset.snapshotCompletedTables().isEmpty()) {
+            document.append("snapshotCompletedTables", List.copyOf(offset.snapshotCompletedTables()));
+        }
         if (offset.sinkAcked() != null) {
             document.append("sinkAckedEpoch", offset.sinkAcked().order().epoch())
                     .append("sinkAckedSeq", offset.sinkAcked().order().seq());

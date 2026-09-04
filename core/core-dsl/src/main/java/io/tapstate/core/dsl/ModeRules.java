@@ -94,7 +94,7 @@ final class ModeRules {
         if (readMode == ReadMode.SNAPSHOT_ONLY && referencesMode(p, sources, SourceMode.CDC)) {
             return ReadMode.SNAPSHOT_ONLY.yaml();
         }
-        for (String sid : p.sources()) {
+        for (String sid : p.sourceIds()) {
             SourceResource s = sources.get(sid);
             if (s != null && s.mode() != null) {
                 return s.mode().yaml();
@@ -105,7 +105,7 @@ final class ModeRules {
 
     private static boolean referencesMode(PipelineResource p, Map<String, SourceResource> sources,
                                           SourceMode mode) {
-        for (String sid : p.sources()) {
+        for (String sid : p.sourceIds()) {
             SourceResource s = sources.get(sid);    // existence already proved by reference closure
             if (s != null && s.mode() == mode) {
                 return true;

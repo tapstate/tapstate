@@ -31,14 +31,16 @@ public final class SrsRingSource {
      * no cursor wiring.
      */
     public static StreamSource<SrsItem> create(String ringName, StartFrom start) {
-        return create(ringName, start, SrsReadCursorPublisherFactory.NONE);
+        return create(ringName, start, SrsReadCursorPublisherFactory.NONE, null);
     }
 
     /**
      * A Jet stream source that tails the named change ring in sequence order from the {@code start} point
      * and reports its read progress through {@code publisherFactory}. The start point is resolved against
      * the ring on the member that owns it — {@code earliest} replays from the head, {@code latest} takes
-     * only changes from now on, and an instant starts at the first change at or after it. As the per-member
+     * only changes from now on, and an instant starts at the first change at or after it -- one the ring can
+     * no longer reach is refused, and {@code retention} is carried in so that refusal can quote how far back
+     * the buffer is configured to go. As the per-member
      * reader drains the ring it publishes the last sequence it read, the signal the write-side headroom gate
      * reads back as this consumer's cursor.
      *
@@ -48,7 +50,8 @@ public final class SrsRingSource {
      * and out of Jet state.
      */
     public static StreamSource<SrsItem> create(
-            String ringName, StartFrom start, SrsReadCursorPublisherFactory publisherFactory) {
+            String ringName, StartFrom start, SrsReadCursorPublisherFactory publisherFactory,
+            String retention) {
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(start, "start");
         Objects.requireNonNull(publisherFactory, "publisherFactory");
@@ -56,7 +59,8 @@ public final class SrsRingSource {
                 .stream("srs-source-" + ringName, ctx -> {
                     Ringbuffer<SrsItem> rb = ctx.hazelcastInstance().getRingbuffer(ringName);
                     SrsRingbuffer ring = new SrsRingbuffer(rb);
-                    return SrsRingReader.from(ring, start, publisherFactory.resolve(ctx.hazelcastInstance()));
+                    return SrsRingReader.from(
+                            ring, start, publisherFactory.resolve(ctx.hazelcastInstance()), retention);
                 })
                 .fillBufferFn((SrsRingReader reader, SourceBuilder.SourceBuffer<SrsItem> buffer) ->
                         reader.fill((item, seq) -> buffer.add(item), FILL_BATCH))

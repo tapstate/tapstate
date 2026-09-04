@@ -102,6 +102,43 @@ class CanonicalRoundTripTest {
                 .isFalse();
     }
 
+    /**
+     * A source reference written as an object but carrying no srs switch says exactly what the bare id
+     * says, so it canonicalizes to the bare id -- one state, one spelling.
+     *
+     * <p>Leaving both spellings alive would let the same pipeline canonicalize two ways, and the switch
+     * is registered as never-omitted precisely because reading it back as absent means "take the
+     * source's value" -- the link the field exists to cut. An object with the key absent must therefore
+     * not survive into canonical output as an object.
+     *
+     * <p><b>Known divergence, deliberately pinned here rather than left implicit:</b> the generated JSON
+     * schema marks both keys required on the object form, so an editor flags this input while the parser
+     * accepts it. The parser is the permissive side, so nothing schema-valid is refused; which of the two
+     * should move is an authoring-surface question, not one this test decides. It exists so the answer is
+     * chosen rather than discovered.
+     */
+    @Test
+    void aSourceObjectCarryingNoSwitchCanonicalizesToTheBareId() {
+        String raw = """
+                version: tapstate/v1
+                kind: pipeline
+                id: pl_a
+                source:
+                  - { id: src_a }
+                view:
+                  id: pl_a
+                  from: orders
+                  primary_key: id
+                  storage: { warm: { collection: pl_a } }
+                """;
+
+        String canonical = writer.write(parser.parse(raw));
+
+        assertThat(canonical).contains("source: src_a");
+        assertThat(canonical).doesNotContain("srs:");
+        assertThat(writer.write(parser.parse(canonical))).isEqualTo(canonical);
+    }
+
     @Test
     void sourceRegexWithNegativeLookaheadSurvivesCanonicalRoundTrip() {
         String raw = """

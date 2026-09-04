@@ -152,9 +152,11 @@
       "oneOf": [
         {
           "type": "string",
-          "description": "A lifecycle verb, spelled as the product spells it. There is no rewind: re-snapshotting is stop then start.",
+          "description": "A step written on its own: a lifecycle verb spelled as the product spells it, or a word the terminal offers that expands into several of them. There is no rewind: re-snapshotting is stop then start, which is what restart --rerun does.",
           "enum": [
             "pause",
+            "restart",
+            "restart --rerun",
             "resume",
             "start",
             "stop"

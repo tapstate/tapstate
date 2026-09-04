@@ -5,6 +5,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.schema.SchemaNavigator;
 import io.tapstate.messages.MessageCatalog;
@@ -31,6 +32,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -94,12 +96,26 @@ final class Repl {
      * was busy serving somebody else this second, which is the arrangement working: the interactive
      * reads that took its turn are the ones a person is waiting on.
      */
+    /**
+     * The refusal a resume gets when the pipeline's definition was edited while it ran. Matched by code
+     * rather than by message: the message is prose for a person, and this is a branch.
+     */
+    private static final String INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
+
     private static final Set<String> BUSY_CODES =
             Set.of("connector.instances-busy", "connector.instance-limit-reached");
 
+    /** The word that keeps everything, and the words that only say "do not ask me". */
+    private static final String KEEP_STATE = "--keep-state";
+    private static final Set<String> STOP_OPTIONS = Set.of(KEEP_STATE, "-y", "--non-interactive");
+    private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
+    private static final String STOP_USAGE = "stop <pipeline-id> [--keep-state] [-y]";
+    private static final String RESTART_USAGE = "restart <pipeline-id> [--rerun] [-y]";
+    private static final String POSITION_USAGE = "position <pipeline-id> [-f <file>]";
+
     private static final List<String> ONLINE_VERBS = List.of(
-            "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "status", "metrics",
-            "snapshot", "logs", "test", "test-result", "discover-schema", "schema", "register",
+            "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
+            "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
             "connectors", "token");
 
     private final CommandLine commandLine;
@@ -124,6 +140,13 @@ final class Repl {
 
     /** Reads the login password masked; a scripted fake is injected in tests, a JLine one bound in {@link #run}. */
     private Prompter prompter;
+
+    /**
+     * Where a prompter comes from when one is needed and none was injected. A supplier rather than a
+     * prompter because opening one opens a terminal: a verb that never asks anything must not pay for
+     * the ability to ask. The one-shot face sets this; the read loop binds the field directly.
+     */
+    private Supplier<Prompter> prompterSource;
 
     /**
      * Whether this process's output goes to a terminal, which is what the in-place view needs and the
@@ -233,6 +256,19 @@ final class Repl {
     /** Answers how wide the screen is; overridden so the narrow layout can be exercised. */
     void screenWidth(IntSupplier width) {
         this.screenWidth = width;
+    }
+
+    /** Where to get a prompter from if one is asked for and none was injected. */
+    void prompterSource(Supplier<Prompter> source) {
+        this.prompterSource = source;
+    }
+
+    /** The prompter to ask with, opened on first use; null when there is no way to ask at all. */
+    private Prompter prompter() {
+        if (prompter == null && prompterSource != null) {
+            prompter = prompterSource.get();
+        }
+        return prompter;
     }
 
     /** Answers whether this process has a terminal; overridden so both branches can be exercised. */
@@ -652,6 +688,23 @@ final class Repl {
         if (words.get(0).equals("logs") && words.contains("--follow")) {
             return logsFollow(words);
         }
+        // Composed here out of the verbs the product has, so it parses its own words: the four it
+        // composes are all positional, and the guard below would refuse the one option this takes.
+        if (words.get(0).equals("restart")) {
+            return restartOnline(words);
+        }
+        // A stop is the verb that clears, so it is the verb that asks first -- and it carries the two
+        // words that say otherwise. It parses its own line for the same reason the two above do.
+        if (words.get(0).equals("stop")) {
+            return stopOnline(words);
+        }
+        // The write-back names the file it sends, so it parses its own line too. Its option carries a
+        // value rather than standing alone, which is the one shape the positional guard below cannot
+        // read: it would refuse the option, and left to the guard's fall-through the filename after it
+        // would be taken for the pipeline id.
+        if (words.get(0).equals("position")) {
+            return positionOnline(words);
+        }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
         for (int i = 1; i < words.size(); i++) {
@@ -665,11 +718,12 @@ final class Repl {
             case "apply" -> applyOnline(words);
             case "get" -> getOnline(words);
             case "ls" -> lsOnline(words);
-            case "start", "stop", "pause", "resume" -> lifecycleOnline(words);
+            case "start", "pause", "resume" -> lifecycleOnline(words);
             case "status" -> statusOnline(words);
             case "metrics" -> metricsOnline(words);
             case "snapshot" -> snapshotOnline(words);
             case "logs" -> logsOnline(words);
+            case "position" -> positionOnline(words);
             default -> throw new IllegalStateException("not an online verb: " + words.get(0));
         };
     }
@@ -1246,9 +1300,259 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         String id = words.get(1);
-        LifecycleOutcome outcome = withFailover(() ->
-                controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb),
+        // A stop says what it means to do about the pipeline's state; the other three have nothing to
+        // say and send nothing. Stop clears -- that is what the verb is -- and the terminal asking
+        // first is a separate concern from the wire carrying the answer.
+        Boolean purgeState = verb.equals("stop") ? Boolean.TRUE : null;
+        return lifecycleOnline(verb, id, purgeState);
+    }
+
+    /**
+     * {@code stop <pipeline-id> [--keep-state] [-y]} -- the verb that clears, and the two words that
+     * change how it is asked for.
+     *
+     * <p>Plain, it clears what the pipeline accumulated, and asks first. {@code --keep-state} leaves
+     * every one of those items where it is, so the run that follows carries on rather than reading its
+     * whole source again. Which of the two a caller wants is not something the terminal can work out
+     * for them: the difference does not show until that next run is well under way.
+     *
+     * <p>Both spellings print the same list. The keeping one names what it is holding on to rather than
+     * what it is dropping, which is how somebody reads what a clear would take without running one.
+     */
+    private int stopOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        boolean keepState = words.contains(KEEP_STATE);
+        List<String> operands = words.stream().filter(word -> !STOP_OPTIONS.contains(word)).toList();
+        for (int i = 1; i < operands.size(); i++) {
+            if (operands.get(i).startsWith("-")) {
+                err.println("stop: unknown option " + operands.get(i) + " (usage: " + STOP_USAGE + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("stop: missing operand (usage: " + STOP_USAGE + ")");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = operands.get(1);
+        if (keepState) {
+            // Nothing is going, so there is nothing to confirm: this is the spelling that belongs in a
+            // script. The list is still printed -- it is the whole of what the reader gets to check.
+            sayWhatBecomesOfTheState(false);
+            return lifecycleOnline("stop", id, Boolean.FALSE);
+        }
+        OptionalInt refused = clearanceToClear("stop", id, unattended(words));
+        return refused.isPresent() ? refused.getAsInt() : lifecycleOnline("stop", id, Boolean.TRUE);
+    }
+
+    /** Prints what a stop is about to do about the state, item by item, from the declarations. */
+    private void sayWhatBecomesOfTheState(boolean purgeState) {
+        PrintWriter out = commandLine.getOut();
+        PipelineStateInventory.lines(purgeState, PipelineStateInventory.vocabulary())
+                .forEach(out::println);
+        out.flush();
+    }
+
+    /** Whether the caller said not to ask; it says only that, and never that anything may be cleared. */
+    private boolean unattended(List<String> words) {
+        return words.contains("-y") || words.contains("--non-interactive");
+    }
+
+    /**
+     * The gate in front of both spellings that clear: say what goes, then get an answer, or refuse.
+     *
+     * <p>Three outcomes and no fourth. Told not to ask, it goes ahead -- the flag says "do not ask me",
+     * and what may be cleared is carried by the verb, never by this. Asked where there is no terminal,
+     * it refuses: waiting would hang on an input that never arrives, and a hung run reads as a slow one,
+     * while going ahead would make an irreversible clearing the default of exactly the situation where
+     * nobody is watching. Otherwise it asks, and anything but yes leaves the pipeline alone.
+     *
+     * @return the exit code to stop at, or empty when the caller may go ahead
+     */
+    private OptionalInt clearanceToClear(String verb, String id, boolean unattended) {
+        sayWhatBecomesOfTheState(true);
+        if (unattended) {
+            return OptionalInt.empty();
+        }
+        Prompter asking = terminal.getAsBoolean() ? prompter() : null;
+        if (asking == null) {
+            PrintWriter err = commandLine.getErr();
+            Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
+            err.flush();
+            return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
+        }
+        String answer = asking.ask("Clear " + id + "? Type yes to go ahead", "no");
+        String said = answer == null ? "" : answer.trim();
+        if (!said.equalsIgnoreCase("yes") && !said.equalsIgnoreCase("y")) {
+            PrintWriter out = commandLine.getOut();
+            out.println(verb + ": cancelled; " + id + " was left as it is");
+            out.flush();
+            // Not zero. A caller that reads the status of a verb which did not do what it was asked, and
+            // is told it went fine, concludes the pipeline is stopped.
+            return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
+        }
+        return OptionalInt.empty();
+    }
+
+    /**
+     * {@code restart <pipeline-id> [--rerun] [-y]} -- the terminal's own composition of the four verbs
+     * the product has. There is no fifth verb behind this and no operation of its own: what a restart means
+     * is a sequence, and a sequence is what a front end is for.
+     *
+     * <p>Plain, it cycles the pipeline and lets it carry on from where it stopped -- a pause and a resume
+     * over a running one, a resume over a paused one. With {@code --rerun} it asks for the whole source
+     * to be read again, which is a stop that clears followed by a start.
+     *
+     * <p>A pipeline with nothing to carry on from is started, and <em>told so</em>. The two outcomes are
+     * indistinguishable from the outside until the run is well under way -- one continues, the other
+     * re-reads everything -- so a restart that quietly did the second would be reporting the first.
+     */
+    private int restartOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        boolean rerun = words.contains("--rerun");
+        List<String> operands = words.stream().filter(word -> !RESTART_OPTIONS.contains(word)).toList();
+        for (int i = 1; i < operands.size(); i++) {
+            if (operands.get(i).startsWith("-")) {
+                err.println("restart: unknown option " + operands.get(i)
+                        + " (usage: " + RESTART_USAGE + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("restart: missing operand (usage: " + RESTART_USAGE + ")");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = operands.get(1);
+        if (rerun) {
+            // The plain restart clears nothing and asks nothing; this one is a stop that clears wearing
+            // another name, so it meets the same gate the plain stop does.
+            OptionalInt refused = clearanceToClear("restart", id, unattended(words));
+            return refused.isPresent() ? refused.getAsInt() : rerunFromTheStart(id);
+        }
+        StatusOutcome outcome = withFailover(() ->
+                controlPlane.status(session.landingNode(), session.credential(), id),
+                o -> o instanceof StatusOutcome.Unreachable);
+        return switch (outcome) {
+            case StatusOutcome.Found found -> carryOnFrom(id, found.state());
+            case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case StatusOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /** The plain restart, once the pipeline's state says which sequence carrying on actually is. */
+    private int carryOnFrom(String id, String state) {
+        PrintWriter out = commandLine.getOut();
+        PrintWriter err = commandLine.getErr();
+        switch (state.toUpperCase(Locale.ROOT)) {
+            case "RUNNING": {
+                int paused = lifecycleOnline("pause", id, null);
+                if (paused != Cli.EXIT_OK) {
+                    return paused;
+                }
+                LifecycleOutcome resumed = drive("resume", id, null);
+                if (resumed instanceof LifecycleOutcome.Rejected rejected
+                        && INCOMPATIBLE_REVISION.equals(rejected.code())) {
+                    // The one refusal worth more than its own text. Carrying on runs the pipeline as it
+                    // was when it paused, and the definition has been edited since -- so the refusal is
+                    // right, and "try again" is the one thing that will never work. What the caller
+                    // actually wants is named instead.
+                    renderRejection(rejected.code(), rejected.message());
+                    err.println("restart: " + id + " is now paused, and its definition changed while it "
+                            + "ran, so it cannot carry on as it was; 'restart " + id + " --rerun' runs "
+                            + "the new definition and reads the whole source again");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                if (resumed instanceof LifecycleOutcome.Rejected rejected) {
+                    // Any other refusal leaves it paused with everything it had, and trying again is
+                    // an answer -- which the one above is not.
+                    renderRejection(rejected.code(), rejected.message());
+                    err.println("restart: " + id + " is now paused and nothing was lost; running restart "
+                            + "again picks it up");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                return render(resumed);
+            }
+            case "PAUSED":
+                return lifecycleOnline("resume", id, null);
+            case "NEW":
+            case "STOPPED":
+            case "COMPLETED": {
+                // The half that is not the state change. Both outcomes end with the pipeline running, and
+                // which one happened shows only in how much of the source the run reads.
+                out.println("restart: " + id + " has no position to carry on from; this run reads "
+                        + "everything from the start");
+                out.flush();
+                return lifecycleOnline("start", id, null);
+            }
+            case "FAILED": {
+                // A failed run is carried on the same way anything else is, once the sequence is written
+                // out: a stop that keeps what the pipeline has, then a start. The state machine is built
+                // for it -- stopping is legal from failed and starting is not, precisely so recovery is a
+                // deliberate two steps -- and keeping is what makes it a recovery rather than a re-read:
+                // the position the run stopped at is still on record, and a start reads it back.
+                out.println("restart: " + id + " failed; carrying on from the position it reached");
+                out.flush();
+                int stopped = lifecycleOnline("stop", id, Boolean.FALSE);
+                if (stopped != Cli.EXIT_OK) {
+                    return stopped;
+                }
+                return lifecycleOnline("start", id, null);
+            }
+            default:
+                err.println("restart: " + id + " is " + state.toLowerCase(Locale.ROOT)
+                        + ", which restart does not know how to carry on from");
+                err.flush();
+                return Cli.EXIT_VERB_UNAVAILABLE;
+        }
+    }
+
+    /**
+     * {@code restart --rerun} -- clear what the pipeline has, then start it, so the whole source is read
+     * again.
+     *
+     * <p>The ordering that matters is already the product's: a stop that names a pipeline the server does
+     * not have, or one the state machine forbids stopping, is refused before the intent is written -- and
+     * nothing is cleared until the intent is written. So there is no window in which this asks for the
+     * clearing and then discovers the start was never going to be allowed.
+     *
+     * <p>What is left is the window nobody can close: the start being refused after the stop was accepted,
+     * because the pipeline was removed in between. That is reported as what it is rather than as a failed
+     * command, because the pipeline is now stopped with nothing to resume from and the next step is not
+     * "try again".
+     */
+    private int rerunFromTheStart(String id) {
+        int stopped = lifecycleOnline("stop", id, Boolean.TRUE);
+        if (stopped != Cli.EXIT_OK) {
+            return stopped;
+        }
+        int started = lifecycleOnline("start", id, null);
+        if (started != Cli.EXIT_OK) {
+            PrintWriter err = commandLine.getErr();
+            err.println("restart: " + id + " was stopped and its state cleared, but starting it did not "
+                    + "go through; it is stopped with no position to resume from, so the next run reads "
+                    + "the whole source");
+            err.flush();
+        }
+        return started;
+    }
+
+    private int lifecycleOnline(String verb, String id, Boolean purgeState) {
+        return render(drive(verb, id, purgeState));
+    }
+
+    /** The verb over the wire, unrendered, for a caller that has to read the refusal before showing it. */
+    private LifecycleOutcome drive(String verb, String id, Boolean purgeState) {
+        return withFailover(() ->
+                controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb, purgeState),
                 o -> o instanceof LifecycleOutcome.Unreachable);
+    }
+
+    private int render(LifecycleOutcome outcome) {
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case LifecycleOutcome.Accepted accepted -> {
@@ -2770,6 +3074,85 @@ final class Repl {
             }
             case MetricsOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case MetricsOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /**
+     * {@code position <pipeline-id> [-f <file>]} — prints where the pipeline resumes from, one entry per
+     * mining chain, as the document the server holds; with {@code -f} it sends that document back, edited,
+     * and reports where each chain then stands.
+     *
+     * <p>The read prints json and nothing else, because what it prints is meant to be saved, edited and
+     * handed back — {@code position p > p.json}, change {@code resumeFrom.token}, {@code position p -f
+     * p.json}. A table would be a second rendering of the same thing that nothing could send back, and
+     * the values that must survive the trip unchanged are the ones a table would leave out.
+     *
+     * <p>The file is sent as its own bytes, unparsed. What the server compares against is what the server
+     * printed, so anything a reader and writer here changed on the way through would be a difference the
+     * author never made — and the server refuses each of those by name.
+     */
+    private int positionOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        String file = null;
+        List<String> operands = new ArrayList<>();
+        for (int i = 0; i < words.size(); i++) {
+            String word = words.get(i);
+            if (i > 0 && word.equals("-f")) {
+                if (i + 1 >= words.size()) {
+                    err.println("position: -f needs a file (usage: " + POSITION_USAGE + ")");
+                    err.flush();
+                    return Cli.EXIT_USAGE;
+                }
+                file = words.get(++i);
+            } else if (i > 0 && word.startsWith("-")) {
+                err.println("position: unknown option " + word + " (usage: " + POSITION_USAGE + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            } else {
+                operands.add(word);
+            }
+        }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("position: missing operand (usage: " + POSITION_USAGE + ")");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = operands.get(1);
+        String document = null;
+        if (file != null) {
+            try {
+                document = Files.readString(Path.of(file));
+            } catch (IOException | RuntimeException unreadable) {
+                err.println("position: cannot read " + file + " (" + unreadable.getMessage() + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        String body = document;
+        PositionOutcome outcome = withFailover(() -> body == null
+                        ? controlPlane.position(session.landingNode(), session.credential(), id)
+                        : controlPlane.setPosition(session.landingNode(), session.credential(), id, body),
+                o -> o instanceof PositionOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case PositionOutcome.Found found -> {
+                if (body == null) {
+                    out.println(found.document());
+                } else {
+                    out.println("position written back for " + id);
+                    // Where every chain now stands, and -- the part worth printing after the fact --
+                    // whose else those chains are. A write-back moves a chain for every pipeline on it,
+                    // and this is the last moment anybody is told which ones those were.
+                    found.chains().forEach(chain -> out.println("  " + chain.chainId() + "  ->  "
+                            + (chain.token() == null ? "(nothing recorded)" : chain.token())
+                            + (chain.sharedWith().isEmpty()
+                                    ? "" : "   also read by: " + String.join(", ", chain.sharedWith()))));
+                }
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case PositionOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case PositionOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
 

@@ -15,6 +15,9 @@ import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 
@@ -34,6 +37,7 @@ class MongoSrsMetaStoreIT {
 
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final String CHAIN = "orders@mysql-1";
+    private static final Instant WRITTEN_AT = Instant.parse("2026-09-03T10:12:44Z");
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
@@ -53,6 +57,37 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * The narrow read answers exactly what the whole record says, on a chain carrying the two things that
+     * make the two reads differ: several consumers, and a schema history behind them.
+     *
+     * <p>The narrow read exists to leave that history on the endpoint -- it is what the cdc write path
+     * takes on every run of changes, and it never looks at the history. What must not come with the saving
+     * is a different answer, and it is a real risk here rather than a theoretical one: the projection names
+     * the field it keeps, so a rename that misses it would return no cursors at all, and a hot path told
+     * there are no consumers writes an offset bounded by nothing.
+     */
+    @Test
+    void theCursorReadAnswersTheSameAsTheWholeRecordOnAChainWithHistoryBehindIt() {
+        withStore(store -> {
+            store.create(CHAIN, "7d");
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("pipe-a", Map.of("orders", 7L),
+                    new ChainPosition(new SourceOrder(1L, 3L), "tok-a")));
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("pipe-b", Map.of("orders", 4L, "items", 9L),
+                    new ChainPosition(new SourceOrder(1L, 1L), "tok-b")));
+            store.appendSchemaVersion(CHAIN, new SchemaVersion(1L, Map.of("id", "int"), 1L));
+            store.appendSchemaVersion(CHAIN, new SchemaVersion(2L, Map.of("id", "int", "name", "varchar"), 2L));
+
+            assertThat(store.consumerOffsets(CHAIN))
+                    .containsExactlyInAnyOrderElementsOf(store.read(CHAIN).orElseThrow().consumerOffsets());
+        });
+    }
+
+    @Test
+    void theCursorReadIsEmptyForAnUnminedChain() {
+        withStore(store -> assertThat(store.consumerOffsets("never-mined")).isEmpty());
+    }
+
     @Test
     void readReturnsEmptyForAnUnminedChain() {
         withStore(store -> assertThat(store.read("never-mined")).isEmpty());
@@ -62,7 +97,7 @@ class MongoSrsMetaStoreIT {
     void createIsInsertOnlyAndDoesNotDiscardAccumulatedTruth() {
         withStore(store -> {
             store.create(CHAIN, "7d");
-            store.advanceSourceReadOffset(CHAIN, "gtid:aaa-1:500");
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
 
             // a second seed must be refused: overwriting would discard the advanced offset. The
             // collision is a caller ordering error, surfaced bare like the unseeded-mutate error.
@@ -77,9 +112,52 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            store.advanceSourceReadOffset(CHAIN, "gtid:aaa-1:900");
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
 
             assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
+        });
+    }
+
+    @Test
+    void advanceSourceReadOffsetPersistsTheOrderBesideTheToken() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(3L, 42L), "gtid:aaa-1:42"));
+
+            // Both halves survive the round trip. The token is what a read resumes from; the order is what
+            // the next advance is ranked against, and a stored token whose order was dropped can no longer
+            // be told from a rewind.
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .isEqualTo(new ChainPosition(new SourceOrder(3L, 42L), "gtid:aaa-1:42"));
+        });
+    }
+
+    @Test
+    void sourceReadOffsetOnlyEverMovesForward() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
+
+            // Lower sequence, same generation: a clamp to a consumer that is behind. Ignored.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
+
+            // Lower generation: a stale writer from before a restart. Ignored.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(0L, 9999L), "gtid:aaa-1:1"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
+
+            // The same position again: not an advance either, and not an error.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:900");
+
+            // Forward, same generation.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 901L), "gtid:aaa-1:901"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-1:901");
+
+            // Forward by generation, even though the sequence restarts: a rebuilt ring numbers from zero.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(2L, 0L), "gtid:aaa-2:1"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-2:1");
         });
     }
 
@@ -225,15 +303,62 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            store.markSnapshotComplete(CHAIN, "orders");
-            store.markSnapshotComplete(CHAIN, "order_items");
-            store.markSnapshotComplete(CHAIN, "orders");
+            store.markSnapshotComplete(CHAIN, "p1", "orders");
+            store.markSnapshotComplete(CHAIN, "p1", "order_items");
+            store.markSnapshotComplete(CHAIN, "p1", "orders");
 
             // One chain carries many tables, each snapshotted by its own capture run, so the mark is per
             // table. The re-mark exercises $addToSet against the real driver: set membership, so a replayed
             // or re-run snapshot of a table that is already marked adds nothing.
-            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables())
+            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables("p1"))
                     .containsExactly("orders", "order_items");
+        });
+    }
+
+    /**
+     * Two pipelines on one chain keep separate completion sets against the real driver.
+     *
+     * <p>The dotted update path has to create the second consumer's entry rather than reach into the
+     * first's, and a document-root write would satisfy the single-pipeline case above while failing this
+     * one. That failure is the defect this exists for: a pipeline new to a shared chain reads another
+     * pipeline's answer, skips a load it never did, and leaves its target short of every row of that
+     * table -- run healthy, nothing logged.
+     */
+    @Test
+    void markSnapshotCompleteIsPerPipelineAgainstTheRealStore() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+
+            store.markSnapshotComplete(CHAIN, "p1", "orders");
+            store.markSnapshotComplete(CHAIN, "p1", "order_items");
+            store.markSnapshotComplete(CHAIN, "p2", "orders");
+
+            SrsMeta record = store.read(CHAIN).orElseThrow();
+            assertThat(record.snapshotCompletedTables("p1")).containsExactly("orders", "order_items");
+            assertThat(record.snapshotCompletedTables("p2")).containsExactly("orders");
+            assertThat(record.snapshotCompletedTables("never-a-consumer")).isEmpty();
+        });
+    }
+
+    /**
+     * Detaching a consumer takes its completion marks with it and leaves every other consumer's alone.
+     *
+     * <p>This is what makes a pipeline asked to re-read everything actually re-read it while others stay on
+     * the chain. Before completion moved onto the consumer there was nowhere to clear it from without
+     * deciding it on every other consumer's behalf, so it was left alone and the re-read never happened.
+     */
+    @Test
+    void detachingAConsumerClearsOnlyItsOwnCompletionMarks() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.markSnapshotComplete(CHAIN, "leaving", "orders");
+            store.markSnapshotComplete(CHAIN, "staying", "orders");
+
+            store.detachConsumer(CHAIN, "leaving");
+
+            SrsMeta record = store.read(CHAIN).orElseThrow();
+            assertThat(record.snapshotCompletedTables("leaving")).isEmpty();
+            assertThat(record.snapshotCompletedTables("staying")).containsExactly("orders");
         });
     }
 
@@ -257,7 +382,7 @@ class MongoSrsMetaStoreIT {
         // every mutator requires the chain to have been seeded by create first; a mutate on an unseeded
         // chain is a caller ordering error, not a silent no-op.
         withStore(store -> {
-            assertThatThrownBy(() -> store.advanceSourceReadOffset("nope", "x"))
+            assertThatThrownBy(() -> store.advanceSourceReadOffset("nope", new ChainPosition(new SourceOrder(1L, 1L), "x")))
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.upsertConsumerOffset("nope", new ConsumerOffset("p", Map.of(), null)))
                     .isInstanceOf(IllegalStateException.class);
@@ -269,7 +394,7 @@ class MongoSrsMetaStoreIT {
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.appendSchemaVersion("nope", new SchemaVersion(0, Map.of(), 0)))
                     .isInstanceOf(IllegalStateException.class);
-            assertThatThrownBy(() -> store.markSnapshotComplete("nope", "orders"))
+            assertThatThrownBy(() -> store.markSnapshotComplete("nope", "p1", "orders"))
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.openEpoch("nope"))
                     .isInstanceOf(IllegalStateException.class);
@@ -280,7 +405,7 @@ class MongoSrsMetaStoreIT {
     void detachConsumerRemovesOneCursorAndLeavesTheChainAndItsOtherConsumersByteForByte() {
         withStore(store -> {
             store.create(CHAIN, "7d");
-            store.advanceSourceReadOffset(CHAIN, "gtid:aaa-1:500");
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
             store.setCdcStart(CHAIN, "gtid:aaa-1:1", 1L);
             store.appendSchemaVersion(CHAIN, new SchemaVersion(0, Map.of("id", "int"), 0));
             store.upsertConsumerOffset(CHAIN, new ConsumerOffset("departing", Map.of("orders", 100L),
@@ -356,6 +481,83 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    @Test
+    void aWriteBackMovesTheOffsetBackWhereTheSameMoveThroughAnAdvanceWouldNot() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(3L, 900L), "gtid:aaa-3:900"));
+
+            // The control group, and the reason the write-back cannot share the reader's path: asked to
+            // go back through it, the store matches nothing and says nothing, because for a reader that
+            // is the ordinary case of a clamp to a consumer sitting behind.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 100L), "gtid:aaa-1:100"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("gtid:aaa-3:900");
+
+            store.rewindSourceReadOffset(CHAIN, "gtid:aaa-1:100");
+
+            // The token lands, and the order beside it goes: a written-back position names a spot in the
+            // source's own log, and no ring here ever gave that spot a coordinate.
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .isEqualTo(new ChainPosition(null, "gtid:aaa-1:100"));
+        });
+    }
+
+    @Test
+    void aWrittenBackOffsetAdmitsTheNextAdvanceWhateverGenerationItCarries() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(9L, 900L), "gtid:aaa-9:900"));
+
+            store.rewindSourceReadOffset(CHAIN, "gtid:aaa-1:100");
+
+            // The run that comes back opens a generation of its own and must not have to outrank the one
+            // the write-back displaced. Left in place, that order would pin the chain until generation 9
+            // came round again, with every advance in between silently dropped.
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 105L), "gtid:aaa-1:105"));
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .isEqualTo(new ChainPosition(new SourceOrder(1L, 105L), "gtid:aaa-1:105"));
+        });
+    }
+
+    @Test
+    void writingBackAnOffsetOnAnUnseededChainIsAnOrderingError() {
+        withStore(store -> assertThatThrownBy(
+                () -> store.rewindSourceReadOffset("never_seeded", "gtid:aaa-1:1"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("never_seeded"));
+    }
+
+    @Test
+    void bothWritesToTheReadOffsetRecordWhenTheyHappened() {
+        withStoreAt(Clock.fixed(WRITTEN_AT, ZoneOffset.UTC), store -> {
+            store.create(CHAIN, null);
+            // A seeded chain has no offset, so there is no moment to report for one -- absence, not zero.
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadAt()).isNull();
+
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 5L), "gtid:aaa-1:5"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadAt()).isEqualTo(WRITTEN_AT);
+
+            store.rewindSourceReadOffset(CHAIN, "gtid:aaa-1:1");
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadAt()).isEqualTo(WRITTEN_AT);
+        });
+    }
+
+    @Test
+    void anOffsetStoredWithoutItsOrderReadsBackAsThePositionItIs() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            // The shape a record written before the order was stored carries, and the shape a write-back
+            // leaves behind. Read as "nothing has read this chain" it would send the tail to the snapshot
+            // seam and re-mine every change since, which is the loss the recorded token exists to stop.
+            collection.updateOne(new Document("_id", CHAIN),
+                    new Document("$set", new Document("sourceReadOffset", "gtid:aaa-1:77")));
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .isEqualTo(new ChainPosition(null, "gtid:aaa-1:77"));
+        });
+    }
+
     /** The single consumer cursor on the test chain — the shape the per-consumer advance tests read back. */
     private static ConsumerOffset onlyConsumer(MongoSrsMetaStore store) {
         List<ConsumerOffset> cursors = store.read(CHAIN).orElseThrow().consumerOffsets();
@@ -367,12 +569,30 @@ class MongoSrsMetaStoreIT {
         void run(MongoSrsMetaStore store) throws Exception;
     }
 
+    private interface CollectionTest {
+        void run(MongoSrsMetaStore store, MongoCollection<Document> collection) throws Exception;
+    }
+
     /** Runs a test body against a fresh meta store over a clean srs_meta collection on the replica-set. */
     private static void withStore(StoreTest test) {
+        withStoreAt(Clock.systemUTC(), test);
+    }
+
+    /** The same, with the clock the store stamps its writes from decided by the caller. */
+    private static void withStoreAt(Clock clock, StoreTest test) {
+        withCollection(clock, (store, collection) -> test.run(store));
+    }
+
+    /** The same again, handing over the collection too, for a case that has to write a raw document. */
+    private static void withCollection(CollectionTest test) {
+        withCollection(Clock.systemUTC(), test);
+    }
+
+    private static void withCollection(Clock clock, CollectionTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("srs_meta");
             collection.drop();
-            test.run(new MongoSrsMetaStore(collection));
+            test.run(new MongoSrsMetaStore(collection, clock), collection);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

@@ -17,6 +17,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -39,8 +40,10 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -55,6 +58,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -181,7 +185,7 @@ class NestOverTwoSourcesDataFlowTest {
                 .describedAs("both sources merged onto it rather than opening one each")
                 .containsExactlyInAnyOrder(PARENT_SOURCE, CHILD_SOURCE);
 
-        actuator.stop(PIPELINE);
+        actuator.stop(PIPELINE, true);
 
         assertThat(srsCoordinator.isProvisioned(chain))
                 .describedAs("the shared chain is closed once, not once per source")
@@ -195,7 +199,7 @@ class NestOverTwoSourcesDataFlowTest {
      */
     private static void stopQuietly(LifecycleActuator actuator) {
         try {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         } catch (RuntimeException e) {
             System.out.println("stop failed after the run: " + e);
         }
@@ -252,7 +256,7 @@ class NestOverTwoSourcesDataFlowTest {
         aliases.put("i", FromRef.literal(CHILD_TABLE));
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
                 List.of(step), null,
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
@@ -387,7 +391,7 @@ class NestOverTwoSourcesDataFlowTest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             // Nothing changes after the snapshot: what is under test is that the rows already there
             // assemble, which is exactly what the real two-source witness seeds.
             return () -> { };
@@ -425,6 +429,13 @@ class NestOverTwoSourcesDataFlowTest {
         @Override
         public Envelope next() {
             return rows.next();
+        }
+
+        @Override
+        public Optional<SourcePosition> seam() {
+            // Sampled by the source before its first row. The run refuses to start a tail without one,
+            // because a tail that begins wherever it likes loses every change made while the snapshot ran.
+            return Optional.of(new SourcePosition("seam-0"));
         }
 
         @Override

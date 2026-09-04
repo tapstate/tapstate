@@ -8,6 +8,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -56,7 +57,7 @@ class TheCapacityAPipelineWroteIsWhatItRunsOnTest {
 
     private static PipelineResource pipelineOf(Step... steps) {
         List<Step> transforms = new ArrayList<>(List.of(steps));
-        return new PipelineResource(PIPELINE, null, List.of("customers", "policies"), transforms, null,
+        return new PipelineResource(PIPELINE, null, List.of(SourceRef.bare("customers"), SourceRef.bare("policies")), transforms, null,
                 new ServeBlock.Inline("serve", FromRef.literal(transforms.get(transforms.size() - 1).id()),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
                 null, null);
@@ -123,7 +124,7 @@ class TheCapacityAPipelineWroteIsWhatItRunsOnTest {
     @Test
     void aPipelineWithNoNestAtAllIsLeftExactlyAsItWas() {
         NestSettings base = NestSettings.defaults().withEntriesHeldInMemory(40_000);
-        PipelineResource pipeline = new PipelineResource(PIPELINE, null, List.of("customers"), null, null,
+        PipelineResource pipeline = new PipelineResource(PIPELINE, null, List.of(SourceRef.bare("customers")), null, null,
                 new ServeBlock.Inline("serve", FromRef.literal("customers"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
                 null, null);

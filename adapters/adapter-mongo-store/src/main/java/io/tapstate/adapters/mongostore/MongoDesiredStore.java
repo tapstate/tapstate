@@ -74,7 +74,11 @@ public final class MongoDesiredStore implements DesiredStore {
     static Document toDocument(DesiredState desired) {
         return new Document("_id", desired.pipelineId())
                 .append("targetState", desired.targetState().name())
-                .append("revision", desired.revision());
+                .append("revision", desired.revision())
+                .append("purgeState", desired.purgeState())
+                .append("assemblyRevision", desired.assemblyRevision())
+                .append("reassemble", desired.reassemble())
+                .append("rebuiltAtStateEpoch", desired.rebuiltAtStateEpoch());
     }
 
     /** Reconstructs a desired state from its stored document. */
@@ -87,7 +91,20 @@ public final class MongoDesiredStore implements DesiredStore {
             // as a coded io diagnostic rather than a bare null-argument crash while reconstructing.
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
         }
-        return new DesiredState(id, parseState(targetState, id), revision);
+        // Absent reads as false, and that is the one direction it may default in: a document written
+        // before this field existed was written by a stop that could not have asked for anything to be
+        // cleared, so reading it as "clear it" would act on an intent nobody expressed. Unlike the two
+        // fields above it is not treated as corruption when missing -- an older document is a document
+        // this version can still read, which is what makes adding a field backward compatible at all.
+        // Both new fields default the same way and for the same reason as purgeState: an older
+        // document was written by a version that could not have expressed either, so reading it as
+        // "re-assemble" or as "the assembly is unchanged" would act on an intent nobody expressed. A
+        // null assemblyRevision reads as unknown, and the only thing that turns on it is whether a
+        // refusal may be skipped -- so unknown keeps the refusal.
+        return new DesiredState(
+                id, parseState(targetState, id), revision, document.getBoolean("purgeState", false),
+                document.getString("assemblyRevision"), document.getBoolean("reassemble", false),
+                document.get("rebuiltAtStateEpoch") instanceof Number epoch ? epoch.longValue() : null);
     }
 
     /** A stored target state this version does not recognize is corruption, not a bare enum-valueOf crash. */

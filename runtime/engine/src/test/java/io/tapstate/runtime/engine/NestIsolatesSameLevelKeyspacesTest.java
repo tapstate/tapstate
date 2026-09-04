@@ -19,6 +19,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -157,7 +158,7 @@ class NestIsolatesSameLevelKeyspacesTest {
         Step step = Step.inline("customer_doc", FromClause.aliases(aliases), body, null, null);
 
         PipelineResource pipeline = new PipelineResource("p", null,
-                List.of("customers", "policies", "claims", "orders", "items"),
+                List.of(SourceRef.bare("customers"), SourceRef.bare("policies"), SourceRef.bare("claims"), SourceRef.bare("orders"), SourceRef.bare("items")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("customer_doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),

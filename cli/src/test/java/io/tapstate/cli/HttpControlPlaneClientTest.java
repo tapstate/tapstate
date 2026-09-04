@@ -1050,11 +1050,45 @@ class HttpControlPlaneClientTest {
                 "{\"pipelineId\":\"pl1\",\"targetState\":\"RUNNING\",\"revision\":\"rev-abc\"}", seen);
         try {
             LifecycleOutcome outcome =
-                    new HttpControlPlaneClient().lifecycle(baseOf(server), "tok-abc", "pl1", "start");
+                    new HttpControlPlaneClient().lifecycle(baseOf(server), "tok-abc", "pl1", "start", null);
             assertThat(outcome).isEqualTo(new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc"));
             assertThat(seen.get().method()).isEqualTo("POST");
             assertThat(seen.get().path()).isEqualTo("/api/pipelines/pl1:start");
             assertThat(seen.get().authorization()).isEqualTo("Bearer tok-abc");
+            assertThat(seen.get().body()).as("a verb with nothing to say sends nothing").isEmpty();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aStopCarriesTheAnswerItWasGivenInItsBody() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1:stop", 200,
+                "{\"pipelineId\":\"pl1\",\"targetState\":\"STOPPED\",\"revision\":\"rev-abc\"}", seen);
+        try {
+            new HttpControlPlaneClient().lifecycle(baseOf(server), "tok", "pl1", "stop", true);
+
+            // The server refuses a stop that does not state this, so an empty body here is not a smaller
+            // request -- it is a stop that never happens, and the refusal names an argument the terminal
+            // did supply.
+            assertThat(seen.get().body()).isEqualTo("{\"purgeState\":true}");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aStopAskedToKeepSaysSoRatherThanSendingNothing() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1:stop", 200,
+                "{\"pipelineId\":\"pl1\",\"targetState\":\"STOPPED\",\"revision\":\"rev-abc\"}", seen);
+        try {
+            new HttpControlPlaneClient().lifecycle(baseOf(server), "tok", "pl1", "stop", false);
+
+            // Paired with the case above on purpose: "keep" and "did not say" are the two things this
+            // whole argument exists to tell apart, and on the wire they are one character apart.
+            assertThat(seen.get().body()).isEqualTo("{\"purgeState\":false}");
         } finally {
             server.stop(0);
         }
@@ -1067,7 +1101,7 @@ class HttpControlPlaneClientTest {
                 new AtomicReference<>());
         try {
             LifecycleOutcome outcome =
-                    new HttpControlPlaneClient().lifecycle(baseOf(server), "tok", "pl1", "pause");
+                    new HttpControlPlaneClient().lifecycle(baseOf(server), "tok", "pl1", "pause", null);
             assertThat(outcome).isEqualTo(
                     new LifecycleOutcome.Rejected("lifecycle.illegal-transition", "Not running."));
         } finally {
@@ -1082,7 +1116,7 @@ class HttpControlPlaneClientTest {
             closedPort = socket.getLocalPort();
         }
         LifecycleOutcome outcome = new HttpControlPlaneClient()
-                .lifecycle(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1", "start");
+                .lifecycle(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1", "start", null);
         assertThat(outcome).isInstanceOf(LifecycleOutcome.Unreachable.class);
     }
 

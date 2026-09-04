@@ -605,8 +605,23 @@ In the REPL:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> stop order_pipeline
+This clears what the pipeline accumulated:
+  - what its operators had assembled, and the changes they could not assemble
+  - the position it had read and confirmed up to
+  - what the shared mining chain had read, once this is the last pipeline reading it
+The run after this one has no position to carry on from.
+Your target database is not touched either way.
+Clear order_pipeline? Type yes to go ahead [no]: yes
+order_pipeline  stopped
 tapstate(admin@127.0.0.1:8080)> exit
 ```
+
+`stop` is the verb that clears, so it asks first and says what it is about to take. To stop a
+pipeline and keep all of it — so the next start carries on from where this run got to rather than
+reading the whole source again — use `stop order_pipeline --keep-state`, which asks nothing because
+nothing is going. In a script or a CI step, where there is no terminal to answer at, a plain `stop`
+is refused rather than either waiting on input that never arrives or clearing unasked: add `-y` to
+go ahead, or use `--keep-state`.
 
 Then stop the stack and delete its data:
 

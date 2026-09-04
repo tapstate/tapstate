@@ -8,6 +8,7 @@ import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeBlock;
@@ -210,7 +211,8 @@ final class NewCmd implements Callable<Integer> {
             legs.add(new SyncElement("sync_" + (i + 1), syncTo.get(i), null, null, null, null));
         }
         ServeBlock serve = new ServeBlock.Inline("serve", FromRef.regex(".*"), legs, null, null);
-        return new PipelineResource(id, null, List.copyOf(sources), null, null, serve, null, null);
+        return new PipelineResource(id, null, sources.stream().<SourceRef>map(SourceRef::bare).toList(),
+                null, null, serve, null, null);
     }
 
     private int callTransform(PrintWriter err) {
@@ -437,7 +439,7 @@ final class NewCmd implements Callable<Integer> {
         if (resource instanceof SourceResource source) {
             env.put("connector", source.connector());
         } else if (resource instanceof PipelineResource pipe) {
-            env.put("sources", pipe.sources());
+            env.put("sources", pipe.sourceIds());
         } else if (resource instanceof TransformResource transform) {
             env.put("type", transform.body().type());
         } else if (resource instanceof ViewResource view && view.primaryKey() != null) {

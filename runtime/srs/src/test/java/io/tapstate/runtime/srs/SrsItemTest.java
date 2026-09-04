@@ -65,9 +65,15 @@ class SrsItemTest {
     }
 
     @Test
-    void rejectsANullSourcePosition() {
-        assertThatThrownBy(() -> new SrsItem(null, Op.INSERT, 1L, null, Map.of("id", 1), 0L))
-                .isInstanceOf(NullPointerException.class);
+    void acceptsAChangeTheSourceStatedNoPositionAt() {
+        // A source names one position for a run of changes -- "everything up to here has been handed
+        // over" -- so only the change closing that run carries one. Requiring one on every change would
+        // force the runtime to fill the others in, which says a change was read that was not; a run
+        // interrupted between them would then resume past changes it never delivered. Nothing here ranks
+        // by the position anyway: ordering is the ring's own sequence paired with its generation.
+        SrsItem item = new SrsItem(null, Op.INSERT, 1L, null, Map.of("id", 1), 0L);
+
+        assertThat(item.srcPos()).isNull();
     }
 
     @Test

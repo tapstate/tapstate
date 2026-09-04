@@ -52,4 +52,18 @@ public record SourceResource(
     public String kind() {
         return "source";
     }
+
+    /**
+     * Whether this source buffers its changes through the shared replay store.
+     *
+     * <p>On unless the source says otherwise: a source with no {@code srs} block, or one whose block
+     * leaves {@code enabled} unset, is buffered. Only an explicit {@code enabled: false} turns it off.
+     *
+     * <p>It lives on the resource because more than one layer asks -- the capture side to decide how to
+     * run, the control side to decide whether the answer may change right now -- and two readings of a
+     * default are two things that can disagree about a source nobody wrote the field on.
+     */
+    public boolean srsEnabled() {
+        return srs == null || srs.enabled() == null || srs.enabled();
+    }
 }

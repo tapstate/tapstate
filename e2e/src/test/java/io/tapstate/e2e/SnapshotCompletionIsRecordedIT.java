@@ -48,6 +48,7 @@ class SnapshotCompletionIsRecordedIT {
     private static final String TABLE = "orders";
 
     private static final String SRS_META = "srs_meta";
+    private static final String CONSUMERS = "consumerOffsets";
     private static final String COMPLETED = "snapshotCompletedTables";
 
     @TempDir
@@ -117,9 +118,23 @@ class SnapshotCompletionIsRecordedIT {
             String database = new com.mongodb.ConnectionString(storeUri).getDatabase();
             List<String> tables = new ArrayList<>();
             for (Document chain : client.getDatabase(database).getCollection(SRS_META).find()) {
-                Object marked = chain.get(COMPLETED);
-                if (marked instanceof List<?> entries) {
-                    entries.forEach(entry -> tables.add(String.valueOf(entry)));
+                // Completion is recorded against the pipeline that confirmed it, under its own consumer
+                // entry -- a chain-level list would answer every pipeline on the chain with the first
+                // one's answer. This gathers every consumer's, which is what "was it recorded at all"
+                // asks; which pipeline marked it is asserted where two of them exist.
+                Object consumers = chain.get(CONSUMERS);
+                if (!(consumers instanceof Document byPipeline)) {
+                    continue;
+                }
+                for (String pipelineId : byPipeline.keySet()) {
+                    Object consumer = byPipeline.get(pipelineId);
+                    if (!(consumer instanceof Document record)) {
+                        continue;
+                    }
+                    Object marked = record.get(COMPLETED);
+                    if (marked instanceof List<?> entries) {
+                        entries.forEach(entry -> tables.add(String.valueOf(entry)));
+                    }
                 }
             }
             return tables;
