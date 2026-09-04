@@ -53,6 +53,10 @@ printf 'fake-postgres-connector-jar\n' > "$QS_STUB/connectors-preview/postgres-c
 
 trap 'rm -rf "$CLI_STUB" "$QS_STUB"' EXIT
 
+# Set to an executable to place a fake `curl` first on PATH for the next run_prepare, so a test can
+# make a transfer die the way a dropped link does. Empty means the real curl runs.
+CURL_SHIM=""
+
 # Run quickstart.sh's prepare phase in a demo dir with a faked platform.
 #   run_prepare OS ARCH MUSL(glibc|musl) [REUSE_DEMO_DIR]
 # Sets RC, OUT, DEMO. With REUSE_DEMO_DIR the same directory is reused (for the idempotency check).
@@ -78,6 +82,7 @@ EOF
 echo "\$*" >> "$DEMO/.xattr-calls"
 EOF
   chmod +x "$shim/xattr"
+  [ -z "$CURL_SHIM" ] || { cp "$CURL_SHIM" "$shim/curl"; chmod +x "$shim/curl"; }
   OUT="$(cd "$DEMO" && PATH="$shim:$PATH" \
     TAPSTATE_VERSION="${PIN_VERSION-$VERSION}" \
     TAPSTATE_BASE_URL="file://$CLI_STUB" \
@@ -806,6 +811,80 @@ if grep -qE 'repl_status" -ne 0' "$QUICKSTART_SH"; then
 else
   bad "nothing answers a non-zero CLI exit that is neither auth-failed nor not-authenticated"
 fi
+
+# --- a dropped transfer leaves no stump, and the run survives one -----------------------------------
+# Reported from a from-scratch install of a published release: the postgres jar transfer dropped
+# mid-flight three runs in a row, at three different offsets. Two things then went wrong, and the
+# second is the expensive one. The transfer wrote in place, so the partial bytes landed at the real
+# path; the guard below is `[ -f ... ] ||`, existence only, so every later run read the stump as
+# "already have it" and never re-fetched it. The stack came up with a corrupt connector and the
+# failure surfaced three steps downstream, naming a remedy that was the step that had just failed.
+#
+# The fake curl reproduces the drop rather than describing it: it writes a few bytes to wherever -o
+# points and exits 18 (partial file), the code the real one gave, for the first $FAIL_TIMES attempts
+# at that URL. Every other transfer is passed through to the real curl untouched.
+REAL_CURL="$(command -v curl 2>/dev/null || true)"
+DROP_DIR="$(mktemp -d)"
+cat > "$DROP_DIR/curl" <<EOF
+#!/bin/sh
+out=""; url=""; prev=""
+for a in "\$@"; do
+  [ "\$prev" = "-o" ] && out="\$a"
+  case "\$a" in http://*|https://*|file://*) url="\$a" ;; esac
+  prev="\$a"
+done
+case "\$url" in
+  *postgres-connector.jar)
+    n=0; [ -f "$DROP_DIR/n" ] && n="\$(cat "$DROP_DIR/n")"
+    if [ "\$n" -lt "\$(cat "$DROP_DIR/fail_times")" ]; then
+      echo "\$((n + 1))" > "$DROP_DIR/n"
+      [ -n "\$out" ] && printf 'fake-pos' > "\$out"
+      echo "curl: (18) Transferred a partial file" >&2
+      exit 18
+    fi ;;
+esac
+exec "$REAL_CURL" "\$@"
+EOF
+chmod +x "$DROP_DIR/curl"
+JAR_BYTES="$(wc -c < "$QS_STUB/connectors-preview/postgres-connector.jar" | tr -d ' ')"
+
+if [ -z "$REAL_CURL" ]; then
+  bad "no curl on PATH, so the dropped-transfer cases never ran"
+else
+  # One drop, then the link recovers -- which is what a flaky link does. The documented one-liner has
+  # to survive this by itself: a user who must run it again is doing an undocumented manual step.
+  CURL_SHIM="$DROP_DIR/curl"; echo 1 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
+  run_prepare Linux x86_64 glibc
+  DROP1="$DEMO"
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP1/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
+    ok "a transfer that drops once is retried, and the run completes on its own"
+  else
+    bad "one dropped transfer ended the run (rc=$RC, jar=$(wc -c < "$DROP1/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes)"
+  fi
+
+  # A link that never recovers. The run must fail -- but it must not leave a partial file at the real
+  # path, because that is what the next run would accept.
+  CURL_SHIM="$DROP_DIR/curl"; echo 99 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
+  run_prepare Linux x86_64 glibc
+  DROP2="$DEMO"
+  if [ "$RC" -ne 0 ] && [ ! -f "$DROP2/postgres-connector.jar" ]; then
+    ok "a transfer that never completes leaves nothing at the final path"
+  else
+    bad "a stump survived a failed transfer (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes at the real path)"
+  fi
+
+  # And the run after it recovers, which is the half the user actually hits: same directory, working
+  # link, no manual deletion. Under the old guard the stump was read as "already have it" forever.
+  CURL_SHIM=""
+  run_prepare Linux x86_64 glibc "$DROP2"
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP2/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
+    ok "re-running after a failed transfer re-fetches the jar instead of accepting the stump"
+  else
+    bad "the re-run did not recover the jar (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes): $OUT"
+  fi
+  CURL_SHIM=""
+fi
+rm -rf "$DROP_DIR"
 
 # --- summary ----------------------------------------------------------------------------------------
 echo
