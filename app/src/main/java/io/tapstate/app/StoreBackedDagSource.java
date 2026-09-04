@@ -80,6 +80,7 @@ final class StoreBackedDagSource implements DagSource {
     private final TargetModelResolver targetModelResolver;
     private final NestSettings nestSettings;
     private final StoreReachability storeReachability;
+    private final JoinSchemaDrift joinSchemaDrift;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -150,6 +151,7 @@ final class StoreBackedDagSource implements DagSource {
         this.targetModelResolver = new TargetModelResolver(this.storePort);
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
+        this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
     }
 
     @Override
@@ -170,6 +172,13 @@ final class StoreBackedDagSource implements DagSource {
         // twice would mean two answers to the same question with nothing comparing them.
         Map<String, CompiledJoin> compiledJoins =
                 compiledJoins(pipeline, sourceIdByTable(sourceVertices));
+        // Held to the columns it was last recorded producing, before anything is built out of them. A
+        // join's output columns follow from the SELECT and from what the sources say their columns are,
+        // so the same pipeline can start one day producing a differently shaped row than the day before
+        // - and every write of that row succeeds, which is why the difference has to be caught here or
+        // not at all.
+        compiledJoins.forEach((stepId, compiled) -> joinSchemaDrift.checkAndRecord(
+                pipelineId, stepId, compiled.sql(), compiled.plan(), compiled.tables()));
         // A nest or a join emits under the id of the step that produced it rather than under a table name,
         // so the resolution above - which answers per source table - says nothing about it. Registering it
         // here is what lets the sink key its upsert and name the table it writes; without it the sink falls
@@ -989,15 +998,16 @@ final class StoreBackedDagSource implements DagSource {
                 }
             });
         }
+        List<io.tapstate.core.sql.SourceTable> derivedFrom = List.copyOf(tables);
         io.tapstate.core.sql.JoinPlan plan =
-                io.tapstate.core.sql.SqlFrontEnd.derive(join.sql(), List.copyOf(tables));
+                io.tapstate.core.sql.SqlFrontEnd.derive(join.sql(), derivedFrom);
         String driving = plan.factSource().table();
         List<String> key = keyByTable.getOrDefault(driving, List.of());
         if (key.isEmpty()) {
             throw new TapstateException(ActuationError.JOIN_SOURCE_KEY_MISSING,
                     Map.of("step", step.id(), "table", driving), null);
         }
-        return new CompiledJoin(plan, key, Map.copyOf(tableByName));
+        return new CompiledJoin(plan, key, Map.copyOf(tableByName), join.sql(), derivedFrom);
     }
 
     /** The columns of one table, in the shared type vocabulary the plan is derived against. */
@@ -1020,9 +1030,15 @@ final class StoreBackedDagSource implements DagSource {
     /**
      * One join step's plan, the key its driving rows are filed under, and the real table behind each
      * name the plan calls a source by - alias and table name both, since the SQL may write either.
+     *
+     * <p>The two inputs the plan was derived from are carried alongside it. The plan states the answer;
+     * whoever has to say why the answer moved needs what it was worked out from, and needs the author's
+     * input and the world's kept apart - an edited query producing new columns is what the author asked
+     * for, while an untouched query producing new columns is the world having moved under it.
      */
     private record CompiledJoin(io.tapstate.core.sql.JoinPlan plan, List<String> factKeyColumns,
-            Map<String, String> tableByName) {
+            Map<String, String> tableByName, String sql,
+            List<io.tapstate.core.sql.SourceTable> tables) {
     }
 
     private NestBinding nestBinding(PipelineResource pipeline, Map<String, String> sourceIdByTable) {

@@ -87,6 +87,26 @@ public final class SqlFrontEnd {
             "a join condition that is not an equality between two columns";
 
     /**
+     * What worked a plan's output columns out, for whoever records a derivation and later has to say
+     * why it answers differently. Two parts, because two things move: the rules in this class, which
+     * are versioned here by hand, and the library underneath them, whose upgrade is the change this
+     * string most often has to explain.
+     *
+     * <p>The library half is read from the jar manifest and reads {@code unknown} where there is none -
+     * off a build tree, in a shaded jar that dropped it. That is honest rather than useful, and it is
+     * why nothing decides anything on this string: whether the derivation changed is answered by the
+     * columns moving while the query and the source columns did not, which holds whether or not anybody
+     * can name the version.
+     */
+    public static final String DERIVATION_VERSION = "join-derivation/1+calcite/" + libraryVersion();
+
+    private static String libraryVersion() {
+        Package library = SqlParser.class.getPackage();
+        String version = library == null ? null : library.getImplementationVersion();
+        return version == null ? "unknown" : version;
+    }
+
+    /**
      * The first construct in this SQL that a join declaration may not be written with, if any.
      *
      * <p>Reads the text alone -- no schema, no table names, no connection -- so the offline gate

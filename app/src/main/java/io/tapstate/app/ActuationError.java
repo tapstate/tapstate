@@ -64,6 +64,30 @@ enum ActuationError implements TapstateErrorCode {
     JOIN_OUTPUT_KEY_NOT_PUBLISHED("actuation.join-output-key-not-published",
             Set.of("step", "table", "column")),
 
+    /**
+     * A join's output columns no longer match the ones it was recorded producing, and its sources are
+     * what moved: {@code pipeline} and {@code step} name the join, and {@code added} / {@code removed} /
+     * {@code retyped} carry the difference. Ordinary in a change-data product - a column widened, a
+     * type changed - and the operator's to rule on, which is why it is told apart from the same
+     * difference arriving for our reasons ({@link #JOIN_OUTPUT_SCHEMA_ENGINE_CHANGED}). Refused rather
+     * than written through: the target was built for the recorded shape, so the writes succeed and
+     * whatever no longer fits is truncated or rounded with nothing reporting it.
+     */
+    JOIN_OUTPUT_SCHEMA_SOURCE_CHANGED("actuation.join-output-schema-source-changed",
+            Set.of("pipeline", "step", "added", "removed", "retyped")),
+
+    /**
+     * A join's output columns no longer match the ones it was recorded producing, and neither the query
+     * nor the source columns moved - so what changed is how we work them out: {@code pipeline} and
+     * {@code step} name the join, {@code added} / {@code removed} / {@code retyped} carry the
+     * difference, and {@code recordedBy} / {@code nowBy} name the derivation on each side. This is our
+     * compatibility break rather than the operator's, and it should have been caught by the derivation
+     * goldens long before it reached anybody; reaching a user at all means one of them is missing the
+     * shape that moved.
+     */
+    JOIN_OUTPUT_SCHEMA_ENGINE_CHANGED("actuation.join-output-schema-engine-changed",
+            Set.of("pipeline", "step", "added", "removed", "retyped", "recordedBy", "nowBy")),
+
     /** A serve.from regex is invalid; {@code regex} carries the expression. */
     FROM_REGEX_INVALID("actuation.from-regex-invalid", Set.of("regex")),
 

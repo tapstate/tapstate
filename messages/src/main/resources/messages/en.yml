@@ -23,6 +23,12 @@ actuation.join-source-key-missing:
 actuation.join-output-key-not-published:
   message: "Join `{step}` does not publish column `{column}` of its driving table `{table}`, so nothing identifies a row of its result."
   solution: "Add `{column}` to the SELECT as a plain column, for example `SELECT t.{column} AS {column}, ...`. It has to be the column itself and not an expression over it: a computed value need not be unique where the column is, so rows the query says are distinct would be written over one another."
+actuation.join-output-schema-source-changed:
+  message: "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and its sources are what changed. Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}."
+  solution: "Nothing in your pipeline changed - a source table did. Compare the recorded columns with today's and with what the target table actually holds, then either let the target follow the sources, leave the target alone if the values still fit it, or pin the old shape by casting in the SELECT and applying again. Starting before the target can hold the new shape writes rows that succeed and lose data to truncation or rounding."
+actuation.join-output-schema-engine-changed:
+  message: "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and neither the query nor the source columns changed - what changed is how we work them out ({recordedBy} -> {nowBy}). Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}."
+  solution: "Please report this - it is a compatibility break on our side that our own release checks should have caught before you ever saw it. To carry on: either rebuild the target table for the new column types, which may lose data where a type narrowed and so wants a deliberate decision, or stay on the version you were running. Do not simply start again: the new types are not what the target was built for."
 actuation.view-key-missing:
   message: "View `{view}` declares no primary key."
   solution: "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."
