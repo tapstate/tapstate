@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
 
 import org.bson.Document;
@@ -15,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.LongSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -38,6 +40,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * standing failure of a restart witness: the pipeline reads RUNNING, every await passes against values
  * the previous run already landed, and the assertion is vacuous. So the restarted run is made to carry
  * one unrelated new row first, and only a row that actually crosses proves capture came back at all.
+ *
+ * <p>That gate is necessary and it is not sufficient, which these cases were green for a while without
+ * saying. A row that crosses proves some capture is running; it does not say the run this case is about
+ * is the one that carried it, and it does not say that run exists. Both were false here at once -- the
+ * new run had failed to start and the old one, never torn down, went on delivering -- and every await
+ * passed. So the reading the claim rests on is taken through a guard that reads the state and the
+ * per-run record count at the same moment, and the count is the part that tells one run from another.
  *
  * <p>Gated on Docker and on a directory of real connector jars
  * ({@code -Dtapstate.e2e.connectors-dir}); the real-process tier additionally needs the app module
@@ -81,6 +90,7 @@ class RestartResumesTheTailIT {
         String targetUri = SharedMongo.replicaSetUrl("restart_tail_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
+        long droveBefore;
         try (MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle server = tier.launch(storeUri)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
@@ -102,6 +112,9 @@ class RestartResumesTheTailIT {
                 // than only a completed snapshot -- resuming has to have something to resume from.
                 update(source, 1, BEFORE_STOP);
                 awaitName(mongo, target, 1, BEFORE_STOP, "the change the first run captured");
+
+                // What this run reached, so that the run after it can be told from it by its own count.
+                droveBefore = settledRecordCount(control, PIPELINE_ID);
             }
 
             // The downtime window. Nothing is watching the source now, so this change is only ever seen
@@ -115,8 +128,8 @@ class RestartResumesTheTailIT {
                 control.login("e2e", "e2e-password");
                 // No start verb here: the pipeline's desired state is in the store the restart reopened,
                 // so the converge loop brings it back on its own -- issuing start is refused outright as
-                // an illegal transition out of RUNNING. Whether it really came back is what the liveness
-                // gate below settles; the state face alone would say RUNNING either way.
+                // an illegal transition out of RUNNING. Whether it really came back is what the guard on
+                // the reading below settles; the state face alone would say RUNNING either way.
 
                 // Liveness first: an unrelated row written now, crossing now, is what rules out an
                 // assertion that would pass against what the previous run had already landed.
@@ -125,16 +138,14 @@ class RestartResumesTheTailIT {
 
                 awaitName(mongo, target, 2, DURING_DOWNTIME, "the change made while the server was down");
 
-                long written = settledRecordCount(control);
-                assertThat(written)
+                assertThat(settledRecordCount(control, PIPELINE_ID))
                         .as("records the restarted run wrote: resuming costs the downtime change and the "
                                 + "liveness row, re-reading the table costs %d more", SEEDED_ROWS)
                         .isLessThan(SEEDED_ROWS);
 
-                // The claim itself. A resumed run reads no snapshot rows at all, so the entry is either
-                // absent or zero -- both say the table was not read again, and which of the two it is
-                // depends on whether the run published a snapshot face for a phase it never entered.
-                assertThat(control.snapshotRowsRead(PIPELINE_ID).getOrDefault(TABLE, 0L))
+                // The claim itself. A resumed run reads no snapshot rows at all -- but so does a run that
+                // is not there, which is why the reading is taken through the guard rather than raw.
+                assertThat(rowsReadByTheRunThatReplacedTheOneBefore(control, PIPELINE_ID, droveBefore))
                         .as("rows the restarted run read from %s: it resumes from a recorded position, "
                                 + "so the table is not read again at all", TABLE)
                         .isZero();
@@ -163,6 +174,9 @@ class RestartResumesTheTailIT {
             update(source, 1, BEFORE_STOP);
             awaitName(mongo, target, 1, BEFORE_STOP, "the change the first run captured");
 
+            // What this run reached, so that the run after it can be told from it by its own count.
+            long droveBefore = settledRecordCount(control, pipelineId);
+
             // The pair the terminal composes for `restart`: a stop that keeps, then a start.
             control.stop(pipelineId, false);
             control.lifecycle(pipelineId, LifecycleVerb.START);
@@ -172,7 +186,7 @@ class RestartResumesTheTailIT {
             insert(source, LIVENESS_ID, LIVENESS_ROW);
             awaitName(mongo, target, LIVENESS_ID, LIVENESS_ROW, "a row written after the restart");
 
-            assertThat(settledRowsRead(control, pipelineId))
+            assertThat(rowsReadByTheRunThatReplacedTheOneBefore(control, pipelineId, droveBefore))
                     .as("rows the restarted run read from %s: the plain word carries on, so the table is "
                             + "not read again", TABLE)
                     .isZero();
@@ -230,16 +244,50 @@ class RestartResumesTheTailIT {
     }
 
     /**
-     * The restarted run's record count once it stops moving. A single reading is the last one collected
-     * rather than the current total, so a count taken the moment an await returns can be short by
-     * whatever the last collection missed -- and short is the direction that would make this pass.
+     * The rows-read reading, taken only once the run it is a reading of is shown to be there at all and
+     * to be a new one. Two situations answer "it read nought" while the claim above it is false, and both
+     * have been met in this file: a pipeline with no live run answers the snapshot face with nothing, and
+     * the default this reading takes for a missing table turns that into the very value the claim
+     * asserts; and a restart that did not restart leaves the run before it delivering the rows the case
+     * waited for, so they arrive on time while saying nothing about a run that was never built.
+     *
+     * <p>The record count separates all three, because it counts only what the live job drove: it is
+     * absent when there is no job, it is the old figure and still climbing when the old job is the one
+     * still running, and a job that replaced another begins again at nought -- so the one reading that
+     * means "a new run drove these rows" is one above nought and below what the run before it reached.
      */
-    private static long settledRecordCount(ControlPlane control) {
+    private static long rowsReadByTheRunThatReplacedTheOneBefore(
+            ControlPlane control, String pipelineId, long droveBefore) {
+        long read = settledRowsRead(control, pipelineId);
+        assertThat(control.state(pipelineId))
+                .as("the state of %s, whose run this reading is a reading of -- and the reading itself "
+                        + "was %d, which is what the claim below would have accepted from a run that is "
+                        + "not there", pipelineId, read)
+                .contains(PipelineState.RUNNING);
+        assertThat(control.snapshotRowsRead(pipelineId))
+                .as("the snapshot face of %s: with no live run it answers nothing at all, which the "
+                        + "reading taken from it would report as a table that was never read", pipelineId)
+                .containsKey(TABLE);
+        assertThat(settledRecordCount(control, pipelineId))
+                .as("records the live run of %s has driven: the run before it reached %d, so a count at "
+                        + "or above that is that same run still going rather than the new one, and a "
+                        + "count of nought is rows that reached the target by some other route",
+                        pipelineId, droveBefore)
+                .isStrictlyBetween(0L, droveBefore);
+        return read;
+    }
+
+    /**
+     * A reading once it stops moving. Each of these is the job's last collection rather than its current
+     * total, so a sample taken the moment an await returns can be short by whatever that collection
+     * missed -- and short is the direction that would make these cases pass.
+     */
+    private static long settled(LongSupplier reading) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();
         long last = -1;
         long unchangedSince = System.nanoTime();
         while (System.nanoTime() - deadline < 0) {
-            long now = control.recordCount(PIPELINE_ID).orElse(-1L);
+            long now = reading.getAsLong();
             if (now != last) {
                 last = now;
                 unchangedSince = System.nanoTime();
@@ -249,6 +297,11 @@ class RestartResumesTheTailIT {
             sleep();
         }
         return last;
+    }
+
+    /** What the run has driven to its sinks, once that count settles; -1 for as long as none is live. */
+    private static long settledRecordCount(ControlPlane control, String pipelineId) {
+        return settled(() -> control.recordCount(pipelineId).orElse(-1L));
     }
 
     private static void awaitCount(
@@ -359,26 +412,9 @@ class RestartResumesTheTailIT {
                 .formatted(pipelineId);
     }
 
-    /**
-     * What the run has read from the table once that reading stops moving. A single sample is the last
-     * collection rather than the current total, and low is the direction that would make the plain-restart
-     * case pass for the wrong reason.
-     */
+    /** What the run has read from the table, once that reading settles. */
     private static long settledRowsRead(ControlPlane control, String pipelineId) {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        long last = -1;
-        long unchangedSince = System.nanoTime();
-        while (System.nanoTime() - deadline < 0) {
-            long now = control.snapshotRowsRead(pipelineId).getOrDefault(TABLE, 0L);
-            if (now != last) {
-                last = now;
-                unchangedSince = System.nanoTime();
-            } else if (System.nanoTime() - unchangedSince > SETTLE.toNanos()) {
-                return last;
-            }
-            sleep();
-        }
-        return last;
+        return settled(() -> control.snapshotRowsRead(pipelineId).getOrDefault(TABLE, 0L));
     }
 
     private static void sleep() {
