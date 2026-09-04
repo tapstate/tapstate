@@ -36,6 +36,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -293,6 +294,63 @@ class CdcPhaseTest {
                         + "the end instead, this is a single entry and the redo is the whole run",
                         deliveries, perDelivery, perDelivery)
                 .hasSize(deliveries);
+    }
+
+    /**
+     * A write that would take an unread change's place waits for the reader instead.
+     *
+     * <p>The buffer is bounded and a delivery can be larger than it, so something has to give when the
+     * reader is behind: either the write waits, or it goes in and the change nobody has read yet is gone.
+     * The second loses data with nothing to show for it -- the ring reports a healthy tail, the reader
+     * carries on from where it was, and the changes in between were never anywhere else.
+     *
+     * <p>The reader here has read nothing for its first few looks and then catches up, which is what a
+     * slow consumer is from the writer's side. What says the write waited is how often the reader was
+     * asked: the admission re-reads the cursors on every attempt -- it has to, since that is the only
+     * thing that can tell a parked write that room has appeared -- so more looks than there are pieces to
+     * write means attempts that were refused. Without the bound the pieces go straight in and the count
+     * is one look each.
+     *
+     * <p>And nothing was lost while it waited: the whole delivery is in the ring at the end. Both are
+     * needed. A write that simply refused for ever would satisfy the first reading and fail this one.
+     *
+     * <p>Beside the case that drives the gate directly, not instead of it. That one says the gate refuses
+     * and is asked again; this one says a delivery larger than the buffer gets through anyway -- it is cut
+     * into pieces the buffer can hold and each waits its turn, which is a property of the admission above
+     * the gate and not of the gate. Each case is green with the other deleted.
+     */
+    @Test
+    void aWriteThatWouldTakeAnUnreadChangesPlaceWaitsForTheReader() {
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.burstwait"));
+        SrsWriteGate gate = new SrsWriteGate(ring);
+        RecordingMeta meta = new RecordingMeta();
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+
+        int capacity = (int) ring.capacity();
+        int burst = capacity * 2;
+        int pieces = burst / capacity;
+        AtomicInteger looks = new AtomicInteger();
+
+        // Behind for its first few looks, then caught up. The count is what the case reads, so the reader
+        // has to move eventually: one that never did would park the writer for the length of the run.
+        Supplier<Collection<ConsumerOffset>> reader = () -> {
+            long readTo = looks.incrementAndGet() < 5 ? 0L : burst;
+            return List.of(new ConsumerOffset("p1", Map.of("orders", readTo),
+                    new ChainPosition(new SourceOrder(RING_GENERATION, readTo), "w" + readTo)));
+        };
+
+        CdcPhase.run(new BatchingCdcPort(burst, burst), config(), chain, reader, new CaptureHealth());
+
+        assertThat(looks.get())
+                .as("times the writer asked what the reader had reached, over %d pieces: it re-reads on "
+                        + "every attempt, so more than one look per piece is attempts that were refused. "
+                        + "With no bound the pieces go straight in and this is %d", pieces, pieces)
+                .isGreaterThan(pieces);
+        assertThat(ring.tailSequence() + 1)
+                .as("changes in the buffer once the reader caught up: waiting is only right if nothing was "
+                        + "dropped while it waited, and a writer that refused for ever would pass the "
+                        + "reading above and fail this one")
+                .isEqualTo(burst);
     }
 
     /** A consumer acked far past anything these cases deliver, so the clamp never decides the reading. */
