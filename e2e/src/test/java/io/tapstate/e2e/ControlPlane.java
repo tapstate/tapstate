@@ -1008,6 +1008,47 @@ final class ControlPlane {
     }
 
     /**
+     * The resume point this pipeline would start from, reduced to the two things a caller may hand back:
+     * the chain and the token it is standing at. Keyed {@code chainId} and {@code token}, empty when the
+     * face reports no chain yet.
+     *
+     * <p>Reduced rather than carried whole, because the product refuses its own rendering verbatim and is
+     * right to: the document it hands out also carries readings -- when the point was recorded, among
+     * others -- and setting one of those is meaningless, so a write-back that names one is answered with a
+     * coded refusal naming the field. What the round trip is a question about is the token's coordinate
+     * system, not the envelope it arrives in.
+     */
+    Map<String, String> resumePoint(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        expect(response, 200, "read the resume point of " + pipelineId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> document)
+                || !(document.get("chains") instanceof List<?> chains) || chains.isEmpty()
+                || !(chains.getFirst() instanceof Map<?, ?> chain)) {
+            return Map.of();
+        }
+        if (!(chain.get("resumeFrom") instanceof Map<?, ?> point)
+                || !(point.get("token") instanceof String token)) {
+            return Map.of();
+        }
+        return Map.of("chainId", String.valueOf(chain.get("chainId")), "token", token);
+    }
+
+    /**
+     * Puts a chain back at a token, and answers what the product says the pipeline now stands at.
+     *
+     * <p>Only the two settable parts are sent. A body carrying anything the face reports as a reading is
+     * refused, so composing the smallest document that names a point is what a caller has to do.
+     */
+    String writeBackPosition(String pipelineId, String chainId, String token) {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", pipelineId,
+                "chains", List.of(Map.of("chainId", chainId, "resumeFrom", Map.of("token", token)))));
+        HttpResponse<String> response = send(authedPut("/api/pipelines/" + pipelineId + "/position", body));
+        expect(response, 200, "write back the resume point of " + pipelineId);
+        return response.body();
+    }
+
+    /**
      * The durable source position this pipeline has acked for one table, or empty when it has acked none
      * there yet. This is the frontier as a reader sees it: below it, every change is either at a sink or
      * held somewhere it survives a restart from.
@@ -1133,6 +1174,16 @@ final class ControlPlane {
                 .timeout(TIMEOUT)
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+    }
+
+    /** The same request as a replacement rather than a submission, for the one face that takes a PUT. */
+    private HttpRequest authedPut(String path, String body) {
+        return HttpRequest.newBuilder(baseUrl.resolve(path))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + requireCredential())
+                .PUT(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
     }
 

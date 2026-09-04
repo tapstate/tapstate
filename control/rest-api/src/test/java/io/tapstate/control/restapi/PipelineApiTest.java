@@ -391,11 +391,22 @@ class PipelineApiTest {
         });
 
         assertThat(projectedPipelineVerbs)
-                .as("the full pipeline surface — four lifecycle writes and four observation reads — projects "
-                        + "onto the authenticated /api surface (this test boots the whole face bundle)")
+                .as("the full pipeline surface — four lifecycle writes, four observation reads and the two "
+                        + "position verbs — projects onto the authenticated /api surface (this test boots "
+                        + "the whole face bundle)")
                 .containsExactlyInAnyOrder(
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
-                        "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs");
+                        "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
+                        "pipeline.position", "pipeline.set-position");
+
+        // The other direction, and it is the one that was missing. Above, every projected verb is checked
+        // to be a registered one; nothing checked that every registered one is projected. A controller
+        // that exists, is tested, and is simply never mounted answers 404 in the product while its own
+        // tests pass -- which is what happened to the two position verbs, and what this closes.
+        assertThat(projectedPipelineVerbs)
+                .as("every pipeline verb the registry exposes to the terminal has a route: a controller "
+                        + "left out of the face bundle is invisible except as a 404 nobody is testing for")
+                .containsAll(cliExposed.stream().filter(id -> id.startsWith("pipeline.")).toList());
     }
 
     // ---- fixtures ----
@@ -459,6 +470,7 @@ class PipelineApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
+            PipelinePositionTestConfiguration.class,
             AuditedSourceServiceTestConfiguration.class})
     static class TestApp {
 

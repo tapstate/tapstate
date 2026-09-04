@@ -718,6 +718,7 @@ class AuthTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
+            PipelinePositionTestConfiguration.class,
             AuditedSourceServiceTestConfiguration.class})
     static class TestApp {
 
