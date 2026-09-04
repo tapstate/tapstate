@@ -36,6 +36,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -94,6 +95,76 @@ class CaptureRunUnitTest {
         return Envelope.insert(id, "orders", Map.of("id", id), Map.of());
     }
 
+
+    /**
+     * Turning the buffer off between two runs does not lose where the first one got to.
+     *
+     * <p>What the switch decides is whether changes are staged for replay. Where a run begins is decided
+     * by the record, and the record belongs to the chain rather than to the buffer -- so a run that reads
+     * its source directly picks up exactly where a buffered one stopped. When the accounting was kept with
+     * the buffer instead, flipping the switch threw the position away with it and the next run began at the
+     * source's present moment: every change made in between simply never arrived.
+     *
+     * <p>The position is read back out of the record rather than written into the assertion. What it is
+     * exactly is the chain's business; what this case is about is that the second run is handed the same
+     * one, and spelling a token here would make the case fail the day that spelling changes for a reason
+     * nobody cares about.
+     */
+    @Test
+    void aRunThatTurnsTheBufferOffBeginsWhereTheBufferedOneStopped() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource buffered = new FakeSource(List.of(row(1), row(2)), List.of(change(10)));
+        CaptureRun first = runUnit(buffered, meta)
+                .start(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-flip-off"), e -> { });
+        String chain = first.chainId().orElseThrow().value();
+        meta.markSnapshotComplete(chain, "pipe-1", "orders");
+        String recorded = recordedStart(meta, chain);
+
+        FakeSource direct = new FakeSource(List.of(row(1), row(2)), List.of(change(11)));
+        runUnit(direct, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-flip-off"), e -> { });
+
+        assertThat(direct.cdcStart)
+                .as("where the run reads from after the buffer was turned off: the record is the chain's "
+                        + "and not the buffer's, so it is still there to be picked up. Kept with the "
+                        + "buffer, this is the source's present moment and the changes in between are gone")
+                .isEqualTo(CaptureStart.resume(new SourcePosition(recorded)));
+    }
+
+    /**
+     * And the other way, which is a different question rather than the same one mirrored.
+     *
+     * <p>A directly-read run writes its position through a path of its own -- it has no buffer to ride
+     * along with -- so that the record it leaves is one a buffered run can pick up is a second thing to
+     * be true, not a restatement of the first. Both directions are here because an accounting that worked
+     * one way and not the other would look correct from whichever side happened to be tested.
+     */
+    @Test
+    void aRunThatTurnsTheBufferOnBeginsWhereTheDirectOneStopped() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource direct = new FakeSource(List.of(row(1), row(2)), List.of(change(20)));
+        CaptureRun first = runUnit(direct, meta)
+                .start(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-flip-on"), e -> { });
+        String chain = first.chainId().orElseThrow().value();
+        meta.markSnapshotComplete(chain, "pipe-1", "orders");
+        String recorded = recordedStart(meta, chain);
+
+        FakeSource buffered = new FakeSource(List.of(row(1), row(2)), List.of(change(21)));
+        runUnit(buffered, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-flip-on"), e -> { });
+
+        assertThat(buffered.cdcStart)
+                .as("where the run reads from after the buffer was turned back on: what the direct run "
+                        + "wrote is on the chain, so the buffered one that follows it begins there")
+                .isEqualTo(CaptureStart.resume(new SourcePosition(recorded)));
+    }
+
+    /** What the chain says a next run should begin at: the read offset if there is one, else the seam. */
+    private static String recordedStart(InMemoryMeta meta, String chain) {
+        SrsMeta record = meta.read(chain).orElseThrow();
+        String start = record.sourceReadOffset() != null
+                ? record.sourceReadOffset()
+                : record.cdcStartPosition();
+        return Objects.requireNonNull(start, "the first run recorded nothing for the second to pick up");
+    }
     /** A run spec for a config-derived chain (no srs.key). */
     private static CaptureRunSpec spec(ReadMode mode, boolean srsEnabled) {
         return spec(mode, srsEnabled, null);
