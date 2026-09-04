@@ -36,6 +36,15 @@ import java.util.Set;
  * low. Reading it as the truth would then hide whole pages of fact rows, which is a fan-out that
  * silently stops part way. So the count is probed upwards from the hint until a page is absent, and the
  * hint only saves the probing from starting at nothing.
+ *
+ * <p><b>That walk is paid only where an answer that is too low would be wrong.</b> Its last step is the
+ * question that ends it - is the page after the last one there - and the answer is always no; asking a
+ * read-through map about a key that is nowhere in memory is a trip to the layer under it, so each walk
+ * costs one trip that is certain to find nothing. Counting a bucket's pages and removing a fact key from
+ * one both need the true end and pay it. An append does not: it is told by the page it tries that the
+ * page is full, and moves on, so starting from the hint costs an extra attempt in the window where the
+ * hint lags and nothing at all the rest of the time. Neither does the trailing-page trim behind a
+ * removal, which is handed the end the removal already walked to.
  */
 public final class ImapJoinStores implements JoinStores {
 
@@ -117,12 +126,16 @@ public final class ImapJoinStores implements JoinStores {
      * Appends to the last page, moving on a page at a time while the one tried is full. Two writers
      * deciding at once that a page is full both move on and both append to the next one, because the
      * append is what decides rather than the reading that preceded it.
+     *
+     * <p>It starts at the hint rather than walking to the true end, because the page it tries is what
+     * tells it whether it started low - and unlike a count or a removal, being told costs an attempt
+     * rather than an answer that is wrong.
      */
     @Override
     public void indexAdd(String source, String dimensionKey, String factKey) {
         IMap<ReverseBucket.At, ReverseBucket> pages = index(source);
         ReverseBucket head = pages.get(new ReverseBucket.At(dimensionKey, 0));
-        int page = head == null ? 0 : lastPage(pages, dimensionKey, head);
+        int page = head == null ? 0 : head.furtherPages();
         while (!Boolean.TRUE.equals(
                 pages.executeOnKey(new ReverseBucket.At(dimensionKey, page), new Append(factKey, pageSize)))) {
             page++;
@@ -148,7 +161,7 @@ public final class ImapJoinStores implements JoinStores {
                 break;
             }
         }
-        trim(pages, dimensionKey);
+        trim(pages, dimensionKey, last);
     }
 
     /**
@@ -156,13 +169,13 @@ public final class ImapJoinStores implements JoinStores {
      * entries holding nothing - the memory budget over these maps counts entries and is blind to how
      * large one is. Only off the end: an empty page in the middle stays, because removing it would put
      * a hole in the run of pages the count above probes across.
+     *
+     * <p>The end is the one the removal in front of it already walked to, rather than a second walk to
+     * the same place. Nothing between the two opens a page, and were something to, this would start
+     * below the end and trim less - which the next removal's trim does instead.
      */
-    private void trim(IMap<ReverseBucket.At, ReverseBucket> pages, String dimensionKey) {
-        ReverseBucket head = pages.get(new ReverseBucket.At(dimensionKey, 0));
-        if (head == null) {
-            return;
-        }
-        int page = lastPage(pages, dimensionKey, head);
+    private void trim(IMap<ReverseBucket.At, ReverseBucket> pages, String dimensionKey, int end) {
+        int page = end;
         // Read-then-delete would be a page emptied by this thread and refilled by another between the
         // two, so the emptiness is decided where the entry lives and the delete happens there or not
         // at all.

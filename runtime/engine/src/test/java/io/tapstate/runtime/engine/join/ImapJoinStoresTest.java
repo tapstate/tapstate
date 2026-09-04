@@ -130,6 +130,67 @@ class ImapJoinStoresTest {
         assertThat(cold.singles).isEmpty();
     }
 
+    /**
+     * What the page walk costs, which is the one thing about it no other case here says. The walk ends
+     * on the page after the last one, that page is by definition absent, and asking a read-through map
+     * whether a key is there is a read: the answer for a key that is not in memory comes from the layer
+     * under it. So every operation on a bucket pays one trip that is certain to find nothing.
+     *
+     * <p><b>The control arm is the head page, and it is what makes this a measurement.</b> It is asked
+     * for in the same call and it is in memory, so it reaches the layer not at all - without that, a
+     * layer reached once would be indistinguishable from a layer reached for everything.
+     */
+    @Test
+    @DisplayName("counting a bucket's pages costs one trip to the layer, for the page that is not there")
+    void theWalkPastTheLastPageIsATripToTheLayer() {
+        stores.indexAdd(DIMENSION, "d1", "f0");
+        cold.singles.clear();
+
+        assertThat(stores.indexPageCount(DIMENSION, "d1")).isEqualTo(1);
+
+        assertThat(cold.singles)
+                .as("the page after the last, asked of the layer because it is nowhere in memory")
+                .containsExactly("1/d1");
+    }
+
+    /**
+     * The walk is what {@link ImapJoinStores#indexPageCount} and a removal need, and an append does
+     * not: an append that starts below the end is told so by the page it tries, and moves on. Paying
+     * the walk here bought nothing and cost a trip on every fact row that ever joined a bucket, which
+     * on a first load is every fact row there is.
+     */
+    @Test
+    @DisplayName("appending to a bucket reaches the layer not at all")
+    void anAppendDoesNotWalkPastTheEnd() {
+        stores.indexAdd(DIMENSION, "d1", "f0");
+        cold.singles.clear();
+
+        stores.indexAdd(DIMENSION, "d1", "f1");
+
+        assertThat(cold.singles)
+                .as("the head is in memory and nothing else has to be asked about")
+                .isEmpty();
+    }
+
+    /**
+     * A removal walks to the end to find the page holding the key, and the trailing-page trim that
+     * follows it walks to the same end for the same reason. One walk answers both: nothing between
+     * them opens a page, and a walk that starts low trims less rather than wrongly.
+     */
+    @Test
+    @DisplayName("a removal walks past the end once, not once again for the trim behind it")
+    void aRemovalWalksPastTheEndOnce() {
+        stores.indexAdd(DIMENSION, "d1", "f0");
+        stores.indexAdd(DIMENSION, "d1", "f1");
+        cold.singles.clear();
+
+        stores.indexRemove(DIMENSION, "d1", "f0");
+
+        assertThat(cold.singles)
+                .as("the page after the last, asked once for the whole removal")
+                .containsExactly("1/d1");
+    }
+
     @Test
     @DisplayName("a bucket fills a page and opens the next")
     void aBucketPagesAsItGrows() {
