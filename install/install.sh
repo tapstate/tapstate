@@ -92,14 +92,38 @@ $platform
 }
 
 # Download $1 to the file $2 with whichever of curl / wget is present.
+#
+# Attempts resume the partial rather than restarting it -- a link that drops once on a large download
+# tends to drop again, and restarting from zero each time can make no progress at all. The transfer
+# lands in $2.part and is moved into place only once it has completed, so an interrupted one leaves
+# nothing at the real path. The last attempt starts clean, which is the only way past a server that
+# cannot serve ranges, or a .part that is already complete because a run was killed between the
+# transfer and the move.
+#
+# The quickstart carries this function verbatim, deliberately: the two are halves of one documented
+# install path, and a transfer that survives a dropped link in one half but not the other is the same
+# dead install to whoever ran the one-liner.
+#
+# It reports and returns non-zero rather than exiting, so the caller decides: under `set -e` an
+# unguarded call ends the run exactly as it did before, and a caller that can do without the file
+# keeps its own `|| ...`.
 fetch() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" -o "$2"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$1" -O "$2"
-    else
-        die "neither curl nor wget is available to download $1."
-    fi
+    _part="$2.part"
+    _try=0
+    while [ "$_try" -lt 3 ]; do
+        _try=$((_try + 1))
+        [ "$_try" -lt 3 ] || rm -f "$_part"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 2 -C - "$1" -o "$_part" && { mv -f "$_part" "$2"; return 0; }
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -c "$1" -O "$_part" && { mv -f "$_part" "$2"; return 0; }
+        else
+            die "neither curl nor wget is available to download $1."
+        fi
+    done
+    printf 'install: could not download %s -- %s attempts, the last from scratch. Whatever arrived is\n' "$1" "$_try" >&2
+    printf 'install: kept at %s, so a later run resumes it rather than starting over.\n' "$_part" >&2
+    return 1
 }
 
 # The version to install: the caller's override, or the pin above. The /releases/latest redirect is
