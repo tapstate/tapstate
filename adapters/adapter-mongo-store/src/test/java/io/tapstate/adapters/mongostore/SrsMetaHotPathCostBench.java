@@ -80,6 +80,12 @@ class SrsMetaHotPathCostBench {
      */
     private static final int WIDE_TABLES = 100;
 
+    /**
+     * How many changes one burst carries. Large enough that the steady state dominates the first few
+     * round trips, small enough that the whole bench still finishes in a coffee break.
+     */
+    private static final int BURST = 2000;
+
     private static final int WARMUP = 20;
     private static final int RUNS = 200;
 
@@ -131,6 +137,71 @@ class SrsMetaHotPathCostBench {
      * twice under one name: the hot path makes two of them per run today, and what a run pays is the
      * pair, not one of them.
      */
+    /**
+     * What a burst of changes actually sustains, end to end, rather than what adding two medians predicts.
+     *
+     * <p>The rest of this bench times one touch at a time and reports a median. A rate built by adding
+     * two of those medians and inverting the sum is arithmetic, not a measurement: it assumes every
+     * round trip pays the median, that nothing overlaps, and that the record's working set behaves the
+     * same on the two-thousandth change as on the first. None of those is a safe assumption, and which
+     * way they push is not obvious in advance -- connection reuse and the driver's pipelining make the
+     * real rate higher, while the growth of the record and the write concern's durability make it lower.
+     *
+     * <p>So this drives the two touches the hot path actually makes per change -- one projected read of
+     * the consumer cursors, one advance of the read offset -- back to back with nothing in between, and
+     * times the whole run. The per-change touch count is not assumed here either; it is pinned by a case
+     * elsewhere that counts the calls rather than timing them.
+     *
+     * <p>Two shapes, and the pair is the point. A chain with no schema history is what a young one looks
+     * like; one with five hundred entries is what a long-lived one becomes, since nothing trims that
+     * history. If the projection is doing its job the two rates are close, and if it ever stops the
+     * second collapses.
+     *
+     * <p>What this does not include: any connector, any Jet vertex, any ring. It is the coordination
+     * record's own ceiling -- the thing that has to be higher than the rate a source can deliver, not
+     * an end-to-end throughput figure.
+     */
+    @Test
+    void whatABurstOfChangesSustainsAgainstTheRecord() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("tapstate");
+            MongoCollection<Document> collection = database.getCollection("srs_meta");
+            MongoSrsMetaStore store = new MongoSrsMetaStore(collection);
+
+            System.out.println("consumers,ddls,doc_bytes,path,changes,elapsed_ms,sustained_ev_s");
+            burst(store, collection, 16, 0);
+            burst(store, collection, 16, 500);
+        }
+    }
+
+    /** One burst against a record of the given shape, timed as a whole. */
+    private static void burst(
+            MongoSrsMetaStore store, MongoCollection<Document> collection, int consumers, int ddls) {
+        String chain = "burst-c" + consumers + "-d" + ddls;
+        seed(store, chain, consumers, ddls, 0, TABLES);
+        long bytes = documentBytes(collection, chain);
+
+        // Warmed so that what is timed is the rate a burst settles at, not the cost of getting there.
+        for (int i = 1; i <= WARMUP; i++) {
+            store.consumerOffsets(chain);
+            store.advanceSourceReadOffset(chain, position(i));
+        }
+
+        long start = System.nanoTime();
+        for (int i = 1; i <= BURST; i++) {
+            store.consumerOffsets(chain);
+            // Strictly ahead of everything written so far, so every write takes the matching path --
+            // the repeated-advance path is a different cost and is measured on its own above.
+            store.advanceSourceReadOffset(chain, position(WARMUP + i));
+        }
+        long elapsed = System.nanoTime() - start;
+
+        System.out.printf(
+                "%d,%d,%d,burst-sustained,%d,%d,%d%n",
+                consumers, ddls, bytes, BURST, elapsed / 1_000_000L,
+                BURST * 1_000_000_000L / Math.max(elapsed, 1));
+    }
+
     private static void measureShape(
             MongoSrsMetaStore store, MongoCollection<Document> collection, int consumers, int ddls) {
         measureShape(store, collection, consumers, ddls, 0);
