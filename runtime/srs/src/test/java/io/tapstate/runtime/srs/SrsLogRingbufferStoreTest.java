@@ -142,6 +142,60 @@ class SrsLogRingbufferStoreTest {
         });
     }
 
+
+    /**
+     * A reader on a rebuilt ring gets back what was written before the process went away.
+     *
+     * <p>The case above it says the log keeps the changes and that a rebuilt ring numbers on from where
+     * the log left off rather than from zero. Neither says anybody can read them. That is the half that
+     * matters: after a restart the ring holds nothing, and a consumer carries a cursor pointing at
+     * sequences written before it -- so every one of those reads lands below the head of an empty ring,
+     * and what answers is the record or nothing.
+     *
+     * <p>What this does not say is that anything in the product asks for such a read, and as of this
+     * writing nothing does. A reader placed at the earliest point starts at the ring's head, not below it;
+     * a consumer that is merely behind cannot be overwritten, because the write-side headroom bound is the
+     * minimum over the consumers in the record and holds the ring open for it; and a restart re-mines the
+     * ring from the durable source read offset rather than replaying what was written down. So the read
+     * below the head is a capacity of the ring that no caller currently reaches.
+     *
+     * <p>Which leaves the record earning its keep on the case above rather than on this one: a rebuilt ring
+     * numbers on from the largest sequence the record has seen, so a sequence recorded before a restart
+     * still names the same change afterwards. This case pins the other half of that composition -- that a
+     * rebuilt ring routes a below-head read to the record rather than failing it -- so the capacity is
+     * witnessed and stays witnessed if a caller is ever pointed at it.
+     */
+    @Test
+    @DisplayName("a rebuilt ring serves a sequence below its head from the record rather than failing it")
+    void readsBackWhatWasWrittenBeforeTheMemberWentAway() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> {
+            member.getRingbuffer(RING).add(item("before-the-restart", 1L));
+            member.getRingbuffer(RING).add(item("also-before", 2L));
+        });
+
+        // The member is gone and with it the ring. Only the log is left.
+        withMember(log, member -> {
+            SrsRingbuffer rebuilt = new SrsRingbuffer(member.getRingbuffer(RING));
+
+            // The precondition, asserted rather than assumed: the rebuilt ring numbers on from the log, so
+            // sequence 0 is behind its head and cannot be answered out of memory.
+            assertThat(rebuilt.headSequence())
+                    .as("where the rebuilt ring begins: it carries on from the log's largest sequence, so "
+                            + "a cursor left pointing at 0 is asking for something the ring never held")
+                    .isGreaterThan(0L);
+
+            SrsItem readBack = rebuilt.readOne(0L);
+            assertThat(readBack)
+                    .as("a change written before the process went away, asked for after it came back: the "
+                            + "ring is empty, so the record is the only place left it can come from")
+                    .isNotNull();
+            assertThat(readBack.srcPos().token())
+                    .as("and it is the change that was written at that sequence")
+                    .isEqualTo("before-the-restart");
+        });
+    }
+
     private static SrsItem item(String token, long ts) {
         return new SrsItem(new SourcePosition(token), Op.INSERT, ts, null, Map.of("id", ts), 0L);
     }
