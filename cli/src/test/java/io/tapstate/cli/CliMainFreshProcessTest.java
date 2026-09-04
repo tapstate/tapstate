@@ -80,6 +80,54 @@ class CliMainFreshProcessTest {
         }
     }
 
+    /**
+     * A server older than the CLI is healthy, answers no version, and has nothing serving the issuer
+     * endpoint - so its authentication filter refuses that path like any other unknown one. Measured
+     * against the published 0.3.0 image, which answers exactly this. The refusal used to reach an
+     * unchecked cast and kill the process with a Java stack trace, which is why the claim is made over
+     * a real process rather than over the gate alone: what a user sees is the whole complaint.
+     */
+    @Test
+    void aServerThatRefusesIssuerDiscoveryIsReportedRatherThanCrashingTheProcess(@TempDir Path home)
+            throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            boolean health = "/healthz".equals(exchange.getRequestURI().getPath());
+            byte[] body = health ? new byte[0] : ("{\"code\":\"control.unauthenticated\",\"params\":{},"
+                    + "\"message\":\"This operation requires authentication.\"}")
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(health ? 200 : 401, health ? -1 : body.length);
+            if (!health) {
+                try (OutputStream out = exchange.getResponseBody()) {
+                    out.write(body);
+                }
+            }
+            exchange.close();
+        });
+        server.start();
+        try {
+            URI seed = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            awaitServerReady(seed);
+
+            ProcessResult result = runCli(home, workspace, Map.of("TAPSTATE_PASSWORD", "secret"),
+                    "-c", seed.toString(), "-u", "admin", "connectors");
+
+            assertThat(result.stderr())
+                    .as("the refusal is reported as a coded diagnostic, carrying what the server said")
+                    .contains("cli.issuer-discovery-rejected")
+                    .contains("control.unauthenticated")
+                    .doesNotContain("ClassCastException")
+                    .doesNotContain("Exception in thread");
+            assertThat(result.exitCode())
+                    .as("a refused seed is a diagnosed failure, not a success")
+                    .isNotZero();
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void environmentMachineTokenWinsWithoutConsultingHumanCache(@TempDir Path home) throws Exception {
         Path workspace = Files.createDirectory(home.resolve("orders"));
