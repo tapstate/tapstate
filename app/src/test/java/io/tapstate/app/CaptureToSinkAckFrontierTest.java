@@ -38,6 +38,8 @@ import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
+import io.tapstate.runtime.srs.SrsDurableFrontier;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
@@ -101,6 +103,9 @@ import org.junit.jupiter.api.Test;
 class CaptureToSinkAckFrontierTest {
 
     private static final String PIPELINE = "p";
+
+    /** The peer that reads the same source directly -- the one this file did not have. */
+    private static final String DIRECT_PIPELINE = "p_direct";
     private static final String SOURCE_ID = "orders_src";
     private static final String DEST_ID = "orders_dest";
     private static final String TABLE = "orders";
@@ -329,6 +334,118 @@ class CaptureToSinkAckFrontierTest {
         DagSource dagSource = wrapDag.apply(new StoreBackedDagSource(store, capturingSink));
         return new EngineLifecycleActuator(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
+    }
+
+    /**
+     * A pipeline reading its source directly still counts when the chain works out what it may forget.
+     *
+     * <p>Turning the shared buffer off changes where a pipeline reads from. It must not change whether the
+     * chain knows it is there: the frontier is the slowest consumer's acked position, and a consumer the
+     * frontier cannot see is one it will pass -- taking the record past changes that pipeline has not
+     * landed, which is the loss that leaves nothing behind to find.
+     *
+     * <p>Two consumers, and that is not decoration. With one, a frontier that has lost sight of it takes a
+     * minimum over nothing and returns nothing at all -- the same answer as a frontier that is correctly
+     * held back, so the case would pass either way. It takes a second, faster consumer for "the slow one
+     * was ignored" and "the slow one held it" to be different values.
+     *
+     * <p>The faster one is moved ahead by hand rather than by racing it. What is under test is whether the
+     * direct pipeline is in the set the minimum is taken over, and a race that happened to leave them level
+     * would make the two readings equal again -- passing, and saying nothing.
+     *
+     * <p>No mutation stands behind this one, and the reason is worth more than a mutation would be: there
+     * is no branch to break. What puts a pipeline in that set is the acknowledgement wiring, and the wiring
+     * walks the pipeline's sources and resolves each one's chain without ever reading the buffering switch.
+     * A direct pipeline is not admitted by a special case; it is admitted because nothing asks. So this is
+     * a guard against that distinction being introduced rather than a witness of it being absent -- and it
+     * is not a vacuous one: it reddens the day anyone adds the branch, which is the day it would matter.
+     */
+    @Test
+    @DisplayName("a directly-read pipeline is still one of the consumers the frontier waits for")
+    void aDirectlyReadPipelineStillCountsInTheChainsFrontier() {
+        InMemoryStorePort store = seedStoreWithADirectPeer();
+        GatedSource gatedSource = new GatedSource();
+        LifecycleActuator actuator = wireRuntime(store, gatedSource, UnaryOperator.identity());
+
+        SrsMetaStore meta = store.meta();
+        String chainId = SourceCaptureResolution
+                .of(StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID)).chainId().value();
+
+        actuator.start(PIPELINE);
+        actuator.start(DIRECT_PIPELINE);
+        try {
+            gatedSource.feed(change(0));
+            awaitSinkSize(2);
+            awaitConsumers(meta, chainId, 2);
+
+            assertThat(meta.consumerOffsets(chainId))
+                    .as("the consumers the chain knows about: the switch decides where a pipeline reads "
+                            + "from, not whether the chain can see it")
+                    .extracting(ConsumerOffset::pipelineId)
+                    .containsExactlyInAnyOrder(PIPELINE, DIRECT_PIPELINE);
+
+            ChainPosition acked = directAckedPosition(meta, chainId);
+            assertThat(acked).as("the direct pipeline's own acked position").isNotNull();
+
+            // The other one races ahead. By hand, because what is under test is membership of the set the
+            // minimum is taken over -- and a race that left them level would make both readings equal.
+            ChainPosition farAhead = new ChainPosition(
+                    new SourceOrder(acked.order().epoch(), acked.order().seq() + 1_000), "src-far");
+            meta.advanceSinkAcked(chainId, PIPELINE, farAhead);
+
+            assertThat(SrsDurableFrontier.safeAdvance(farAhead, meta.consumerOffsets(chainId)))
+                    .as("what the chain may forget once one consumer has run far ahead: the direct one is "
+                            + "still in the minimum, so the answer is where it got to and not where the "
+                            + "fast one did. Left out of the set, this is the fast one's position and the "
+                            + "record moves past changes the direct pipeline has not landed")
+                    .contains(acked);
+        } finally {
+            actuator.stop(DIRECT_PIPELINE, true);
+            actuator.stop(PIPELINE, true);
+        }
+    }
+
+    /** The direct pipeline's acked position, or null while it has acked nothing. */
+    private static ChainPosition directAckedPosition(SrsMetaStore meta, String chainId) {
+        return meta.consumerOffsets(chainId).stream()
+                .filter(offset -> DIRECT_PIPELINE.equals(offset.pipelineId()))
+                .map(ConsumerOffset::sinkAcked)
+                .filter(java.util.Objects::nonNull)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private void awaitConsumers(SrsMetaStore meta, String chainId, int expected) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        while (meta.consumerOffsets(chainId).size() < expected
+                || directAckedPosition(meta, chainId) == null) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("timed out waiting for " + expected
+                        + " consumers with the direct one having acked; the chain knew "
+                        + meta.consumerOffsets(chainId));
+            }
+            park();
+        }
+    }
+
+    /**
+     * The seeded store with a second pipeline over the same source, reading it directly.
+     *
+     * <p>The same source declaration for both, which is what puts them on one chain: what a chain is keyed
+     * on is the connection, and the buffering switch sits on the pipeline's reference to the source rather
+     * than on the source.
+     */
+    private static InMemoryStorePort seedStoreWithADirectPeer() {
+        InMemoryStorePort store = seedStore();
+        store.artifacts().save(new PipelineResource(DIRECT_PIPELINE, null,
+                List.of(SourceRef.spec(SOURCE_ID, false)),
+                List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
+                        new TransformBody.Filter("true"), null, null)),
+                null,
+                new ServeBlock.Inline(null, FromRef.literal("keep_all"),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        return store;
     }
 
     private static Envelope change(int id) {
