@@ -134,7 +134,7 @@ class CdcPhaseTest {
                 Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 1, "n", 9), Map.of()),
                 Envelope.delete(3, "orders", Map.of("id", 1), Map.of())));
 
-        CdcPhase.run(port, config(), chain, List::of, new CaptureHealth());
+        CdcPhase.run(port, config(), chain, () -> List.of(keepingUp()), new CaptureHealth());
 
         assertThat(ring.tailSequence()).isEqualTo(2L);
         SrsItem first = ring.readOne(0);
@@ -204,6 +204,147 @@ class CdcPhaseTest {
                 .isLessThanOrEqualTo(5);
     }
 
+
+    /**
+     * A burst larger than the buffer is carried whole, and costs one durable write rather than one per
+     * change.
+     *
+     * <p>This is the shape a cleanup transaction makes: a source hands over thousands of changes in a
+     * single delivery. Two things have to be true of it and they pull in opposite directions -- every
+     * change has to get through, and getting them through must not cost a round trip each. An
+     * implementation that wrote per change satisfies the first and fails the second; one that dropped
+     * what would not fit satisfies the second and fails the first. Neither reading alone is worth
+     * anything, which is why both are here.
+     *
+     * <p>Said plainly: neither half of this one has a witness. Refusing a burst that will not fit rather
+     * than admitting it -- the obvious way to break the first -- was tried and left this green, and it was
+     * not chased down whether that is the wrong site or a change the ring does not observe. The second
+     * rests on where the advance sits: outside the loop over the delivery's changes, so it happens once
+     * however many there are. Moving it inside is a restructuring, not an edit. So this stands as a
+     * regression guard on a shape that is currently right, and says so rather than implying more.
+     *
+     * <p>Counted rather than timed. What a burst costs in microseconds is a fact about the machine that
+     * ran it, and the figure it would be compared against is from another one; what it costs in writes to
+     * the record is the same everywhere. And that every change got through is read off the sequence the
+     * buffer assigned, not off a clock: it says all of them were admitted whether or not any is still in
+     * memory, which for a burst past the buffer's size is the only honest way to ask.
+     */
+    @Test
+    void aBurstPastTheBufferGetsThroughWholeAndCostsOneWrite() {
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.burst"));
+        SrsWriteGate gate = new SrsWriteGate(ring);
+        // A consumer that is well ahead of anything this delivers. Without one the frontier has nothing
+        // to take a minimum over and never moves at all -- measured: with no consumers both readings
+        // below are nought, which would read as "it wrote nothing" and mean "nobody asked it to".
+        CountingMeta meta = new CountingMeta(List.of(keepingUp()));
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+
+        int burst = (int) ring.capacity() * 6;
+        BatchingCdcPort port = new BatchingCdcPort(burst, burst);
+
+        CdcPhase.run(port, config(), chain, () -> meta.consumerOffsets("chain"), new CaptureHealth());
+
+        assertThat(ring.tailSequence() + 1)
+                .as("changes the buffer took in from a burst of %d -- %d is its whole capacity, so this "
+                        + "asks whether the delivery got through rather than whether it still fits",
+                        burst, ring.capacity())
+                .isEqualTo(burst);
+        assertThat(meta.writes)
+                .as("writes to the record that burst cost: the offset is advanced once at the close of a "
+                        + "delivery, so a burst is one write however many changes it carries. One per "
+                        + "change would be %d", burst)
+                .isEqualTo(1);
+    }
+
+    /**
+     * The offset is written at the close of every delivery, which is what bounds how much a restart redoes.
+     *
+     * <p>A run that stops carries on from the last offset it wrote, so everything after that one is
+     * delivered a second time. What that costs is therefore decided entirely by how often the offset is
+     * written: at the close of each delivery, the most that can be redone is the delivery that was in
+     * flight. Written once at the end of the whole run instead, everything since the run began is redone
+     * -- unbounded in the only sense that matters, since a tail does not end.
+     *
+     * <p>So the reading is the number of advances against the number of deliveries. It is the mechanism
+     * rather than the consequence, and deliberately: measuring the redo directly needs a run to be cut at
+     * a chosen instant, and an instant chosen by a test is not the one a failure picks. The count of
+     * advances says the bound holds wherever the cut lands.
+     */
+    @Test
+    void theOffsetIsWrittenPerDeliveryWhichIsWhatBoundsARedo() {
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.redo")));
+        RecordingMeta meta = new RecordingMeta();
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+
+        int perDelivery = 4;
+        int deliveries = 5;
+        BatchingCdcPort port = new BatchingCdcPort(perDelivery * deliveries, perDelivery);
+
+        CdcPhase.run(port, config(), chain, () -> List.of(keepingUp()), new CaptureHealth());
+
+        assertThat(meta.advances)
+                .as("positions written over %d deliveries of %d changes each: one at the close of each, so "
+                        + "a run cut anywhere redoes at most the %d that were in flight. Written once at "
+                        + "the end instead, this is a single entry and the redo is the whole run",
+                        deliveries, perDelivery, perDelivery)
+                .hasSize(deliveries);
+    }
+
+    /** A consumer acked far past anything these cases deliver, so the clamp never decides the reading. */
+    private static ConsumerOffset keepingUp() {
+        return new ConsumerOffset("p1", Map.of("orders", 99_999L),
+                new ChainPosition(new SourceOrder(RING_GENERATION, 99_999), "w99999"));
+    }
+
+    /**
+     * A source that hands its changes over in deliveries of a chosen size, each with one position.
+     *
+     * <p>The port beside this one hands every change over on its own, which cannot tell "once per
+     * delivery" from "once per change" -- with one change per delivery the two are the same number. The
+     * size is what makes them different figures, so it is a parameter here.
+     */
+    private static final class BatchingCdcPort implements CapturePort {
+
+        private final int changes;
+        private final int perDelivery;
+        private final Supplier<SourcePosition> positions = sourceStatedPositions();
+
+        BatchingCdcPort(int changes, int perDelivery) {
+            this.changes = changes;
+            this.perDelivery = perDelivery;
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            List<Envelope> delivery = new ArrayList<>(perDelivery);
+            for (int change = 1; change <= changes; change++) {
+                delivery.add(Envelope.insert(change, "orders", Map.of("id", change), Map.of()));
+                if (delivery.size() == perDelivery) {
+                    listener.onBatch(List.copyOf(delivery), Optional.of(positions.get()));
+                    delivery.clear();
+                }
+            }
+            if (!delivery.isEmpty()) {
+                listener.onBatch(List.copyOf(delivery), Optional.of(positions.get()));
+            }
+            return () -> { };
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+    }
     /**
      * A store that answers the cursor read directly, the way the shipped one does, and counts every way
      * it is touched. The distinction between the two read counters is the point: a store that dropped the
