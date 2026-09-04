@@ -122,7 +122,7 @@ services:
     # tree adds the build back through docker-compose.dev.yml, which only exists inside the repository.
     # The tag is pinned rather than floating, so a demo brought up months apart runs the same server
     # both times; the quickstart smoke fails the build if it drifts from the version being built.
-    image: ghcr.io/tapstate/tapstate:0.4.1
+    image: ghcr.io/tapstate/tapstate:0.4.3
     depends_on:
       mongo:
         condition: service_healthy
