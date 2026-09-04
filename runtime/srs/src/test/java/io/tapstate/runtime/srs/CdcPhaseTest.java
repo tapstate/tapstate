@@ -216,12 +216,17 @@ class CdcPhaseTest {
      * what would not fit satisfies the second and fails the first. Neither reading alone is worth
      * anything, which is why both are here.
      *
-     * <p>Said plainly: neither half of this one has a witness. Refusing a burst that will not fit rather
-     * than admitting it -- the obvious way to break the first -- was tried and left this green, and it was
-     * not chased down whether that is the wrong site or a change the ring does not observe. The second
-     * rests on where the advance sits: outside the loop over the delivery's changes, so it happens once
-     * however many there are. Moving it inside is a restructuring, not an edit. So this stands as a
-     * regression guard on a shape that is currently right, and says so rather than implying more.
+     * <p>The first half is witnessed: admitting only the first piece of a burst reddens it, alone among
+     * the cases in this file. That is where the decision is -- a delivery larger than the buffer is taken
+     * in a piece at a time, each waiting for room, so what makes a burst arrive whole is that loop and not
+     * the policy on any one append. Refusing an append that will not fit was tried first and left this
+     * green, which is the wrong site rather than an absent one: the pieces are cut to the buffer's size,
+     * so no append ever does not fit.
+     *
+     * <p>The second half is not witnessed and this says so. It rests on where the advance sits -- outside
+     * the loop over a delivery's changes, so it happens once however many there are -- and moving it
+     * inside is a restructuring rather than an edit. For that half this is a regression guard on a shape
+     * that is currently right, which is less than a witness and is not written up as one.
      *
      * <p>Counted rather than timed. What a burst costs in microseconds is a fact about the machine that
      * ran it, and the figure it would be compared against is from another one; what it costs in writes to
