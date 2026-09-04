@@ -142,7 +142,7 @@ probe="$(printf '\xE4\xB8\xAD')"   # U+4E2D, written as bytes so this file stays
 first_allowed="$(printf '%s' "$allowed_hex" | cut -d' ' -f1)"
 allowed_char="$(perl -CSD -e 'print chr(hex($ARGV[0]))' "$first_allowed")"
 
-if ! printf '%s' "$probe" | grep -qP "$UNKNOWN"; then
+if ! grep -qP "$UNKNOWN" <<<"$probe"; then
   echo "::error::the check did not flag a character that is not on the allow-list, so nothing it reports can be trusted."
   exit 1
 fi
@@ -150,7 +150,7 @@ if printf '%s' "Tapstate" | grep -qP "$UNKNOWN"; then
   echo "::error::the check flagged plain ASCII, so nothing it reports can be trusted."
   exit 1
 fi
-if printf '%s' "$allowed_char" | grep -qP "$UNKNOWN"; then
+if grep -qP "$UNKNOWN" <<<"$allowed_char"; then
   echo "::error::the check flagged U+${first_allowed}, which is on the allow-list: the list was read but never reached the pattern."
   exit 1
 fi
