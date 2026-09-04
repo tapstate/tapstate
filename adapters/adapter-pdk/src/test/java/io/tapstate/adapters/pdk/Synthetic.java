@@ -123,6 +123,43 @@ final class Synthetic {
     }
 
     /**
+     * Reads its own state map, writes to it, and reports on every row it emits what it read there.
+     *
+     * <p>A connector's notes to itself are invisible from outside it - nothing above the connector can
+     * look into the map it was handed. So the connector is made to say what it found: each row carries a
+     * {@code seen} column holding the value the map answered before this drive overwrote it, or the
+     * string {@code null} when the map was empty. A drive that finds what an earlier drive wrote reads
+     * {@code written}; one handed a fresh map reads {@code null}, and the two are not confusable.
+     *
+     * <p>Both read functions do the same thing, so the same connector answers two different questions:
+     * a snapshot followed by a stream asks whether the two phases of one run share a map, and a snapshot
+     * followed by another snapshot asks whether one run's map is still there for the next.
+     */
+    static Path stateRecordingSource(Path dir) {
+        String recallAndRecord = ""
+                + "Object seen = context.getStateMap().get(\"mark\");"
+                + "context.getStateMap().put(\"mark\", \"written\");"
+                + "Map<String,Object> r = new LinkedHashMap<>();"
+                + "r.put(\"id\", 1); r.put(\"seen\", String.valueOf(seen));"
+                + "List<TapEvent> evs = new ArrayList<>();";
+        String register = ""
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + recallAndRecord
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "});"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + recallAndRecord
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "  consumer.streamReadEnded();"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.StateRecordingSource",
+                source("StateRecordingSource", "", register));
+    }
+
+    /**
      * A source whose batchRead emits one row per column of the table it is handed, so a read through a
      * bare, fieldless table yields nothing. The scaffold's discovery reports one-column {@code t1}, so a
      * drive that passes the discovered table reads one row and a drive that passes a bare name reads zero.
