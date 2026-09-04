@@ -12,7 +12,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -272,8 +271,7 @@ class JoinDriverTest {
         }
         assertThat(fixture.stores.indexPageCount("c", fixture.dimensionKeyOf(1L)))
                 .as("two pages, so a page-at-a-time read is visible as two") .isEqualTo(2);
-        fixture.stores.batchReads = 0;
-        fixture.stores.keysRead = 0;
+        fixture.stores.forgetCounts();
 
         fixture.apply(dimension("c",
                 update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
@@ -281,6 +279,97 @@ class JoinDriverTest {
         assertThat(fixture.stores.keysRead).isEqualTo(8);
         assertThat(fixture.stores.batchReads).as("both pages in one read, not one read each")
                 .isEqualTo(1);
+    }
+
+    /**
+     * The mirror reads a first load makes, which are the ones there are most of - one per row of the
+     * table. Every row of a snapshot arrives carrying no before image, so each asks the mirror what
+     * that key used to hold, and on a first load the answer is always nothing. Asked a key at a time
+     * that is a round trip per row; asked as the batch it arrived in it is one for the batch, and both
+     * answer identically - so nothing but a count of the asking says which one happened.
+     *
+     * <p>The batch is read before any of it is taken in, so what it holds is what the mirror held
+     * before the batch. A key the batch itself writes is dropped from it as that write happens, which
+     * is what {@link #aRepeatedKeyInOneBatchSeesTheEarlierChange} is about.
+     */
+    @Test
+    @DisplayName("a batch of arriving fact rows asks the mirror once, not once per row")
+    void aBatchOfFactRowsAsksTheMirrorOnce() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        List<SourceChange> batch = new ArrayList<>();
+        for (long id = 0; id < 8; id++) {
+            batch.add(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        fixture.stores.forgetCounts();
+
+        fixture.applyBatch(batch);
+
+        assertThat(fixture.stores.singleReads)
+                .as("not a round trip per row of the snapshot").isZero();
+        assertThat(fixture.stores.batchReads)
+                .as("the whole batch's keys asked for once").isEqualTo(1);
+        assertThat(fixture.stores.keysRead).isEqualTo(8);
+    }
+
+    /**
+     * What reading a batch up front must not cost: a second change to a key the same batch already
+     * changed has to see the first one. Reading the batch before taking any of it in makes the answer
+     * for every key the pre-batch answer, and a key written half way through the batch stops agreeing
+     * with it right there.
+     *
+     * <p>Here the same order moves from one customer to another and then to a third, in one batch. If
+     * the second change were served the pre-batch image it would read the move as being from the first
+     * customer rather than the second, and take the row out of a bucket it is no longer in while
+     * leaving it in the one it is - a fan-out that sends a row it should not and misses one it should,
+     * with nothing reporting either.
+     */
+    @Test
+    @DisplayName("a key changed twice in one batch sees the earlier change, not the batch's first read")
+    void aRepeatedKeyInOneBatchSeesTheEarlierChange() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        for (long id = 1; id <= 3; id++) {
+            fixture.apply(dimension("c", insert(Map.of("id", id, "name", "name-" + id))));
+        }
+        fixture.apply(fact(insert(Map.of("id", 7L, "cust_id", 1L))));
+
+        // Both carry no before image, so both ask the mirror - which is what makes them a batch read.
+        fixture.applyBatch(List.of(
+                fact(insert(Map.of("id", 7L, "cust_id", 2L))),
+                fact(insert(Map.of("id", 7L, "cust_id", 3L)))));
+
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(1L), 0))
+                .as("left the first customer's bucket").isEmpty();
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(2L), 0))
+                .as("and the second's, which only the earlier change in this batch put it in").isEmpty();
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(3L), 0))
+                .as("and is in the third's, once").hasSize(1);
+    }
+
+    /**
+     * The same rule reached the other way, and it is a different place in the code. Here the earlier
+     * change carries its own before image, so it never asks the mirror at all - it only writes to it.
+     * The later one does ask, and what it has to get is what the earlier change wrote. A read ahead
+     * that is dropped when a key is <em>read</em> but not when it is <em>written</em> passes the case
+     * above and fails this one.
+     */
+    @Test
+    @DisplayName("a key written earlier in the batch is read again, not answered from the batch's read")
+    void aKeyWrittenEarlierInTheBatchIsReadAgain() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        for (long id = 1; id <= 3; id++) {
+            fixture.apply(dimension("c", insert(Map.of("id", id, "name", "name-" + id))));
+        }
+        fixture.apply(fact(insert(Map.of("id", 7L, "cust_id", 1L))));
+
+        fixture.applyBatch(List.of(
+                fact(update(Map.of("id", 7L, "cust_id", 1L), Map.of("id", 7L, "cust_id", 2L))),
+                fact(insert(Map.of("id", 7L, "cust_id", 3L)))));
+
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(2L), 0))
+                .as("left the bucket the earlier change in this batch put it in").isEmpty();
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(3L), 0))
+                .as("and is in the third's, once").hasSize(1);
     }
 
     /**
@@ -643,7 +732,7 @@ class JoinDriverTest {
     /** One driver over plain maps, with a sink that can be told to stop taking rows. */
     private static final class Fixture {
 
-        private final CountingStores stores;
+        private final CountingJoinStores stores;
         private final RecordingSink sink = new RecordingSink();
         private final JoinDriver driver;
         private final boolean withNote;
@@ -654,20 +743,27 @@ class JoinDriverTest {
 
         Fixture(JoinKind kind, int pageSize) {
             this.withNote = true;
-            this.stores = new CountingStores(pageSize);
+            this.stores = new CountingJoinStores(pageSize);
             this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores);
         }
 
         /** As above, watching what the join reports about its recomputes. */
         Fixture(JoinKind kind, int pageSize, JoinGauge gauge) {
             this.withNote = true;
-            this.stores = new CountingStores(pageSize);
+            this.stores = new CountingJoinStores(pageSize);
             this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores,
                     JoinDriver.DEFAULT_KEYS_PER_READ, gauge);
         }
 
         void apply(SourceChange change) {
             if (!driver.apply(List.of(change), sink)) {
+                drainFully();
+            }
+        }
+
+        /** Takes a whole batch in at once, which is how the vertex hands one over. */
+        void applyBatch(List<SourceChange> changes) {
+            if (!driver.apply(changes, sink)) {
                 drainFully();
             }
         }
@@ -752,75 +848,6 @@ class JoinDriverTest {
                         new Expr.Column(new JoinTree.ColumnRef("o", "note")))),
                 from,
                 Map.of("o", List.of("cust_id", "id", "note"), "c", List.of("id", "name")));
-    }
-
-    /** The plain-map state, plus a count of how the fact rows were asked for. */
-    private static final class CountingStores implements JoinStores {
-
-        private final MapJoinStores held;
-        private int batchReads;
-        private int keysRead;
-
-        CountingStores(int pageSize) {
-            this.held = new MapJoinStores(pageSize);
-        }
-
-        @Override
-        public Map<String, Object> fact(String factKey) {
-            return held.fact(factKey);
-        }
-
-        @Override
-        public Map<String, Map<String, Object>> factsUnder(Collection<String> factKeys) {
-            batchReads++;
-            keysRead += factKeys.size();
-            return held.factsUnder(factKeys);
-        }
-
-        @Override
-        public void putFact(String factKey, Map<String, Object> row) {
-            held.putFact(factKey, row);
-        }
-
-        @Override
-        public void removeFact(String factKey) {
-            held.removeFact(factKey);
-        }
-
-        @Override
-        public Map<String, Object> dimensionRow(String source, String dimensionKey) {
-            return held.dimensionRow(source, dimensionKey);
-        }
-
-        @Override
-        public void putDimensionRow(String source, String dimensionKey, Map<String, Object> row) {
-            held.putDimensionRow(source, dimensionKey, row);
-        }
-
-        @Override
-        public void removeDimensionRow(String source, String dimensionKey) {
-            held.removeDimensionRow(source, dimensionKey);
-        }
-
-        @Override
-        public int indexPageCount(String source, String dimensionKey) {
-            return held.indexPageCount(source, dimensionKey);
-        }
-
-        @Override
-        public List<String> indexPage(String source, String dimensionKey, int page) {
-            return held.indexPage(source, dimensionKey, page);
-        }
-
-        @Override
-        public void indexAdd(String source, String dimensionKey, String factKey) {
-            held.indexAdd(source, dimensionKey, factKey);
-        }
-
-        @Override
-        public void indexRemove(String source, String dimensionKey, String factKey) {
-            held.indexRemove(source, dimensionKey, factKey);
-        }
     }
 
     /** A sink that takes what it is told to and refuses the rest. */

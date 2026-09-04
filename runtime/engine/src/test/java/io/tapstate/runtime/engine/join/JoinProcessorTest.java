@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine.join;
 
+import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.common.TapstateType;
@@ -25,13 +26,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * underneath it, and both are silent when they are wrong.
  *
  * <ul>
- *   <li><b>A change offered again must not be taken in again.</b> The substrate re-offers an item whose
- *       processing answered "not yet", and a join that absorbed it a second time would index the row
- *       twice and publish it twice - which an idempotent sink hides, right up until the duplicate is
- *       in the reverse index and the next dimension change sends the row twice for ever.
+ *   <li><b>A change offered again must not be taken in again.</b> The substrate re-offers a delivery
+ *       whose processing answered "not yet", and a join that absorbed it a second time would index the
+ *       row twice and publish it twice - which an idempotent sink hides, right up until the duplicate
+ *       is in the reverse index and the next dimension change sends the row twice for ever.
  *   <li><b>The rest of a recompute must go out when nothing is arriving.</b> A stream that has caught
  *       up stops delivering, so a vertex that only pushed on arrival would leave a fan-out half sent,
  *       with the job running and nothing reported.
+ *   <li><b>A delivery must reach the driver whole.</b> The driver reads the fact mirror once per batch
+ *       it is handed; a vertex that passed items down one at a time would turn that into one read per
+ *       row while every other assertion here stayed green.
  * </ul>
  */
 class JoinProcessorTest {
@@ -40,14 +44,14 @@ class JoinProcessorTest {
     private static final int FACT = 0;
     private static final int DIMENSION = 1;
 
-    private MapJoinStores stores;
+    private CountingJoinStores stores;
     private JoinDriver driver;
     private JoinProcessor processor;
     private TestOutbox outbox;
 
     @BeforeEach
     void buildVertex() throws Exception {
-        stores = new MapJoinStores(2);
+        stores = new CountingJoinStores(2);
         driver = new JoinDriver(plan(), List.of("id"), STREAM, stores, 4);
         processor = new JoinProcessor(driver, Map.of(FACT, "o", DIMENSION, "c"));
         outbox = new TestOutbox(new int[] {2}, 2);
@@ -57,11 +61,37 @@ class JoinProcessorTest {
     @Test
     @DisplayName("a fact row arriving is published with its dimension row joined in")
     void aFactRowIsPublishedJoined() {
-        assertThat(processor.tryProcess(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")))).isTrue();
+        assertThat(offer(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")))).isTrue();
 
-        assertThat(processor.tryProcess(FACT, insert(Map.of("id", 10L, "cust_id", 1L)))).isTrue();
+        assertThat(offer(FACT, insert(Map.of("id", 10L, "cust_id", 1L)))).isTrue();
 
         assertThat(published()).containsExactly(Map.of("order_id", 10L, "customer_name", "Ada"));
+    }
+
+    /**
+     * The one that says the batching underneath is actually reached. Six fact rows arrive in one
+     * delivery, none of them carrying a before image, so each has to ask the mirror what its key used
+     * to hold - which is the read a first load makes most of. A vertex that hands them down one at a
+     * time asks six times for one key each; every other case in this class passes either way.
+     */
+    @Test
+    @DisplayName("a delivery reaches the driver whole, so its mirror reads are one ask and not six")
+    void aDeliveryIsAbsorbedAsOneBatch() {
+        offer(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")));
+        Envelope[] arriving = new Envelope[6];
+        for (int i = 0; i < arriving.length; i++) {
+            arriving[i] = insert(Map.of("id", (long) i, "cust_id", 1L));
+        }
+        stores.forgetCounts();
+
+        offerUntilTaken(FACT, arriving);
+
+        assertThat(stores.singleReads).as("not one round trip per arriving row").isZero();
+        assertThat(stores.batchReads)
+                .as("the delivery's keys asked for once, however many times it was offered")
+                .isEqualTo(1);
+        assertThat(stores.keysRead).isEqualTo(6);
+        assertThat(published()).hasSize(6);
     }
 
     /**
@@ -70,27 +100,16 @@ class JoinProcessorTest {
      * what the substrate does.
      */
     @Test
-    @DisplayName("a change offered again is not taken into the state a second time")
+    @DisplayName("a delivery offered again is not taken into the state a second time")
     void aRetriedChangeIsAbsorbedOnce() {
-        processor.tryProcess(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")));
+        offer(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")));
         for (long id = 0; id < 5; id++) {
             offerUntilTaken(FACT, insert(Map.of("id", id, "cust_id", 1L)));
         }
         forgetWhatWasPublished();
 
-        Envelope change = update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"));
-        assertThat(processor.tryProcess(DIMENSION, change))
-                .as("the outbox holds two, so five rows cannot go out in one call").isFalse();
-        // The substrate offers the same item again, and again, until it is taken. Bounded, because a
-        // vertex that never finishes is a hang rather than a failure, and a hang reads as an
-        // infrastructure problem rather than as this case.
-        int offers = 1;
-        while (!processor.tryProcess(DIMENSION, change)) {
-            drainOutbox();
-            if (++offers > 100) {
-                throw new AssertionError("the vertex never took the change in");
-            }
-        }
+        int offers = offerUntilTaken(DIMENSION,
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace")));
 
         assertThat(offers).as("it really was offered more than once").isGreaterThan(1);
         List<Map<String, Object>> rows = published();
@@ -107,7 +126,7 @@ class JoinProcessorTest {
     @Test
     @DisplayName("what is left of a recompute goes out when nothing is arriving")
     void theRestOfARecomputeGoesOutWhenNothingArrives() {
-        processor.tryProcess(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")));
+        offer(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")));
         for (long id = 0; id < 5; id++) {
             offerUntilTaken(FACT, insert(Map.of("id", id, "cust_id", 1L)));
         }
@@ -115,7 +134,7 @@ class JoinProcessorTest {
 
         // One offer, which fills the outbox and leaves the rest of the fan-out queued. Nothing is
         // offered again after this - the stream has caught up, which is the case being made.
-        assertThat(processor.tryProcess(DIMENSION,
+        assertThat(offer(DIMENSION,
                 update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))))
                 .as("the outbox holds two, so five rows cannot go out in one call").isFalse();
         assertThat(driver.hasPending()).isTrue();
@@ -139,19 +158,36 @@ class JoinProcessorTest {
     @DisplayName("an edge on an ordinal naming no source is a wiring mistake and says so")
     void anUnknownOrdinalIsRefused() {
         org.assertj.core.api.Assertions
-                .assertThatThrownBy(() -> processor.tryProcess(7, insert(Map.of("id", 1L))))
+                .assertThatThrownBy(() -> offer(7, insert(Map.of("id", 1L))))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("names no source");
     }
 
-    private void offerUntilTaken(int ordinal, Envelope item) {
-        int guard = 0;
-        while (!processor.tryProcess(ordinal, item)) {
-            drainOutbox();
-            if (++guard > 100) {
-                throw new AssertionError("the vertex never took the change in");
+    /** Offers {@code items} as one delivery, and says whether all of it went out in that one call. */
+    private boolean offer(int ordinal, Envelope... items) {
+        TestInbox inbox = new TestInbox(List.of(items));
+        processor.process(ordinal, inbox);
+        return inbox.isEmpty();
+    }
+
+    /**
+     * Offers one delivery over and over, the way the substrate does with what a vertex has not
+     * finished with, until it has all gone out. Bounded, because a vertex that never finishes is a
+     * hang rather than a failure, and a hang in a suite reads as an infrastructure problem rather
+     * than as the case that caused it.
+     *
+     * @return how many times it had to be offered
+     */
+    private int offerUntilTaken(int ordinal, Envelope... items) {
+        TestInbox inbox = new TestInbox(List.of(items));
+        for (int offers = 1; offers <= 100; offers++) {
+            processor.process(ordinal, inbox);
+            if (inbox.isEmpty()) {
+                return offers;
             }
+            drainOutbox();
         }
+        throw new AssertionError("the vertex never took the delivery in");
     }
 
     private final List<Map<String, Object>> collected = new ArrayList<>();

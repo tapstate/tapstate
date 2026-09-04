@@ -1,8 +1,10 @@
 package io.tapstate.runtime.engine.join;
 
 import com.hazelcast.jet.core.AbstractProcessor;
+import com.hazelcast.jet.core.Inbox;
 import io.tapstate.core.event.Envelope;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -20,10 +22,17 @@ import java.util.Objects;
  * vertices in this runtime already rely on the same one.
  *
  * <p><b>A change is taken into the state once, however many times the item is offered.</b> The
- * substrate re-offers an item whose processing answered "not yet", and a join that took it in again
+ * substrate re-offers items whose processing answered "not yet", and a join that took them in again
  * would apply the same change twice - indexing a fact row under one dimension key twice over, and
- * publishing its row twice. So taking it in and sending what it means are separate steps here, and only
- * the sending is retried.
+ * publishing its row twice. So taking them in and sending what they mean are separate steps here, and
+ * only the sending is retried.
+ *
+ * <p><b>What is offered is taken in a whole delivery at a time rather than an item at a time.</b> The
+ * driver reads the fact mirror once for the keys a batch is about to ask about, which is one round
+ * trip for a delivery instead of one per row; handing it one item per call would leave that read
+ * asking for a single key every time, which is the same number of trips the batching exists to
+ * remove. The re-offer rule is unchanged and simply applies to the delivery: it is absorbed once, and
+ * the items stay where they are until everything they meant has gone out.
  */
 public final class JoinProcessor extends AbstractProcessor {
 
@@ -41,25 +50,38 @@ public final class JoinProcessor extends AbstractProcessor {
         this.sourceByOrdinal = Map.copyOf(Objects.requireNonNull(sourceByOrdinal, "sourceByOrdinal"));
     }
 
-    /** Whether the change currently being offered has already been taken into the state. */
+    /** Whether what is currently being offered has already been taken into the state. */
     private boolean taken;
 
+    /**
+     * Takes in everything being offered, then sends as much of what it means as the outbox will hold.
+     *
+     * <p>The items are left where they are until all of it has gone out, which is how the substrate is
+     * told there is more to do: it offers the same delivery again, and {@link #taken} is what keeps it
+     * from being absorbed a second time. Nothing new is added to what is being offered in the
+     * meantime - the substrate refills only once it has been emptied - so the two cannot interleave.
+     */
     @Override
-    protected boolean tryProcess(int ordinal, Object item) {
+    public void process(int ordinal, Inbox inbox) {
         String source = sourceByOrdinal.get(ordinal);
         if (source == null) {
             throw new IllegalStateException(
                     "a join vertex was given an edge on ordinal " + ordinal + ", which names no source");
         }
         if (!taken) {
-            driver.absorb(List.of(new SourceChange(source, (Envelope) item)));
+            List<SourceChange> changes = new ArrayList<>(inbox.size());
+            // Reading rather than draining: what is not sent yet has to still be there to be offered
+            // again, and it is the sending that decides, not this.
+            for (Object item : inbox) {
+                changes.add(new SourceChange(source, (Envelope) item));
+            }
+            driver.absorb(changes);
             taken = true;
         }
         if (driver.drain(this::tryEmit)) {
+            inbox.clear();
             taken = false;
-            return true;
         }
-        return false;
     }
 
     /**

@@ -4,6 +4,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.MapConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.jet.config.EdgeConfig;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.sql.JoinPlan;
@@ -114,6 +115,9 @@ class JoinBenchRun {
          */
         static final String PARTITIONS = "joinbench.partitions";
 
+        /** How many changes are handed over in one call. See {@link JoinBenchRun#DELIVERY}. */
+        static final String DELIVERY = "joinbench.delivery";
+
         private Knob() {
         }
     }
@@ -127,6 +131,18 @@ class JoinBenchRun {
     /** How many filler columns each side carries in the wide shape, on top of its named ones. */
     private static final int WIDE_FILLER = 23;
 
+    /**
+     * How many changes reach the vertex in one delivery. The substrate hands a vertex what its inbound
+     * queue holds, so the default is that queue's default size rather than a number picked here - the
+     * point of the bench is to feed the operator what the product feeds it.
+     *
+     * <p>It is a knob because it is the one variable the operator's mirror reads are a function of, and
+     * <b>{@code 1} is the shape the operator had before it read a delivery's keys together</b>: at one
+     * change per call the driver's read ahead does not engage at all. So the arm to compare against is
+     * a property away rather than a build away, which is what keeps the two arms otherwise identical.
+     */
+    private static final int DELIVERY = intProperty(Knob.DELIVERY, EdgeConfig.DEFAULT_QUEUE_SIZE);
+
     @Test
     void measure() {
         String want = System.getProperty(Knob.SCENARIOS, "all");
@@ -136,7 +152,8 @@ class JoinBenchRun {
                 intProperty(Knob.BATCH, 500));
 
         System.out.println("# joinbench tier=" + tier + " partitions="
-                + System.getProperty(Knob.PARTITIONS, "271 (default)") + " " + sizes);
+                + System.getProperty(Knob.PARTITIONS, "271 (default)")
+                + " delivery=" + DELIVERY + " " + sizes);
         System.out.println(Result.header());
         for (String name : scenarios(want)) {
             // Twice, reporting the second: the first is the interpreter, and reporting it would be
@@ -506,20 +523,27 @@ class JoinBenchRun {
         }
 
         /**
-         * Feeds {@code changes} the way the vertex does: one at a time, draining after each.
+         * Feeds {@code changes} the way the vertex does: a delivery at a time, draining after each.
          *
          * <p><b>Not the whole list in one call, which is what this was first written as.</b> The vertex
-         * is handed one item per call and drains before taking the next, so a queue of work never grows
-         * past one change's worth; a run that absorbed two hundred thousand changes before sending any
-         * would build a queue that deep and be measuring the queue. The work itself is identical either
-         * way - {@code absorb} loops per change regardless - so the only thing the batched form changed
-         * was the memory, in the direction that flatters nothing.
+         * is handed one delivery per call and drains before taking the next, so a queue of work never
+         * grows past a delivery's worth; a run that absorbed two hundred thousand changes before sending
+         * any would build a queue that deep and be measuring the queue.
+         *
+         * <p><b>Nor one change per call, which is what it was written as next.</b> That was right while
+         * the vertex was handed one item at a time; it is not now. The driver asks the fact mirror once
+         * for the keys a delivery is about to ask about, so feeding it singly turns that one ask into
+         * one per row - a round trip per row of the table, on a shape where the answer is always the
+         * same. A bench that fed differently from the vertex would be measuring a batch size the
+         * product never uses, in whichever direction it happened to differ.
          */
         private void feed(List<SourceChange> changes) {
-            for (SourceChange change : changes) {
+            for (int from = 0; from < changes.size(); from += DELIVERY) {
+                List<SourceChange> delivery =
+                        changes.subList(from, Math.min(from + DELIVERY, changes.size()));
                 // Called again with nothing until it says it is done: a rebuild outlives the change
                 // that caused it, and the call carrying that change is not where it finishes.
-                boolean done = executor.apply(List.of(change), sink);
+                boolean done = executor.apply(delivery, sink);
                 while (!done) {
                     done = executor.apply(List.of(), sink);
                 }

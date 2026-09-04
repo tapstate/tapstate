@@ -13,9 +13,11 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The incremental half of a join: what one change to one source means for the flat rows already
@@ -48,6 +50,13 @@ import java.util.Objects;
  *       partition count, and how large a stored page may be stays a separate question.
  * </ul>
  *
+ * <p><b>A batch is asked of the mirror once, before any of it is taken in.</b> Every row of a first
+ * load arrives with no before image and asks what its key used to hold, which on a first load is a
+ * round trip per row of the table for an answer that is always nothing. The read ahead is a read, not
+ * a skip: it answers exactly what asking one key at a time would, including for a snapshot delivered
+ * a second time, where the mirror is not empty and the old key on a moved row is the whole point. A
+ * key stops being answered from it the moment the batch itself writes or forgets that key.
+ *
  * <p><b>What the index says is checked against what the fact row says.</b> The index is derived; the
  * truth about which dimension row a fact row points at is the foreign key on the fact row. A bucket
  * may name rows that have since been deleted or re-pointed, so each one is read and asked, and one
@@ -69,6 +78,15 @@ public final class JoinDriver {
     private final List<String> factKeyColumns;
     private final List<Dimension> dimensions;
     private final Deque<Work> pending = new ArrayDeque<>();
+
+    /**
+     * What the fact mirror held, for the keys the batch being taken in is about to ask it for. Empty
+     * outside a batch. A key is dropped from it the moment its answer stops being the mirror's - when
+     * it is used, and when this batch writes or forgets that key - so nothing here is ever read twice
+     * or read after it went stale. Values may be null: "the mirror holds nothing for this key" is an
+     * answer, and it is the answer a first load gets for every row it carries.
+     */
+    private final Map<String, Map<String, Object>> primed = new HashMap<>();
     private final int keysPerRead;
     private final JoinGauge gauge;
 
@@ -144,9 +162,92 @@ public final class JoinDriver {
      * inside {@link #apply}, which is why the caller that needs to tell them apart is given both.
      */
     public void absorb(List<SourceChange> changes) {
+        prime(changes);
         for (SourceChange change : changes) {
             absorb(change);
         }
+        primed.clear();
+    }
+
+    /**
+     * Asks the mirror, once, for every key this batch is going to ask it for.
+     *
+     * <p><b>This is the read a first load makes most of.</b> Every row of a snapshot arrives carrying
+     * no before image, so each one asks the mirror what that key held - and on a first load the answer
+     * is always nothing. Asked a key at a time against a store on the other side of a network that is
+     * a round trip per row of the table; asked as the batch it arrived in it is one, and both answer
+     * identically, so nothing but the clock says which one is happening.
+     *
+     * <p><b>It is a read ahead, never a skip.</b> The answer for every key is still the mirror's own,
+     * because nothing has been taken in yet when this runs. A snapshot delivered a second time - a
+     * restart with no durable point to resume from - therefore reads exactly what it read before:
+     * rows that are already there, with the key a row used to point at still on them. Skipping the
+     * read on the grounds that a snapshot is new is the thing this is not doing, and it would lose the
+     * old bucket entry and the old published row, silently, on every re-sent row whose key had moved.
+     *
+     * <p>A batch of one is left alone: asking for one key as a batch of one is the same trip, and
+     * every case and every caller that hands changes over singly then behaves exactly as before.
+     */
+    private void prime(List<SourceChange> changes) {
+        primed.clear();
+        if (changes.size() < 2) {
+            return;
+        }
+        Set<String> asked = new LinkedHashSet<>();
+        for (SourceChange change : changes) {
+            if (!change.source().equals(factSource)) {
+                continue;
+            }
+            Envelope event = change.event();
+            boolean reads = (event.after() == null) != (event.before() == null);
+            if (!reads) {
+                // Both images means the change carries its own previous; neither says nothing at all.
+                continue;
+            }
+            // Not factKeyOf: a row with a null in its own key is refused where it is absorbed, and
+            // refusing it here instead would move the failure to before anything in the batch ran.
+            String key = keyOf(event.after() != null ? event.after() : event.before(), factKeyColumns);
+            if (key != null) {
+                asked.add(key);
+            }
+        }
+        if (asked.isEmpty()) {
+            return;
+        }
+        Map<String, Map<String, Object>> rows = stores.factsUnder(asked);
+        for (String key : asked) {
+            primed.put(key, rows.get(key));
+        }
+    }
+
+    /**
+     * What the mirror holds for {@code factKey} - from this batch's read ahead, or from the store.
+     *
+     * <p>Taking the entry rather than reading it is a guard and not the mechanism: every path that
+     * reaches here goes on to write or forget that same key, and {@link #dropPrimed} at those two
+     * places is what actually keeps a second change to the key in one batch from being answered with
+     * what the mirror held before the first. Removing the {@code remove} here changes no case, which
+     * was measured rather than assumed. It stays because the argument that makes it redundant is a
+     * claim about the shape of {@link #absorbFact} - one early return added between a read and its
+     * write would end it, silently, on a path whose failure is a row indexed under a key it left.
+     */
+    private Map<String, Object> mirrored(String factKey) {
+        return primed.containsKey(factKey) ? primed.remove(factKey) : stores.fact(factKey);
+    }
+
+    /**
+     * Drops what the read ahead holds for {@code factKey}, because the mirror is about to stop agreeing
+     * with it. A later change to that key in the same batch then reads the store, which is what it
+     * would have done had the batch never been read ahead at all.
+     *
+     * <p>It is called from both places the fact mirror is written, and that is the rule rather than the
+     * reachability: in {@link #forget} the key being dropped is one this change has usually just read,
+     * so the entry is already gone. Keeping the rule without an exception is what makes it possible to
+     * say the read ahead can never be stale, instead of saying it is not stale as long as one argument
+     * about which keys can reach {@code forget} keeps holding.
+     */
+    private void dropPrimed(String factKey) {
+        primed.remove(factKey);
     }
 
     /** Whether anything is still waiting to be sent. */
@@ -184,7 +285,7 @@ public final class JoinDriver {
                 return;
             }
             String key = factKeyOf(before);
-            Map<String, Object> mirrored = stores.fact(key);
+            Map<String, Object> mirrored = mirrored(key);
             // The mirror where there is one: a connector's before image may hold the key columns
             // alone, and the published row is built from the whole row.
             Map<String, Object> row = mirrored != null ? mirrored : before;
@@ -193,7 +294,7 @@ public final class JoinDriver {
             return;
         }
         String key = factKeyOf(after);
-        Map<String, Object> previous = before != null ? before : stores.fact(key);
+        Map<String, Object> previous = before != null ? before : mirrored(key);
         if (previous != null) {
             String previousKey = factKeyOf(previous);
             if (!previousKey.equals(key)) {
@@ -220,6 +321,7 @@ public final class JoinDriver {
                 stores.indexAdd(dimension.source(), now, key);
             }
         }
+        dropPrimed(key);
         stores.putFact(key, after);
         queueRow(after, event.ts(), false);
     }
@@ -490,6 +592,7 @@ public final class JoinDriver {
                 stores.indexRemove(dimension.source(), key, factKey);
             }
         }
+        dropPrimed(factKey);
         stores.removeFact(factKey);
     }
 
