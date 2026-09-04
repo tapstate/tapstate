@@ -311,8 +311,9 @@ TAPSTATE_PTY_TUI=1 pty_session "$tui_in"
 TUI_COMMAND_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && grep -q "TAPSTATE" <<< "$TUI_COMMAND_CLEAN" \
-   && grep -qE '(^|[^[:alpha:]])valid:' <<< "$TUI_COMMAND_CLEAN"; then
-  ok "TUI ran validate and restored its alternate screen and cursor (rc 0)"
+   && grep -qE '(^|[^[:alpha:]])valid:' <<< "$TUI_COMMAND_CLEAN" \
+   && ! grep -Fq $'\033[?1049h' <<< "$PTY_OUT"; then
+  ok "TUI ran validate in the inline display and restored the cursor (rc 0)"
 else
   bad "TUI command session failed (rc=$PTY_RC) or missing expected markers; output:"; echo "$PTY_OUT"
 fi
@@ -567,7 +568,7 @@ fi
 # --- 13. TUI lifecycle -------------------------------------------------------------------------
 # A native image has a separate reachability surface for JLine terminal resources and shutdown
 # cleanup. Exercise the default TUI entry point on a real pseudo-terminal with an explicit workspace,
-# then require the alternate screen to be restored after Ctrl-D exits.
+# then require the inline display to release cleanly after Ctrl-D exits.
 bold "[13] TUI dashboard — native workspace entry and cleanup"
 TUI_WORKSPACE="$STUB_DIR/tui-workspace"
 mkdir -p "$TUI_WORKSPACE/source"
@@ -583,12 +584,11 @@ EOF
 TAPSTATE_PTY_TUI=1 pty_session $'\004' -w "$TUI_WORKSPACE"
 TUI_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && grep -Fq $'\033[?1049h' <<< "$PTY_OUT" \
-   && grep -Fq $'\033[?1049l' <<< "$PTY_OUT" \
+   && ! grep -Fq $'\033[?1049h' <<< "$PTY_OUT" \
    && grep -Fq "${TUI_WORKSPACE##*/}" <<< "$TUI_CLEAN" \
    && { grep -Fq $'\033[?25h' <<< "$PTY_OUT" \
         || grep -Fq $'\033[?12;25h' <<< "$PTY_OUT"; }; then
-  ok "native tui accepted its workspace and restored its alternate screen and cursor"
+  ok "native tui accepted its workspace and released the inline display and cursor"
 else
   bad "native tui workspace PTY failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
 fi

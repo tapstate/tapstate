@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import dev.tamboui.backend.jline3.JLineBackend;
+import dev.tamboui.inline.InlineDisplay;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.utils.NonBlockingReader;
@@ -22,13 +23,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
 /**
- * Runtime for the first TUI surface. It owns the terminal lifecycle and delegates command semantics to
- * the existing REPL, so the full-screen face cannot drift from the tested CLI command language.
+ * Runtime for the interactive CLI surface. It owns the terminal lifecycle and delegates command
+ * semantics to the existing REPL, so the inline face cannot drift from the tested CLI language.
  */
 final class TuiApp {
 
     private static final int DEFAULT_WIDTH = 100;
     private static final int DEFAULT_HEIGHT = 24;
+    private static final int INLINE_DISPLAY_HEIGHT = 14;
     private static final int READ_TIMEOUT_MILLIS = 50;
     // Terminal emulators may deliver ESC and the rest of an arrow sequence in separate input chunks.
     // Keep standalone Escape responsive while allowing that split sequence to remain prompt-owned.
@@ -54,7 +56,7 @@ final class TuiApp {
             new ConcurrentLinkedQueue<>();
 
     private NonBlockingReader reader;
-    private dev.tamboui.terminal.Terminal<JLineBackend> display;
+    private InlineDisplay display;
     private JLineBackend backend;
     private Terminal terminal;
     private TuiAppState uiState;
@@ -104,9 +106,7 @@ final class TuiApp {
             this.terminal = terminal;
             this.backend = new JLineBackend(terminal);
             backend.enableRawMode();
-            backend.enterAlternateScreen();
-            backend.hideCursor();
-            this.display = new dev.tamboui.terminal.Terminal<>(backend);
+            this.display = InlineDisplay.withBackend(INLINE_DISPLAY_HEIGHT, backend);
             backend.onResize(() -> resizeRequested.set(true));
             terminal.handle(Terminal.Signal.INT, signal -> {
                 interrupted.set(true);
@@ -128,6 +128,9 @@ final class TuiApp {
                 Runtime.getRuntime().removeShutdownHook(shutdownHook);
                 commandExecution.close();
                 restoreTerminal(display);
+                if (display != null) {
+                    display.close();
+                }
                 this.uiState = reduce(new TuiAction.ClearPrompt());
                 this.reader = null;
                 this.display = null;
@@ -142,16 +145,18 @@ final class TuiApp {
         }
     }
 
-    private void restoreTerminal(dev.tamboui.terminal.Terminal<JLineBackend> display) {
+    private void restoreTerminal(InlineDisplay display) {
         if (!terminationRequested.compareAndSet(false, true)) {
             return;
         }
         try {
-            JLineBackend activeBackend = display.backend();
-            activeBackend.showCursor();
-            activeBackend.leaveAlternateScreen();
-            activeBackend.disableRawMode();
-            activeBackend.flush();
+            if (display != null) {
+                display.release();
+            }
+            if (backend != null) {
+                backend.disableRawMode();
+                backend.flush();
+            }
         } catch (IOException failure) {
             throw new UncheckedIOException(failure);
         }
@@ -205,7 +210,7 @@ final class TuiApp {
         return List.copyOf(words);
     }
 
-    private int eventLoop(dev.tamboui.terminal.Terminal<JLineBackend> display, Terminal terminal) throws IOException {
+    private int eventLoop(InlineDisplay display, Terminal terminal) throws IOException {
         int lastWidth = -1;
         int lastHeight = -1;
         long nextDashboardRefresh = 0L;
@@ -231,7 +236,7 @@ final class TuiApp {
                 draw(display, terminal);
                 continue;
             }
-            dev.tamboui.layout.Size size = display.size();
+            dev.tamboui.layout.Size size = backend.size();
             int width = dimension(size.width(), DEFAULT_WIDTH);
             int height = dimension(size.height(), DEFAULT_HEIGHT);
             if (resizeRequested.getAndSet(false) || width != lastWidth || height != lastHeight) {
@@ -860,8 +865,11 @@ final class TuiApp {
         }
     }
 
-    private void draw(dev.tamboui.terminal.Terminal<JLineBackend> display, Terminal terminal) {
-        display.draw(frame -> dashboard.render(frame, state(), workspaceScroll));
+    private void draw(InlineDisplay display, Terminal terminal) {
+        int height = Math.min(INLINE_DISPLAY_HEIGHT,
+                Math.max(8, terminal.getHeight() > 0 ? terminal.getHeight() : DEFAULT_HEIGHT));
+        display.render((area, buffer) -> dashboard.render(
+                dev.tamboui.terminal.Frame.forTesting(buffer), state(), workspaceScroll), height, -1, -1);
     }
 
     private void startDashboardRefreshIfNeeded(int width) {
