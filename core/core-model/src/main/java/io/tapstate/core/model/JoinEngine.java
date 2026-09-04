@@ -1,7 +1,7 @@
 package io.tapstate.core.model;
 
 /**
- * The engine a join transform's SQL runs on (ADR-0016 §5.2).
+ * The engine a join transform's SQL runs on.
  *
  * <p>One member, and it is still an enum: the field used to be free text, so any spelling was
  * accepted and a pipeline naming an engine that does not exist was refused by nothing until it
