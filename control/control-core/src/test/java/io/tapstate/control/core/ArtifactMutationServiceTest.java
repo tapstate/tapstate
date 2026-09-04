@@ -24,6 +24,8 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.DerivedSchema;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaVersion;
@@ -54,12 +56,13 @@ class ArtifactMutationServiceTest {
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final InMemoryObservationStore observations = new InMemoryObservationStore();
     private final InMemorySrsMetaStore srsMeta = new InMemorySrsMetaStore();
+    private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
     private final List<String> reclaimOrder = new ArrayList<>();
     private final RecordingAuditStore auditStore = new RecordingAuditStore();
     private final List<String> followsStopped = new ArrayList<>();
     private final ArtifactMutationService service = new ArtifactMutationService(
-            store, desired, state, observations, srsMeta, new AuditGate(auditStore, FIXED_CLOCK),
-            followsStopped::add);
+            store, desired, state, observations, srsMeta, derivedSchemas,
+            new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
 
     private static final Clock FIXED_CLOCK =
             Clock.fixed(Instant.parse("2026-08-11T09:00:00Z"), ZoneOffset.UTC);
@@ -266,6 +269,7 @@ class ArtifactMutationServiceTest {
         state.put("flow", PipelineState.STOPPED);
         desired.put("flow", PipelineState.STOPPED);
         observations.put("flow");
+        derivedSchemas.put("flow", "widen");
         srsMeta.seed("chain-a", consumer("flow"), consumer("other"));
 
         service.delete(PRINCIPAL, "flow", hash(flow));
@@ -276,10 +280,43 @@ class ArtifactMutationServiceTest {
         assertThat(desired.pipelineIds()).doesNotContain("flow");
         assertThat(state.read("flow")).isEmpty();
         assertThat(observations.read("flow")).isEmpty();
+        // Left behind, this one is worse than residue: the next pipeline applied under the id would be
+        // refused at start over a difference against a schema belonging to something that is gone.
+        assertThat(derivedSchemas.holdsAnythingFor("flow")).isFalse();
         assertThat(srsMeta.consumerIds("chain-a")).containsExactly("other");
         // Shared first: it is the only residue that stalls a different pipeline, so a process that dies
         // mid-reclaim has already contained the damage that was not this pipeline's alone to suffer.
-        assertThat(reclaimOrder).containsExactly("srs", "desired", "state", "observation");
+        assertThat(reclaimOrder)
+                .containsExactly("srs", "desired", "state", "observation", "derived-schema");
+    }
+
+    @Test
+    void aDerivedSchemaOfAnotherPipelineSurvivesThisOnesRemoval() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        derivedSchemas.put("flow", "widen");
+        derivedSchemas.put("other", "widen");
+
+        service.delete(PRINCIPAL, "flow", hash(flow));
+
+        assertThat(derivedSchemas.holdsAnythingFor("flow")).isFalse();
+        assertThat(derivedSchemas.holdsAnythingFor("other")).isTrue();
+    }
+
+    @Test
+    void aDerivedSchemaThatCannotBeReclaimedIsReportedAsResidueLikeEveryOtherStep() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        derivedSchemas.put("flow", "widen");
+        derivedSchemas.failDeleteWith(new IllegalStateException("store down"));
+
+        assertThatThrownBy(() -> service.delete(PRINCIPAL, "flow", hash(flow)))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.args()).containsEntry("residue", List.of("derived-schema")));
+        // The artifact is gone either way: a removal the caller was told succeeded must not undo itself.
+        assertThat(store.get("flow")).isEmpty();
+        // The residue the report is about really is left behind — otherwise this witnesses nothing.
+        assertThat(derivedSchemas.holdsAnythingFor("flow")).isTrue();
     }
 
     @Test
@@ -416,7 +453,7 @@ class ArtifactMutationServiceTest {
     @Test
     void anUnavailableAuditBackendRefusesTheDeleteAndLeavesTheArtifactByteForByte() {
         ArtifactMutationService blocked = new ArtifactMutationService(
-                store, desired, state, observations, srsMeta,
+                store, desired, state, observations, srsMeta, derivedSchemas,
                 new AuditGate(new FailingAuditStore(), FIXED_CLOCK), followsStopped::add);
         SourceResource orders = source("orders");
         store.save(orders);
@@ -820,6 +857,45 @@ class ArtifactMutationServiceTest {
             // the reporting is about.
             step("observation", deleteFailure);
             docs.remove(pipelineId);
+        }
+    }
+
+    private final class InMemoryDerivedSchemaStore implements DerivedSchemaStore {
+
+        private final Map<String, DerivedSchema> byStep = new LinkedHashMap<>();
+        private RuntimeException deleteFailure;
+
+        void put(String pipelineId, String stepId) {
+            byStep.put(pipelineId + "/" + stepId,
+                    new DerivedSchema(0L, Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite"));
+        }
+
+        boolean holdsAnythingFor(String pipelineId) {
+            return byStep.keySet().stream().anyMatch(key -> key.startsWith(pipelineId + "/"));
+        }
+
+        void failDeleteWith(RuntimeException failure) {
+            this.deleteFailure = failure;
+        }
+
+        @Override
+        public Optional<DerivedSchema> latest(String pipelineId, String stepId) {
+            return Optional.ofNullable(byStep.get(pipelineId + "/" + stepId));
+        }
+
+        @Override
+        public void record(String pipelineId, String stepId, Map<String, String> schema,
+                String statement, String derivedFrom, String derivedBy) {
+            byStep.put(pipelineId + "/" + stepId,
+                    new DerivedSchema(0L, schema, statement, derivedFrom, derivedBy));
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            // Fail before mutating, so an armed failure leaves the record behind — the residue the
+            // reporting is about.
+            step("derived-schema", deleteFailure);
+            byStep.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
         }
     }
 

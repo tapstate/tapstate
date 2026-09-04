@@ -49,7 +49,7 @@ class StorePortTest {
     // --- facade ---
 
     @Test
-    void facadeExposesTheElevenStores() {
+    void facadeExposesTheTwelveStores() {
         StorePort store = new InMemoryStore();
 
         assertThat(store.artifacts()).isNotNull();
@@ -63,6 +63,133 @@ class StorePortTest {
         assertThat(store.connectionTestResults()).isNotNull();
         assertThat(store.observations()).isNotNull();
         assertThat(store.meta()).isNotNull();
+        assertThat(store.derivedSchemas()).isNotNull();
+    }
+
+    // --- derived schemas (the side record of what a step works out for itself) ---
+
+    @Test
+    void aStepWithNothingRecordedAnswersEmpty() {
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+
+        assertThat(derived.latest("widen_orders", "widen")).isEmpty();
+    }
+
+    @Test
+    void theFirstRecordingIsVersionZero() {
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+
+        derived.record("widen_orders", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+
+        DerivedSchema recorded = derived.latest("widen_orders", "widen").orElseThrow();
+        assertThat(recorded.version()).isZero();
+        assertThat(recorded.schema()).containsExactly(Map.entry("id", "LONG"));
+        assertThat(recorded.statement()).isEqualTo("sql-v1");
+        assertThat(recorded.derivedFrom()).isEqualTo("src-v1");
+        assertThat(recorded.derivedBy()).isEqualTo("calcite-1.40.0");
+    }
+
+    @Test
+    void recordingTheSameColumnsAgainAppendsNoVersion() {
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+        derived.record("widen_orders", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+
+        derived.record("widen_orders", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+
+        assertThat(derived.latest("widen_orders", "widen").orElseThrow().version()).isZero();
+    }
+
+    @Test
+    void recordingTheSameColumnsFromDifferentInputsRefreshesAllThreeProvenanceFieldsInPlace() {
+        // The whole point of refreshing: a source that moves without moving the output would otherwise
+        // leave the recorded provenance stale, and the next real difference would then be attributed to
+        // the sources when it was the derivation. The version does not move, because the schema did not.
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+        derived.record("widen_orders", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+
+        derived.record("widen_orders", "widen", Map.of("id", "LONG"), "sql-v2", "src-v2", "calcite-1.41.0");
+
+        DerivedSchema recorded = derived.latest("widen_orders", "widen").orElseThrow();
+        assertThat(recorded.version()).isZero();
+        assertThat(recorded.statement()).isEqualTo("sql-v2");
+        assertThat(recorded.derivedFrom()).isEqualTo("src-v2");
+        assertThat(recorded.derivedBy()).isEqualTo("calcite-1.41.0");
+    }
+
+    @Test
+    void recordingDifferentColumnsAppendsTheNextVersion() {
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+        derived.record("widen_orders", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+
+        derived.record("widen_orders", "widen", Map.of("id", "DECIMAL"), "sql-v1", "src-v2", "calcite-1.40.0");
+
+        DerivedSchema recorded = derived.latest("widen_orders", "widen").orElseThrow();
+        assertThat(recorded.version()).isEqualTo(1L);
+        assertThat(recorded.schema()).containsExactly(Map.entry("id", "DECIMAL"));
+    }
+
+    @Test
+    void whatTheAuthorWroteAndWhatTheDerivationReadAreKeptApart() {
+        // Folded into one fingerprint these two are indistinguishable, and they want opposite reactions:
+        // an edited query producing new columns is what the author asked for, while the same query
+        // producing new columns is the world having moved under it.
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+
+        derived.record("p", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+
+        DerivedSchema recorded = derived.latest("p", "widen").orElseThrow();
+        assertThat(recorded.statement()).isNotEqualTo(recorded.derivedFrom());
+    }
+
+    @Test
+    void twoStepsOfOnePipelineAreRecordedApart() {
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+
+        derived.record("p", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+        derived.record("p", "enrich", Map.of("name", "STRING"), "sql-v9", "src-v1", "calcite-1.40.0");
+
+        assertThat(derived.latest("p", "widen").orElseThrow().schema())
+                .containsExactly(Map.entry("id", "LONG"));
+        assertThat(derived.latest("p", "enrich").orElseThrow().schema())
+                .containsExactly(Map.entry("name", "STRING"));
+    }
+
+    @Test
+    void deletingAPipelineRemovesEveryStepItRecorded() {
+        // A record left behind would be read as the history of whatever is applied under that id next.
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+        derived.record("p", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+        derived.record("p", "enrich", Map.of("name", "STRING"), "sql-v9", "src-v1", "calcite-1.40.0");
+        derived.record("other", "widen", Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite-1.40.0");
+
+        derived.delete("p");
+
+        assertThat(derived.latest("p", "widen")).isEmpty();
+        assertThat(derived.latest("p", "enrich")).isEmpty();
+        assertThat(derived.latest("other", "widen")).isPresent();
+    }
+
+    @Test
+    void deletingAPipelineThatRecordedNothingIsNotAnError() {
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+
+        assertThatCode(() -> derived.delete("never-seen")).doesNotThrowAnyException();
+    }
+
+    @Test
+    void theRecordedColumnsKeepTheirOutputOrder() {
+        // Order is part of the shape a target table is built from, so a record that lost it would
+        // report a reordering as no change at all.
+        DerivedSchemaStore derived = new InMemoryStore().derivedSchemas();
+        Map<String, String> ordered = new LinkedHashMap<>();
+        ordered.put("id", "LONG");
+        ordered.put("customer_name", "STRING");
+        ordered.put("total", "DECIMAL");
+
+        derived.record("p", "widen", ordered, "sql-v1", "src-v1", "calcite-1.40.0");
+
+        assertThat(derived.latest("p", "widen").orElseThrow().schema().keySet())
+                .containsExactly("id", "customer_name", "total");
     }
 
     // --- artifacts (the canonical truth layer) ---
@@ -792,6 +919,7 @@ class StorePortTest {
         private final Map<String, SrsMeta> srsMeta = new HashMap<>();
         private final Map<String, byte[]> keyedState = new HashMap<>();
         private final Map<String, NestDeadLetterRecord> deadLetters = new LinkedHashMap<>();
+        private final Map<String, List<DerivedSchema>> derivedSchemas = new LinkedHashMap<>();
 
         @Override
         public ArtifactStore artifacts() {
@@ -1011,6 +1139,41 @@ class StorePortTest {
                 @Override
                 public void delete(String pipelineId) {
                     observations.remove(pipelineId);
+                }
+            };
+        }
+
+        @Override
+        public DerivedSchemaStore derivedSchemas() {
+            return new DerivedSchemaStore() {
+                @Override
+                public Optional<DerivedSchema> latest(String pipelineId, String stepId) {
+                    List<DerivedSchema> versions = derivedSchemas.get(pipelineId + "/" + stepId);
+                    return versions == null || versions.isEmpty()
+                            ? Optional.empty()
+                            : Optional.of(versions.get(versions.size() - 1));
+                }
+
+                @Override
+                public void record(String pipelineId, String stepId, Map<String, String> schema,
+                        String statement, String derivedFrom, String derivedBy) {
+                    List<DerivedSchema> versions = derivedSchemas
+                            .computeIfAbsent(pipelineId + "/" + stepId, ignored -> new ArrayList<>());
+                    DerivedSchema last = versions.isEmpty() ? null : versions.get(versions.size() - 1);
+                    if (last != null && last.schema().equals(schema)) {
+                        // Same shape: the provenance is refreshed in place so the next difference stays
+                        // attributable, and no version is spent on a schema that did not move.
+                        versions.set(versions.size() - 1, new DerivedSchema(
+                                last.version(), last.schema(), statement, derivedFrom, derivedBy));
+                        return;
+                    }
+                    versions.add(new DerivedSchema(last == null ? 0L : last.version() + 1, schema,
+                            statement, derivedFrom, derivedBy));
+                }
+
+                @Override
+                public void delete(String pipelineId) {
+                    derivedSchemas.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
                 }
             };
         }

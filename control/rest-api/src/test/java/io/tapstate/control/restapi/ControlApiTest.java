@@ -835,7 +835,8 @@ class ControlApiTest {
         ArtifactMutationService artifactMutationService(ArtifactStore store, AuditGate auditGate) {
             return new ArtifactMutationService(
                     store, NoReclaimStores.desired(), NoReclaimStores.state(),
-                    NoReclaimStores.observations(), NoReclaimStores.srsMeta(), auditGate, DataBrowserFollows.NONE);
+                    NoReclaimStores.observations(), NoReclaimStores.srsMeta(),
+                    NoReclaimStores.derivedSchemas(), auditGate, DataBrowserFollows.NONE);
         }
 
         // The connection-test controller is imported, so its service must be present for the context to
