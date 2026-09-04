@@ -76,6 +76,14 @@ final class JoinSchemaDrift {
      * <p>A refused start records nothing. The record is what the next comparison is made against, so
      * absorbing the new shape here would make the difference undetectable by the time anyone looked -
      * the start would refuse once and then quietly run on the new shape forever after.
+     *
+     * <p><b>Column order is not part of what is compared</b>, although the record preserves it. Two
+     * schemas holding the same names at the same types are the same shape here even if they arrive in
+     * a different order - which is reachable, through a {@code SELECT *} over a source table that was
+     * rebuilt with its columns in another order. Refusing that would be a false alarm: nothing about a
+     * reordering can truncate or round a value, and the writes are matched by name. The cost, stated
+     * because it is not obvious: a reordering leaves the recorded order stale, so the report renders
+     * the order last recorded rather than today's.
      */
     void checkAndRecord(String pipelineId, String stepId, String sql, JoinPlan plan,
             List<SourceTable> tables) {
