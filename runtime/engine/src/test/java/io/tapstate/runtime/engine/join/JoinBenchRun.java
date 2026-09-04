@@ -118,6 +118,9 @@ class JoinBenchRun {
         /** How many changes are handed over in one call. See {@link JoinBenchRun#DELIVERY}. */
         static final String DELIVERY = "joinbench.delivery";
 
+        /** Which arms to run: {@code carrier}, {@code heap}, or {@code both}. */
+        static final String ARMS = "joinbench.arms";
+
         private Knob() {
         }
     }
@@ -156,12 +159,23 @@ class JoinBenchRun {
                 + " delivery=" + DELIVERY + " " + sizes);
         System.out.println(Result.header());
         for (String name : scenarios(want)) {
-            // Twice, reporting the second: the first is the interpreter, and reporting it would be
-            // measuring the JVM's warm-up rather than the operator.
-            run(name, tier, sizes);
-            System.out.println(run(name, tier, sizes).row());
-            System.out.flush();
+            for (Arm arm : arms(System.getProperty(Knob.ARMS, "carrier"))) {
+                // Twice, reporting the second: the first is the interpreter, and reporting it would be
+                // measuring the JVM's warm-up rather than the operator.
+                run(name, tier, sizes, arm);
+                System.out.println(run(name, tier, sizes, arm).row());
+                System.out.flush();
+            }
         }
+    }
+
+    private static List<Arm> arms(String want) {
+        return switch (want) {
+            case "carrier" -> List.of(Arm.CARRIER);
+            case "heap" -> List.of(Arm.HEAP);
+            case "both" -> List.of(Arm.HEAP, Arm.CARRIER);
+            default -> throw new IllegalArgumentException("no arm called " + want);
+        };
     }
 
     private static List<String> scenarios(String want) {
@@ -169,8 +183,8 @@ class JoinBenchRun {
         return "all".equals(want) ? all : List.of(want.split(","));
     }
 
-    private static Result run(String name, String tier, Sizes sizes) {
-        try (Rig rig = new Rig(name, tier)) {
+    static Result run(String name, String tier, Sizes sizes, Arm arm) {
+        try (Rig rig = new Rig(name, tier, arm)) {
             return switch (name) {
                 case "F1" -> f1(rig, sizes);
                 case "F2" -> f2(rig, sizes);
@@ -454,8 +468,27 @@ class JoinBenchRun {
 
     // ---------------------------------------------------------------- the rig
 
+    /**
+     * Which state the operator is run against.
+     *
+     * <p><b>The two differ in the store and in nothing else</b> - same executor, same corpus, same
+     * scenario code - so a ratio between them is what the carrier costs over plain heap, with the
+     * machine's speed divided out. That is the only form an assertion about time can take here: this
+     * repository has measured the same tree at 6.9 seconds in CI and over 60 on a developer's machine,
+     * and a threshold in seconds is either slack enough to catch nothing or tight enough to redden on
+     * a busy runner.
+     *
+     * <p>{@code HEAP} starts no member and has no cold layer, so its trip counts are zero by
+     * construction; it is a clock, not a subject. It reports its tier as {@code heap} rather than the
+     * one that was asked for, because a tier is a map configuration and it has no maps.
+     */
+    enum Arm {
+        CARRIER,
+        HEAP
+    }
+
     /** How large everything is. */
-    private record Sizes(int dims, int fanout, int wideFanout, int batches, int batch) {
+    record Sizes(int dims, int fanout, int wideFanout, int batches, int batch) {
 
         @Override
         public String toString() {
@@ -475,11 +508,25 @@ class JoinBenchRun {
         private final HazelcastInstance member;
         private final ColdLayer cold = new ColdLayer();
         private final BuiltinJoinExecutor executor;
+        private final CountingJoinStores stores;
         private final String tier;
+        private final Arm arm;
         private final Counting sink = new Counting();
         private long emittedAtLastReset;
 
-        private Rig(String scenario, String tier) {
+        private Rig(String scenario, String tier, Arm arm) {
+            this.arm = arm;
+            if (arm == Arm.HEAP) {
+                // No member, no maps, no layer behind them - the same executor over plain heap state.
+                // The tier it reports is its own rather than the one asked for: a tier is a map
+                // configuration, and a row claiming to be cold while holding everything in a HashMap
+                // would be the one reading nobody could catch.
+                this.tier = "heap";
+                this.member = null;
+                this.stores = new CountingJoinStores(new MapJoinStores());
+                this.executor = new BuiltinJoinExecutor(List.of("id"), OUT, stores);
+                return;
+            }
             this.tier = tier;
             Config config = new Config();
             config.setClusterName("joinbench-" + scenario + "-" + System.nanoTime());
@@ -491,10 +538,10 @@ class JoinBenchRun {
             config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
             config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);
             config.addMapConfig(mapConfigFor(tier));
-            member = Hazelcast.newHazelcastInstance(config);
+            this.member = Hazelcast.newHazelcastInstance(config);
             JoinStateMapStoreFactory.bindTo(member, cold);
-            executor = new BuiltinJoinExecutor(List.of("id"), OUT,
-                    new ImapJoinStores(member, PIPELINE, STEP));
+            this.stores = new CountingJoinStores(new ImapJoinStores(member, PIPELINE, STEP));
+            this.executor = new BuiltinJoinExecutor(List.of("id"), OUT, stores);
         }
 
         private void open(Shape shape) {
@@ -552,6 +599,7 @@ class JoinBenchRun {
 
         /** Puts the counters where the next timed region starts from. */
         private void settle() {
+            stores.forgetCounts();
             cold.trips.reset();
             cold.keys.reset();
             cold.tripsWhere.values().forEach(LongAdder::reset);
@@ -589,7 +637,8 @@ class JoinBenchRun {
             long written = cold.entries();
             checkTierBit(name, resident, written);
             return new Result(name, tier, note, nanos, rows, cold.trips.sum(), cold.keys.sum(),
-                    cold.breakdown(), resident, written);
+                    cold.breakdown(), resident, written, stores.batchReads, stores.singleReads,
+                    stores.keysRead, stores.writes);
         }
 
         /**
@@ -602,6 +651,9 @@ class JoinBenchRun {
          * true of no tier at all.
          */
         private void checkTierBit(String name, long resident, long written) {
+            if (arm == Arm.HEAP) {
+                return;
+            }
             if ("nostore".equals(tier)) {
                 return;
             }
@@ -619,6 +671,9 @@ class JoinBenchRun {
 
         /** How many entries the three maps hold in memory, across this member. */
         private long resident() {
+            if (arm == Arm.HEAP) {
+                return 0;
+            }
             return owned(JoinMaps.factMirror(PIPELINE, STEP))
                     + owned(JoinMaps.dimensionMirror(PIPELINE, STEP, DIM))
                     + owned(JoinMaps.reverseIndex(PIPELINE, STEP, DIM));
@@ -631,7 +686,9 @@ class JoinBenchRun {
         @Override
         public void close() {
             executor.close();
-            member.shutdown();
+            if (member != null) {
+                member.shutdown();
+            }
         }
     }
 
@@ -1006,34 +1063,47 @@ class JoinBenchRun {
 
     // ---------------------------------------------------------------- reporting
 
-    private record Result(String scenario, String tier, String note, long nanos, long rows, long trips,
-                          long coldKeys, String tripsWhere, long resident, long written,
-                          long[] batches) {
+    /**
+     * One scenario's numbers.
+     *
+     * <p><b>{@code batchReads} / {@code singleReads} / {@code keysRead} are the operator's own asking;
+     * {@code trips} is what got past the maps to the layer.</b> Only the first three are a property of
+     * the operator: the last moves with which entries happen to be resident, and the eviction that
+     * decides that samples rather than orders. Three identical runs of one rebuild on the mixed tier
+     * reached the layer 344, 272 and 348 times while asking the mirror the same way every time. So a
+     * threshold is held against the first three, and the last is reported for the trend.
+     */
+    record Result(String scenario, String tier, String note, long nanos, long rows, long trips,
+                  long coldKeys, String tripsWhere, long resident, long written,
+                  int batchReads, int singleReads, long keysRead, int writes, long[] batches) {
 
-        private Result(String scenario, String tier, String note, long nanos, long rows, long trips,
-                long coldKeys, String tripsWhere, long resident, long written) {
+        Result(String scenario, String tier, String note, long nanos, long rows, long trips,
+                long coldKeys, String tripsWhere, long resident, long written, int batchReads,
+                int singleReads, long keysRead, int writes) {
             this(scenario, tier, note, nanos, rows, trips, coldKeys, tripsWhere, resident, written,
-                    null);
+                    batchReads, singleReads, keysRead, writes, null);
         }
 
-        private Result withBatches(long[] each) {
+        Result withBatches(long[] each) {
             return new Result(scenario, tier, note, nanos, rows, trips, coldKeys, tripsWhere, resident,
-                    written, each);
+                    written, batchReads, singleReads, keysRead, writes, each);
         }
 
-        private static String header() {
-            return String.join("\t", "scenario", "tier", "rows", "ms", "rows/s", "trips", "coldKeys",
-                    "trips/batch", "p50ms", "p95ms", "p99ms", "resident", "written", "tripsWhere",
-                    "note");
+        static String header() {
+            return String.join("\t", "scenario", "tier", "rows", "ms", "rows/s", "batchReads",
+                    "singleReads", "keysRead", "writes", "trips", "coldKeys", "trips/batch", "p50ms",
+                    "p95ms", "p99ms", "resident", "written", "tripsWhere", "note");
         }
 
-        private String row() {
+        String row() {
             // A rate is meaningless where the scenario is meant to emit nothing, so R5 reports none.
             String rate = rows == 0 ? "-" : String.format("%.0f", rows / (nanos / 1e9));
             String perBatch =
                     batches == null ? "-" : String.format("%.1f", trips / (double) batches.length);
             return String.join("\t", scenario, tier, Long.toString(rows),
-                    String.format("%.1f", nanos / 1e6), rate, Long.toString(trips),
+                    String.format("%.1f", nanos / 1e6), rate, Integer.toString(batchReads),
+                    Integer.toString(singleReads), Long.toString(keysRead), Integer.toString(writes),
+                    Long.toString(trips),
                     Long.toString(coldKeys), perBatch, percentile(50), percentile(95), percentile(99),
                     Long.toString(resident), Long.toString(written), tripsWhere, note);
         }

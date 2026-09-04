@@ -127,6 +127,7 @@ has "and a red smoke blocks the gate"         gates      'needs:.*cli-native'
 # --- the gate is upstream of the draft -------------------------------------------------------------
 has "the draft waits on the gate"             draft  'needs:.*gates'
 has "the gate waits on the connector lane"    gates  'needs:.*connectors'
+has "the gate waits on the performance lane" gates  'needs:.*join-perf'
 # The slow lane starts alongside the build, not after it, which is the only reason its ~38 minutes
 # overlap the release rather than being added to it. "Not after the gate" is too weak a way to say
 # that -- waiting on the build instead would cost the same and still satisfy it -- so what is pinned
@@ -169,13 +170,21 @@ has "the write-back only opens for the newest line" write-back "if: needs.versio
 has "the connector lane is judged by the same reader as every other check" \
     gates 'checks-on-commit\.sh --sha .* --required real-connectors'
 
+# --- and so is the performance lane -------------------------------------------------------------
+# The same shape for the same reason. This one is the easier of the two to lose: the ordinary build
+# runs part of it, so a reader can talk themselves into "the merge gate covers it" - and what the
+# merge gate covers is three scenarios on one tier out of eleven on three. A lane that never started
+# on the release commit leaves no check-run, which every way of counting failures reports as fine.
+has "the performance lane is judged by the same reader as every other check" \
+    gates 'checks-on-commit\.sh --sha .* --required join-perf'
+
 # --- everything is built from the commit the version job resolved -------------------------------
 # The `commit` input is what makes a release from an older line possible at all, and it defaults to
 # the ref the dispatch ran on. So a job that checked out `github.ref` instead is indistinguishable
 # from a correct one on every dispatch from `main`: same tree, same artifacts, same green run. It
 # diverges only on the case the input exists for, and there it builds the wrong line's code under the
 # right line's version number and publishes it -- with nothing red anywhere.
-for j in cli-native server-image connectors gates draft publish; do
+for j in cli-native server-image connectors join-perf gates draft publish; do
   has "$j builds the commit the version job resolved" "$j" 'ref: \$\{\{ needs\.version\.outputs\.sha \}\}'
 done
 # And the release that comes out says so, which is the half a reader can check afterwards.
