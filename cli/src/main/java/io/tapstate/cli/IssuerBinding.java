@@ -12,6 +12,10 @@ import java.util.function.BiFunction;
 final class IssuerBinding {
 
     private static final String ISSUER_PREFIX = "urn:tapstate:cluster:";
+
+    /** The named argument every discovery refusal carries: what the seed said, in its own words. */
+    private static final String REASON = "reason";
+
     private final ControlPlaneClient client;
 
     IssuerBinding(ControlPlaneClient client) {
@@ -35,33 +39,36 @@ final class IssuerBinding {
         DiscoveryOutcome.Discovered agreed = null;
         URI selected = null;
         for (URI seed : seeds) {
-            // Switched over the sealed outcome rather than tested and cast: a variant added later is a
-            // compile error here instead of a ClassCastException in front of a user.
-            switch (client.discover(seed)) {
+            // A switch over the sealed outcome rather than a test-and-cast: a variant added later is a
+            // compile error here instead of a ClassCastException in front of a user. An expression, so
+            // the language itself demands every variant be covered and no default can be bolted on to
+            // absorb the next one silently.
+            DiscoveryOutcome.Discovered discovered = switch (client.discover(seed)) {
+                case DiscoveryOutcome.Discovered found -> found;
+                // No answer from this seed; a later one may still carry the cluster.
+                case DiscoveryOutcome.Unreachable() -> null;
                 case DiscoveryOutcome.Invalid invalid -> throw failure(CliError.ISSUER_DISCOVERY_INVALID,
-                        Map.of("seed", seed.toString(), "reason", invalid.reason()));
+                        Map.of("seed", seed.toString(), REASON, invalid.reason()));
                 // A reachable seed that refuses the gate has given a definite answer, not a flake - a
                 // server older than this CLI does not serve the endpoint at all and refuses every time.
                 // Refusing here carries what it said, which is the only part a reader can act on.
                 case DiscoveryOutcome.Rejected refused -> throw failure(CliError.ISSUER_DISCOVERY_REJECTED,
-                        Map.of("seed", seed.toString(), "reason", refused.code().isBlank()
+                        Map.of("seed", seed.toString(), REASON, refused.code().isBlank()
                                 ? refused.message()
                                 : refused.code() + ": " + refused.message()));
-                case DiscoveryOutcome.Unreachable ignored -> {
-                    // No answer from this seed; a later one may still carry the cluster.
-                }
-                case DiscoveryOutcome.Discovered discovered -> {
-                    validate(seed, discovered);
-                    if (agreed == null) {
-                        agreed = discovered;
-                        selected = seed;
-                    } else if (!agreed.issuer().equals(discovered.issuer())) {
-                        throw mismatch(agreed.issuer(), discovered.issuer(), seed);
-                    }
-                    if (expectedIssuer != null && !expectedIssuer.equals(discovered.issuer())) {
-                        throw mismatch(expectedIssuer, discovered.issuer(), seed);
-                    }
-                }
+            };
+            if (discovered == null) {
+                continue;
+            }
+            validate(seed, discovered);
+            if (agreed == null) {
+                agreed = discovered;
+                selected = seed;
+            } else if (!agreed.issuer().equals(discovered.issuer())) {
+                throw mismatch(agreed.issuer(), discovered.issuer(), seed);
+            }
+            if (expectedIssuer != null && !expectedIssuer.equals(discovered.issuer())) {
+                throw mismatch(expectedIssuer, discovered.issuer(), seed);
             }
         }
         if (agreed == null) {
@@ -121,7 +128,7 @@ final class IssuerBinding {
                 || !modes.contains("password")
                 || !modes.contains("machine_token")) {
             throw failure(CliError.ISSUER_DISCOVERY_INVALID,
-                    Map.of("seed", seed.toString(), "reason", "response-contract"));
+                    Map.of("seed", seed.toString(), REASON, "response-contract"));
         }
     }
 
