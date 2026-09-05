@@ -84,6 +84,15 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void resume(String pipelineId) {
+        // A load still running when the pause landed left nothing recorded to carry on from, so resuming the
+        // job in place comes back to a capture tailing over a load that will never finish -- the pipeline
+        // reads nothing and reports RUNNING. Rebuilding is what a stop and a start already do correctly
+        // here: the tables the record still owes are read again, and nothing is cleared.
+        if (!captureCoordinator.loadComplete(pipelineId)) {
+            stop(pipelineId, false);
+            start(pipelineId);
+            return;
+        }
         engine.resume(pipelineId);
     }
 

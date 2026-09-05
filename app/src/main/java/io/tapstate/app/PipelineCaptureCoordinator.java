@@ -39,6 +39,23 @@ interface PipelineCaptureCoordinator {
     }
 
     /**
+     * Whether every table this pipeline reads has finished its initial load.
+     *
+     * <p>The question exists because an unfinished one leaves nothing behind to carry on from. Every row of
+     * a snapshot carries one reserved position, so a table becomes durable in the record only once its whole
+     * load is done -- a table interrupted part way through is indistinguishable, in the record, from one that
+     * never started. A resume that carried on in place would leave the capture tailing over a load nobody
+     * will finish.
+     *
+     * <p>Reports true when there is nothing to be unfinished: a coordinator running no capture, and a
+     * pipeline with no load of its own. That default is what keeps every caller that never had this question
+     * on the path it already takes.
+     */
+    default boolean loadComplete(String pipelineId) {
+        return true;
+    }
+
+    /**
      * How far each of the pipeline's tables got through its initial load, keyed by table, or empty when no
      * capture is running for it. A coordinator that runs no capture reports none.
      *
