@@ -220,7 +220,7 @@
           "$ref": "#/$defs/Metadata"
         },
         "source": {
-          "description": "Ids of pre-created sources this pipeline reads from; at least one is required.",
+          "description": "Ids of pre-created sources this pipeline reads from; blank drafts may omit them.",
           "oneOf": [
             {
               "type": "string"
@@ -454,7 +454,7 @@
         },
         "from": {
           "description": "The data source this serve block exposes.",
-          "$ref": "#/$defs/FromRef"
+          "$ref": "#/$defs/FromClause"
         },
         "sync": {
           "description": "Tables continuously synchronized to the serving layer.",
@@ -497,7 +497,7 @@
         },
         "from": {
           "description": "The data source this serve block exposes.",
-          "$ref": "#/$defs/FromRef"
+          "$ref": "#/$defs/FromClause"
         }
       },
       "required": [

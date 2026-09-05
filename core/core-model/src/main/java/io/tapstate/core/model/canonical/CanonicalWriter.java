@@ -335,7 +335,7 @@ public final class CanonicalWriter {
         switch (serve) {
             case ServeBlock.Inline s -> {
                 b.scalar("id", s.id());
-                b.scalar("from", fromRef(s.from()));
+                b.put("from", serveFrom(s.from()));
                 serveElements(b, s.sync(), s.query(), s.push());
             }
             case ServeBlock.Use u -> {
@@ -343,10 +343,18 @@ public final class CanonicalWriter {
                     b.scalar("id", u.id());
                 }
                 b.scalar("use", u.use());
-                b.scalar("from", fromRef(u.from()));
+                b.put("from", serveFrom(u.from()));
             }
         }
         return b.build();
+    }
+
+    /** Preserve the legacy scalar spelling for one serve input and use a sequence for multiple inputs. */
+    private Node serveFrom(FromClause from) {
+        if (from instanceof FromClause.Flow flow && flow.refs().size() == 1) {
+            return scalar(fromRef(flow.refs().getFirst()));
+        }
+        return fromClause(from);
     }
 
     private void serveElements(B b, List<SyncElement> sync, List<QueryElement> query,
