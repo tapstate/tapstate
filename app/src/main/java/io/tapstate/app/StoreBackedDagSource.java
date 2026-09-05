@@ -554,14 +554,16 @@ final class StoreBackedDagSource implements DagSource {
     /** The source artifacts whose rows can reach one terminal reference. */
     private static Set<String> sourceIdsReaching(
             PipelineResource pipeline,
-            FromRef from,
+            FromClause from,
             Map<String, String> sourceKeyByTable,
             Map<String, List<String>> sourceKeysById,
             Map<String, SourceVertex> sourceVertices,
             Set<String> stepIds) {
         Set<String> sourceIds = new LinkedHashSet<>();
-        collectSourceIds(pipeline, from, sourceKeyByTable, sourceKeysById, sourceVertices,
-                stepIds, sourceIds, new HashSet<>());
+        for (FromRef ref : refsOf(from)) {
+            collectSourceIds(pipeline, ref, sourceKeyByTable, sourceKeysById, sourceVertices,
+                    stepIds, sourceIds, new HashSet<>());
+        }
         return sourceIds;
     }
 
@@ -599,6 +601,22 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /** The stream ids a terminal sink can receive: source tables, or a nest step's assembled stream id. */
+    private static Set<String> streamsReaching(
+            PipelineResource pipeline,
+            FromClause from,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> sourceVertices,
+            Set<String> stepIds) {
+        Set<String> streams = new LinkedHashSet<>();
+        for (FromRef ref : refsOf(from)) {
+            collectStreams(pipeline, ref, sourceKeyByTable, sourceKeysById, sourceVertices,
+                    stepIds, streams, new HashSet<>());
+        }
+        return streams;
+    }
+
+    /** The view form remains a single reference; keep its terminal walk scalar. */
     private static Set<String> streamsReaching(
             PipelineResource pipeline,
             FromRef from,

@@ -17,7 +17,7 @@ public record PipelineResource(
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,
-        @Doc(value = "Ids of pre-created sources this pipeline reads from; at least one is required.",
+        @Doc(value = "Ids of pre-created sources this pipeline reads from; blank drafts may omit them.",
                 required = true, key = "source")
         @YamlScalarOrList
         List<String> sources,
@@ -36,7 +36,7 @@ public record PipelineResource(
     public PipelineResource {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(sources, "sources");
-        if (sources.isEmpty()) {
+        if (sources.isEmpty() && (transforms != null && !transforms.isEmpty() || view != null || serve != null)) {
             throw new IllegalArgumentException("source: must reference at least one source (X17)");
         }
         sources = List.copyOf(sources);

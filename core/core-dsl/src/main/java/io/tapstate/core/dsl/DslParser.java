@@ -429,18 +429,18 @@ public final class DslParser {
             return null;
         }
         if (n instanceof ScalarNode sc) {
-            return new ServeBlock.Use(null, sc.getValue(), naturalRef(prevId, n));
+            return new ServeBlock.Use(null, sc.getValue(), naturalFrom(prevId, n));
         }
         YamlMap s = m.mapping("serve");
         if (s.has("use")) {
             s.requireOnly(SERVE_USE_KEYS);
-            return new ServeBlock.Use(idOf(s), s.string("use"), blockFrom(s, prevId, n));
+            return new ServeBlock.Use(idOf(s), s.string("use"), serveFrom(s, prevId, n));
         }
         s.requireOnly(SERVE_INLINE_KEYS);
         String id = idOf(s);
         return new ServeBlock.Inline(
                 id != null ? id : "serve",     // anonymous serve block -> 'serve' (2026-06-15)
-                blockFrom(s, prevId, n),
+                serveFrom(s, prevId, n),
                 syncList(s.seq("sync"), "serve."),
                 queryList(s.seq("query"), "serve."),
                 pushList(s.seq("push"), "serve."));
@@ -626,10 +626,17 @@ public final class DslParser {
         return FromClause.aliases(aliases);
     }
 
-    /** A view/serve {@code from:} — a single ref, explicit or natural-order. */
+    /** A view {@code from:} — a single ref, explicit or natural-order. */
     private FromRef blockFrom(YamlMap owner, String prevId, Node at) {
         Node fn = owner.node("from");
         return fn != null ? fromRef(fn) : naturalRef(prevId, at);
+    }
+
+    /** A serve {@code from:} — a scalar or list of refs, explicit or natural-order. */
+    private FromClause serveFrom(YamlMap owner, String prevId, Node at) {
+        return owner.node("from") == null
+                ? naturalFrom(prevId, at)
+                : fromFlow(owner, prevId, at);
     }
 
     private static FromClause naturalFrom(String prevId, Node at) {

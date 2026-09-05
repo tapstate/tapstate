@@ -18,7 +18,6 @@ import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.AuditGate;
-import io.tapstate.control.core.AuditedSourceService;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
@@ -32,16 +31,20 @@ import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineProjectionService;
+import io.tapstate.control.core.PipelineRepresentation;
+import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
-import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.SessionService;
+import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -508,20 +511,41 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SourceService sourceService(
-            ConnectorCatalogView connectorCatalogView, ArtifactStore artifactStore,
-            SourceRepresentation representation, ObjectProvider<DataBrowserFollows> follows) {
-        // Resolved through a provider rather than injected directly: the streaming face is
-        // servlet-only, and a control plane assembled without one still deletes sources -- it
-        // simply has no follows to stop. Asked for at call time so it cannot depend on which
-        // configuration Spring happens to process first.
-        return new SourceService(connectorCatalogView::merged, artifactStore, representation,
-                follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+    SourceProjectionService sourceProjectionService(
+            ApplyService applyService,
+            ArtifactQueryService artifactQueryService,
+            ArtifactMutationService artifactMutationService,
+            SourceRepresentation representation) {
+        return new SourceProjectionService(
+                applyService, artifactQueryService, artifactMutationService, representation);
     }
 
     @Bean
-    AuditedSourceService auditedSourceService(SourceService sourceService, AuditGate auditGate) {
-        return new AuditedSourceService(sourceService, auditGate);
+    PipelineRepresentation pipelineRepresentation() {
+        return new PipelineRepresentation();
+    }
+
+    @Bean
+    PipelineViewService pipelineViewService(
+            ArtifactQueryService artifactQueryService,
+            PipelineRepresentation representation,
+            PipelineObservationQueryService observations) {
+        return new PipelineViewService(artifactQueryService, representation, observations);
+    }
+
+    @Bean
+    PipelineProjectionService pipelineProjectionService(
+            ApplyService applyService,
+            ArtifactQueryService artifactQueryService,
+            PipelineRepresentation representation,
+            PipelineViewService pipelineViewService) {
+        return new PipelineProjectionService(
+                applyService, artifactQueryService, representation, pipelineViewService);
+    }
+
+    @Bean
+    PipelineLayoutService pipelineLayoutService(PipelineViewService pipelines, StorePort storePort) {
+        return new PipelineLayoutService(pipelines, storePort.layouts());
     }
 
     /**

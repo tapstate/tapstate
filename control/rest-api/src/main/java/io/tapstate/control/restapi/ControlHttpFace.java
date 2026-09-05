@@ -39,6 +39,9 @@ import tools.jackson.databind.DeserializationFeature;
         PipelineStreamConfiguration.class, ClusterController.class, HealthController.class,
         VersionController.class, AuthController.class, IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,
+        ConnectorIconController.class,
+        PipelineViewController.class,
+        PipelineLayoutController.class,
         SourceDraftController.class,
         ApiExceptionHandler.class})
 public class ControlHttpFace {

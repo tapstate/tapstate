@@ -27,13 +27,16 @@ import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineProjectionService;
+import io.tapstate.control.core.PipelineRepresentation;
+import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SessionService;
-import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -57,6 +60,8 @@ import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayout;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SessionRecord;
 import io.tapstate.spi.store.SessionStore;
@@ -661,8 +666,16 @@ class AuthTest {
         // current request's error, no application data). A future plain @Controller added at the root would
         // escape both the verb-derivation gate and the interceptor — this pins the anonymous surface to
         // exactly that set.
-        Set<String> allowedRootPaths = Set.of("/healthz", "/version", AuthWire.DISCOVERY_PATH, "/auth/login",
-                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, "/auth/bootstrap", "/error");
+        Set<String> allowedRootPaths = Set.of(
+                "/healthz",
+                "/version",
+                AuthWire.DISCOVERY_PATH,
+                "/auth/login",
+                AuthWire.SESSION_PATH,
+                AuthWire.LOGOUT_PATH,
+                "/auth/bootstrap",
+                "/connector-icons/{id}",
+                "/error");
 
         RequestMappingHandlerMapping mapping =
                 context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
@@ -684,8 +697,9 @@ class AuthTest {
         });
 
         assertThat(unexpectedRootEndpoints)
-                .as("only the liveness probe, issuer discovery, and the pre-auth entry points may live outside /api; every "
-                        + "other endpoint is a registry verb under the authenticated /api prefix")
+                .as("only the liveness probe, pre-auth entry points, and the anonymous connector icon asset "
+                        + "surface may live outside /api; every other endpoint is a registry verb under the "
+                        + "authenticated /api prefix")
                 .isEmpty();
     }
 
@@ -716,8 +730,7 @@ class AuthTest {
      */
     @SpringBootConfiguration
     @EnableAutoConfiguration
-    @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
-            AuditedSourceServiceTestConfiguration.class})
+    @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class})
     static class TestApp {
 
         @Bean
@@ -834,6 +847,50 @@ class AuthTest {
         @Bean
         ArtifactQueryService artifactQueryService(InMemoryArtifactStore store) {
             return new ArtifactQueryService(store);
+        }
+
+        @Bean
+        PipelineRepresentation pipelineRepresentation() {
+            return new PipelineRepresentation();
+        }
+
+        @Bean
+        PipelineViewService pipelineViewService(
+                ArtifactQueryService artifacts, PipelineRepresentation representation) {
+            return new PipelineViewService(artifacts, representation);
+        }
+
+        @Bean
+        PipelineProjectionService pipelineProjectionService(
+                ApplyService applyService,
+                ArtifactQueryService artifactQueryService,
+                PipelineRepresentation representation,
+                PipelineViewService pipelineViewService) {
+            return new PipelineProjectionService(
+                    applyService, artifactQueryService, representation, pipelineViewService);
+        }
+
+        @Bean
+        PipelineLayoutStore pipelineLayoutStore() {
+            return new PipelineLayoutStore() {
+                @Override
+                public Optional<PipelineLayout> get(String pipelineId) {
+                    return Optional.empty();
+                }
+
+                @Override
+                public void save(PipelineLayout layout) {
+                }
+
+                @Override
+                public void delete(String pipelineId) {
+                }
+            };
+        }
+
+        @Bean
+        PipelineLayoutService pipelineLayoutService(PipelineViewService pipelines, PipelineLayoutStore layouts) {
+            return new PipelineLayoutService(pipelines, layouts);
         }
 
         // The removal controller comes in with the whole ControlHttpFace bundle, so its service must be

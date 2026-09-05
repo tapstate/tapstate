@@ -26,13 +26,16 @@ import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineProjectionService;
+import io.tapstate.control.core.PipelineRepresentation;
+import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.Scope;
-import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -59,6 +62,8 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayout;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.spi.store.TokenRecord;
@@ -78,8 +83,10 @@ import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
@@ -98,9 +105,10 @@ import java.util.stream.Collectors;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The pipeline lifecycle write verbs projected onto the authenticated {@code /api} surface: start / stop /
- * pause / resume, each a custom method on a pipeline instance ({@code POST /api/pipelines/{id}:start}). It
- * proves the four verbs round-trip through the real control-core service (over in-memory fakes), that the
+ * The Pipeline write verbs projected onto the authenticated {@code /api} surface: structured replacement
+ * through {@code PUT /api/pipelines/{id}} plus start / stop / pause / resume custom methods on a pipeline
+ * instance ({@code POST /api/pipelines/{id}:start}). It proves the replacement and lifecycle verbs
+ * round-trip through the real control-core service (over in-memory fakes), that the
  * state-machine and revision refusals surface as their proper 4xx coded bodies rather than a bare 500, that
  * the grade check guards them like any write verb, and that the authenticated caller becomes the audit
  * principal recorded for the audited write. The context is booted programmatically so the module stays on
@@ -139,10 +147,13 @@ class PipelineApiTest {
         context.getBean(FakeUserStore.class).clear();
         context.getBean(FakeTokenStore.class).clear();
         context.getBean(FakeDesiredStore.class).clear();
+        context.getBean(FakePipelineLayoutStore.class).clear();
         context.getBean(RecordingAuditStore.class).clear();
         FakeArtifactStore artifacts = context.getBean(FakeArtifactStore.class);
         artifacts.clear();
-        // Every test starts from one applied, never-run pipeline (state NEW).
+        // Every test starts from one applied, never-run pipeline (state NEW) and its complete reference closure.
+        artifacts.seed(SOURCE_X);
+        artifacts.seed(SOURCE_TARGET);
         artifacts.seed(PIPELINE_V1);
     }
 
@@ -156,6 +167,29 @@ class PipelineApiTest {
     }
 
     // ---- the four verbs round-trip through the service ----
+
+    @Test
+    void createPersistsABlankEditorDraftBeforeTheFirstTypedDagSave() {
+        String mutation = """
+                {"id":"blank_draft","metadata":{"labels":{},"description":"draft"},
+                 "sources":[],"transforms":[],"view":null,"serve":null,"settings":null,"experimental":null}
+                """;
+
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(mutation)
+                .retrieve().toEntity(Map.class);
+
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getHeaders().getLocation().toString()).endsWith("/api/pipelines/blank_draft");
+        assertThat(created.getHeaders().getETag()).matches("\"[0-9a-f]{64}\"");
+        assertThat(created.getBody()).containsEntry("id", "blank_draft");
+        Map<?, ?> dag = (Map<?, ?>) created.getBody().get("dag");
+        assertThat(dag).isNotNull();
+        assertThat(dag.get("nodes")).isEqualTo(List.of());
+        assertThat(dag.get("edges")).isEqualTo(List.of());
+    }
 
     @Test
     void startWithAWriteCredentialWritesRunningDesiredAtTheLatestRevision() {
@@ -287,6 +321,152 @@ class PipelineApiTest {
         });
     }
 
+    @Test
+    void listAndGetExposeTheStaticPipelineViewWithoutCanonicalYamlOrObservationState() {
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_X);
+
+        ResponseEntity<Map> listed = client().get().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+
+        assertThat(listed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(listed.getBody()).containsOnlyKeys("items");
+        assertThat((List<?>) listed.getBody().get("items")).hasSize(1);
+
+        ResponseEntity<Map> got = client().get().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+
+        assertThat(got.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(got.getHeaders().getETag()).matches("\"[0-9a-f]{64}\"");
+        assertPipelineView(got.getBody());
+        Map<?, ?> source = (Map<?, ?>) ((List<?>) got.getBody().get("sources")).getFirst();
+        assertThat(source.get("id")).isEqualTo("src_x");
+        assertThat(source.get("connector")).isEqualTo("mysql");
+        Map<?, ?> dag = (Map<?, ?>) got.getBody().get("dag");
+        List<?> nodes = (List<?>) dag.get("nodes");
+        List<?> edges = (List<?>) dag.get("edges");
+        assertThat(nodes).allSatisfy(node -> assertThat(((Map<?, ?>) node).get("type")).isNotEqualTo("serve"));
+        assertThat(nodes).anySatisfy(node -> {
+            Map<?, ?> mapped = (Map<?, ?>) node;
+            assertThat(mapped.get("id")).isEqualTo("source:src_x:/.*/");
+            assertThat(mapped.get("label")).isEqualTo("/.*/");
+            assertThat(mapped.get("detail")).isEqualTo("src_x");
+        });
+        assertThat(nodes).anySatisfy(node -> {
+            Map<?, ?> mapped = (Map<?, ?>) node;
+            assertThat(mapped.get("id")).isEqualTo("target:tgt_x:/.*/");
+            assertThat(mapped.get("label")).isEqualTo("/.*/");
+            assertThat(mapped.get("detail")).isEqualTo("tgt_x");
+        });
+        assertThat(edges).anySatisfy(edge -> {
+            Map<?, ?> mapped = (Map<?, ?>) edge;
+            assertThat(mapped.get("source")).isEqualTo("source:src_x:/.*/");
+            assertThat(mapped.get("target")).isEqualTo("target:tgt_x:/.*/");
+            assertThat(mapped.get("label")).isEqualTo("sink1");
+        });
+
+        ApiError missing = client().get().uri("/api/pipelines/ghost")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(missing.code()).isEqualTo("pipeline.not-found");
+        assertThat(missing.params()).containsEntry("id", "ghost");
+    }
+
+    @Test
+    void updateReplacesTheStructuredPipelineAndReturnsANewEtag() {
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_X);
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_TARGET);
+        ResponseEntity<Map> current = client().get().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+        String etag = current.getHeaders().getETag();
+
+        String mutation = """
+                {"id":"pl1","sources":["src_x"],"transforms":[],"view":null,
+                 "serve":{"id":"serve","from":"/.*/","sync":[{"id":"sink1","source":"tgt_x","writeMode":"append","ddl":"apply"}]},
+                 "settings":{"readMode":"cdc_only"},"metadata":null,"experimental":null}
+                """;
+        ResponseEntity<Map> replaced = client().put().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .header(HttpHeaders.IF_MATCH, etag)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(mutation)
+                .retrieve().toEntity(Map.class);
+
+        assertThat(replaced.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(replaced.getHeaders().getETag()).matches("\"[0-9a-f]{64}\"")
+                .isNotEqualTo(etag);
+        assertThat(((Map<?, ?>) replaced.getBody().get("settings")).get("readMode")).isEqualTo("CDC_ONLY");
+        assertThat(context.getBean(RecordingAuditStore.class).records)
+                .anySatisfy(record -> assertThat(record.operationId()).isEqualTo("artifact.apply"));
+    }
+
+    @Test
+    void updateRequiresTheCurrentEtag() {
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_X);
+        String mutation = "{\"id\":\"pl1\",\"sources\":[\"src_x\"]}";
+        ApiError error = client().put().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(mutation)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(error.code()).isEqualTo("pipeline.precondition-required");
+    }
+
+    @Test
+    void layoutIsSavedSeparatelyFromThePipelineArtifactAndRequiresWriteScope() {
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_X);
+        String pipelineEtag = client().get().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class).getHeaders().getETag();
+
+        ResponseEntity<Map> empty = client().get().uri("/api/pipelines/pl1/layout")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+
+        assertThat(empty.getBody()).containsEntry("pipelineId", "pl1");
+        assertThat((Map<?, ?>) empty.getBody().get("nodes")).isEmpty();
+        assertThat(empty.getBody()).containsEntry("viewport", null);
+
+        Map<String, Object> update = Map.of(
+                "nodes", Map.of("source:src_x", Map.of("x", 120.0, "y", 240.0)),
+                "viewport", Map.of("x", -10.0, "y", 20.0, "zoom", 0.75));
+        ResponseEntity<Map> saved = client().put().uri("/api/pipelines/pl1/layout")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(update)
+                .retrieve().toEntity(Map.class);
+
+        assertThat(saved.getBody()).containsEntry("pipelineId", "pl1");
+        assertThat(((Map<?, ?>) saved.getBody().get("nodes")).get("source:src_x"))
+                .isEqualTo(Map.of("x", 120.0, "y", 240.0));
+        assertThat(saved.getBody()).containsEntry("viewport", Map.of("x", -10.0, "y", 20.0, "zoom", 0.75));
+        assertThat(client().get().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class).getHeaders().getETag())
+                .isEqualTo(pipelineEtag);
+
+        ApiError forbidden = client().put().uri("/api/pipelines/pl1/layout")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(update)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(forbidden.code()).isEqualTo("control.forbidden");
+        assertThat(forbidden.params()).containsEntry("op", "pipeline.layout.update").containsEntry("required", "write");
+    }
+
     // ---- the endpoint table is a derivation of the registry: the pipeline verbs project onto /api ----
 
     @Test
@@ -310,9 +490,11 @@ class PipelineApiTest {
         });
 
         assertThat(projectedPipelineVerbs)
-                .as("the full pipeline surface — four lifecycle writes and four observation reads — projects "
+                .as("the full pipeline surface — static reads, lifecycle writes, and observation reads — projects "
                         + "onto the authenticated /api surface (this test boots the whole face bundle)")
                 .containsExactlyInAnyOrder(
+                        "pipeline.list", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
+                        "pipeline.update",
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs");
     }
@@ -326,6 +508,20 @@ class PipelineApiTest {
     /** The revision of a pipeline is the content hash of its canonical form — the value apply stamps. */
     private static String revisionOf(String dsl) {
         return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+    }
+
+    private static void assertPipelineView(Map<?, ?> view) {
+        for (String field : List.of("id", "sources", "settings", "serve", "dag", "contentHash")) {
+            assertThat(view.containsKey(field)).as(field).isTrue();
+        }
+        assertThat(view.get("id")).isEqualTo("pl1");
+        assertThat(String.valueOf(view.get("contentHash"))).matches("[0-9a-f]{64}");
+        assertThat(((Map<?, ?>) view.get("dag")).containsKey("nodes")).isTrue();
+        assertThat(((Map<?, ?>) view.get("dag")).containsKey("edges")).isTrue();
+        for (String forbidden : List.of(
+                "version", "kind", "canonicalForm", "desiredState", "state", "metrics", "logs", "positions")) {
+            assertThat(view.containsKey(forbidden)).as(forbidden).isFalse();
+        }
     }
 
     private void seedUser(String username, String password, String role) {
@@ -364,6 +560,20 @@ class PipelineApiTest {
                   ddl: apply
             """;
 
+    private static final String SOURCE_X = """
+            version: tapstate/v1
+            kind: source
+            id: src_x
+            connector: mysql
+            """;
+
+    private static final String SOURCE_TARGET = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_x
+            connector: mysql
+            """;
+
     /**
      * A minimal boot config: auto-configures Web MVC + the embedded servlet container, imports the whole
      * HTTP control face as one bundle ({@link ControlHttpFace}), and constructs the real control-core
@@ -372,8 +582,7 @@ class PipelineApiTest {
      */
     @SpringBootConfiguration
     @EnableAutoConfiguration
-    @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
-            AuditedSourceServiceTestConfiguration.class})
+    @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class})
     static class TestApp {
 
         @Bean
@@ -513,6 +722,38 @@ class PipelineApiTest {
         @Bean
         ArtifactQueryService artifactQueryService(ArtifactStore store) {
             return new ArtifactQueryService(store);
+        }
+
+        @Bean
+        PipelineRepresentation pipelineRepresentation() {
+            return new PipelineRepresentation();
+        }
+
+        @Bean
+        PipelineViewService pipelineViewService(
+                ArtifactQueryService artifactQueryService, PipelineRepresentation representation) {
+            return new PipelineViewService(artifactQueryService, representation);
+        }
+
+        @Bean
+        PipelineProjectionService pipelineProjectionService(
+                ApplyService applyService,
+                ArtifactQueryService artifactQueryService,
+                PipelineRepresentation representation,
+                PipelineViewService pipelineViewService) {
+            return new PipelineProjectionService(
+                    applyService, artifactQueryService, representation, pipelineViewService);
+        }
+
+        @Bean
+        FakePipelineLayoutStore pipelineLayoutStore() {
+            return new FakePipelineLayoutStore();
+        }
+
+        @Bean
+        PipelineLayoutService pipelineLayoutService(
+                PipelineViewService pipelines, PipelineLayoutStore layouts) {
+            return new PipelineLayoutService(pipelines, layouts);
         }
 
         // The removal controller comes in with the whole ControlHttpFace bundle, so its service must be
@@ -709,6 +950,29 @@ class PipelineApiTest {
         }
 
         @Override
+        public io.tapstate.spi.store.ArtifactMutation create(Resource artifact) {
+            if (byId.containsKey(artifact.id())) {
+                return io.tapstate.spi.store.ArtifactMutation.ALREADY_EXISTS;
+            }
+            byId.put(artifact.id(), artifact);
+            return io.tapstate.spi.store.ArtifactMutation.CREATED;
+        }
+
+        @Override
+        public io.tapstate.spi.store.ArtifactMutation replace(
+                String id, String expectedContentHash, Resource replacement) {
+            Resource current = byId.get(id);
+            if (current == null) {
+                return io.tapstate.spi.store.ArtifactMutation.NOT_FOUND;
+            }
+            if (!CanonicalHash.of(new CanonicalWriter().write(current)).equals(expectedContentHash)) {
+                return io.tapstate.spi.store.ArtifactMutation.VERSION_CONFLICT;
+            }
+            byId.put(id, replacement);
+            return io.tapstate.spi.store.ArtifactMutation.REPLACED;
+        }
+
+        @Override
         public Optional<Resource> get(String id) {
             return Optional.ofNullable(byId.get(id));
         }
@@ -745,6 +1009,30 @@ class PipelineApiTest {
         @Override
         public List<String> pipelineIds() {
             return List.copyOf(byId.keySet());
+        }
+    }
+
+    /** An in-memory layout store that is intentionally independent from the artifact test double. */
+    static final class FakePipelineLayoutStore implements PipelineLayoutStore {
+        private final Map<String, PipelineLayout> byPipeline = new LinkedHashMap<>();
+
+        void clear() {
+            byPipeline.clear();
+        }
+
+        @Override
+        public Optional<PipelineLayout> get(String pipelineId) {
+            return Optional.ofNullable(byPipeline.get(pipelineId));
+        }
+
+        @Override
+        public void save(PipelineLayout layout) {
+            byPipeline.put(layout.pipelineId(), layout);
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            byPipeline.remove(pipelineId);
         }
     }
 

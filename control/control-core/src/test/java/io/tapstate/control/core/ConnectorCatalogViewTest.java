@@ -3,9 +3,13 @@ package io.tapstate.control.core;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 
 import org.junit.jupiter.api.Test;
 
@@ -22,10 +26,9 @@ import io.tapstate.core.catalog.CatalogEntryReader;
 import io.tapstate.core.catalog.TapstateCatalog;
 
 /**
- * The online catalog view unions the bundled snapshot with the rows derived for registered connectors:
- * a registered connector becomes visible without a restart (the view re-reads the store per call), and
- * every listed connector is tagged bundled or registered so a face can tell an authored-in connector
- * from a user-uploaded one.
+ * The online catalog view keeps the bundled snapshot for capability validation and detail fallback, while
+ * the authoring list exposes only rows derived for registered connectors. A registration becomes visible
+ * without a restart because the view re-reads the store per call.
  */
 class ConnectorCatalogViewTest {
 
@@ -33,7 +36,7 @@ class ConnectorCatalogViewTest {
 
     private static final String ACME_ROW = """
             {
-              "id": "acme", "name": "Acme", "displayName": "Acme", "icon": null,
+              "id": "acme", "name": "Acme", "displayName": "Acme", "icon": "icons/acme.png",
               "group": "database", "modes": ["snapshot"], "discovery": "catalog",
               "sink": {"capable": false, "writeSemantics": []}, "pushOut": false, "config": [],
               "provenance": {"specPath": "spec.json", "specContentHash": "h",
@@ -162,7 +165,7 @@ class ConnectorCatalogViewTest {
     }
 
     @Test
-    void summariesTagRegisteredRowsRegisteredAndBundledRowsBundled() {
+    void summariesExposeOnlyRegisteredConnectorsAsAuthoringCandidates() {
         InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
         store.upsert(CatalogEntryReader.read(ACME_ROW));
         ConnectorCatalogView view = new ConnectorCatalogView(
@@ -170,12 +173,55 @@ class ConnectorCatalogViewTest {
 
         List<ConnectorSummary> summaries = view.summaries();
 
-        ConnectorSummary acme = summaries.stream().filter(s -> s.id().equals("acme")).findFirst().orElseThrow();
-        assertThat(acme.origin()).isEqualTo("registered");
-        assertThat(acme.modes()).contains("snapshot");
-        String bundledId = BUNDLED.ids().get(0);
-        ConnectorSummary bundled = summaries.stream().filter(s -> s.id().equals(bundledId)).findFirst().orElseThrow();
-        assertThat(bundled.origin()).isEqualTo("bundled");
+        assertThat(summaries).extracting(ConnectorSummary::id).containsExactly("acme");
+        assertThat(summaries.get(0).origin()).isEqualTo("registered");
+        assertThat(summaries.get(0).modes()).contains("snapshot");
+    }
+
+    @Test
+    void summariesReflectRegistrationsAddedAfterTheViewWasConstructed() {
+        InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, store, new InMemoryConnectorSpecStore(), emptyRegistry());
+
+        assertThat(view.summaries()).isEmpty();
+
+        store.upsert(CatalogEntryReader.read(ACME_ROW));
+
+        assertThat(view.summaries()).extracting(ConnectorSummary::id).containsExactly("acme");
+    }
+
+    @Test
+    void iconReadsTheDeclaredEntryFromTheRegisteredArtifact() {
+        InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
+        store.upsert(CatalogEntryReader.read(ACME_ROW));
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, store, new InMemoryConnectorSpecStore(),
+                registryHoldingArtifact("acme", "jar-hash", jarWith("icons/acme.png", new byte[] {4, 5, 6})));
+
+        ConnectorIcon icon = view.icon("acme").orElseThrow();
+
+        assertThat(icon.mediaType()).isEqualTo("image/png");
+        assertThat(icon.bytes()).containsExactly(4, 5, 6);
+    }
+
+    @Test
+    void iconIsAbsentWhenTheConnectorIsNotRegisteredInTheCatalogStore() {
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, new InMemoryConnectorCatalogStore(), new InMemoryConnectorSpecStore(), emptyRegistry());
+
+        assertThat(view.icon("mysql")).isEmpty();
+    }
+
+    @Test
+    void iconIsAbsentWhenTheArtifactDoesNotContainTheDeclaredEntry() {
+        InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
+        store.upsert(CatalogEntryReader.read(ACME_ROW));
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, store, new InMemoryConnectorSpecStore(),
+                registryHoldingArtifact("acme", "jar-hash", jarWith("icons/other.png", new byte[] {4})));
+
+        assertThat(view.icon("acme")).isEmpty();
     }
 
     @Test
@@ -445,5 +491,45 @@ class ConnectorCatalogViewTest {
                 return bytesPresent && hash.equals(contentHash);
             }
         };
+    }
+
+    private static ConnectorRegistry registryHoldingArtifact(String connectorId, String contentHash, byte[] artifact) {
+        List<ConnectorRegistration> registrations = List.of(
+                new ConnectorRegistration(connectorId, contentHash, "1.0.0", RegistrationSource.REGISTER));
+        return new ConnectorRegistry() {
+            @Override
+            public RegistrationOutcome register(String id, String pdkApiVersion, RegistrationSource source, byte[] bytes) {
+                throw new UnsupportedOperationException("the icon read never registers");
+            }
+
+            @Override
+            public List<ConnectorRegistration> list() {
+                return registrations;
+            }
+
+            @Override
+            public Optional<byte[]> artifact(String hash) {
+                return hash.equals(contentHash) ? Optional.of(artifact.clone()) : Optional.empty();
+            }
+
+            @Override
+            public boolean hasArtifact(String hash) {
+                return hash.equals(contentHash);
+            }
+        };
+    }
+
+    private static byte[] jarWith(String path, byte[] bytes) {
+        try {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (JarOutputStream jar = new JarOutputStream(output)) {
+                jar.putNextEntry(new JarEntry(path));
+                jar.write(bytes);
+                jar.closeEntry();
+            }
+            return output.toByteArray();
+        } catch (IOException error) {
+            throw new AssertionError("test jar could not be created", error);
+        }
     }
 }

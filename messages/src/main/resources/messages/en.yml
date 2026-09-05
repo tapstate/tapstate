@@ -456,6 +456,21 @@ source.precondition-required:
 source.version-conflict:
   message: "Source '{id}' changed after it was read."
   solution: "Read the current Source and retry the operation with its new ETag."
+pipeline.not-found:
+  message: "No Pipeline with id '{id}' exists."
+  solution: "List Pipelines to find an existing id."
+pipeline.already-exists:
+  message: "A Pipeline with id '{id}' already exists."
+  solution: "Choose a different Pipeline id, or edit the existing Pipeline."
+pipeline.id-mismatch:
+  message: "Pipeline id '{bodyId}' in the request body does not match path id '{pathId}'."
+  solution: "Use the same immutable Pipeline id in the request path and body."
+pipeline.precondition-required:
+  message: "Pipeline '{id}' requires its current ETag for this operation."
+  solution: "Read the Pipeline, then retry with its ETag in If-Match."
+pipeline.version-conflict:
+  message: "Pipeline '{id}' changed after it was read."
+  solution: "Read the current Pipeline and retry the operation with its new ETag."
 transform.expression-failed:
   message: "Expression {expr} could not be evaluated for a row: {detail}."
   solution: "Check the expression against the fields and types the row actually carries at runtime."

@@ -35,7 +35,7 @@ import org.junit.jupiter.api.Test;
  * epoch-fencing compare-and-swap, a plain-upsert desired-intent store, a connection catalog store, a
  * discovered source-schema store, a connector distribution registry, the derived connector catalog
  * store, the content-addressed connector spec source store, the latest connection-test result store, a
- * plain-upsert per-pipeline observation store, and the SRS meta store.
+ * plain-upsert per-pipeline observation store, the editor-only Pipeline layout store, and the SRS meta store.
  */
 class StorePortTest {
 
@@ -49,7 +49,7 @@ class StorePortTest {
     // --- facade ---
 
     @Test
-    void facadeExposesTheElevenStores() {
+    void facadeExposesTheFourteenStores() {
         StorePort store = new InMemoryStore();
 
         assertThat(store.artifacts()).isNotNull();
@@ -63,6 +63,25 @@ class StorePortTest {
         assertThat(store.connectionTestResults()).isNotNull();
         assertThat(store.observations()).isNotNull();
         assertThat(store.meta()).isNotNull();
+        assertThat(store.layouts()).isNotNull();
+        assertThat(store.keyedState()).isNotNull();
+        assertThat(store.nestDeadLetters()).isNotNull();
+    }
+
+    @Test
+    void layoutIsMutableWithoutChangingTheArtifactTruthLayer() {
+        StorePort store = new InMemoryStore();
+        PipelineLayout layout = new PipelineLayout(
+                "orders_sync",
+                Map.of("source:orders", new PipelineLayout.NodePosition(80, 120)),
+                new PipelineLayout.Viewport(0, 0, 1));
+
+        store.layouts().save(layout);
+
+        assertThat(store.layouts().get("orders_sync")).contains(layout);
+        assertThat(store.artifacts().get("orders_sync")).isEmpty();
+        store.layouts().delete("orders_sync");
+        assertThat(store.layouts().get("orders_sync")).isEmpty();
     }
 
     // --- artifacts (the canonical truth layer) ---
@@ -790,6 +809,7 @@ class StorePortTest {
         private final Map<String, DesiredState> desired = new HashMap<>();
         private final Map<String, Observation> observations = new HashMap<>();
         private final Map<String, SrsMeta> srsMeta = new HashMap<>();
+        private final Map<String, PipelineLayout> layouts = new HashMap<>();
         private final Map<String, byte[]> keyedState = new HashMap<>();
         private final Map<String, NestDeadLetterRecord> deadLetters = new LinkedHashMap<>();
 
@@ -1011,6 +1031,26 @@ class StorePortTest {
                 @Override
                 public void delete(String pipelineId) {
                     observations.remove(pipelineId);
+                }
+            };
+        }
+
+        @Override
+        public PipelineLayoutStore layouts() {
+            return new PipelineLayoutStore() {
+                @Override
+                public Optional<PipelineLayout> get(String pipelineId) {
+                    return Optional.ofNullable(layouts.get(pipelineId));
+                }
+
+                @Override
+                public void save(PipelineLayout layout) {
+                    layouts.put(layout.pipelineId(), layout);
+                }
+
+                @Override
+                public void delete(String pipelineId) {
+                    layouts.remove(pipelineId);
                 }
             };
         }

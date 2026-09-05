@@ -415,6 +415,19 @@ public final class PipelineDagBuilder {
         return verticesOf(resolve(ref, bindings), byKey);
     }
 
+    /** The vertices named by a serve flow, preserving every selected table in one sink path. */
+    private static List<Vertex> upstreamOf(FromClause from, Map<String, Vertex> byKey,
+            DagBindings bindings, Map<String, List<Vertex>> readsAs) {
+        if (from instanceof FromClause.Flow flow) {
+            List<Vertex> upstream = new ArrayList<>();
+            for (FromRef ref : flow.refs()) {
+                upstream.addAll(upstreamOf(ref, byKey, bindings, readsAs));
+            }
+            return upstream;
+        }
+        throw new IllegalArgumentException("serve.from must be a flow of references");
+    }
+
     /** The vertices those producer keys name, refusing a key no vertex was built for. */
     private static List<Vertex> verticesOf(List<String> keys, Map<String, Vertex> byKey) {
         List<Vertex> vertices = new ArrayList<>();

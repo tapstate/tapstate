@@ -1,12 +1,14 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.catalog.TapstateCatalog;
-import io.tapstate.core.common.TapstateType;
-import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.CapabilityRules;
+import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.DiscoveredTable;
 import io.tapstate.core.dsl.RowExpressionTypeRules;
+import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.dsl.WriteKeyRules;
 import io.tapstate.core.model.PipelineResource;
@@ -16,16 +18,22 @@ import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
 
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -37,8 +45,9 @@ import java.util.regex.PatternSyntaxException;
  * the catalog), judges the batch's row expressions against the columns of the tables its sources were
  * discovered to hold, then emits each resource's canonical form and content hash. It writes nothing. It reads the
  * schema store — an observation of what discovery found, never the config truth layer, which apply is
- * the one writer of — and reads the artifact store only for a draft that carries a precondition, to
- * judge that precondition against the stored version.
+ * the one writer of — and reads the artifact truth layer to overlay submitted resources on the stored
+ * workspace before validation. A draft carrying a precondition also reads its stored version to report
+ * a stale edit before the atomic write check.
  * {@link #apply} runs a plan and then upserts each artifact into the store by its id, skipping the
  * write when the stored artifact's content hash is unchanged (a no-op).
  *
@@ -50,12 +59,12 @@ import java.util.regex.PatternSyntaxException;
  * draft whose precondition has gone stale aborts the same way with {@code artifact.version-conflict};
  * nothing is written on either. The refusal is of the whole batch, never of the offending draft alone —
  * a batch is one closure, so letting half of it land would store a state nothing ever validated. The
- * batch is the closure: references resolve within the
- * submitted set. The union with store-resident artifacts is layered in where the store is consulted.
+ * candidate workspace is the closure: each submission overlays its id on every stored artifact, so
+ * references resolve against the state that would exist after the write.
  *
  * <p>The catalog is supplied per plan rather than fixed, so the online path validates against the live
- * catalog view — the bundled snapshot union the connectors registered so far — and a connector
- * registered at runtime is honoured without a restart.
+ * capability view — the bundled snapshot with registered rows overlaid — and a connector registered at
+ * runtime is honoured without a restart.
  *
  * <p>The no-op is keyed by the content hash over the canonical form, so re-applying identical content
  * — even with different raw key order — writes nothing. Apply writes the changed set — the created and
@@ -121,19 +130,143 @@ public final class ApplyService {
                 preconditions.put(parsed.id(), draft.expectedContentHash());
             }
         }
-        Workspace workspace = Workspace.of(resources, catalog.get());
+        return planResources(resources, preconditions, ValidationScope.OFFLINE);
+    }
+
+    /**
+     * Plans one or more already-built resources through the same candidate-workspace validation path
+     * used by parsed drafts. Typed control faces call this entry after their input mapper has built a
+     * resource; they do not serialize it to YAML or recreate validation beside apply.
+     */
+    private ApplyPlan planResources(
+            List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope) {
+        Objects.requireNonNull(submitted, "submitted");
+        Objects.requireNonNull(preconditions, "preconditions");
+        Objects.requireNonNull(validationScope, "validationScope");
+        Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
+        List<Resource> candidate = new ArrayList<>();
+        for (Resource stored : store.list()) {
+            if (!submittedIds.contains(stored.id())) {
+                candidate.add(stored);
+            }
+        }
+        candidate.addAll(submitted);
+        TapstateCatalog liveCatalog = catalog.get();
+        Workspace workspace = Workspace.of(candidate, liveCatalog);
+        if (validationScope == ValidationScope.ONLINE_SOURCE) {
+            for (Resource resource : submitted) {
+                if (resource instanceof SourceResource source) {
+                    CapabilityRules.validateOnline(source, liveCatalog);
+                }
+            }
+        }
         // Read once and handed to both: the gate judges the batch against it, then the advisory pass
         // advises on the same reading rather than paying a second round trip for a possibly different one.
-        Map<String, List<DiscoveredTable>> discovered = discoveredTables(resources);
-        RowExpressionTypeRules.validate(resources, discovered);
-        WriteKeyRules.validate(resources, discovered);
+        List<Resource> semanticValidation = semanticValidationResources(candidate, submitted, validationScope);
+        Map<String, List<DiscoveredTable>> discovered = discoveredTables(semanticValidation);
+        RowExpressionTypeRules.validate(semanticValidation, discovered);
+        WriteKeyRules.validate(semanticValidation, discovered);
         List<Resource> validated = List.copyOf(workspace.resources());
-        List<PreparedArtifact> prepared = new ArrayList<>();
+        Map<String, Resource> validatedById = new LinkedHashMap<>();
         for (Resource resource : validated) {
+            validatedById.put(resource.id(), resource);
+        }
+        List<PreparedArtifact> prepared = new ArrayList<>();
+        for (Resource submittedResource : submitted) {
+            Resource resource = validatedById.get(submittedResource.id());
             String canonicalForm = writer.write(resource);
             prepared.add(new PreparedArtifact(resource, canonicalForm, CanonicalHash.of(canonicalForm)));
         }
         return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions);
+    }
+
+    /**
+     * Selects the resources that need discovered-schema semantic gates for an online typed write.
+     *
+     * <p>Workspace validation above always runs over the complete post-write candidate. The
+     * discovered gates are different: a typed source edit should not re-validate an unrelated
+     * pipeline against stale schema observations. Pipelines are included when they are transitively
+     * reachable through references to the submitted source (including inline serve sinks and
+     * reusable serve definitions); all non-pipeline resources remain available for wiring lookup.
+     */
+    private static List<Resource> semanticValidationResources(
+            List<Resource> candidate, List<Resource> submitted, ValidationScope scope) {
+        if (scope != ValidationScope.ONLINE_SOURCE) {
+            return candidate;
+        }
+        Set<String> submittedSourceIds = new LinkedHashSet<>();
+        Set<String> submittedPipelineIds = new LinkedHashSet<>();
+        for (Resource resource : submitted) {
+            if (resource instanceof SourceResource) {
+                submittedSourceIds.add(resource.id());
+            } else if (resource instanceof PipelineResource) {
+                submittedPipelineIds.add(resource.id());
+            }
+        }
+        // A typed Pipeline write must be judged against its own discovered sources, but it must not
+        // re-run schema-dependent gates for every unrelated stored Pipeline. A stale keyless table in
+        // another pipeline would otherwise make creating an empty draft impossible (and would report
+        // an error for the wrong request). Non-pipeline resources remain available to resolve the
+        // submitted pipeline's source/serve definitions.
+        if (!submittedPipelineIds.isEmpty()) {
+            return candidate.stream()
+                    .filter(resource -> !(resource instanceof PipelineResource)
+                            || submittedPipelineIds.contains(resource.id()))
+                    .toList();
+        }
+        if (submittedSourceIds.isEmpty()) {
+            return candidate;
+        }
+
+        ReferenceGraph graph = ReferenceGraph.of(candidate);
+        Set<String> impacted = new HashSet<>();
+        ArrayDeque<String> pending = new ArrayDeque<>(submittedSourceIds);
+        while (!pending.isEmpty()) {
+            String id = pending.removeFirst();
+            if (!impacted.add(id)) {
+                continue;
+            }
+            for (ReferenceGraph.Edge referrer : graph.referencedBy(id)) {
+                pending.addLast(referrer.id());
+            }
+        }
+
+        List<Resource> selected = new ArrayList<>();
+        for (Resource resource : candidate) {
+            if (!(resource instanceof PipelineResource) || impacted.contains(resource.id())) {
+                selected.add(resource);
+            }
+        }
+        return selected;
+    }
+
+    /** Applies one typed resource only while its id is absent. */
+    public ArtifactWriteResult create(String principal, Resource resource) {
+        return writeTyped(principal, resource, ArtifactWrite.Intent.CREATE_ONLY, null);
+    }
+
+    /** Applies one typed resource only while its stored canonical hash equals {@code expectedContentHash}. */
+    public ArtifactWriteResult replace(String principal, Resource resource, String expectedContentHash) {
+        Objects.requireNonNull(expectedContentHash, "expectedContentHash");
+        return writeTyped(principal, resource, ArtifactWrite.Intent.REPLACE_ONLY, expectedContentHash);
+    }
+
+    private ArtifactWriteResult writeTyped(
+            String principal, Resource resource, ArtifactWrite.Intent intent, String expectedContentHash) {
+        Objects.requireNonNull(principal, "principal");
+        Objects.requireNonNull(resource, "resource");
+        ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        PreparedArtifact prepared = plan.artifacts().getFirst();
+        ArtifactWrite write = switch (intent) {
+            case CREATE_ONLY -> ArtifactWrite.createOnly(prepared.resource());
+            case REPLACE_ONLY -> ArtifactWrite.replaceOnly(prepared.resource(), expectedContentHash);
+            case UPSERT -> throw new IllegalArgumentException("typed writes must be conditional");
+        };
+        ArtifactBatchWrite outcome = auditGate.dispatchAll(
+                ControlOperations.ARTIFACT_APPLY,
+                List.of(new AuditContext(principal, prepared.id(), expectedContentHash)),
+                () -> store.writeAll(List.of(write)));
+        return new ArtifactWriteResult(prepared, outcome);
     }
 
     /** Validates and plans a batch while performing no store or audit write. */
@@ -210,6 +343,11 @@ public final class ApplyService {
             }
             return new ApplyResult(outcomes, plan.warnings());
         });
+    }
+
+    private enum ValidationScope {
+        OFFLINE,
+        ONLINE_SOURCE
     }
 
     /**

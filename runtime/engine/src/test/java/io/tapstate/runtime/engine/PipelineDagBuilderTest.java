@@ -57,6 +57,43 @@ class PipelineDagBuilderTest {
     }
 
     @Test
+    void one_serve_sink_accepts_multiple_explicit_source_table_references() {
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of("src"),
+                null,
+                null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromClause.list(
+                                FromRef.literal("src.orders"),
+                                FromRef.literal("src.customers")),
+                        List.of(sync("sync_1", "orders_dest")),
+                        null,
+                        null),
+                null, null);
+
+        DagBindings bindings = new DagBindings(
+                srcId -> stubMeta(),
+                step -> (SupplierEx<TransformPort>) () -> ev -> List.of(ev),
+                syncElement -> stubWriter(),
+                ref -> Map.of(
+                        FromRef.literal("src.orders"), List.of("src.orders"),
+                        FromRef.literal("src.customers"), List.of("src.customers"))
+                        .getOrDefault(ref, List.of()),
+                sourceId -> List.of("src.orders", "src.customers"),
+                viewBlock -> stubWriter());
+
+        DAG dag = PipelineDagBuilder.build(pipeline, bindings);
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "src.orders", "src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("src.orders", "serve.sync_1", 0, 0),
+                edge("src.customers", "serve.sync_1", 0, 1));
+    }
+
+    @Test
     void view_without_serve_is_a_source_then_a_materialization_sink() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,

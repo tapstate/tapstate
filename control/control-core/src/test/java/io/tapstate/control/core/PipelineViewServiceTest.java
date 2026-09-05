@@ -1,0 +1,240 @@
+package io.tapstate.control.core;
+
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.Metadata;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ArtifactWrite;
+import io.tapstate.spi.store.PipelineLayout;
+import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.ObservationStore;
+import org.junit.jupiter.api.Test;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class PipelineViewServiceTest {
+
+    @Test
+    void listsPipelinesInStableIdOrderAndKeepsDeclaredSourceOrder() {
+        ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
+        store.seed(source("orders", "Orders", "mysql"));
+        store.seed(source("customers", "Customers", "postgres"));
+        store.seed(pipeline("nightly", List.of("customers", "orders")));
+        store.seed(pipeline("daily", List.of("orders", "customers")));
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(store), new PipelineRepresentation());
+
+        List<PipelineView> listed = pipelines.list();
+
+        assertThat(listed).extracting(PipelineView::id).containsExactly("daily", "nightly");
+        assertThat(listed.getFirst().sources()).extracting(PipelineSourceSummary::id)
+                .containsExactly("orders", "customers");
+        assertThat(listed.get(1).sources()).extracting(PipelineSourceSummary::id)
+                .containsExactly("customers", "orders");
+    }
+
+    @Test
+    void findsAPipelineWithCanonicalHashAndResolvedSourceSummaries() {
+        ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
+        store.seed(source("orders", "Orders", "mysql"));
+        store.seed(pipeline("daily", List.of("orders")));
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(store), new PipelineRepresentation());
+
+        PipelineView view = pipelines.find("daily").orElseThrow();
+
+        assertThat(view.id()).isEqualTo("daily");
+        assertThat(view.contentHash()).hasSize(64);
+        assertThat(view.sources()).containsExactly(
+                new PipelineSourceSummary(
+                        "orders", new Metadata(Map.of("team", "sales"), "Orders"), "mysql"));
+    }
+
+    @Test
+    void listAttachesAvailableRuntimeStatusAndLeavesUnobservedPipelinesUnavailable() {
+        ReadOnlyArtifactStore artifacts = new ReadOnlyArtifactStore();
+        artifacts.seed(source("orders", "Orders", "mysql"));
+        artifacts.seed(pipeline("running", List.of("orders")));
+        artifacts.seed(pipeline("pending", List.of("orders")));
+        InMemoryObservationStore observations = new InMemoryObservationStore();
+        observations.save(new Observation("running", PipelineState.RUNNING, Map.of(), Map.of(), Map.of()));
+
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(artifacts),
+                new PipelineRepresentation(),
+                new PipelineObservationQueryService(new ArtifactQueryService(artifacts), observations));
+
+        List<PipelineView> listed = pipelines.list();
+        assertThat(listed).extracting(PipelineView::id).containsExactly("pending", "running");
+        assertThat(listed.get(0).status()).isNull();
+        assertThat(listed.get(1).status())
+                .isEqualTo(new PipelineStatus("running", PipelineState.RUNNING, null));
+    }
+
+    @Test
+    void doesNotTreatNonPipelineArtifactsAsPipelineViews() {
+        ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
+        store.seed(source("orders", "Orders", "mysql"));
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(store), new PipelineRepresentation());
+
+        assertThat(pipelines.find("orders")).isEmpty();
+    }
+
+    @Test
+    void rejectsMissingOrWrongKindSourceReferencesInsteadOfDroppingThem() {
+        ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
+        store.seed(pipeline("missing", List.of("absent")));
+        store.seed(pipeline("wrong_kind", List.of("not_a_source")));
+        store.seed(pipeline("not_a_source", List.of("another_source")));
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(store), new PipelineRepresentation());
+
+        assertThatThrownBy(() -> pipelines.find("missing"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("absent")
+                .hasMessageContaining("Source");
+        assertThatThrownBy(() -> pipelines.find("wrong_kind"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("not_a_source")
+                .hasMessageContaining("Source");
+    }
+
+    @Test
+    void savesEditorLayoutWithoutChangingThePipelineArtifactOrAcceptingAnUnknownPipeline() {
+        ReadOnlyArtifactStore artifacts = new ReadOnlyArtifactStore();
+        artifacts.seed(source("orders", "Orders", "mysql"));
+        artifacts.seed(pipeline("daily", List.of("orders")));
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(artifacts), new PipelineRepresentation());
+        InMemoryPipelineLayoutStore layouts = new InMemoryPipelineLayoutStore();
+        PipelineLayoutService service = new PipelineLayoutService(pipelines, layouts);
+
+        String before = pipelines.get("daily").contentHash();
+        PipelineLayout layout = service.save("daily", Map.of(
+                "source:orders", new PipelineLayout.NodePosition(120.0, 240.0)),
+                new PipelineLayout.Viewport(-10.0, 20.0, 0.75));
+
+        assertThat(service.get("daily")).isEqualTo(layout);
+        assertThat(layouts.get("daily")).contains(layout);
+        assertThat(pipelines.get("daily").contentHash()).isEqualTo(before);
+        assertThatThrownBy(() -> service.get("ghost"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(PipelineError.NOT_FOUND);
+                    assertThat(error.args()).containsEntry("id", "ghost");
+                });
+    }
+
+    private static SourceResource source(String id, String description, String connector) {
+        return new SourceResource(
+                id,
+                new Metadata(Map.of("team", "sales"), description),
+                connector,
+                Map.of(),
+                null,
+                null,
+                null,
+                null,
+                null);
+    }
+
+    private static PipelineResource pipeline(String id, List<String> sourceIds) {
+        return new PipelineResource(id, null, sourceIds, null, null, null, null, null);
+    }
+
+    private static final class ReadOnlyArtifactStore implements ArtifactStore {
+
+        private final Map<String, Resource> resources = new LinkedHashMap<>();
+
+        void seed(Resource resource) {
+            resources.put(resource.id(), resource);
+        }
+
+        @Override
+        public ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
+            throw new AssertionError("Pipeline view queries must not write artifacts");
+        }
+
+        @Override
+        public ArtifactMutation create(Resource artifact) {
+            throw new AssertionError("Pipeline view queries must not write artifacts");
+        }
+
+        @Override
+        public ArtifactMutation replace(String id, String expectedContentHash, Resource replacement) {
+            throw new AssertionError("Pipeline view queries must not write artifacts");
+        }
+
+        @Override
+        public ArtifactMutation delete(String id, String expectedContentHash) {
+            throw new AssertionError("Pipeline view queries must not write artifacts");
+        }
+
+        @Override
+        public void saveAll(List<Resource> artifacts) {
+            throw new AssertionError("Pipeline view queries must not write artifacts");
+        }
+
+        @Override
+        public Optional<Resource> get(String id) {
+            return Optional.ofNullable(resources.get(id));
+        }
+
+        @Override
+        public List<Resource> list() {
+            return List.copyOf(resources.values());
+        }
+    }
+
+    private static final class InMemoryPipelineLayoutStore implements PipelineLayoutStore {
+
+        private final Map<String, PipelineLayout> layouts = new LinkedHashMap<>();
+
+        @Override
+        public Optional<PipelineLayout> get(String pipelineId) {
+            return Optional.ofNullable(layouts.get(pipelineId));
+        }
+
+        @Override
+        public void save(PipelineLayout layout) {
+            layouts.put(layout.pipelineId(), layout);
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            layouts.remove(pipelineId);
+        }
+    }
+
+    private static final class InMemoryObservationStore implements ObservationStore {
+
+        private final Map<String, Observation> observations = new LinkedHashMap<>();
+
+        @Override
+        public void save(Observation observation) {
+            observations.put(observation.pipelineId(), observation);
+        }
+
+        @Override
+        public Optional<Observation> read(String pipelineId) {
+            return Optional.ofNullable(observations.get(pipelineId));
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            observations.remove(pipelineId);
+        }
+    }
+}

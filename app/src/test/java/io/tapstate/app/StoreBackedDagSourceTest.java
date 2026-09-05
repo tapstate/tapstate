@@ -33,6 +33,7 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -334,6 +335,32 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void keeps_an_explicit_multi_table_serve_subset_on_one_sink_path() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "multi_subset", null, List.of("multi_src"), null, null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromClause.list(
+                                FromRef.literal("multi_src.orders"),
+                                FromRef.literal("multi_src.customers")),
+                        List.of(sync("sync_1", "orders_dest")), null, null),
+                null, null));
+        discovered(store, "multi_src", "orders", "customers");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("multi_subset");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "multi_src.orders", "multi_src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("multi_src.orders", "serve.sync_1"),
+                "multi_src.customers->serve.sync_1#0,1");
+    }
+
+    @Test
     void omitted_tables_expand_to_the_latest_discovered_source_schema() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("all_src", null, "mysql", Map.of("host", "h"),
@@ -572,6 +599,11 @@ class StoreBackedDagSourceTest {
 
         @Override
         public ObservationStore observations() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public PipelineLayoutStore layouts() {
             throw new UnsupportedOperationException();
         }
 

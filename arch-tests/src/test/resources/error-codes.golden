@@ -169,6 +169,11 @@ nest.state-far-exceeds-memory-budget
 nest.state-paths-changed
 nest.state-served-from-cold-layer
 nest.tombstone-limit-exceeded
+pipeline.already-exists
+pipeline.id-mismatch
+pipeline.not-found
+pipeline.precondition-required
+pipeline.version-conflict
 role.unsupported
 source.already-exists
 source.id-mismatch
