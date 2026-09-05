@@ -49,7 +49,23 @@ def send(message):
     process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
     process.stdin.flush()
 
-def receive(timeout=5):
+# Two different waits, and one number cannot serve both.
+#
+# The FIRST response has to absorb a cold JVM and Spring Boot's startup. Measured on the slowest
+# runner in the matrix: the server logged "Registered tools: 15" and the five-second budget expired
+# roughly half a second later, so a release failed with a server that had started perfectly well. That
+# is not a margin, it is a coin toss, and it is paid on the one lane where a retry is most expensive.
+#
+# Every LATER response comes from a warm process and arrives in milliseconds. A budget sized for boot
+# would take a minute and a half to notice a hang there.
+#
+# So sizing one timeout for both made it simultaneously too tight to be reliable and too loose to
+# catch what it is watching for. They are separate now, and separating them makes the common case
+# STRICTER rather than more forgiving.
+BOOT_TIMEOUT = 90
+MESSAGE_TIMEOUT = 5
+
+def receive(timeout=MESSAGE_TIMEOUT):
     readable, _, _ = select.select([process.stdout], [], [], timeout)
     if not readable:
         process.kill()
@@ -74,7 +90,7 @@ try:
             "clientInfo": {"name": "tapstate-smoke", "version": "1"},
         },
     })
-    assert receive()["result"]["protocolVersion"] == "2025-06-18"
+    assert receive(BOOT_TIMEOUT)["result"]["protocolVersion"] == "2025-06-18"
     send({"jsonrpc": "2.0", "method": "notifications/initialized"})
     send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     tools = receive()["result"]["tools"]
