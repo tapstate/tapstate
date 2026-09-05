@@ -86,6 +86,30 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
+    void theSnapshotMarkSurvivesTheAdvancesThatFollowIt() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "w0", 1L);
+        HazelcastInstance member = memberWith(store);
+
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+
+        ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
+        ack.advance("orders", at(7, "w7"));
+        store.advanceConsumerReadSeq("mc-orders", "pipe-1", "orders", 5L);
+
+        // The mark, the acked position and the read cursor are three facets of one consumer's record, and
+        // the real store advances each with an update scoped to its own field. A store that rebuilds the
+        // consumer from whichever facet is being written erases the other two -- and erases this one in the
+        // direction nothing notices: the load reads as unfinished, so the next run reads the whole table
+        // again and reaches the right target by the wrong route, with nothing thrown and nothing logged.
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
+                .as("a change acked above the snapshot does not un-record the load")
+                .containsExactly("orders");
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1")).isEqualTo("w7");
+    }
+
+    @Test
     void aChangeAckSaysNothingAboutWhetherASnapshotFinished() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);

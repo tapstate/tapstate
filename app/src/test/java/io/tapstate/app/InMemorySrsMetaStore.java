@@ -64,6 +64,21 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
     }
 
+    /**
+     * The tables {@code existing} was already recorded as having loaded, or none for a consumer with no
+     * record yet.
+     *
+     * <p>Carried through every per-facet mutator, because the real store's are path-scoped updates that
+     * touch one field and leave the rest of the consumer's record alone. Rebuilding the consumer from
+     * the facet being written -- which the three-argument constructor does, defaulting this to none --
+     * erases the completed tables on the next cursor or ack advance, and it erases them in the one
+     * direction nothing notices: the load looks unfinished, so a resume reads it all again and gets the
+     * right answer for the wrong reason.
+     */
+    private static List<String> completedOf(ConsumerOffset existing) {
+        return existing == null ? List.of() : existing.snapshotCompletedTables();
+    }
+
     @Override
     public synchronized void advanceConsumerReadSeq(
             String miningChainId, String pipelineId, String table, long lastReadSeq) {
@@ -80,7 +95,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
         perTable.put(table, lastReadSeq);
         ChainPosition ack = existing == null ? null : existing.sinkAcked();
-        next.add(new ConsumerOffset(pipelineId, perTable, ack));
+        next.add(new ConsumerOffset(pipelineId, perTable, ack, completedOf(existing)));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                 m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
@@ -99,7 +114,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             }
         }
         Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
-        next.add(new ConsumerOffset(pipelineId, perTable, position));
+        next.add(new ConsumerOffset(pipelineId, perTable, position, completedOf(existing)));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
                 m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
