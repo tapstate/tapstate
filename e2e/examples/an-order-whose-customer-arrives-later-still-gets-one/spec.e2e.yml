@@ -1,0 +1,64 @@
+# An order whose customer is not in the customers table, under a LEFT JOIN: the order is still owed a
+# row, and it has to become complete if the customer turns up later.
+#
+# Two failures hide here and they look nothing like each other. The first drops the order entirely -
+# the natural result of treating a lookup that found nothing as a row that does not qualify - and the
+# only thing that sees it is a count, because there is no row left to read. The second keeps the order
+# but never revisits it: the customer arrives, every later order gets a name, and this one sits with an
+# empty one forever. Both are silent, and a target holding one fewer order than the source is not
+# something anybody notices by looking at it.
+#
+# What the assertions have to discriminate:
+#
+# - The count is taken while the customer is still missing. Three orders were written and three rows
+#   are owed, so a preserved side that drops the unmatched one settles on two and fails here. This is
+#   the reading that no per-row lookup can replace, because the row it is about does not exist.
+# - The unmatched order is read for its own column while its customer is still absent. That separates
+#   "the row is there, waiting" from "the row is there because it was matched to something".
+# - The customer is then inserted, and the same order is read again for the joined field. An
+#   implementation that only indexes fact rows once they match cannot find this one again: it was never
+#   in the index, so the arriving customer reaches nothing and the row keeps its empty name.
+# - A second, unrelated customer is inserted at the end and the count is read again. That catches the
+#   opposite mistake - an implementation that reacts to any dimension arrival by rebuilding, which
+#   would also satisfy every reading above.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: an-order-whose-customer-arrives-later-still-gets-one
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, order_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: order_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+  shop_db.orders:
+    values:
+      - { id: 10, customer_id: 1, qty: 2 }
+      - { id: 11, customer_id: 1, qty: 5 }
+      # Points at a customer that does not exist yet.
+      - { id: 12, customer_id: 9, qty: 7 }
+steps:
+  - start
+  # Three orders were written and three rows are owed, including the one that matches nothing.
+  # An implementation that drops unmatched rows settles on two and fails right here.
+  - await: { count: { views.order_state: 3 } }
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: ada } } } }
+  # The unmatched order, read for its own column while its customer is still absent: the row is
+  # present and waiting, not present because it matched something.
+  - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7 } } } }
+  # The customer turns up after the order did.
+  - cdc: { shop_db.customers: { insert: { values: [ { id: 9, name: zeno } ] } } }
+  # The row it was waiting for. An implementation that indexes a fact row only once it matches never
+  # finds this one again, and it keeps an empty name forever with nothing reported.
+  - await: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: zeno } } } }
+  # A customer nobody points at. The count must not move: an implementation that rebuilds on any
+  # dimension arrival satisfies every reading above and fails here.
+  - cdc: { shop_db.customers: { insert: { values: [ { id: 8, name: nobody } ] } } }
+  - assert: { count: { views.order_state: 3 } }
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: ada } } } }

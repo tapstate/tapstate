@@ -1,0 +1,63 @@
+# Change one customer's name, and every order already written for that customer has to change with it.
+#
+# This is the shape that was silently wrong before there was a join at all, and the reason it is worth
+# a published example rather than only a unit case: nothing about the fact rows changes. The orders
+# table is not touched, so those rows produce no event of their own. An implementation that only looks
+# the dimension up as a fact row arrives has nothing to react to here - it keeps the old name in the
+# target, with the job RUNNING and the error count at zero. There is no failure to see; the data is
+# just quietly stale.
+#
+# What the assertions have to discriminate:
+#
+# - The state before the change is asserted first, every time. Without that, an implementation that
+#   never wrote the old value at all satisfies the after-reading trivially, and the case would be
+#   green against a pipeline that had done nothing.
+# - Two orders belong to the changed customer and they are not adjacent; a third belongs to someone
+#   else and is read again afterwards. An implementation that re-emitted every row on any dimension
+#   change would pass the first two readings and fail the third, and that matters because re-emitting
+#   everything is the cheap way to look correct here.
+# - The count is asserted at the end and has not moved. A re-emission that inserted rather than
+#   updated leaves the target with duplicates, which is invisible to any per-row reading.
+# - The unchanged column is read beside the changed one. A rebuild that reached the row and dropped
+#   the fact side would satisfy a reading of customer_name alone.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: a-dimension-change-reaches-the-orders-already-written
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, order_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: order_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: bo }
+  shop_db.orders:
+    values:
+      - { id: 10, customer_id: 1, qty: 2 }
+      - { id: 11, customer_id: 2, qty: 5 }
+      - { id: 12, customer_id: 1, qty: 7 }
+steps:
+  - start
+  - await: { count: { views.order_state: 3 } }
+  # Before the change. These readings are the control: without them, the ones after the change are
+  # satisfied by a pipeline that never wrote the old name in the first place.
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: ada } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: ada } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo } } } }
+  # One row, in a table the orders do not belong to. The orders produce no event of their own here.
+  - cdc: { shop_db.customers: { update: { where: { id: 1 }, set: { name: adelaide } } } }
+  # Both of ada's orders, not just the one that happens to be read first.
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: adelaide } } } }
+  - await: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: adelaide } } } }
+  # Bo's order is untouched. An implementation that re-emits everything on any dimension change
+  # passes the two readings above and fails this one.
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo } } } }
+  # Still three rows: a re-emission that inserted instead of updating leaves duplicates, and no
+  # per-row reading above would see them.
+  - assert: { count: { views.order_state: 3 } }

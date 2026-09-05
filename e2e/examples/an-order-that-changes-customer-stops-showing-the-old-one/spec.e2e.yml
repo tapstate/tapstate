@@ -1,0 +1,56 @@
+# An order changes which customer it belongs to, and the target must stop showing the old one.
+#
+# The failure this exists to catch leaves a target that looks entirely reasonable. An implementation
+# that adds the row under its new customer without withdrawing what it wrote under the old one leaves
+# the order attached to both, and in a target keyed by the order that shows up as a row still carrying
+# a name nobody pointed at any more. Nothing errors; the row is simply wrong, and only a reading taken
+# after the re-pointing can tell.
+#
+# What the assertions have to discriminate:
+#
+# - The row is read before and after, for the same two fields. Reading only afterwards is satisfied by
+#   an implementation that never joined the original customer in at all.
+# - The count is asserted after the move and has not grown. This is the reading that separates
+#   "re-pointed" from "written again alongside": a per-row lookup finds the new name either way, and
+#   only the count sees the row that was left behind.
+# - The other two orders are read again afterwards. Re-pointing one fact row must not disturb rows
+#   that share either customer, and an implementation that rebuilt the whole table would satisfy every
+#   reading above while quietly rewriting these.
+# - Order 12 stays with ada throughout, which is what makes the move visible as a move rather than as
+#   a change to everything ada owns.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: an-order-that-changes-customer-stops-showing-the-old-one
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, order_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: order_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: bo }
+  shop_db.orders:
+    values:
+      - { id: 10, customer_id: 1, qty: 2 }
+      - { id: 11, customer_id: 2, qty: 5 }
+      - { id: 12, customer_id: 1, qty: 7 }
+steps:
+  - start
+  - await: { count: { views.order_state: 3 } }
+  # Where order 10 starts. The control for the reading after the move.
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: ada } } } }
+  # The move: the fact row keeps its identity and changes which dimension row it points at.
+  - cdc: { shop_db.orders: { update: { where: { id: 10 }, set: { customer_id: 2 } } } }
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: bo } } } }
+  # The reading that catches a row left behind under the old customer. A per-row lookup finds bo
+  # whether or not ada's version was withdrawn; only the count does not.
+  - assert: { count: { views.order_state: 3 } }
+  # ada still has order 12, and bo still has order 11: the move touched one row, not a customer.
+  - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: ada } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo } } } }
