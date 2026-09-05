@@ -670,6 +670,140 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 firstSpec.get().config(), firstSpec.get().srsKey()))).isFalse();
     }
 
+    /**
+     * What a resume has to know is whether the load reached the target, and this is the face that answers it.
+     *
+     * <p>The read side cannot: a bounded read drains in one blocking pass before the job carrying its rows is
+     * submitted, so every table's read has returned before anyone can hold the pipeline, while almost none of
+     * what it read has been written. This case puts the two in exactly that state -- every table present on
+     * the read face, not one of them confirmed on the record -- because that is the state a hold lands in, and
+     * an implementation reading the wrong one of the two answers "delivered" throughout it.
+     */
+    @Test
+    void aLoadIsDeliveredOnlyOnceTheRecordShowsEveryTableWrittenNotOnceItsReadReturned() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        AtomicReference<MiningChainId> chain = new AtomicReference<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            chain.set(chainId);
+            return new CaptureRun(Optional.of(chainId), false, 2L, Map.of("orders", 1L, "customers", 1L),
+                    Optional.empty(), Optional.of(() -> {
+                    }), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                new StoreBackedPipelineCaptureCoordinator(store, starter, srsCoordinator, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        // Both reads have returned -- the read face has an entry for every table ...
+        assertThat(coordinator.snapshotProgress("p")).containsOnlyKeys("orders", "customers");
+        // ... and the target has confirmed none of it, which is where a hold part way through a load lands.
+        assertThat(coordinator.loadDelivered("p")).as("read but not written is not delivered").isFalse();
+
+        store.meta().markSnapshotComplete(chain.get().value(), "p", "orders");
+        assertThat(coordinator.loadDelivered("p")).as("one table of two is not the load").isFalse();
+
+        store.meta().markSnapshotComplete(chain.get().value(), "p", "customers");
+        assertThat(coordinator.loadDelivered("p")).as("every table confirmed").isTrue();
+    }
+
+    /**
+     * Another pipeline finishing the same table says nothing about this one: the mark is written against the
+     * pipeline because each writes to a target of its own. Read at the chain level, a pipeline new to the
+     * chain would inherit the first one's answer and be resumed over a load it never did.
+     */
+    @Test
+    void aTableAnotherPipelineFinishedIsNotThisPipelinesLoad() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        AtomicReference<MiningChainId> chain = new AtomicReference<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            chain.set(chainId);
+            return new CaptureRun(Optional.of(chainId), false, 1L, Map.of("orders", 1L),
+                    Optional.empty(), Optional.of(() -> {
+                    }), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                new StoreBackedPipelineCaptureCoordinator(store, starter, srsCoordinator, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        store.meta().markSnapshotComplete(chain.get().value(), "another-pipeline", "orders");
+
+        assertThat(coordinator.loadDelivered("p")).isFalse();
+    }
+
+    /**
+     * A read mode with no load has nothing that could be undelivered, and neither has a pipeline this
+     * coordinator is running nothing for. Both answer true, which is what keeps a resume on the engine-only
+     * path everywhere the question does not arise -- the overwhelming majority of them.
+     */
+    @Test
+    void aPipelineWithNoLoadAndOneThatIsNotRunningBothReportDelivered() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src")); // pipeline() defaults to ReadMode.CDC_ONLY
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
+            }), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                new StoreBackedPipelineCaptureCoordinator(store, starter, srsCoordinator, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.loadDelivered("p")).as("cdc_only runs no load").isTrue();
+        assertThat(coordinator.loadDelivered("never-started")).as("nothing running has no load").isTrue();
+    }
+
+    /**
+     * A stop takes the question away with the run. What is kept here is which tables to ask about and on
+     * which chain -- both belong to the run being torn down, and a stopped pipeline that kept them would
+     * answer for a run that is over.
+     */
+    @Test
+    void aStoppedPipelineReportsDeliveredRatherThanAnsweringForTheRunItNoLongerHas() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 1L, Map.of("orders", 1L),
+                    Optional.empty(), Optional.of(() -> {
+                    }), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                new StoreBackedPipelineCaptureCoordinator(store, starter, srsCoordinator, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        assertThat(coordinator.loadDelivered("p")).isFalse();
+
+        coordinator.stopCapture("p", false);
+
+        assertThat(coordinator.loadDelivered("p")).isTrue();
+    }
+
     // ---- fixtures --------------------------------------------------------------------------------
 
     private static SourceResource cdcSource(String id, String table, String srsKey) {

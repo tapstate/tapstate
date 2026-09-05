@@ -12,6 +12,7 @@ import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.CaptureRunSpec;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
+import io.tapstate.runtime.srs.SnapshotPhase;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
@@ -56,6 +57,16 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** What each running pipeline's tables loaded, keyed by pipeline then table; dropped when it stops. */
     private final Map<String, Map<String, TableSnapshot>> snapshotsByPipeline = new ConcurrentHashMap<>();
 
+    /**
+     * The tables each running pipeline's snapshot covers, per chain; dropped when it stops. Only the
+     * durable record can say whether a load reached the target, and it answers per pipeline, per chain,
+     * per table -- so what is kept here is the question rather than the answer: which tables to ask about
+     * and on which chain to ask. The map above cannot stand in for it. That one is keyed by table name
+     * alone, qualified on collision, and carries no chain; and it holds an entry for every selected table
+     * from the moment a run starts, so a set covering it is covered from the start.
+     */
+    private final Map<String, List<SnapshotOnChain>> snapshotTablesByPipeline = new ConcurrentHashMap<>();
+
     StoreBackedPipelineCaptureCoordinator(
             StorePort storePort, CaptureStarter captureStarter, SrsCoordinator srsCoordinator,
             SnapshotBuffer snapshotBuffer) {
@@ -75,6 +86,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
         List<CaptureRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
+        List<SnapshotOnChain> snapshotTables = new ArrayList<>();
         try {
             for (SourceRef ref : pipeline.sources()) {
                 String sourceId = ref.id();
@@ -86,6 +98,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 CaptureRun run = captureStarter.start(spec, snapshotPassthrough(resolution, observedSnapshotCounts));
                 runs.add(run);
                 recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts);
+                snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
             }
         } catch (RuntimeException | Error failure) {
             // A start that fell over releases what it took and nothing else. It is an abandoned attempt,
@@ -99,6 +112,27 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
         runsByPipeline.put(pipelineId, runs);
         snapshotsByPipeline.put(pipelineId, keyByTableOrQualifyOnCollision(attributed));
+        snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
+    }
+
+    /** One source run's snapshot: the chain that records its completion, and the tables it covers. */
+    private record SnapshotOnChain(String chainId, List<String> tables) {
+    }
+
+    /**
+     * What this run contributes to the delivered question, or empty when it contributes nothing.
+     *
+     * <p>A run whose read mode has no snapshot has no load to deliver. A run with no chain is a
+     * snapshot-only read: it opens no tail, so nothing seeds a record and no completion is ever written
+     * for it. That one contributes nothing rather than counting as never delivered -- a question the
+     * record cannot answer must not be answered by guessing, and guessing that way round would re-read
+     * the whole source on every resume with no state that could ever end it.
+     */
+    private static Optional<SnapshotOnChain> snapshotOnChain(CaptureRunSpec spec, CaptureRun run) {
+        if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
+            return Optional.empty();
+        }
+        return run.chainId().map(chain -> new SnapshotOnChain(chain.value(), spec.config().streams()));
     }
 
     /** One source's attributed snapshot load: which source, which table, and what it loaded. */
@@ -155,11 +189,37 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         return snapshotsByPipeline.getOrDefault(pipelineId, Map.of());
     }
 
+    /**
+     * A load is delivered when this pipeline's own record shows every table its snapshot covers as
+     * written -- the sink's mark, made when its frontier confirms that table's rows.
+     *
+     * <p>Asked of the same reckoning a fresh start re-reads from, deliberately and not merely for tidiness:
+     * the tables a rebuild would read again are exactly the ones this reports as not delivered. Two
+     * readings of that one fact would eventually disagree, and both directions of the disagreement are
+     * silent -- a resume that rebuilds and then reads nothing, or one that carries on over a load nobody
+     * will finish.
+     *
+     * <p>Note what is deliberately not asked: whether the bounded read returned. It returned long before
+     * anyone could hold the pipeline, so that question answers yes for the whole window this one exists
+     * for.
+     */
+    @Override
+    public boolean loadDelivered(String pipelineId) {
+        for (SnapshotOnChain snapshot : snapshotTablesByPipeline.getOrDefault(pipelineId, List.of())) {
+            if (!SnapshotPhase.stillOwed(storePort.meta().read(snapshot.chainId()), pipelineId,
+                    snapshot.tables()).isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     @Override
     public void stopCapture(String pipelineId, boolean purgeState) {
         // The load belongs to the run being torn down: a stopped pipeline reports no snapshot rather than the
         // rows its previous run happened to load.
         snapshotsByPipeline.remove(pipelineId);
+        snapshotTablesByPipeline.remove(pipelineId);
         List<CaptureRun> runs = runsByPipeline.remove(pipelineId);
         if (runs == null) {
             return;

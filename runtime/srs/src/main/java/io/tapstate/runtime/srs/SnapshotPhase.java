@@ -130,6 +130,11 @@ public final class SnapshotPhase {
      * written. A table is owed until this pipeline's sink has confirmed it, however far its read got --
      * reading is not writing, and the only one of the two that is safe to skip a table on is the second.
      *
+     * <p>This is also what a hold has to be resumed against, which is why it is not private. The rows a
+     * load has read but not delivered live nowhere durable, so the tables this reports are exactly the
+     * ones a rebuild would read again -- one reckoning for both questions, because two of them would
+     * eventually disagree and the disagreement is silent either way round.
+     *
      * <p>Read against the pipeline and not the chain. A chain is keyed by the source connection and
      * excludes the table subset, so pipelines reading one database share a chain by construction while
      * writing to targets of their own -- and a chain-level reading hands a pipeline new to the chain the
@@ -137,7 +142,7 @@ public final class SnapshotPhase {
      * target keeps none of the rows that were there before it started, with the run healthy and nothing
      * logged.
      */
-    private static List<String> stillOwed(
+    public static List<String> stillOwed(
             Optional<SrsMeta> record, String pipelineId, List<String> tables) {
         List<String> written =
                 record.map(stored -> stored.snapshotCompletedTables(pipelineId)).orElse(List.of());

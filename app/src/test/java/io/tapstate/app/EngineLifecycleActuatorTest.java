@@ -137,6 +137,46 @@ class EngineLifecycleActuatorTest {
     }
 
     /**
+     * A hold that landed before the load reached the target cannot be carried on from in place, so this
+     * resume rebuilds: a stop that keeps, then a start.
+     *
+     * <p>The rows a load has read but not delivered reach the source vertex through a member-local hand-off
+     * that vertex consumes once, and a resume restarts the job under a guarantee that keeps no execution
+     * state -- so the vertex that comes back finds the hand-off empty over a capture that has moved on, and
+     * reads nothing at all while reporting healthy. A start is what fills it again.
+     *
+     * <p>Asserted on the verbs and their order, which is the whole of what this seam decides. That the stop
+     * is the keeping one is asserted with them and is load-bearing: a purging stop would throw away the
+     * position of a pipeline nobody asked to clear.
+     */
+    @Test
+    void aResumeOverALoadThatHasNotReachedTheTargetRebuildsInsteadOfCarryingOn() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        LifecycleActuator actuator =
+                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+        coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
+
+        actuator.start(PIPE);
+        Job held = member.getJet().getJob(PIPE);
+        awaitStatus(held, JobStatus.RUNNING);
+        actuator.pause(PIPE);
+        awaitStatus(held, JobStatus.SUSPENDED);
+
+        coordinator.loadDelivered = false;
+        actuator.resume(PIPE);
+
+        assertThat(events).containsExactly(
+                "startCapture:" + PIPE, "submit:" + PIPE,
+                "stopCapture:" + PIPE + "[keep][jobTerminal]",
+                "startCapture:" + PIPE, "submit:" + PIPE);
+        Job rebuilt = member.getJet().getJob(PIPE);
+        assertThat(rebuilt).as("the rebuild submits a job of its own").isNotSameAs(held);
+        awaitStatus(rebuilt, JobStatus.RUNNING);
+    }
+
+    /**
      * The state teardown these cases run against: the stand-in topology keeps no state, so what this drops
      * is nothing. It is here because the actuator will not be built without one, which is the point.
      */
@@ -186,6 +226,7 @@ class EngineLifecycleActuatorTest {
         private final List<String> events;
         private Supplier<Boolean> jobTerminalProbe = () -> false;
         private Throwable captureFailure;
+        private boolean loadDelivered = true;
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
@@ -205,6 +246,11 @@ class EngineLifecycleActuatorTest {
         @Override
         public Optional<Throwable> captureFailure(String pipelineId) {
             return Optional.ofNullable(captureFailure);
+        }
+
+        @Override
+        public boolean loadDelivered(String pipelineId) {
+            return loadDelivered;
         }
     }
 

@@ -28,8 +28,10 @@ import java.util.Set;
  *       it. A stop that was asked to keep the state does not write the drop down either, which is a
  *       stronger thing than not carrying it out: the note is what a later start finishes, so one written
  *       here would have the state dropped by the next start of a pipeline nobody asked to clear.</li>
- *   <li>{@code pause} / {@code resume} are engine-only: the capture keeps running while a pipeline is paused,
- *       held back by the ring's headroom backpressure, and a resume replays the buffered ring.</li>
+ *   <li>{@code pause} / {@code resume} are engine-only once the initial load has reached the target: the
+ *       capture keeps running while a pipeline is paused, held back by the ring's headroom backpressure,
+ *       and a resume replays the buffered ring. A load still undelivered is the one case that cannot be
+ *       resumed in place, and it rebuilds instead.</li>
  * </ul>
  */
 final class EngineLifecycleActuator implements LifecycleActuator {
@@ -82,8 +84,29 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         engine.suspend(pipelineId);
     }
 
+    /**
+     * Resumes the pipeline, rebuilding rather than carrying on when its initial load has not reached the
+     * target yet.
+     *
+     * <p>The rows a load has read but not delivered live nowhere durable. They reach the source vertex
+     * through a member-local hand-off that vertex consumes once, and resuming restarts the job under a
+     * guarantee that keeps no execution state -- so the vertex that comes back finds an empty hand-off
+     * over a capture that has moved on to tailing. It then reads nothing at all, indefinitely, with the
+     * job running and nothing thrown.
+     *
+     * <p>Rebuilding is what a stop that keeps and a start already do correctly here: the tables the record
+     * still owes are read again and nothing is cleared. Re-reading them is the right cost rather than a
+     * regression -- every row of a snapshot carries one reserved position, so nothing anywhere represents
+     * a table loaded part way, and avoiding the re-read would mean inventing a durable per-row notion of
+     * load progress plus a new ordering question for every consumer of the chain.
+     */
     @Override
     public void resume(String pipelineId) {
+        if (!captureCoordinator.loadDelivered(pipelineId)) {
+            stop(pipelineId, false);
+            start(pipelineId);
+            return;
+        }
         engine.resume(pipelineId);
     }
 
