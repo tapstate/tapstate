@@ -50,6 +50,28 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
     /** The field holding the state itself. */
     static final String STATE = "state";
 
+    /**
+     * How many keys one batch read asks for at most. A request is a single BSON document with a hard
+     * server-side ceiling, so a batch has to be split at some size; splitting at a count keeps the split
+     * predictable for the common case, where keys are short and this bound is the one that is reached.
+     */
+    static final int MAX_KEYS_PER_READ = 1_000;
+
+    /**
+     * How large the ids of one batch may get before it is split regardless of how many there are. Keys
+     * are renderings of business keys and have no length limit of their own, so a count alone does not
+     * bound the request: a thousand long ones exceed the server's document ceiling, and what comes back
+     * is a driver failure rather than a short answer. Half the ceiling, because the ids are not the whole
+     * request.
+     */
+    private static final int MAX_ID_BYTES_PER_READ = 8 * 1024 * 1024;
+
+    /** What one id costs beyond its two strings: the sub-document, its two field names, their lengths. */
+    private static final int ID_OVERHEAD_BYTES = 48;
+
+    /** The most bytes one Java character can become in UTF-8. Deliberately the bound, not the average. */
+    private static final int WORST_CASE_BYTES_PER_CHAR = 3;
+
     private final MongoCollection<Document> collection;
 
     public MongoKeyedStateStore(MongoCollection<Document> collection) {
@@ -67,33 +89,39 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
     }
 
     /**
-     * One query for however many keys were asked for. The ids are matched with {@code $in} on {@code _id}
-     * itself rather than on a path inside it, for the reason {@link #count} matches a range of it: the
-     * index is on the id, and a filter naming {@code _id.ns} would read the whole collection instead.
+     * The states of {@code keys}, in as few round trips as the request ceiling allows. This is the read
+     * a recompute makes — one key per row it is about to re-emit — and the difference between making it
+     * here and making it a key at a time is three orders of magnitude on a large one, invisible in every
+     * way but the clock.
      *
-     * <p>What comes back is keyed by the key half of each id, so a caller gets back the names it asked
-     * with. Entries that are not there are simply not in the cursor, which is the same absence the
-     * per-key form reports as an empty answer.
+     * <p><b>The filter matches the whole id, never a path inside it.</b> The only index here is on
+     * {@code _id}; a filter written {@code _id.k: {$in: [...]}} is not covered by it and answers by
+     * reading every document in the collection — the same rows returned, at whole-collection cost, which
+     * is exactly the failure this method exists to avoid while looking like the fix for it.
+     *
+     * <p><b>The id sub-documents are built by {@link #id}, which is not a tidiness.</b> BSON compares
+     * sub-documents field by field in order, so an id assembled key-half-first matches nothing at all —
+     * and nothing at all is what a namespace whose keys have no state yet also answers, so an operator
+     * would quietly rebuild state it already had.
      */
     @Override
     public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
         Objects.requireNonNull(namespace, "namespace");
-        if (keys.isEmpty()) {
-            return Map.of();
-        }
-        List<Document> ids = new ArrayList<>(keys.size());
+        Map<String, byte[]> loaded = new LinkedHashMap<>();
+        List<Document> batch = new ArrayList<>();
+        int idBytes = 0;
         for (String key : keys) {
-            ids.add(id(namespace, key));
+            batch.add(id(namespace, key));
+            idBytes += ID_OVERHEAD_BYTES
+                    + WORST_CASE_BYTES_PER_CHAR * (namespace.length() + key.length());
+            if (batch.size() >= MAX_KEYS_PER_READ || idBytes >= MAX_ID_BYTES_PER_READ) {
+                readInto(loaded, batch);
+                batch.clear();
+                idBytes = 0;
+            }
         }
-        Map<String, byte[]> found = new LinkedHashMap<>();
-        StoreIo.run(() -> collection.find(new Document("_id", new Document("$in", ids)))
-                .forEach(document -> {
-                    Binary state = document.get(STATE, Binary.class);
-                    if (state != null) {
-                        found.put(document.get("_id", Document.class).getString(KEY), state.getData());
-                    }
-                }));
-        return found;
+        readInto(loaded, batch);
+        return loaded;
     }
 
     @Override
@@ -134,6 +162,26 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
         Document withinNamespace = new Document("_id",
                 new Document("$gte", lower).append("$lte", upper));
         return StoreIo.call(() -> collection.countDocuments(withinNamespace));
+    }
+
+    /**
+     * Reads one batch of ids into {@code loaded}. An empty batch sends nothing: a caller on the event
+     * path arrives with one routinely, and a round trip that asks for no keys is paid in the common case
+     * rather than the odd one.
+     */
+    private void readInto(Map<String, byte[]> loaded, List<Document> ids) {
+        if (ids.isEmpty()) {
+            return;
+        }
+        Document byIds = new Document("_id", new Document("$in", List.copyOf(ids)));
+        StoreIo.run(() -> {
+            for (Document document : collection.find(byIds)) {
+                Binary state = document.get(STATE, Binary.class);
+                if (state != null) {
+                    loaded.put(document.get("_id", Document.class).getString(KEY), state.getData());
+                }
+            }
+        });
     }
 
     private static Document byId(String namespace, String key) {

@@ -9,6 +9,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -67,6 +68,7 @@ public final class ArtifactMutationService {
     private final StateStore state;
     private final ObservationStore observations;
     private final SrsMetaStore srsMeta;
+    private final DerivedSchemaStore derivedSchemas;
     private final AuditGate auditGate;
 
     private final DataBrowserFollows follows;
@@ -77,6 +79,7 @@ public final class ArtifactMutationService {
             StateStore state,
             ObservationStore observations,
             SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
             AuditGate auditGate,
             DataBrowserFollows follows) {
         this.store = Objects.requireNonNull(store, "store");
@@ -84,6 +87,7 @@ public final class ArtifactMutationService {
         this.state = Objects.requireNonNull(state, "state");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.srsMeta = Objects.requireNonNull(srsMeta, "srsMeta");
+        this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.follows = Objects.requireNonNull(follows, "follows");
     }
@@ -194,7 +198,8 @@ public final class ArtifactMutationService {
     private void reclaim(String id) {
         if (!isAtRest(id)) {
             throw reclaimIncomplete(id, "pipeline-live",
-                    List.of("mining-chain-consumer", "desired", "state", "observation"), List.of());
+                    List.of("mining-chain-consumer", "desired", "state", "observation", "derived-schema"),
+                    List.of());
         }
         List<RuntimeException> failures = new ArrayList<>();
         List<String> residue = new ArrayList<>();
@@ -202,6 +207,10 @@ public final class ArtifactMutationService {
         attempt(failures, residue, "desired", () -> desired.delete(id));
         attempt(failures, residue, "state", () -> state.delete(id));
         attempt(failures, residue, "observation", () -> observations.delete(id));
+        // Left behind, this record would be read as the derivation history of whatever is applied under
+        // the id next, and would refuse to start it over a difference against a schema belonging to
+        // something that no longer exists.
+        attempt(failures, residue, "derived-schema", () -> derivedSchemas.delete(id));
         if (!failures.isEmpty()) {
             throw reclaimIncomplete(id, "step-failed", residue, failures);
         }

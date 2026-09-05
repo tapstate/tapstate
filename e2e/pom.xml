@@ -106,6 +106,23 @@
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
+    <!-- The carrier seam and the plan it is opened on. Reached transitively through the assembly
+         root as well, but named here because this module imports them directly: a dependency that
+         arrives only along a path can be taken away by an exclusion anywhere on that path, and what
+         that leaves behind is a link error at run time rather than a resolution failure at build
+         time. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>engine</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-sql</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
     <!-- Endpoints a specification seeds, changes and counts. This is the harness reading a pipeline's
          target the way a user would, from outside the product; rule R3 locks the driver to
          adapter-mongo-store for the rings, and this module is deliberately not one of them. -->

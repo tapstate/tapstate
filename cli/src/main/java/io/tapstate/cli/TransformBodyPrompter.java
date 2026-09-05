@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 
@@ -76,11 +77,13 @@ final class TransformBodyPrompter {
         return FieldRule.literal(r);
     }
 
-    /** A flat join over duckdb: an engine (default duckdb) and a multi-line SQL block. */
+    /** A flat join: the SQL block alone, since this release runs joins on one engine. */
     private TransformBody askJoin() {
-        String engine = prompter.ask("Join engine", "duckdb");
-        engine = engine == null || engine.isBlank() ? "duckdb" : engine.trim();
-        return new TransformBody.Join(engine, blockText(prompter.lines("Join SQL")));
+        // Deliberately not asked. One legal value means the question can only be answered wrongly,
+        // and the free-text prompt this replaces did worse than allow that -- it offered an engine
+        // that does not exist as the default, so accepting the suggestion produced an artifact that
+        // fails its own validate.
+        return new TransformBody.Join(JoinEngine.BUILTIN, blockText(prompter.lines("Join SQL")));
     }
 
     /**

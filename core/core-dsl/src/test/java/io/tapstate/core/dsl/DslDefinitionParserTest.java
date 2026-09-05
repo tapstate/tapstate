@@ -1,6 +1,7 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
@@ -247,17 +248,17 @@ class DslDefinitionParserTest {
                 kind: transform
                 id: cust_wide
                 type: join
-                engine: duckdb
+                engine: builtin
                 sql: |
-                  SELECT c.id AS customer_id, count(*) AS order_cnt
-                  FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id
+                  SELECT c.id AS customer_id, o.amount AS amount
+                  FROM c JOIN o ON o.customer_id = c.id
                 """;
 
         TransformResource t = (TransformResource) parser.parse(yaml);
 
         TransformBody.Join join = (TransformBody.Join) t.body();
-        assertThat(join.engine()).isEqualTo("duckdb");
-        assertThat(join.sql()).contains("SELECT c.id").contains("GROUP BY c.id");
+        assertThat(join.engine()).isEqualTo(JoinEngine.BUILTIN);
+        assertThat(join.sql()).contains("SELECT c.id").contains("JOIN o ON");
         assertThat(writer.write(parser.parse(writer.write(t)))).isEqualTo(writer.write(t));
     }
 

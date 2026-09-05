@@ -5,6 +5,10 @@
 # removing one = a breaking change to an external contract (review + major version).
 actuation.from-regex-empty
 actuation.from-regex-invalid
+actuation.join-output-key-not-published
+actuation.join-output-schema-engine-changed
+actuation.join-output-schema-source-changed
+actuation.join-source-key-missing
 actuation.not-a-pipeline
 actuation.pipeline-not-found
 actuation.source-schema-not-discovered
@@ -121,6 +125,8 @@ dsl.forbidden-field
 dsl.illegal-expression
 dsl.illegal-value
 dsl.invalid-config-value
+dsl.join-sql-not-parsable
+dsl.join-sql-unsupported
 dsl.malformed-interpolation
 dsl.malformed-yaml
 dsl.missing-reference

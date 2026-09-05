@@ -1,0 +1,37 @@
+# How the join operator reaches its state, and what its full phase costs.
+# Regenerate with -Djoinperf.record=true; see JoinPerformanceGateTest.
+# ratio '-' means this row's cost is not held to a threshold, only its counts.
+# scenario	tier	batchReads	singleReads	keysRead	writes	ratio
+F1	cold	2	0	2000	6000	109.9
+F1	hot	2	0	2000	6000	120.4
+F1	mixed	2	0	2000	6000	98.5
+F2	cold	20	0	20000	42000	73.9
+F2	hot	20	0	20000	42000	67.5
+F2	mixed	20	0	20000	42000	50.1
+I1	cold	5	0	2500	5000	-
+I1	hot	5	0	2500	5000	-
+I1	mixed	5	0	2500	5000	-
+I2	cold	5	0	1665	4165	-
+I2	hot	5	0	1665	4165	-
+I2	mixed	5	0	1665	4165	-
+I3	cold	0	0	0	7500	-
+I3	hot	0	0	0	7500	-
+I3	mixed	0	0	0	7500	-
+I4	cold	5	0	2500	5000	-
+I4	hot	5	0	2500	5000	-
+I4	mixed	5	0	2500	5000	-
+R1	cold	5	0	50	5	-
+R1	hot	5	0	50	5	-
+R1	mixed	5	0	50	5	-
+R2	cold	2	0	10000	1	-
+R2	hot	2	0	10000	1	-
+R2	mixed	2	0	10000	1	-
+R3	cold	6	0	10050	5	-
+R3	hot	6	0	10050	5	-
+R3	mixed	6	0	10050	5	-
+R4	cold	2	0	10000	1	-
+R4	hot	2	0	10000	1	-
+R4	mixed	2	0	10000	1	-
+R5	cold	2	0	10000	6	-
+R5	hot	2	0	10000	6	-
+R5	mixed	2	0	10000	6	-

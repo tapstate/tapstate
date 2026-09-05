@@ -128,6 +128,64 @@ class ValidatedPipelineBuildsTest {
         assertThat(vertexNames(dag)).anyMatch(name -> name.startsWith("nest:"));
     }
 
+    /**
+     * A join step, all the way from the artifact to the graph. Everything the engine will not work out
+     * comes from here: the SQL compiled into a plan (by a library the runtime ring cannot see), the key
+     * the driving rows are filed under (from the discovered schema, which that ring may not read), and
+     * where the state lives. Nothing else joins those three up, so nothing else would notice any of
+     * them going missing.
+     */
+    @Test
+    void aValidatedJoinPipelineBuildsIntoADag() {
+        InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, JOIN_PIPELINE);
+        discovered(store, "orders_src", "orders", List.of("id"));
+        discovered(store, "items_src", "order_items", List.of("id"));
+
+        DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("wide");
+
+        assertThat(vertexNames(dag)).contains("orders_src", "items_src", "widen", "serve.sync_1");
+    }
+
+    /**
+     * The driving source declares no key. Every row a join mirrors and every entry in its reverse index
+     * is filed under that key, so without one two different rows share an entry - which is not an error
+     * anywhere, it simply builds the wide row out of whichever of them was written last. The author is
+     * told, with a code, instead.
+     */
+    @Test
+    void aJoinWhoseDrivingTableDeclaresNoKeyTellsTheAuthorToDeclareOne() {
+        InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, JOIN_PIPELINE);
+        discovered(store, "orders_src", "orders", List.of());
+        discovered(store, "items_src", "order_items", List.of("id"));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store, discardingBinder()).dagFor("wide"))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("actuation.join-source-key-missing");
+    }
+
+    /**
+     * A join over two single-table sources, addressed the way an author writes it. It matches on the
+     * one column the discovery fixture declares, because what this is about is the wiring rather than
+     * the join being a sensible one.
+     */
+    private static final String JOIN_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: wide
+            source: [ orders_src, items_src ]
+            transforms:
+              - id: widen
+                type: join
+                from: { o: orders, i: order_items }
+                engine: builtin
+                sql: |
+                  SELECT o.id AS order_id, i.id AS item_id
+                  FROM o JOIN i ON i.id = o.id
+            serve:
+              from: widen
+              sync: [ { id: sync_1, source: orders_dest } ]
+            """;
+
     @Test
     void aNestEmbedWhoseTableDeclaresNoKeyTellsTheAuthorToDeclareOne() {
         InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, NEST_PIPELINE);
@@ -209,6 +267,44 @@ class ValidatedPipelineBuildsTest {
     // ---- fixtures ----------------------------------------------------------------------
 
     /** Parses and validates through the product's own gate, then stores what it accepted. */
+    /**
+     * A pipeline whose join SQL this release cannot run. The refusal happens while the artifact is
+     * read, which is the whole point of it: the shapes it names run silently wrong rather than
+     * failing, so the check has to sit in the offline path.
+     *
+     * <p><b>What this case is really about is that the check runs at all, here.</b> It is written in
+     * one core module against a SQL library, and whether that library reaches the assembly root is a
+     * property of the dependency graph rather than of any code. Measured: one exclusion on the path
+     * this module reaches that library by took every one of its artifacts off this classpath, and the
+     * whole build stayed green - because nothing else parses a join step from here. A missing library
+     * makes this case fail to link rather than refuse, which is a different failure and a loud one.
+     */
+    @Test
+    void aJoinShapeThisReleaseCannotRunIsRefusedWhileTheArtifactIsRead() {
+        assertThatThrownBy(() -> new DslParser().parse(UNRUNNABLE_JOIN_PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("FULL OUTER JOIN");
+    }
+
+    /** The same shape the validator's own corpus refuses, addressed the way an author writes it. */
+    private static final String UNRUNNABLE_JOIN_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: wide
+            source: [ orders_src, items_src ]
+            transforms:
+              - id: widen
+                type: join
+                from: { o: orders, i: order_items }
+                engine: builtin
+                sql: |
+                  SELECT o.id AS order_id, i.id AS item_id
+                  FROM o FULL OUTER JOIN i ON i.order_id = o.id
+            serve:
+              from: widen
+              sync: [ { id: sync_1, source: orders_dest } ]
+            """;
+
     private static InMemoryStorePort validated(String... documents) {
         DslParser parser = new DslParser();
         List<Resource> resources = new ArrayList<>();

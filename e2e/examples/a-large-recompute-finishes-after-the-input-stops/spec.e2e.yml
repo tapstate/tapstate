@@ -1,0 +1,458 @@
+# One dimension row with four hundred orders under it, changed once -- and then nothing else is fed.
+#
+# The claim is about what happens after the input stops. A dimension change owes every fact row under
+# it, and four hundred rows do not leave the operator in one go: it hands back control part way and has
+# to pick the rest up with nothing arriving. If it only makes progress when something is delivered to
+# it, the target sits permanently half old and half new. That state reports nothing -- the job is
+# RUNNING, no error is counted, and the rows that did update look exactly right.
+#
+# Nothing is fed after the change on purpose. The source is a change stream, so it stays open and idle;
+# every reading below is therefore about progress made with no input at all.
+#
+# What the assertions have to discriminate:
+#
+# - The count before the change is the control: four hundred rows are actually there to be revisited,
+#   so a run that converges trivially because it never built them fails first.
+# - Three orders are read after the change and they are deliberately the first, one in the middle and
+#   the last of the seeded range. An operator that stops part way satisfies whichever end it reached
+#   and fails the other, whichever direction it walks the bucket in.
+# - The count is read again at the end and has not grown. A recompute that re-inserted rather than
+#   updated leaves eight hundred rows, which no per-row reading would notice.
+# - One order belongs to a different customer throughout and is read at both ends, so an
+#   implementation that answered the change by rewriting everything is refused too.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: a-large-recompute-finishes-after-the-input-stops
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, join_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: join_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: bo }
+  shop_db.orders:
+    values:
+      - { id: 1000, customer_id: 1, qty: 1 }
+      - { id: 1001, customer_id: 1, qty: 2 }
+      - { id: 1002, customer_id: 1, qty: 3 }
+      - { id: 1003, customer_id: 1, qty: 4 }
+      - { id: 1004, customer_id: 1, qty: 5 }
+      - { id: 1005, customer_id: 1, qty: 6 }
+      - { id: 1006, customer_id: 1, qty: 7 }
+      - { id: 1007, customer_id: 1, qty: 8 }
+      - { id: 1008, customer_id: 1, qty: 9 }
+      - { id: 1009, customer_id: 1, qty: 1 }
+      - { id: 1010, customer_id: 1, qty: 2 }
+      - { id: 1011, customer_id: 1, qty: 3 }
+      - { id: 1012, customer_id: 1, qty: 4 }
+      - { id: 1013, customer_id: 1, qty: 5 }
+      - { id: 1014, customer_id: 1, qty: 6 }
+      - { id: 1015, customer_id: 1, qty: 7 }
+      - { id: 1016, customer_id: 1, qty: 8 }
+      - { id: 1017, customer_id: 1, qty: 9 }
+      - { id: 1018, customer_id: 1, qty: 1 }
+      - { id: 1019, customer_id: 1, qty: 2 }
+      - { id: 1020, customer_id: 1, qty: 3 }
+      - { id: 1021, customer_id: 1, qty: 4 }
+      - { id: 1022, customer_id: 1, qty: 5 }
+      - { id: 1023, customer_id: 1, qty: 6 }
+      - { id: 1024, customer_id: 1, qty: 7 }
+      - { id: 1025, customer_id: 1, qty: 8 }
+      - { id: 1026, customer_id: 1, qty: 9 }
+      - { id: 1027, customer_id: 1, qty: 1 }
+      - { id: 1028, customer_id: 1, qty: 2 }
+      - { id: 1029, customer_id: 1, qty: 3 }
+      - { id: 1030, customer_id: 1, qty: 4 }
+      - { id: 1031, customer_id: 1, qty: 5 }
+      - { id: 1032, customer_id: 1, qty: 6 }
+      - { id: 1033, customer_id: 1, qty: 7 }
+      - { id: 1034, customer_id: 1, qty: 8 }
+      - { id: 1035, customer_id: 1, qty: 9 }
+      - { id: 1036, customer_id: 1, qty: 1 }
+      - { id: 1037, customer_id: 1, qty: 2 }
+      - { id: 1038, customer_id: 1, qty: 3 }
+      - { id: 1039, customer_id: 1, qty: 4 }
+      - { id: 1040, customer_id: 1, qty: 5 }
+      - { id: 1041, customer_id: 1, qty: 6 }
+      - { id: 1042, customer_id: 1, qty: 7 }
+      - { id: 1043, customer_id: 1, qty: 8 }
+      - { id: 1044, customer_id: 1, qty: 9 }
+      - { id: 1045, customer_id: 1, qty: 1 }
+      - { id: 1046, customer_id: 1, qty: 2 }
+      - { id: 1047, customer_id: 1, qty: 3 }
+      - { id: 1048, customer_id: 1, qty: 4 }
+      - { id: 1049, customer_id: 1, qty: 5 }
+      - { id: 1050, customer_id: 1, qty: 6 }
+      - { id: 1051, customer_id: 1, qty: 7 }
+      - { id: 1052, customer_id: 1, qty: 8 }
+      - { id: 1053, customer_id: 1, qty: 9 }
+      - { id: 1054, customer_id: 1, qty: 1 }
+      - { id: 1055, customer_id: 1, qty: 2 }
+      - { id: 1056, customer_id: 1, qty: 3 }
+      - { id: 1057, customer_id: 1, qty: 4 }
+      - { id: 1058, customer_id: 1, qty: 5 }
+      - { id: 1059, customer_id: 1, qty: 6 }
+      - { id: 1060, customer_id: 1, qty: 7 }
+      - { id: 1061, customer_id: 1, qty: 8 }
+      - { id: 1062, customer_id: 1, qty: 9 }
+      - { id: 1063, customer_id: 1, qty: 1 }
+      - { id: 1064, customer_id: 1, qty: 2 }
+      - { id: 1065, customer_id: 1, qty: 3 }
+      - { id: 1066, customer_id: 1, qty: 4 }
+      - { id: 1067, customer_id: 1, qty: 5 }
+      - { id: 1068, customer_id: 1, qty: 6 }
+      - { id: 1069, customer_id: 1, qty: 7 }
+      - { id: 1070, customer_id: 1, qty: 8 }
+      - { id: 1071, customer_id: 1, qty: 9 }
+      - { id: 1072, customer_id: 1, qty: 1 }
+      - { id: 1073, customer_id: 1, qty: 2 }
+      - { id: 1074, customer_id: 1, qty: 3 }
+      - { id: 1075, customer_id: 1, qty: 4 }
+      - { id: 1076, customer_id: 1, qty: 5 }
+      - { id: 1077, customer_id: 1, qty: 6 }
+      - { id: 1078, customer_id: 1, qty: 7 }
+      - { id: 1079, customer_id: 1, qty: 8 }
+      - { id: 1080, customer_id: 1, qty: 9 }
+      - { id: 1081, customer_id: 1, qty: 1 }
+      - { id: 1082, customer_id: 1, qty: 2 }
+      - { id: 1083, customer_id: 1, qty: 3 }
+      - { id: 1084, customer_id: 1, qty: 4 }
+      - { id: 1085, customer_id: 1, qty: 5 }
+      - { id: 1086, customer_id: 1, qty: 6 }
+      - { id: 1087, customer_id: 1, qty: 7 }
+      - { id: 1088, customer_id: 1, qty: 8 }
+      - { id: 1089, customer_id: 1, qty: 9 }
+      - { id: 1090, customer_id: 1, qty: 1 }
+      - { id: 1091, customer_id: 1, qty: 2 }
+      - { id: 1092, customer_id: 1, qty: 3 }
+      - { id: 1093, customer_id: 1, qty: 4 }
+      - { id: 1094, customer_id: 1, qty: 5 }
+      - { id: 1095, customer_id: 1, qty: 6 }
+      - { id: 1096, customer_id: 1, qty: 7 }
+      - { id: 1097, customer_id: 1, qty: 8 }
+      - { id: 1098, customer_id: 1, qty: 9 }
+      - { id: 1099, customer_id: 1, qty: 1 }
+      - { id: 1100, customer_id: 1, qty: 2 }
+      - { id: 1101, customer_id: 1, qty: 3 }
+      - { id: 1102, customer_id: 1, qty: 4 }
+      - { id: 1103, customer_id: 1, qty: 5 }
+      - { id: 1104, customer_id: 1, qty: 6 }
+      - { id: 1105, customer_id: 1, qty: 7 }
+      - { id: 1106, customer_id: 1, qty: 8 }
+      - { id: 1107, customer_id: 1, qty: 9 }
+      - { id: 1108, customer_id: 1, qty: 1 }
+      - { id: 1109, customer_id: 1, qty: 2 }
+      - { id: 1110, customer_id: 1, qty: 3 }
+      - { id: 1111, customer_id: 1, qty: 4 }
+      - { id: 1112, customer_id: 1, qty: 5 }
+      - { id: 1113, customer_id: 1, qty: 6 }
+      - { id: 1114, customer_id: 1, qty: 7 }
+      - { id: 1115, customer_id: 1, qty: 8 }
+      - { id: 1116, customer_id: 1, qty: 9 }
+      - { id: 1117, customer_id: 1, qty: 1 }
+      - { id: 1118, customer_id: 1, qty: 2 }
+      - { id: 1119, customer_id: 1, qty: 3 }
+      - { id: 1120, customer_id: 1, qty: 4 }
+      - { id: 1121, customer_id: 1, qty: 5 }
+      - { id: 1122, customer_id: 1, qty: 6 }
+      - { id: 1123, customer_id: 1, qty: 7 }
+      - { id: 1124, customer_id: 1, qty: 8 }
+      - { id: 1125, customer_id: 1, qty: 9 }
+      - { id: 1126, customer_id: 1, qty: 1 }
+      - { id: 1127, customer_id: 1, qty: 2 }
+      - { id: 1128, customer_id: 1, qty: 3 }
+      - { id: 1129, customer_id: 1, qty: 4 }
+      - { id: 1130, customer_id: 1, qty: 5 }
+      - { id: 1131, customer_id: 1, qty: 6 }
+      - { id: 1132, customer_id: 1, qty: 7 }
+      - { id: 1133, customer_id: 1, qty: 8 }
+      - { id: 1134, customer_id: 1, qty: 9 }
+      - { id: 1135, customer_id: 1, qty: 1 }
+      - { id: 1136, customer_id: 1, qty: 2 }
+      - { id: 1137, customer_id: 1, qty: 3 }
+      - { id: 1138, customer_id: 1, qty: 4 }
+      - { id: 1139, customer_id: 1, qty: 5 }
+      - { id: 1140, customer_id: 1, qty: 6 }
+      - { id: 1141, customer_id: 1, qty: 7 }
+      - { id: 1142, customer_id: 1, qty: 8 }
+      - { id: 1143, customer_id: 1, qty: 9 }
+      - { id: 1144, customer_id: 1, qty: 1 }
+      - { id: 1145, customer_id: 1, qty: 2 }
+      - { id: 1146, customer_id: 1, qty: 3 }
+      - { id: 1147, customer_id: 1, qty: 4 }
+      - { id: 1148, customer_id: 1, qty: 5 }
+      - { id: 1149, customer_id: 1, qty: 6 }
+      - { id: 1150, customer_id: 1, qty: 7 }
+      - { id: 1151, customer_id: 1, qty: 8 }
+      - { id: 1152, customer_id: 1, qty: 9 }
+      - { id: 1153, customer_id: 1, qty: 1 }
+      - { id: 1154, customer_id: 1, qty: 2 }
+      - { id: 1155, customer_id: 1, qty: 3 }
+      - { id: 1156, customer_id: 1, qty: 4 }
+      - { id: 1157, customer_id: 1, qty: 5 }
+      - { id: 1158, customer_id: 1, qty: 6 }
+      - { id: 1159, customer_id: 1, qty: 7 }
+      - { id: 1160, customer_id: 1, qty: 8 }
+      - { id: 1161, customer_id: 1, qty: 9 }
+      - { id: 1162, customer_id: 1, qty: 1 }
+      - { id: 1163, customer_id: 1, qty: 2 }
+      - { id: 1164, customer_id: 1, qty: 3 }
+      - { id: 1165, customer_id: 1, qty: 4 }
+      - { id: 1166, customer_id: 1, qty: 5 }
+      - { id: 1167, customer_id: 1, qty: 6 }
+      - { id: 1168, customer_id: 1, qty: 7 }
+      - { id: 1169, customer_id: 1, qty: 8 }
+      - { id: 1170, customer_id: 1, qty: 9 }
+      - { id: 1171, customer_id: 1, qty: 1 }
+      - { id: 1172, customer_id: 1, qty: 2 }
+      - { id: 1173, customer_id: 1, qty: 3 }
+      - { id: 1174, customer_id: 1, qty: 4 }
+      - { id: 1175, customer_id: 1, qty: 5 }
+      - { id: 1176, customer_id: 1, qty: 6 }
+      - { id: 1177, customer_id: 1, qty: 7 }
+      - { id: 1178, customer_id: 1, qty: 8 }
+      - { id: 1179, customer_id: 1, qty: 9 }
+      - { id: 1180, customer_id: 1, qty: 1 }
+      - { id: 1181, customer_id: 1, qty: 2 }
+      - { id: 1182, customer_id: 1, qty: 3 }
+      - { id: 1183, customer_id: 1, qty: 4 }
+      - { id: 1184, customer_id: 1, qty: 5 }
+      - { id: 1185, customer_id: 1, qty: 6 }
+      - { id: 1186, customer_id: 1, qty: 7 }
+      - { id: 1187, customer_id: 1, qty: 8 }
+      - { id: 1188, customer_id: 1, qty: 9 }
+      - { id: 1189, customer_id: 1, qty: 1 }
+      - { id: 1190, customer_id: 1, qty: 2 }
+      - { id: 1191, customer_id: 1, qty: 3 }
+      - { id: 1192, customer_id: 1, qty: 4 }
+      - { id: 1193, customer_id: 1, qty: 5 }
+      - { id: 1194, customer_id: 1, qty: 6 }
+      - { id: 1195, customer_id: 1, qty: 7 }
+      - { id: 1196, customer_id: 1, qty: 8 }
+      - { id: 1197, customer_id: 1, qty: 9 }
+      - { id: 1198, customer_id: 1, qty: 1 }
+      - { id: 1199, customer_id: 1, qty: 2 }
+      - { id: 1200, customer_id: 1, qty: 3 }
+      - { id: 1201, customer_id: 1, qty: 4 }
+      - { id: 1202, customer_id: 1, qty: 5 }
+      - { id: 1203, customer_id: 1, qty: 6 }
+      - { id: 1204, customer_id: 1, qty: 7 }
+      - { id: 1205, customer_id: 1, qty: 8 }
+      - { id: 1206, customer_id: 1, qty: 9 }
+      - { id: 1207, customer_id: 1, qty: 1 }
+      - { id: 1208, customer_id: 1, qty: 2 }
+      - { id: 1209, customer_id: 1, qty: 3 }
+      - { id: 1210, customer_id: 1, qty: 4 }
+      - { id: 1211, customer_id: 1, qty: 5 }
+      - { id: 1212, customer_id: 1, qty: 6 }
+      - { id: 1213, customer_id: 1, qty: 7 }
+      - { id: 1214, customer_id: 1, qty: 8 }
+      - { id: 1215, customer_id: 1, qty: 9 }
+      - { id: 1216, customer_id: 1, qty: 1 }
+      - { id: 1217, customer_id: 1, qty: 2 }
+      - { id: 1218, customer_id: 1, qty: 3 }
+      - { id: 1219, customer_id: 1, qty: 4 }
+      - { id: 1220, customer_id: 1, qty: 5 }
+      - { id: 1221, customer_id: 1, qty: 6 }
+      - { id: 1222, customer_id: 1, qty: 7 }
+      - { id: 1223, customer_id: 1, qty: 8 }
+      - { id: 1224, customer_id: 1, qty: 9 }
+      - { id: 1225, customer_id: 1, qty: 1 }
+      - { id: 1226, customer_id: 1, qty: 2 }
+      - { id: 1227, customer_id: 1, qty: 3 }
+      - { id: 1228, customer_id: 1, qty: 4 }
+      - { id: 1229, customer_id: 1, qty: 5 }
+      - { id: 1230, customer_id: 1, qty: 6 }
+      - { id: 1231, customer_id: 1, qty: 7 }
+      - { id: 1232, customer_id: 1, qty: 8 }
+      - { id: 1233, customer_id: 1, qty: 9 }
+      - { id: 1234, customer_id: 1, qty: 1 }
+      - { id: 1235, customer_id: 1, qty: 2 }
+      - { id: 1236, customer_id: 1, qty: 3 }
+      - { id: 1237, customer_id: 1, qty: 4 }
+      - { id: 1238, customer_id: 1, qty: 5 }
+      - { id: 1239, customer_id: 1, qty: 6 }
+      - { id: 1240, customer_id: 1, qty: 7 }
+      - { id: 1241, customer_id: 1, qty: 8 }
+      - { id: 1242, customer_id: 1, qty: 9 }
+      - { id: 1243, customer_id: 1, qty: 1 }
+      - { id: 1244, customer_id: 1, qty: 2 }
+      - { id: 1245, customer_id: 1, qty: 3 }
+      - { id: 1246, customer_id: 1, qty: 4 }
+      - { id: 1247, customer_id: 1, qty: 5 }
+      - { id: 1248, customer_id: 1, qty: 6 }
+      - { id: 1249, customer_id: 1, qty: 7 }
+      - { id: 1250, customer_id: 1, qty: 8 }
+      - { id: 1251, customer_id: 1, qty: 9 }
+      - { id: 1252, customer_id: 1, qty: 1 }
+      - { id: 1253, customer_id: 1, qty: 2 }
+      - { id: 1254, customer_id: 1, qty: 3 }
+      - { id: 1255, customer_id: 1, qty: 4 }
+      - { id: 1256, customer_id: 1, qty: 5 }
+      - { id: 1257, customer_id: 1, qty: 6 }
+      - { id: 1258, customer_id: 1, qty: 7 }
+      - { id: 1259, customer_id: 1, qty: 8 }
+      - { id: 1260, customer_id: 1, qty: 9 }
+      - { id: 1261, customer_id: 1, qty: 1 }
+      - { id: 1262, customer_id: 1, qty: 2 }
+      - { id: 1263, customer_id: 1, qty: 3 }
+      - { id: 1264, customer_id: 1, qty: 4 }
+      - { id: 1265, customer_id: 1, qty: 5 }
+      - { id: 1266, customer_id: 1, qty: 6 }
+      - { id: 1267, customer_id: 1, qty: 7 }
+      - { id: 1268, customer_id: 1, qty: 8 }
+      - { id: 1269, customer_id: 1, qty: 9 }
+      - { id: 1270, customer_id: 1, qty: 1 }
+      - { id: 1271, customer_id: 1, qty: 2 }
+      - { id: 1272, customer_id: 1, qty: 3 }
+      - { id: 1273, customer_id: 1, qty: 4 }
+      - { id: 1274, customer_id: 1, qty: 5 }
+      - { id: 1275, customer_id: 1, qty: 6 }
+      - { id: 1276, customer_id: 1, qty: 7 }
+      - { id: 1277, customer_id: 1, qty: 8 }
+      - { id: 1278, customer_id: 1, qty: 9 }
+      - { id: 1279, customer_id: 1, qty: 1 }
+      - { id: 1280, customer_id: 1, qty: 2 }
+      - { id: 1281, customer_id: 1, qty: 3 }
+      - { id: 1282, customer_id: 1, qty: 4 }
+      - { id: 1283, customer_id: 1, qty: 5 }
+      - { id: 1284, customer_id: 1, qty: 6 }
+      - { id: 1285, customer_id: 1, qty: 7 }
+      - { id: 1286, customer_id: 1, qty: 8 }
+      - { id: 1287, customer_id: 1, qty: 9 }
+      - { id: 1288, customer_id: 1, qty: 1 }
+      - { id: 1289, customer_id: 1, qty: 2 }
+      - { id: 1290, customer_id: 1, qty: 3 }
+      - { id: 1291, customer_id: 1, qty: 4 }
+      - { id: 1292, customer_id: 1, qty: 5 }
+      - { id: 1293, customer_id: 1, qty: 6 }
+      - { id: 1294, customer_id: 1, qty: 7 }
+      - { id: 1295, customer_id: 1, qty: 8 }
+      - { id: 1296, customer_id: 1, qty: 9 }
+      - { id: 1297, customer_id: 1, qty: 1 }
+      - { id: 1298, customer_id: 1, qty: 2 }
+      - { id: 1299, customer_id: 1, qty: 3 }
+      - { id: 1300, customer_id: 1, qty: 4 }
+      - { id: 1301, customer_id: 1, qty: 5 }
+      - { id: 1302, customer_id: 1, qty: 6 }
+      - { id: 1303, customer_id: 1, qty: 7 }
+      - { id: 1304, customer_id: 1, qty: 8 }
+      - { id: 1305, customer_id: 1, qty: 9 }
+      - { id: 1306, customer_id: 1, qty: 1 }
+      - { id: 1307, customer_id: 1, qty: 2 }
+      - { id: 1308, customer_id: 1, qty: 3 }
+      - { id: 1309, customer_id: 1, qty: 4 }
+      - { id: 1310, customer_id: 1, qty: 5 }
+      - { id: 1311, customer_id: 1, qty: 6 }
+      - { id: 1312, customer_id: 1, qty: 7 }
+      - { id: 1313, customer_id: 1, qty: 8 }
+      - { id: 1314, customer_id: 1, qty: 9 }
+      - { id: 1315, customer_id: 1, qty: 1 }
+      - { id: 1316, customer_id: 1, qty: 2 }
+      - { id: 1317, customer_id: 1, qty: 3 }
+      - { id: 1318, customer_id: 1, qty: 4 }
+      - { id: 1319, customer_id: 1, qty: 5 }
+      - { id: 1320, customer_id: 1, qty: 6 }
+      - { id: 1321, customer_id: 1, qty: 7 }
+      - { id: 1322, customer_id: 1, qty: 8 }
+      - { id: 1323, customer_id: 1, qty: 9 }
+      - { id: 1324, customer_id: 1, qty: 1 }
+      - { id: 1325, customer_id: 1, qty: 2 }
+      - { id: 1326, customer_id: 1, qty: 3 }
+      - { id: 1327, customer_id: 1, qty: 4 }
+      - { id: 1328, customer_id: 1, qty: 5 }
+      - { id: 1329, customer_id: 1, qty: 6 }
+      - { id: 1330, customer_id: 1, qty: 7 }
+      - { id: 1331, customer_id: 1, qty: 8 }
+      - { id: 1332, customer_id: 1, qty: 9 }
+      - { id: 1333, customer_id: 1, qty: 1 }
+      - { id: 1334, customer_id: 1, qty: 2 }
+      - { id: 1335, customer_id: 1, qty: 3 }
+      - { id: 1336, customer_id: 1, qty: 4 }
+      - { id: 1337, customer_id: 1, qty: 5 }
+      - { id: 1338, customer_id: 1, qty: 6 }
+      - { id: 1339, customer_id: 1, qty: 7 }
+      - { id: 1340, customer_id: 1, qty: 8 }
+      - { id: 1341, customer_id: 1, qty: 9 }
+      - { id: 1342, customer_id: 1, qty: 1 }
+      - { id: 1343, customer_id: 1, qty: 2 }
+      - { id: 1344, customer_id: 1, qty: 3 }
+      - { id: 1345, customer_id: 1, qty: 4 }
+      - { id: 1346, customer_id: 1, qty: 5 }
+      - { id: 1347, customer_id: 1, qty: 6 }
+      - { id: 1348, customer_id: 1, qty: 7 }
+      - { id: 1349, customer_id: 1, qty: 8 }
+      - { id: 1350, customer_id: 1, qty: 9 }
+      - { id: 1351, customer_id: 1, qty: 1 }
+      - { id: 1352, customer_id: 1, qty: 2 }
+      - { id: 1353, customer_id: 1, qty: 3 }
+      - { id: 1354, customer_id: 1, qty: 4 }
+      - { id: 1355, customer_id: 1, qty: 5 }
+      - { id: 1356, customer_id: 1, qty: 6 }
+      - { id: 1357, customer_id: 1, qty: 7 }
+      - { id: 1358, customer_id: 1, qty: 8 }
+      - { id: 1359, customer_id: 1, qty: 9 }
+      - { id: 1360, customer_id: 1, qty: 1 }
+      - { id: 1361, customer_id: 1, qty: 2 }
+      - { id: 1362, customer_id: 1, qty: 3 }
+      - { id: 1363, customer_id: 1, qty: 4 }
+      - { id: 1364, customer_id: 1, qty: 5 }
+      - { id: 1365, customer_id: 1, qty: 6 }
+      - { id: 1366, customer_id: 1, qty: 7 }
+      - { id: 1367, customer_id: 1, qty: 8 }
+      - { id: 1368, customer_id: 1, qty: 9 }
+      - { id: 1369, customer_id: 1, qty: 1 }
+      - { id: 1370, customer_id: 1, qty: 2 }
+      - { id: 1371, customer_id: 1, qty: 3 }
+      - { id: 1372, customer_id: 1, qty: 4 }
+      - { id: 1373, customer_id: 1, qty: 5 }
+      - { id: 1374, customer_id: 1, qty: 6 }
+      - { id: 1375, customer_id: 1, qty: 7 }
+      - { id: 1376, customer_id: 1, qty: 8 }
+      - { id: 1377, customer_id: 1, qty: 9 }
+      - { id: 1378, customer_id: 1, qty: 1 }
+      - { id: 1379, customer_id: 1, qty: 2 }
+      - { id: 1380, customer_id: 1, qty: 3 }
+      - { id: 1381, customer_id: 1, qty: 4 }
+      - { id: 1382, customer_id: 1, qty: 5 }
+      - { id: 1383, customer_id: 1, qty: 6 }
+      - { id: 1384, customer_id: 1, qty: 7 }
+      - { id: 1385, customer_id: 1, qty: 8 }
+      - { id: 1386, customer_id: 1, qty: 9 }
+      - { id: 1387, customer_id: 1, qty: 1 }
+      - { id: 1388, customer_id: 1, qty: 2 }
+      - { id: 1389, customer_id: 1, qty: 3 }
+      - { id: 1390, customer_id: 1, qty: 4 }
+      - { id: 1391, customer_id: 1, qty: 5 }
+      - { id: 1392, customer_id: 1, qty: 6 }
+      - { id: 1393, customer_id: 1, qty: 7 }
+      - { id: 1394, customer_id: 1, qty: 8 }
+      - { id: 1395, customer_id: 1, qty: 9 }
+      - { id: 1396, customer_id: 1, qty: 1 }
+      - { id: 1397, customer_id: 1, qty: 2 }
+      - { id: 1398, customer_id: 1, qty: 3 }
+      - { id: 1399, customer_id: 1, qty: 4 }
+      - { id: 9999, customer_id: 2, qty: 4 }
+steps:
+  - start
+  # The control: the rows really are there to be revisited.
+  - await: { count: { views.order_state: 401 } }
+  - await: { doc: { views.order_state: { where: { order_id: 1000 }, expect: { customer_name: ada } } } }
+  # One change, and then nothing is fed again for the rest of the run.
+  - cdc: { shop_db.customers: { update: { where: { id: 1 }, set: { name: adelaide } } } }
+  # The two ends of the range and one in the middle. Stopping part way satisfies one end and not the
+  # other, whichever way the bucket is walked.
+  - await: { doc: { views.order_state: { where: { order_id: 1000 }, expect: { customer_name: adelaide } } } }
+  - await: { doc: { views.order_state: { where: { order_id: 1200 }, expect: { customer_name: adelaide } } } }
+  - await: { doc: { views.order_state: { where: { order_id: 1399 }, expect: { customer_name: adelaide } } } }
+  # Bo's order never belonged to the changed customer.
+  - assert: { doc: { views.order_state: { where: { order_id: 9999 }, expect: { customer_name: bo } } } }
+  # And nothing was duplicated on the way.
+  - assert: { count: { views.order_state: 401 } }

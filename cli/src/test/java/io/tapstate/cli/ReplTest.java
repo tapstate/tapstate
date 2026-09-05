@@ -148,6 +148,9 @@ class ReplTest {
         /** Per-artifact register outcomes keyed by artifact byte length (for batch/directory tests); falls back to {@link #registerOutcome}. */
         final Map<Integer, ConnectorRegisterOutcome> registerOutcomeByLength = new HashMap<>();
         ConnectorListOutcome connectorListOutcome = new ConnectorListOutcome.Unreachable();
+        /** The canned derived-schema answer, and every call as {@code read|accept credential@base/id}. */
+        DerivedSchemaOutcome derivedSchemaOutcome = new DerivedSchemaOutcome.Unreachable();
+        final List<String> derivedSchemaCalls = new ArrayList<>();
         LifecycleOutcome lifecycleOutcome = new LifecycleOutcome.Unreachable();
         StatusOutcome statusOutcome = new StatusOutcome.Unreachable();
         MetricsOutcome metricsOutcome = new MetricsOutcome.Unreachable();
@@ -383,6 +386,21 @@ class ReplTest {
         public StatusOutcome status(URI baseUrl, String credential, String pipelineId) {
             statusCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
             return healthy.contains(baseUrl) ? statusOutcome : new StatusOutcome.Unreachable();
+        }
+
+        @Override
+        public DerivedSchemaOutcome derivedSchema(URI baseUrl, String credential, String pipelineId) {
+            derivedSchemaCalls.add("read " + credential + "@" + baseUrl + "/" + pipelineId);
+            return healthy.contains(baseUrl)
+                    ? derivedSchemaOutcome : new DerivedSchemaOutcome.Unreachable();
+        }
+
+        @Override
+        public DerivedSchemaOutcome acceptDerivedSchema(
+                URI baseUrl, String credential, String pipelineId) {
+            derivedSchemaCalls.add("accept " + credential + "@" + baseUrl + "/" + pipelineId);
+            return healthy.contains(baseUrl)
+                    ? derivedSchemaOutcome : new DerivedSchemaOutcome.Unreachable();
         }
 
         @Override
@@ -3637,6 +3655,91 @@ class ReplTest {
     }
 
     // --- observation read verbs route online to GET /api/pipelines/{id}/{face} --------------------
+
+    private static DerivedSchemaOutcome.Found oneStep(RemoteDerivedColumn... columns) {
+        return new DerivedSchemaOutcome.Found("pl1",
+                List.of(new RemoteDerivedStep("widen", "orders", true, List.of(columns))));
+    }
+
+    @Test
+    void derivedSchemaRoutesToTheReadAndPrintsAllThreeSides() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = oneStep(
+                new RemoteDerivedColumn("o_total", "DECIMAL NOT NULL", "DOUBLE NOT NULL", "decimal(10,2)"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("derived-schema pl1")).isTrue();
+
+        String printed = h.sink().toString().substring(mark);
+        // All three, because the two that decide anything are the recorded-versus-derived difference and
+        // whether the target can hold the result, and dropping either leaves the reader guessing at it.
+        assertThat(printed).contains("o_total").contains("DECIMAL NOT NULL")
+                .contains("DOUBLE NOT NULL").contains("decimal(10,2)");
+        assertThat(client.derivedSchemaCalls).containsExactly("read jwt-tok@http://node1:7900/pl1");
+    }
+
+    @Test
+    void derivedSchemaWithAcceptRoutesToTheAcceptAndNotToTheRead() {
+        // The one assertion that matters most here. A --accept that reached the read would print exactly
+        // the same thing and report success, and the operator would carry on believing the difference had
+        // been accepted while the next start refused it again.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = oneStep(
+                new RemoteDerivedColumn("o_total", "DOUBLE NOT NULL", "DOUBLE NOT NULL", "double"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("derived-schema pl1 --accept")).isTrue();
+
+        assertThat(client.derivedSchemaCalls).containsExactly("accept jwt-tok@http://node1:7900/pl1");
+        assertThat(h.sink().toString().substring(mark)).contains("accepted");
+    }
+
+    @Test
+    void aColumnMissingFromOneSideIsPrintedAsAbsentRatherThanBlank() {
+        // A blank cell reads as a value that failed to render. This is a column that is not there, which
+        // is the whole finding for one that appeared or went.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = oneStep(
+                new RemoteDerivedColumn("surcharge", null, "DECIMAL NULL", null));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("derived-schema pl1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("surcharge").contains("-");
+    }
+
+    @Test
+    void aTargetNobodyHasDiscoveredSaysSoRatherThanReadingAsAgreement() {
+        // An unknown printed as an empty cell is indistinguishable from a target that holds none of these
+        // columns, and only one of those means "go and look" before starting.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = new DerivedSchemaOutcome.Found("pl1",
+                List.of(new RemoteDerivedStep("widen", "orders", false,
+                        List.of(new RemoteDerivedColumn("o_id", "INT64 NOT NULL", "INT64 NOT NULL", null)))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("derived-schema pl1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("target columns unknown");
+    }
+
+    @Test
+    void derivedSchemaRefusesAnArgumentItDoesNotKnow() {
+        // A misspelt --accept must not be swallowed into a plain read reported as success: that is the
+        // same silent no-op the accept routing test guards from the other side.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = oneStep(
+                new RemoteDerivedColumn("o_id", "INT64 NOT NULL", "INT64 NOT NULL", "bigint"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("derived-schema pl1 --accpet")).isTrue();
+
+        assertThat(client.derivedSchemaCalls).isEmpty();
+    }
 
     @Test
     void statusWhileAuthenticatedRoutesToTheServerAndPrintsTheState() {

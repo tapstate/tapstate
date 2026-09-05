@@ -37,6 +37,7 @@ import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
+import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
@@ -258,7 +259,16 @@ class ControlPlaneConfiguration {
         // off the store port: those facets have no service in front of them.
         return new ArtifactMutationService(
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
-                storePort.meta(), auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+                storePort.meta(), storePort.derivedSchemas(), auditGate,
+                follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+    }
+
+    @Bean
+    DerivedSchemas derivedSchemas(StorePort storePort, AuditGate auditGate) {
+        // Wired on the control plane rather than beside the data plane on purpose: the read exists to be
+        // available when a start has just been refused, which is exactly the moment a data plane may not
+        // be running at all.
+        return new StoreBackedDerivedSchemas(storePort, auditGate);
     }
 
     @Bean

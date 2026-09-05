@@ -1,0 +1,68 @@
+# One SELECT, and it has to cover both halves of the run: the rows that were already there when the
+# pipeline started, and the rows that arrive afterwards.
+#
+# That is the whole claim, and it is worth stating why it needs a case at all. A join is easy to build
+# twice by accident - a batch path that reads both tables and joins them, and a streaming path that
+# looks a dimension up as each fact row arrives. Two paths pass every assertion about the finished
+# table while quietly disagreeing about the projection, and the disagreement only shows the day
+# somebody changes the SELECT and half the rows move. So the reading below is deliberately the same
+# reading twice: the same fields, by name, on a row from each half.
+#
+# What the assertions have to discriminate:
+#
+# - Counting is not enough on its own and is never used alone here. Five rows arrive whether or not a
+#   single customer name was joined in, so every count is followed by a doc matcher that names the
+#   joined field beside the fact row's own column. A pipeline that carried the orders through
+#   untouched satisfies the counts perfectly and fails the first doc.
+# - The customer names differ per order, and the orders under one customer are not contiguous. A
+#   join that matched every fact row to the first dimension row it saw satisfies any single reading
+#   and fails the second.
+# - The row added after start is read for the same two fields as the row seeded before it. This is
+#   the pair that separates one SQL text from two code paths: a snapshot-only projection leaves the
+#   later row without customer_name, and a stream-only projection leaves the earlier ones without it,
+#   and each is green under half the readings here.
+# - order 4 belongs to a customer with no other orders, so it also witnesses that the join is not
+#   quietly grouping.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: one-select-covers-the-snapshot-and-the-changes-after-it
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, join_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: join_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: bo }
+      - { id: 3, name: cleo }
+  shop_db.orders:
+    values:
+      - { id: 10, customer_id: 1, qty: 2 }
+      - { id: 11, customer_id: 2, qty: 5 }
+      - { id: 12, customer_id: 1, qty: 7 }
+      - { id: 13, customer_id: 3, qty: 1 }
+steps:
+  - start
+  # The snapshot half: four orders, each carrying its own customer's name.
+  - await: { count: { views.order_state: 4 } }
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: ada } } } }
+  # Not contiguous with order 10, and the same customer: a join that hung every fact row on the first
+  # dimension row it saw passes the reading above and fails this one.
+  - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: ada } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 13 }, expect: { qty: 1, customer_name: cleo } } } }
+  # The change half. Same SELECT, a row that did not exist when the pipeline started.
+  - cdc: { shop_db.orders: { insert: { values: [ { id: 14, customer_id: 2, qty: 9 } ] } } }
+  - await: { count: { views.order_state: 5 } }
+  # The pair that matters: the same two fields, read on a row from the other half of the run.
+  - await: { doc: { views.order_state: { where: { order_id: 14 }, expect: { qty: 9, customer_name: bo } } } }
+  # And the snapshot rows are still what they were - a change half that rebuilt the table would pass
+  # the reading above and quietly rewrite these.
+  - assert: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: ada } } } }
+  - assert: { count: { views.order_state: 5 } }

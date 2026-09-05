@@ -54,7 +54,9 @@ class CorpusSmokeTest {
             "duplicate-id",         // id collision: top-level / pipeline-internal uniqueness, or step-id shadowing (§2/F8, §5)
             "unsupported-mode",     // source mode outside the connector's capability matrix (§4 / C3)
             "config-type-mismatch", // connector config value of the wrong declared type (C3)
-            "invalid-config-value");// connector config value outside the declared enum choices (C3)
+            "invalid-config-value", // connector config value outside the declared enum choices (C3)
+            "join-sql-not-parsable", // a join's sql: is not SQL at all (SS2)
+            "join-sql-unsupported");// a join's sql: uses a construct this release does not run (SS2)
 
     private static final Set<String> KINDS = Set.of("source", "pipeline", "transform", "view", "serve");
 

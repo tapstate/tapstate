@@ -29,6 +29,8 @@
     <module>core-common</module>
     <module>core-model</module>
     <module>core-dsl</module>
+    <!-- the SQL front end for join declarations: parse / validate / type derivation, no execution -->
+    <module>core-sql</module>
     <module>core-schema</module>
     <module>core-catalog</module>
     <module>core-lifecycle</module>

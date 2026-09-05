@@ -7,6 +7,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
@@ -269,7 +270,7 @@ final class NewCmd implements Callable<Integer> {
             case "js" -> new TransformBody.Js("emit(after)\n");
             case "map" -> new TransformBody.MapProjection(Map.of("id", FieldRule.rename("id")));
             case "nest" -> new TransformBody.Nest(null, null, new NestRoot("main", null, null, null, null));
-            case "join" -> new TransformBody.Join("duckdb", "SELECT * FROM a\n");
+            case "join" -> new TransformBody.Join(JoinEngine.BUILTIN, "SELECT * FROM a\n");
             default -> throw new IllegalStateException("unhandled transform type: " + type);
         };
     }

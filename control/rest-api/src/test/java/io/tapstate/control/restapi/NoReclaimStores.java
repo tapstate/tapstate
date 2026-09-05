@@ -6,6 +6,8 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.DerivedSchema;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaVersion;
@@ -15,6 +17,7 @@ import io.tapstate.spi.store.StateStore;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -96,6 +99,26 @@ final class NoReclaimStores {
             @Override
             public void delete(String pipelineId) {
                 throw unexpected("ObservationStore.delete");
+            }
+        };
+    }
+
+    static DerivedSchemaStore derivedSchemas() {
+        return new DerivedSchemaStore() {
+            @Override
+            public Optional<DerivedSchema> latest(String pipelineId, String stepId) {
+                throw unexpected("DerivedSchemaStore.latest");
+            }
+
+            @Override
+            public void record(String pipelineId, String stepId, Map<String, String> schema,
+                    String statement, String derivedFrom, String derivedBy) {
+                throw unexpected("DerivedSchemaStore.record");
+            }
+
+            @Override
+            public void delete(String pipelineId) {
+                throw unexpected("DerivedSchemaStore.delete");
             }
         };
     }

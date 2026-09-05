@@ -394,13 +394,45 @@ jobs:
           gh workflow run nightly-real-connectors.yml --ref "${GITHUB_REF_NAME}"
           echo "Dispatched the real-connector lane on ${GITHUB_REF_NAME} (${tip})."
 
-  gates:
-    # The release gate. Six conditions, all decided by machine, none of them a box a person can tick
-    # -- a switch somebody can flip is not a check, and every one of them is another way to produce a
-    # release that did not go the standard way.
+  join-perf:
+    # The join operator's performance lane, started here for the same reason as the connector one
+    # above: the ordinary build runs three of its scenarios on one tier, so a release could otherwise
+    # go out having never had the other eight measured, or the resident and cold tiers looked at at
+    # all - and where that state sits moves the numbers by orders of magnitude.
     #
-    # Two of the six are not steps here, because they are already the reason this job can run at all,
-    # and re-asserting them would be this workflow grading its own dependency graph:
+    # Dispatched rather than waited on, and started beside the build rather than after it. The same
+    # rule about a bare commit applies: `workflow_dispatch` takes a ref, so when the release commit is
+    # not the tip of the one this ran from, nothing is started and the gate below asks for a run that
+    # already exists on that commit. It refuses if there is none, which is the true answer.
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write   # dispatch the performance lane
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: start the join performance lane on the commit being released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tip="$(gh api "repos/${{ github.repository }}/commits/${GITHUB_REF_NAME}" --jq '.sha' 2>/dev/null || true)"
+          if [ "$tip" != "${{ needs.version.outputs.sha }}" ]; then
+            echo "The release commit is not the tip of ${GITHUB_REF_NAME}, so the lane cannot be dispatched at it."
+            echo "The gate will ask for a run that already succeeded on ${{ needs.version.outputs.sha }}."
+            exit 0
+          fi
+          gh workflow run join-perf.yml --ref "${GITHUB_REF_NAME}"
+          echo "Dispatched the join performance lane on ${GITHUB_REF_NAME} (${tip})."
+
+  gates:
+    # The release gate. Eight conditions, all decided by machine, none of them a box a person can
+    # tick -- a switch somebody can flip is not a check, and every one of them is another way to
+    # produce a release that did not go the standard way.
+    #
+    # Two of the eight are not steps here, because they are already the reason this job can run at
+    # all, and re-asserting them would be this workflow grading its own dependency graph:
     #
     #   2. the release smoke tests are green   `cli-native` runs the native and MCP smokes against
     #                                          each produced binary; a red one fails that job and
@@ -408,8 +440,8 @@ jobs:
     #   3. the distribution is complete        `release-manifest.sh`, in the job below, opening every
     #                                          asset before the draft is assembled
     #
-    # The four that are steps are the ones nothing else was asking.
-    needs: [version, connectors, cli-native, server-image]
+    # The six that are steps are the ones nothing else was asking.
+    needs: [version, connectors, join-perf, cli-native, server-image]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -462,6 +494,28 @@ jobs:
               exit 1
             fi
             echo "waiting for the real-connector lane..."
+            sleep 60
+          done
+
+      # 8. And so is the join performance lane, for the same reason and read the same way. It is the
+      #    other lane no merge gate covers in full: the ordinary build measures three of its scenarios
+      #    on one tier, and this is where the rest of the matrix is required to have been green on the
+      #    commit going out. A shipped release that got slower is not something a later run can undo.
+      - name: 8. the join performance lane is green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deadline=$(( SECONDS + 90 * 60 ))
+          while true; do
+            .github/scripts/checks-on-commit.sh --sha "${{ needs.version.outputs.sha }}" --required join-perf && break
+            # As above: 3 alone means nothing has concluded yet, and anything else has concluded
+            # something that waiting will not change.
+            [ "$?" = 3 ] || exit 1
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::the join performance lane has not finished on ${{ needs.version.outputs.sha }} within 90 minutes"
+              exit 1
+            fi
+            echo "waiting for the join performance lane..."
             sleep 60
           done
 

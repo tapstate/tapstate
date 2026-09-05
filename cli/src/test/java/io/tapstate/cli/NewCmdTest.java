@@ -646,7 +646,7 @@ class NewCmdTest {
                 kind: transform
                 id: t_join
                 type: join
-                engine: duckdb
+                engine: builtin
                 sql: |
                   SELECT * FROM a
                 """);

@@ -17,6 +17,18 @@ actuation.not-a-pipeline:
 actuation.source-schema-not-discovered:
   message: "Source `{source}` needs a discovered schema before its tables can be selected."
   solution: "Run schema discovery for the source, then apply or start the pipeline again."
+actuation.join-source-key-missing:
+  message: "Join `{step}` is driven from table `{table}`, which declares no primary key."
+  solution: "Give the table a primary key and run schema discovery again. A join files every row it holds under the driving row's key, so without one two different rows share an entry and the wide row is built from whichever was written last."
+actuation.join-output-key-not-published:
+  message: "Join `{step}` does not publish column `{column}` of its driving table `{table}`, so nothing identifies a row of its result."
+  solution: "Add `{column}` to the SELECT as a plain column, for example `SELECT t.{column} AS {column}, ...`. It has to be the column itself and not an expression over it: a computed value need not be unique where the column is, so rows the query says are distinct would be written over one another."
+actuation.join-output-schema-source-changed:
+  message: "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and its sources are what changed. Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}."
+  solution: "Nothing in your pipeline changed - a source table did. Run `derived-schema {pipeline}` to see the recorded columns beside today's and beside what the target table actually declares. Then make the target able to hold the new shape if it cannot already, and run `derived-schema {pipeline} --accept` to record today's columns as what the next start is held to. Starting before the target can hold them writes rows that succeed and lose data to truncation or rounding, which no error anywhere reports."
+actuation.join-output-schema-engine-changed:
+  message: "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and neither the query nor the source columns changed - what changed is how we work them out ({recordedBy} -> {nowBy}). Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}."
+  solution: "Please report this - it is a compatibility break on our side that our own release checks should have caught before you ever saw it. To carry on, run `derived-schema {pipeline}` to see what moved, rebuild the target table for the new column types, then `derived-schema {pipeline} --accept`. Read the difference first: a type that narrowed loses data on the next write, which is a deliberate decision and not a formality. Staying on the version you were running is the other way out."
 actuation.view-key-missing:
   message: "View `{view}` declares no primary key."
   solution: "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."
@@ -237,6 +249,12 @@ dsl.config-required:
 dsl.invalid-config-value:
   message: "Config field '{field}' of connector '{connector}' at {path} has an invalid value '{value}'."
   solution: "Use one of the allowed values: {allowed}."
+dsl.join-sql-not-parsable:
+  message: "The join SQL at {path} is not valid SQL: {detail}"
+  solution: "Fix the SQL; the line and column in that message count from the start of the `sql:` block itself."
+dsl.join-sql-unsupported:
+  message: "The join SQL at {path} uses {shape} at line {line}, column {column}, which this release does not run."
+  solution: "A join is one SELECT over tables combined with equality conditions, publishing one row per match; it cannot filter, sort, cut, de-duplicate, aggregate or nest queries. Rewrite the SQL within that subset, or do the rest in a later step."
 dsl.malformed-yaml:
   message: "Malformed YAML: {detail}."
   solution: "Fix the YAML syntax; the line and column point at the problem."

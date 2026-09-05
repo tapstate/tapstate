@@ -7,6 +7,7 @@ import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
@@ -450,9 +451,9 @@ class CanonicalWriterTest {
                             FromClause.aliases(Map.of(
                                     "c", FromRef.literal("customers"),
                                     "o", FromRef.literal("orders"))),
-                            new TransformBody.Join("duckdb",
-                                    "SELECT c.id AS customer_id, count(*) AS order_cnt, sum(o.amount) AS total\n"
-                                            + "FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id\n"),
+                            new TransformBody.Join(JoinEngine.BUILTIN,
+                                    "SELECT c.id AS customer_id, o.id AS order_id, o.amount AS amount\n"
+                                            + "FROM c JOIN o ON o.customer_id = c.id\n"),
                             null, null)),
                     new ViewBlock.Inline("cust_stats", FromRef.literal("cust_orders"),
                             "customer_id",
@@ -470,10 +471,10 @@ class CanonicalWriterTest {
                         from:
                           c: customers
                           o: orders
-                        engine: duckdb
+                        engine: builtin
                         sql: |
-                          SELECT c.id AS customer_id, count(*) AS order_cnt, sum(o.amount) AS total
-                          FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id
+                          SELECT c.id AS customer_id, o.id AS order_id, o.amount AS amount
+                          FROM c JOIN o ON o.customer_id = c.id
                     view:
                       id: cust_stats
                       from: cust_orders

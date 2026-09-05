@@ -8,14 +8,14 @@ transforms:
     from:
       c: customers
       o: orders
-    engine: duckdb
+    engine: builtin
     sql: |
-      SELECT c.id AS customer_id, count(*) AS order_cnt, sum(o.amount) AS total
-      FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id
+      SELECT c.id AS customer_id, o.id AS order_id, o.amount AS amount
+      FROM c JOIN o ON o.customer_id = c.id
 view:
   id: cust_stats
   from: cust_orders
-  primary_key: customer_id
+  primary_key: order_id
   storage:
     warm:
       collection: cust_stats

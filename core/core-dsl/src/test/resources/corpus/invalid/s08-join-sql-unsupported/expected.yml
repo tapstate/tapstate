@@ -1,0 +1,4 @@
+rule: join-sql-unsupported
+adr: "ADR-0016 §5.2"
+path: transforms[0].sql
+note: "FULL OUTER JOIN is outside the supported subset; refused at parse, not at assembly"

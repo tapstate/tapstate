@@ -111,12 +111,12 @@ public sealed interface TransformBody {
         }
     }
 
-    /** {@code type: join} — duckdb flat wide-table materialization (§5.2). */
+    /** {@code type: join} — flat wide-table materialization over joined streams (§5.2). */
     @YamlType("join")
     @Doc("Materializes a flat wide table by joining streams with SQL.")
     record Join(
-            @Doc(value = "The query engine that runs the join, such as duckdb.", required = true)
-            String engine,
+            @Doc(value = "The engine that runs the join.", required = true)
+            JoinEngine engine,
             @Doc(value = "The SQL query that produces the joined wide table.", required = true)
             String sql) implements TransformBody {
         public Join {

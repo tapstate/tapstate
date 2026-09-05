@@ -34,7 +34,7 @@ cdc read, and `srs.enabled: false`.
 | `s05-cdc-to-kafka-push` | §14.5 | MySQL CDC → Kafka | `push` element (no `type`), `topic`, `settings.read_mode: cdc_only` |
 | `s06-api-poll-mongo` | §14.6 | GitHub API polling → MongoDB | `mode: api`, `poll_interval`/`cursor`, `tables[].pk`, whole-source regex |
 | `s07-csv-batch-import` | §14.7 | CSV batch import + cleanse | `mode: file`, literal-only `tables`, map computed value (`"=CEL"`) |
-| `s08-dual-source-join` | §14.8 | Cross-database dual-source join | `source:` id list, `join` (duckdb SQL + aggregation), view-only output |
+| `s08-dual-source-join` | §14.8 | Cross-database dual-source join | `source:` id list, `join` (SQL inside the supported subset), view-only output |
 | `s09-filter-fanout-pipelines` | §14.9 | Conditional fan-out, v1 form | N pipelines × `filter` over one shared source (router is out of v1, X14) |
 | `s10-ddl-evolution-chain` | §14.10 | DDL / schema evolution five-hop chain | `include_ddl`, `srs.schema_evolution: track`, map passthrough, `view.schema`, sink `ddl: apply` |
 | `s11-reuse-assembly` | §14.11 | Definition bodies + pure-reference assembly | `kind: transform/view/serve` definitions, string = `use:` sugar, natural-order wiring (X19) |

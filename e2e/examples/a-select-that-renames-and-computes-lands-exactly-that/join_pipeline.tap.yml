@@ -1,0 +1,19 @@
+version: tapstate/v1
+kind: pipeline
+id: order_pipeline
+source: shop_db
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: widen
+    type: join
+    from: { o: orders, c: customers }
+    engine: builtin
+    sql: |
+      SELECT o.id AS order_id,
+             c.name AS customer_name,
+             o.qty * o.price AS amount
+      FROM o JOIN c ON o.customer_id = c.id
+view:
+  id: order_state
+  from: widen
+  primary_key: order_id

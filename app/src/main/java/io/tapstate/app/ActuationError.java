@@ -44,6 +44,50 @@ enum ActuationError implements TapstateErrorCode {
     /** A table object carries settings the current capture path does not implement; fields lists their names. */
     SOURCE_TABLE_SPEC_UNSUPPORTED("actuation.source-table-spec-unsupported", Set.of("source", "table", "fields")),
 
+    /**
+     * A join's driving source declares no key, so nothing identifies the row a change is about;
+     * {@code step} is the join step and {@code table} the table it is driven from. Every row a join
+     * mirrors and every entry in its reverse index is filed under that key, so without one two
+     * different rows land in one entry - which is not an error anywhere, it simply builds the wide row
+     * out of whichever of them was written last.
+     */
+    JOIN_SOURCE_KEY_MISSING("actuation.join-source-key-missing", Set.of("step", "table")),
+
+    /**
+     * A join's SELECT does not publish the driving table's key, so nothing identifies a result row;
+     * {@code step} is the join step, {@code table} the driving table and {@code column} the key column
+     * missing from the projection. A target keyed on anything less collapses rows the SQL says are
+     * distinct, and the collapse is invisible: the write succeeds and the target holds fewer rows than
+     * it should with no error anywhere. A column reaching the output only through an expression does
+     * not publish it - the value is a function of the key, and a function need not be injective.
+     */
+    JOIN_OUTPUT_KEY_NOT_PUBLISHED("actuation.join-output-key-not-published",
+            Set.of("step", "table", "column")),
+
+    /**
+     * A join's output columns no longer match the ones it was recorded producing, and its sources are
+     * what moved: {@code pipeline} and {@code step} name the join, and {@code added} / {@code removed} /
+     * {@code retyped} carry the difference. Ordinary in a change-data product - a column widened, a
+     * type changed - and the operator's to rule on, which is why it is told apart from the same
+     * difference arriving for our reasons ({@link #JOIN_OUTPUT_SCHEMA_ENGINE_CHANGED}). Refused rather
+     * than written through: the target was built for the recorded shape, so the writes succeed and
+     * whatever no longer fits is truncated or rounded with nothing reporting it.
+     */
+    JOIN_OUTPUT_SCHEMA_SOURCE_CHANGED("actuation.join-output-schema-source-changed",
+            Set.of("pipeline", "step", "added", "removed", "retyped")),
+
+    /**
+     * A join's output columns no longer match the ones it was recorded producing, and neither the query
+     * nor the source columns moved - so what changed is how we work them out: {@code pipeline} and
+     * {@code step} name the join, {@code added} / {@code removed} / {@code retyped} carry the
+     * difference, and {@code recordedBy} / {@code nowBy} name the derivation on each side. This is our
+     * compatibility break rather than the operator's, and it should have been caught by the derivation
+     * goldens long before it reached anybody; reaching a user at all means one of them is missing the
+     * shape that moved.
+     */
+    JOIN_OUTPUT_SCHEMA_ENGINE_CHANGED("actuation.join-output-schema-engine-changed",
+            Set.of("pipeline", "step", "added", "removed", "retyped", "recordedBy", "nowBy")),
+
     /** A serve.from regex is invalid; {@code regex} carries the expression. */
     FROM_REGEX_INVALID("actuation.from-regex-invalid", Set.of("regex")),
 

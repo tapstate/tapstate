@@ -1,0 +1,18 @@
+# The sql: block is not SQL at all. A different answer from 'this release does not run that
+# shape', and a different thing for the reader to go and do about it.
+version: tapstate/v1
+kind: pipeline
+id: cust_wide
+source: [ src_crm, src_erp ]
+transforms:
+  - id: cust_orders
+    type: join
+    from: { c: customers, o: orders }
+    engine: builtin
+    sql: |
+      SELECT FROM WHERE
+view:
+  id: cust_wide
+  from: cust_orders
+  primary_key: customer_id
+  storage: { warm: { collection: cust_wide } }

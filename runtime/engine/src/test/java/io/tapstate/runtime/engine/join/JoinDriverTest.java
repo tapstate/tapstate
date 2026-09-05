@@ -1,0 +1,873 @@
+package io.tapstate.runtime.engine.join;
+
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
+import io.tapstate.core.sql.Expr;
+import io.tapstate.core.sql.JoinKind;
+import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.core.sql.JoinTree;
+import io.tapstate.core.sql.OutputField;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * What one change means for the rows already published, including changes to the side nothing is
+ * driven from.
+ *
+ * <p>Almost every failure here publishes a row that looks entirely ordinary, so most of these cases
+ * are about what did <em>not</em> happen: a dimension edit that produced nothing, a bucket that never
+ * recorded a miss, an old row that was left behind, a recompute that stopped when the input went
+ * quiet.
+ */
+class JoinDriverTest {
+
+    private static final String STREAM = "order_state";
+
+    @Test
+    @DisplayName("a fact row arriving is published with its dimension row joined in")
+    void aFactRowIsPublishedJoined() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+
+        assertThat(fixture.published()).containsExactly(
+                Map.entry(Op.INSERT, Map.of("order_id", 10L, "customer_name", "Ada")));
+    }
+
+    @Test
+    @DisplayName("a left join with no dimension row publishes the row with nulls, an inner join publishes nothing")
+    void anUnmatchedRowFollowsTheJoinKind() {
+        Fixture left = new Fixture(JoinKind.LEFT);
+        left.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        assertThat(left.published()).singleElement()
+                .extracting(Map.Entry::getValue)
+                .isEqualTo(rowOf("order_id", 10L, "customer_name", null));
+
+        Fixture inner = new Fixture(JoinKind.INNER);
+        inner.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        assertThat(inner.published()).isEmpty();
+    }
+
+    /**
+     * The case a matching-only index cannot serve. The fact row missed, so an index built from matches
+     * has no record that it exists; when the dimension row finally arrives, those rows stay null for
+     * ever with nothing reporting it.
+     */
+    @Test
+    @DisplayName("a dimension row arriving later turns rows that missed it into matches")
+    void aLateDimensionRowTurnsMissesIntoMatches() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+
+        assertThat(fixture.published()).containsExactly(
+                Map.entry(Op.INSERT, Map.of("order_id", 10L, "customer_name", "Ada")));
+    }
+
+    /**
+     * The half the substrate's own enrichment operators do not do at all: measured on both of them, a
+     * dimension row edited while a job ran produced zero re-emissions, with the job running and nothing
+     * reported.
+     */
+    @Test
+    @DisplayName("a dimension row changing re-emits every fact row pointing at it")
+    void aDimensionChangeReEmitsItsFactRows() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.apply(fact(insert(Map.of("id", 11L, "cust_id", 1L))));
+        fixture.apply(fact(insert(Map.of("id", 12L, "cust_id", 2L))));
+        fixture.clear();
+
+        fixture.apply(dimension("c", update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(fixture.published()).containsExactlyInAnyOrder(
+                Map.entry(Op.INSERT, Map.of("order_id", 10L, "customer_name", "Grace")),
+                Map.entry(Op.INSERT, Map.of("order_id", 11L, "customer_name", "Grace")));
+    }
+
+    /**
+     * The contract that keeps a large recompute from stopping half way. A stream that has caught up
+     * stops delivering, so if the only moment work were pushed were the arrival of the next change,
+     * the rest of a fan-out would never be sent - with the job running, no errors, and the target table
+     * half updated.
+     */
+    @Test
+    @DisplayName("a recompute finishes while nothing at all is arriving")
+    void aRecomputeIsPushedWithNoInput() {
+        Fixture fixture = new Fixture(JoinKind.LEFT, 2);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        for (long id = 0; id < 5; id++) {
+            fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        fixture.clear();
+        fixture.sink.takeAtMost(1);
+
+        assertThat(fixture.driver.apply(List.of(
+                dimension("c", update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace")))),
+                fixture.sink)).as("refused after one row, so there is more to do").isFalse();
+
+        fixture.sink.takeAtMost(Integer.MAX_VALUE);
+        // Nothing arriving at all, which is the ordinary state of a stream that has caught up.
+        assertThat(fixture.driver.apply(List.of(), fixture.sink)).isTrue();
+        assertThat(fixture.published()).hasSize(5)
+                .allSatisfy(entry -> assertThat(entry.getValue())
+                        .containsEntry("customer_name", "Grace"));
+    }
+
+    /**
+     * A sink refusing part way through must be able to be offered the rest, in order, without the ones
+     * it already took. Both failures are silent at the sink: a duplicate is absorbed by an idempotent
+     * write, and a gap is a row that simply never updates.
+     */
+    @Test
+    @DisplayName("a refused fan-out resumes with no gaps and no repeats")
+    void aRefusedFanOutResumesExactlyWhereItStopped() {
+        Fixture fixture = new Fixture(JoinKind.LEFT, 2);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        for (long id = 0; id < 7; id++) {
+            fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        fixture.clear();
+
+        fixture.sink.takeAtMost(3);
+        fixture.driver.apply(List.of(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace")))), fixture.sink);
+        fixture.sink.takeAtMost(Integer.MAX_VALUE);
+        fixture.drainFully();
+
+        List<Object> ids = fixture.published().stream()
+                .map(entry -> entry.getValue().get("order_id")).toList();
+        assertThat(ids).containsExactlyInAnyOrder(0L, 1L, 2L, 3L, 4L, 5L, 6L);
+    }
+
+    /**
+     * The rule that reads like tuning and is correctness. Queuing the fact row when the work is queued
+     * is the more natural implementation, and it loses a concurrent update: the new value is emitted
+     * first and the queued old one lands after it, so the target table settles on the older value.
+     */
+    @Test
+    @DisplayName("a recompute emits the fact row as it is when it is sent, not as it was when it was queued")
+    void aRecomputeReReadsTheFactRow() {
+        Fixture fixture = new Fixture(JoinKind.LEFT, 1);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L, "note", "first"))));
+        fixture.apply(fact(insert(Map.of("id", 11L, "cust_id", 1L, "note", "first"))));
+        fixture.clear();
+
+        fixture.sink.takeAtMost(1);
+        fixture.driver.apply(List.of(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace")))), fixture.sink);
+        // Both fact rows are edited while the recompute is part way through, and nothing is taken while
+        // that happens - so everything published afterwards is published by a recompute that was
+        // already under way when the rows changed.
+        fixture.sink.takeAtMost(0);
+        fixture.driver.apply(List.of(
+                fact(update(Map.of("id", 10L, "cust_id", 1L, "note", "first"),
+                        Map.of("id", 10L, "cust_id", 1L, "note", "second"))),
+                fact(update(Map.of("id", 11L, "cust_id", 1L, "note", "first"),
+                        Map.of("id", 11L, "cust_id", 1L, "note", "second")))), fixture.sink);
+        fixture.clear();
+        fixture.sink.takeAtMost(Integer.MAX_VALUE);
+        fixture.drainFully();
+
+        // Not "the last one is right": a recompute holding the row it was queued with would publish the
+        // older note here, and the newer one would land afterwards anyway - so the last value is the
+        // same under both implementations and says nothing. What differs is whether the older value is
+        // published at all.
+        assertThat(fixture.notesPublished())
+                .as("nothing carries the value the row held when the work was queued")
+                .doesNotContain("first");
+        assertThat(fixture.notesPublished()).contains("second");
+    }
+
+    /**
+     * Where the published row's identity carries the dimension key - which is what a fan-out target
+     * table has to key on - the row under the old key and the row under the new one are two different
+     * rows. Writing only the new one leaves the old one behind: one order under two customers at once.
+     */
+    @Test
+    @DisplayName("a fact row re-pointed at another dimension key removes what it published under the old one")
+    void aRePointedFactRowRemovesItsOldRow() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(dimension("c", insert(Map.of("id", 2L, "name", "Grace"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.apply(fact(update(Map.of("id", 10L, "cust_id", 1L), Map.of("id", 10L, "cust_id", 2L))));
+
+        assertThat(fixture.published()).containsExactly(
+                Map.entry(Op.DELETE, Map.of("order_id", 10L, "customer_name", "Ada")),
+                Map.entry(Op.INSERT, Map.of("order_id", 10L, "customer_name", "Grace")));
+    }
+
+    @Test
+    @DisplayName("a fact row deleted is removed and stops being reached by its dimension key")
+    void aDeletedFactRowIsRemovedAndUnindexed() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.apply(fact(delete(Map.of("id", 10L, "cust_id", 1L))));
+        assertThat(fixture.published()).containsExactly(
+                Map.entry(Op.DELETE, Map.of("order_id", 10L, "customer_name", "Ada")));
+
+        fixture.clear();
+        fixture.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+        assertThat(fixture.published()).as("nothing points at it any more").isEmpty();
+    }
+
+    /**
+     * The index is derived and may name a row that has since gone or moved. Emitting from it without
+     * asking the fact row would publish that row against a dimension row it has nothing to do with -
+     * and the published row would look entirely ordinary.
+     */
+    @Test
+    @DisplayName("an index entry the fact row no longer agrees with is dropped rather than emitted")
+    void aStaleIndexEntryIsNeverEmitted() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 2L))));
+        fixture.clear();
+        // A bucket naming a row that points somewhere else: what a rebuild or a missed removal leaves.
+        String bucket = fixture.dimensionKeyOf(1L);
+        fixture.stores.indexAdd("c", bucket, fixture.onlyFactKey());
+
+        fixture.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(fixture.published()).isEmpty();
+        assertThat(fixture.stores.indexPageCount("c", bucket))
+                .as("and it is gone, so the bucket does not grow for ever").isZero();
+    }
+
+    /**
+     * A million keys asked one at a time against a remote store is a million round trips. One page at a
+     * time is barely better: a read is answered by every partition its keys fall across, so a read the
+     * size of a small page is a call per key wearing the batch's name. Neither answers differently from
+     * the other, so nothing but the clock says which is happening - which is why this counts the asking.
+     */
+    @Test
+    @DisplayName("fact rows are read across pages in one go, not a page at a time")
+    void factRowsAreReadAcrossPagesInOneBatch() {
+        Fixture fixture = new Fixture(JoinKind.LEFT, 4);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        for (long id = 0; id < 8; id++) {
+            fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        assertThat(fixture.stores.indexPageCount("c", fixture.dimensionKeyOf(1L)))
+                .as("two pages, so a page-at-a-time read is visible as two") .isEqualTo(2);
+        fixture.stores.forgetCounts();
+
+        fixture.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(fixture.stores.keysRead).isEqualTo(8);
+        assertThat(fixture.stores.batchReads).as("both pages in one read, not one read each")
+                .isEqualTo(1);
+    }
+
+    /**
+     * The mirror reads a first load makes, which are the ones there are most of - one per row of the
+     * table. Every row of a snapshot arrives carrying no before image, so each asks the mirror what
+     * that key used to hold, and on a first load the answer is always nothing. Asked a key at a time
+     * that is a round trip per row; asked as the batch it arrived in it is one for the batch, and both
+     * answer identically - so nothing but a count of the asking says which one happened.
+     *
+     * <p>The batch is read before any of it is taken in, so what it holds is what the mirror held
+     * before the batch. A key the batch itself writes is dropped from it as that write happens, which
+     * is what {@link #aRepeatedKeyInOneBatchSeesTheEarlierChange} is about.
+     */
+    @Test
+    @DisplayName("a batch of arriving fact rows asks the mirror once, not once per row")
+    void aBatchOfFactRowsAsksTheMirrorOnce() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        List<SourceChange> batch = new ArrayList<>();
+        for (long id = 0; id < 8; id++) {
+            batch.add(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        fixture.stores.forgetCounts();
+
+        fixture.applyBatch(batch);
+
+        assertThat(fixture.stores.singleReads)
+                .as("not a round trip per row of the snapshot").isZero();
+        assertThat(fixture.stores.batchReads)
+                .as("the whole batch's keys asked for once").isEqualTo(1);
+        assertThat(fixture.stores.keysRead).isEqualTo(8);
+    }
+
+    /**
+     * What reading a batch up front must not cost: a second change to a key the same batch already
+     * changed has to see the first one. Reading the batch before taking any of it in makes the answer
+     * for every key the pre-batch answer, and a key written half way through the batch stops agreeing
+     * with it right there.
+     *
+     * <p>Here the same order moves from one customer to another and then to a third, in one batch. If
+     * the second change were served the pre-batch image it would read the move as being from the first
+     * customer rather than the second, and take the row out of a bucket it is no longer in while
+     * leaving it in the one it is - a fan-out that sends a row it should not and misses one it should,
+     * with nothing reporting either.
+     */
+    @Test
+    @DisplayName("a key changed twice in one batch sees the earlier change, not the batch's first read")
+    void aRepeatedKeyInOneBatchSeesTheEarlierChange() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        for (long id = 1; id <= 3; id++) {
+            fixture.apply(dimension("c", insert(Map.of("id", id, "name", "name-" + id))));
+        }
+        fixture.apply(fact(insert(Map.of("id", 7L, "cust_id", 1L))));
+
+        // Both carry no before image, so both ask the mirror - which is what makes them a batch read.
+        fixture.applyBatch(List.of(
+                fact(insert(Map.of("id", 7L, "cust_id", 2L))),
+                fact(insert(Map.of("id", 7L, "cust_id", 3L)))));
+
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(1L), 0))
+                .as("left the first customer's bucket").isEmpty();
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(2L), 0))
+                .as("and the second's, which only the earlier change in this batch put it in").isEmpty();
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(3L), 0))
+                .as("and is in the third's, once").hasSize(1);
+    }
+
+    /**
+     * The same rule reached the other way, and it is a different place in the code. Here the earlier
+     * change carries its own before image, so it never asks the mirror at all - it only writes to it.
+     * The later one does ask, and what it has to get is what the earlier change wrote. A read ahead
+     * that is dropped when a key is <em>read</em> but not when it is <em>written</em> passes the case
+     * above and fails this one.
+     */
+    @Test
+    @DisplayName("a key written earlier in the batch is read again, not answered from the batch's read")
+    void aKeyWrittenEarlierInTheBatchIsReadAgain() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        for (long id = 1; id <= 3; id++) {
+            fixture.apply(dimension("c", insert(Map.of("id", id, "name", "name-" + id))));
+        }
+        fixture.apply(fact(insert(Map.of("id", 7L, "cust_id", 1L))));
+
+        fixture.applyBatch(List.of(
+                fact(update(Map.of("id", 7L, "cust_id", 1L), Map.of("id", 7L, "cust_id", 2L))),
+                fact(insert(Map.of("id", 7L, "cust_id", 3L)))));
+
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(2L), 0))
+                .as("left the bucket the earlier change in this batch put it in").isEmpty();
+        assertThat(fixture.stores.indexPage("c", fixture.dimensionKeyOf(3L), 0))
+                .as("and is in the third's, once").hasSize(1);
+    }
+
+    /**
+     * The first load and the changes after it, through the one method that serves both. A source
+     * delivers its snapshot as read events on the stream its later changes arrive on, so there is no
+     * second phase to run - and the rows a snapshot arrives in no useful order still have to converge.
+     *
+     * <p>The order here is the hostile one on purpose: every fact row before any dimension row, which
+     * is what a snapshot over two independent tables routinely produces. Each of those rows publishes
+     * with nulls first and is corrected when its dimension row lands, which is the same mechanism a
+     * late dimension row uses at any other time - not a separate one for loading.
+     */
+    @Test
+    @DisplayName("the first load and the changes after it come out of the same call")
+    void theSnapshotAndTheChangesAfterItShareOnePath() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        for (long id = 0; id < 3; id++) {
+            fixture.apply(fact(read(Map.of("id", id, "cust_id", 1L))));
+        }
+        fixture.apply(dimension("c", read(Map.of("id", 1L, "name", "Ada"))));
+        fixture.clear();
+
+        // A change arriving after the load is applied by the same call, and lands on the rows the load
+        // left behind rather than on a second copy of them.
+        fixture.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(fixture.published()).containsExactlyInAnyOrder(
+                Map.entry(Op.INSERT, Map.of("order_id", 0L, "customer_name", "Grace")),
+                Map.entry(Op.INSERT, Map.of("order_id", 1L, "customer_name", "Grace")),
+                Map.entry(Op.INSERT, Map.of("order_id", 2L, "customer_name", "Grace")));
+    }
+
+    /**
+     * The load itself, in that hostile order: what it settles on. Not "no nulls were ever published" -
+     * they are, and that is the mechanism working - but that the last thing said about each row is the
+     * joined one.
+     */
+    @Test
+    @DisplayName("a snapshot whose fact rows arrive before their dimension rows still converges")
+    void aSnapshotConvergesWhateverOrderItArrivesIn() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+
+        for (long id = 0; id < 3; id++) {
+            fixture.apply(fact(read(Map.of("id", id, "cust_id", 1L))));
+        }
+        fixture.apply(dimension("c", read(Map.of("id", 1L, "name", "Ada"))));
+
+        Map<Object, Object> settled = new LinkedHashMap<>();
+        for (Map.Entry<Op, Map<String, Object>> row : fixture.published()) {
+            settled.put(row.getValue().get("order_id"), row.getValue().get("customer_name"));
+        }
+        assertThat(settled).containsExactly(
+                Map.entry(0L, "Ada"), Map.entry(1L, "Ada"), Map.entry(2L, "Ada"));
+    }
+
+    /**
+     * The one number that makes this structure's worst shapes visible before they hurt. A bucket
+     * approaching what one stored entry may hold, an initial load quadratic in what one dimension key
+     * holds, a fan-out that takes minutes to recompute - none of them shows up in queue depth or in
+     * throughput until it is already happening, and the fan-out under one key is what says it is coming.
+     *
+     * <p>The deepest ever seen, not the last: the last is whichever key was walked most recently.
+     */
+    @Test
+    @DisplayName("the widest bucket walked is reported, and stays the widest")
+    void theWidestBucketIsReported() {
+        List<Integer> reported = new ArrayList<>();
+        MapJoinStores stores = new MapJoinStores(2);
+        JoinDriver driver = new JoinDriver(planOf(JoinKind.LEFT), List.of("id"), STREAM, stores, 4,
+                (source, dimensionKey, pages) -> reported.add(pages));
+        RecordingSink sink = new RecordingSink();
+        driver.apply(List.of(dimension("c", insert(Map.of("id", 1L, "name", "Ada")))), sink);
+        for (long id = 0; id < 5; id++) {
+            driver.apply(List.of(fact(insert(Map.of("id", id, "cust_id", 1L)))), sink);
+        }
+        driver.apply(List.of(dimension("c", insert(Map.of("id", 2L, "name", "Grace")))), sink);
+        driver.apply(List.of(fact(insert(Map.of("id", 99L, "cust_id", 2L)))), sink);
+        reported.clear();
+
+        driver.apply(List.of(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Ada2")))), sink);
+        driver.apply(List.of(dimension("c",
+                update(Map.of("id", 2L, "name", "Grace"), Map.of("id", 2L, "name", "Grace2")))), sink);
+
+        assertThat(reported).as("five keys in pages of two, then one key").containsExactly(3, 1);
+    }
+
+    @Test
+    @DisplayName("a null in a join key matches nothing, on either side")
+    void aNullJoinKeyMatchesNothing() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+
+        Map<String, Object> withNullKey = new LinkedHashMap<>();
+        withNullKey.put("id", 10L);
+        withNullKey.put("cust_id", null);
+        fixture.apply(fact(insert(withNullKey)));
+
+        assertThat(fixture.published()).singleElement().extracting(Map.Entry::getValue)
+                .isEqualTo(rowOf("order_id", 10L, "customer_name", null));
+        assertThat(fixture.stores.indexPageCount("c", fixture.dimensionKeyOf(1L)))
+                .as("and it is in no bucket, because it names none").isZero();
+    }
+
+    /**
+     * Found by comparing a run against a real database rather than by picturing it: an inner join
+     * published its rows, the dimension row was deleted, and every one of those rows stayed in the
+     * target. A recompute asks what each row is now, and for an inner join whose dimension row has gone
+     * the answer is "no row at all" - which arrived as nothing to send rather than as a removal, so the
+     * old row was never taken back. Nothing reports it: the rows are the ones the join really did
+     * publish a moment ago, and they go on looking like the join's own output.
+     */
+    @Test
+    @DisplayName("an inner join takes back what it published once the dimension row is deleted")
+    void anInnerJoinRetractsRowsWhoseDimensionRowIsDeleted() {
+        Fixture fixture = new Fixture(JoinKind.INNER);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.apply(fact(insert(Map.of("id", 11L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.apply(dimension("c", delete(Map.of("id", 1L, "name", "Ada"))));
+
+        assertThat(fixture.published()).containsExactlyInAnyOrder(
+                Map.entry(Op.DELETE, rowOf("order_id", 10L, "customer_name", null)),
+                Map.entry(Op.DELETE, rowOf("order_id", 11L, "customer_name", null)));
+    }
+
+    /**
+     * The filter that decides how often the expensive thing happens at all. A dimension key with a
+     * million fact rows under it means a million rows are rebuilt and written; a real workload edits
+     * customers constantly, and most of those edits touch a column the join never publishes. Without
+     * this every one of them is a full fan-out.
+     *
+     * <p>Asserted on what was queued rather than on what came out: a recompute that was enqueued and
+     * then found nothing to send publishes exactly as little as one that was never enqueued, so
+     * "nothing was published" cannot tell the two apart - and the whole cost being avoided is the walk,
+     * not the send.
+     */
+    @Test
+    @DisplayName("editing a dimension column the output never reads queues no work at all")
+    void anEditOutsideTheOutputIsDiscarded() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada", "address", "Rue A"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.absorbOnly(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada", "address", "Rue A"),
+                Map.of("id", 1L, "name", "Ada", "address", "Rue B"))));
+
+        assertThat(fixture.hasPending())
+                .as("an address the join does not publish cannot change a single byte of the output")
+                .isFalse();
+    }
+
+    /**
+     * The control group for the case above, and it is the only thing separating "the filter works"
+     * from "the filter drops everything". Both leave the same empty output on the case above.
+     */
+    @Test
+    @DisplayName("editing a dimension column the output does read still queues the recompute")
+    void anEditInsideTheOutputIsKept() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada", "address", "Rue A"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.absorbOnly(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada", "address", "Rue A"),
+                Map.of("id", 1L, "name", "Grace", "address", "Rue A"))));
+
+        assertThat(fixture.hasPending()).isTrue();
+        fixture.drainFully();
+        assertThat(fixture.published()).containsExactly(
+                Map.entry(Op.INSERT, Map.of("order_id", 10L, "customer_name", "Grace")));
+    }
+
+    /**
+     * Some connectors emit an event for {@code UPDATE ... SET x = x}, and some emit one when only a
+     * timestamp moved. The columns intersect the output and the values do not differ, so there is
+     * nothing to rebuild.
+     */
+    @Test
+    @DisplayName("a dimension event that repeats the values it already had queues no work")
+    void anEditThatChangesNothingIsDiscarded() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.clear();
+
+        fixture.absorbOnly(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Ada"))));
+
+        assertThat(fixture.hasPending()).isFalse();
+    }
+
+    /**
+     * Loading a dimension table before any facts arrive is the ordinary way a pipeline starts, and
+     * every one of those rows would otherwise queue a walk of a bucket that does not exist.
+     */
+    @Test
+    @DisplayName("a dimension row nothing points at queues no work, however it changed")
+    void anEditToARowWithNoFactsIsDiscarded() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+
+        fixture.absorbOnly(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+
+        assertThat(fixture.hasPending()).isFalse();
+    }
+
+    /**
+     * The case the filter above must not swallow, and the one that makes it dangerous. When the
+     * dimension row's own join key moves, the columns the output reads may be untouched - the name is
+     * the same - yet both buckets are wrong: the rows under the old key have lost their match and the
+     * rows under the new one have gained it. Filtering on the output's columns alone discards this, and
+     * what is left behind is a row still showing a customer it is no longer joined to.
+     */
+    @Test
+    @DisplayName("a dimension row whose own join key moves is recomputed under both keys")
+    void aMovedDimensionKeyRecomputesBothSides() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        fixture.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        fixture.apply(fact(insert(Map.of("id", 11L, "cust_id", 2L))));
+        fixture.clear();
+
+        // The name does not change; only the key does.
+        fixture.apply(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada"), Map.of("id", 2L, "name", "Ada"))));
+
+        assertThat(fixture.published()).containsExactlyInAnyOrder(
+                Map.entry(Op.INSERT, rowOf("order_id", 10L, "customer_name", null)),
+                Map.entry(Op.INSERT, rowOf("order_id", 11L, "customer_name", "Ada")));
+    }
+
+    /**
+     * A dimension key with a large fan-out under it means every one of those rows is rebuilt and
+     * written, which takes as long as it takes. Nothing shortens that; what this stops is it being
+     * <em>invisible</em>. Throughout, the job is running, the error count is zero and the target holds
+     * half the old value and half the new one - a state that reads exactly like a healthy steady one,
+     * so an operator has no way to tell "wait a minute" from "something is wrong".
+     *
+     * <p>Reported while it is going rather than at the end, which is the whole point: a number that
+     * arrives once the recompute is over describes a situation that is no longer happening. The first
+     * report goes out before a single row does.
+     */
+    @Test
+    @DisplayName("a recompute reports its progress while it runs, not only once it has finished")
+    void aRecomputeReportsProgressWhileItRuns() {
+        RecordingGauge gauge = new RecordingGauge();
+        Fixture fixture = new Fixture(JoinKind.LEFT, 2, gauge);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        for (long id = 10; id < 15; id++) {
+            fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        gauge.clear();
+
+        fixture.apply(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(gauge.done())
+                .as("progress is reported before any row goes out, and only ever advances")
+                .isNotEmpty()
+                .isSorted()
+                .startsWith(0L)
+                .endsWith(5L);
+        assertThat(gauge.keys()).containsOnly(fixture.dimensionKeyOf(1L));
+    }
+
+    /**
+     * The estimate the progress is measured against. Counting the fan-out exactly would mean walking
+     * every page before walking them again to rebuild, so it is read off the page count - and for a
+     * bucket that fits in one page that happens to be exact.
+     */
+    @Test
+    @DisplayName("a recompute says how many rows it expects, taken from the index rather than counted")
+    void aRecomputeReportsWhatItExpects() {
+        RecordingGauge gauge = new RecordingGauge();
+        Fixture fixture = new Fixture(JoinKind.LEFT, 100, gauge);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        for (long id = 10; id < 13; id++) {
+            fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        gauge.clear();
+
+        fixture.apply(dimension("c", update(
+                Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(gauge.expected()).containsOnly(3L);
+    }
+
+    /** Records what a join reported about its recomputes, in the order it reported them. */
+    private static final class RecordingGauge implements JoinGauge {
+
+        private final List<long[]> progress = new ArrayList<>();
+        private final List<String> keys = new ArrayList<>();
+
+        @Override
+        public void bucketWalked(String source, String dimensionKey, int pages) {
+        }
+
+        @Override
+        public void recomputing(String source, String dimensionKey, long rowsDone, long rowsExpected) {
+            keys.add(dimensionKey);
+            progress.add(new long[] {rowsDone, rowsExpected});
+        }
+
+        void clear() {
+            progress.clear();
+            keys.clear();
+        }
+
+        List<Long> done() {
+            return progress.stream().map(entry -> entry[0]).toList();
+        }
+
+        List<Long> expected() {
+            return progress.stream().map(entry -> entry[1]).toList();
+        }
+
+        List<String> keys() {
+            return keys;
+        }
+    }
+
+    private static Map<String, Object> rowOf(String first, Object firstValue, String second,
+            Object secondValue) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put(first, firstValue);
+        row.put(second, secondValue);
+        return row;
+    }
+
+    private static SourceChange fact(Envelope event) {
+        return new SourceChange("o", event);
+    }
+
+    private static SourceChange dimension(String source, Envelope event) {
+        return new SourceChange(source, event);
+    }
+
+    private static Envelope read(Map<String, Object> after) {
+        return Envelope.read(1L, "src", after, null);
+    }
+
+    private static Envelope insert(Map<String, Object> after) {
+        return Envelope.insert(1L, "src", after, null);
+    }
+
+    private static Envelope update(Map<String, Object> before, Map<String, Object> after) {
+        return Envelope.update(1L, "src", before, after, null);
+    }
+
+    private static Envelope delete(Map<String, Object> before) {
+        return Envelope.delete(1L, "src", before, null);
+    }
+
+    /** One driver over plain maps, with a sink that can be told to stop taking rows. */
+    private static final class Fixture {
+
+        private final CountingJoinStores stores;
+        private final RecordingSink sink = new RecordingSink();
+        private final JoinDriver driver;
+        private final boolean withNote;
+
+        Fixture(JoinKind kind) {
+            this(kind, ReverseIndex.DEFAULT_PAGE_SIZE);
+        }
+
+        Fixture(JoinKind kind, int pageSize) {
+            this.withNote = true;
+            this.stores = new CountingJoinStores(pageSize);
+            this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores);
+        }
+
+        /** As above, watching what the join reports about its recomputes. */
+        Fixture(JoinKind kind, int pageSize, JoinGauge gauge) {
+            this.withNote = true;
+            this.stores = new CountingJoinStores(pageSize);
+            this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores,
+                    JoinDriver.DEFAULT_KEYS_PER_READ, gauge);
+        }
+
+        void apply(SourceChange change) {
+            if (!driver.apply(List.of(change), sink)) {
+                drainFully();
+            }
+        }
+
+        /** Takes a whole batch in at once, which is how the vertex hands one over. */
+        void applyBatch(List<SourceChange> changes) {
+            if (!driver.apply(changes, sink)) {
+                drainFully();
+            }
+        }
+
+        /**
+         * Offers until there is nothing left, the way the idle hook does - but a bounded number of
+         * times. An unbounded loop here does not fail when the driver stops making progress, it hangs,
+         * and a hang in a suite reads as an infrastructure problem rather than as this case.
+         */
+        void drainFully() {
+            for (int offer = 0; offer < 10_000; offer++) {
+                if (driver.apply(List.of(), sink)) {
+                    return;
+                }
+            }
+            throw new AssertionError("the driver never finished with nothing arriving");
+        }
+
+        /** Takes the change in without sending anything - what a case about queuing has to see. */
+        void absorbOnly(SourceChange change) {
+            driver.absorb(List.of(change));
+        }
+
+        boolean hasPending() {
+            return driver.hasPending();
+        }
+
+        void clear() {
+            sink.taken.clear();
+        }
+
+        List<Map.Entry<Op, Map<String, Object>>> published() {
+            List<Map.Entry<Op, Map<String, Object>>> rows = new ArrayList<>();
+            for (Envelope event : sink.taken) {
+                Map<String, Object> row = event.after() != null ? event.after() : event.before();
+                Map<String, Object> withoutNote = new LinkedHashMap<>(row);
+                if (withNote) {
+                    withoutNote.remove("note");
+                }
+                rows.add(Map.entry(event.op(), withoutNote));
+            }
+            return rows;
+        }
+
+        /** Every value the {@code note} column has been published with, in order. */
+        List<Object> notesPublished() {
+            List<Object> notes = new ArrayList<>();
+            for (Envelope event : sink.taken) {
+                Map<String, Object> row = event.after() != null ? event.after() : event.before();
+                notes.add(row.get("note"));
+            }
+            return notes;
+        }
+
+        String dimensionKeyOf(long id) {
+            return io.tapstate.core.sql.JoinKey.of(List.of(id)).name();
+        }
+
+        String onlyFactKey() {
+            return factKeyOf(10L);
+        }
+
+        String factKeyOf(long id) {
+            return io.tapstate.core.sql.JoinKey.of(List.of(id)).name();
+        }
+    }
+
+    private static JoinPlan planOf(JoinKind kind) {
+        JoinTree from = new JoinTree.Join(
+                new JoinTree.Source("o", "orders"),
+                new JoinTree.Source("c", "customers"),
+                kind,
+                List.of(new JoinTree.KeyPair(new JoinTree.ColumnRef("o", "cust_id"),
+                        new JoinTree.ColumnRef("c", "id"))),
+                false);
+        return new JoinPlan(List.of(
+                new OutputField("order_id", TapstateType.INT64, false,
+                        new Expr.Column(new JoinTree.ColumnRef("o", "id"))),
+                new OutputField("customer_name", TapstateType.STRING, true,
+                        new Expr.Column(new JoinTree.ColumnRef("c", "name"))),
+                new OutputField("note", TapstateType.STRING, true,
+                        new Expr.Column(new JoinTree.ColumnRef("o", "note")))),
+                from,
+                Map.of("o", List.of("cust_id", "id", "note"), "c", List.of("id", "name")));
+    }
+
+    /** A sink that takes what it is told to and refuses the rest. */
+    private static final class RecordingSink implements JoinSink {
+
+        private final List<Envelope> taken = new ArrayList<>();
+        private int room = Integer.MAX_VALUE;
+
+        void takeAtMost(int room) {
+            this.room = room;
+        }
+
+        @Override
+        public boolean offer(Envelope change) {
+            if (room <= 0) {
+                return false;
+            }
+            room--;
+            taken.add(change);
+            return true;
+        }
+    }
+}
