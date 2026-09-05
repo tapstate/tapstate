@@ -65,8 +65,12 @@ jobs:
       - name: every scenario, on every tier
         run: |
           set -o pipefail
+          # -Dtest= reaches every module -am builds, and surefire fails the first upstream one
+          # that holds no such test. The flag below is the one that governs that, and it does not
+          # weaken the lane: a run that measured nothing is caught by the row count in the next
+          # step, which is stricter than surefire could be about it.
           mvn -B -pl runtime/engine -am test -Dtest=JoinPerformanceGateTest \
-              -DfailIfNoTests=false -Djacoco.skip=true \
+              -Dsurefire.failIfNoSpecifiedTests=false -Djacoco.skip=true \
               -Djoinperf.scenarios=F1,F2,I1,I2,I3,I4,R1,R2,R3,R4,R5 \
               -Djoinperf.tiers=hot,mixed,cold 2>&1 | tee run.log
 
