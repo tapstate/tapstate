@@ -20,6 +20,8 @@ a-child-row-is-deleted-and-the-assembled-document-shrinks on IN_PROCESS
 a-child-row-is-deleted-and-the-assembled-document-shrinks on REAL_PROCESS
 a-declared-view-materializes-with-no-serve-block on IN_PROCESS
 a-declared-view-materializes-with-no-serve-block on REAL_PROCESS
+a-deleted-customer-takes-its-orders-out-of-the-target on IN_PROCESS
+a-deleted-customer-takes-its-orders-out-of-the-target on REAL_PROCESS
 a-dimension-change-reaches-the-orders-already-written on IN_PROCESS
 a-dimension-change-reaches-the-orders-already-written on REAL_PROCESS
 a-parent-column-change-reaches-the-assembled-document on IN_PROCESS
@@ -30,6 +32,8 @@ a-real-change-stream-carries-rows-written-after-start on IN_PROCESS
 a-real-change-stream-carries-rows-written-after-start on REAL_PROCESS
 a-row-keeps-its-sequence-across-the-crossing on IN_PROCESS
 a-row-keeps-its-sequence-across-the-crossing on REAL_PROCESS
+a-select-that-renames-and-computes-lands-exactly-that on IN_PROCESS
+a-select-that-renames-and-computes-lands-exactly-that on REAL_PROCESS
 a-sink-write-failure-is-observable on IN_PROCESS
 a-sink-write-failure-is-observable on REAL_PROCESS
 a-sync-start-before-source-discovery-is-refused on IN_PROCESS

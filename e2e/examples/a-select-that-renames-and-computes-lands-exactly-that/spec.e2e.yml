@@ -1,0 +1,60 @@
+# The SELECT renames columns and computes one, and the target has to carry exactly what it asked for.
+#
+# A join is not only a lookup: the row it publishes is the row the SELECT describes. Two things go
+# wrong here quietly. A projection that passes source columns through leaves the target carrying `id`
+# and `qty` rather than `order_id` and `amount`, which a reading of the joined name alone never
+# notices. And an expression evaluated at the wrong moment - or not at all - leaves `amount` absent or
+# stale while every other field is right.
+#
+# What the assertions have to discriminate:
+#
+# - Every reading names the renamed field, never the source column. An implementation that published
+#   the source names would fail to be found at all, which is the point: the names are part of the
+#   contract the SELECT wrote.
+# - The computed value differs per row and is not a multiple of any single input, so a projection that
+#   carried qty through, or price, or a constant, disagrees on at least one row. The three products
+#   are also distinct from each other and from every qty and price in the seed, so no accidental
+#   agreement is available.
+# - One row is changed after the run has started, in the column the expression multiplies. That
+#   separates an expression evaluated on the way through from one evaluated once at load: the second
+#   is correct for the seeded rows and wrong from the first update onward.
+# - The joined name is read beside the computed value every time, so a row whose expression is right
+#   and whose join was lost still fails.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: a-select-that-renames-and-computes-lands-exactly-that
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, order_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: order_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: bo }
+  shop_db.orders:
+    # The products are 6, 35 and 28: distinct from each other, and from every qty and price here,
+    # so a projection carrying either factor through cannot agree by accident.
+    values:
+      - { id: 10, customer_id: 1, qty: 2, price: 3 }
+      - { id: 11, customer_id: 2, qty: 5, price: 7 }
+      - { id: 12, customer_id: 1, qty: 4, price: 7 }
+steps:
+  - start
+  - await: { count: { views.order_state: 3 } }
+  # Named by the SELECT's names, not the source's. A pass-through projection is not found here at all.
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { customer_name: ada, amount: 6 } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { customer_name: bo, amount: 35 } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { customer_name: ada, amount: 28 } } } }
+  # A factor changes after the run started. An expression evaluated once at load is right for
+  # everything above and wrong from here on.
+  - cdc: { shop_db.orders: { update: { where: { id: 10 }, set: { qty: 10 } } } }
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { customer_name: ada, amount: 30 } } } }
+  # The others did not move, and the row count did not grow.
+  - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { customer_name: ada, amount: 28 } } } }
+  - assert: { count: { views.order_state: 3 } }
