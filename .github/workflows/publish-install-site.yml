@@ -126,23 +126,27 @@ jobs:
           # deployed to the domain the README tells people to pipe into sh.
           pinned="$(.github/scripts/site-from-tag.sh "$tag" "$site")"
           echo "publishing the entry points pinned to $pinned"
-          if git show "$tag:deploy/install-site/vercel.json" > "$site/vercel.json" 2>/dev/null; then
-            echo "routing: from $tag"
+          # The receiver and the routing that reaches it are ONE unit, taken from one source. Deciding
+          # their provenance separately is how this published a working function nobody could reach:
+          # the receiver fell back to this checkout because the tag lacked it, while the routing came
+          # from the tag -- whose vercel.json exists and simply has no /e rewrite. The fallback tests
+          # whether the file is there, not whether it mentions the route, so it never fired. Deploy
+          # succeeded, both static entry points matched byte for byte, and /e answered 404 with the
+          # function live at its default path behind it. A tag old enough to lack the receiver is old
+          # enough to lack the route that reaches it.
+          mkdir -p "$site/api"
+          if git show "$tag:deploy/install-site/api/event.js" > "$site/api/event.js" 2>/dev/null \
+             && git show "$tag:deploy/install-site/vercel.json" > "$site/vercel.json" 2>/dev/null; then
+            echo "receiver + routing: from $tag"
           else
-            echo "routing: $tag predates the checked-in routing; using this checkout's vercel.json"
+            echo "receiver + routing: $tag predates the checked-in receiver; using this checkout's copies"
+            cp deploy/install-site/api/event.js "$site/api/event.js"
             cp deploy/install-site/vercel.json "$site/vercel.json"
           fi
-          # The event receiver travels with the routing, from the tag when the tag has it. Without this
-          # the site deploys with a /e rewrite and nothing behind it: the route 404s, the installer's
-          # report fails silently by design, and no signal anywhere says the endpoint was never
-          # published. A missing function and a quiet week look identical downstream.
-          mkdir -p "$site/api"
-          if git show "$tag:deploy/install-site/api/event.js" > "$site/api/event.js" 2>/dev/null; then
-            echo "receiver: from $tag"
-          else
-            echo "receiver: $tag predates the checked-in receiver; using this checkout's copy"
-            cp deploy/install-site/api/event.js "$site/api/event.js"
-          fi
+          # And then it is checked rather than trusted. The rule above is one line of shell away from
+          # being wrong again; this refuses the result -- before anything reaches the edge -- whenever
+          # a function has no route or a route has no function.
+          deploy/install-site/check-site.sh "$site"
           ls -lR "$site"
           echo "dir=$site" >> "$GITHUB_OUTPUT"
 
