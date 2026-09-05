@@ -137,9 +137,9 @@ final class InlineRenderer implements AutoCloseable {
 }
 
 /**
- * Phase-one inline session: JLine owns the terminal and input stream, while TamboUI paints only the
- * current input region. A submitted line is committed before dispatch and command output is committed
- * after dispatch, leaving both in ordinary terminal scrollback.
+ * Inline session: JLine owns the terminal and input stream, while TamboUI paints only the current
+ * temporary region. Submitted lines and completed command output are committed to ordinary terminal
+ * scrollback; running state stays temporary.
  */
 final class InlineTui {
 
@@ -150,6 +150,9 @@ final class InlineTui {
     private static final int CTRL_D = 4;
     private static final int BACKSPACE = 8;
     private static final int DELETE = 127;
+    private static final String[] RUNNING_FRAMES = {
+            "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
+    };
 
     private static final dev.tamboui.style.Color INPUT_BACKGROUND =
             dev.tamboui.style.Color.rgb(35, 38, 43);
@@ -166,6 +169,7 @@ final class InlineTui {
     private final java.io.StringWriter capturedOut;
     private final java.io.StringWriter capturedErr;
     private final StringBuilder input = new StringBuilder();
+    private final java.util.ArrayDeque<Integer> deferredInput = new java.util.ArrayDeque<>();
     private volatile boolean interrupted;
     private volatile boolean resizeRequested;
     private org.jline.terminal.Terminal terminal;
@@ -173,6 +177,10 @@ final class InlineTui {
     private org.jline.utils.NonBlockingReader reader;
     private InlineRenderer renderer;
     private JLinePrompter prompter;
+    private java.util.concurrent.ExecutorService operationExecutor;
+    private java.util.concurrent.Future<Boolean> activeOperation;
+    private int runningFrame;
+    private boolean cancelRequested;
 
     InlineTui(Repl repl, java.io.StringWriter capturedOut, java.io.StringWriter capturedErr) {
         this.repl = java.util.Objects.requireNonNull(repl, "repl");
@@ -183,6 +191,24 @@ final class InlineTui {
     /** Returns whether this process has a terminal suitable for an inline session. */
     static boolean hasInteractiveTerminal() {
         return System.console() != null;
+    }
+
+    /**
+     * Returns whether dispatch can run without asking the user for terminal input or changing the
+     * session's terminal-owned state. This conservative boundary keeps JLine's prompt reader and the
+     * inline reader from ever competing for the same raw input stream.
+     */
+    static boolean canRunInBackground(String line) {
+        String trimmed = line == null ? "" : line.trim();
+        if (trimmed.isEmpty()) {
+            return false;
+        }
+        String verb = trimmed.split("\\s+", 2)[0];
+        return switch (verb) {
+            case "auth", "cd", "connect", "context", "disconnect", "exit", "login", "logout",
+                    "new", "pwd", "quit", ":ctx" -> false;
+            default -> true;
+        };
     }
 
     int run() {
@@ -196,6 +222,11 @@ final class InlineTui {
             prompter = new JLinePrompter(terminal, false);
             repl.installPrompterIfMissing(prompter);
             renderer = InlineRenderer.open(backend, INPUT_REGION_HEIGHT);
+            operationExecutor = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                Thread worker = new Thread(task, "tapstate-inline-operation");
+                worker.setDaemon(true);
+                return worker;
+            });
 
             commitCaptured();
             renderer.commit("Tapstate");
@@ -210,19 +241,42 @@ final class InlineTui {
             while (!stoppedByUser) {
                 if (resizeRequested) {
                     resizeRequested = false;
-                    renderInput();
+                    renderActiveRegion();
                 }
-                int code = reader.read(READ_TIMEOUT_MILLIS);
+                int code = nextInputCode(READ_TIMEOUT_MILLIS);
                 if (code == org.jline.utils.NonBlockingReader.READ_EXPIRED) {
                     if (interrupted) {
                         interrupted = false;
-                        input.setLength(0);
-                        renderInput();
+                        if (activeOperation != null) {
+                            cancelRequested = true;
+                            renderRunning();
+                        } else {
+                            input.setLength(0);
+                            renderInput();
+                        }
+                    }
+                    if (activeOperation != null && activeOperation.isDone()) {
+                        stoppedByUser = finishOperation();
                     }
                     continue;
                 }
                 if (code == org.jline.utils.NonBlockingReader.EOF) {
-                    stoppedByUser = true;
+                    if (activeOperation == null) {
+                        stoppedByUser = true;
+                    }
+                    continue;
+                }
+                if (activeOperation != null) {
+                    if (code == CTRL_C && !cancelRequested) {
+                        cancelRequested = true;
+                        repl.cancelStream();
+                        renderRunning();
+                    } else {
+                        deferredInput.addLast(code);
+                    }
+                    if (activeOperation.isDone()) {
+                        stoppedByUser = finishOperation();
+                    }
                     continue;
                 }
                 if (code == CTRL_C) {
@@ -278,6 +332,9 @@ final class InlineTui {
             if (prompter != null) {
                 prompter.close();
             }
+            if (operationExecutor != null) {
+                operationExecutor.shutdownNow();
+            }
         }
     }
 
@@ -289,14 +346,49 @@ final class InlineTui {
             return false;
         }
         renderer.commit("$ " + line);
-        renderer.clear();
-        boolean keepRunning = repl.dispatch(line);
-        commitCaptured();
-        if (!keepRunning) {
-            return true;
+        if (canRunInBackground(line)) {
+            runningFrame = 0;
+            cancelRequested = false;
+            activeOperation = operationExecutor.submit(() -> repl.dispatch(line));
+            renderRunning();
+            return false;
         }
-        renderInput();
-        return false;
+        renderRunning();
+        boolean keepRunning = repl.dispatch(line);
+        renderer.clear();
+        commitCaptured();
+        if (keepRunning) {
+            renderInput();
+        }
+        return !keepRunning;
+    }
+
+    private boolean finishOperation() {
+        java.util.concurrent.Future<Boolean> completed = activeOperation;
+        activeOperation = null;
+        boolean keepRunning;
+        try {
+            keepRunning = completed.get();
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("inline command was interrupted", failure);
+        } catch (java.util.concurrent.ExecutionException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof RuntimeException runtimeFailure) {
+                throw runtimeFailure;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("inline command failed", cause);
+        }
+        cancelRequested = false;
+        renderer.clear();
+        commitCaptured();
+        if (keepRunning) {
+            renderInput();
+        }
+        return !keepRunning;
     }
 
     private void commitCaptured() {
@@ -324,9 +416,9 @@ final class InlineTui {
                     .background(INPUT_BACKGROUND)
                     .build();
             frame.renderWidget(block, inputArea);
-                dev.tamboui.layout.Rect content = block.inner(inputArea);
-                if (!content.isEmpty()) {
-                    dev.tamboui.text.Text text = dev.tamboui.text.Text.from(input.toString())
+            dev.tamboui.layout.Rect content = block.inner(inputArea);
+            if (!content.isEmpty()) {
+                dev.tamboui.text.Text text = dev.tamboui.text.Text.from(input.toString())
                         .fg(INPUT_FOREGROUND)
                         .bg(INPUT_BACKGROUND)
                         .append(dev.tamboui.text.Text.from("▌")
@@ -350,6 +442,53 @@ final class InlineTui {
         }, INPUT_REGION_HEIGHT);
     }
 
+    private void renderRunning() {
+        String frame = RUNNING_FRAMES[runningFrame++ % RUNNING_FRAMES.length];
+        String status = cancelRequested ? frame + " Cancelling…" : frame + " Running…";
+        renderer.update(view -> {
+            dev.tamboui.layout.Rect area = view.area();
+            int inputHeight = Math.min(3, area.height());
+            dev.tamboui.layout.Rect inputArea = new dev.tamboui.layout.Rect(
+                    area.x(), area.y(), area.width(), inputHeight);
+            dev.tamboui.widgets.block.Block block = dev.tamboui.widgets.block.Block.builder()
+                    .borderType(dev.tamboui.widgets.block.BorderType.ROUNDED)
+                    .borders(dev.tamboui.widgets.block.Borders.ALL)
+                    .borderColor(INPUT_BORDER)
+                    .background(INPUT_BACKGROUND)
+                    .build();
+            view.renderWidget(block, inputArea);
+            dev.tamboui.layout.Rect content = block.inner(inputArea);
+            if (!content.isEmpty()) {
+                view.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
+                        .text(dev.tamboui.text.Text.from(status)
+                                .fg(INPUT_FOREGROUND)
+                                .bg(INPUT_BACKGROUND))
+                        .overflow(dev.tamboui.style.Overflow.CLIP)
+                        .background(INPUT_BACKGROUND)
+                        .build(), content);
+            }
+            if (area.height() > inputHeight) {
+                dev.tamboui.layout.Rect hintArea = new dev.tamboui.layout.Rect(
+                        area.x(), area.y() + inputHeight, area.width(), 1);
+                view.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
+                        .text(dev.tamboui.text.Text.from(cancelRequested
+                                        ? "Ctrl-C cancelling  ·  Please wait"
+                                        : "Ctrl-C cancel  ·  Please wait")
+                                .fg(HINT_FOREGROUND))
+                        .overflow(dev.tamboui.style.Overflow.CLIP)
+                        .build(), hintArea);
+            }
+        }, INPUT_REGION_HEIGHT);
+    }
+
+    private void renderActiveRegion() {
+        if (activeOperation == null) {
+            renderInput();
+        } else {
+            renderRunning();
+        }
+    }
+
     private void removeLastCodePoint() {
         if (input.isEmpty()) {
             return;
@@ -359,18 +498,16 @@ final class InlineTui {
 
     /** Consume arrows and other escape sequences without allowing them to reach command dispatch. */
     private void consumeEscapeSequence() throws IOException {
-        int next = reader.read(ESCAPE_TIMEOUT_MILLIS);
+        int next = nextInputCode(ESCAPE_TIMEOUT_MILLIS);
         if (next == org.jline.utils.NonBlockingReader.READ_EXPIRED ||
                 next == org.jline.utils.NonBlockingReader.EOF) {
-            input.setLength(0);
-            renderInput();
             return;
         }
         if (next != '[' && next != 'O') {
             return;
         }
         while (true) {
-            int tail = reader.read(ESCAPE_TIMEOUT_MILLIS);
+            int tail = nextInputCode(ESCAPE_TIMEOUT_MILLIS);
             if (tail == org.jline.utils.NonBlockingReader.READ_EXPIRED ||
                     tail == org.jline.utils.NonBlockingReader.EOF) {
                 return;
@@ -379,6 +516,13 @@ final class InlineTui {
                 return;
             }
         }
+    }
+
+    private int nextInputCode(int timeoutMillis) throws IOException {
+        if (!deferredInput.isEmpty()) {
+            return deferredInput.removeFirst();
+        }
+        return reader.read(timeoutMillis);
     }
 }
 

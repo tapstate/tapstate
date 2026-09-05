@@ -52,7 +52,7 @@ pty_session() {
   local input="$1"; shift
   set +e
   PTY_OUT=$(TAPSTATE_BIN="$BINARY" TAPSTATE_PTY_INPUT="$input" python3 - "$@" <<'PY'
-import os, pty, sys, select, time, signal
+import os, pty, sys, select, time, signal, fcntl, termios, struct
 
 binary = os.environ["TAPSTATE_BIN"]
 data = os.environ["TAPSTATE_PTY_INPUT"].encode()
@@ -67,6 +67,9 @@ if pid == 0:                              # child: the binary on a controlling t
     except Exception:
         os._exit(127)
 else:
+    # pty.fork() starts with a zero-sized slave on macOS. A real terminal always supplies dimensions;
+    # set representative ones here so inline widgets are not clipped to an empty width in smoke.
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("hhhh", 24, 120, 0, 0))
     out = bytearray()
     input_sent = False
     write_failed = None
@@ -286,7 +289,7 @@ else
 fi
 
 # --- 5. REPL under a real pty (JLine interactive loop) ------------------------------------------
-bold "[5] REPL — interactive loop under a pty (JLine)"
+bold "[5] REPL — inline running state + interactive loop under a pty (JLine)"
 # printf -v (not $(...)) so the trailing newline that submits `exit` survives — command substitution
 # would strip it, leaving the REPL waiting for Enter until the deadline.
 printf -v repl_in 'help\nvalidate %s\nexit\n' "$VALID_DIR"
@@ -295,10 +298,11 @@ pty_session "$repl_in"
 # `invalid:` (a rejected validate must not pass as a success), and require a clean child exit.
 REPL_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && printf '%s' "$REPL_CLEAN" | grep -q "Workspace: tap-work" \
-   && printf '%s' "$REPL_CLEAN" | grep -qE '(^|[^[:alpha:]])valid:' \
-   && printf '%s' "$REPL_CLEAN" | grep -q "bye"; then
-  ok "inline workspace + successful validate + clean exit (rc 0) observed over a pty"
+   && [[ "$REPL_CLEAN" == *"Workspace: tap-work"* ]] \
+   && [[ "$REPL_CLEAN" == *"Running"* ]] \
+   && [[ "$REPL_CLEAN" =~ (^|[^[:alpha:]])valid: ]] \
+   && [[ "$REPL_CLEAN" == *"bye"* ]]; then
+  ok "inline running state + successful validate + clean exit (rc 0) observed over a pty"
 else
   bad "REPL pty session failed (rc=$PTY_RC) or missing expected markers; output:"; echo "$PTY_OUT"
 fi
@@ -432,10 +436,10 @@ pty_session "$online_in"
 ONLINE_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && [[ -n "$STUB_PORT" ]] \
-   && printf '%s' "$ONLINE_CLEAN" | grep -q "connected to 127.0.0.1:$STUB_PORT" \
-   && printf '%s' "$ONLINE_CLEAN" | grep -q "logged in as admin" \
-   && printf '%s' "$ONLINE_CLEAN" | grep -qE 'registered[[:space:]]+smoke' \
-   && ! printf '%s' "$ONLINE_CLEAN" | grep -qE '\.java:[0-9]+\)'; then
+   && [[ "$ONLINE_CLEAN" == *"connected to 127.0.0.1:$STUB_PORT"* ]] \
+   && [[ "$ONLINE_CLEAN" == *"logged in as admin"* ]] \
+   && [[ "$ONLINE_CLEAN" =~ registered[[:space:]]+smoke ]] \
+   && ! [[ "$ONLINE_CLEAN" =~ \.java:[0-9]+\) ]]; then
   ok "connect + login + register ran end to end through the native binary (no AOT fault)"
 else
   bad "online register pty session failed (rc=$PTY_RC, port=${STUB_PORT:-none}); output:"; echo "$PTY_OUT"

@@ -36,6 +36,21 @@ class InlineRendererTest {
     }
 
     @Test
+    void runningUpdatesStayTemporaryUntilTheFinalResultIsCommitted() {
+        RecordingSurface surface = new RecordingSurface();
+        InlineRenderer renderer = new InlineRenderer(surface, 8);
+
+        renderer.render(frame -> { }, 4);
+        renderer.update(frame -> { }, 4);
+        renderer.update(frame -> { }, 4);
+        renderer.clear();
+        renderer.commit("valid: 1");
+
+        assertThat(surface.heights).containsExactly(4, 4, 4, 0);
+        assertThat(surface.commitLines).containsExactly("valid: 1");
+    }
+
+    @Test
     void commitPreservesMultipleScrollbackLinesAndDoesNotRenderThemAsActiveState() {
         RecordingSurface surface = new RecordingSurface();
         InlineRenderer renderer = new InlineRenderer(surface, 8);
@@ -76,6 +91,18 @@ class InlineRendererTest {
         renderer.close();
 
         assertThat(surface.releaseCount).isEqualTo(1);
+    }
+
+    @Test
+    void onlyCommandsWithoutTerminalPromptsRunInTheBackground() {
+        assertThat(InlineTui.canRunInBackground("ls")).isTrue();
+        assertThat(InlineTui.canRunInBackground("validate ./work")).isTrue();
+        assertThat(InlineTui.canRunInBackground("connect localhost:8081")).isFalse();
+        assertThat(InlineTui.canRunInBackground("login admin")).isFalse();
+        assertThat(InlineTui.canRunInBackground(":ctx")).isFalse();
+        assertThat(InlineTui.canRunInBackground("context list")).isFalse();
+        assertThat(InlineTui.canRunInBackground("auth login admin")).isFalse();
+        assertThat(InlineTui.canRunInBackground("exit")).isFalse();
     }
 
     private static final class RecordingSurface implements InlineRenderer.Surface {
