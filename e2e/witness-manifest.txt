@@ -42,6 +42,8 @@ holding-one-stream-does-not-stop-the-other on IN_PROCESS
 holding-one-stream-does-not-stop-the-other on REAL_PROCESS
 negative-lookahead-source-regex-roundtrip on IN_PROCESS
 negative-lookahead-source-regex-roundtrip on REAL_PROCESS
+one-select-covers-the-snapshot-and-the-changes-after-it on IN_PROCESS
+one-select-covers-the-snapshot-and-the-changes-after-it on REAL_PROCESS
 real-mysql-rows-cross-to-a-real-mongo-target on IN_PROCESS
 real-mysql-rows-cross-to-a-real-mongo-target on REAL_PROCESS
 rows-cross-from-a-source-file-to-a-target-file on IN_PROCESS
