@@ -56,14 +56,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** What each running pipeline's tables loaded, keyed by pipeline then table; dropped when it stops. */
     private final Map<String, Map<String, TableSnapshot>> snapshotsByPipeline = new ConcurrentHashMap<>();
 
-    /**
-     * Which tables each running pipeline's sources were asked to read, beside what they finished reading.
-     * Kept because the two answer different questions: the map above says what a load produced, and this
-     * says what it was for -- and only the pair can tell a load that finished from one that stopped part
-     * way through, which is what a resume has to know.
-     */
-    private final Map<String, Set<String>> tablesByPipeline = new ConcurrentHashMap<>();
-
     StoreBackedPipelineCaptureCoordinator(
             StorePort storePort, CaptureStarter captureStarter, SrsCoordinator srsCoordinator,
             SnapshotBuffer snapshotBuffer) {
@@ -83,7 +75,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
         List<CaptureRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
-        List<String> asked = new ArrayList<>();
         try {
             for (SourceRef ref : pipeline.sources()) {
                 String sourceId = ref.id();
@@ -91,7 +82,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
                 CaptureRunSpec spec = deriveSpec(
                         pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref));
-                asked.addAll(spec.config().streams());
                 Map<String, Long> observedSnapshotCounts = new LinkedHashMap<>();
                 CaptureRun run = captureStarter.start(spec, snapshotPassthrough(resolution, observedSnapshotCounts));
                 runs.add(run);
@@ -109,7 +99,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
         runsByPipeline.put(pipelineId, runs);
         snapshotsByPipeline.put(pipelineId, keyByTableOrQualifyOnCollision(attributed));
-        tablesByPipeline.put(pipelineId, Set.copyOf(asked));
     }
 
     /** One source's attributed snapshot load: which source, which table, and what it loaded. */
@@ -166,30 +155,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         return snapshotsByPipeline.getOrDefault(pipelineId, Map.of());
     }
 
-    /**
-     * A load is complete when every table the pipeline's sources were asked to read has finished loading.
-     *
-     * <p>Absent counts as incomplete, and deliberately so. A table appears in the progress map only once its
-     * bounded read has returned, and a pipeline whose capture is still opening has no entry at all -- both
-     * are "not done", and both are states a resume must not carry on from. A pipeline this coordinator is
-     * running nothing for answers true through the interface default, because it has no load to leave
-     * unfinished.
-     */
-    @Override
-    public boolean loadComplete(String pipelineId) {
-        Set<String> asked = tablesByPipeline.get(pipelineId);
-        if (asked == null || asked.isEmpty()) {
-            return true;
-        }
-        return snapshotProgress(pipelineId).keySet().containsAll(asked);
-    }
-
     @Override
     public void stopCapture(String pipelineId, boolean purgeState) {
         // The load belongs to the run being torn down: a stopped pipeline reports no snapshot rather than the
         // rows its previous run happened to load.
         snapshotsByPipeline.remove(pipelineId);
-        tablesByPipeline.remove(pipelineId);
         List<CaptureRun> runs = runsByPipeline.remove(pipelineId);
         if (runs == null) {
             return;

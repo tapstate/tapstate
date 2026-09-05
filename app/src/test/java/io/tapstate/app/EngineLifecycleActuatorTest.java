@@ -95,43 +95,6 @@ class EngineLifecycleActuatorTest {
                 "stopCapture:" + PIPE + "[purge][jobTerminal]");
     }
 
-    /**
-     * A resume that follows a load which never finished rebuilds instead of carrying on.
-     *
-     * <p>The pair of verbs is engine-only wherever there is nothing unfinished, which the case above pins.
-     * This is the one situation where that is not enough: the capture keeps running across a pause, but a
-     * bounded load interrupted part way through does not come back, and nothing recorded says how far it
-     * got -- every row of a snapshot carries one reserved position, so a table is durable only once it is
-     * whole. Left to resume in place the pipeline sits in RUNNING reading nothing at all.
-     *
-     * <p>What it asserts is the verb composition, not the engine's job status: a stop that keeps, then a
-     * start, which is the same path a stop and a start already take and the same one the record's own
-     * accounting expects -- the tables it still owes are read again.
-     */
-    @Test
-    @DisplayName("a resume after a load that never finished rebuilds rather than carrying on in place")
-    void aResumeAfterAnUnfinishedLoadRebuilds() {
-        List<String> events = new CopyOnWriteArrayList<>();
-        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
-        RecordingDagSource dagSource = new RecordingDagSource(events);
-        LifecycleActuator actuator =
-                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
-
-        actuator.start(PIPE);
-        Job job = member.getJet().getJob(PIPE);
-        awaitStatus(job, JobStatus.RUNNING);
-        actuator.pause(PIPE);
-        awaitStatus(job, JobStatus.SUSPENDED);
-
-        coordinator.loadComplete = false;
-        actuator.resume(PIPE);
-
-        assertThat(events).containsExactly(
-                "startCapture:" + PIPE, "submit:" + PIPE,
-                "stopCapture:" + PIPE + "[keep][jobLive]",
-                "startCapture:" + PIPE, "submit:" + PIPE);
-    }
-
     @Test
     void surfacesACaptureFailureThroughTheSeamWhenTheEngineJobReportsNone() {
         RuntimeException boom = new RuntimeException("cdc tail died");
@@ -223,7 +186,6 @@ class EngineLifecycleActuatorTest {
         private final List<String> events;
         private Supplier<Boolean> jobTerminalProbe = () -> false;
         private Throwable captureFailure;
-        private boolean loadComplete = true;
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
@@ -243,11 +205,6 @@ class EngineLifecycleActuatorTest {
         @Override
         public Optional<Throwable> captureFailure(String pipelineId) {
             return Optional.ofNullable(captureFailure);
-        }
-
-        @Override
-        public boolean loadComplete(String pipelineId) {
-            return loadComplete;
         }
     }
 
