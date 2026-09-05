@@ -430,6 +430,11 @@ class ARunningNestReportsWhatItsStateCostsTest {
         }
 
         @Override
+        public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            return Optional.ofNullable(COLD.putIfAbsent(namespace + "\0" + key, state));
+        }
+
+        @Override
         public void delete(String namespace, String key) {
             COLD.remove(namespace + "\0" + key);
         }

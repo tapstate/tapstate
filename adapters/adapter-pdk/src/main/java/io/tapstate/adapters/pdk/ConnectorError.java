@@ -195,7 +195,21 @@ public enum ConnectorError implements TapstateErrorCode {
      * connector id; {@code timeout} is how long it was given. The instance it ran on is closed rather
      * than reused, because the abandoned read is still inside it.
      */
-    READ_TIMEOUT("connector.read-timeout", Set.of("connector", "timeout"));
+    READ_TIMEOUT("connector.read-timeout", Set.of("connector", "timeout")),
+
+    /**
+     * A connector asked to keep a value whose type this build has no encoding for. Refused where it is
+     * written rather than coerced: a value stringified on the way in reads back as text and passes for
+     * what was stored, and the connector that wrote a number finds one only when it casts.
+     */
+    STATE_VALUE_UNSUPPORTED("connector.state-value-unsupported", Set.of("type")),
+
+    /**
+     * A stored connector note cannot be read back - a format or a tag from a later build, or bytes that
+     * end early. Reported rather than treated as absent, because absent is what a connector reads as
+     * "this is my first run", and acting on that quietly discards whatever it had recorded.
+     */
+    STATE_UNREADABLE("connector.state-unreadable", Set.of("detail"));
 
     private final String code;
     private final Set<String> placeholders;

@@ -915,6 +915,18 @@ class NestOperatorCostTest {
             COLD.put(namespace + "\0" + key, state);
         }
 
+        /** One trip like a save, but the bytes only count when they are the ones that landed. */
+        @Override
+        public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            Trips trips = trips(namespace);
+            trips.saves.incrementAndGet();
+            byte[] existing = COLD.putIfAbsent(namespace + "\0" + key, state);
+            if (existing == null) {
+                trips.bytes.addAndGet(state.length);
+            }
+            return Optional.ofNullable(existing);
+        }
+
         @Override
         public void delete(String namespace, String key) {
             trips(namespace).deletes.incrementAndGet();

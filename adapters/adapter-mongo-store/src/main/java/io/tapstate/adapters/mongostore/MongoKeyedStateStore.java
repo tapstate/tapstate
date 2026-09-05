@@ -1,7 +1,12 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ErrorCategory;
+import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.ReturnDocument;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.KeyedStateStore;
 import org.bson.Document;
 import org.bson.types.Binary;
@@ -102,6 +107,44 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
         Document document = new Document("_id", id(namespace, key)).append(STATE, new Binary(state));
         StoreIo.run(() -> collection.replaceOne(byId(namespace, key), document,
                 new ReplaceOptions().upsert(true)));
+    }
+
+    /**
+     * One round trip that both tests and writes: an upsert whose only change is applied on insert, asking
+     * for the document as it was beforehand. Absent means this call inserted it; present means it was
+     * already there and nothing was overwritten.
+     *
+     * <p>Two writers racing on a key that does not exist yet is the case this exists for, and the unique
+     * id index is what settles it: one insert wins and the other is rejected, which the driver reports as
+     * a duplicate key. That loser has not written anything, so what it owes its caller is the winner's
+     * value -- read back rather than assumed, because assuming would hand back the candidate this method
+     * exists to avoid handing back.
+     */
+    @Override
+    public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+        Objects.requireNonNull(state, "state");
+        Document onInsert = new Document("$setOnInsert", new Document(STATE, new Binary(state)));
+        FindOneAndUpdateOptions asItWas = new FindOneAndUpdateOptions()
+                .upsert(true)
+                .returnDocument(ReturnDocument.BEFORE);
+        Document before;
+        try {
+            before = StoreIo.call(
+                    () -> collection.findOneAndUpdate(byId(namespace, key), onInsert, asItWas));
+        } catch (TapstateException e) {
+            if (!(e.getCause() instanceof MongoWriteException write)
+                    || write.getError().getCategory() != ErrorCategory.DUPLICATE_KEY) {
+                throw e;
+            }
+            // Lost the race: somebody else inserted between the check and the write. Their value is the
+            // one that stands, and it is now readable.
+            return load(namespace, key);
+        }
+        if (before == null) {
+            return Optional.empty();
+        }
+        Binary existing = before.get(STATE, Binary.class);
+        return existing == null ? Optional.empty() : Optional.of(existing.getData());
     }
 
     @Override

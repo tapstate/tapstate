@@ -57,8 +57,9 @@ class DataPlaneActuationConfiguration {
     }
 
     @Bean
-    CapturePort capturePort(ConnectorProvisioner connectorProvisioner) {
-        return new PdkCapturePort(connectorProvisioner);
+    CapturePort capturePort(ConnectorProvisioner connectorProvisioner,
+            @Nullable KeyedStateStore keyedStateStore) {
+        return new PdkCapturePort(connectorProvisioner, keyedStateStore);
     }
 
     @Bean

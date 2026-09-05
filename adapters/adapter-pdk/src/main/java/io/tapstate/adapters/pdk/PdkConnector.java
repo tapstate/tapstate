@@ -8,6 +8,7 @@ import io.tapdata.entity.mapping.DefaultExpressionMatchingMap;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.utils.DataMap;
 import io.tapdata.pdk.apis.TapConnector;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.ConnectorCapabilities;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
@@ -83,6 +84,17 @@ final class PdkConnector implements AutoCloseable {
      */
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              String stateNamespace) {
+        return open(connectorId, ref, settings, stateNamespace, null);
+    }
+
+    /**
+     * As above, with the store the connector's own notes are kept in. When a namespace and a store are
+     * both present the notes outlive this handle and the next open of the same node reads them back;
+     * with either missing they live and die with the handle, which is what the read-only drives get and
+     * what every caller got before there was anywhere to put them.
+     */
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+                             String stateNamespace, KeyedStateStore stateStore) {
         ensureDeploymentIdentity();
         gateApiLevel(connectorId, ref);
 
@@ -120,7 +132,12 @@ final class PdkConnector implements AutoCloseable {
             // touch NPEs. The map handed over here is the same reference for as long as this handle
             // lives: a connector may compare the map it was bound to against the one it is later handed
             // and refuse to run when they differ, and that expectation is nowhere in the signatures.
-            context.setStateMap(new InMemoryStateMap());
+            context.setStateMap(stateNamespace == null || stateStore == null
+                    ? new InMemoryStateMap()
+                    : new DurableStateMap(stateStore, stateNamespace));
+            // The map the contract calls global is still per-handle here: making it genuinely shared is a
+            // different scope question with its own answer, and giving it this connector's namespace
+            // would be the wrong one written down as if it were settled.
             context.setGlobalStateMap(new InMemoryStateMap());
             // A connector reads its capability alternatives off the context during the drive; the context
             // leaves them null, so give it an empty set or the first read NPEs. Empty means no overrides:

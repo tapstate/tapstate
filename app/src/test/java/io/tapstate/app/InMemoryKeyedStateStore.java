@@ -27,6 +27,13 @@ final class InMemoryKeyedStateStore implements KeyedStateStore {
     }
 
     @Override
+    public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+        return Optional.ofNullable(byNamespace
+                .computeIfAbsent(namespace, ignored -> new LinkedHashMap<>())
+                .putIfAbsent(key, state));
+    }
+
+    @Override
     public void delete(String namespace, String key) {
         Map<String, byte[]> entries = byNamespace.get(namespace);
         if (entries != null) {

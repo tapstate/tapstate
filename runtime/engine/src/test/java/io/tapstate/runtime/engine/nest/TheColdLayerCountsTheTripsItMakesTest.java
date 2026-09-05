@@ -96,6 +96,11 @@ class TheColdLayerCountsTheTripsItMakesTest {
         }
 
         @Override
+        public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            return Optional.empty();
+        }
+
+        @Override
         public void delete(String namespace, String key) {
         }
 

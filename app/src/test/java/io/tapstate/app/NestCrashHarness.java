@@ -422,6 +422,12 @@ public final class NestCrashHarness {
         }
 
         @Override
+        public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(delayMillis));
+            return delegate.saveIfAbsent(namespace, key, state);
+        }
+
+        @Override
         public void delete(String namespace, String key) {
             delegate.delete(namespace, key);
         }

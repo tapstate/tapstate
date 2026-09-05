@@ -351,6 +351,12 @@ connector.instance-limit-reached:
 connector.read-timeout:
   message: "Reading '{connector}' took longer than {timeout} and was stopped."
   solution: "Narrow the read with a filter or a smaller limit, or check the store is not overloaded."
+connector.state-unreadable:
+  message: "A note this connector kept for itself cannot be read back: {detail}."
+  solution: "If this followed a downgrade, run the build that wrote it. Otherwise clear the pipeline's state to start the connector fresh, which makes it read its source from the beginning."
+connector.state-value-unsupported:
+  message: "This connector tried to keep a value of type {type}, which cannot be stored."
+  solution: "Report this against the connector: it is the connector's own state that cannot be held, not anything in your pipeline."
 control.audit-blocked:
   message: "Operation '{op}' was refused because its required audit record could not be written."
   solution: "An audited operation must leave an audit record before it runs; check the store is reachable and healthy, then retry."

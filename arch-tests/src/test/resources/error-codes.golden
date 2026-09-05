@@ -94,6 +94,8 @@ connector.read-timeout
 connector.registration-conflict
 connector.spec-invalid
 connector.spec-not-found
+connector.state-unreadable
+connector.state-value-unsupported
 connector.test-failed
 connector.write-failed
 control.audit-blocked

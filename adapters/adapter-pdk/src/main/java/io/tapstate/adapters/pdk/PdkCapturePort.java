@@ -10,6 +10,7 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.capture.TableSchema;
 import io.tapdata.entity.event.TapEvent;
 import io.tapdata.entity.event.control.ControlEvent;
@@ -52,9 +53,16 @@ public final class PdkCapturePort implements CapturePort {
     private static final long SHUTDOWN_JOIN_MILLIS = 2000;
 
     private final ConnectorProvisioner provisioner;
+    private final KeyedStateStore stateStore;
 
+    /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
+        this(provisioner, null);
+    }
+
+    public PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
         this.provisioner = provisioner;
+        this.stateStore = stateStore;
     }
 
     @Override
@@ -150,7 +158,7 @@ public final class PdkCapturePort implements CapturePort {
 
     private PdkConnector open(CaptureConfig config, String stateNamespace) {
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                stateNamespace);
+                stateNamespace, stateStore);
     }
 
     /** Inits the connector once, then batch-reads the configured streams (or every discovered stream). */

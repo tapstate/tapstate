@@ -68,6 +68,20 @@ public interface KeyedStateStore {
      */
     void save(String namespace, String key, byte[] state);
 
+    /**
+     * Stores {@code state} under {@code key} only if the key holds nothing, and says what was already
+     * there: empty when this call is what stored it, and the value that was already present when it was
+     * not. One operation rather than a load followed by a save, because the answer is what callers decide
+     * on -- a connector minting an identity keeps the one that is returned, so two callers that both read
+     * "nothing there" would mint two identities and each keep its own. Where that identity names an
+     * external resource, the second one is a resource nobody will ever come back for.
+     *
+     * <p>Reaching durable storage before returning is required of it exactly as it is of {@code save}. An
+     * implementation that cannot do this in one atomic step must say so by refusing rather than by
+     * approximating it with a load and a save.
+     */
+    Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state);
+
     /** Removes the entry under {@code key}, if there is one. Removing what is not there is not an error. */
     void delete(String namespace, String key);
 
