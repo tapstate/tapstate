@@ -59,6 +59,7 @@ cli.demo-workspace-exists
 cli.if-match-needs-one-resource
 cli.issuer-discovery-failed
 cli.issuer-discovery-invalid
+cli.issuer-discovery-rejected
 cli.kind-dir-mismatch
 cli.mcp-unavailable
 cli.not-authenticated
