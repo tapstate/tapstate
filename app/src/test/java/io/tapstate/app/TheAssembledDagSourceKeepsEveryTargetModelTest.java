@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.model.PipelineNode;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -39,7 +41,8 @@ class TheAssembledDagSourceKeepsEveryTargetModelTest {
     void theBinderTheProductIsAssembledWithKeepsBothModels() {
         StoreBackedDagSource.SinkWriterBinder binder = StoreBackedDagSource.assembledSinkWriterBinder();
 
-        Object bound = binder.bind("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, TWO);
+        Object bound = binder.bind("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, TWO,
+                new PipelineNode("p1", "to_mongo"));
 
         assertThat(bound).isInstanceOf(PdkSinkWriterFactory.class);
         assertThat(((PdkSinkWriterFactory) bound).targets())
@@ -53,9 +56,25 @@ class TheAssembledDagSourceKeepsEveryTargetModelTest {
         TargetTable only = new TargetTable("orders", List.of(new TargetField("id", "int", true)));
 
         Object bound = binder.bind("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL,
-                Map.of("orders", only));
+                Map.of("orders", only), new PipelineNode("p1", "to_mongo"));
 
         assertThat(((PdkSinkWriterFactory) bound).targets()).containsOnlyKeys("orders");
+    }
+
+    /**
+     * The product's own binder passes the node on rather than dropping it. The binder is the only seam
+     * between a topology that knows which node it is building and a factory that opens the connector on
+     * another member, so a binder that ignored the argument would leave every sink writing correctly with
+     * nothing scoping what its connector records for itself - visible nowhere in the rows.
+     */
+    @Test
+    void theNodeTheSinkWritesForReachesTheFactory() {
+        StoreBackedDagSource.SinkWriterBinder binder = StoreBackedDagSource.assembledSinkWriterBinder();
+
+        Object bound = binder.bind("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, TWO,
+                new PipelineNode("p1", "to_mongo"));
+
+        assertThat(((PdkSinkWriterFactory) bound).node()).isEqualTo(new PipelineNode("p1", "to_mongo"));
     }
 
     /** The nest-capable constructor is the one the runtime is wired through; it must use that binder. */

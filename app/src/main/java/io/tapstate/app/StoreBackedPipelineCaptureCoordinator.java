@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -226,7 +227,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 ? settings.startFrom() : "earliest";
         String retention = source.srs() != null ? source.srs().retention() : null;
         return new CaptureRunSpec(
-                resolution.config(),
+                // This is the one place that knows both halves: the source resolves without a pipeline,
+                // and the pipeline starts each of its sources here. Attaching the node to the config the
+                // run is driven with is what gives the full load and the change tail that follows it one
+                // place to keep what the connector records for itself, and keeps another pipeline reading
+                // the same database out of it.
+                resolution.config().at(new PipelineNode(pipelineId, resolution.sourceId())),
                 readMode,
                 resolution.srsKey(),
                 srsEnabled(source),

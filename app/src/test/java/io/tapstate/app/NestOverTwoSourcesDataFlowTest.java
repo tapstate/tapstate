@@ -230,7 +230,7 @@ class NestOverTwoSourcesDataFlowTest {
                 store, captureRunUnit::start, srsCoordinator, snapshotBuffer);
 
         StoreBackedDagSource.SinkWriterBinder capturingSink =
-                (connectorId, settings, writeMode, ddl, target) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
+                (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
         return new EngineLifecycleActuator(
                 new Engine(member), new StoreBackedDagSource(store, capturingSink), coordinator,
                 new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));

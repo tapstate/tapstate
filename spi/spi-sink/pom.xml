@@ -24,6 +24,15 @@
       <version>${revision}</version>
     </dependency>
 
+    <!-- Which pipeline node a write is driven for, so a connector's own notes are scoped to it
+         (rule R2: core only). The read side names the same identity from the same place, which is
+         what keeps the two from drifting into two spellings of one node. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-model</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>

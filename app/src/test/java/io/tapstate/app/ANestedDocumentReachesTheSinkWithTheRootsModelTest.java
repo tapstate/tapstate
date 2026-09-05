@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.model.PipelineNode;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.function.SupplierEx;
@@ -207,13 +209,13 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
 
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
-                    WriteMode writeMode, DdlPolicy ddl, TargetTable target) {
+                    WriteMode writeMode, DdlPolicy ddl, TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;
             }
 
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
-                    WriteMode writeMode, DdlPolicy ddl, Map<String, TargetTable> targets) {
+                    WriteMode writeMode, DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node) {
                 bound.set(targets);
                 return (SupplierEx<SinkWriter>) () -> null;
             }

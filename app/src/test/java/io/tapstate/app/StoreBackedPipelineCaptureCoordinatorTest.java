@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
 
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.ReadMode;
@@ -61,6 +62,43 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(spec.srsEnabled()).as("srs defaults on when the source declares no srs block").isTrue();
         assertThat(spec.startFrom()).isEqualTo(io.tapstate.runtime.srs.StartFrom.earliest());
         assertThat(spec.schemaVer()).isZero();
+    }
+
+    /**
+     * The config a run is driven with names the node it is driven for. This is the only place both halves
+     * exist: a source resolves without knowing any pipeline, and a pipeline is what starts each of its
+     * sources — so a spec that carried the pair beside the config while the config itself named nothing
+     * would leave the connector, which is handed only the config, with nowhere to keep what it records
+     * for itself. The two ids on the spec are not the witness for this; the one on the config is.
+     */
+    @Test
+    void theConfigTheRunIsDrivenWithNamesTheNodeItIsDrivenFor() {
+        SourceResource source = cdcSource("orders_src", "orders", null);
+
+        CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, source, SourceCaptureResolution.of(source));
+
+        assertThat(spec.config().node()).isEqualTo(new PipelineNode("pipe-1", "orders_src"));
+    }
+
+    /**
+     * Two pipelines reading one database still mine it once. The node is what separates their notes, and
+     * the chain is what merges their reading — deriving one from the other in either direction breaks the
+     * half that was not being thought about, and neither break shows up in the rows.
+     */
+    @Test
+    void twoPipelinesReadingOneSourceKeepSeparateNodesAndStillShareOneChain() {
+        SourceResource source = cdcSource("orders_src", "orders", null);
+
+        CaptureRunSpec one = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, source, SourceCaptureResolution.of(source));
+        CaptureRunSpec other = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-2", null, source, SourceCaptureResolution.of(source));
+
+        assertThat(one.config().node()).isNotEqualTo(other.config().node());
+        assertThat(MiningChainId.of(one.config()))
+                .as("the chain both pipelines mine is the source's, not either pipeline's")
+                .isEqualTo(MiningChainId.of(other.config()));
     }
 
     @Test

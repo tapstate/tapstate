@@ -159,7 +159,7 @@ class CaptureToSinkDataFlowTest {
         // The real store-backed topology, with the sink bound to a capturing writer so the run needs no PDK
         // sink connector -- the source-vertex ring-name derivation and the transform chain are the real thing.
         StoreBackedDagSource.SinkWriterBinder capturingSink =
-                (connectorId, settings, writeMode, ddl, target) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
+                (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
         DagSource dagSource = new StoreBackedDagSource(store, capturingSink);
 
         LifecycleActuator actuator = new EngineLifecycleActuator(

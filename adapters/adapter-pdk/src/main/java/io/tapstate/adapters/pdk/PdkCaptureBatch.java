@@ -22,6 +22,11 @@ final class PdkCaptureBatch implements CaptureBatch {
         this.connector = connector;
     }
 
+    /** The connector this batch was read from, and the state scope it was opened under. */
+    PdkConnector connector() {
+        return connector;
+    }
+
     @Override
     public boolean hasNext() {
         return rows.hasNext();

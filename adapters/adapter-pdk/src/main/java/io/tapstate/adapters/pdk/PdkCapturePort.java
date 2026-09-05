@@ -103,7 +103,7 @@ public final class PdkCapturePort implements CapturePort {
 
     @Override
     public ConnectionReport testConnection(CaptureConfig config) {
-        PdkConnector connector = open(config);
+        PdkConnector connector = openUnscoped(config);
         try {
             Probe probe = read(connector, () -> probe(connector, config));
             DiscoveredSchema schema = toDiscoveredSchema(probe.tables());
@@ -117,7 +117,7 @@ public final class PdkCapturePort implements CapturePort {
 
     @Override
     public DiscoveredSchema discoverSchema(CaptureConfig config) {
-        PdkConnector connector = open(config);
+        PdkConnector connector = openUnscoped(config);
         try {
             List<TapTable> tables = read(connector, () -> discover(connector, config.streams()));
             return toDiscoveredSchema(tables);
@@ -129,8 +129,28 @@ public final class PdkCapturePort implements CapturePort {
 
     // ---- drive helpers ---------------------------------------------------------------------------
 
+    /**
+     * Opens the connector for a drive that keeps notes: the node on the config says where they belong,
+     * so the full load and the change tail of one run file under one name and read each other's.
+     */
     private PdkConnector open(CaptureConfig config) {
-        return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
+        return open(config, ConnectorStateNamespace.of(config.node()));
+    }
+
+    /**
+     * Opens the connector for a drive that keeps nothing. A connection test and a schema discovery each
+     * live for the single call that made them, so there is no later drive for anything they wrote to be
+     * read back by — filing it would leave a record with no reader. The node is ignored here rather than
+     * assumed absent: whether these two scope state is decided at this seam, not by what a caller
+     * happened to put on the config.
+     */
+    private PdkConnector openUnscoped(CaptureConfig config) {
+        return open(config, null);
+    }
+
+    private PdkConnector open(CaptureConfig config, String stateNamespace) {
+        return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
+                stateNamespace);
     }
 
     /** Inits the connector once, then batch-reads the configured streams (or every discovered stream). */

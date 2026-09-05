@@ -230,7 +230,7 @@ class ValidatedPipelineBuildsTest {
     }
 
     private static StoreBackedDagSource.SinkWriterBinder discardingBinder() {
-        return (connectorId, settings, writeMode, ddl, target) -> (SupplierEx<SinkWriter>) () -> null;
+        return (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) () -> null;
     }
 
     private static List<String> vertexNames(DAG dag) {

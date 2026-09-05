@@ -31,7 +31,8 @@ public final class PdkSinkPort implements SinkPort {
 
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
         PdkConnector connector = PdkConnector.open(
-                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
+                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
+                ConnectorStateNamespace.of(config.node()));
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());

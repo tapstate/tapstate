@@ -9,6 +9,7 @@ import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
@@ -380,7 +381,7 @@ final class StoreBackedDagSource implements DagSource {
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes),
                 StoreBackedDagSource::transformPort,
-                element -> sinkWriter(element, targets, serveStreams),
+                element -> sinkWriter(pipeline, element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> viewSink(pipeline, view, targets, viewStreams, sourceKeysById),
@@ -440,7 +441,8 @@ final class StoreBackedDagSource implements DagSource {
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
         return sinkWriterBinder.bind(
-                store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable);
+                store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
+                new PipelineNode(pipeline.id(), inline.id()));
     }
 
     /**
@@ -903,11 +905,29 @@ final class StoreBackedDagSource implements DagSource {
      * that runs the sink.
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
-            SyncElement element, Map<String, TargetTable> targets, Set<String> serveStreams) {
+            PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
+            Set<String> serveStreams) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
         return sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
-                TargetModelResolver.renameAll(targets, serveStreams, element.rename()));
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename()),
+                new PipelineNode(pipeline.id(), syncNodeId(element)));
+    }
+
+    /**
+     * What names a serve.sync element as a node of its pipeline: its own id, which authoring generates
+     * for an element that declares none and holds unique across everything a pipeline names inside
+     * itself. That uniqueness is what makes it usable as a node id at all — the ids of two sinks of one
+     * pipeline have to differ or their connectors share one set of notes.
+     *
+     * <p>The fall back to the source written to is for an artifact that reached the store without going
+     * through authoring, where the id is still what the model says it is: optional. It names something
+     * rather than leaving the sink with no node at all. Two id-less elements writing to one target would
+     * name the same node, which is why authoring generating the ids is what this rests on rather than
+     * the fallback.
+     */
+    private static String syncNodeId(SyncElement element) {
+        return element.id() != null && !element.id().isBlank() ? element.id() : element.source();
     }
 
     /**
@@ -1021,13 +1041,13 @@ final class StoreBackedDagSource implements DagSource {
 
         SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                TargetTable target);
+                TargetTable target, PipelineNode node);
 
         default SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                Map<String, TargetTable> targets) {
+                Map<String, TargetTable> targets, PipelineNode node) {
             return bind(connectorId, settings, writeMode, ddl,
-                    targets.size() == 1 ? targets.values().iterator().next() : null);
+                    targets.size() == 1 ? targets.values().iterator().next() : null, node);
         }
     }
 
@@ -1036,15 +1056,15 @@ final class StoreBackedDagSource implements DagSource {
         @Override
         public SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                TargetTable target) {
-            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, target);
+                TargetTable target, PipelineNode node) {
+            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, target, node);
         }
 
         @Override
         public SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                Map<String, TargetTable> targets) {
-            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, targets);
+                Map<String, TargetTable> targets, PipelineNode node) {
+            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, targets, node);
         }
     }
 }

@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameCase;
 import io.tapstate.core.model.RenameSpec;
@@ -291,6 +292,71 @@ class StoreBackedDagSourceTargetModelTest {
 
     // ---- fixtures ----------------------------------------------------------------------
 
+    /**
+     * The topology is the only place that knows which node a sink is, so the binder is where that has to
+     * be handed over. A sink whose node never arrived opens its connector scoped to nothing and writes
+     * every row correctly, so nothing about the data says the identity went missing.
+     */
+    @Test
+    void the_node_a_sync_element_is_names_the_pipeline_and_the_element() {
+        InMemoryStorePort store = seededPipeline();
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable(
+                "orders",
+                List.of(new SourceField("id", "INT"), new SourceField("amount", "DECIMAL")),
+                List.of("id"),
+                List.of())));
+        List<PipelineNode> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, nodeCapturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).containsExactly(new PipelineNode("p", "sync_1"));
+    }
+
+    /**
+     * An element that declares no id of its own is named by the source it writes to. Left unnamed it
+     * would have no node at all, and a sync element without an id is the ordinary shape — the id is only
+     * required when a query backend refers to it.
+     */
+    @Test
+    void a_sync_element_with_no_id_is_named_by_the_source_it_writes_to() {
+        InMemoryStorePort store = seededPipeline(new SyncElement(null, "orders_dest", null, null, null, null));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable(
+                "orders",
+                List.of(new SourceField("id", "INT"), new SourceField("amount", "DECIMAL")),
+                List.of("id"),
+                List.of())));
+        List<PipelineNode> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, nodeCapturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).containsExactly(new PipelineNode("p", "orders_dest"));
+    }
+
+    /** A view's sink is a node too, named by the view — the same seam, reached by the other binding. */
+    @Test
+    void the_node_a_view_sink_is_names_the_pipeline_and_the_view() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+        store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
+                "mongodb", Map.of("uri", "u"), null, null, null, null, null));
+        store.artifacts().save(new PipelineResource("p", null, List.of("orders_src"), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
+                null, null, null));
+        List<PipelineNode> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, nodeCapturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).containsExactly(new PipelineNode("p", "order_state"));
+    }
+
+    private static StoreBackedDagSource.SinkWriterBinder nodeCapturingBinder(List<PipelineNode> bound) {
+        return (connectorId, settings, writeMode, ddl, target, node) -> {
+            bound.add(node);
+            return (SupplierEx<SinkWriter>) () -> null;
+        };
+    }
+
     private static InMemoryStorePort seededPipeline() {
         return seededPipeline(new SyncElement("sync_1", "orders_dest", null, null, null, null));
     }
@@ -348,7 +414,7 @@ class StoreBackedDagSourceTargetModelTest {
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
                     io.tapstate.spi.sink.WriteMode writeMode, io.tapstate.spi.sink.DdlPolicy ddl,
-                    TargetTable target) {
+                    TargetTable target, PipelineNode node) {
                 bound.add(target == null ? Map.of() : Map.of(target.name(), target));
                 return (SupplierEx<SinkWriter>) () -> null;
             }
@@ -356,7 +422,7 @@ class StoreBackedDagSourceTargetModelTest {
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
                     io.tapstate.spi.sink.WriteMode writeMode, io.tapstate.spi.sink.DdlPolicy ddl,
-                    Map<String, TargetTable> targets) {
+                    Map<String, TargetTable> targets, PipelineNode node) {
                 bound.add(targets);
                 return (SupplierEx<SinkWriter>) () -> null;
             }
@@ -364,7 +430,7 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     private static StoreBackedDagSource.SinkWriterBinder capturingBinder(List<TargetTable> bound) {
-        return (connectorId, settings, writeMode, ddl, target) -> {
+        return (connectorId, settings, writeMode, ddl, target, node) -> {
             bound.add(target);
             return (SupplierEx<SinkWriter>) () -> null;
         };
@@ -375,7 +441,7 @@ class StoreBackedDagSourceTargetModelTest {
             @Override
             public SupplierEx<? extends SinkWriter> bind(
                     String connectorId, Map<String, Object> settings, io.tapstate.spi.sink.WriteMode writeMode,
-                    io.tapstate.spi.sink.DdlPolicy ddl, TargetTable target) {
+                    io.tapstate.spi.sink.DdlPolicy ddl, TargetTable target, PipelineNode node) {
                 if (target != null) {
                     bound.put(target.name(), target);
                 }
@@ -385,7 +451,7 @@ class StoreBackedDagSourceTargetModelTest {
             @Override
             public SupplierEx<? extends SinkWriter> bind(
                     String connectorId, Map<String, Object> settings, io.tapstate.spi.sink.WriteMode writeMode,
-                    io.tapstate.spi.sink.DdlPolicy ddl, Map<String, TargetTable> targets) {
+                    io.tapstate.spi.sink.DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node) {
                 bound.putAll(targets);
                 return (SupplierEx<SinkWriter>) () -> null;
             }

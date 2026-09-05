@@ -1,5 +1,7 @@
 package io.tapstate.spi.sink;
 
+import io.tapstate.core.model.PipelineNode;
+
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -21,10 +23,16 @@ import java.util.Objects;
  * chosen). It is null when no target model was resolved; the sink then falls back to a bare table id
  * and leaves structure and keying to the connector.
  *
+ * <p>{@code node} is the pipeline and sink element the write is being driven for. It scopes whatever
+ * the connector keeps for itself, the same way the read side's does, so a target connector that
+ * recorded something on one run of a pipeline finds it again on the next and never finds another
+ * pipeline's. It is null where no node is named.
+ *
  * <p>{@code settings} is held as an unmodifiable defensive copy; a null map is normalized to empty.
  */
 public record SinkConfig(
-        String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl, TargetTable target) {
+        String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+        TargetTable target, PipelineNode node) {
 
     public SinkConfig {
         Objects.requireNonNull(connectorId, "connectorId");
@@ -33,8 +41,15 @@ public record SinkConfig(
         settings = settings == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(settings));
     }
 
+    /** A config naming no node — a write driven outside any pipeline. */
+    public SinkConfig(
+            String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+            TargetTable target) {
+        this(connectorId, settings, writeMode, ddl, target, null);
+    }
+
     /** A config with no resolved target model — the sink falls back to a bare table id. */
     public SinkConfig(String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl) {
-        this(connectorId, settings, writeMode, ddl, null);
+        this(connectorId, settings, writeMode, ddl, null, null);
     }
 }

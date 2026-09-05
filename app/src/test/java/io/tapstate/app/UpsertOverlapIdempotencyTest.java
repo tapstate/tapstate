@@ -199,7 +199,7 @@ class UpsertOverlapIdempotencyTest {
                 store, captureRunUnit::start, srsCoordinator,
                 (SnapshotBuffer) member.getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY));
         StoreBackedDagSource.SinkWriterBinder upsertSink =
-                (connectorId, settings, writeMode, ddl, target) -> (SupplierEx<SinkWriter>) () -> new UpsertSink(target);
+                (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) () -> new UpsertSink(target);
         DagSource dagSource = new StoreBackedDagSource(store, upsertSink);
         return new EngineLifecycleActuator(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));

@@ -237,7 +237,7 @@ class LifecycleVerbsOnRealChainE2ETest {
                 store, captureRunUnit::start, srsCoordinator,
                 (SnapshotBuffer) member.getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY));
         StoreBackedDagSource.SinkWriterBinder recordingSink =
-                (connectorId, settings, writeMode, ddl, target) -> (SupplierEx<SinkWriter>) () -> new RecordingSink(target);
+                (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) () -> new RecordingSink(target);
         DagSource dagSource = new StoreBackedDagSource(store, recordingSink);
         Engine engine = new Engine(member);
         EngineLifecycleActuator actuator = new EngineLifecycleActuator(
