@@ -172,6 +172,7 @@ final class InlineTui {
     private dev.tamboui.backend.jline3.JLineBackend backend;
     private org.jline.utils.NonBlockingReader reader;
     private InlineRenderer renderer;
+    private JLinePrompter prompter;
 
     InlineTui(Repl repl, java.io.StringWriter capturedOut, java.io.StringWriter capturedErr) {
         this.repl = java.util.Objects.requireNonNull(repl, "repl");
@@ -192,6 +193,8 @@ final class InlineTui {
             backend.onResize(() -> resizeRequested = true);
             backend.enableRawMode();
             reader = terminal.reader();
+            prompter = new JLinePrompter(terminal, false);
+            repl.installPrompterIfMissing(prompter);
             renderer = InlineRenderer.open(backend, INPUT_REGION_HEIGHT);
 
             commitCaptured();
@@ -271,6 +274,9 @@ final class InlineTui {
                 } catch (IOException ignored) {
                     // Terminal restoration is best effort during shutdown.
                 }
+            }
+            if (prompter != null) {
+                prompter.close();
             }
         }
     }

@@ -1035,6 +1035,25 @@ class ReplTest {
     }
 
     @Test
+    void aSessionCanInstallItsInteractivePrompterAfterConstruction() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-abc");
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        commandLine.setOut(new PrintWriter(sink));
+        commandLine.setErr(new PrintWriter(sink));
+        Repl repl = new Repl(commandLine, Path.of("tap-work"), client);
+        ScriptedPrompter prompter = new ScriptedPrompter("s3cret");
+
+        repl.installPrompterIfMissing(prompter);
+        repl.dispatch("connect localhost:7900");
+
+        assertThat(repl.dispatch("login alice")).isTrue();
+        assertThat(prompter.secretQuestions).containsExactly("Password");
+        assertThat(client.loginCalls).containsExactly("alice:s3cret@http://localhost:7900");
+    }
+
+    @Test
     void authenticatedPromptShowsThePrincipalAtTheNode() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-abc");

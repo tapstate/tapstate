@@ -214,6 +214,13 @@ final class Repl {
         this.contextManager = contextManager;
     }
 
+    /** Installs the session's JLine prompter without replacing a test or one-shot injection. */
+    void installPrompterIfMissing(Prompter candidate) {
+        if (prompter == null) {
+            prompter = java.util.Objects.requireNonNull(candidate, "prompter");
+        }
+    }
+
     /** Whether this verb can be routed to the control plane when a context resolves. */
     static boolean isOnlineVerb(String verb) {
         return ONLINE_VERBS.contains(verb) || Cli.LIVE_VIEW_VERBS.contains(verb)

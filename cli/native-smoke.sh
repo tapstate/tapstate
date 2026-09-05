@@ -84,10 +84,10 @@ else:
                 timed_out = False
                 break
             out += chunk
-            # A REPL must enter terminal raw mode before TAB is written. Its banner is stable while
-            # the prompt contains terminal control sequences. The wizard can accept input as soon
-            # as it emits its first prompt bytes.
-            ready = (len(argv) == 1 and b"Tapstate CLI." in out) or (len(argv) > 1)
+            # The inline session is ready once its committed workspace line is visible. The input
+            # region itself contains terminal control sequences, so the stable committed line is the
+            # synchronization point. The wizard can accept input as soon as it emits its first prompt.
+            ready = (len(argv) == 1 and b"Workspace:" in out) or (len(argv) > 1)
             if ready and not input_sent:
                 time.sleep(0.05)
                 try:
@@ -291,14 +291,14 @@ bold "[5] REPL — interactive loop under a pty (JLine)"
 # would strip it, leaving the REPL waiting for Enter until the deadline.
 printf -v repl_in 'help\nvalidate %s\nexit\n' "$VALID_DIR"
 pty_session "$repl_in"
-# match on ANSI-stripped text: anchor `valid:` so it cannot be satisfied by the `valid:` inside
+# Match on ANSI-stripped text: anchor `valid:` so it cannot be satisfied by the `valid:` inside
 # `invalid:` (a rejected validate must not pass as a success), and require a clean child exit.
 REPL_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && printf '%s' "$REPL_CLEAN" | grep -q "Tapstate CLI" \
+   && printf '%s' "$REPL_CLEAN" | grep -q "Workspace: tap-work" \
    && printf '%s' "$REPL_CLEAN" | grep -qE '(^|[^[:alpha:]])valid:' \
    && printf '%s' "$REPL_CLEAN" | grep -q "bye"; then
-  ok "REPL banner + successful validate + clean exit (rc 0) observed over a pty"
+  ok "inline workspace + successful validate + clean exit (rc 0) observed over a pty"
 else
   bad "REPL pty session failed (rc=$PTY_RC) or missing expected markers; output:"; echo "$PTY_OUT"
 fi
@@ -341,21 +341,23 @@ else
   bad "-o yaml did not render the expected block mapping; explain: $YAML_EXPLAIN | validate: $YAML_VALIDATE"
 fi
 
-# --- 8. Tab completion under a pty (the JLine completer reachable in the image) ------------------
-# Feed `va` + TAB so the verb completer resolves it to `validate`, then a valid corpus dir + Enter.
-# `va` on its own is not a verb (it draws an "Unmatched argument" usage error), so a `valid:` result
-# can only mean the native JLine completer fired and completed `va`→`validate`. This is the only
-# native exercise of completion; the JVM unit suite covers the candidate logic itself.
-bold "[8] Tab completion — verb completer under a pty (JLine)"
-printf -v comp_in 'va\t %s\nexit\n' "$VALID_DIR"
-pty_session "$comp_in"
-COMP_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
+# --- 8. inline input isolation under a pty (arrows stay in the input layer) ---------------------
+# Phase 1 deliberately does not implement suggestions. Prove the lower-level contract first: after
+# a committed command, an arrow sequence is consumed by the inline input layer and cannot become a
+# second command or bubble into a different interaction mode. Suggestion rendering belongs to Phase 3.
+bold "[8] inline input isolation — arrows do not escape the input layer"
+printf -v arrow_in 'pwd\n\033[Aexit\n'
+pty_session "$arrow_in"
+ARROW_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && printf '%s' "$COMP_CLEAN" | grep -qE '(^|[^[:alpha:]])valid:' \
-   && ! printf '%s' "$COMP_CLEAN" | grep -q 'Unmatched argument'; then
-  ok "Tab completed 'va'→'validate' and ran it over a pty (completer reachable in the image)"
+   && printf '%s' "$ARROW_CLEAN" | grep -q '\$ pwd' \
+   && printf '%s' "$ARROW_CLEAN" | grep -q 'tap-work' \
+   && printf '%s' "$ARROW_CLEAN" | grep -q '\$ exit' \
+   && printf '%s' "$ARROW_CLEAN" | grep -q 'bye' \
+   && ! printf '%s' "$ARROW_CLEAN" | grep -q 'Unmatched argument'; then
+  ok "arrow input stayed local and the following exit command completed cleanly"
 else
-  bad "Tab completion pty session failed (rc=$PTY_RC) or did not complete 'va'→'validate'; output:"; echo "$PTY_OUT"
+  bad "inline arrow isolation failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
 fi
 
 # --- 9. online register under a pty (HttpClient POST + Bearer + JSON reachable in the image) -----
