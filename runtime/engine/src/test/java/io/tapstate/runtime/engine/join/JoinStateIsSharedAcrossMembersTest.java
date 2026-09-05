@@ -204,8 +204,19 @@ class JoinStateIsSharedAcrossMembersTest {
 
         private final Map<String, byte[]> entries = new ConcurrentHashMap<>();
 
+        /**
+         * Joins a namespace to a key. A separator is needed at all so that one namespace is not a
+         * prefix of another when {@code dropNamespace} and {@code count} scan by prefix.
+         *
+         * <p>Written as an escape, and deliberately not as a raw byte: a NUL written literally into
+         * a tracked file makes grep treat the whole file as binary and skip it in silence, so a gate
+         * in this repository refuses one anywhere. This line used to carry the byte itself, and that
+         * gate is what caught it.
+         */
+        private static final String SEPARATOR = "\u001f";
+
         private static String at(String namespace, String key) {
-            return namespace + " " + key;
+            return namespace + SEPARATOR + key;
         }
 
         @Override
@@ -225,12 +236,12 @@ class JoinStateIsSharedAcrossMembersTest {
 
         @Override
         public void dropNamespace(String namespace) {
-            entries.keySet().removeIf(at -> at.startsWith(namespace + " "));
+            entries.keySet().removeIf(at -> at.startsWith(namespace + SEPARATOR));
         }
 
         @Override
         public long count(String namespace) {
-            return entries.keySet().stream().filter(at -> at.startsWith(namespace + " ")).count();
+            return entries.keySet().stream().filter(at -> at.startsWith(namespace + SEPARATOR)).count();
         }
 
         @Override
