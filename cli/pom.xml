@@ -2,13 +2,13 @@
 <!--
   cli — the surface ring: Tapstate's offline CLI product front-end.
 
-  Dual-mode: bare `tapstate` opens an offline REPL; one-shot subcommands share the same verb
-  table for scripting / AI. Offline verbs are a whitelist (validate / new / explain); server
+  Dual-mode: bare `tapstate` opens an inline terminal workbench; one-shot subcommands share the same
+  verb table for scripting / AI. Offline verbs are a whitelist (validate / new / explain); server
   verbs are registered too but report "requires a connection" rather than going missing.
 
   Ring rule R6: the CLI talks to services over HTTP only. Its dependency surface is allowlisted
   (bannedDependencies, the coarse twin of the arch-tests R6 rule): the named core-ring modules,
-  the framework-free control HTTP client, picocli (command framework), and jline (REPL line reader).
+  the framework-free control HTTP client, picocli, jline, and TamboUI's inline terminal surface.
   Product control services and runtime implementations remain forbidden. Every allowed artifact is
   listed explicitly, so a new dependency fails the build until its boundary is deliberately reviewed.
 -->
@@ -91,6 +91,14 @@
       <groupId>org.jline</groupId>
       <artifactId>jline</artifactId>
     </dependency>
+    <dependency>
+      <groupId>dev.tamboui</groupId>
+      <artifactId>tamboui-tui</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.tamboui</groupId>
+      <artifactId>tamboui-jline3-backend</artifactId>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -143,7 +151,7 @@
         </configuration>
       </plugin>
 
-      <!-- R6 coarse gate: only named core modules, control-client, picocli, and jline on the surface.
+      <!-- R6 coarse gate: only named core modules, control-client, picocli, jline, and TamboUI on the surface.
            The fine-grained twin is the arch-tests R6 ArchUnit rule. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -157,7 +165,7 @@
             <configuration>
               <rules>
                 <bannedDependencies>
-                  <!-- Direct dependencies only: the CLI adds no third-party beyond picocli / jline.
+                  <!-- Direct dependencies only: the CLI adds no third-party beyond picocli / jline / TamboUI.
                        The DSL link's own libraries (snakeyaml, cel, jackson-annotations) arrive
                        transitively through the core ring, which governs that surface under R1 — they
                        are not the CLI's to re-allowlist. This gate covers direct deps; the arch-tests
@@ -182,12 +190,13 @@
                     <include>info.picocli:picocli</include>
                     <!-- jline aggregates its own modules under one version -->
                     <include>org.jline:*</include>
+                    <include>dev.tamboui:*</include>
                     <!-- test scope never ships -->
                     <include>*:*:*:*:test</include>
                   </includes>
                   <message>
-Dependency outside the cli surface-ring allowlist (rule R6). Only io.tapstate modules, picocli and
-jline are allowed; the CLI must reach services over HTTP, never via a compile dependency on
+Dependency outside the cli surface-ring allowlist (rule R6). Only io.tapstate modules, picocli, jline,
+and TamboUI are allowed; the CLI must reach services over HTTP, never via a compile dependency on
 control / runtime modules. Amend the recorded allowlist decision before adding an exception.
                   </message>
                 </bannedDependencies>

@@ -7,6 +7,8 @@ import picocli.CommandLine.Model.UsageMessageSpec;
 import picocli.CommandLine.Spec;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -16,7 +18,7 @@ import java.util.function.Supplier;
 
 /**
  * The Tapstate CLI: the surface-ring product front-end. Dual-mode — bare {@code tapstate} opens the
- * offline REPL; one-shot subcommands share the same verb table for scripting / AI.
+ * inline terminal workbench; one-shot subcommands share the same verb table for scripting / AI.
  *
  * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code explain} / {@code ls} /
  * {@code desc} run fully without any server. The server-state verbs are registered too, so they are
@@ -486,6 +488,7 @@ public final class Cli implements Runnable {
                                   Supplier<Prompter> prompter, ContextResolver resolver,
                                   AuthService authService) {
         Prompter oneShotPrompter = null;
+        boolean interactive = InlineTui.hasInteractiveTerminal();
         try {
             if (launch.hasConflictingTargets()) {
                 Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
@@ -502,7 +505,16 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
-            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
+            CommandLine commandLine = newCommandLine();
+            StringWriter capturedOut = null;
+            StringWriter capturedErr = null;
+            if (!launch.isOneShot() && interactive) {
+                capturedOut = new StringWriter();
+                capturedErr = new StringWriter();
+                commandLine.setOut(new PrintWriter(capturedOut, true));
+                commandLine.setErr(new PrintWriter(capturedErr, true));
+            }
+            Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
                     new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
             String machineToken = launch.machineToken();
@@ -522,8 +534,10 @@ public final class Cli implements Runnable {
                 repl.dispatch(launch.command(), true);
                 return repl.lastExitCode();
             }
-            repl.run();
-            return EXIT_OK;
+            if (!interactive) {
+                return PlainSession.run(repl);
+            }
+            return new InlineTui(repl, capturedOut, capturedErr).run();
         } finally {
             if (oneShotPrompter instanceof JLinePrompter jline) {
                 jline.close();
