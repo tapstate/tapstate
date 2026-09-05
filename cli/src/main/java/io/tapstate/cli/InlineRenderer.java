@@ -484,6 +484,8 @@ final class InlineTui {
             dev.tamboui.layout.Rect area = frame.area();
             int inputHeight = Math.min(2, area.height());
             if (area.height() > 0) {
+                fillDefaultSurface(frame, new dev.tamboui.layout.Rect(
+                        area.x(), area.y(), area.width(), 1));
                 frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
                         .text(dev.tamboui.text.Text.from(question).fg(ACCENT_FOREGROUND).bold())
                         .overflow(dev.tamboui.style.Overflow.CLIP)
@@ -512,6 +514,7 @@ final class InlineTui {
             if (area.height() == 0) {
                 return;
             }
+            fillBackground(frame, area, INPUT_BACKGROUND);
             frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
                     .text(dev.tamboui.text.Text.from(question).fg(ACCENT_FOREGROUND).bold())
                     .overflow(dev.tamboui.style.Overflow.CLIP)
@@ -521,6 +524,11 @@ final class InlineTui {
             for (int row = 0; row < visible; row++) {
                 int index = start + row;
                 boolean active = index == selected;
+                dev.tamboui.layout.Rect rowArea = new dev.tamboui.layout.Rect(
+                        area.x(), area.y() + 1 + row, area.width(), 1);
+                if (active) {
+                    fillBackground(frame, rowArea, SELECTION_BACKGROUND);
+                }
                 dev.tamboui.text.Text option = dev.tamboui.text.Text.from(
                         (active ? "› " : "  ") + options.get(index))
                         .fg(active ? INPUT_FOREGROUND : HINT_FOREGROUND)
@@ -529,8 +537,7 @@ final class InlineTui {
                         .text(option)
                         .background(active ? SELECTION_BACKGROUND : INPUT_BACKGROUND)
                         .overflow(dev.tamboui.style.Overflow.CLIP)
-                        .build(), new dev.tamboui.layout.Rect(
-                                area.x(), area.y() + 1 + row, area.width(), 1));
+                        .build(), rowArea);
             }
             String hint = "↑↓ choose  ·  Enter select  ·  Esc cancel";
             if (query != null && !query.isEmpty()) {
@@ -541,13 +548,33 @@ final class InlineTui {
         }, Math.min(INLINE_REGION_CAPACITY, Math.max(4, options.size() + 2)));
     }
 
+    static void fillBackground(dev.tamboui.terminal.Frame frame,
+                               dev.tamboui.layout.Rect area,
+                               dev.tamboui.style.Color background) {
+        fillSurface(frame, area, dev.tamboui.style.Style.create().bg(background));
+    }
+
     private static void renderInputBackground(dev.tamboui.terminal.Frame frame,
                                               dev.tamboui.layout.Rect area) {
-        if (!area.isEmpty()) {
-            frame.renderWidget(dev.tamboui.widgets.block.Block.builder()
-                    .borders(dev.tamboui.widgets.block.Borders.NONE)
-                    .background(INPUT_BACKGROUND)
-                    .build(), area);
+        fillBackground(frame, area, INPUT_BACKGROUND);
+    }
+
+    private static void fillDefaultSurface(dev.tamboui.terminal.Frame frame,
+                                           dev.tamboui.layout.Rect area) {
+        fillSurface(frame, area, dev.tamboui.style.Style.EMPTY);
+    }
+
+    private static void fillSurface(dev.tamboui.terminal.Frame frame,
+                                    dev.tamboui.layout.Rect area,
+                                    dev.tamboui.style.Style style) {
+        if (area.isEmpty()) {
+            return;
+        }
+        dev.tamboui.buffer.Buffer buffer = frame.buffer();
+        buffer.setStyle(area, style);
+        String blankLine = "\u00a0".repeat(area.width());
+        for (int row = area.y(); row < area.bottom(); row++) {
+            buffer.setString(area.x(), row, blankLine, style);
         }
     }
 
@@ -580,13 +607,15 @@ final class InlineTui {
 
     private void renderStatus(dev.tamboui.terminal.Frame frame, dev.tamboui.layout.Rect area,
                               String controls) {
-        dev.tamboui.text.Text status = dev.tamboui.text.Text.from(
-                "local  ·  dir " + compactWorkdir() + "  ·  " + controls)
-                .fg(HINT_FOREGROUND);
-        frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
-                .text(status)
-                .overflow(dev.tamboui.style.Overflow.CLIP)
-                .build(), area);
+        if (area.isEmpty()) {
+            return;
+        }
+        String status = "local  ·  dir " + compactWorkdir() + "  ·  " + controls;
+        String padded = status.length() >= area.width()
+                ? status
+                : status + "\u00a0".repeat(area.width() - status.length());
+        frame.buffer().setString(area.x(), area.y(), padded,
+                dev.tamboui.style.Style.create().fg(HINT_FOREGROUND));
     }
 
     private String compactWorkdir() {

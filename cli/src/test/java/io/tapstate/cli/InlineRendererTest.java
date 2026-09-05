@@ -5,8 +5,6 @@ import dev.tamboui.buffer.Buffer;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.style.Color;
 import dev.tamboui.text.Text;
-import dev.tamboui.widgets.block.Block;
-import dev.tamboui.widgets.block.Borders;
 import dev.tamboui.widgets.paragraph.Paragraph;
 import org.junit.jupiter.api.Test;
 
@@ -127,15 +125,16 @@ class InlineRendererTest {
         Buffer buffer = Buffer.empty(Rect.of(20, 2));
         Frame frame = Frame.forTesting(buffer);
 
-        frame.renderWidget(Block.builder().borders(Borders.NONE).background(background).build(),
-                new Rect(0, 0, 20, 2));
+        InlineTui.fillBackground(frame, new Rect(0, 0, 20, 2), background);
         frame.renderWidget(Paragraph.builder()
                         .text(Text.from("▌").fg(Color.rgb(82, 166, 118)).bg(background))
                         .background(background)
                         .build(), new Rect(0, 0, 20, 2));
 
         assertThat(buffer.get(0, 0).symbol()).isEqualTo("▌");
+        assertThat(buffer.get(19, 0).symbol()).isEqualTo("\u00a0");
         assertThat(buffer.get(19, 0).style().bg()).contains(background);
+        assertThat(buffer.toAnsiStringTrimmed()).contains("\u00a0");
     }
 
     private static final class RecordingSurface implements InlineRenderer.Surface {
