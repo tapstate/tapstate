@@ -116,6 +116,8 @@ jobs:
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
           shellcheck deploy/install-site/verify-smoke.sh
+          shellcheck -s sh deploy/install-site/check-site.sh
+          shellcheck -s sh deploy/install-site/check-site-smoke.sh
           shellcheck -s sh scripts/funnel-capture.sh
           shellcheck -s sh scripts/funnel-publish.sh
           shellcheck -s sh scripts/funnel-report.sh
@@ -126,6 +128,11 @@ jobs:
         run: bash deploy/quickstart/quickstart-smoke.sh
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
+
+      # A function and the route that reaches it travel separately through the release path, so they
+      # can disagree -- and when they do, every downstream signal still looks correct.
+      - name: install-site consistency smoke
+        run: sh deploy/install-site/check-site-smoke.sh
 
       # The receiver decides what is stored, so its rules are tested rather than reviewed. node --test
       # is built in; there is no package.json and no dependency to install.
