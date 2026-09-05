@@ -121,13 +121,17 @@ final class RowScript {
         Object op = record.get("op");
         Object ts = record.get("ts");
         Object src = record.get("src");
+        // The removal a step before this one declared is carried through. It is the only way a target
+        // hears that a field went, so rebuilding the record without it silently withdraws the statement.
+        // Safe even where the script puts the field back: a removal is only ever applied to a field the
+        // row does not carry, so a re-added one simply stops being a removal.
         return new Envelope(
                 opOf(op, source),
                 ts instanceof Number number ? number.longValue() : source.ts(),
                 src != null ? String.valueOf(src) : source.src(),
                 dataMap(record.get("before")),
                 dataMap(record.get("after")),
-                dataMap(record.get("schema")));
+                dataMap(record.get("schema"))).withRemoved(source.removed());
     }
 
     // The output op: the source's when the script left it alone, else the wire symbol it wrote. An op

@@ -15,6 +15,7 @@ import java.time.ZonedDateTime;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -180,6 +181,39 @@ class TapEventCodecTest {
         TapEvent encoded = TapEventCodec.encode(env);
         assertThat(encoded).isInstanceOf(TapDDLUnknownEvent.class);
         assertThat(TapEventCodec.decodeChange(encoded)).isEqualTo(env);
+    }
+
+    /**
+     * That a producer saying a field is gone reaches the connector as the removal it is.
+     *
+     * <p><b>A field dropped from a row and a field the row never had are the same bytes on the wire, and a
+     * sink cannot tell them apart from the row alone.</b> Every write into a keyed target applies the row by
+     * setting the fields in it, so a field that stops being produced is left standing in the target for ever
+     * - the write succeeds, the row that arrives is correct, and nothing anywhere reports a difference. The
+     * removal has to travel beside the row or it does not travel at all.
+     */
+    @Test
+    void afieldTheProducerDroppedTravelsToTheConnectorAsARemoval() {
+        TapInsertRecordEvent insert = (TapInsertRecordEvent) TapEventCodec.encode(
+                Envelope.insert(1L, "t", Map.of("id", 1), null).withRemoved(Set.of("customer")));
+        assertThat(insert.getRemovedFields())
+                .describedAs("the connector reads this to build the removal; left unset it writes none, and "
+                        + "the target keeps the old value with every other assertion still passing")
+                .containsExactly("customer");
+
+        TapUpdateRecordEvent update = (TapUpdateRecordEvent) TapEventCodec.encode(
+                Envelope.update(1L, "t", Map.of("id", 1), Map.of("id", 1), null)
+                        .withRemoved(Set.of("customer")));
+        assertThat(update.getRemovedFields()).containsExactly("customer");
+    }
+
+    @Test
+    void anEventThatDroppedNothingCarriesNoRemoval() {
+        // Distinct from an empty list on purpose: the connector tests it for emptiness either way, and a
+        // producer that drops nothing should be indistinguishable from one built before this existed.
+        TapInsertRecordEvent insert = (TapInsertRecordEvent)
+                TapEventCodec.encode(Envelope.insert(1L, "t", Map.of("id", 1), null));
+        assertThat(insert.getRemovedFields()).isNullOrEmpty();
     }
 
     @Test

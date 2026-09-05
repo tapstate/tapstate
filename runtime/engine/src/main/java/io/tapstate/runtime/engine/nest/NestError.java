@@ -45,10 +45,27 @@ public enum NestError implements TapstateErrorCode {
     ROOT_KEY_REQUIRED("nest.root-key-required", Set.of("rootAlias")),
 
     /**
-     * Checking the tree: an embed declares no array key and its table offers no primary key to take one
-     * from, leaving its elements with no identity — updates would pile up as duplicates.
+     * Checking the tree: a level declares no key and its stream offers neither a primary key nor a unique
+     * index to take one from, leaving its rows with no identity — updates would pile up as duplicates.
      */
     ARRAY_KEY_UNRESOLVABLE("nest.array-key-unresolvable", Set.of("embedPath", "table")),
+
+    /**
+     * Checking the tree: a level declares no key and its table offers no primary key but more than one
+     * unique index. Each identifies a row equally well, so taking either would settle the identity of the
+     * level on catalog order rather than on anything the author said.
+     */
+    KEY_AMBIGUOUS("nest.key-ambiguous", Set.of("embedPath", "table", "candidates")),
+
+    /**
+     * Checking the tree: a level the document points at has embeds hanging beneath it. A row that is pointed
+     * at belongs to no one document — the same row can sit under thousands at once — so there is no document
+     * for its children to be grouped under and no answer to which of them a change beneath it should reach.
+     * Refused rather than assembled: the two shapes are written identically, and left to compile the rows
+     * beneath would be gathered into state nothing renders from, with every document still going out.
+     */
+    REFERENCED_LEVEL_CARRIES_EMBEDS("nest.referenced-level-carries-embeds",
+            Set.of("embedPath", "table", "children")),
 
     /** Checking the tree: it compiles to more resolver vertices than the limit allows, each taking a thread. */
     RESOLVER_VERTEX_LIMIT_EXCEEDED("nest.resolver-vertex-limit-exceeded", Set.of("vertices", "limit")),
@@ -106,6 +123,27 @@ public enum NestError implements TapstateErrorCode {
      * than by a count.
      */
     ROOT_FANOUT_LIMIT_EXCEEDED("nest.root-fanout-limit-exceeded", Set.of("rootKey", "elements", "limit")),
+
+    /**
+     * Running: more rows point at one row than are allowed to, so editing that row would redraw and write
+     * out that many documents at once.
+     *
+     * <p><b>The only limit here that is not about storage, and the distinction is the whole of why it
+     * exists.</b> The identities pointing at one row are spread over a fixed number of buckets, so what
+     * records them divides and the layer behind the map carries it however many there are - measured by
+     * entry, this is comfortable. What no store can help with is the far end: every identity recorded there
+     * is a whole document to draw again the moment the row is edited, and nothing folds them, because the
+     * throttle opens its window per document and these are a different document each. So what is refused
+     * here is the rewrite. Raising the bucket count does not soften it, and reading this as an entry that
+     * grew too large is what would lead someone to try.
+     *
+     * <p>Weighed on an edit to the row being pointed at rather than as each row registers, because that is
+     * where the count is already in hand. A row can therefore grow past the limit quietly and be refused
+     * only when it is first edited - which is also the first moment the cost this bounds is about to be
+     * paid.
+     */
+    REFERENCE_FANOUT_LIMIT_EXCEEDED("nest.reference-fanout-limit-exceeded",
+            Set.of("refPath", "identity", "referrers", "limit")),
 
     /**
      * Running: one key is holding more changes for something that has not arrived than it is allowed to.

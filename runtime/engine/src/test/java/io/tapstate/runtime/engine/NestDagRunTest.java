@@ -214,6 +214,36 @@ class NestDagRunTest {
         Thread.sleep(LEFT_WAITING.plusSeconds(1).toMillis());
     }
 
+    @Test
+    void aRootBringsInTheRowItPointsAtRatherThanTheRowsThatPointAtIt() {
+        // The other direction: an order names a customer, so the customer is one row shared by many
+        // documents rather than a child grouped under one. Three orders across two customers, and the
+        // count alone tells the two readings apart - grouping on customer_id would produce two.
+        // The two sides are deliberately named differently. Written as one name on both, a reference read
+        // off the wrong side of the join still finds the right value and every assertion here still
+        // passes - so the shape that would prove nothing is the one that looks tidiest.
+        DAG dag = ordersWithCustomers(
+                List.of(row("order_id", 1, "cust_ref", 100, "code", "A"),
+                        row("order_id", 2, "cust_ref", 100, "code", "B"),
+                        row("order_id", 3, "cust_ref", 200, "code", "C")),
+                List.of(row("customer_id", 100, "name", "Ada"),
+                        row("customer_id", 200, "name", "Grace")));
+
+        member.getJet().newJob(dag).join();
+
+        Map<Object, Map<String, Object>> documents = latestPerRoot();
+        assertThat(documents.keySet())
+                .describedAs("one document per order, not one per customer")
+                .containsExactlyInAnyOrder(1, 2, 3);
+        assertThat(customer(documents.get(1)).get("name"))
+                .describedAs("the customer the order points at, fetched rather than routed here")
+                .isEqualTo("Ada");
+        assertThat(customer(documents.get(2)).get("name"))
+                .describedAs("the same customer row reaches a second document")
+                .isEqualTo("Ada");
+        assertThat(customer(documents.get(3)).get("name")).isEqualTo("Grace");
+    }
+
     // ---- the pipeline under test ------------------------------------------------------
 
     /** orders as the root, order_items embedded beneath it as an array at {@code items}. */
@@ -269,6 +299,53 @@ class NestDagRunTest {
         return PipelineDagBuilder.build(pipeline, bindings);
     }
 
+    /**
+     * orders as the root with the customer each one points at placed at {@code customer}. Nothing here
+     * declares a direction: orders.customer_id is not what identifies an order and customers.customer_id
+     * is what identifies a customer, which is the whole of what says which way this embed points.
+     */
+    private static DAG ordersWithCustomers(List<Map<String, Object>> orders,
+            List<Map<String, Object>> customers) {
+        Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
+                "customer", null, null, null, null);
+        TransformBody.Nest body = new TransformBody.Nest(null, null,
+                new NestRoot("order", List.of("order_id"), null, null, List.of(customer)));
+
+        Map<String, FromRef> aliases = new LinkedHashMap<>();
+        aliases.put("order", FromRef.literal("orders"));
+        aliases.put("customer", FromRef.literal("customers"));
+        Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null, null);
+
+        PipelineResource pipeline = new PipelineResource("p", null,
+                List.of("orders", "customers"),
+                List.of(step), null,
+                new ServeBlock.Inline("serve", FromRef.literal("order_doc"),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                null, null);
+
+        Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
+        // The customers are in place before an order asks for one. What wakes a document whose reference
+        // arrives after it is a different mechanism from the one under test here - this case is about the
+        // read finding the row, and holding the orders back is what keeps the two apart.
+        sources.put("orders", rowsSource("orders", orders, false, LATE_ROOT));
+        sources.put("customers", rowsSource("customers", customers, false, Duration.ZERO));
+
+        Map<String, NestTable> tables = new LinkedHashMap<>();
+        tables.put("order", new NestTable("orders", List.of("order_id")));
+        tables.put("customer", new NestTable("customers", List.of("customer_id")));
+
+        DagBindings bindings = new DagBindings(
+                sources::get,
+                s -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
+                syncElement -> (SupplierEx<SinkWriter>) CollectingSinkWriter::new,
+                ref -> List.of(((FromRef.Literal) ref).ref()),
+                new NestBinding(tables::get, HeapNestStores.onHeap(),
+                        (from, released) -> RELEASED.add(released), new CountingFloors(),
+                        NestStateLedger.NONE, NestSettings.defaults(), NestClock.SYSTEM));
+
+        return PipelineDagBuilder.build(pipeline, bindings);
+    }
+
     /** A read side that records that it was bound and then knows nothing, so nothing is ever forgotten. */
     private static final class CountingFloors implements ReplayFloorFactory {
 
@@ -293,6 +370,14 @@ class NestDagRunTest {
             }
         }
         return latest;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> customer(Map<String, Object> document) {
+        assertThat(document).describedAs("no document was assembled for this root").isNotNull();
+        Object embedded = document.get("customer");
+        assertThat(embedded).describedAs("the document carries no customer: %s", document).isNotNull();
+        return (Map<String, Object>) embedded;
     }
 
     @SuppressWarnings("unchecked")

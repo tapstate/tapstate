@@ -37,6 +37,7 @@ import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StorePort;
@@ -803,11 +804,27 @@ final class StoreBackedDagSource implements DagSource {
             // A step id: the stream is another step's output, which has no table key to fall back on.
             return new NestTable(table, List.of());
         }
-        return new NestTable(table, storePort.schemas().get(sourceId)
+        return storePort.schemas().get(sourceId)
                 .map(DiscoveredSourceModel::model)
                 .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(table)).findFirst())
-                .map(SourceTable::primaryKey)
-                .orElse(List.of()));
+                .map(discovered -> new NestTable(table, discovered.primaryKey(), uniqueIndexesOf(discovered)))
+                .orElseGet(() -> new NestTable(table, List.of()));
+    }
+
+    /**
+     * The columns of each unique index on a discovered table, in the order the source reported them. It
+     * is the last place a level's identity can come from when the table declares no primary key, so the
+     * non-unique indexes are dropped here rather than downstream: an index that does not identify a row
+     * is not a candidate, and carrying it further would only give the compiler more to reject.
+     */
+    private static List<List<String>> uniqueIndexesOf(SourceTable table) {
+        List<List<String>> unique = new ArrayList<>();
+        for (SourceIndex index : table.indexes()) {
+            if (index.unique() && !index.fields().isEmpty()) {
+                unique.add(index.fields());
+            }
+        }
+        return unique;
     }
 
     /**

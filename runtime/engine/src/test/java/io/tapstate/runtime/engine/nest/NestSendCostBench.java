@@ -41,7 +41,7 @@ import org.junit.jupiter.api.Test;
  * name keeps it out of the default surefire selection, so it costs a build nothing and is run
  * deliberately:
  *
- * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestSendCostBench -DfailIfNoTests=false}</pre>
+ * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestSendCostBench -Dsurefire.failIfNoSpecifiedTests=false}</pre>
  */
 class NestSendCostBench {
 

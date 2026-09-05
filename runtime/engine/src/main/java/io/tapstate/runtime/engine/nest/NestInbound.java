@@ -24,7 +24,7 @@ import java.util.Objects;
  */
 public record NestInbound(int ordinal, String alias, List<String> pathId, List<String> keyFields,
         List<String> elementKey, boolean tracksKeyChanges, String table,
-        boolean carriesDepartures) implements Serializable {
+        boolean carriesDepartures, boolean carriesTouches) implements Serializable {
 
     public NestInbound {
         Objects.requireNonNull(pathId, "pathId");
@@ -42,18 +42,37 @@ public record NestInbound(int ordinal, String alias, List<String> pathId, List<S
             throw new IllegalArgumentException(
                     "only a stream whose key changes are followed has departures to carry");
         }
+        if (carriesTouches && (carriesDepartures || tracksKeyChanges)) {
+            throw new IllegalArgumentException(
+                    "no row of a stream arrives on a touch edge to track or to re-key");
+        }
     }
 
     /** An edge over rows nobody asked to have key changes followed on - the shape most of them are. */
     public NestInbound(int ordinal, String alias, List<String> pathId, List<String> keyFields,
             List<String> elementKey) {
-        this(ordinal, alias, pathId, keyFields, elementKey, false, null, false);
+        this(ordinal, alias, pathId, keyFields, elementKey, false, null, false, false);
     }
 
     /** An edge carrying rows as they now are, which is what all but the departure edges carry. */
     public NestInbound(int ordinal, String alias, List<String> pathId, List<String> keyFields,
             List<String> elementKey, boolean tracksKeyChanges, String table) {
-        this(ordinal, alias, pathId, keyFields, elementKey, tracksKeyChanges, table, false);
+        this(ordinal, alias, pathId, keyFields, elementKey, tracksKeyChanges, table, false, false);
+    }
+
+    /**
+     * The edge a level is told on that a row it points at has changed. It arrives from the vertex that
+     * files those rows rather than from any source, so the alias it names is the pointed-at stream and is
+     * here for one thing: what a level may promise about a chain is worked out per edge, and this is the
+     * only edge in the whole tree over which that stream's chain ever reaches a document.
+     *
+     * <p>{@code keyFields} names what identifies this level's own rows - the same key the word is routed by.
+     * It is read off the word rather than off a row, because there is no row: the vertex that sends it
+     * worked the key out from what it had recorded about who points where.
+     */
+    public static NestInbound touchesOf(int ordinal, String alias, List<String> pathId,
+            List<String> referrerIdentity) {
+        return new NestInbound(ordinal, alias, pathId, referrerIdentity, List.of(), false, null, false, true);
     }
 
     /**
@@ -70,7 +89,7 @@ public record NestInbound(int ordinal, String alias, List<String> pathId, List<S
      */
     public static NestInbound departuresOf(int ordinal, NestInbound tracked) {
         return new NestInbound(ordinal, tracked.alias(), tracked.pathId(), tracked.keyFields(),
-                tracked.elementKey(), tracked.tracksKeyChanges(), tracked.table(), true);
+                tracked.elementKey(), tracked.tracksKeyChanges(), tracked.table(), true, false);
     }
 
     /** Whether these rows arrive already stamped with the parent key by the vertex one level down. */
