@@ -27,9 +27,9 @@ setup:
     shop: { kind: mysql }
     store: { kind: mongo }
   connectors: [mysql, mongodb]
-  apply: [shop_db.tap.yml, views.tap.yml, order_pipeline.tap.yml]
+  apply: [shop_db.tap.yml, views.tap.yml, join_pipeline.tap.yml]
   discover: [shop_db]
-pipeline: order_pipeline.tap.yml
+pipeline: join_pipeline.tap.yml
 seed:
   shop_db.customers:
     values:
