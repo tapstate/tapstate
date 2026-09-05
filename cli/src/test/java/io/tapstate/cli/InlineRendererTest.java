@@ -1,6 +1,13 @@
 package io.tapstate.cli;
 
 import dev.tamboui.terminal.Frame;
+import dev.tamboui.buffer.Buffer;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Color;
+import dev.tamboui.text.Text;
+import dev.tamboui.widgets.block.Block;
+import dev.tamboui.widgets.block.Borders;
+import dev.tamboui.widgets.paragraph.Paragraph;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -96,6 +103,7 @@ class InlineRendererTest {
     @Test
     void onlyCommandsWithoutTerminalPromptsRunInTheBackground() {
         assertThat(InlineTui.canRunInBackground("ls")).isTrue();
+        assertThat(InlineTui.canRunInBackground("pwd")).isTrue();
         assertThat(InlineTui.canRunInBackground("validate ./work")).isTrue();
         assertThat(InlineTui.canRunInBackground("connect localhost:8081")).isFalse();
         assertThat(InlineTui.canRunInBackground("login admin")).isFalse();
@@ -103,6 +111,31 @@ class InlineRendererTest {
         assertThat(InlineTui.canRunInBackground("context list")).isFalse();
         assertThat(InlineTui.canRunInBackground("auth login admin")).isFalse();
         assertThat(InlineTui.canRunInBackground("exit")).isFalse();
+    }
+
+    @Test
+    void contextArrowsStayInsideTheInlineSelectionSurface() {
+        assertThat(InlinePrompter.selectionAfterKey(0, 2, InlinePrompter.DOWN)).isEqualTo(1);
+        assertThat(InlinePrompter.selectionAfterKey(1, 2, InlinePrompter.DOWN)).isEqualTo(1);
+        assertThat(InlinePrompter.selectionAfterKey(1, 2, InlinePrompter.UP)).isEqualTo(0);
+        assertThat(InlinePrompter.selectionAfterKey(0, 2, InlinePrompter.UP)).isEqualTo(0);
+    }
+
+    @Test
+    void borderlessInputSurfaceStillPaintsItsBackgroundAndCursor() {
+        Color background = Color.rgb(35, 38, 43);
+        Buffer buffer = Buffer.empty(Rect.of(20, 2));
+        Frame frame = Frame.forTesting(buffer);
+
+        frame.renderWidget(Block.builder().borders(Borders.NONE).background(background).build(),
+                new Rect(0, 0, 20, 2));
+        frame.renderWidget(Paragraph.builder()
+                        .text(Text.from("▌").fg(Color.rgb(82, 166, 118)).bg(background))
+                        .background(background)
+                        .build(), new Rect(0, 0, 20, 2));
+
+        assertThat(buffer.get(0, 0).symbol()).isEqualTo("▌");
+        assertThat(buffer.get(19, 0).style().bg()).contains(background);
     }
 
     private static final class RecordingSurface implements InlineRenderer.Surface {

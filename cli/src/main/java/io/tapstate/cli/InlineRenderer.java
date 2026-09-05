@@ -144,6 +144,7 @@ final class InlineRenderer implements AutoCloseable {
 final class InlineTui {
 
     private static final int INPUT_REGION_HEIGHT = 4;
+    private static final int INLINE_REGION_CAPACITY = 12;
     private static final int READ_TIMEOUT_MILLIS = 50;
     private static final int ESCAPE_TIMEOUT_MILLIS = 100;
     private static final int CTRL_C = 3;
@@ -156,14 +157,16 @@ final class InlineTui {
 
     private static final dev.tamboui.style.Color INPUT_BACKGROUND =
             dev.tamboui.style.Color.rgb(35, 38, 43);
-    private static final dev.tamboui.style.Color INPUT_BORDER =
-            dev.tamboui.style.Color.rgb(112, 118, 130);
     private static final dev.tamboui.style.Color INPUT_FOREGROUND =
             dev.tamboui.style.Color.rgb(226, 229, 235);
+    private static final dev.tamboui.style.Color ACCENT_FOREGROUND =
+            dev.tamboui.style.Color.rgb(180, 155, 224);
     private static final dev.tamboui.style.Color HINT_FOREGROUND =
             dev.tamboui.style.Color.rgb(138, 145, 156);
     private static final dev.tamboui.style.Color CURSOR_FOREGROUND =
             dev.tamboui.style.Color.rgb(82, 166, 118);
+    private static final dev.tamboui.style.Color SELECTION_BACKGROUND =
+            dev.tamboui.style.Color.rgb(62, 64, 70);
 
     private final Repl repl;
     private final java.io.StringWriter capturedOut;
@@ -176,7 +179,7 @@ final class InlineTui {
     private dev.tamboui.backend.jline3.JLineBackend backend;
     private org.jline.utils.NonBlockingReader reader;
     private InlineRenderer renderer;
-    private JLinePrompter prompter;
+    private InlinePrompter prompter;
     private java.util.concurrent.ExecutorService operationExecutor;
     private java.util.concurrent.Future<Boolean> activeOperation;
     private int runningFrame;
@@ -206,7 +209,7 @@ final class InlineTui {
         String verb = trimmed.split("\\s+", 2)[0];
         return switch (verb) {
             case "auth", "cd", "connect", "context", "disconnect", "exit", "login", "logout",
-                    "new", "pwd", "quit", ":ctx" -> false;
+                    "new", "quit", ":ctx" -> false;
             default -> true;
         };
     }
@@ -219,9 +222,23 @@ final class InlineTui {
             backend.onResize(() -> resizeRequested = true);
             backend.enableRawMode();
             reader = terminal.reader();
-            prompter = new JLinePrompter(terminal, false);
+            renderer = InlineRenderer.open(backend, INLINE_REGION_CAPACITY);
+            prompter = new InlinePrompter(
+                    this::nextInputCode,
+                    new InlinePrompter.View() {
+                        @Override
+                        public void showInput(String question, String value, int cursor,
+                                              String defaultValue, boolean secret) {
+                            renderPromptInput(question, value, cursor, defaultValue, secret);
+                        }
+
+                        @Override
+                        public void showChoices(String question, java.util.List<String> options,
+                                                int selected, String query) {
+                            renderPromptChoices(question, options, selected, query);
+                        }
+                    });
             repl.installPrompterIfMissing(prompter);
-            renderer = InlineRenderer.open(backend, INPUT_REGION_HEIGHT);
             operationExecutor = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
                 Thread worker = new Thread(task, "tapstate-inline-operation");
                 worker.setDaemon(true);
@@ -329,9 +346,6 @@ final class InlineTui {
                     // Terminal restoration is best effort during shutdown.
                 }
             }
-            if (prompter != null) {
-                prompter.close();
-            }
             if (operationExecutor != null) {
                 operationExecutor.shutdownNow();
             }
@@ -353,7 +367,10 @@ final class InlineTui {
             renderRunning();
             return false;
         }
-        renderRunning();
+        // Prompting commands use the same reader and renderer through InlinePrompter. Leaving a
+        // running widget mounted here would let a second prompt move the temporary region into
+        // scrollback and would put two cursor owners on the terminal.
+        renderer.clear();
         boolean keepRunning = repl.dispatch(line);
         renderer.clear();
         commitCaptured();
@@ -406,17 +423,11 @@ final class InlineTui {
     private void renderInput() {
         renderer.update(frame -> {
             dev.tamboui.layout.Rect area = frame.area();
-            int inputHeight = Math.min(3, area.height());
+            int inputHeight = Math.min(2, area.height());
             dev.tamboui.layout.Rect inputArea = new dev.tamboui.layout.Rect(
                     area.x(), area.y(), area.width(), inputHeight);
-            dev.tamboui.widgets.block.Block block = dev.tamboui.widgets.block.Block.builder()
-                    .borderType(dev.tamboui.widgets.block.BorderType.ROUNDED)
-                    .borders(dev.tamboui.widgets.block.Borders.ALL)
-                    .borderColor(INPUT_BORDER)
-                    .background(INPUT_BACKGROUND)
-                    .build();
-            frame.renderWidget(block, inputArea);
-            dev.tamboui.layout.Rect content = block.inner(inputArea);
+            renderInputBackground(frame, inputArea);
+            dev.tamboui.layout.Rect content = inputArea;
             if (!content.isEmpty()) {
                 dev.tamboui.text.Text text = dev.tamboui.text.Text.from(input.toString())
                         .fg(INPUT_FOREGROUND)
@@ -433,11 +444,7 @@ final class InlineTui {
             if (area.height() > inputHeight) {
                 dev.tamboui.layout.Rect hintArea = new dev.tamboui.layout.Rect(
                         area.x(), area.y() + inputHeight, area.width(), 1);
-                frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
-                        .text(dev.tamboui.text.Text.from("Enter run  ·  Ctrl-C clear  ·  Ctrl-D exit")
-                                .fg(HINT_FOREGROUND))
-                        .overflow(dev.tamboui.style.Overflow.CLIP)
-                        .build(), hintArea);
+                renderStatus(frame, hintArea, "Enter run  ·  Ctrl-C clear  ·  Ctrl-D exit");
             }
         }, INPUT_REGION_HEIGHT);
     }
@@ -447,17 +454,11 @@ final class InlineTui {
         String status = cancelRequested ? frame + " Cancelling…" : frame + " Running…";
         renderer.update(view -> {
             dev.tamboui.layout.Rect area = view.area();
-            int inputHeight = Math.min(3, area.height());
+            int inputHeight = Math.min(2, area.height());
             dev.tamboui.layout.Rect inputArea = new dev.tamboui.layout.Rect(
                     area.x(), area.y(), area.width(), inputHeight);
-            dev.tamboui.widgets.block.Block block = dev.tamboui.widgets.block.Block.builder()
-                    .borderType(dev.tamboui.widgets.block.BorderType.ROUNDED)
-                    .borders(dev.tamboui.widgets.block.Borders.ALL)
-                    .borderColor(INPUT_BORDER)
-                    .background(INPUT_BACKGROUND)
-                    .build();
-            view.renderWidget(block, inputArea);
-            dev.tamboui.layout.Rect content = block.inner(inputArea);
+            renderInputBackground(view, inputArea);
+            dev.tamboui.layout.Rect content = inputArea;
             if (!content.isEmpty()) {
                 view.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
                         .text(dev.tamboui.text.Text.from(status)
@@ -470,15 +471,138 @@ final class InlineTui {
             if (area.height() > inputHeight) {
                 dev.tamboui.layout.Rect hintArea = new dev.tamboui.layout.Rect(
                         area.x(), area.y() + inputHeight, area.width(), 1);
-                view.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
-                        .text(dev.tamboui.text.Text.from(cancelRequested
-                                        ? "Ctrl-C cancelling  ·  Please wait"
-                                        : "Ctrl-C cancel  ·  Please wait")
-                                .fg(HINT_FOREGROUND))
-                        .overflow(dev.tamboui.style.Overflow.CLIP)
-                        .build(), hintArea);
+                renderStatus(view, hintArea, cancelRequested
+                        ? "Ctrl-C cancelling  ·  Please wait"
+                        : "Ctrl-C cancel  ·  Please wait");
             }
         }, INPUT_REGION_HEIGHT);
+    }
+
+    private void renderPromptInput(String question, String value, int cursor, String defaultValue,
+                                   boolean secret) {
+        renderer.update(frame -> {
+            dev.tamboui.layout.Rect area = frame.area();
+            int inputHeight = Math.min(2, area.height());
+            if (area.height() > 0) {
+                frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
+                        .text(dev.tamboui.text.Text.from(question).fg(ACCENT_FOREGROUND).bold())
+                        .overflow(dev.tamboui.style.Overflow.CLIP)
+                        .build(), new dev.tamboui.layout.Rect(area.x(), area.y(), area.width(), 1));
+            }
+            if (area.height() > 1) {
+                dev.tamboui.layout.Rect inputArea = new dev.tamboui.layout.Rect(
+                        area.x(), area.y() + 1, area.width(), inputHeight - 1);
+                renderInputBackground(frame, inputArea);
+                renderCursorText(frame, inputArea, value, cursor, secret);
+            }
+            if (area.height() > 2) {
+                String hint = defaultValue == null || defaultValue.isEmpty()
+                        ? "Enter submit  ·  Esc cancel"
+                        : "Enter submit  ·  Esc cancel  ·  default " + defaultValue;
+                renderStatus(frame, new dev.tamboui.layout.Rect(
+                        area.x(), area.bottom() - 1, area.width(), 1), hint);
+            }
+        }, INPUT_REGION_HEIGHT);
+    }
+
+    private void renderPromptChoices(String question, java.util.List<String> options, int selected,
+                                     String query) {
+        renderer.update(frame -> {
+            dev.tamboui.layout.Rect area = frame.area();
+            if (area.height() == 0) {
+                return;
+            }
+            frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
+                    .text(dev.tamboui.text.Text.from(question).fg(ACCENT_FOREGROUND).bold())
+                    .overflow(dev.tamboui.style.Overflow.CLIP)
+                    .build(), new dev.tamboui.layout.Rect(area.x(), area.y(), area.width(), 1));
+            int visible = Math.max(1, Math.min(options.size(), area.height() - 2));
+            int start = Math.min(Math.max(0, selected - visible + 1), options.size() - visible);
+            for (int row = 0; row < visible; row++) {
+                int index = start + row;
+                boolean active = index == selected;
+                dev.tamboui.text.Text option = dev.tamboui.text.Text.from(
+                        (active ? "› " : "  ") + options.get(index))
+                        .fg(active ? INPUT_FOREGROUND : HINT_FOREGROUND)
+                        .bg(active ? SELECTION_BACKGROUND : INPUT_BACKGROUND);
+                frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
+                        .text(option)
+                        .background(active ? SELECTION_BACKGROUND : INPUT_BACKGROUND)
+                        .overflow(dev.tamboui.style.Overflow.CLIP)
+                        .build(), new dev.tamboui.layout.Rect(
+                                area.x(), area.y() + 1 + row, area.width(), 1));
+            }
+            String hint = "↑↓ choose  ·  Enter select  ·  Esc cancel";
+            if (query != null && !query.isEmpty()) {
+                hint += "  ·  " + query;
+            }
+            renderStatus(frame, new dev.tamboui.layout.Rect(
+                    area.x(), area.bottom() - 1, area.width(), 1), hint);
+        }, Math.min(INLINE_REGION_CAPACITY, Math.max(4, options.size() + 2)));
+    }
+
+    private static void renderInputBackground(dev.tamboui.terminal.Frame frame,
+                                              dev.tamboui.layout.Rect area) {
+        if (!area.isEmpty()) {
+            frame.renderWidget(dev.tamboui.widgets.block.Block.builder()
+                    .borders(dev.tamboui.widgets.block.Borders.NONE)
+                    .background(INPUT_BACKGROUND)
+                    .build(), area);
+        }
+    }
+
+    private static void renderCursorText(dev.tamboui.terminal.Frame frame,
+                                         dev.tamboui.layout.Rect area, String value, int cursor,
+                                         boolean secret) {
+        if (area.isEmpty()) {
+            return;
+        }
+        String shown = secret ? "*".repeat(value.codePointCount(0, value.length())) : value;
+        int safeCursor = Math.max(0, Math.min(cursor, value.length()));
+        int visibleCursor = secret ? value.codePointCount(0, safeCursor) : safeCursor;
+        String prefix = shown.substring(0, Math.min(visibleCursor, shown.length()));
+        String suffix = shown.substring(Math.min(visibleCursor, shown.length()));
+        dev.tamboui.text.Text text = dev.tamboui.text.Text.from(prefix)
+                .fg(INPUT_FOREGROUND)
+                .bg(INPUT_BACKGROUND)
+                .append(dev.tamboui.text.Text.from("▌")
+                        .fg(CURSOR_FOREGROUND)
+                        .bg(INPUT_BACKGROUND))
+                .append(dev.tamboui.text.Text.from(suffix)
+                        .fg(INPUT_FOREGROUND)
+                        .bg(INPUT_BACKGROUND));
+        frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
+                .text(text)
+                .overflow(dev.tamboui.style.Overflow.CLIP)
+                .background(INPUT_BACKGROUND)
+                .build(), area);
+    }
+
+    private void renderStatus(dev.tamboui.terminal.Frame frame, dev.tamboui.layout.Rect area,
+                              String controls) {
+        dev.tamboui.text.Text status = dev.tamboui.text.Text.from(
+                "local  ·  dir " + compactWorkdir() + "  ·  " + controls)
+                .fg(HINT_FOREGROUND);
+        frame.renderWidget(dev.tamboui.widgets.paragraph.Paragraph.builder()
+                .text(status)
+                .overflow(dev.tamboui.style.Overflow.CLIP)
+                .build(), area);
+    }
+
+    private String compactWorkdir() {
+        java.nio.file.Path current = repl.workdir().toAbsolutePath().normalize();
+        java.nio.file.Path home = java.nio.file.Path.of(System.getProperty("user.home"))
+                .toAbsolutePath().normalize();
+        if (current.startsWith(home)) {
+            java.nio.file.Path relative = home.relativize(current);
+            String value = relative.toString().replace(java.io.File.separatorChar, '/');
+            if (value.isEmpty()) {
+                return "~";
+            }
+            String[] parts = value.split("/");
+            return parts.length > 3 ? "~/…/" + parts[parts.length - 1] : "~/" + value;
+        }
+        return current.toString();
     }
 
     private void renderActiveRegion() {
@@ -523,6 +647,234 @@ final class InlineTui {
             return deferredInput.removeFirst();
         }
         return reader.read(timeoutMillis);
+    }
+}
+
+/**
+ * Prompt adapter for the inline session. It shares the session reader and renderer, so a context
+ * picker never starts a second line editor or lets navigation keys reach the outer command bar.
+ */
+final class InlinePrompter implements Prompter {
+
+    static final int UP = -10;
+    static final int DOWN = -11;
+    private static final int LEFT = -12;
+    private static final int RIGHT = -13;
+    private static final int HOME = -14;
+    private static final int END = -15;
+    private static final int READ_TIMEOUT_MILLIS = 50;
+    private static final int ESCAPE_TIMEOUT_MILLIS = 100;
+    private static final int CTRL_C = 3;
+    private static final int CTRL_D = 4;
+    private static final int BACKSPACE = 8;
+    private static final int DELETE = 127;
+    private static final int ENTER = 13;
+    private static final int ESCAPE = 27;
+
+    @FunctionalInterface
+    interface KeyReader {
+        int read(int timeoutMillis) throws IOException;
+    }
+
+    interface View {
+        void showInput(String question, String value, int cursor, String defaultValue, boolean secret);
+
+        void showChoices(String question, java.util.List<String> options, int selected, String query);
+    }
+
+    private final KeyReader reader;
+    private final View view;
+    private boolean cancelled;
+
+    InlinePrompter(KeyReader reader, View view) {
+        this.reader = java.util.Objects.requireNonNull(reader, "reader");
+        this.view = java.util.Objects.requireNonNull(view, "view");
+    }
+
+    @Override
+    public String ask(String question, String defaultValue) {
+        return readLine(question, defaultValue, false, true);
+    }
+
+    @Override
+    public String secret(String question) {
+        return readLine(question, null, true, false);
+    }
+
+    @Override
+    public String choose(String question, java.util.List<String> options) {
+        if (options == null || options.isEmpty()) {
+            return "";
+        }
+        int selected = 0;
+        StringBuilder query = new StringBuilder();
+        view.showChoices(question, options, selected, query.toString());
+        while (true) {
+            int key = nextKey();
+            switch (key) {
+                case UP, DOWN -> selected = selectionAfterKey(selected, options.size(), key);
+                case ENTER, 10 -> {
+                    return options.get(selected);
+                }
+                case ESCAPE, CTRL_C, CTRL_D -> {
+                    return options.get(options.size() - 1);
+                }
+                case BACKSPACE, DELETE -> removeLastCodePoint(query);
+                default -> {
+                    if (key >= 32) {
+                        query.appendCodePoint(key);
+                        selected = matchingSelection(options, query.toString(), selected);
+                    }
+                }
+            }
+            view.showChoices(question, options, selected, query.toString());
+        }
+    }
+
+    @Override
+    public String lines(String question) {
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        while (true) {
+            String line = readLine(question + " (end with a single '.' on its own line)",
+                    null, false, false);
+            if (cancelled || line.strip().equals(".")) {
+                return String.join("\n", lines);
+            }
+            lines.add(line);
+        }
+    }
+
+    static int selectionAfterKey(int current, int size, int key) {
+        if (size <= 0) {
+            return 0;
+        }
+        if (key == DOWN) {
+            return Math.min(size - 1, Math.max(0, current) + 1);
+        }
+        if (key == UP) {
+            return Math.max(0, Math.min(size - 1, current) - 1);
+        }
+        return Math.max(0, Math.min(size - 1, current));
+    }
+
+    private String readLine(String question, String defaultValue, boolean secret, boolean trim) {
+        StringBuilder value = new StringBuilder();
+        int cursor = 0;
+        cancelled = false;
+        view.showInput(question, value.toString(), cursor, defaultValue, secret);
+        while (true) {
+            int key = nextKey();
+            switch (key) {
+                case ENTER, 10 -> {
+                    return trim ? value.toString().trim() : value.toString();
+                }
+                case ESCAPE, CTRL_C, CTRL_D -> {
+                    cancelled = true;
+                    return "";
+                }
+                case BACKSPACE -> {
+                    if (cursor > 0) {
+                        int previous = value.offsetByCodePoints(cursor, -1);
+                        value.delete(previous, cursor);
+                        cursor = previous;
+                    }
+                }
+                case DELETE -> {
+                    if (cursor < value.length()) {
+                        int next = value.offsetByCodePoints(cursor, 1);
+                        value.delete(cursor, next);
+                    }
+                }
+                case LEFT -> cursor = value.offsetByCodePoints(cursor, -1);
+                case RIGHT -> cursor = value.offsetByCodePoints(cursor, 1);
+                case HOME -> cursor = 0;
+                case END -> cursor = value.length();
+                case UP, DOWN -> {
+                    // Vertical navigation belongs to a choice surface, not a text prompt.
+                }
+                default -> {
+                    if (key >= 32) {
+                        char[] codePoint = Character.toChars(key);
+                        value.insert(cursor, codePoint);
+                        cursor += codePoint.length;
+                    }
+                }
+            }
+            view.showInput(question, value.toString(), cursor, defaultValue, secret);
+        }
+    }
+
+    private int nextKey() {
+        try {
+            while (true) {
+                int key = reader.read(READ_TIMEOUT_MILLIS);
+                if (key == org.jline.utils.NonBlockingReader.READ_EXPIRED) {
+                    continue;
+                }
+                if (key == org.jline.utils.NonBlockingReader.EOF) {
+                    return CTRL_D;
+                }
+                if (key != ESCAPE) {
+                    return key;
+                }
+                return readEscapeKey();
+            }
+        } catch (IOException failure) {
+            throw new java.io.UncheckedIOException(failure);
+        }
+    }
+
+    private int readEscapeKey() throws IOException {
+        int next = reader.read(ESCAPE_TIMEOUT_MILLIS);
+        if (next == org.jline.utils.NonBlockingReader.READ_EXPIRED
+                || next == org.jline.utils.NonBlockingReader.EOF) {
+            return ESCAPE;
+        }
+        if (next != '[' && next != 'O') {
+            return ESCAPE;
+        }
+        while (true) {
+            int tail = reader.read(ESCAPE_TIMEOUT_MILLIS);
+            if (tail == org.jline.utils.NonBlockingReader.READ_EXPIRED
+                    || tail == org.jline.utils.NonBlockingReader.EOF) {
+                return ESCAPE;
+            }
+            if ((tail >= 'A' && tail <= 'Z') || (tail >= 'a' && tail <= 'z') || tail == '~') {
+                return switch (tail) {
+                    case 'A' -> UP;
+                    case 'B' -> DOWN;
+                    case 'C' -> RIGHT;
+                    case 'D' -> LEFT;
+                    case 'H' -> HOME;
+                    case 'F' -> END;
+                    default -> ESCAPE;
+                };
+            }
+        }
+    }
+
+    private static int matchingSelection(java.util.List<String> options, String query, int fallback) {
+        try {
+            int number = Integer.parseInt(query);
+            if (number >= 1 && number <= options.size()) {
+                return number - 1;
+            }
+        } catch (NumberFormatException ignored) {
+            // Text queries are matched below.
+        }
+        String normalized = query.toLowerCase(java.util.Locale.ROOT);
+        for (int i = 0; i < options.size(); i++) {
+            if (options.get(i).toLowerCase(java.util.Locale.ROOT).startsWith(normalized)) {
+                return i;
+            }
+        }
+        return fallback;
+    }
+
+    private static void removeLastCodePoint(StringBuilder value) {
+        if (!value.isEmpty()) {
+            value.deleteCharAt(value.offsetByCodePoints(value.length(), -1));
+        }
     }
 }
 
