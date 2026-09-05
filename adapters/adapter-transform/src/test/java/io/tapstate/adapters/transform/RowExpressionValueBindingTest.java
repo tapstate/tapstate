@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.TransformBody;
@@ -31,6 +32,20 @@ import org.junit.jupiter.api.Test;
  * stated it.
  */
 class RowExpressionValueBindingTest {
+
+    @Test
+    @DisplayName("a value a connector converted is compared as the value, not as what carries it")
+    void aCarriedValueIsBoundAsTheValueInside() {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("_id", new ConvertedValue("64f0c0de", "the-driver-object"));
+        row.put("tags", List.of(new ConvertedValue("eu", "the-driver-object")));
+
+        // The failure this pins is the quiet one: an expression over a carrier neither fails nor warns,
+        // it is simply false for every row - so a filter drops everything and a computed flag is never
+        // set, both looking exactly like data that did not match.
+        assertThat(compute("hit", "after._id == \'64f0c0de\'", row).get("hit")).isEqualTo(true);
+        assertThat(compute("first", "after.tags[0]", row).get("first")).isEqualTo("eu");
+    }
 
     private static TransformPort map(String field, FieldRule rule) {
         LinkedHashMap<String, FieldRule> fields = new LinkedHashMap<>();

@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.ToTapValueCodec;
@@ -190,7 +191,11 @@ public final class TapEventCodec {
         }
         converted.setOriginValue(value);
         converted.setOriginType(value.getClass().getSimpleName());
-        return converted;
+        // Handed on inside a carrier the rest of the tree can name. The conversion's own type belongs
+        // to the connector contract, which only this module may reference, and a row travels through
+        // rings that may not - so what travels is the portable result plus the object it came from,
+        // and the reader that needs the second one is the only one that knows what it is.
+        return new ConvertedValue(converted.getValue(), converted);
     }
 
     /**
@@ -213,9 +218,15 @@ public final class TapEventCodec {
         };
     }
 
-    /** A fresh mutable copy PDK can write through in place, or {@code null} when the map is absent. */
+    /**
+     * A fresh mutable copy PDK can write through in place, or {@code null} when the map is absent.
+     *
+     * <p>Carriers are unwrapped on the way out: what a target is handed is the value, not the box a
+     * row travelled in. This restores what the value looked like to a target before conversions were
+     * applied at all - a key arrives as its text. Handing the box on instead would write the box.
+     */
     private static Map<String, Object> mutable(Map<String, Object> map) {
-        return map == null ? null : new LinkedHashMap<>(map);
+        return map == null ? null : new LinkedHashMap<>(ConvertedValue.unwrapRow(map));
     }
 
     /**

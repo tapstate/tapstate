@@ -21,11 +21,11 @@ import io.tapstate.spi.store.DataBrowserQuery;
 import io.tapstate.spi.store.FieldPath;
 import io.tapstate.spi.store.DataBrowserSubscription;
 import io.tapstate.spi.store.DataBrowserTailRequest;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.spi.store.DataBrowserSort;
 import io.tapstate.spi.store.DataBrowserTableInfo;
 import io.tapdata.pdk.apis.entity.ExecuteResult;
 import io.tapdata.entity.schema.TapTable;
-import io.tapdata.entity.schema.value.TapValue;
 import io.tapdata.pdk.apis.entity.TapExecuteCommand;
 import io.tapdata.pdk.apis.functions.connection.GetTableInfoFunction;
 import io.tapdata.pdk.apis.functions.connection.GetTableNamesFunction;
@@ -305,7 +305,7 @@ public final class PdkDataBrowser implements DataBrowser {
             // A value the connector converted for travel renders as what it converted it to, not as
             // the carrier around it: the carrier's own text spells out its internals and would read
             // as neither the value nor the shape the other face shows.
-            case TapValue<?, ?> carried -> writableValue(carried.getValue());
+            case ConvertedValue carried -> writableValue(carried.value());
             case String text -> text;
             case Number number -> number;
             case Boolean flag -> flag;

@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import io.tapstate.core.event.ConvertedValue;
 import java.util.Objects;
 
 /** Reading the few things a nest vertex needs off an event, the same way at every vertex. */
@@ -27,7 +28,11 @@ final class NestKeys {
     static List<Object> valuesOf(Map<String, Object> row, List<String> fields) {
         List<Object> values = new ArrayList<>(fields.size());
         for (String field : fields) {
-            values.add(row.get(field));
+            // Unwrapped: a value a connector converted travels in a carrier, and a carrier has no
+            // equality of its own - two of them holding the same key are different objects. A key built
+            // from one matches nothing, on either side of the join, and nothing reports it: the join
+            // runs, the rows arrive, and the document simply never fills in.
+            values.add(ConvertedValue.unwrap(row.get(field)));
         }
         return Collections.unmodifiableList(values);
     }

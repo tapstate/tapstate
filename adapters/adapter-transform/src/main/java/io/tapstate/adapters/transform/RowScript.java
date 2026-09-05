@@ -1,5 +1,6 @@
 package io.tapstate.adapters.transform;
 
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import java.util.ArrayList;
@@ -108,8 +109,11 @@ final class RowScript {
         record.put("op", event.op().symbol());
         record.put("ts", event.ts());
         record.put("src", event.src());
-        record.put("before", event.before());
-        record.put("after", event.after());
+        // Unwrapped: a guest sees a carrier as an opaque host object, so `after._id === "64f0..."` is
+        // false for every row and the script neither fails nor warns. The carrier does not survive the
+        // round trip - a script rebuilds the whole record, so every value it hands back is a new one.
+        record.put("before", ConvertedValue.unwrapRow(event.before()));
+        record.put("after", ConvertedValue.unwrapRow(event.after()));
         record.put("schema", event.schema());
         return record;
     }

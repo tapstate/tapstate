@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
@@ -175,8 +176,8 @@ class TapEventValueModelTest {
         // type only that driver's client knows - each one rendering it however its own serializer
         // happened to, which is how one row came to read two ways.
         assertThat(env.after().get("_id"))
-                .isInstanceOf(TapValue.class)
-                .extracting(value -> ((TapValue<?, ?>) value).getValue())
+                .isInstanceOf(ConvertedValue.class)
+                .extracting(value -> ((ConvertedValue) value).value())
                 .isEqualTo("64f0c0de");
     }
 
@@ -189,9 +190,9 @@ class TapEventValueModelTest {
         // A sink of the same kind puts the value back the way it arrived by reading these two. Without
         // them the write side has only the text and writes a key as a string - silently, and only on
         // the target, where the read-side cases cannot see it.
-        TapValue<?, ?> carried = (TapValue<?, ?>) env.after().get("_id");
-        assertThat(carried.getOriginValue()).isSameAs(key);
-        assertThat(carried.getOriginType()).isEqualTo("DriverKey");
+        TapValue<?, ?> origin = (TapValue<?, ?>) ((ConvertedValue) env.after().get("_id")).origin();
+        assertThat(origin.getOriginValue()).isSameAs(key);
+        assertThat(origin.getOriginType()).isEqualTo("DriverKey");
     }
 
     @Test
@@ -201,9 +202,9 @@ class TapEventValueModelTest {
         // The frozen surface registers nothing for these on purpose. Wrapping them anyway would pay a
         // carrier per value for a conversion that does not exist, and would make the row uniform by
         // spending exactly what the surface declines to spend.
-        assertThat(env.after().get("qty")).isEqualTo(5L).isNotInstanceOf(TapValue.class);
-        assertThat(env.after().get("amount")).isEqualTo(new BigDecimal("1.50")).isNotInstanceOf(TapValue.class);
-        assertThat(env.after().get("name")).isEqualTo("eu").isNotInstanceOf(TapValue.class);
+        assertThat(env.after().get("qty")).isEqualTo(5L).isNotInstanceOf(ConvertedValue.class);
+        assertThat(env.after().get("amount")).isEqualTo(new BigDecimal("1.50")).isNotInstanceOf(ConvertedValue.class);
+        assertThat(env.after().get("name")).isEqualTo("eu").isNotInstanceOf(ConvertedValue.class);
     }
 
     @Test
@@ -215,11 +216,11 @@ class TapEventValueModelTest {
         // A key one level down is as reachable from a reader as a top-level one, and a lane that
         // stopped at the top would leave the same two-shapes problem intact everywhere but there.
         assertThat(((Map<?, ?>) env.after().get("doc")).get("_id"))
-                .isInstanceOf(TapValue.class)
-                .extracting(value -> ((TapValue<?, ?>) value).getValue()).isEqualTo("aa");
+                .isInstanceOf(ConvertedValue.class)
+                .extracting(value -> ((ConvertedValue) value).value()).isEqualTo("aa");
         assertThat(((List<?>) env.after().get("keys")).get(0))
-                .isInstanceOf(TapValue.class)
-                .extracting(value -> ((TapValue<?, ?>) value).getValue()).isEqualTo("bb");
+                .isInstanceOf(ConvertedValue.class)
+                .extracting(value -> ((ConvertedValue) value).value()).isEqualTo("bb");
     }
 
     @Test
@@ -232,7 +233,7 @@ class TapEventValueModelTest {
         // Which lane a value takes is the connector's answer and nothing else's. Were the registry
         // ignored - a shared one, a default one, one built on the spot - both sides would agree here
         // and every case above would still pass, since they all use the one registry.
-        assertThat(registered.after().get("_id")).isInstanceOf(TapValue.class);
+        assertThat(registered.after().get("_id")).isInstanceOf(ConvertedValue.class);
         assertThat(none.after().get("_id")).isInstanceOf(DriverKey.class);
     }
 
@@ -246,6 +247,18 @@ class TapEventValueModelTest {
         // observable: a full row of already-converted values must cost nothing per container. Nothing
         // in the build measures allocation, so losing this would be silent until a large read.
         assertThat(env.after().get("doc")).isSameAs(doc);
+    }
+
+    @Test
+    void whatATargetIsHandedIsTheValue() {
+        Envelope decoded = insert(row("_id", new DriverKey("64f0c0de"), "qty", 5));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        // A target writes what it is given. Handed the box a value travelled in, it writes the box -
+        // and the row lands, the write reports success, and only the target's own contents are wrong.
+        assertThat(encoded.getAfter().get("_id")).isEqualTo("64f0c0de");
+        assertThat(encoded.getAfter().get("qty")).isEqualTo(5L);
     }
 
     private static Envelope insert(Map<String, Object> after) {

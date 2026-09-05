@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.transform.TransformPort;
@@ -28,6 +29,23 @@ class JsTransformTest {
 
     private static Map<String, Object> after(Envelope out) {
         return out.after();
+    }
+
+    @Test
+    @DisplayName("a value a connector converted reaches the script as the value, not as a host object")
+    void aCarriedValueReachesTheScriptAsTheValue() {
+        TransformPort js = js(
+                "function process(r, ctx) { r.after.hit = (r.after._id === '64f0c0de'); return r; }");
+        Envelope row = Envelope.insert(1L, "orders", new LinkedHashMap<>(
+                Map.of("_id", new ConvertedValue("64f0c0de", "the-driver-object"))), null);
+
+        // A guest cannot see into a host object it was not taught about, so the comparison is false for
+        // every row - and a script that neither throws nor logs is indistinguishable from data that
+        // genuinely did not match. Unlike the expression seam, a script rebuilds the whole record, so
+        // this is also where every field stops carrying what a target would use to write it back.
+        assertThat(after(js.transform(row).get(0)))
+                .containsEntry("hit", true)
+                .containsEntry("_id", "64f0c0de");
     }
 
     @Test
