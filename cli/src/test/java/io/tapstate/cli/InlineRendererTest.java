@@ -124,16 +124,18 @@ class InlineRendererTest {
         Color background = Color.rgb(35, 38, 43);
         Buffer buffer = Buffer.empty(Rect.of(20, 2));
         Frame frame = Frame.forTesting(buffer);
+        Rect textArea = new Rect(0, 0, 19, 2);
 
         InlineTui.fillBackground(frame, new Rect(0, 0, 20, 2), background);
         frame.renderWidget(Paragraph.builder()
                         .text(Text.from("▌").fg(Color.rgb(82, 166, 118)).bg(background))
                         .background(background)
-                        .build(), new Rect(0, 0, 20, 2));
+                        .build(), textArea);
 
         assertThat(buffer.get(0, 0).symbol()).isEqualTo("▌");
-        assertThat(buffer.get(19, 0).symbol()).isEqualTo("\u00a0");
-        assertThat(buffer.get(19, 0).style().bg()).contains(background);
+        assertThat(buffer.get(18, 0).symbol()).isEqualTo("\u00a0");
+        assertThat(buffer.get(18, 0).style().bg()).contains(background);
+        assertThat(buffer.get(19, 0).symbol()).isEqualTo(" ");
         assertThat(buffer.toAnsiStringTrimmed()).contains("\u00a0");
     }
 
