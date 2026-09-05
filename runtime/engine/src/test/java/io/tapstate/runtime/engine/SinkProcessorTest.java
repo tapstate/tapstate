@@ -381,6 +381,28 @@ class SinkProcessorTest {
     }
 
     @Test
+    void a_snapshot_row_is_acked_when_a_change_above_it_settles_in_the_same_batch() throws Exception {
+        RecordingAck ack = new RecordingAck();
+        // A batch wide enough to hold a table's whole load and the first change above it. That is the
+        // ordinary shape rather than an edge case: the load is handed over ahead of the tail through one
+        // buffer, so the two meet inside one batch whenever the batch is the larger of the two.
+        SinkProcessor processor = init(new SinkProcessor(
+                new RecordingWriter(), ack, new ContiguousPrefix(AXES), 1, 4));
+
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(snapshotRow("orders"), snapshotRow("orders"), at("orders", "p1")));
+        pump(processor, inbox);
+
+        // Reduced to the batch's highest position, the snapshot position is never open and so is never
+        // acked -- and that ack is the one moment anything records this table's load as having reached the
+        // target. A load nothing records is read again in full by every run that follows, with the pipeline
+        // healthy and nothing logged.
+        assertThat(ack.positions).extracting(ChainPosition::order)
+                .as("the snapshot position is acked in its own right, not passed over by the change above it")
+                .contains(SourceOrder.snapshotRow(1));
+    }
+
+    @Test
     void a_bound_that_arrives_before_the_write_settles_still_acks_once_it_does() throws Exception {
         RecordingAck ack = new RecordingAck();
         ManualWriter writer = new ManualWriter();

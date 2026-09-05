@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceOrder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -54,27 +55,50 @@ final class ContiguousPrefix implements SinkFrontier {
     }
 
     /**
-     * The last position each chain contributes to this batch. Under the single-in-flight, order-preserving
-     * contract a chain's last event in the batch is its highest position there. An event a transform built
-     * carries no position of its own and does not take part: it inherits one a real event already reported.
+     * The last position each chain contributes to this batch, preceded by that chain's snapshot position
+     * when the batch carries it beneath something higher.
+     *
+     * <p>Under the single-in-flight, order-preserving contract a chain's last event in the batch is its
+     * highest position there, and the prefix beneath it needs no entry of its own: acking the highest says
+     * everything below it settled. The snapshot position is the one exception, and not because the
+     * accounting differs there -- because arriving at it is the single moment anything records that this
+     * table's load was written to this pipeline's target, and a batch reduced to its highest position never
+     * arrives at it. A load is handed to the sink ahead of the tail through one buffer, so it meets the
+     * first change above it inside one batch whenever the batch is the larger of the two -- the ordinary
+     * shape for a table, not an edge. The table was then never recorded as written, and every run that
+     * followed read it again in full with the pipeline healthy and nothing logged.
+     *
+     * <p>An event a transform built carries no position of its own and does not take part: it inherits one
+     * a real event already reported.
      *
      * <p>Taking part is decided on the order alone. A snapshot row has one and carries no token, which is
-     * the chain's cdc start being persisted for it rather than a reason to pass it over -- passing it over
-     * leaves a table whose rows are the whole of what the sink was given as a table the sink is never
-     * recorded as having written.
+     * the chain's cdc start being persisted for it rather than a reason to pass it over.
      */
     @Override
     public List<ChainEntry> positions(List<Envelope> batch) {
         Map<String, ChainPosition> last = new LinkedHashMap<>();
+        Map<String, ChainPosition> snapshots = new HashMap<>();
         for (Envelope event : batch) {
             event.positions().forEach((chain, position) -> {
-                if (position.order() != null) {
-                    last.put(chain, position);
+                if (position.order() == null) {
+                    return;
                 }
+                if (position.order().seq() == SourceOrder.SNAPSHOT_SEQ) {
+                    snapshots.putIfAbsent(chain, position);
+                }
+                last.put(chain, position);
             });
         }
         List<ChainEntry> entries = new ArrayList<>(last.size());
-        last.forEach((chain, position) -> entries.add(new ChainEntry(chain, position)));
+        last.forEach((chain, position) -> {
+            ChainPosition snapshot = snapshots.get(chain);
+            // Only where something above it shares the batch. A batch that is snapshot rows alone already
+            // reports that position as its last, and reporting it twice would offer it against itself.
+            if (snapshot != null && snapshot.order().compareTo(position.order()) < 0) {
+                entries.add(new ChainEntry(chain, snapshot));
+            }
+            entries.add(new ChainEntry(chain, position));
+        });
         return entries;
     }
 
