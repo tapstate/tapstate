@@ -52,6 +52,14 @@ contains() {
     esac
 }
 
+excludes() {
+    local name="$1" needle="$2" haystack="$3"
+    case "$haystack" in
+        *"$needle"*) fail "$name" "'$needle' leaked into: $haystack" ;;
+        *) pass "$name" ;;
+    esac
+}
+
 refuses() {
     local name="$1"; shift
     local out rc
@@ -118,6 +126,66 @@ case "$out" in
     *) pass "the list is what decides, not a built-in default" ;;
 esac
 
+
+# --- when the API call itself fails -----------------------------------------------------------
+
+# `gh api` writes the error body to stdout, not stderr, when a request fails. An output taken
+# without its exit status is therefore that body: non-empty, and not the value that was asked for.
+# Every reader below either compares the result against a literal or tests it for emptiness, and a
+# JSON blob quietly passes the emptiness test -- so the precise sentence each site was written to
+# print can never fire, and the blob is printed in place of the value instead. A token with no
+# access at all to a repository gets a 404, which is the single most likely reason for any of these
+# branches to run, and the release gate is where they run.
+stub="$tmp/bin"
+mkdir -p "$stub"
+cat > "$stub/gh" <<'STUB'
+#!/usr/bin/env bash
+# Fails the way the real gh does: the error body on stdout, a line on stderr, exit 1.
+# GH_STUB_FAIL is a substring of the arguments to fail on; empty means fail every call.
+if [ -z "${GH_STUB_FAIL:-}" ] || [[ "$*" == *"$GH_STUB_FAIL"* ]]; then
+    echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}'
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1
+fi
+echo "${GH_STUB_OK:-main}"
+STUB
+chmod +x "$stub/gh"
+
+# A stub that is not the gh being run would make every case below pass against the real one.
+if [ "$(PATH="$stub:$PATH" command -v gh)" = "$stub/gh" ]; then
+    pass "the stub is the gh these cases run"
+else
+    fail "the stub is the gh these cases run" "command -v gh found something else"
+fi
+
+# A repository that does not exist, so a stub that somehow is not picked up still writes nothing.
+solo="$tmp/solo.txt"; echo "tapstate/satellites-smoke-no-such-repo" > "$solo"
+
+# <fail-substring> <verb> [args...] -- output of one run against the stub, exit status dropped.
+stubbed() {
+    local f="$1"; shift
+    local out
+    set +e
+    out="$(PATH="$stub:$PATH" GH_TOKEN=t GH_STUB_FAIL="$f" bash "$script" "$@" --list "$solo" 2>&1)"
+    set -e
+    printf '%s' "$out"
+}
+
+out="$(stubbed "" reach)"
+contains "reach reports an unreadable permission as unreadable" "permissions.push=unreadable" "$out"
+excludes "reach does not print the error body as the permission" "Not Found" "$out"
+
+refuses "reach still refuses when the call fails" \
+    env PATH="$stub:$PATH" GH_TOKEN=t GH_STUB_FAIL= bash "$script" reach --list "$solo"
+
+out="$(stubbed "" branch 0.4.0)"
+contains "branch says which read failed" "cannot read the default branch" "$out"
+
+out="$(stubbed "git/ref" branch 0.4.0)"
+contains "branch says which ref it could not read" "cannot read main" "$out"
+
+out="$(stubbed "" release 0.4.0 --notes-url https://example.invalid/notes)"
+contains "release says the branch it would tag is not there" "has no ws/release-0.4.0 to tag" "$out"
 echo
 if [ "$failures" -eq 0 ]; then
     echo "satellites-smoke: all cases passed"

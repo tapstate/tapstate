@@ -63,6 +63,14 @@ done
 
 die() { echo "satellites.sh: $1" >&2; exit "${2:-1}"; }
 
+# `gh api` writes the error body to stdout, not stderr, when a request fails. An output taken
+# without its exit status is therefore that body, not the value asked for -- and it is non-empty,
+# which is exactly what every reader below tests for. So a failed call used to pass the emptiness
+# check and be carried on as a default branch name, a sha, or a permission, and the sentence each
+# site was written to print when it cannot read something could never fire. Hand back nothing when
+# the call failed, so an empty result means what the callers already assume it means.
+api() { local out; out="$(gh api "$@" 2>/dev/null)" || return 1; printf '%s' "$out"; }
+
 case "$verb" in
     reach|branch|release|unbranch) ;;
     "") die "no verb. Expected one of: reach, branch, release, unbranch" 2 ;;
@@ -105,7 +113,7 @@ for repo in $repos; do
             if [ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
                 die "no token in GH_TOKEN. An empty token writes nothing and reports nothing"
             fi
-            push="$(gh api "repos/$repo" --jq '.permissions.push' 2>/dev/null || true)"
+            push="$(api "repos/$repo" --jq '.permissions.push')"
             if [ "$push" = true ]; then
                 echo "$repo  reachable, push permitted"
             else
@@ -118,9 +126,9 @@ for repo in $repos; do
                 echo "$repo  create refs/heads/$branch at its default branch tip"
                 continue
             fi
-            head="$(gh api "repos/$repo" --jq '.default_branch' 2>/dev/null)"
+            head="$(api "repos/$repo" --jq '.default_branch')"
             [ -n "$head" ] || { echo "$repo  cannot read the default branch" >&2; rc=1; continue; }
-            sha="$(gh api "repos/$repo/git/ref/heads/$head" --jq '.object.sha' 2>/dev/null)"
+            sha="$(api "repos/$repo/git/ref/heads/$head" --jq '.object.sha')"
             [ -n "$sha" ] || { echo "$repo  cannot read $head" >&2; rc=1; continue; }
             if gh api "repos/$repo/git/refs" -f "ref=refs/heads/$branch" -f "sha=$sha" >/dev/null 2>&1; then
                 echo "$repo  $branch created at ${sha%"${sha#???????}"}"
@@ -134,7 +142,7 @@ for repo in $repos; do
                 echo "$repo  tag $tag at $branch, release body links to $notes_url"
                 continue
             fi
-            sha="$(gh api "repos/$repo/git/ref/heads/$branch" --jq '.object.sha' 2>/dev/null)"
+            sha="$(api "repos/$repo/git/ref/heads/$branch" --jq '.object.sha')"
             [ -n "$sha" ] || { echo "$repo  has no $branch to tag" >&2; rc=1; continue; }
             if gh release create "$tag" --repo "$repo" --target "$sha" --title "$tag" \
                  --notes "This repository is released alongside tapstate $tag. What changed, and everything else worth reading, is in the tapstate release: $notes_url" \
