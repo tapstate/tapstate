@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 
 import java.util.Objects;
@@ -48,5 +49,13 @@ public record CaptureRunSpec(
         Objects.requireNonNull(startFrom, "startFrom");
         Objects.requireNonNull(cdcStart, "cdcStart");
         Objects.requireNonNull(watermark, "watermark");
+        // The connector doing this read files notes it has to find again on a later drive, and which node
+        // they belong to is the pair named right here. Scoped from those two rather than accepted on the
+        // config, so there is one derivation of the pair instead of two held together by nobody: a caller
+        // that stopped scoping the config, or scoped it to another node, would leave the connector filing
+        // under a name no later drive looks at, and nothing above would say so - the rows all arrive, the
+        // chain is still mined once, and the only trace is a connector reading its own notes as empty,
+        // which is what a first run looks like.
+        config = config.at(new PipelineNode(pipelineId, sourceId));
     }
 }
