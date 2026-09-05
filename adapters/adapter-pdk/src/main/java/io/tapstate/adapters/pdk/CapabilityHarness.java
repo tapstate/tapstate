@@ -51,6 +51,8 @@ public final class CapabilityHarness {
             TapConnector connector = connectorClass.getDeclaredConstructor().newInstance();
 
             ConnectorFunctions functions = new ConnectorFunctions();
+            // Discarded on purpose, unlike where rows are read: this asks the connector only which
+            // capabilities it offers, and no value ever passes through here to be converted.
             connector.registerCapabilities(functions, new TapCodecsRegistry());
 
             Set<String> capabilities = new TreeSet<>();

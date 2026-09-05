@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.event.Envelope;
+import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.ddl.table.TapNewFieldEvent;
 import io.tapdata.entity.event.dml.TapDeleteRecordEvent;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
@@ -26,6 +27,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class TapEventCodecGoldenTest {
 
+    /** No connector registered a conversion here: this pins the projection, not the value lanes. */
+    private static final TapCodecsRegistry CODECS = new TapCodecsRegistry();
+
+
     private static final Path GOLDEN =
             Path.of("src", "test", "resources", "golden", "tapevent-codec.golden.json");
     private static final boolean UPDATE = Boolean.getBoolean("tapstate.codec.golden.update");
@@ -47,11 +52,11 @@ class TapEventCodecGoldenTest {
         ddl.setOriginDDL("ALTER TABLE orders ADD note VARCHAR(64)");
 
         return List.of(
-                TapEventCodec.decodeChange(insert),
-                TapEventCodec.decodeChange(update),
-                TapEventCodec.decodeChange(delete),
-                TapEventCodec.decodeSnapshotRow(row),
-                TapEventCodec.decodeChange(ddl));
+                TapEventCodec.decodeChange(insert, CODECS),
+                TapEventCodec.decodeChange(update, CODECS),
+                TapEventCodec.decodeChange(delete, CODECS),
+                TapEventCodec.decodeSnapshotRow(row, CODECS),
+                TapEventCodec.decodeChange(ddl, CODECS));
     }
 
     @Test

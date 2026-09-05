@@ -1,8 +1,11 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.event.Envelope;
+import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
+import io.tapdata.entity.schema.value.TapStringValue;
+import io.tapdata.entity.schema.value.TapValue;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
@@ -22,8 +25,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>The conversions widen or leave alone and never round, so no value changes on the way in. Anything
  * the namespace does not name a lossless target for is left exactly as it came.
+ *
+ * <p>Every case here runs against a registry a connector has actually registered into, so the cells
+ * below say what happens to an ordinary box <em>while</em> conversions are live - which is the whole
+ * question, since a connector registers nothing for the ordinary boxes and they must stay bare.
  */
 class TapEventValueModelTest {
+
+    /** A driver's own type, standing in for the ones a real client hands back. */
+    private record DriverKey(String hex) {
+    }
+
+    /** What a connector registers: its own types become portable values, the ordinary boxes are left. */
+    private static final TapCodecsRegistry CODECS = new TapCodecsRegistry()
+            .registerToTapValue(DriverKey.class, (value, tapType) ->
+                    new TapStringValue(((DriverKey) value).hex()));
 
     @Test
     void anIntegerColumnArrivesAsTheSixtyFourBitIntegerItsTypeSaysItIs() {
@@ -132,7 +148,7 @@ class TapEventValueModelTest {
                 .table("orders").referenceTime(1000L)
                 .before(row("qty", 5)).after(row("qty", 6));
 
-        Envelope env = TapEventCodec.decodeChange(event);
+        Envelope env = TapEventCodec.decodeChange(event, CODECS);
 
         assertThat(env.before().get("qty")).isEqualTo(5L);
         assertThat(env.after().get("qty")).isEqualTo(6L);
@@ -143,15 +159,102 @@ class TapEventValueModelTest {
         TapInsertRecordEvent event = TapInsertRecordEvent.create()
                 .table("orders").referenceTime(1000L).after(row("qty", 5));
 
-        Envelope env = TapEventCodec.decodeSnapshotRow(event);
+        Envelope env = TapEventCodec.decodeSnapshotRow(event, CODECS);
 
         // The phase says which op a row carries, never what its values are.
         assertThat(env.after().get("qty")).isEqualTo(5L);
     }
 
+    // ---- the lane a connector's own types take ---------------------------------------------------
+
+    @Test
+    void aTypeTheConnectorRegisteredAConversionForArrivesAsThatConversion() {
+        Envelope env = insert(row("_id", new DriverKey("64f0c0de")));
+
+        // Before this, the driver's own object travelled untouched and every reader downstream met a
+        // type only that driver's client knows - each one rendering it however its own serializer
+        // happened to, which is how one row came to read two ways.
+        assertThat(env.after().get("_id"))
+                .isInstanceOf(TapValue.class)
+                .extracting(value -> ((TapValue<?, ?>) value).getValue())
+                .isEqualTo("64f0c0de");
+    }
+
+    @Test
+    void theOriginalValueAndTheTypeItCameInAsTravelOnTheConvertedValue() {
+        DriverKey key = new DriverKey("64f0c0de");
+
+        Envelope env = insert(row("_id", key));
+
+        // A sink of the same kind puts the value back the way it arrived by reading these two. Without
+        // them the write side has only the text and writes a key as a string - silently, and only on
+        // the target, where the read-side cases cannot see it.
+        TapValue<?, ?> carried = (TapValue<?, ?>) env.after().get("_id");
+        assertThat(carried.getOriginValue()).isSameAs(key);
+        assertThat(carried.getOriginType()).isEqualTo("DriverKey");
+    }
+
+    @Test
+    void anOrdinaryBoxIsLeftBareEvenWhileConversionsAreLive() {
+        Envelope env = insert(row("qty", 5, "amount", new BigDecimal("1.50"), "name", "eu"));
+
+        // The frozen surface registers nothing for these on purpose. Wrapping them anyway would pay a
+        // carrier per value for a conversion that does not exist, and would make the row uniform by
+        // spending exactly what the surface declines to spend.
+        assertThat(env.after().get("qty")).isEqualTo(5L).isNotInstanceOf(TapValue.class);
+        assertThat(env.after().get("amount")).isEqualTo(new BigDecimal("1.50")).isNotInstanceOf(TapValue.class);
+        assertThat(env.after().get("name")).isEqualTo("eu").isNotInstanceOf(TapValue.class);
+    }
+
+    @Test
+    void aRegisteredTypeIsConvertedInsideANestedDocumentAndInsideAnArray() {
+        Envelope env = insert(row(
+                "doc", Map.of("_id", new DriverKey("aa")),
+                "keys", List.of(new DriverKey("bb"))));
+
+        // A key one level down is as reachable from a reader as a top-level one, and a lane that
+        // stopped at the top would leave the same two-shapes problem intact everywhere but there.
+        assertThat(((Map<?, ?>) env.after().get("doc")).get("_id"))
+                .isInstanceOf(TapValue.class)
+                .extracting(value -> ((TapValue<?, ?>) value).getValue()).isEqualTo("aa");
+        assertThat(((List<?>) env.after().get("keys")).get(0))
+                .isInstanceOf(TapValue.class)
+                .extracting(value -> ((TapValue<?, ?>) value).getValue()).isEqualTo("bb");
+    }
+
+    @Test
+    void theSameRowThroughTwoRegistriesDecodesTwoWays() {
+        Map<String, Object> after = row("_id", new DriverKey("64f0c0de"));
+
+        Envelope registered = insert(after, CODECS);
+        Envelope none = insert(after, new TapCodecsRegistry());
+
+        // Which lane a value takes is the connector's answer and nothing else's. Were the registry
+        // ignored - a shared one, a default one, one built on the spot - both sides would agree here
+        // and every case above would still pass, since they all use the one registry.
+        assertThat(registered.after().get("_id")).isInstanceOf(TapValue.class);
+        assertThat(none.after().get("_id")).isInstanceOf(DriverKey.class);
+    }
+
+    @Test
+    void aNestedContainerWithNothingToConvertIsHandedBackUncopied() {
+        Map<String, Object> doc = Map.of("name", "eu");
+
+        Envelope env = insert(row("doc", doc));
+
+        // The row map itself is copied by the envelope, so this is where the no-copy property is
+        // observable: a full row of already-converted values must cost nothing per container. Nothing
+        // in the build measures allocation, so losing this would be silent until a large read.
+        assertThat(env.after().get("doc")).isSameAs(doc);
+    }
+
     private static Envelope insert(Map<String, Object> after) {
+        return insert(after, CODECS);
+    }
+
+    private static Envelope insert(Map<String, Object> after, TapCodecsRegistry codecs) {
         return TapEventCodec.decodeChange(
-                TapInsertRecordEvent.create().table("orders").referenceTime(1000L).after(after));
+                TapInsertRecordEvent.create().table("orders").referenceTime(1000L).after(after), codecs);
     }
 
     private static Map<String, Object> row(Object... kv) {

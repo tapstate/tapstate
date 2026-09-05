@@ -66,7 +66,7 @@ public final class PdkCapturePort implements CapturePort {
             // being laundered into a coded capture failure.
             BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
             List<TapEvent> raw = read(connector, () -> batchRead(connector, config, batch));
-            List<Envelope> rows = decodeSnapshot(connector.connectorId(), raw);
+            List<Envelope> rows = decodeSnapshot(connector, raw);
             return new PdkCaptureBatch(rows, connector);
         } catch (RuntimeException e) {
             connector.stopQuietly();
@@ -107,7 +107,7 @@ public final class PdkCapturePort implements CapturePort {
         try {
             Probe probe = read(connector, () -> probe(connector, config));
             DiscoveredSchema schema = toDiscoveredSchema(probe.tables());
-            List<Envelope> sample = decodeSnapshot(connector.connectorId(), probe.sample());
+            List<Envelope> sample = decodeSnapshot(connector, probe.sample());
             return new ConnectionReport(schema, sample);
         } finally {
             connector.stopQuietly();
@@ -236,7 +236,7 @@ public final class PdkCapturePort implements CapturePort {
                         if (event instanceof ControlEvent) {
                             continue;
                         }
-                        listener.onEvent(TapEventCodec.decodeChange(event));
+                        listener.onEvent(TapEventCodec.decodeChange(event, connector.codecs()));
                     }
                 });
                 stream.streamRead(connector.context(), config.streams(), startOffset, BATCH_SIZE, consumer);
@@ -337,15 +337,15 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     /** Projects raw snapshot rows to envelopes; a codec refusal is a projection failure, not a read failure. */
-    private static List<Envelope> decodeSnapshot(String connectorId, List<TapEvent> raw) {
+    private static List<Envelope> decodeSnapshot(PdkConnector connector, List<TapEvent> raw) {
         List<Envelope> rows = new ArrayList<>(raw.size());
         try {
             for (TapEvent event : raw) {
-                rows.add(TapEventCodec.decodeSnapshotRow(event));
+                rows.add(TapEventCodec.decodeSnapshotRow(event, connector.codecs()));
             }
         } catch (RuntimeException e) {
             throw new TapstateException(ConnectorError.PROJECTION_FAILED,
-                    Map.of("connector", connectorId, "detail", detail(e)), e);
+                    Map.of("connector", connector.connectorId(), "detail", detail(e)), e);
         }
         return rows;
     }

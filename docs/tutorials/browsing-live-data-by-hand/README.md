@@ -170,13 +170,14 @@ tapstate(admin@127.0.0.1:8080)> tail shop.orders
 Where `watch` holds one row, `tail` prints every change to the collection as it arrives - inserts,
 updates and deletes alike. Make several changes from outside and confirm all of them appear.
 
-One value looks different here than it did in section 3, and it is worth knowing which way round.
-An `_id` arrives in a change as the hexadecimal string the database stores it as; a read reports the
-same id as a document of `date` and `timestamp`. That is not a rendering choice on either side: a
-read is served by the connector's own query, which converts the id before Tapstate is handed it, and
-a change is not. What the converted form keeps is the second the id was created in and nothing else,
-so two rows written in the same second carry ids that a read cannot tell apart. Where you need to
-know which row you are looking at, take it from a field you declared rather than from `_id`.
+Compare a row here against the same row in section 3: every value reads the same on both faces. An
+`_id` is the hexadecimal string the database stores it as whether you read it or follow it, so a row
+you found by reading is the row you recognise in the stream.
+
+It used to differ. A read reported an `_id` as a document of `date` and `timestamp`, which kept only
+the second the id was created in - so two rows written in the same second had ids a read could not
+tell apart, while the same two rows were plainly distinct in a change. Nothing was ever lost on the
+wire; the two faces spelled the same value differently, and only one of them said the whole of it.
 
 **Look at this (3 of 4): close the terminal window - do not press `Ctrl-C`.** A `tail` holds a
 connector instance open for as long as it is streaming. `Ctrl-C` is the polite exit and is well

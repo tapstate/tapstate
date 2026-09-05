@@ -266,6 +266,65 @@ class PdkDataBrowserTest {
     // ---- executeCommand --------------------------------------------------------------------------
 
     @Test
+    void aConversionTheConnectorRegisteredIsRunAndItsResultIsWhatTheFollowerSees(@TempDir Path dir)
+            throws Exception {
+        // The whole chain in one run: the registry a connector writes into is kept, the conversion it
+        // registered is applied to the row, and what reaches a follower is the converted value rather
+        // than the carrier holding it. The conversion produces a string nothing else on this path
+        // produces, so "it never ran" and "it ran" cannot be read as each other - without it, the
+        // driver object renders as its own text, which is a perfectly plausible-looking answer.
+        PdkDataBrowser reader = reader(Synthetic.codecValueSource(dir), "synthetic.CodecValue");
+        List<DataBrowserChange> handed = java.util.Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch delivered = new CountDownLatch(1);
+
+        try (DataBrowserSubscription following = reader.tail(config(),
+                new DataBrowserTailRequest("t1"), change -> {
+                    handed.add(change);
+                    delivered.countDown();
+                })) {
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+
+        Map<String, Object> after = handed.get(0).after();
+        assertThat(after.get("key"))
+                .as("the connector's own conversion ran, and its result is what travels")
+                .isEqualTo("converted:00000000-0000-0000-0000-00000000002a");
+        assertThat(((Map<?, ?>) after.get("meta")).get("ref"))
+                .as("a value one level down takes the same lane")
+                .isEqualTo("converted:00000000-0000-0000-0000-00000000002a");
+        // The connector registers nothing for these, and the frozen surface registers nothing for them
+        // either: they must come through bare, not wrapped for the sake of a uniform row.
+        assertThat(after.get("id")).isInstanceOf(Number.class);
+        assertThat(after.get("name")).isEqualTo("row-7");
+    }
+
+
+    @Test
+    void theQueryFaceRendersAValueTheSameWayTheFollowFaceDoes(@TempDir Path dir) {
+        // The same document read two ways must read as the same document. It did not: only the follow
+        // face rendered, and the query face handed the driver's object on to be serialized by whatever
+        // sat above - so a key came back as its own text on one face and as a two-field object on the
+        // other, and a reader comparing them saw two rows. Neither face lost anything; they disagreed.
+        PdkDataBrowser reader = reader(Synthetic.opaqueQuerySource(dir), "synthetic.OpaqueQuery");
+
+        Map<String, Object> row = reader.find(config(), new DataBrowserQuery("orders", null, 10)).rows().get(0);
+
+        assertThat(row.get("key")).isEqualTo("00000000-0000-0000-0000-00000000002a");
+        assertThat(((Map<?, ?>) row.get("meta")).get("ref"))
+                .as("a value nested in a document is rendered on this face too")
+                .isEqualTo("00000000-0000-0000-0000-00000000002a");
+        assertThat(((List<?>) row.get("refs")).get(0))
+                .as("a value inside a list is rendered on this face too")
+                .isEqualTo("00000000-0000-0000-0000-00000000002a");
+        // The half that discriminates, same as on the follow face: rendering everything as text would
+        // satisfy the three above while turning a number into a string no reader could tell from text.
+        assertThat(row.get("id")).as("a number stays a number").isInstanceOf(Number.class);
+        assertThat(row.get("flag")).as("a boolean stays a boolean").isEqualTo(Boolean.TRUE);
+        assertThat(row.get("name")).as("text stays text").isEqualTo("row-7");
+    }
+
+
+    @Test
     void findPinsTheCommandToExecuteQuery(@TempDir Path dir) {
         // The command name is the connector's dispatch key: "execute" and "update" reach write paths on
         // the same function. It is assembled here and is not a caller input, so the read face has no

@@ -152,8 +152,8 @@ final class PdkSinkWriter implements SinkWriter {
         return result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
     }
 
-    private static TapRecordEvent encode(Envelope env) {
-        return (TapRecordEvent) TapEventCodec.encode(env);
+    private TapRecordEvent encode(Envelope env) {
+        return (TapRecordEvent) TapEventCodec.encode(env, connector.codecs());
     }
 
     /** Reforge a row envelope into an insert (append mode): the row's payload becomes an inserted row. */

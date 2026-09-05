@@ -47,18 +47,20 @@ final class PdkConnector implements AutoCloseable {
     private final TapConnector connector;
     private final ConnectorFunctions functions;
     private final TapConnectorContext context;
+    private final TapCodecsRegistry codecs;
     private final DefaultExpressionMatchingMap dataTypesMap;
     /** Volatile because the thread that stops an instance is rarely the thread that drove it. */
     private volatile boolean stopped;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
-                         DefaultExpressionMatchingMap dataTypesMap) {
+                         TapCodecsRegistry codecs, DefaultExpressionMatchingMap dataTypesMap) {
         this.connectorId = connectorId;
         this.loader = loader;
         this.connector = connector;
         this.functions = functions;
         this.context = context;
+        this.codecs = codecs;
         this.dataTypesMap = dataTypesMap;
     }
 
@@ -83,12 +85,17 @@ final class PdkConnector implements AutoCloseable {
             ClassLoader restore = Thread.currentThread().getContextClassLoader();
             TapConnector connector;
             ConnectorFunctions functions = new ConnectorFunctions();
+            // Held, not discarded: the value codecs a connector registers here are the only place it
+            // says how its own driver types become portable values, and every row it hands over is
+            // read through them. A registry constructed inline at the call and dropped registers the
+            // connector's answers into nothing.
+            TapCodecsRegistry codecs = new TapCodecsRegistry();
             try {
                 // Construct under the connector's own loader so any context-loader-based PDK lookup
                 // resolves against the connector's classpath rather than the host.
                 Thread.currentThread().setContextClassLoader(connectorClass.getClassLoader());
                 connector = connectorClass.getDeclaredConstructor().newInstance();
-                connector.registerCapabilities(functions, new TapCodecsRegistry());
+                connector.registerCapabilities(functions, codecs);
             } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
                 // A connector that will not construct, register, or link (e.g. a missing bundled
                 // dependency surfacing as NoClassDefFoundError, or a throwing static initializer) is a
@@ -109,7 +116,7 @@ final class PdkConnector implements AutoCloseable {
             // the connector uses its own default capability behaviour, which is the L1 intent.
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
-                    connectorId, loader, connector, functions, context, dataTypesFrom(ref.spec()));
+                    connectorId, loader, connector, functions, context, codecs, dataTypesFrom(ref.spec()));
             opened = true;
             return result;
         } finally {
@@ -183,6 +190,11 @@ final class PdkConnector implements AutoCloseable {
 
     TapConnector connector() {
         return connector;
+    }
+
+    /** The value codecs this connector registered when it was opened; empty when it registered none. */
+    TapCodecsRegistry codecs() {
+        return codecs;
     }
 
     ConnectorFunctions functions() {
