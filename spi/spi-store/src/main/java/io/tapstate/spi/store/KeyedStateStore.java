@@ -49,6 +49,13 @@ public interface KeyedStateStore {
      * ones, taking three orders of magnitude longer, with nothing anywhere reporting a problem — the run
      * is merely slow, and the most natural diagnosis (the store is slow) points away from the cause.
      *
+     * <p><b>How much it saves depends on how the keys reach here, and a caller in front of a
+     * partitioned map should not expect much.</b> Measured on the nest operator, whose batches arrive
+     * through such a map: the substrate hands a store the missing keys one partition at a time, so
+     * forty identities in forty partitions arrive as forty calls of one key each and the count is
+     * unchanged. What it saves there is only the keys that happen to share a partition - measured, two
+     * trips out of sixty-nine. A caller that holds its keys directly saves the whole difference.
+     *
      * <p>An empty {@code keys} reaches the store not at all. A caller on the event path arrives with one
      * routinely — a change touching only keys already in memory — so the round trip it would otherwise
      * cost is paid in the common case rather than the odd one.

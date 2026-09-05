@@ -20,7 +20,13 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.RestClient;
 
+import java.net.BindException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A single embedded web context boots on one port, and every {@code @RestController} handler is
@@ -51,7 +57,7 @@ class RestApiWebContextTest {
     }
 
     private RestClient client() {
-        return RestClient.create("http://localhost:" + port);
+        return RestClient.create("http://127.0.0.1:" + port);
     }
 
     @Test
@@ -67,6 +73,30 @@ class RestApiWebContextTest {
         HttpStatusCode atRoot = client().get().uri("/probe")
                 .exchange((request, response) -> response.getStatusCode());
         assertThat(atRoot).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    /**
+     * The embedded test server owns its port on the loopback address the client dials, not merely on the
+     * wildcard. A wildcard listener does not reserve {@code 127.0.0.1:<port>}: the kernel will hand a
+     * wildcard bind a port that another local process already holds on the loopback, and a connection to
+     * {@code 127.0.0.1} is then routed to that more specific holder rather than to this server. A class
+     * whose port was captured once at boot would then send every request to a stranger, which answers each
+     * one with the same bare status and no body -- a failure that reads as the feature being broken rather
+     * than as a port collision.
+     *
+     * <p>Binding the loopback explicitly is what closes it: the ephemeral port allocator will not hand out
+     * a loopback port that is already taken, so the address the client dials is the address this server
+     * owns for as long as it runs.
+     */
+    @Test
+    void theTestServerOwnsItsPortOnTheLoopbackAddressTheClientDials() throws Exception {
+        try (ServerSocket shadow = new ServerSocket()) {
+            shadow.setReuseAddress(true);
+            assertThatThrownBy(() -> shadow.bind(
+                    new InetSocketAddress(InetAddress.getByName("127.0.0.1"), port)))
+                    .as("no other socket may take 127.0.0.1:%d out from under the running test server", port)
+                    .isInstanceOf(BindException.class);
+        }
     }
 
     /**

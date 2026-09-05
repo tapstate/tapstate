@@ -222,7 +222,7 @@ class NestAdvancesTheDurableFrontierTest {
         dag.edge(Edge.from(assembled, outbound.merge(assembled, 1, Integer::sum) - 1)
                 .to(sink, 0).distributed());
         // Named so the run's statistics can be read back the way the read face reads them - by pipeline.
-        job = member.getJet().newJob(dag, new JobConfig().setName("nest-frontier"));
+        job = JetJobs.submit(member, dag, "nest-frontier");
     }
 
     /** One row a source emits, with the order the engine would have stamped on it. */

@@ -131,7 +131,7 @@ class ControlApiTest {
     }
 
     private RestClient client() {
-        return RestClient.create("http://localhost:" + port);
+        return RestClient.create("http://127.0.0.1:" + port);
     }
 
     private ApplyResult applyDrafts(String... drafts) {

@@ -44,6 +44,13 @@ concurrency:
   group: quickstart-live-${{ github.ref }}
   cancel-in-progress: true
 
+# This lane pipes the published installer, so it completes real installs on every run. Their events
+# would land in the funnel's one denominator as installs no person performed. Pointed at a port
+# nothing listens on, the send is refused instantly and the installer swallows it -- the same path a
+# user with no network takes.
+env:
+  TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e
+
 jobs:
   quickstart-live:
     # Two legs over one set of steps. They differ in exactly one variable -- where the server comes from --
@@ -103,17 +110,36 @@ jobs:
           if [ "$LEG" = published ]; then
             tag="$(.github/scripts/latest-release-tag.sh)"
             raw="https://raw.githubusercontent.com/$REPO/$tag"
-            curl -fsSL "$raw/deploy/quickstart/quickstart.sh" -o "$script"
+            # The script comes from the install site, which is where a user gets it, and the assets from
+            # the tag, which is where the script fetches them. That split is not an inconsistency to
+            # tidy up -- it is the combination a real one-liner produces, and it is the one thing this
+            # leg exists to run.
+            #
+            # Taken from the tag instead, as it was, both halves come from the same stale tree and agree
+            # with each other: the site serves the script with the version written in, the tag's tree
+            # still pins the release before it, and a leg that reads both from the tag runs an older
+            # release consistently and passes. It announced "the published release v0.4.1" and ran
+            # 0.3.0, on the same run, two lines apart, while the published one-liner could not log in.
+            curl -fsSL https://install.tapstate.dev/ -o "$script"
             curl -fsSL "$raw/deploy/quickstart/docker-compose.yml" -o "$RUNNER_TEMP/script/compose.yml"
             compose="$RUNNER_TEMP/script/compose.yml"
-            echo "leg: the published release $tag -- script, assets and image all from that tag"
+            echo "leg: the published release $tag -- script from the install site, assets from that tag"
           else
             cp "$GITHUB_WORKSPACE/deploy/quickstart/quickstart.sh" "$script"
             compose="$GITHUB_WORKSPACE/deploy/quickstart/docker-compose.yml"
             echo "leg: this checkout -- script, assets and image all from it"
           fi
-          ref="$(sed -n 's|.*image: \(ghcr.io/tapstate/tapstate:[^ ]*\).*|\1|p' "$compose" | head -1)"
-          [ -n "$ref" ] || { echo "no server image reference found in $compose" >&2; exit 1; }
+          # Read off the script under test, not off the compose file. The script pins the compose it
+          # fetches to its own version before starting anything, so on the published leg the compose as
+          # downloaded still names the previous release and the stack will not run it. Reading the
+          # compose here would compare, pull and inspect an image the run never starts -- and on that
+          # leg it would agree with itself, which is how a leg passes while the thing it stands for is
+          # broken. The store database below is already read off the script for the same reason.
+          ver="$(sed -n 's/^CLI_VERSION="\(.*\)"$/\1/p' "$script" | head -1)"
+          [ -n "$ver" ] || { echo "no CLI_VERSION found in the script under test" >&2; exit 1; }
+          ref="ghcr.io/tapstate/tapstate:$ver"
+          grep -q "image: ghcr.io/tapstate/tapstate:" "$compose" \
+            || { echo "no server image reference found in $compose" >&2; exit 1; }
           db="$(sed -n 's|.*mongodb://mongo:27017/\([A-Za-z0-9_]*\)?directConnection.*|\1|p' \
             "$script" | head -1)"
           [ -n "$db" ] || { echo "no store database found in the script under test" >&2; exit 1; }

@@ -14,6 +14,11 @@
 # not on the roadmap and is not meant to be -- a drive-by fix, an outside contribution -- so it is
 # passed over in silence rather than reported as something missing.
 #
+# Not every `Refs #N` names an issue. A release pull request can accurately reference the pull
+# request before it, and that number resolves to no issue at all -- so it is reported as passed
+# over rather than failed, because the board holds work items and a red roadmap is meant to mean
+# something needs looking at.
+#
 # Items are added rather than expected: an issue nobody put on the board is still work this release
 # shipped, and adding it is how the board learns about it. `addProjectV2ItemById` returns the
 # existing item when there already is one, so this is safe to run twice over the same release.
@@ -108,15 +113,47 @@ set_field() {   # item, field id, the value expression jq built
         projectV2Item { id } } }" >/dev/null
 }
 
+# What the board says about one item now. The mutations report on the request, not on the state that
+# survives it: a project workflow triggered by an item being added lands after them and leaves the
+# item at its own value, with nothing in either response to say so.
+# shellcheck disable=SC2016  # the $ names are GraphQL variables, bound by the -f flags
+read_back() {   # item -> the status on line 1, the released-in text on line 2
+  gh api graphql -f item="$1" -f query='
+    query($item:ID!) { node(id:$item) { ... on ProjectV2Item { fieldValues(first:50) { nodes {
+      ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } }
+      ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { name } } } } } } } }' 2>/dev/null \
+    | jq -r --arg s "$status_field" --arg r "$released_field" '
+        (.data.node.fieldValues.nodes // []) | map(select(.field.name != null))
+        | ((map(select(.field.name == $s)) | first | .name) // ""),
+          ((map(select(.field.name == $r)) | first | .text) // "")'
+}
+
 failed=0
 for i in $issues; do
+  # gh writes the response body to stdout even when the query errored, so a lookup that found
+  # nothing does not come back empty -- it comes back as the NOT_FOUND body, which is what the
+  # guard below is reading. Take the exit status: without it that body went on as a node id, and
+  # every mutation after reported on a global id that was a blob of JSON.
   # shellcheck disable=SC2016  # GraphQL variables again
   node="$(gh api graphql -f owner="$repo_owner" -f repo="$repo_name" -F number="$i" -f query='
     query($owner:String!, $repo:String!, $number:Int!) {
       repository(owner:$owner, name:$repo) { issue(number:$number) { id title } } }' \
-    --jq '.data.repository.issue.id' 2>/dev/null)"
+    --jq '.data.repository.issue.id' 2>/dev/null)" || node=""
   if [ -z "$node" ]; then
-    echo "  #${i}: no such issue in ${repo}, skipped" >&2
+    # A pull request resolves to no issue here, and the reference that named it is honest when it
+    # does -- a release pull request saying `Refs #N` about the one that wrote the version pins.
+    # The board is a list of work items, so this is passed over: out loud, because a step silent
+    # about what it skipped is one nobody can check, and not red, because a red roadmap is supposed
+    # to mean something needs looking at and this needs none.
+    if gh pr view "$i" --json number >/dev/null 2>&1; then
+      echo "  #${i}: a pull request, not an issue -- passed over, the board holds work items"
+      continue
+    fi
+    # Two readings, and this cannot tell them apart: the number is wrong, or the credential cannot
+    # read issues at all. Passing over it in silence made the second one report success having moved
+    # nothing -- the exact shape a roadmap step must not have, since nobody reads a green job.
+    echo "  #${i}: not an issue in ${repo} -- either the number is wrong, or this credential cannot read issues" >&2
+    failed=1
     continue
   fi
   if [ "$dry" = 1 ]; then
@@ -127,17 +164,34 @@ for i in $issues; do
   item="$(gh api graphql -f project="$project_id" -f content="$node" -f query='
     mutation($project:ID!, $content:ID!) {
       addProjectV2ItemById(input:{projectId:$project, contentId:$content}) { item { id } } }' \
-    --jq '.data.addProjectV2ItemById.item.id' 2>/dev/null)"
+    --jq '.data.addProjectV2ItemById.item.id' 2>/dev/null)" || item=""   # the error body is on stdout here too
   if [ -z "$item" ]; then
     echo "  #${i}: could not be put on the board" >&2
     failed=1
     continue
   fi
-  if set_field "$item" "$status_id" "$shipped_id" singleSelectOptionId &&
-     set_field "$item" "$released_id" "$version" text; then
+  set_field "$item" "$status_id" "$shipped_id" singleSelectOptionId
+  set_field "$item" "$released_id" "$version" text
+  # Asked, not assumed. Measured on the first real release: both mutations answered success for
+  # fifteen issues and the board kept seven of them -- the workflow fires when the item is added, so
+  # it lands after the write and the response carries no sign of it. Writing again wins because that
+  # trigger does not fire twice; three looks bound it, and a value that still will not hold is a
+  # failure rather than a line claiming it moved.
+  status_now=""; released_now=""; attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    board_now="$(read_back "$item")"
+    status_now="$(printf '%s\n' "$board_now" | sed -n 1p)"
+    released_now="$(printf '%s\n' "$board_now" | sed -n 2p)"
+    if [ "$status_now" = "$status_option" ] && [ "$released_now" = "$version" ]; then break; fi
+    [ "$attempt" -lt 3 ] || break
+    set_field "$item" "$status_id" "$shipped_id" singleSelectOptionId
+    set_field "$item" "$released_id" "$version" text
+  done
+  if [ "$status_now" = "$status_option" ] && [ "$released_now" = "$version" ]; then
     echo "  #${i}: ${status_option}, ${released_field} = ${version}"
   else
-    echo "  #${i}: on the board, but the fields were not written" >&2
+    echo "  #${i}: the board says '${status_now:-<unset>}' / '${released_now:-<unset>}' after ${attempt} attempt(s), not '${status_option}' / '${version}'" >&2
     failed=1
   fi
 done

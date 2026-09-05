@@ -494,16 +494,22 @@ nest.sibling-embeds-target-different-parent-keys:
   solution: "Have every embed under one parent join on the same parent field; that field is the parent's identity."
 nest.embed-target-not-parent-key:
   message: "The embeds under {embedPath} join on {fields}, which does not identify its rows; its key is {parentKey}."
-  solution: "Join on the parent's key. A field that merely refers to another table makes every row sharing a value one identity, so a nest embeds rows that belong to a parent rather than rows a parent refers to."
+  solution: "Join on the parent's key. If the row above is the one pointing at this table, name that table's own key on its side of on: - the direction is read from which side identifies a row, and neither side does here. Without that, a field that merely refers to another table makes every row sharing a value one identity."
 nest.embed-path-conflict:
   message: "Embeds {embedPathA} and {embedPathB} both target the path {path}."
   solution: "Give each embed a path of its own, or one silently overwrites the other in the document."
 nest.root-key-required:
-  message: "The nest rooted at {rootAlias} declares no key."
-  solution: "Declare root.key: it is the identity children are grouped under, and the assembled document has none without it."
+  message: "The nest rooted at {rootAlias} has no key: it declares none, and its stream offers neither a primary key nor a single unique index to take one from."
+  solution: "Declare root.key: it is the identity children are grouped under, and the assembled document has none without it. A root over a table that already declares one need not repeat it."
 nest.array-key-unresolvable:
-  message: "Embed {embedPath} declares no array key, and table {table} has no primary key to take one from."
-  solution: "Declare arrayKey on that embed; without an element identity, updates pile up as duplicates."
+  message: "Nothing identifies a row of {embedPath}: it declares no key, and table {table} has no primary key or unique index to take one from."
+  solution: "Declare key on that level, naming the columns that identify one of its rows. Without an identity, rows cannot be told apart and updates pile up as duplicates."
+nest.key-ambiguous:
+  message: "Nothing settles what identifies a row of {embedPath}: it declares no key, and table {table} has no primary key but several unique indexes: {candidates}."
+  solution: "Declare key on that level to say which columns identify a row; choosing for you would settle it on whichever index the source reported first."
+nest.referenced-level-carries-embeds:
+  message: "{embedPath} is a row this document points at rather than one grouped under it, and it carries embeds of its own: {children}."
+  solution: "Move those embeds to a level the document holds, or join {table} the other way round so its rows hang under this document instead of being pointed at."
 nest.resolver-vertex-limit-exceeded:
   message: "This nest compiles to {vertices} resolver vertices, past the limit of {limit}."
   solution: "Flatten the tree or split the pipeline: every vertex takes a thread of its own."
@@ -531,6 +537,9 @@ nest.root-fanout-limit-exceeded:
 nest.migration-parking-limit-exceeded:
   message: "Rows on their way to {address} have parked {changes} changes, past the limit of {limit}."
   solution: "These rows are in no document while they sit there and the durable position is held below the change that moved them, so this is worth looking at rather than only raising. Reaching it usually means the half of the move that collects them is not being worked - check that side before raising the limit."
+nest.reference-fanout-limit-exceeded:
+  message: "Row {identity} behind embed {refPath} is referenced by {referrers} rows, past the per-row limit of {limit}."
+  solution: "One change to that row rewrites that many documents, which is what this bounds - it is not a limit on storage, so widening how the references are held does not lift it. Raise the limit if the data really is this wide, or embed the row from the other side so the change travels with one document instead of all of them."
 nest.pending-limit-exceeded:
   message: "Key {key} of nest state {namespace} holds {pending} changes waiting for something that has not arrived, past the limit of {limit}."
   solution: "Check whether the parent rows are simply late or are never coming - a load reading children before their parents fills these queues and empties them again, where a broken reference fills them for good. Raise the limit if the wait is real and this deep."

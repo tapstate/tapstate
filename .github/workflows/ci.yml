@@ -116,12 +116,28 @@ jobs:
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
           shellcheck deploy/install-site/verify-smoke.sh
+          shellcheck -s sh scripts/funnel-capture.sh
+          shellcheck -s sh scripts/funnel-publish.sh
+          shellcheck -s sh scripts/funnel-report.sh
+          shellcheck -s sh scripts/funnel-capture-smoke.sh
       - name: installer smoke
         run: bash install/install-smoke.sh
       - name: quickstart smoke
         run: bash deploy/quickstart/quickstart-smoke.sh
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
+
+      # The receiver decides what is stored, so its rules are tested rather than reviewed. node --test
+      # is built in; there is no package.json and no dependency to install.
+      - name: install event receiver tests
+        run: node --test deploy/install-site/api/event.test.js
+
+      # The capture/report/publish half of the funnel is where a wrong number is produced silently: a
+      # double-counted window, a running total presented as a period, or a gap reported as zero all
+      # look entirely plausible on the page. Fixtures stand in for the API, so this needs no network
+      # and no credentials.
+      - name: funnel capture smoke
+        run: sh scripts/funnel-capture-smoke.sh
 
   catalog-scripts:
     # The catalog refresh driver and the connector build it calls are shell, and the driver is a gate:
@@ -138,7 +154,7 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh
       - name: refresh driver cases
         run: bash scripts/refresh-catalog-smoke.sh
       - name: connector build cases
@@ -200,11 +216,17 @@ jobs:
       # it, because --plan returns 0 down every path and the issue lookup needs somebody else's repo.
       - name: The documentation site still cannot block a release
         run: bash .github/scripts/docs-release-smoke.sh
+      # The board is a concurrent writer: a project workflow fires when an item is added and lands
+      # after the mutation, so a run can report every issue moved, exit 0, and leave the board saying
+      # something else. Measured on the first real release -- fifteen reported, seven kept. These
+      # cases are the only exercise this script gets outside a published release.
+      - name: The roadmap step still reports what the board kept, not what it asked for
+        run: bash .github/scripts/roadmap-shipped-smoke.sh
       # Not a script's cases -- the release workflow's own shape. The three acts that cannot be
       # taken back are all downstream of the approval, and every one of them is one line from
       # moving; a rejected release is otherwise the only thing that would find out.
       - name: The release workflow still puts every irreversible act after the approval
-        run: bash .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh
+        run: bash .github/scripts/release-shape-smoke.sh
 
       # Same reason, one lane over. The quickstart lanes run nightly against published releases, so
       # what they cover is never read on a pull request -- and the edits that hollow them out are one

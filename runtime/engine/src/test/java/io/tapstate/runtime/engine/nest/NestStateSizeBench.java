@@ -43,7 +43,7 @@ import org.junit.jupiter.api.Test;
  * and the machine, and none of that belongs in a build gate. Its name keeps it out of the default
  * surefire selection, so it costs a build nothing and is run deliberately:
  *
- * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestStateSizeBench -DfailIfNoTests=false \
+ * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestStateSizeBench -Dsurefire.failIfNoSpecifiedTests=false \
  *   -Dsurefire.failIfNoSpecifiedTests=false -DargLine="-Xmx2g"}</pre>
  */
 class NestStateSizeBench {

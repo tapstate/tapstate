@@ -113,7 +113,7 @@ class PipelineObservationApiTest {
     }
 
     private RestClient client() {
-        return RestClient.create("http://localhost:" + port);
+        return RestClient.create("http://127.0.0.1:" + port);
     }
 
     /** Mints a machine token of the given grade through the real token service and returns the bearer string. */

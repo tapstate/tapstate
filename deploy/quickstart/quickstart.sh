@@ -36,7 +36,7 @@ set -eu
 # nothing and install.sh refuses, which would strand the quickstart at the CLI step on a clean machine.
 # Pin it here instead, the same way the demo connector jars are pinned to a published tag. This must
 # match the version in pom.xml; quickstart-smoke.sh fails the build when the two drift apart.
-CLI_VERSION="0.3.0"
+CLI_VERSION="0.4.3"
 
 die() {
     printf 'quickstart: %s\n' "$1" >&2
@@ -44,14 +44,39 @@ die() {
 }
 
 # Download $1 to the file $2 with whichever of curl / wget is present.
+#
+# The transfer lands in $2.part and is moved into place only once it has completed, so an interrupted
+# one leaves nothing at the real path. That matters more than it reads: callers guard on existence
+# alone, so a partial file sitting at the real path is read as "already have it" by every later run,
+# and the corrupt result surfaces steps downstream with nothing naming the cause.
+#
+# Attempts resume the partial rather than restarting it -- a link that drops once on a 50 MB download
+# tends to drop again, and restarting from zero each time can make no progress at all. The last
+# attempt starts clean instead, which is the only way past a server that cannot serve ranges, or a
+# .part that is already complete because a run was killed between the transfer and the move.
+#
+# It reports and returns non-zero rather than exiting, so the caller decides: under `set -e` an
+# unguarded call ends the run exactly as it did before, and a caller that can do without the file
+# keeps its own `|| ...`.
 fetch() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" -o "$2"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$1" -O "$2"
-    else
-        die "neither curl nor wget is available to download $1."
-    fi
+    _part="$2.part"
+    _try=0
+    while [ "$_try" -lt 3 ]; do
+        _try=$((_try + 1))
+        [ "$_try" -lt 3 ] || rm -f "$_part"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 2 -C - "$1" -o "$_part" && { mv -f "$_part" "$2"; return 0; }
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -c "$1" -O "$_part" && { mv -f "$_part" "$2"; return 0; }
+        else
+            die "neither curl nor wget is available to download $1."
+        fi
+    done
+    printf 'quickstart: could not download %s -- %s attempts, the last from scratch.\n' "$1" "$_try" >&2
+    # Only when there is one. A transfer that never opened leaves no .part, and promising a
+    # resume of a file that is not there sends the reader looking for it.
+    [ ! -f "$_part" ] || printf 'quickstart: what did arrive is kept at %s, so a later run resumes it.\n' "$_part" >&2
+    return 1
 }
 
 # One number read out of the managed store, as a plain integer. A read that fails, or answers anything
@@ -306,7 +331,33 @@ main() {
     # empty directory and starts a database with no demo data in it, which then fails much later as a
     # pipeline that reads nothing.
     mkdir -p mysql-init postgres-init connectors
-    [ -f ./docker-compose.yml ]              || fetch "${qbase}/deploy/quickstart/docker-compose.yml" ./docker-compose.yml
+    # Fetched from the tag, then pinned to this script's own version. A release tag's tree carries the
+    # previous release's pins by construction: the number is written into the tree inside the release
+    # runner, which never commits, so the tag lands on the commit CI validated and that tree still says
+    # the release before this one. The two files the install site serves are rewritten on the way out,
+    # which is why the CLI installs correctly -- everything fetched from the tag afterwards is not, and
+    # the compose file is the one of those that carries a version.
+    #
+    # Left as it shipped, the one-liner brings up the previous release's server under this release's
+    # CLI. Measured on 0.4.1: a 0.4.1 CLI against a 0.3.0 server, whose discovery endpoint the newer
+    # CLI cannot use, so the demo could not log in at all.
+    #
+    # An existing file is never rewritten -- a re-run keeps the stack it already has, and a compose the
+    # user edited is theirs.
+    if [ ! -f ./docker-compose.yml ]; then
+        fetch "${qbase}/deploy/quickstart/docker-compose.yml" ./docker-compose.yml
+        sed "s|image: ghcr.io/tapstate/tapstate:[^[:space:]]*|image: ghcr.io/tapstate/tapstate:${CLI_VERSION}|g" \
+            ./docker-compose.yml > ./docker-compose.yml.pinned \
+            && mv ./docker-compose.yml.pinned ./docker-compose.yml
+        # The substitution is checked, not assumed. A compose file that writes the image reference any
+        # other way leaves this a silent no-op, and a silent no-op here is the whole defect coming back
+        # -- with a stack that starts, reports healthy, and runs the wrong server.
+        left="$(grep -c "image: ghcr.io/tapstate/tapstate:${CLI_VERSION}" ./docker-compose.yml || true)"
+        other="$(grep -c "image: ghcr.io/tapstate/tapstate:" ./docker-compose.yml || true)"
+        if [ "$left" = 0 ] || [ "$left" != "$other" ]; then
+            die "the compose file does not pin the server image the way this script expects; it would have started a server other than ${CLI_VERSION}"
+        fi
+    fi
     [ -f ./mysql-init/01-orders.sql ]        || fetch "${qbase}/deploy/quickstart/mysql-init/01-orders.sql" ./mysql-init/01-orders.sql
     [ -f ./postgres-init/01-shipments.sql ]  || fetch "${qbase}/deploy/quickstart/postgres-init/01-shipments.sql" ./postgres-init/01-shipments.sql
 
@@ -315,7 +366,11 @@ main() {
     # removes it. install.sh's own stdout (a PATH hint that does not apply in place) is dropped; its
     # errors still surface and abort under set -e.
     if [ ! -x ./tapstate ]; then
+        # TAPSTATE_ENTRYPOINT tells the install event which of the two front doors this was, so the
+        # two paths can be compared. stdout stays dropped; the installer's disclosure is on stderr and
+        # still reaches the user.
         TAPSTATE_INSTALL_DIR="$PWD" TAPSTATE_VERSION="${TAPSTATE_VERSION:-$CLI_VERSION}" \
+            TAPSTATE_ENTRYPOINT=quickstart \
             sh "$work/install.sh" >/dev/null
         # A binary fetched by a browser carries macOS's quarantine attribute, which blocks it from running
         # until cleared; install.sh's atomic move preserves it. Strip it -- only on macOS, only if xattr
@@ -423,8 +478,14 @@ main() {
     # the one failure that cascades -- every verb after it reports cli.not-authenticated, so the real
     # cause ends up at the top of a screen of consequences.
     admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
+    repl_status=0
     repl_out="$(printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nregister ../mysql-connector.jar\nregister ../mongodb-connector.jar\nregister ../postgres-connector.jar\napply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' "$admin_pw" \
-        | ./tapstate -w work 2>&1)"
+        | ./tapstate -w work 2>&1)" || repl_status=$?
+    # The status is taken beside the output rather than being left to `set -e`. As the bare assignment
+    # it was, a CLI that exits non-zero ends the script AT this line: the print below never runs, the
+    # `case` below it never runs, and everything the CLI said -- a refusal, a stack trace, ten frames of
+    # it -- reaches the exit code and nowhere else. The one report of that shape blamed the CPU, and the
+    # same silence was reproduced later on hardware where that could not be the cause.
     printf '%s\n' "$repl_out"
     case "$repl_out" in
         *control.auth-failed*|*cli.not-authenticated*)
@@ -450,6 +511,13 @@ main() {
                     die "the CLI could not log in, so no verb after it ran; inspect it with: docker compose logs bootstrap" ;;
             esac ;;
     esac
+    # Anything else the CLI failed on. Without this the two named cases are the only failures that stop
+    # the script, and every other one -- including a crash -- falls through to the row-count wait, which
+    # then reports an empty target half a minute later and sends the reader to the server log to
+    # investigate a pipeline that was never started.
+    if [ "$repl_status" -ne 0 ]; then
+        die "the CLI exited $repl_status before the pipeline was started; its output is above"
+    fi
 
     # Snapshot verification, printed automatically: the demo's payoff is a real row count in the target,
     # not an "it should have worked". A fresh snapshot of the seeded rows is quick, but the read still

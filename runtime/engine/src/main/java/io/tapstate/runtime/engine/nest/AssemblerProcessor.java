@@ -11,6 +11,7 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.ReplayFloor;
+import io.tapstate.runtime.engine.SettledPositions;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -54,6 +55,13 @@ public final class AssemblerProcessor extends AbstractProcessor {
 
     private final NestVertex vertex;
     private final List<EmbedSlot> slots;
+
+    /**
+     * Where the rows this tree's levels point at are read from, by the namespace the slot naming them
+     * carries. Read only, and read by key only: this vertex never writes an entry of any of them, which is
+     * what lets it reach outside its own partition for one at all.
+     */
+    private final Map<String, NestStore<Map<String, Object>>> referenced;
     private final NestStore<RootAssembly> store;
     private final String outputStream;
     private final Deque<Object> outgoing = new ArrayDeque<>();
@@ -97,6 +105,23 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * again is a key that has stopped growing, and one that is touched is filed here again on the spot.
      */
     private final Set<Object> keeping = new LinkedHashSet<>();
+
+    /**
+     * Keys held back because a row they point at has not been read yet. Kept so that the word saying such
+     * a row is already filed can be dropped without reading anything: it is sent on every row of a
+     * pointing stream, and on the ordinary path none of them is waiting.
+     *
+     * <p><b>Wrong in only one direction, and it is the harmless one.</b> A key left here after it stopped
+     * waiting costs one drain that had nothing to do; a key missing from here while it waits is the lost
+     * word this exists to deliver. So it is added wherever a wait is seen and removed only where the
+     * document demonstrably went out or went away - never on a path that returned early for some other
+     * reason, where what it is waiting for was not re-decided.
+     *
+     * <p>A restart starts it empty, and needs nothing else: a document waiting on a row it points at has
+     * its own row held short of the durable frontier, so that row is replayed and the document is drawn
+     * again from it, reading the row it wanted rather than being told about it.
+     */
+    private final Set<Object> waiting = new LinkedHashSet<>();
 
     /** When the records of deletion were last swept, or null before the first sweep. */
     private Long forgottenAt;
@@ -150,6 +175,11 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * bound.
      */
     private final Map<Object, Window> windows = new LinkedHashMap<>();
+
+    // The highest position per chain that a lookup has said owes nothing, waiting until this level holds
+    // nothing lower on that chain. In memory, like the windows beside it: a restart that has lost it has
+    // lost only a chance to advance a frontier, which is the direction to lose in.
+    private final Map<String, ChainPosition> settledAhead = new LinkedHashMap<>();
 
     /**
      * The moves whose subtree is parked and not yet collected, against what the change that started each was
@@ -278,6 +308,21 @@ public final class AssemblerProcessor extends AbstractProcessor {
             String outputStream, ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal,
             ReplayFloor floor, NestSettings settings, NestClock clock, NestSendPolicy sending,
             NestStore<ParkedSubtree> parking, NestDeadLetter deadLetter) {
+        this(vertex, slots, store, outputStream, axes, chainsByOrdinal, floor, settings, clock, sending,
+                parking, deadLetter, Map.of());
+    }
+
+    /**
+     * All of the above, with the rows this tree's levels point at reachable through {@code referenced} -
+     * one store per namespace a slot names. Empty for a tree that points at nothing, which is every tree
+     * written before there was a second direction.
+     */
+    public AssemblerProcessor(NestVertex vertex, List<EmbedSlot> slots, NestStore<RootAssembly> store,
+            String outputStream, ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal,
+            ReplayFloor floor, NestSettings settings, NestClock clock, NestSendPolicy sending,
+            NestStore<ParkedSubtree> parking, NestDeadLetter deadLetter,
+            Map<String, NestStore<Map<String, Object>>> referenced) {
+        this.referenced = Map.copyOf(referenced);
         this.parking = parking;
         this.deadLetter = Objects.requireNonNull(deadLetter, "deadLetter");
         this.vertex = Objects.requireNonNull(vertex, "vertex");
@@ -330,6 +375,9 @@ public final class AssemblerProcessor extends AbstractProcessor {
         // coming from costing a chain more than its protection.
         giveUpOnHandOversNobodyCollected();
         if (!sendWhatWindowsHaveRunOutOn()) {
+            return false;
+        }
+        if (!passOnWhatOwesNothing()) {
             return false;
         }
         weighDeletedRoots();
@@ -575,6 +623,9 @@ public final class AssemblerProcessor extends AbstractProcessor {
         if (!sendWhatWindowsHaveRunOutOn()) {
             return false;
         }
+        if (!passOnWhatOwesNothing()) {
+            return false;
+        }
         if (bounds == null) {
             return true;
         }
@@ -595,6 +646,29 @@ public final class AssemblerProcessor extends AbstractProcessor {
     }
 
     private void handle(NestInbound edge, Object item, Map<Object, Touched> touched) {
+        // Asked of the item rather than of the edge, because two edges bring it. One is the edge from the
+        // vertex filing the rows this document itself points at; the other is an ordinary cascade, carrying
+        // word that a row some level beneath points at was edited, climbing with that level's own changes.
+        // The ordinal says which level it came from and says nothing about which of the two it is.
+        if (item instanceof SettledPositions settled) {
+            SettledPositions.fold(settledAhead, settled.positions());
+            return;
+        }
+        if (item instanceof NestTouch word) {
+            // A word that only answers a wait is dropped where there is none, before anything is read: it
+            // is sent on every row of a pointing stream whose row is already filed, and drawing those
+            // documents again would double what a stream costs to say nothing new.
+            if (word.onlyIfWaiting() && !waiting.contains(word.key())) {
+                return;
+            }
+            // Nothing here changes - what the document should now show is read out of that row's own
+            // namespace when it is drawn - so all this does is put the document in the drain, which is
+            // what gets it drawn and sent again.
+            Touched document = touched(word.key(), touched);
+            document.ts = Math.max(document.ts, word.ts());
+            document.assembly.absorb(word.positions());
+            return;
+        }
         if (edge.isCascade()) {
             KeyedElement arrived = (KeyedElement) item;
             Touched document = touched(arrived.key(), touched);
@@ -915,6 +989,56 @@ public final class AssemblerProcessor extends AbstractProcessor {
     }
 
     /**
+     * Fetches the rows every document in this drain points at, one reach per namespace for all of them at
+     * once. Gathered across the whole drain rather than per document: the documents of one drain overlap in
+     * what they point at far more often than not - that is what a reference is - so a shared batch asks for
+     * each row once where a batch per document would ask for a popular one as many times as it appeared.
+     *
+     * <p>A tree that points at nothing does none of this and reaches for nothing, which is what keeps the
+     * cost of the direction that already existed exactly where it was.
+     */
+    private Map<String, Map<Object, Map<String, Object>>> resolveReferences(Map<Object, Touched> touched) {
+        if (referenced.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Set<List<Object>>> needed = new LinkedHashMap<>();
+        for (Touched document : touched.values()) {
+            document.assembly.referencesNeeded(slots).forEach((namespace, keys) ->
+                    needed.computeIfAbsent(namespace, name -> new LinkedHashSet<>()).addAll(keys));
+        }
+        Map<String, Map<Object, Map<String, Object>>> resolved = new LinkedHashMap<>();
+        needed.forEach((namespace, keys) ->
+                resolved.put(namespace, storeOf(namespace).loadAll(new LinkedHashSet<>(keys))));
+        return resolved;
+    }
+
+    /** The rows one document points at, for the places a single document is rendered on its own. */
+    private Map<String, Map<Object, Map<String, Object>>> referencesFor(RootAssembly assembly) {
+        if (referenced.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Map<Object, Map<String, Object>>> resolved = new LinkedHashMap<>();
+        assembly.referencesNeeded(slots).forEach((namespace, keys) ->
+                resolved.put(namespace, storeOf(namespace).loadAll(new LinkedHashSet<>(keys))));
+        return resolved;
+    }
+
+    /**
+     * Where the rows of one namespace are read from. Named rather than dereferenced at each call site,
+     * because the two callers had two different failures for the same wiring mistake - one said which
+     * namespace had no store and the other dereferenced null, on a path a window reaches and a drain
+     * does not.
+     */
+    private NestStore<Map<String, Object>> storeOf(String namespace) {
+        NestStore<Map<String, Object>> store = referenced.get(namespace);
+        if (store == null) {
+            throw new IllegalStateException(
+                    "a slot points at " + namespace + ", which this vertex was given no store for");
+        }
+        return store;
+    }
+
+    /**
      * Stores every document this drain touched and emits each one once, in the state it now stands in.
      *
      * <p>A document goes out as a whole row and is applied by upserting it on its key, which is what makes
@@ -931,16 +1055,27 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * is what is still owed rather than what has just been paid.
      */
     private void settle(Map<Object, Touched> touched) {
+        Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
         touched.forEach((key, document) -> {
-            document.assembly.render(slots).ifPresentOrElse(
+            document.assembly.render(slots, resolved).ifPresentOrElse(
                     rendered -> {
                         deleted.remove(key);
                         if (isOwedAHandOver(key)) {
                             return;
                         }
+                        if (document.assembly.waitsForARowItPointsAt(slots, resolved)) {
+                            waiting.add(key);
+                            return;
+                        }
+                        waiting.remove(key);
                         if (mayGoOutNow(key)) {
                             outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
-                                    .withPositions(document.assembly.covered()));
+                                    .withPositions(document.assembly.covered())
+                                    // Said out loud, because a field that stopped being rendered and a
+                                    // field this tree never had are the same document downstream - and a
+                                    // target applies one by setting what is in it, so what is gone from it
+                                    // stays there at its last value unless the emission names it.
+                                    .withRemoved(RootAssembly.embedsNotRendered(slots, rendered)));
                             document.assembly.documentSent();
                         } else {
                             windows.get(key).holds(document.ts, document.assembly.lowestUnsentByChain());
@@ -956,6 +1091,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
                             // The window goes with it. What it was holding back names a key that is gone,
                             // and the row bringing that key back is a change nothing should delay.
                             windows.remove(key);
+                            waiting.remove(key);
                         }
                     });
             store.save(key, document.assembly);
@@ -1077,15 +1213,42 @@ public final class AssemblerProcessor extends AbstractProcessor {
             if (isOwedAHandOver(entry.getKey())) {
                 continue;
             }
+            // Asked before anything is read, because what ends this wait is an arrival and never this pass:
+            // the row turning up wakes the document through the drain, which is where the wait is lifted. A
+            // window that has run out is looked at again on every idle turn, so re-reading the state and the
+            // rows it names each time is one state reach per waiting document per turn, for as long as the
+            // wait lasts - and the reach for a row that is not there is a miss the layer behind the map
+            // answers every single time.
+            if (waiting.contains(entry.getKey())) {
+                continue;
+            }
             RootAssembly assembly = store.load(entry.getKey());
-            Optional<Map<String, Object>> rendered =
-                    assembly == null ? Optional.empty() : assembly.render(slots);
+            Map<String, Map<Object, Map<String, Object>>> references = assembly == null
+                    ? Map.of()
+                    : referencesFor(assembly);
+            Optional<Map<String, Object>> rendered = assembly == null
+                    ? Optional.empty()
+                    : assembly.render(slots, references);
             if (rendered.isEmpty()) {
                 open.remove();
                 continue;
             }
+            // The same as the hold above, and for the same reason: a window running out is a clock, and a
+            // clock is exactly what must not release a document that is still missing a row it names.
+            if (assembly.waitsForARowItPointsAt(slots, references)) {
+                // Recorded as well as skipped, so the next turn takes the cheap exit above rather than
+                // reading the same absence again. A restart arrives here with nothing recorded, which is
+                // what this covers: the drain that first saw the wait may be on the other side of it.
+                waiting.add(entry.getKey());
+                continue;
+            }
+            waiting.remove(entry.getKey());
             outgoing.add(Envelope.insert(window.ts, outputStream, rendered.get(), null)
-                    .withPositions(assembly.covered()));
+                    .withPositions(assembly.covered())
+                    // As on the drain's own path. A document released by the window is the same document
+                    // and needs the same saying-so - and this is the path a deployment with a window open
+                    // sends most of them on, so leaving it out would fix nothing where it matters.
+                    .withRemoved(RootAssembly.embedsNotRendered(slots, rendered.get())));
             assembly.documentSent();
             store.save(entry.getKey(), assembly);
             window.reopen(now);
@@ -1100,6 +1263,46 @@ public final class AssemblerProcessor extends AbstractProcessor {
         // speaking sends nothing more to prompt the recount, and the chain would stay pinned at whatever
         // the fold held it to.
         return !letGo || bounds == null || bounds.release(this::tryEmit);
+    }
+
+    /**
+     * Queues on, for each chain, the position a lookup said owes nothing, once this level holds nothing
+     * lower on that chain.
+     *
+     * <p><b>Held rather than passed straight on, and the hold is the whole of what makes it safe.</b> What
+     * it says is true where it was said: those rows are durable and no record about them is coming. What it
+     * cannot see is a document sitting here in its window holding a <em>lower</em> position on the same
+     * chain - a document that is not durable anywhere, because a word about a row it points at changes
+     * nothing in the state, only what has to be drawn again. Let past that document, this would have a sink
+     * ack above a change that is then neither delivered nor replayable: the document stays at its previous
+     * version for ever, the job running and every count healthy.
+     *
+     * <p>So the condition is the one the bound already uses, asked of the same reading: whatever a window
+     * or an uncollected hand-over keeps this level's promise below, keeps this below it too. Queued after
+     * the documents whose windows just ran out, for the same reason a bound is - one sent ahead of what is
+     * queued behind it would say those documents had gone.
+     */
+    private boolean passOnWhatOwesNothing() {
+        if (settledAhead.isEmpty()) {
+            return true;
+        }
+        Map<String, ChainPosition> free = new LinkedHashMap<>();
+        settledAhead.entrySet().removeIf(entry -> {
+            SourceOrder unsent = lowestUnsentOn(entry.getKey());
+            if (unsent != null && unsent.compareTo(entry.getValue().order()) <= 0) {
+                return false;
+            }
+            free.put(entry.getKey(), entry.getValue());
+            return true;
+        });
+        if (free.isEmpty()) {
+            return true;
+        }
+        outgoing.add(new SettledPositions(free));
+        // Flushed here rather than left to whatever runs next: every caller has already flushed by the
+        // time this is reached, so a word only queued would wait for the next turn that happens to flush
+        // - and on the stream this is for, that turn is one no further row is coming to cause.
+        return flush();
     }
 
     /**

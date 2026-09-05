@@ -32,6 +32,16 @@ concurrency:
   group: install-e2e-${{ github.ref }}
   cancel-in-progress: true
 
+# The installer reports one event per completed install, and its default endpoint is the production
+# one. Installing is this lane's whole job -- four platforms, several installs each, every night --
+# so left alone it feeds a steady floor of installs that no person performed into the one figure the
+# funnel divides by, and nothing downstream can tell them apart afterwards. Pointed at a port nothing
+# listens on, the send is refused instantly and the installer swallows it, which is what a user
+# offline already sees. Deliberately not TAPSTATE_TELEMETRY=off: that also skips the identifier file,
+# and the installer smoke run below asserts on both halves.
+env:
+  TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e
+
 jobs:
   install:
     strategy:
@@ -167,8 +177,14 @@ jobs:
           echo "newest published release: $tag"
           git fetch --quiet origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null || true
           site="$(mktemp -d)"
-          git show "$tag:deploy/quickstart/quickstart.sh" > "$site/quickstart.sh"
-          git show "$tag:install/install.sh"              > "$site/install.sh"
+          # Assembled the way the publisher assembles it, never read straight out of the tag. The
+          # tree a release tag points at carries the PREVIOUS release's pins by construction -- the
+          # number is written inside the release runner, which never commits -- so a raw read
+          # compares the edge against the release before the one being announced. That is wrong in
+          # both directions and was wrong in both: it passed for a whole release cycle while the
+          # one-liner handed out a stale version, and it fails the moment the site is correct.
+          pinned="$(.github/scripts/site-from-tag.sh "$tag" "$site")"
+          echo "the newest release should be serving: $pinned"
           sh deploy/install-site/verify-published.sh https://install.tapstate.dev "$site"
 
   musl-refuses-loudly:

@@ -45,7 +45,7 @@ expect() { # expect <name> <want code> <want text>
   local name="$1" want_code="$2" want_text="$3" out code
   bash "$gate" > "$scratch/out" 2>&1; code=$?
   out="$(tr -d '\000' < "$scratch/out")"
-  if [ "$code" = "$want_code" ] && printf '%s' "$out" | grep -qF "$want_text"; then
+  if [ "$code" = "$want_code" ] && grep -qF "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"; passed=$((passed + 1))
   else
     printf '  FAIL  %s\n        wanted exit %s containing %s\n        got exit %s: %s\n' \
@@ -122,7 +122,7 @@ printf '#!/bin/sh\necho "git: simulated failure" >&2\nexit 1\n' > "$shadow/git"
 chmod +x "$shadow/git"
 PATH="$shadow:$PATH" bash "$gate" > "$scratch/out" 2>&1; code=$?
 out="$(tr -d '\000' < "$scratch/out")"
-if [ "$code" != 0 ] && printf '%s' "$out" | grep -qF "did not match a control file"; then
+if [ "$code" != 0 ] && grep -qF "did not match a control file" <<<"$out"; then
   printf '  ok    %s\n' "a matcher that cannot run reddens instead of reporting clean"; passed=$((passed + 1))
 else
   printf '  FAIL  %s\n        got exit %s: %s\n' \

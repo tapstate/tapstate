@@ -8,6 +8,13 @@
 # which stops before Docker. A fake `uname` (and, for the musl case, a fake `ldd`) placed first on PATH
 # drives the platform each run sees. Exit 0 iff every check passes.
 set -uo pipefail
+# Every case here runs the real installer, and the installer's default event endpoint is the
+# production one. A harness that forgets to override it posts a forged install for each case it runs
+# -- 21 from one run of this file -- into the very denominator that endpoint exists to collect, and
+# not one of them is distinguishable from a real install afterwards. Point the default at a port
+# nothing listens on: the send is refused instantly and the installer swallows it, exactly as it does
+# for a user who is offline. A case that wants to observe an event still sets its own URL.
+export TAPSTATE_TELEMETRY_URL="${TAPSTATE_TELEMETRY_URL:-http://127.0.0.1:1/e}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"          # deploy/quickstart -> repo root
@@ -53,6 +60,10 @@ printf 'fake-postgres-connector-jar\n' > "$QS_STUB/connectors-preview/postgres-c
 
 trap 'rm -rf "$CLI_STUB" "$QS_STUB"' EXIT
 
+# Set to an executable to place a fake `curl` first on PATH for the next run_prepare, so a test can
+# make a transfer die the way a dropped link does. Empty means the real curl runs.
+CURL_SHIM=""
+
 # Run quickstart.sh's prepare phase in a demo dir with a faked platform.
 #   run_prepare OS ARCH MUSL(glibc|musl) [REUSE_DEMO_DIR]
 # Sets RC, OUT, DEMO. With REUSE_DEMO_DIR the same directory is reused (for the idempotency check).
@@ -78,6 +89,7 @@ EOF
 echo "\$*" >> "$DEMO/.xattr-calls"
 EOF
   chmod +x "$shim/xattr"
+  [ -z "$CURL_SHIM" ] || { cp "$CURL_SHIM" "$shim/curl"; chmod +x "$shim/curl"; }
   OUT="$(cd "$DEMO" && PATH="$shim:$PATH" \
     TAPSTATE_VERSION="${PIN_VERSION-$VERSION}" \
     TAPSTATE_BASE_URL="file://$CLI_STUB" \
@@ -756,6 +768,241 @@ if [ -f "$COMPOSE_DEV" ] && grep -qE '^\s*build:' "$COMPOSE_DEV"; then
 else
   bad "docker-compose.dev.yml missing or carries no build: — the from-source path would have no way to build"
 fi
+
+# --- a compose fetched from a stale tree is pinned to this script's own version ----------------------
+# The stub above serves the repository's own compose, which is in sync with the script, so nothing here
+# could tell a script that pins from one that does not. Reality is the opposite: the script fetches this
+# file from a release tag, and a tag's tree carries the PREVIOUS release's pins by construction -- the
+# number is written inside the release runner, which never commits. So the case seeds exactly that and
+# asks what reaches the demo directory.
+#
+# Shipped, this was a 0.4.1 CLI starting a 0.3.0 server. Nothing reported it: the file was present, the
+# version it named existed, every container came up healthy, and the demo then could not log in.
+STALE_STUB="$(mktemp -d)"
+cp -R "$QS_STUB/." "$STALE_STUB/"
+sed 's|image: ghcr.io/tapstate/tapstate:[^[:space:]]*|image: ghcr.io/tapstate/tapstate:0.0.1-stale|g' \
+    "$QS_STUB/deploy/quickstart/docker-compose.yml" > "$STALE_STUB/deploy/quickstart/docker-compose.yml"
+# The seed is checked before it is used. A substitution that quietly matched nothing would leave the
+# stub in sync with the script, and the case would pass having tested the situation it exists to avoid.
+if grep -q '0\.0\.1-stale' "$STALE_STUB/deploy/quickstart/docker-compose.yml"; then
+  REAL_STUB="$QS_STUB"; QS_STUB="$STALE_STUB"
+  run_prepare Linux x86_64 glibc
+  QS_STUB="$REAL_STUB"
+  if grep -q "image: ghcr.io/tapstate/tapstate:$VERSION" "$DEMO/docker-compose.yml" \
+     && ! grep -q '0\.0\.1-stale' "$DEMO/docker-compose.yml"; then
+    ok "a compose fetched from a stale tree is pinned to this script's version ($VERSION)"
+  else
+    bad "the fetched compose still names $(sed -n 's|.*image: ghcr.io/tapstate/tapstate:\([^[:space:]]*\).*|\1|p' "$DEMO/docker-compose.yml" | head -1) — the demo would run a server other than $VERSION"
+  fi
+else
+  bad "could not seed a stale compose, so the pinning was never exercised"
+fi
+rm -rf "$STALE_STUB"
+
+# --- the CLI's own words survive a CLI that fails ---------------------------------------------------
+# Text, not behaviour: this smoke stops before Docker, and the line in question runs only against a live
+# stack. It is checked at all because of what its absence looks like -- the script runs under `set -e`,
+# and as a bare assignment `repl_out="$(... )"` ends the script AT that line when the CLI exits
+# non-zero. The print and the diagnosis below it never run, and everything the CLI said, up to and
+# including a stack trace, reaches the exit status and nowhere else. That shape was reported once as a
+# CPU-specific fault and reproduced later on hardware where that could not be the cause.
+if grep -qE '\|\| repl_status=\$\?' "$QUICKSTART_SH"; then
+  ok "a failing CLI does not end the script before its output is printed"
+else
+  bad "the REPL capture is a bare assignment again — under set -e the CLI's output would be discarded"
+fi
+# And a failure the two named cases do not recognise still stops the run, rather than falling through to
+# the row-count wait, which reports an empty target and sends the reader to a pipeline never started.
+if grep -qE 'repl_status" -ne 0' "$QUICKSTART_SH"; then
+  ok "a CLI failure the named cases do not match still stops the run"
+else
+  bad "nothing answers a non-zero CLI exit that is neither auth-failed nor not-authenticated"
+fi
+
+# --- a dropped transfer leaves no stump, and the run survives one -----------------------------------
+# Reported from a from-scratch install of a published release: the postgres jar transfer dropped
+# mid-flight three runs in a row, at three different offsets. Two things then went wrong, and the
+# second is the expensive one. The transfer wrote in place, so the partial bytes landed at the real
+# path; the guard below is `[ -f ... ] ||`, existence only, so every later run read the stump as
+# "already have it" and never re-fetched it. The stack came up with a corrupt connector and the
+# failure surfaced three steps downstream, naming a remedy that was the step that had just failed.
+#
+# The fake curl reproduces the drop rather than describing it: it writes a few bytes to wherever -o
+# points and exits 18 (partial file), the code the real one gave, for the first $FAIL_TIMES attempts
+# at that URL. Every other transfer is passed through to the real curl untouched.
+REAL_CURL="$(command -v curl 2>/dev/null || true)"
+DROP_DIR="$(mktemp -d)"
+cat > "$DROP_DIR/curl" <<EOF
+#!/bin/sh
+out=""; url=""; prev=""
+for a in "\$@"; do
+  [ "\$prev" = "-o" ] && out="\$a"
+  case "\$a" in http://*|https://*|file://*) url="\$a" ;; esac
+  prev="\$a"
+done
+case "\$url" in
+  *postgres-connector.jar)
+    n=0; [ -f "$DROP_DIR/n" ] && n="\$(cat "$DROP_DIR/n")"
+    if [ "\$n" -lt "\$(cat "$DROP_DIR/fail_times")" ]; then
+      echo "\$((n + 1))" > "$DROP_DIR/n"
+      [ -n "\$out" ] && printf 'fake-pos' > "\$out"
+      echo "curl: (18) Transferred a partial file" >&2
+      exit 18
+    fi ;;
+esac
+exec "$REAL_CURL" "\$@"
+EOF
+chmod +x "$DROP_DIR/curl"
+JAR_BYTES="$(wc -c < "$QS_STUB/connectors-preview/postgres-connector.jar" | tr -d ' ')"
+
+if [ -z "$REAL_CURL" ]; then
+  bad "no curl on PATH, so the dropped-transfer cases never ran"
+else
+  # One drop, then the link recovers -- which is what a flaky link does. The documented one-liner has
+  # to survive this by itself: a user who must run it again is doing an undocumented manual step.
+  CURL_SHIM="$DROP_DIR/curl"; echo 1 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
+  run_prepare Linux x86_64 glibc
+  DROP1="$DEMO"
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP1/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
+    ok "a transfer that drops once is retried, and the run completes on its own"
+  else
+    bad "one dropped transfer ended the run (rc=$RC, jar=$(wc -c < "$DROP1/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes)"
+  fi
+
+  # A link that never recovers. The run must fail -- but it must not leave a partial file at the real
+  # path, because that is what the next run would accept.
+  CURL_SHIM="$DROP_DIR/curl"; echo 99 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
+  run_prepare Linux x86_64 glibc
+  DROP2="$DEMO"
+  if [ "$RC" -ne 0 ] && [ ! -f "$DROP2/postgres-connector.jar" ]; then
+    ok "a transfer that never completes leaves nothing at the final path"
+  else
+    bad "a stump survived a failed transfer (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes at the real path)"
+  fi
+
+  # And the run after it recovers, which is the half the user actually hits: same directory, working
+  # link, no manual deletion. Under the old guard the stump was read as "already have it" forever.
+  CURL_SHIM=""
+  run_prepare Linux x86_64 glibc "$DROP2"
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP2/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
+    ok "re-running after a failed transfer re-fetches the jar instead of accepting the stump"
+  else
+    bad "the re-run did not recover the jar (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes): $OUT"
+  fi
+  CURL_SHIM=""
+fi
+rm -rf "$DROP_DIR"
+
+# --- the install event, seen from the path a first-time user actually takes -------------------------
+# install-smoke.sh covers the installer in isolation. These three cover what only the composed flow can
+# show: the quickstart calls install.sh TWICE (the platform gate, then the real install) and it drops
+# the installer's stdout. Both facts are invisible from install.sh alone.
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "quickstart install event: python3 is needed for the local sink"
+else
+  QBD="$(mktemp -d)"; : > "$QBD/log"
+  python3 - "$QBD" <<'PYEOF' &
+import http.server, os, sys
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        with open(os.path.join(d, 'log'), 'a') as fh:
+            fh.write(self.rfile.read(n).decode('utf-8', 'replace') + "\n")
+        self.send_response(204); self.end_headers()
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+with open(os.path.join(d, 'port'), 'w') as fh:
+    fh.write(str(srv.server_address[1]))
+srv.serve_forever()
+PYEOF
+  QB_PID=$!
+  for _ in $(seq 1 50); do [ -s "$QBD/port" ] && break; sleep 0.1; done
+  QB_URL="http://127.0.0.1:$(cat "$QBD/port")/e"
+
+  # like run_prepare, but keeps stdout and stderr apart -- the disclosure case is about which stream
+  # a message lands on, so merging them would make that case unable to fail.
+  qs_run() {   # $1 stdout file  $2 stderr file
+    local outf="$1" errf="$2" shim
+    DEMO="$(mktemp -d)/tapstate-demo"; mkdir -p "$DEMO"; cp "$QUICKSTART_SH" "$DEMO/quickstart.sh"
+    # A sandboxed HOME, so "the installer wrote nothing outside the demo directory" is a claim that
+    # can be checked at all. install.sh's default install directory is $HOME/.tapstate/bin, and the
+    # quickstart's TAPSTATE_INSTALL_DIR="$PWD" is the only thing keeping the identifier out of it.
+    QS_HOME="$(mktemp -d)"
+    shim="$(mktemp -d)"
+    # shellcheck disable=SC2016
+    printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; *) echo unknown ;; esac\n' > "$shim/uname"
+    chmod +x "$shim/uname"
+    printf '#!/bin/sh\nexit 0\n' > "$shim/xattr"; chmod +x "$shim/xattr"
+    ( cd "$DEMO" && PATH="$shim:$PATH" \
+      HOME="$QS_HOME" \
+      TAPSTATE_VERSION="$VERSION" \
+      TAPSTATE_BASE_URL="file://$CLI_STUB" \
+      TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
+      TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
+      TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
+      TAPSTATE_TELEMETRY_URL="$QB_URL" \
+      sh "$DEMO/quickstart.sh" >"$outf" 2>"$errf" )
+    rm -rf "$shim"
+  }
+
+  qs_out="$(mktemp)"; qs_err="$(mktemp)"
+  : > "$QBD/log"
+  qs_run "$qs_out" "$qs_err"
+  n_events="$(grep -c . "$QBD/log" 2>/dev/null | tr -d ' ')"
+
+  # exactly one. The platform gate runs install.sh before the install does, so an event fired from
+  # anywhere but the completed-install path doubles every quickstart install ever measured -- and the
+  # doubling is invisible unless something counts the events of one whole run.
+  if [ "$n_events" = "1" ]; then ok "a whole quickstart run produces exactly one install event"
+  else bad "quickstart produced $n_events install event(s), expected exactly 1"; fi
+
+  # the entry point must be distinguishable, or the two front doors cannot be compared at all
+  if grep -q '"entrypoint":"quickstart"' "$QBD/log"; then ok "the event is tagged entrypoint=quickstart"
+  else bad "event not tagged as quickstart: $(cat "$QBD/log")"; fi
+
+  # the disclosure has to survive quickstart.sh dropping the installer's stdout. A disclosure written
+  # to stdout disappears exactly here, on the path most first-time users take, while install-smoke's
+  # own stderr case would still pass.
+  if grep -qi 'anonymous install event' "$qs_err"; then
+    ok "the disclosure survives the quickstart's dropped stdout"
+  else
+    bad "the disclosure never reached the user through the quickstart path"
+  fi
+
+  # the id lives in the demo directory, so the documented cleanup really does forget the installation
+  id_here="$(find "$DEMO" -name '.installation-id' 2>/dev/null | head -1)"
+  if [ -n "$id_here" ]; then ok "the installation id is inside the demo directory"
+  else bad "no installation id under the demo directory -- it was written somewhere rm -rf will not reach"; fi
+
+  # and it is the ONLY one: nothing was written where the documented cleanup cannot reach. Searched in
+  # the sandboxed HOME, which is where install.sh puts things when the quickstart's
+  # TAPSTATE_INSTALL_DIR seam is absent. The previous form of this case searched the demo directory
+  # AFTER rm -rf had removed it, so it could never return anything and therefore could never fail --
+  # it passed identically whether the product behaved or not.
+  stray="$(find "$QS_HOME" -name '*installation*' 2>/dev/null | head -1)"
+  if [ -z "$stray" ]; then ok "the installer writes no identifier outside the demo directory"
+  else bad "an identifier was written outside the demo directory, where rm -rf will not reach: $stray"; fi
+
+  demo_parent="$(dirname "$DEMO")"
+  rm -rf "$demo_parent"
+  left="$(find "$demo_parent" "$QS_HOME" -name '*installation*' 2>/dev/null | head -1)"
+  if [ -z "$left" ]; then ok "rm -rf of the demo directory leaves no identifier anywhere"
+  else bad "an identifier survived rm -rf of the demo directory: $left"; fi
+  rm -rf "$QS_HOME"
+
+  rm -f "$qs_out" "$qs_err"
+  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null
+fi
+
+# --- the harness itself must not report installs -----------------------------------------------------
+# The subject of this case is one line at the top of this file, and losing that line is silent: the
+# suite stays green while every case in it posts a forged install to the production endpoint.
+case "${TAPSTATE_TELEMETRY_URL:-}" in
+  "")             bad "the suite runs the installer with no endpoint override -- every case posts a real install event" ;;
+  *tapstate.dev*) bad "the suite points the installer at the production endpoint: $TAPSTATE_TELEMETRY_URL" ;;
+  *)              ok  "the suite's own install events go nowhere near the production endpoint" ;;
+esac
 
 # --- summary ----------------------------------------------------------------------------------------
 echo

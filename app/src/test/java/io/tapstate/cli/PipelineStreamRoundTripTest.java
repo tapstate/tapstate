@@ -74,15 +74,15 @@ class PipelineStreamRoundTripTest {
 
     @BeforeAll
     static void startServer() {
-        // server.port goes in as a command-line argument, not through properties(). properties()
-        // populates the DEFAULT property source, which is the lowest-ranked one there is, and the
-        // application's own configuration sets server.port to the published 8080 -- so it wins, and
-        // this server silently binds 8080 while the test believes it asked for a free port. That is
-        // invisible until something else on the host holds 8080, at which point the client below
-        // talks to whatever that is and every assertion here fails as though streaming were broken.
         context = new SpringApplicationBuilder(TestApp.class)
                 .properties("tapstate.control.stream.poll-interval=PT0.05S")
-                .run("--server.port=0");
+                // Both the address and the port are run arguments, not default properties: `properties(...)`
+                // populates the lowest-ranked source Spring has, and the product's own application
+                // configuration publishes 8080, so a port asked for there is silently overridden. The
+                // address is the other half -- a free port alone binds the wildcard, and a wildcard bind
+                // does not reserve 127.0.0.1:<port>, so a process already holding that port on the loopback
+                // keeps receiving what this test sends.
+                .run("--server.address=127.0.0.1", "--server.port=0");
         port = ((WebServerApplicationContext) context).getWebServer().getPort();
     }
 
@@ -100,7 +100,9 @@ class PipelineStreamRoundTripTest {
     }
 
     private URI baseUrl() {
-        return URI.create("http://localhost:" + port);
+        // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
+        // one of those is the address bound above.
+        return URI.create("http://127.0.0.1:" + port);
     }
 
     private String readToken() {

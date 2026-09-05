@@ -16,6 +16,10 @@
 #                          binary never enters PATH and `rm -rf` of the demo directory removes it.
 #   TAPSTATE_BASE_URL      release base URL; default https://github.com/tapstate/tapstate/releases
 #                          (override for a mirror).
+#   TAPSTATE_TELEMETRY     "off" disables the install event entirely: nothing is sent AND no id file is
+#                          written. Checked before either happens, never after.
+#   TAPSTATE_TELEMETRY_URL where the install event goes; default https://install.tapstate.dev/e.
+#   TAPSTATE_ENTRYPOINT    which entry point ran this: "cli" (default) or "quickstart".
 #
 # POSIX sh, no bashisms. All work is inside main(); the final line calls it, so a truncated download can
 # never execute a partial script.
@@ -26,7 +30,10 @@ set -eu
 # prerelease that lookup finds nothing and a bare run would die on a clean machine. Pinning also makes
 # the promise reproducible -- the same script installs the same build. TAPSTATE_VERSION overrides for
 # a one-off; releases update this line, and the smoke fails the build if it drifts from pom.xml.
-PINNED_VERSION="0.3.0"
+PINNED_VERSION="0.4.3"
+
+# Kept in the installation directory, so removing that directory forgets the installation.
+ID_FILE=".installation-id"
 
 die() {
     printf 'install: %s\n' "$1" >&2
@@ -92,14 +99,40 @@ $platform
 }
 
 # Download $1 to the file $2 with whichever of curl / wget is present.
+#
+# Attempts resume the partial rather than restarting it -- a link that drops once on a large download
+# tends to drop again, and restarting from zero each time can make no progress at all. The transfer
+# lands in $2.part and is moved into place only once it has completed, so an interrupted one leaves
+# nothing at the real path. The last attempt starts clean, which is the only way past a server that
+# cannot serve ranges, or a .part that is already complete because a run was killed between the
+# transfer and the move.
+#
+# The quickstart carries this function verbatim, deliberately: the two are halves of one documented
+# install path, and a transfer that survives a dropped link in one half but not the other is the same
+# dead install to whoever ran the one-liner.
+#
+# It reports and returns non-zero rather than exiting, so the caller decides: under `set -e` an
+# unguarded call ends the run exactly as it did before, and a caller that can do without the file
+# keeps its own `|| ...`.
 fetch() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" -o "$2"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$1" -O "$2"
-    else
-        die "neither curl nor wget is available to download $1."
-    fi
+    _part="$2.part"
+    _try=0
+    while [ "$_try" -lt 3 ]; do
+        _try=$((_try + 1))
+        [ "$_try" -lt 3 ] || rm -f "$_part"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 2 -C - "$1" -o "$_part" && { mv -f "$_part" "$2"; return 0; }
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -c "$1" -O "$_part" && { mv -f "$_part" "$2"; return 0; }
+        else
+            die "neither curl nor wget is available to download $1."
+        fi
+    done
+    printf 'install: could not download %s -- %s attempts, the last from scratch.\n' "$1" "$_try" >&2
+    # Only when there is one. A transfer that never opened leaves no .part, and promising a
+    # resume of a file that is not there sends the reader looking for it.
+    [ ! -f "$_part" ] || printf 'install: what did arrive is kept at %s, so a later run resumes it.\n' "$_part" >&2
+    return 1
 }
 
 # The version to install: the caller's override, or the pin above. The /releases/latest redirect is
@@ -157,7 +190,9 @@ version_ge() {
 # requirement this installer does not know, an unreadable version -- says nothing at all, because a
 # check that did not happen must not masquerade as one that passed.
 note_recommended_platform() {
-    fetch "${base_url}/download/v${version}/platform-minimums.txt" "$tmp/minimums" || return 0
+    # Stderr is dropped rather than shown: this file is optional, every word fetch would say about
+    # failing to get it describes a normal install of a release that does not publish one.
+    fetch "${base_url}/download/v${version}/platform-minimums.txt" "$tmp/minimums" 2>/dev/null || return 0
     [ -s "$tmp/minimums" ] || return 0
     kind="$(awk -v p="$platform" '$1 == p { print $2; exit }' "$tmp/minimums")"
     need="$(awk -v p="$platform" '$1 == p { print $3; exit }' "$tmp/minimums")"
@@ -305,6 +340,69 @@ install_alias() {
     staged_alias=""
 }
 
+# --- the install event -------------------------------------------------------------------------------
+# One event per completed install, so we can tell how many installs of a given release actually finish.
+# It carries no IP address (the receiving edge derives a country and discards the address), no hostname,
+# and nothing about what is being connected to.
+#
+# The id identifies an INSTALLATION, not a machine and not a person: it lives in the installation
+# directory, so a reinstall in the same place keeps it and `rm -rf` of that directory forgets it. Two
+# directories on one machine are two installations, which is the intended reading, not a defect.
+
+telemetry_enabled() {
+    case "${TAPSTATE_TELEMETRY:-on}" in
+        off|OFF|0|false|no) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Said before anything is written or sent, and on stderr: the quickstart runs this script with stdout
+# dropped, so a disclosure on stdout would be invisible on the path most first-time users take.
+telemetry_disclose() {
+    telemetry_enabled || return 0
+    printf 'tapstate reports one anonymous install event (version, OS/arch, entry point, and a random\n' >&2
+    printf 'installation id kept in %s). No IP address is stored.\n' "$install_dir" >&2
+    printf 'Turn it off with TAPSTATE_TELEMETRY=off; deleting %s forgets this installation.\n\n' "$install_dir/$ID_FILE" >&2
+}
+
+new_installation_id() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+    else
+        od -An -tx1 -N16 /dev/urandom | tr -d ' \n'
+    fi
+}
+
+# Never fails the install: a timeout, a refused connection or a missing tool leaves the installed CLI
+# exactly as it was. There is no retry -- a second attempt would be a second event.
+send_install_event() {
+    telemetry_enabled || return 0
+    [ -d "$install_dir" ] || return 0
+
+    id_path="$install_dir/$ID_FILE"
+    if [ -r "$id_path" ]; then
+        installation_id="$(cat "$id_path" 2>/dev/null)" || return 0
+    else
+        installation_id="$(new_installation_id)" || return 0
+        ( umask 077; printf '%s\n' "$installation_id" > "$id_path" ) 2>/dev/null || return 0
+    fi
+    [ -n "$installation_id" ] || return 0
+
+    event_os="${platform%%-*}"
+    event_arch="${platform#*-}"
+    payload="$(printf '{"installation_id":"%s","version":"%s","os":"%s","arch":"%s","entrypoint":"%s","timestamp":"%s"}' \
+        "$installation_id" "$version" "$event_os" "$event_arch" \
+        "${TAPSTATE_ENTRYPOINT:-cli}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    endpoint="${TAPSTATE_TELEMETRY_URL:-https://install.tapstate.dev/e}"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS -m 2 -X POST -H 'Content-Type: application/json' -d "$payload" "$endpoint" >/dev/null 2>&1 || :
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 2 --header='Content-Type: application/json' --post-data="$payload" -O /dev/null "$endpoint" >/dev/null 2>&1 || :
+    fi
+    return 0
+}
+
 main() {
     base_url="${TAPSTATE_BASE_URL:-https://github.com/tapstate/tapstate/releases}"
     install_dir="${TAPSTATE_INSTALL_DIR:-$HOME/.tapstate/bin}"
@@ -323,6 +421,8 @@ main() {
         printf '%s\n' "$platform"
         return
     fi
+    # After the gate, before the first download: the gate collects nothing, so it discloses nothing.
+    telemetry_disclose
     resolve_version
     asset="tapstate-${version}-${platform}.tar.gz"
     url="${base_url}/download/v${version}/${asset}"
@@ -369,6 +469,10 @@ main() {
     printf '  %s validate\n' "$run_as"
     printf 'to run a real pipeline (server + databases): see docs/quickstart-online.md in the repository\n'
     printf 'to uninstall: rm -rf ~/.tapstate  (and drop the PATH line if you added one)\n'
+
+    # Last, and only here: the event means "an install completed", so it cannot be sent from anywhere
+    # that might still refuse -- and the platform gate above returns long before this line.
+    send_install_event
 }
 
 main "$@"

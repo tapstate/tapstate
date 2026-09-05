@@ -51,18 +51,31 @@ step() {
 }
 
 has() {   # $1 = description, $2 = text, $3 = extended regex
-  if printf '%s' "$2" | grep -qE "$3"; then ok "$1"; else bad "$1"; fi
+  if grep -qE "$3" <<<"$2"; then ok "$1"; else bad "$1"; fi
+}
+
+hasnt() {   # $1 = description, $2 = text, $3 = extended regex
+  if grep -qE "$3" <<<"$2"; then bad "$1"; else ok "$1"; fi
 }
 
 lacks() { # $1 = description, $2 = text, $3 = extended regex
-  if printf '%s' "$2" | grep -qE "$3"; then bad "$1"; else ok "$1"; fi
+  if grep -qE "$3" <<<"$2"; then bad "$1"; else ok "$1"; fi
 }
+
+# The helpers themselves, before anything leans on them. A `|` into `grep -q` under `pipefail` reports
+# the pipeline, not the match: grep stops at the first hit without draining, the writer left mid-write
+# takes an EPIPE, and a case whose pattern *did* match comes back FAIL. It needs a text that outruns a
+# pipe buffer -- which the jobs below are -- so on a small one the broken shape and the sound one read
+# alike. This seeds one big enough to tell them apart.
+big_text="the needle$(printf '\n%*s' 200000 '')"
+has "a match is still a match when the text outruns a pipe buffer" "$big_text" '^the needle$'
+unset big_text
 
 # Vacuity first. Every case below reads a job or a step by name, and a rename would empty all of them
 # at once -- silently, and in the direction that reports success.
 jobs_list="$(awk '/^  [a-z][a-z0-9_-]*:[ \t]*$/ { gsub(/[ :]/, ""); print }' "$workflow")"
 for want in quickstart-live quickstart-upgrade; do
-  if printf '%s\n' "$jobs_list" | grep -qx "$want"; then
+  if grep -qx "$want" <<<"$jobs_list"; then
     ok "the $want job is here"
   else
     bad "no $want job in the workflow -- every case about it below would pass over nothing"
@@ -125,6 +138,28 @@ has "and the image the stack runs is moved to the new version" "$upgrade_step" \
 # --- and it will not stay vacuous quietly ---------------------------------------------------------
 has "the lane refuses once a migration runner exists and it still asserts nothing about one" \
   "$upgrade" 'MigrationRunner'
+
+# --- the published leg runs the combination a user actually gets -----------------------------------
+# The script from the install site, the assets from the tag. Those are two different points in history
+# and that is the point: the site serves the script with the version written in, while a release tag's
+# tree carries the previous release's pins, so a user runs a newer script against older assets. Taking
+# both from the tag gives a self-consistent older release which passes while the real one-liner is
+# broken -- measured: the leg announced "the published release v0.4.1" and ran 0.3.0 two lines later,
+# on a day the published one-liner could not log in at all.
+leg_step="$(step 'Resolve what this leg runs')"
+has "the published leg takes its script from the install site" "$leg_step" 'install\.tapstate\.dev'
+has "and its assets from the release tag"                      "$leg_step" 'raw\.githubusercontent\.com'
+# And the image is derived from the script, not from the compose as downloaded. The script pins the
+# compose to its own version before starting anything, so the file as fetched names an image the run
+# never starts; comparing, pulling and inspecting that one is how this leg agreed with itself.
+# Anchored on the assignment, not on the word. Matching `CLI_VERSION` alone is satisfied by the refusal
+# message one line below it -- checked: with the derivation reverted to read the compose, a case written
+# that way still passed, because "no CLI_VERSION found in the script under test" contains it.
+# shellcheck disable=SC2016  # the workflow's own text is `$script`; expanding it here would search for ours
+has "the image under test comes from the script's own version" "$leg_step" \
+  'ver=.*CLI_VERSION.*"\$script"'
+hasnt "and not from the compose as downloaded"                 "$leg_step" \
+  'ver=.*image: ghcr'
 
 if [ "$failed" -ne 0 ]; then
   echo "$failed case(s) failed" >&2

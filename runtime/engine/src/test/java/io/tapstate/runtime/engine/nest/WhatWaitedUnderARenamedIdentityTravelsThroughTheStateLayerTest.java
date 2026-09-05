@@ -108,6 +108,42 @@ class WhatWaitedUnderARenamedIdentityTravelsThroughTheStateLayerTest {
                 .isZero();
     }
 
+    /**
+     * The same carrying with the parking area evicted out of memory in between, which is the state that
+     * decides what an ask of this area actually risks. In an ordinary round every one of those asks answers
+     * null, and a null from a map with a layer behind it has two readings that are identical from the
+     * outside: nothing was ever left here, or what was left was dropped on its way out of memory. Only the
+     * second one is data loss, and no count of trips can tell them apart.
+     *
+     * <p>Evicting on purpose separates them. What is evicted is gone from memory and not from the layer, so
+     * if the claim still lands the ask is fetching it back rather than finding it missing - and an ask that
+     * answers null is then costing a trip and never a row.
+     */
+    @Test
+    void aClaimWaitingIsStillAnsweredAfterTheParkingAreaIsEvicted() throws Exception {
+        ResolverProcessor policies = resolver();
+        feed(policies, CLAIMS, claim(1, "K1", "P1"));
+        assertThat(drain()).describedAs("nothing can travel while the parent is unknown").isEmpty();
+
+        feed(policies, twinOf(POLICIES.pathId()), policyRenamed(2, "P1", "P2", "C1"));
+        assertThat(cold.count(POLICIES.parkingMapName()))
+                .describedAs("what the vacated identity gave up reached the layer behind the map")
+                .isEqualTo(1L);
+
+        // Out of memory, still in the layer - which is the one arrangement where the two readings of a
+        // null differ, and the only one in which the answer can be got wrong without anything saying so.
+        member.getMap(POLICIES.parkingMapName()).evictAll();
+
+        feed(policies, OWN_ROWS, policyRenamed(2, "P1", "P2", "C1"));
+
+        assertThat(drain())
+                .describedAs("the policy, and the claim that was waiting - fetched back rather than lost")
+                .hasSize(2);
+        assertThat(cold.count(POLICIES.parkingMapName()))
+                .describedAs("taken in rather than left behind, eviction or not")
+                .isZero();
+    }
+
     private ResolverProcessor resolver() throws Exception {
         member = startMember(cold);
         NestBinding.NestStores stores = NestBinding.onMap().bind(member);
