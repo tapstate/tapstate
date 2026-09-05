@@ -21,11 +21,14 @@ class DslErrorTest {
     @Test
     void carriesTheCorpusVocabularyCodes() {
         assertThat(DslError.values()).extracting(DslError::code).containsExactlyInAnyOrder(
+                "dsl.unsupported-version",
                 "dsl.unknown-field",
                 "dsl.forbidden-field",
+                "dsl.missing-field",
                 "dsl.missing-reference",
                 "dsl.ambiguous-reference",
                 "dsl.mode-mismatch",
+                "dsl.mode-required-for-read",
                 "dsl.illegal-value",
                 "dsl.illegal-expression",
                 "dsl.composition",
@@ -54,9 +57,13 @@ class DslErrorTest {
     void declaresThePlaceholderContractPerCode() {
         assertThat(DslError.UNKNOWN_FIELD.placeholders()).containsExactlyInAnyOrder("field", "path");
         assertThat(DslError.FORBIDDEN_FIELD.placeholders()).containsExactlyInAnyOrder("field", "path");
+        assertThat(DslError.MISSING_FIELD.placeholders()).containsExactlyInAnyOrder("field", "path");
         assertThat(DslError.MISSING_REFERENCE.placeholders()).containsExactlyInAnyOrder("ref", "path");
         assertThat(DslError.AMBIGUOUS_REFERENCE.placeholders()).containsExactlyInAnyOrder("ref", "path");
         assertThat(DslError.MODE_MISMATCH.placeholders()).containsExactlyInAnyOrder("field", "mode", "path");
+        // the pipeline is what made the field required, so it is named alongside the source that lacks it
+        assertThat(DslError.MODE_REQUIRED_FOR_READ.placeholders())
+                .containsExactlyInAnyOrder("source", "pipeline", "path");
         assertThat(DslError.ILLEGAL_VALUE.placeholders()).containsExactlyInAnyOrder("value", "expected", "path");
         assertThat(DslError.ILLEGAL_EXPRESSION.placeholders()).containsExactlyInAnyOrder("expr", "detail", "path");
         assertThat(DslError.COMPOSITION.placeholders()).containsExactlyInAnyOrder("detail", "path");

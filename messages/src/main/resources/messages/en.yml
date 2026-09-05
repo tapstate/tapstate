@@ -225,6 +225,15 @@ dsl.composition:
 dsl.duplicate-id:
   message: "Duplicate id '{id}' at {path}."
   solution: "Ids must be unique within the workspace; rename one of them."
+dsl.missing-field:
+  message: "Required field '{field}' is missing at {path}."
+  solution: "Add '{field}' to that block. It has no default, and nothing else in the document implies it."
+dsl.mode-required-for-read:
+  message: "Source '{source}' is read by pipeline '{pipeline}' but declares no {path}."
+  solution: "Add '{path}:' to '{source}', saying how it is read. A source named only as a sync or push target supplies a connection rather than rows, and correctly declares none."
+dsl.unsupported-version:
+  message: "This document declares version '{got}', which this build cannot read."
+  solution: "Write one of the supported versions: {supported}. A version is supported for two further minor releases after its successor ships."
 dsl.unsupported-mode:
   message: "Connector '{connector}' does not support mode '{mode}' at {path}."
   solution: "Choose one of the connector's supported modes: {allowed}."
@@ -270,6 +279,15 @@ store.invalid-uri:
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
+migration.data-newer-than-binary:
+  message: "The store holds system data at version {installed}, which is newer than this build supports (up to {supported})."
+  solution: "Start a build at or above the one that wrote it. Downgrading across a system-data version is not supported; to go back, restore the backup taken before the upgrade."
+migration.lock-timeout:
+  message: "Another member ({holder}) has been migrating the system data since {since} and has not finished."
+  solution: "Check that member is still running. If it has died, this one takes over on its own once the lock goes stale; if it is stuck, stop it and start this one again."
+migration.changeset-failed:
+  message: "System data changeset {changeset} failed: {cause}"
+  solution: "Fix what the cause names, then start again -- the migration resumes at this changeset rather than repeating the ones before it."
 io.store-unavailable:
   message: "A store operation could not complete: {detail}."
   solution: "Check the store is reachable and healthy, then retry."
@@ -277,7 +295,7 @@ io.store-unauthorized:
   message: "The store rejected the credentials for the operation."
   solution: "Check the store username and password in the connection settings."
 io.document-unreadable:
-  message: "A stored document with id '{id}' could not be read back."
+  message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."
 connector.not-official:
   message: "Runtime registration supports these connectors today: {official}. '{connector}' is not among them yet."

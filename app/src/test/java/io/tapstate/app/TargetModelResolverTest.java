@@ -113,7 +113,7 @@ class TargetModelResolverTest {
 
     private static SourceResource cdcSource(String id, String table) {
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static PipelineResource pipeline(String id, String sourceId) {

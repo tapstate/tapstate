@@ -70,6 +70,15 @@
       <artifactId>mongodb-driver-sync</artifactId>
     </dependency>
 
+    <!-- The logging facade, for the one thing in this module that has to narrate itself: a system-data
+         migration runs before the server is up and can take a while, so an operator watching a start
+         that has not finished needs to be told which step is running and how long the last one took.
+         API only; whichever backend the process already has picks it up. -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>

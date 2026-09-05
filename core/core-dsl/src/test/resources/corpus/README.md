@@ -60,9 +60,11 @@ together):
 |---|---|---|
 | `unknown-field` | field outside the v1 schema, strict rejection | §11.5 |
 | `forbidden-field` | field known to the schema but banned in this position | X18/X19 |
+| `missing-field` | required field the parser cannot supply, left out of the document | §3/§7/§8 |
 | `missing-reference` | id / table / step reference with no target in the batch | §1/§4/§8 |
 | `ambiguous-reference` | bare table name colliding across declared sources | §4 |
 | `mode-mismatch` | option / block illegal for the source mode or boundedness | §4/X7/X10 |
+| `mode-required-for-read` | a source a pipeline reads declares no mode; one named only as a write target correctly declares none | §4 (X18) |
 | `illegal-value` | enum or format constraint violation | §2/§8 |
 | `illegal-expression` | CEL expression field fails to compile or type-check | §12 |
 | `composition` | structural composition rule broken | X17 |
@@ -99,6 +101,9 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `g11-config-enum-violation` | invalid-config-value | `mysql.deploymentMode` set to `cluster`, outside the declared enum |
 | `g12-snapshot-only-on-stream` | mode-mismatch | `settings.read_mode: snapshot_only` over a pure stream source (no one-shot read) |
 | `g13-start-from-without-tail` | mode-mismatch | `settings.start_from` on a bounded read (api source, no incremental tail) |
+| `g14-source-without-connector` | missing-field | source with no `connector:`, the field nothing else implies |
+| `g15-read-source-without-mode` | mode-required-for-read | source read by a pipeline with no `mode:`; the write target in the same batch correctly has none |
+| `g16-view-without-primary-key` | missing-field | inline view with no `primary_key:`, the field its sink indexes uniquely |
 
 Connector-dimension variants (capability matrix, config field checks) are validated against the
 bundled catalog by plan task C3. The catalog's mode signal is trusted only where it is reliable —

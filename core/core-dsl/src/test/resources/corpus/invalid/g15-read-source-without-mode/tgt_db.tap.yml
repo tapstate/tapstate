@@ -1,0 +1,7 @@
+# Valid on purpose: a pure connection supplier (X18) is named only as a write target, so it declares
+# no mode and must not. This half is what makes the rule conditional rather than a plain required field.
+version: tapstate/v1
+kind: source
+id: tgt_db
+connector: mysql
+config: { host: 10.30.0.12, username: writer, password: Db_2026 }

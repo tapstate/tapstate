@@ -21,15 +21,13 @@ public sealed interface Step {
 
     FromClause from();
 
-    Map<String, Object> options();
-
     static Inline inline(String id, FromClause from, TransformBody body,
-                         Map<String, Object> options, Map<String, Object> experimental) {
-        return new Inline(id, from, body, options, experimental);
+                         Map<String, Object> experimental) {
+        return new Inline(id, from, body, experimental);
     }
 
-    static Use use(String id, String use, FromClause from, Map<String, Object> options) {
-        return new Use(id, use, from, options);
+    static Use use(String id, String use, FromClause from) {
+        return new Use(id, use, from);
     }
 
     @Doc("A transform defined inline in the pipeline, with its body specified directly.")
@@ -39,8 +37,6 @@ public sealed interface Step {
             @Doc(value = "The upstream steps or sources this transform reads from.", required = true)
             FromClause from,
             @YamlFlatten TransformBody body,
-            @Doc("Transform-owned extension options.")
-            Map<String, Object> options,
             @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
             Map<String, Object> experimental) implements Step {
         public Inline {
@@ -52,28 +48,29 @@ public sealed interface Step {
                 throw new IllegalArgumentException(
                         "nest/join take an alias-map from:, streaming steps take a list from: (ADR-0016 §5)");
             }
-            options = copy(options);
             experimental = copy(experimental);
         }
     }
 
-    /** {@code use:} reference; only options may override the definition body (X19). */
-    @Doc("A reference to a named transform definition; only options may override the referenced body.")
+    /**
+     * {@code use:} reference. The definition body is taken as it stands: the reference overrides
+     * nothing. Options were the one documented override and they carried no engine option anyone
+     * read, so the override existed on paper only; it comes back with the first real option, as a
+     * typed component rather than a free map.
+     */
+    @Doc("A reference to a named transform definition, used as defined.")
     record Use(
             @Doc("Unique step id within the pipeline; defaults to the referenced transform name.")
             String id,
             @Doc(value = "Name of the transform definition to reuse.", required = true)
             String use,
             @Doc(value = "The upstream steps or sources this transform reads from.", required = true)
-            FromClause from,
-            @Doc("Transform-owned extension options.")
-            Map<String, Object> options)
+            FromClause from)
             implements Step {
         public Use {
             Objects.requireNonNull(use, "use");
             Objects.requireNonNull(from, "from");
             id = id == null ? use : id;
-            options = copy(options);
         }
     }
 

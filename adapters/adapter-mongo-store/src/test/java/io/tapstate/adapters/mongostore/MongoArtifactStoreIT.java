@@ -3,11 +3,13 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.IndexOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.adapters.mongostore.migration.V1BaselineIndexes;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.IoError;
@@ -140,8 +142,8 @@ class MongoArtifactStoreIT {
                     config:
                       host: replica
                     """);
-            String oldHash = CanonicalHash.of(WRITER.write(source));
-            String newHash = CanonicalHash.of(WRITER.write(changed));
+            String oldHash = CanonicalHash.of(source);
+            String newHash = CanonicalHash.of(changed);
 
             assertThat(store.create(source)).isEqualTo(ArtifactMutation.CREATED);
             assertThat(store.create(source)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
@@ -229,15 +231,14 @@ class MongoArtifactStoreIT {
             // not be dragged into a batch that merely declares a version of something else — otherwise
             // one unreadable document would veto every conditional write in the store.
             collection.insertOne(new Document("_id", "corrupt").append("kind", "source")
-                    .append("canonical", "not: [valid").append("contentHash", "0".repeat(64)));
+                    .append("body", new Document("version", "tapstate/v1")
+                            .append("kind", "source").append("id", "corrupt"))
+                    .append("contentHash", "0".repeat(64)));
             String declared = collection.find(new Document("_id", "orders")).first().getString("contentHash");
+            Resource replica = PARSER.parse(ORDERS.replace("localhost", "replica"));
 
-            assertThat(store.saveAll(
-                    List.of(PARSER.parse(ORDERS.replace("localhost", "replica"))),
-                    Map.of("orders", declared)))
-                    .isEmpty();
-            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
-                    .isEqualTo(WRITER.write(PARSER.parse(ORDERS.replace("localhost", "replica"))));
+            assertThat(store.saveAll(List.of(replica), Map.of("orders", declared))).isEmpty();
+            assertThat(store.get("orders")).contains(replica);
         });
     }
 
@@ -270,10 +271,12 @@ class MongoArtifactStoreIT {
     void listSurfacesAnUnreadableStoredDocument() {
         withStore((store, collection) -> {
             store.save(PARSER.parse(ORDERS));
-            // An out-of-band document whose body is not a parseable artifact (corruption, or a body
-            // written by a newer grammar). The truth layer must surface it rather than silently skip
-            // it, and the scan must not leak its server-side cursor on the failure path.
-            collection.insertOne(new Document("_id", "corrupt").append("kind", "source").append("canonical", "not: [valid"));
+            // An out-of-band document whose body does not bind (corruption, or a body written by a
+            // newer grammar). The truth layer must surface it rather than silently skip it, and the
+            // scan must not leak its server-side cursor on the failure path.
+            collection.insertOne(new Document("_id", "corrupt").append("kind", "source")
+                    .append("body", new Document("version", "tapstate/v1")
+                            .append("kind", "source").append("id", "corrupt")));
 
             Throwable thrown = catchThrowable(store::list);
             assertThat(thrown).isInstanceOf(TapstateException.class);
@@ -286,10 +289,10 @@ class MongoArtifactStoreIT {
     void listStoredKeepsAnUnreadableStoredDocumentWithoutBlockingItsReadableSiblings() {
         withStore((store, collection) -> {
             store.save(PARSER.parse(ORDERS));
-            String malformed = "not: [valid";
             collection.insertOne(new Document("_id", "corrupt")
                     .append("kind", "pipeline")
-                    .append("canonical", malformed)
+                    .append("body", new Document("version", "tapstate/v1")
+                            .append("kind", "pipeline").append("id", "corrupt"))
                     .append("contentHash", "stale-hash"));
 
             List<StoredArtifactRecord> rows = store.listStored();
@@ -300,11 +303,51 @@ class MongoArtifactStoreIT {
             assertThat(rows).filteredOn(row -> row.id().equals("corrupt")).singleElement()
                     .satisfies(row -> {
                         assertThat(row.kind()).isEqualTo("pipeline");
-                        assertThat(row.canonicalForm()).isEqualTo(malformed);
+                        assertThat(row.canonicalForm())
+                                .as("the canonical form is rendered from the model, so a body that does "
+                                        + "not become a model has none to show")
+                                .isNull();
                         assertThat(row.contentHash()).isEqualTo("stale-hash");
                         assertThat(row.readable()).isFalse();
                     });
         });
+    }
+
+
+    @Test
+    void theReadPathBindsTheStructureAndNeverLooksAtTextBesideIt() {
+        withStore((store, collection) -> {
+            Resource orders = PARSER.parse(ORDERS);
+            store.save(orders);
+            // Text that cannot be parsed, put beside a body that binds. A read that still went through
+            // text would fail on it; one that binds the structure never looks. Nothing writes this field
+            // any more — it is here because a read that ignores it has to be shown ignoring something.
+            collection.updateOne(new Document("_id", "orders"),
+                    new Document("$set", new Document("canonical", "not: [valid")));
+
+            assertThat(store.get("orders")).contains(orders);
+        });
+    }
+
+    @Test
+    void aReadByKindIsAnIndexedLookupRatherThanAScanOfEveryArtifact() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("tapstate");
+            MongoCollection<Document> collection = database.getCollection("artifacts");
+            collection.drop();
+            MongoArtifactStore store = new MongoArtifactStore(client, collection);
+            store.saveAll(List.of(PARSER.parse(ORDERS), PARSER.parse(ORDERS_SYNC)));
+            // Built by the product from the row's own declaration rather than written out here: a test
+            // that created its own index would keep passing over a release that ships none.
+            new V1BaselineIndexes().up(database);
+
+            assertThat(store.listStored("source")).singleElement()
+                    .satisfies(row -> assertThat(row.id()).isEqualTo("orders"));
+            assertThat(collection.find(new Document("kind", "source")).explain().toJson())
+                    .as("a read by kind has to use the index; a collection scan degrades with the "
+                            + "workspace and nothing reports it")
+                    .contains("IXSCAN");
+        }
     }
 
     private interface StoreTest {

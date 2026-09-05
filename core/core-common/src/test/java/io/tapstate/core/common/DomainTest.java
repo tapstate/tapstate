@@ -22,7 +22,7 @@ class DomainTest {
         assertThat(Domain.ids())
                 .containsExactlyInAnyOrder(
                         "dsl", "cli", "core", "catalog", "schema", "lifecycle", "role", "boot",
-                        "actuation", "store", "connector", "transform", "io", "control",
+                        "actuation", "store", "migration", "connector", "transform", "io", "control",
                         "engine", "monitor", "data-browser", "artifact", "source", "mcp",
                         "capture", "nest");
     }

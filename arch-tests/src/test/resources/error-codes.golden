@@ -123,14 +123,17 @@ dsl.illegal-value
 dsl.invalid-config-value
 dsl.malformed-interpolation
 dsl.malformed-yaml
+dsl.missing-field
 dsl.missing-reference
 dsl.mode-mismatch
+dsl.mode-required-for-read
 dsl.row-expression-needs-discovery
 dsl.row-expression-type-unknown
 dsl.row-expression-type-unsupported
 dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode
+dsl.unsupported-version
 dsl.upsert-needs-key
 engine.frontier-order-not-encodable
 engine.frontier-pinned
@@ -145,6 +148,9 @@ lifecycle.unknown-pipeline
 mcp.connector-spec-unavailable
 mcp.environment-missing
 mcp.server-rejected
+migration.changeset-failed
+migration.data-newer-than-binary
+migration.lock-timeout
 monitor.no-observation
 nest.append-mode-conflicts-with-key-tracking
 nest.array-key-unresolvable

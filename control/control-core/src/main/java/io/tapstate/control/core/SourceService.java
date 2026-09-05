@@ -177,7 +177,7 @@ public final class SourceService {
     }
 
     private SourceView view(SourceResource source) {
-        String contentHash = CanonicalHash.of(writer.write(source));
+        String contentHash = CanonicalHash.of(source);
         return representation.toView(source, contentHash);
     }
 

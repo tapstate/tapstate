@@ -25,6 +25,7 @@ final class YamlMap {
     private final String path;                                  // "" at the document root
     private final Map<String, Node> values = new LinkedHashMap<>();
     private final Map<String, Node> keyNodes = new LinkedHashMap<>();
+    private Node self;                                          // the mapping itself, for locating
 
     private YamlMap(String path) {
         this.path = path;
@@ -32,6 +33,7 @@ final class YamlMap {
 
     static YamlMap of(MappingNode node, String path) {
         YamlMap m = new YamlMap(path);
+        m.self = node;
         for (NodeTuple tuple : node.getValue()) {
             String key = ((ScalarNode) tuple.getKeyNode()).getValue();
             m.values.put(key, tuple.getValueNode());
@@ -47,6 +49,27 @@ final class YamlMap {
                 throw error(DslError.UNKNOWN_FIELD, childPath(key), keyNodes.get(key),
                         Map.of("field", key));
             }
+        }
+    }
+
+    /**
+     * Rejects a mapping missing any of {@code required} with code {@link DslError#MISSING_FIELD}.
+     * Reported at the mapping's own position: an absent key has no node to point at, and a diagnostic
+     * naming a field with no place to put it is most of the answer missing in a directory of files.
+     *
+     * <p>Reports the alphabetically first of several, so the same document always names the same
+     * field. Iteration order over the caller's set is not specified, and a diagnostic that varies
+     * between runs is one no test can pin and no user can compare against a colleague's.
+     */
+    void requirePresent(Set<String> required) {
+        String missing = null;
+        for (String key : required) {
+            if (!values.containsKey(key) && (missing == null || key.compareTo(missing) < 0)) {
+                missing = key;
+            }
+        }
+        if (missing != null) {
+            throw error(DslError.MISSING_FIELD, childPath(missing), self, Map.of("field", missing));
         }
     }
 
@@ -78,9 +101,23 @@ final class YamlMap {
         return n == null ? null : nodeValue(n);
     }
 
+    /**
+     * Free-form mapping value, or null if absent. A value that is present but is not a mapping is
+     * refused here rather than cast: the cast succeeds unchecked and the failure surfaces later as a
+     * class-cast crash carrying no field, no position and no document — an authoring mistake reported
+     * as a fault in the reader.
+     */
     @SuppressWarnings("unchecked")
     Map<String, Object> freeMap(String key) {
-        return (Map<String, Object>) value(key);
+        Object value = value(key);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Map<?, ?>)) {
+            throw errorAt(key, DslError.ILLEGAL_VALUE,
+                    Map.of("value", nodeTypeName(values.get(key)), "expected", "a mapping"));
+        }
+        return (Map<String, Object>) value;
     }
 
     /** Sub-mapping as a located view, carrying the extended path; null if absent; error if not a mapping. */

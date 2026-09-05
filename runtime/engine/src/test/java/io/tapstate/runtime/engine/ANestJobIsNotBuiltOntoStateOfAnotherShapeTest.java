@@ -73,7 +73,7 @@ class ANestJobIsNotBuiltOntoStateOfAnotherShapeTest {
     void aPipelineWithNoNestInItLeavesNoRecordBehind() {
         RecordingLedger ledger = new RecordingLedger();
         Step plain = Step.inline("doc", FromClause.list(FromRef.literal("customers")),
-                new TransformBody.Filter("true"), null, null);
+                new TransformBody.Filter("true"), null);
 
         PipelineDagBuilder.build(pipeline(plain), bindings(ledger));
 
@@ -104,7 +104,7 @@ class ANestJobIsNotBuiltOntoStateOfAnotherShapeTest {
         aliases.put("claim", FromRef.literal("claims"));
         aliases.put("order", FromRef.literal("orders"));
         aliases.put("item", FromRef.literal("items"));
-        return pipeline(Step.inline("doc", FromClause.aliases(aliases), body, null, null));
+        return pipeline(Step.inline("doc", FromClause.aliases(aliases), body, null));
     }
 
     private static PipelineResource pipeline(Step step) {
@@ -112,7 +112,7 @@ class ANestJobIsNotBuiltOntoStateOfAnotherShapeTest {
                 List.of("customers", "policies", "claims", "orders", "items"),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
     }
 

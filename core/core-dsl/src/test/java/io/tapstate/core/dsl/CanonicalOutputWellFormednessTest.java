@@ -56,7 +56,7 @@ class CanonicalOutputWellFormednessTest {
         // boolean literal!), quoted expression, flow sequences.
         PipelineResource p = new PipelineResource("customer_360", null, List.of("src_ins"),
                 List.of(Step.inline("clean", FromClause.list(FromRef.literal("CUSTOMERS")),
-                                new TransformBody.MapProjection(fields()), null, null),
+                                new TransformBody.MapProjection(fields()), null),
                         Step.inline("c360",
                                 FromClause.aliases(Map.of(
                                         "customer", FromRef.literal("clean"),
@@ -66,8 +66,7 @@ class CanonicalOutputWellFormednessTest {
                                                 List.of(new Embed("policy",
                                                         Map.of("CUST_ID", "customer_id"),
                                                         EmbedAs.ARRAY, "policies",
-                                                        List.of("POLICY_ID"), null, null, null)))),
-                                null, null)),
+                                                        List.of("POLICY_ID"), null, null, null)))), null)),
                 new ViewBlock.Inline("customer_360", FromRef.literal("c360"), "customer_id",
                         new Storage(new Storage.Hot("1h"), null, null), null),
                 new ServeBlock.Inline(null, FromRef.literal("customer_360"), null,
@@ -112,7 +111,7 @@ class CanonicalOutputWellFormednessTest {
         config.put("answer", "yes");
 
         SourceResource src = new SourceResource("tgt_x", null, "mysql", config,
-                SourceMode.CDC, List.of(TableRef.regex(".*")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.regex(".*")), null, null);
 
         Map<String, Object> doc = parse(writer.write(src));
 

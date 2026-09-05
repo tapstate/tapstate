@@ -11,6 +11,3 @@ tables:
     pk: [id]
   - name: pulls
     pk: [id]
-options:
-  cursor: updated_at
-  poll_interval: 5m

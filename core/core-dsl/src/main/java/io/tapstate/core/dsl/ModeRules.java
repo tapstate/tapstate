@@ -22,6 +22,8 @@ import java.util.Map;
  * {@code snapshot_only}. The rules:
  *
  * <ul>
+ *   <li>a source a pipeline reads declares a {@code mode} (X18) — a source named only as a write
+ *       target does not, so the field follows the role rather than the resource;</li>
  *   <li>an {@code srs} block is legal only for {@code mode: cdc} — SRS derives solely from unbounded
  *       + keyed change semantics;</li>
  *   <li>{@code settings.read_mode: snapshot_only} is illegal when a pure stream source is referenced
@@ -31,6 +33,12 @@ import java.util.Map;
  *   <li>{@code settings.schedule} is legal only for a bounded read — a read with an incremental tail
  *       has no re-run concept.</li>
  * </ul>
+ *
+ * <p>The first rule runs before the rest and is what makes them mean anything. Every one of them
+ * reads the mode of a referenced source, and an absent mode is not a third answer: it silently
+ * resolved to "neither stream nor cdc", so a schedule over a change feed passed and a start_from
+ * over one was refused for being bounded — the same omission turning one rule off and pointing
+ * another at a reason no source in the document supported.
  */
 final class ModeRules {
 
@@ -42,6 +50,17 @@ final class ModeRules {
         for (Resource r : batch) {
             if (r instanceof SourceResource s) {
                 sources.put(s.id(), s);
+            }
+        }
+        // A whole pass of its own, before any rule that reads a mode. Every rule below resolves one,
+        // so a source missing it makes them all answer about a document that has not said enough yet
+        // -- and which of them speaks first would otherwise be decided by where the source happens to
+        // sit in the batch. A modeless source carrying srs reported the srs rule when the source came
+        // first and the missing mode when the pipeline did: the same three documents, two diagnostics,
+        // told apart by filename order.
+        for (Resource r : batch) {
+            if (r instanceof PipelineResource p) {
+                requireModeOnEveryReadSource(p, sources);
             }
         }
         for (Resource r : batch) {
@@ -101,6 +120,27 @@ final class ModeRules {
             }
         }
         return "(bounded)";
+    }
+
+    /**
+     * X18, the read half: a source this pipeline reads has to say how it is read. The write half —
+     * that a source named only by a sync or push element carries no mode — needs no check here,
+     * because nothing walks those references looking for one.
+     *
+     * <p>Judged per pipeline rather than per source, so the diagnostic can name what made the field
+     * required. The same source document is correct on its own and correct as a write target; only
+     * the pipeline reading it turns the omission into a fault, and an author with several pipelines
+     * cannot tell from the source alone which one that was.
+     */
+    private static void requireModeOnEveryReadSource(PipelineResource p,
+                                                     Map<String, SourceResource> sources) {
+        for (String sid : p.sources()) {
+            SourceResource s = sources.get(sid);     // existence already proved by reference closure
+            if (s != null && s.mode() == null) {
+                throw new DslException(DslError.MODE_REQUIRED_FOR_READ, "mode", 0, 0, null,
+                        Map.of("source", sid, "pipeline", p.id()));
+            }
+        }
     }
 
     private static boolean referencesMode(PipelineResource p, Map<String, SourceResource> sources,

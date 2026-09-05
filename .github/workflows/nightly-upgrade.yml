@@ -1,0 +1,176 @@
+# Upgrade-from-a-released-build lane.
+#
+# The witnesses here start a build somebody already published, let it write a store, and then hand
+# that store to the build under test. That is the only way to ask the question the migration exists
+# for -- whether it reads what people actually have -- and it is also why these cannot be a per-commit
+# gate: they reach for a published release, so a red run can mean the release is stale or the registry
+# is unavailable rather than that the pull request is wrong. Blocking unrelated work on that would be
+# a lie about what failed. The quickstart's live journey is nightly for the same reason.
+#
+# Opt-in on a pull request is not a contradiction of that: a label puts this evidence on a branch
+# because somebody asked for it there, which is a different thing from every pull request in the area
+# carrying the risk by default. See the trigger block for why the alternative is no evidence at all
+# until after the merge.
+#
+# One witness needs a build of the product that is not the one this reactor makes, so the lane builds
+# it: the release line's tag plus the single commit carrying the startup gate, which is how the patch
+# release for that line is itself assembled. Both halves are derived from the repository rather than
+# written down here, because a pinned tag goes stale at the next release and a pinned commit goes stale
+# the moment history moves -- and neither staleness would turn this red, it would just quietly test
+# something else.
+#
+# Which classes run is derived from the source rather than listed here. A witness asks for this lane
+# by calling the lane gate, and this reads those calls back. A hand-maintained list fails open: the
+# witness somebody adds without editing this file simply never runs, and that looks exactly like a
+# lane with nothing to do. Five nest witnesses were once written, committed, documented and never run
+# by anything, which is the failure this shape avoids.
+#
+# Every way this can go wrong is red rather than quiet. Finding no witnesses at all fails, because the
+# gate having been renamed and the lane having no work are the same empty list. And each witness is
+# checked to have actually run, name by name -- a witness that skipped still writes a report, so
+# counting reports would pass over exactly the outcome this lane exists to prevent.
+name: Upgrade from a released build
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Clear of the real-connector lane and the quickstart journey, so the three do not queue together.
+    - cron: "10 21 * * *"
+  # Asked for by label, never by path. These witnesses can go red because a published release is stale
+  # or a registry is unavailable, so running them on every pull request that happens to touch this area
+  # would make that somebody else's problem regularly -- which is the whole reason they are a lane of
+  # their own. A label is a maintainer saying "I want this evidence, on this branch, now".
+  #
+  # Without it there is no way to get that evidence before the merge at all. A workflow that is not yet
+  # on the default branch is not registered: the schedule only ever fires on the default branch, and
+  # there is no workflow id to dispatch against either. So the first run of anything added to this lane
+  # would otherwise be the night after it merged, against code already on the default branch.
+  #
+  # `labeled` is in the list so that applying the label starts a run, rather than only arming the next
+  # push to the branch.
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: upgrade-lane-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upgrade:
+    # Every other trigger runs this; a pull request runs it only when asked. Applying any other label
+    # reaches here too -- `labeled` cannot be narrowed to one label -- and is filtered out by this.
+    if: >-
+      github.event_name != 'pull_request'
+      || contains(github.event.pull_request.labels.*.name, 'upgrade-lane')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags and history. One witness here runs a build of the product other than this one, and that
+          # build is assembled below from a release tag plus one commit; a shallow checkout has neither.
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: which witnesses asked for this lane
+        id: witnesses
+        run: |
+          set -euo pipefail
+          classes="$(grep -rl 'UpgradeLaneGate.require' e2e/src/test/java/io/tapstate/e2e/ \
+            | xargs -n1 basename | sed 's/\.java$//' | sort | paste -sd, -)"
+          if [ -z "$classes" ]; then
+            echo "no witness calls UpgradeLaneGate.require: either they were removed or the gate was" \
+                 "renamed and this lane now runs nothing" >&2
+            exit 1
+          fi
+          echo "classes=$classes" >> "$GITHUB_OUTPUT"
+          echo "running: $classes"
+
+      - name: the binary an older release line carries
+        id: old-binary
+        # Assembled the way the patch release for an older line is made: that line's tag, plus the one
+        # commit carrying the startup gate, and nothing else. So the witness that rolls back to it is
+        # not pointed at a fixture standing in for an old build -- it is pointed at that build, made by
+        # that recipe. A recipe that has stopped working is red here, before somebody ships by it.
+        #
+        # Both halves are derived rather than written down. A tag pinned here goes stale at the next
+        # release and a commit pinned here goes stale the moment history moves, and in both cases the
+        # lane would go on testing something other than what it says it tests.
+        #
+        # This arrangement has a designed expiry, and reaching it is meant to be loud. Once a release
+        # ships carrying the gate, the newest tag already contains it, so the search below finds no
+        # commit and this step fails. That is correct: at that point "the binary from the release line"
+        # means a published build rather than one assembled here, and the witness wants rewriting to
+        # reach for that image the way the other one already does. Failing here is what makes somebody
+        # decide it, instead of the witness quietly testing a binary that is no longer older.
+        run: |
+          set -euo pipefail
+          marker=adapters/adapter-mongo-store/src/main/java/io/tapstate/adapters/mongostore/MigrationError.java
+          base="$(git describe --tags --abbrev=0 HEAD)"
+          gate="$(git log --diff-filter=A --format=%H "$base"..HEAD -- "$marker")"
+          if [ "$(printf '%s\n' "$gate" | grep -c .)" != "1" ]; then
+            echo "expected exactly one commit adding $marker since $base, found: ${gate:-none}." \
+                 "That commit is what a patch release for an older line cherry-picks, so without it" \
+                 "this lane cannot build the binary the rollback witness is supposed to be handed." \
+                 "If the answer is none, the most likely reason is that $base already carries the" \
+                 "gate -- a release has shipped it since this was written. That is this lane's" \
+                 "designed expiry, not a broken script: the witness should now reach for the" \
+                 "published image of a build older than $base rather than assembling one here." >&2
+            exit 1
+          fi
+          echo "building $base + $gate"
+          git worktree add --detach ../old-binary "$base"
+          git -C ../old-binary cherry-pick -n "$gate"
+          (cd ../old-binary && mvn -B -pl app -am -DskipTests package)
+          jar="$(ls ../old-binary/app/target/app-*-boot.jar)"
+          echo "jar=$(cd "$(dirname "$jar")" && pwd)/$(basename "$jar")" >> "$GITHUB_OUTPUT"
+
+      - name: run them against a published release
+        run: >
+          mvn -B -pl e2e -am verify
+          -Dtapstate.e2e.upgrade-lane=true
+          -Dtapstate.e2e.old-binary-jar=${{ steps.old-binary.outputs.jar }}
+          -Dtest=ZzzNoSuchSurefireSelector -Dsurefire.failIfNoSpecifiedTests=false
+          -Dit.test=${{ steps.witnesses.outputs.classes }}
+          -Dfailsafe.failIfNoSpecifiedTests=false
+
+      - name: every witness the lane named actually ran
+        # The gate skips when the lane did not ask, and a skipped class still writes a report. So the
+        # reports are read for what they say rather than counted: a class that reports no tests run is
+        # a witness that was named, was gated out anyway, and would otherwise leave this lane green
+        # having proven nothing.
+        if: always()
+        run: |
+          set -euo pipefail
+          status=0
+          IFS=',' read -ra named <<< "${{ steps.witnesses.outputs.classes }}"
+          for class in "${named[@]}"; do
+            report="e2e/target/failsafe-reports/io.tapstate.e2e.$class.txt"
+            if [ ! -f "$report" ]; then
+              echo "$class: no report at all, so it never ran" >&2
+              status=1
+              continue
+            fi
+            line="$(grep -m1 'Tests run:' "$report" || true)"
+            case "$line" in
+              *"Tests run: 0"*|"")
+                echo "$class: $line -- named by this lane and did not run" >&2
+                status=1
+                ;;
+              *) echo "$class: $line" ;;
+            esac
+          done
+          exit "$status"
+
+      - name: the scene where a witness failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-failure-scenes
+          path: e2e/target/failure-scenes/
+          if-no-files-found: ignore
+          retention-days: 7

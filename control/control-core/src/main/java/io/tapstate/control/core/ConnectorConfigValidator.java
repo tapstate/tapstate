@@ -29,7 +29,7 @@ public final class ConnectorConfigValidator {
                     null);
         }
         SourceResource candidate = new SourceResource(
-                "__config_validation__", null, connector, settings, null, null, null, null, null);
+                "__config_validation__", null, connector, settings, null, null, null, null);
         CapabilityRules.validateOnline(candidate, live);
     }
 }

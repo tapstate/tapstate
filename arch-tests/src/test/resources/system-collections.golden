@@ -1,0 +1,20 @@
+# collection | database | owner | strategy | introducedIn | indexes
+artifacts | store | MongoArtifactStore | migrated | 0 | kind
+pipeline_state | store | MongoStateStore | migrated | 0 | -
+pipeline_desired | store | MongoDesiredStore | migrated | 0 | -
+pipeline_observation | store | MongoObservationStore | migrated | 0 | -
+connections | store | MongoCatalogStore | migrated | 0 | -
+source_schemas | store | MongoSchemaStore | migrated | 0 | -
+connector_catalog | store | MongoConnectorCatalogStore | migrated | 0 | -
+connector_specs | store | MongoConnectorSpecStore | migrated | 0 | -
+connection_test_results | store | MongoConnectionTestResultStore | migrated | 0 | -
+users | store | MongoAuthStores | migrated | 0 | -
+tokens | store | MongoAuthStores | migrated | 0 | -
+sessions | store | MongoAuthStores | migrated | 0 | secretHash+issuer
+audit | store | MongoAuthStores | migrated | 0 | -
+cluster_identity | store | MongoAuthStores | migrated | 0 | -
+connector_artifacts (gridfs) | store | MongoConnectorRegistry | immutable | 0 | metadata.connectorId
+srs_meta | store | MongoSrsMetaStore | owned-elsewhere | 0 | -
+system_meta | store | MongoConnection | migrated | 1 | -
+operator_state | nest | MongoKeyedStateStore | nest-excluded | 0 | -
+nest_dead_letters | nest | MongoNestDeadLetterStore | nest-excluded | 0 | -

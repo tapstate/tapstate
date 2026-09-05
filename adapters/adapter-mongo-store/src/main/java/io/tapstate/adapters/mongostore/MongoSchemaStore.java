@@ -259,6 +259,7 @@ public final class MongoSchemaStore implements SchemaStore {
     private static TapstateException unreadable(String id) {
         // A stored schema document whose shape cannot be reconstructed is store corruption, surfaced as a
         // coded io diagnostic rather than a bare crash while reconstructing.
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", String.valueOf(id), "field", "schema"), null);
     }
 }

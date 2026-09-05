@@ -1,6 +1,10 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.runtime.engine.Engine;
@@ -20,6 +24,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -45,6 +50,7 @@ class FullAssemblyStartupIT {
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private ConfigurableApplicationContext context;
+    private String database;
 
     @AfterEach
     void stop() {
@@ -80,9 +86,46 @@ class FullAssemblyStartupIT {
         assertThat(health).isEqualTo("ok");
     }
 
+    /**
+     * What the whole assembly leaves behind in the store, reconciled against the registry that declares
+     * every collection this product keeps.
+     *
+     * <p>Done here rather than only over the store adapter because this is the one boot that brings up
+     * all six rings at once: a collection created by the member, the engine or the convergence loop is
+     * invisible to a test that drives the stores alone, and undeclared is exactly how it would look to
+     * anybody reading the registry afterwards.
+     *
+     * <p>The version endpoint is checked in the same run for the same reason -- what it reports about
+     * the store is only true if a real start actually migrated one.
+     */
+    @Test
+    void theFullAssemblyLeavesNothingInTheStoreThatNothingDeclares() {
+        int port = startFullAssembly();
+
+        List<String> live = new ArrayList<>();
+        try (MongoClient raw = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            raw.getDatabase(database).listCollectionNames().into(live);
+        }
+        assertThat(live)
+                .as("positive control: a full boot must have written something, or the reconciliation "
+                        + "below is over an empty set")
+                .isNotEmpty();
+        assertThat(live)
+                .as("a collection with no row is one nothing knows the shape or the evolution rule of")
+                .isSubsetOf(SystemCollections.physicalNamesIn(SystemCollections.Database.STORE));
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> version = RestClient.create("http://localhost:" + port)
+                .get().uri("/version").retrieve().body(Map.class);
+        assertThat(version).containsEntry("dslVersions", List.of("tapstate/v1"));
+        assertThat(version)
+                .as("the store a real start opened has been brought to the version this build knows")
+                .containsEntry("dataVersion", MigrationRunner.SUPPORTED_VERSION);
+    }
+
     private int startFullAssembly(String... extraProperties) {
         // A per-run database on the shared class container keeps runs independent.
-        String database = "assembly_all_" + Long.toUnsignedString(System.nanoTime(), 16);
+        database = "assembly_all_" + Long.toUnsignedString(System.nanoTime(), 16);
         List<String> properties = new ArrayList<>(List.of(
                 "tapstate.store.mongo.enabled=true",
                 "tapstate.store.mongo.uri=" + REPLICA_SET.getReplicaSetUrl(database),

@@ -1,0 +1,8 @@
+# The pipeline is what turns src_orders into a read, and so what makes its mode required.
+version: tapstate/v1
+kind: pipeline
+id: to_db
+source: src_orders
+serve:
+  from: orders
+  sync: [ { id: db, source: tgt_db, write_mode: upsert } ]

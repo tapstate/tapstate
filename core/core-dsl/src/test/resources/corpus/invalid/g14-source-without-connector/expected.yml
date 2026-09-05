@@ -1,0 +1,4 @@
+rule: missing-field
+adr: "ADR-0016 §3"
+path: connector
+note: "a source declares no connector; the field is required and the parser has nothing to derive it from"

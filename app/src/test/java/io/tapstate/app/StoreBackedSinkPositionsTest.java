@@ -130,7 +130,7 @@ class StoreBackedSinkPositionsTest {
     void isEmptyWhileAnOmittedSelectionWaitsForDiscovery() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("orders_src", null, "fake", Map.of("host", "h-orders"),
-                SourceMode.CDC, null, null, null, null);
+                SourceMode.CDC, null, null, null);
         artifacts.save(source);
         artifacts.save(pipeline(PIPELINE, "orders_src"));
 
@@ -141,7 +141,7 @@ class StoreBackedSinkPositionsTest {
     void propagates_invalid_selection_after_discovery() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("orders_src", null, "fake", Map.of("host", "h-orders"),
-                SourceMode.CDC, List.of(TableRef.regex("[")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.regex("[")), null, null);
         artifacts.save(source);
         artifacts.save(pipeline(PIPELINE, "orders_src"));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
@@ -166,7 +166,7 @@ class StoreBackedSinkPositionsTest {
 
     private static SourceResource source(String id, String table, String host) {
         return new SourceResource(id, null, "fake", Map.of("host", host), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static PipelineResource pipeline(String id, String... sourceIds) {

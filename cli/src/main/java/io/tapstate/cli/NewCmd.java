@@ -83,6 +83,10 @@ final class NewCmd implements Callable<Integer> {
             description = "Source read mode (cdc, snapshot, stream, file, api) — must suit the connector.")
     SourceMode mode;
 
+    @Option(names = "--primary-key", paramLabel = "FIELD",
+            description = "Field that uniquely identifies a record in a view - required for --kind view.")
+    String primaryKey;
+
     @Option(names = "--set", paramLabel = "KEY=VALUE",
             description = "A connector config entry (repeatable).")
     Map<String, String> config = new LinkedHashMap<>();
@@ -139,6 +143,9 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private int callSource(PrintWriter err) {
+        if (rejectsPrimaryKey(err, "source")) {
+            return EXIT_USAGE;
+        }
         if (!sources.isEmpty() || !syncTo.isEmpty()) {
             err.println("new: --source/--sync-to are not valid for --kind source");
             err.flush();
@@ -165,6 +172,9 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private int callPipeline(PrintWriter err) {
+        if (rejectsPrimaryKey(err, "pipeline")) {
+            return EXIT_USAGE;
+        }
         if (connector != null || mode != null || !config.isEmpty()) {
             err.println("new: --connector/--mode/--set are not valid for --kind pipeline");
             err.flush();
@@ -207,13 +217,16 @@ final class NewCmd implements Callable<Integer> {
     private Resource buildPipelineFromFlags() {
         List<SyncElement> legs = new ArrayList<>();
         for (int i = 0; i < syncTo.size(); i++) {
-            legs.add(new SyncElement("sync_" + (i + 1), syncTo.get(i), null, null, null, null));
+            legs.add(new SyncElement("sync_" + (i + 1), syncTo.get(i), null, null, null));
         }
         ServeBlock serve = new ServeBlock.Inline("serve", FromRef.regex(".*"), legs, null, null);
         return new PipelineResource(id, null, List.copyOf(sources), null, null, serve, null, null);
     }
 
     private int callTransform(PrintWriter err) {
+        if (rejectsPrimaryKey(err, "transform")) {
+            return EXIT_USAGE;
+        }
         // a transform is pure logic (X19): no connector, mode, config or pipeline-wiring flags
         if (connector != null || mode != null || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty()) {
             err.println("new: --connector/--mode/--set/--source/--sync-to are not valid for --kind transform");
@@ -255,7 +268,7 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private Resource buildTransformFromFlags() {
-        return new TransformResource(id, null, scaffoldTransformBody(type), null, null);
+        return new TransformResource(id, null, scaffoldTransformBody(type), null);
     }
 
     /**
@@ -279,13 +292,16 @@ final class NewCmd implements Callable<Integer> {
             return EXIT_USAGE;
         }
         boolean interactive = prompter != null || (!nonInteractive && id == null && System.console() != null);
-        if (!interactive && id == null) {
-            err.println("new: provide --id, or run interactively at a terminal");
+        if (!interactive && (id == null || primaryKey == null)) {
+            // Named rather than defaulted: the key is the view's unique index, and a scaffold that
+            // guessed one would hand back a document that validates and indexes the wrong field.
+            err.println("new: provide --id and --primary-key, or run interactively at a terminal");
             err.flush();
             return EXIT_USAGE;
         }
         try {
-            Resource resource = interactive ? runViewWizard() : new ViewResource(id, null, null, null, null, null);
+            Resource resource =
+                    interactive ? runViewWizard() : new ViewResource(id, null, primaryKey, null, null, null);
             return emit(resource);
         } catch (TapstateException e) {
             return emitDiagnostic(e);
@@ -297,6 +313,9 @@ final class NewCmd implements Callable<Integer> {
     }
 
     private int callServe(PrintWriter err) {
+        if (rejectsPrimaryKey(err, "serve")) {
+            return EXIT_USAGE;
+        }
         if (rejectsDefinitionFlags(err, "serve")) {
             return EXIT_USAGE;
         }
@@ -322,6 +341,19 @@ final class NewCmd implements Callable<Integer> {
      * A standalone definition body (view / serve) is pure structure — it takes no connector, mode,
      * config or pipeline-wiring flags. Reports the offending flags and returns true when any are present.
      */
+    /**
+     * Only a view has a primary key. Rejected rather than ignored on the others, the way every
+     * other kind-specific flag here is: a flag that is silently dropped reads as one that worked.
+     */
+    private boolean rejectsPrimaryKey(PrintWriter err, String kindLabel) {
+        if (primaryKey != null) {
+            err.println("new: --primary-key is not valid for --kind " + kindLabel);
+            err.flush();
+            return true;
+        }
+        return false;
+    }
+
     private boolean rejectsDefinitionFlags(PrintWriter err, String kindLabel) {
         if (connector != null || mode != null || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty()) {
             err.println("new: --connector/--mode/--set/--source/--sync-to are not valid for --kind " + kindLabel);
@@ -378,7 +410,7 @@ final class NewCmd implements Callable<Integer> {
                     "path", "mode"), null);
         }
         Map<String, Object> cfg = new LinkedHashMap<>(config);
-        return new SourceResource(id, null, connector, cfg, mode, null, null, null, null);
+        return new SourceResource(id, null, connector, cfg, mode, null, null, null);
     }
 
     private int emit(Resource resource) throws IOException {

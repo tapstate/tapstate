@@ -192,10 +192,10 @@ class NestHoldsDescendantsUntilAncestorsArriveTest {
 
     private static DAG build(String nodeId, TransformBody.Nest body, Map<String, FromRef> aliases,
             Map<String, ProcessorMetaSupplier> sources, Map<String, NestTable> tables, List<String> streams) {
-        Step step = Step.inline(nodeId, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(nodeId, FromClause.aliases(aliases), body, null);
         PipelineResource pipeline = new PipelineResource("p", null, streams, List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(nodeId),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         DagBindings bindings = new DagBindings(

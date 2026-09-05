@@ -150,7 +150,8 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
     }
 
     private static TapstateException unreadable(String contentHash) {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(contentHash)), null);
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", String.valueOf(contentHash), "field", "artifact"), null);
     }
 
     @Override

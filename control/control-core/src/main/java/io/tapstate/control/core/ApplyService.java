@@ -131,7 +131,7 @@ public final class ApplyService {
         List<PreparedArtifact> prepared = new ArrayList<>();
         for (Resource resource : validated) {
             String canonicalForm = writer.write(resource);
-            prepared.add(new PreparedArtifact(resource, canonicalForm, CanonicalHash.of(canonicalForm)));
+            prepared.add(new PreparedArtifact(resource, canonicalForm, CanonicalHash.of(resource)));
         }
         return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions);
     }
@@ -332,9 +332,9 @@ public final class ApplyService {
         return new ArtifactOutcome(prepared.id(), prepared.kind(), change, prepared.contentHash());
     }
 
-    /** The content hash of a stored artifact, recomputed over its canonical form for the no-op check. */
+    /** The content hash of a stored artifact, recomputed over its canonical structure for the no-op check. */
     private String storedHash(Resource stored) {
-        return CanonicalHash.of(writer.write(stored));
+        return CanonicalHash.of(stored);
     }
 
     /**
