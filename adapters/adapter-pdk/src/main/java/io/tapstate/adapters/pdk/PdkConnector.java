@@ -135,10 +135,16 @@ final class PdkConnector implements AutoCloseable {
             context.setStateMap(stateNamespace == null || stateStore == null
                     ? new InMemoryStateMap()
                     : new DurableStateMap(stateStore, stateNamespace));
-            // The map the contract calls global is still per-handle here: making it genuinely shared is a
-            // different scope question with its own answer, and giving it this connector's namespace
-            // would be the wrong one written down as if it were settled.
-            context.setGlobalStateMap(new InMemoryStateMap());
+            // The map the contract calls global is one the whole deployment shares, so it is the store
+            // that makes it so: every member reads and writes the same namespace, and a write is visible
+            // to the next reader wherever it runs. It is read through rather than loaded once on the way
+            // up — a copy taken at startup stops being shared the moment another member writes, and the
+            // store has no way to list a namespace precisely so that nothing is tempted to take one.
+            // The node plays no part in the name: being tied to no node is the whole of what makes it
+            // global, which is why this asks only whether there is somewhere to keep it.
+            context.setGlobalStateMap(stateStore == null
+                    ? new InMemoryStateMap()
+                    : new DurableStateMap(stateStore, ConnectorStateNamespace.GLOBAL));
             // A connector reads its capability alternatives off the context during the drive; the context
             // leaves them null, so give it an empty set or the first read NPEs. Empty means no overrides:
             // the connector uses its own default capability behaviour, which is the L1 intent.
