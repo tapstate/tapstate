@@ -90,6 +90,31 @@ final class PipelineDagProjection {
     }
 
     private static void addWiring(
+            FromClause from,
+            String target,
+            Map<String, String> upstreamNodes,
+            List<PipelineSourceSummary> sourceSummaries,
+            Map<String, PipelineDagNode> sourceNodes,
+            List<PipelineDagEdge> edges,
+            Set<String> usedEdgeIds,
+            Map<String, Integer> edgeCounts,
+            String edgeLabel) {
+        if (from instanceof FromClause.Flow flow) {
+            for (FromRef reference : flow.refs()) {
+                addEdge(reference, edgeLabel, target, upstreamNodes, sourceSummaries,
+                        sourceNodes, edges, usedEdgeIds, edgeCounts);
+            }
+            return;
+        }
+        FromClause.Aliases aliases = (FromClause.Aliases) from;
+        for (Map.Entry<String, FromRef> entry : aliases.aliases().entrySet()) {
+            addEdge(entry.getValue(), edgeLabel == null ? entry.getKey() : edgeLabel,
+                    target, upstreamNodes, sourceSummaries, sourceNodes, edges,
+                    usedEdgeIds, edgeCounts);
+        }
+    }
+
+    private static void addWiring(
             FromRef from,
             String target,
             Map<String, String> upstreamNodes,
@@ -157,11 +182,15 @@ final class PipelineDagProjection {
             Map<String, Integer> edgeCounts) {
         if (serve.sync() != null) {
             for (SyncElement sync : serve.sync()) {
-                String sourceTable = tableForTerminal(serve.from());
-                String targetTable = TableRename.apply(sourceTable, sync.rename());
+                List<String> sourceTables = tablesForTerminal(serve.from());
+                List<String> targetTables = sourceTables.stream()
+                        .map(table -> TableRename.apply(table, sync.rename()))
+                        .toList();
+                String targetTable = targetTables.getFirst();
                 String targetNodeId = targetNodeId(sync.source(), targetTable);
                 targetNodes.putIfAbsent(targetNodeId,
-                        new PipelineDagNode(targetNodeId, "target", targetTable, sync.source()));
+                        new PipelineDagNode(targetNodeId, "target", targetTable, sync.source(),
+                                targetTables.size() > 1 ? targetTables : List.of()));
                 addWiring(serve.from(), targetNodeId, upstreamNodes, sourceSummaries,
                         sourceNodes, edges, usedEdgeIds, edgeCounts, sync.id());
             }
@@ -233,6 +262,14 @@ final class PipelineDagProjection {
 
     private static String viewNodeId(String id) {
         return "view:" + id;
+    }
+
+    private static List<String> tablesForTerminal(FromClause from) {
+        List<FromRef> refs = switch (from) {
+            case FromClause.Flow flow -> flow.refs();
+            case FromClause.Aliases aliases -> List.copyOf(aliases.aliases().values());
+        };
+        return refs.stream().map(PipelineDagProjection::tableForTerminal).toList();
     }
 
     private static String tableForTerminal(FromRef reference) {

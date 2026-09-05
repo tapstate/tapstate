@@ -221,7 +221,7 @@ public final class PipelineRepresentation {
         }
         String path = "serve";
         String use = textOrNull(value.get("use"), path + ".use");
-        FromRef from = fromRef(value(value, "from"), path + ".from");
+        FromClause from = fromClause(value(value, "from"), path + ".from");
         String id = textOrNull(value.get("id"), path + ".id");
         if (use != null) {
             return new ServeBlock.Use(id, use, from);

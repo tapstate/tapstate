@@ -106,7 +106,7 @@ final class ReferenceClosure {
 
         ServeBlock serve = p.serve();
         if (serve != null) {
-            resolveRef(serveFrom(serve), serveScope(stepIds, view), universe, "serve.from");
+            resolveFrom(serveFrom(serve), serveScope(stepIds, view), universe, "serve.from");
             validateServeSinks(serve);
             if (serve instanceof ServeBlock.Use u) {
                 resolveUse(u.use(), Kind.SERVE, "serve.use");
@@ -354,7 +354,7 @@ final class ReferenceClosure {
         };
     }
 
-    private static FromRef serveFrom(ServeBlock s) {
+    private static FromClause serveFrom(ServeBlock s) {
         return switch (s) {
             case ServeBlock.Inline i -> i.from();
             case ServeBlock.Use u -> u.from();

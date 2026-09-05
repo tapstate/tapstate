@@ -220,6 +220,44 @@ class PipelineRepresentationTest {
     }
 
     @Test
+    void projectsExplicitMultiTableServeWiringAsOneTargetWithStableTableRefs() {
+        PipelineResource pipeline = new PipelineResource(
+                "mysql_to_mongodb",
+                null,
+                List.of("mysql_feynman"),
+                null,
+                null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromClause.list(
+                                FromRef.literal("mysql_feynman.Player"),
+                                FromRef.literal("mysql_feynman.PlayerAddress")),
+                        List.of(new SyncElement("mongodb_players", "mongodb_target", null, null, null, null)),
+                        null,
+                        null),
+                null,
+                null);
+
+        PipelineView view = representation.toView(
+                pipeline,
+                "m".repeat(64),
+                List.of(new PipelineSourceSummary("mysql_feynman", null, "mysql")));
+
+        assertThat(view.dag().nodes()).containsExactly(
+                new PipelineDagNode("source:mysql_feynman:Player", "source", "Player", "mysql_feynman"),
+                new PipelineDagNode("source:mysql_feynman:PlayerAddress", "source", "PlayerAddress", "mysql_feynman"),
+                new PipelineDagNode("target:mongodb_target:Player", "target", "Player", "mongodb_target",
+                        List.of("Player", "PlayerAddress")));
+        assertThat(view.dag().edges()).containsExactly(
+                new PipelineDagEdge(
+                        "source:mysql_feynman:Player->target:mongodb_target:Player:mongodb_players",
+                        "source:mysql_feynman:Player", "target:mongodb_target:Player", "mongodb_players"),
+                new PipelineDagEdge(
+                        "source:mysql_feynman:PlayerAddress->target:mongodb_target:Player:mongodb_players",
+                        "source:mysql_feynman:PlayerAddress", "target:mongodb_target:Player", "mongodb_players"));
+    }
+
+    @Test
     void appliesSyncRenameWhenNamingTheTargetTableNode() {
         PipelineResource pipeline = new PipelineResource(
                 "mysql_to_mongodb",
