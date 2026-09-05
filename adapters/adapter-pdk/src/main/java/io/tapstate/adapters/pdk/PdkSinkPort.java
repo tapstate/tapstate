@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkPort;
 import io.tapstate.spi.sink.SinkWriter;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import io.tapstate.spi.sink.TargetTable;
 import java.util.Map;
@@ -18,9 +19,16 @@ import java.util.Map;
 public final class PdkSinkPort implements SinkPort {
 
     private final ConnectorProvisioner provisioner;
+    private final KeyedStateStore stateStore;
 
+    /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkSinkPort(ConnectorProvisioner provisioner) {
+        this(provisioner, null);
+    }
+
+    public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
         this.provisioner = provisioner;
+        this.stateStore = stateStore;
     }
 
     @Override
@@ -32,7 +40,7 @@ public final class PdkSinkPort implements SinkPort {
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                ConnectorStateNamespace.of(config.node()));
+                ConnectorStateNamespace.of(config.node()), stateStore);
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());

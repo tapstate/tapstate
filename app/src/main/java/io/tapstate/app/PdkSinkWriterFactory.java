@@ -11,6 +11,7 @@ import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
+import io.tapstate.spi.store.KeyedStateStore;
 import java.util.Map;
 import java.util.Set;
 
@@ -41,6 +42,15 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
      * it makes the member sink-capable.
      */
     static final String CONNECTOR_PROVISIONER_USER_CONTEXT_KEY = "tapstate.pdk.connector-provisioner";
+
+    /**
+     * The member user-context key under which the layer a connector's own notes are kept in is bound. It is
+     * reached the same way and for the same reason as the provisioner: the factory crosses to another member
+     * and a live store does not survive the crossing, so what travels is the node it writes for and the store
+     * is picked up where the connector is actually opened. A member with none bound keeps a connector's notes
+     * only for the life of the open, which is what every sink got before there was anywhere to file them.
+     */
+    static final String CONNECTOR_STATE_STORE_USER_CONTEXT_KEY = "tapstate.pdk.connector-state-store";
 
     private final String connectorId;
     private final Map<String, Object> settings;
@@ -79,9 +89,20 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
 
     @Override
     public SinkWriter getEx() {
-        ConnectorProvisioner provisioner = provisioner(localMember());
-        return new PdkSinkPort(provisioner)
+        HazelcastInstance member = localMember();
+        return new PdkSinkPort(provisioner(member), stateStore(member))
                 .open(new SinkConfig(connectorId, settings, writeMode, ddl, null, node), targets);
+    }
+
+    /**
+     * The layer this member keeps connector notes in, or null when none is bound. Null is a real answer and
+     * not a failure: it is a run with no store behind it, and the connector then keeps its notes for the life
+     * of the open. Unlike the provisioner, whose absence means the member cannot write at all, a missing store
+     * costs only durability - so this does not refuse.
+     */
+    private static KeyedStateStore stateStore(HazelcastInstance member) {
+        Object bound = member.getUserContext().get(CONNECTOR_STATE_STORE_USER_CONTEXT_KEY);
+        return bound instanceof KeyedStateStore store ? store : null;
     }
 
     /** The connector provisioner bound onto the local member, or a bare failure when the member has none. */

@@ -16,6 +16,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
@@ -227,6 +228,37 @@ class HazelcastMemberTest {
             // a sink open fails loudly rather than silently dropping writes.
             assertThat(member.getUserContext())
                     .doesNotContainKey(PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY);
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    @Test
+    void hazelcastMemberBindsTheConnectorStateStoreIntoTheUserContext() {
+        KeyedStateStore store = new InMemoryKeyedStateStore();
+        HazelcastInstance member = new HazelcastConfiguration()
+                .hazelcastMember(new HazelcastProperties(), null, null, null, store, NestSettings.defaults(), null);
+        try {
+            // A sink-writer factory is serialized onto the sink vertex and opens its connector on whichever
+            // member runs it, so the layer a connector's own notes are kept in cannot travel with the factory
+            // and is resolved member-side instead. Unbound, every sink connector would be handed a map that
+            // dies with the open -- and on a single member that is indistinguishable from working.
+            assertThat(member.getUserContext().get(PdkSinkWriterFactory.CONNECTOR_STATE_STORE_USER_CONTEXT_KEY))
+                    .isSameAs(store);
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    @Test
+    void hazelcastMemberLeavesTheConnectorStateStoreUnboundWhenNoneIsConfigured() {
+        HazelcastInstance member = new HazelcastConfiguration()
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+        try {
+            // A run with no store (mongo disabled) binds nothing, and a sink connector then keeps its notes
+            // for the life of the open -- which is what every caller got before there was anywhere to file them.
+            assertThat(member.getUserContext())
+                    .doesNotContainKey(PdkSinkWriterFactory.CONNECTOR_STATE_STORE_USER_CONTEXT_KEY);
         } finally {
             member.shutdown();
         }

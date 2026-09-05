@@ -75,6 +75,17 @@ class HazelcastConfiguration {
             member.getUserContext().put(
                     PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY, connectorProvisioner);
         }
+        // Bind the layer a connector's own notes are kept in onto the member, for the same reason the
+        // provisioner is: the sink-writer factory crosses to whichever member runs the sink vertex and a live
+        // store does not survive the crossing, so the node travels and the store is picked up where the
+        // connector is actually opened. The read side needs no such indirection -- it opens its connector in
+        // the process that holds the store -- which is why only the write side reaches through here. A run
+        // with no store (mongo disabled) binds nothing, and a sink connector then keeps its notes for the life
+        // of the open, exactly as it did before there was anywhere to file them.
+        if (nestStateStore != null) {
+            member.getUserContext().put(
+                    PdkSinkWriterFactory.CONNECTOR_STATE_STORE_USER_CONTEXT_KEY, nestStateStore);
+        }
         // Bind the snapshot buffer onto the member so a source vertex -- resolved member-side by the ring name
         // it carries -- can drain this ring's snapshot rows and emit them ahead of the cdc tail. The coordinator
         // holds the same instance and fills it through the snapshot pass-through. A run with no buffer (mongo

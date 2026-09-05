@@ -306,6 +306,23 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.CountingSink", source("CountingSink", "", register));
     }
 
+    /**
+     * A sink connector that recalls its own state map on every write: it reports one accepted row when the
+     * map already held a mark and none when it did not, then leaves the mark behind. Driving it twice for
+     * the same node is how a caller sees whether what the first open wrote reached anywhere a later open
+     * can read it - the count is the connector's own answer, not an inspection of the host's object.
+     */
+    static Path stateRecordingSink(Path dir) {
+        String register = "functions.supportWriteRecord((context, events, table, consumer) -> {"
+                + "  Object seen = context.getStateMap().get(\"mark\");"
+                + "  context.getStateMap().put(\"mark\", \"written\");"
+                + "  consumer.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>("
+                + "      seen == null ? 0L : 1L, 0L, 0L));"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.StateRecordingSink",
+                source("StateRecordingSink", "", register));
+    }
+
     /** A sink connector whose writeRecord rejects any event that is not an insert — proves append reforge. */
     static Path insertsOnlySink(Path dir) {
         String register = "functions.supportWriteRecord((context, events, table, consumer) -> {"
