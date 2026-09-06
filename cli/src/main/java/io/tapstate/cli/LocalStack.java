@@ -21,6 +21,7 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 import java.util.function.Predicate;
@@ -229,6 +230,24 @@ final class LocalStack {
             answer = attempt.get();
         }
         return answer;
+    }
+
+    /**
+     * Waits until every bundled connector is registered on a stack that just came up, polling
+     * {@code registered} on the same bound as the health wait. The server answers its health probe as
+     * soon as it listens, and registers the staged jars in a boot-time sweep a few seconds later; a
+     * workspace handed over in between fails its first {@code up} on a connector that is about to exist.
+     *
+     * @throws TapstateException {@code cli.docker-unavailable} when they never all appear in time
+     */
+    void awaitConnectors(Supplier<Set<String>> registered) {
+        Set<String> present = retryWhile(registered, ids -> !ids.containsAll(CONNECTOR_JARS));
+        if (!present.containsAll(CONNECTOR_JARS)) {
+            throw unavailable("the stack in " + dir + " answered but had not registered its connectors ("
+                    + String.join(", ", CONNECTOR_JARS) + ") within " + (healthPolls * POLL_MILLIS / 1_000)
+                    + " s; look at its logs with docker compose -f " + dir.resolve(COMPOSE_FILE)
+                    + " logs, or stop it with " + stopCommand());
+        }
     }
 
     /** Runs {@code command} in {@code where}, or from the CLI's own directory when that is null. */

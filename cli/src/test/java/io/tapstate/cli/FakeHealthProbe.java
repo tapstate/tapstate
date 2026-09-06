@@ -10,9 +10,12 @@ import java.util.Map;
  * A control plane for the guided first run: it answers the health probe with a verdict a test can
  * flip, and the sign-in that follows a healthy answer - issuer discovery and the login itself, with
  * whatever outcome the test scripted (a saved-session success by default). It remembers what was
- * probed and every login attempted, so a test can assert the order and the credentials. Every other
- * call fails the test: the first run has no business talking to the server beyond these, so another
- * call is a defect, not something to stub.
+ * probed and every login attempted, so a test can assert the order and the credentials. The one call
+ * after sign-in it answers is the connector list, which a stack that just came up is polled for: the
+ * staged connectors are listed as {@code bundled} from the first answer and flip to {@code registered}
+ * after as many lists as the test scripted, or never. Every other call fails
+ * the test: the first run has no business talking to the server beyond these, so another call is a
+ * defect, not something to stub.
  */
 final class FakeHealthProbe implements ControlPlaneClient {
 
@@ -27,6 +30,12 @@ final class FakeHealthProbe implements ControlPlaneClient {
     final List<String> logins = new ArrayList<>();
     /** What a login is answered with; null means a success carrying a persistent session. */
     LoginOutcome loginOutcome;
+    /** How many lists answer with the staged connectors still {@code bundled} before they register; 0 means at once. */
+    int connectorListsBeforeSeeded;
+    /** When set, the staged connectors stay {@code bundled} for good, however often the list is asked for. */
+    boolean connectorsNeverSeeded;
+    /** How many times the connector list was asked for. */
+    int connectorLists;
 
     FakeHealthProbe(boolean healthy) {
         this.healthy = healthy;
@@ -67,7 +76,15 @@ final class FakeHealthProbe implements ControlPlaneClient {
     @Override public ConnectionDiscoverSchemaOutcome discoverSchema(URI u, String c, String id, String connector, Map<String, Object> s) { throw new AssertionError(); }
     @Override public ConnectionSchemaOutcome schema(URI u, String c, String id) { throw new AssertionError(); }
     @Override public ConnectorRegisterOutcome register(URI u, String c, byte[] a) { throw new AssertionError(); }
-    @Override public ConnectorListOutcome connectorList(URI u, String c) { throw new AssertionError(); }
+    @Override
+    public ConnectorListOutcome connectorList(URI baseUrl, String credential) {
+        connectorLists++;
+        boolean loaded = !connectorsNeverSeeded && connectorLists > connectorListsBeforeSeeded;
+        String origin = loaded ? "registered" : "bundled";
+        return new ConnectorListOutcome.Listed(LocalStack.CONNECTOR_JARS.stream()
+                .map(id -> new CatalogConnector(id, id, "database", List.of("cdc"), true, origin))
+                .toList());
+    }
     @Override public DataBrowserOutcome.Collections collections(URI u, String c, String id) { throw new AssertionError(); }
     @Override public DataBrowserOutcome.Stats stats(URI u, String c, String id, String collection) { throw new AssertionError(); }
     @Override public DataBrowserOutcome.Find find(URI u, String c, String id, String collection, Object f, DataBrowserCall.Order o, Integer l) { throw new AssertionError(); }

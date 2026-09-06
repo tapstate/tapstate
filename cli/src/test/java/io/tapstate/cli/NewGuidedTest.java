@@ -290,6 +290,42 @@ class NewGuidedTest {
     }
 
     @Test
+    void aFreshStackIsHandedOverOnlyOnceItsConnectorsAreRegistered(@TempDir Path home, @TempDir Path ws) {
+        // the server answers its health probe before its boot-time seed sweep has registered the bundled
+        // connectors; a workspace handed over in that window fails its first `up` on a connector that is
+        // about to exist
+        Fakes fakes = new Fakes(false);
+        fakes.probe.connectorListsBeforeSeeded = 3;
+
+        Run r = run(home, new ScriptedPrompter(), fakes, "new", "blank", "--yes", "--start-local", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isZero();
+        assertThat(r.err()).isEmpty();
+        // three empty answers were waited through, the fourth had all of them
+        assertThat(fakes.probe.connectorLists).isEqualTo(4);
+        assertThat(manager(home).contextBoundExactlyTo(ws)).contains("local");
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n");
+    }
+
+    @Test
+    void aFreshStackWhoseConnectorsNeverRegisterIsRefusedNamingThem(@TempDir Path home, @TempDir Path ws) {
+        Fakes fakes = new Fakes(false);
+        fakes.polls = 3;
+        fakes.probe.connectorsNeverSeeded = true;
+
+        Run r = run(home, new ScriptedPrompter(), fakes, "new", "blank", "--yes", "--start-local", "-w", ws.toString());
+
+        assertThat(r.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).contains("cli.docker-unavailable")
+                .contains("mysql, mongodb, postgres")
+                .contains("docker compose -f " + stackDir(home) + "/docker-compose.yml logs");
+        assertThat(fakes.probe.connectorLists).isEqualTo(3);
+        // signed in, since the wait needs a session, but nothing was bound: the workspace is not usable yet
+        assertThat(fakes.probe.logins).hasSize(1);
+        assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
+    }
+
+    @Test
     void yesWithStartLocalStartsTheStackWithoutAPrompt(@TempDir Path home, @TempDir Path ws) throws IOException {
         ScriptedPrompter prompter = new ScriptedPrompter();
         Fakes fakes = new Fakes(false);
