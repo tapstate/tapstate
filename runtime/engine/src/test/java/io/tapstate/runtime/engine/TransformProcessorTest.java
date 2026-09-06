@@ -101,6 +101,6 @@ class TransformProcessorTest {
         TransformPort identity = e -> List.of(e);
         // The whole-cluster pin, not the preferredLocalParallelism proxy: a per-member supplier would
         // also report 1 but re-lane the ordered position stream across members.
-        assertThat(TotalParallelismOne.pins(TransformProcessor.metaSupplier(() -> identity), 3)).isTrue();
+        assertThat(TotalParallelismOne.pins(TransformProcessor.metaSupplier("t", () -> identity), 3)).isTrue();
     }
 }

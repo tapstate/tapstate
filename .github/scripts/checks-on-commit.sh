@@ -187,6 +187,7 @@ while IFS= read -r name; do
   if [ -z "$line" ]; then
     if [ -n "$fallback_declined" ]; then
       echo "::error::'${name}' did not run on ${sha}, and ${fallback_declined} — the head of the pull request it came from — carries a different tree, so what ran there is not an answer about this commit"
+      stale_merge=1
     else
       echo "::error::'${name}' never ran on ${sha} — a check that was not dispatched leaves no record, so this cannot be read off the failures"
     fi
@@ -220,6 +221,23 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 if [ "$unsettled" -ne 0 ]; then
+  # Said once, after the names: the cause and the cure are the same for every one of them, and
+  # repeating it per check buries the list it belongs to.
+  #
+  # How a commit reaches this state: a pull request was merged while its branch was NOT up to date,
+  # so the merge commit's tree is neither side's -- and checks that only run on `pull_request` never
+  # saw that combination. They cannot be run against it now either; nothing dispatches them on a
+  # push. The commit is not broken, it is unanswered, and it stays unanswered forever.
+  #
+  # Naming the way out matters because the obvious one does not work. Releasing an older commit that
+  # IS answered looks right and fails later and more expensively: `workflow_dispatch` takes a ref,
+  # never a bare commit, so any lane that has to be started cannot be started at it, and the gate
+  # that waits for that lane then waits for something nobody will ever produce.
+  if [ "${stale_merge:-0}" = "1" ]; then
+    echo "::error::This commit merged a branch that was not up to date, so the pull-request-only checks above never ran against this tree — and they cannot be run against it now."
+    echo "::error::Merge one more pull request that IS up to date with the default branch; its checks then answer for the new tip. Releasing an older commit instead does not work — the lanes that must be dispatched take a ref, not a commit."
+    echo "::error::It is reachable at all only when \"require branches to be up to date\" is bypassed."
+  fi
   echo "Nothing above has concluded anything yet, so this says nothing about ${sha} either way."
   exit 3
 fi

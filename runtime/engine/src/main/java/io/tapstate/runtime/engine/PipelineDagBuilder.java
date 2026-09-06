@@ -291,8 +291,9 @@ public final class PipelineDagBuilder {
             // A declared view IS its own instruction to materialize: the pipeline needs no serve block
             // to reach the state store, and the vertex is a terminal sink like any other.
             List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
-            Vertex vertex = dag.newVertex(VIEW_VERTEX_PREFIX + view.id(),
-                    sinkVertex(bindings.viewSinks().apply(view), sinkAck, axes, assembled));
+            String viewName = VIEW_VERTEX_PREFIX + view.id();
+            Vertex vertex = dag.newVertex(viewName,
+                    sinkVertex(viewName, bindings.viewSinks().apply(view), sinkAck, axes, assembled));
             connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
             readsAs.put(view.id(), upstream);
         }
@@ -308,7 +309,7 @@ public final class PipelineDagBuilder {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
                 Vertex vertex = dag.newVertex(name,
-                        sinkVertex(bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
+                        sinkVertex(name, bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
                 connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
             }
         }
@@ -332,15 +333,16 @@ public final class PipelineDagBuilder {
      * a bound to, so its frontier stands still. That is the direction to fail in: reading a stream of
      * several chains as though it were one would ack positions whose changes are still in flight.
      */
-    private static ProcessorMetaSupplier sinkVertex(SupplierEx<? extends SinkWriter> writerFactory,
+    private static ProcessorMetaSupplier sinkVertex(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAck, ChainAxes axes, boolean assembled) {
         if (sinkAck == null) {
-            return SinkProcessor.metaSupplier(writerFactory);
+            return SinkProcessor.metaSupplier(vertexName, writerFactory);
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
                 : ContiguousPrefix::new;
-        return SinkProcessor.metaSupplier(writerFactory, sinkAck, frontier);
+        return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier);
     }
 
     /**
@@ -363,9 +365,10 @@ public final class PipelineDagBuilder {
             // The merge is the topology, so nothing is transformed here - but the frontier still has to be
             // worked out per edge. The combined bound the engine would forward is never delivered at all
             // for a chain only one of the merged streams carries, which is the whole shape a union is.
-            return dag.newVertex(step.id(), PassthroughProcessor.metaSupplier(axes, chainsByOrdinal));
+            return dag.newVertex(step.id(),
+                    PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal));
         }
-        return dag.newVertex(step.id(), TransformProcessor.metaSupplier(
+        return dag.newVertex(step.id(), TransformProcessor.metaSupplier(step.id(),
                 bindings.transformPorts().apply(step), axes, chainsByOrdinal));
     }
 
@@ -454,13 +457,28 @@ public final class PipelineDagBuilder {
         return vertices;
     }
 
-    /** Draws one edge from each upstream vertex into the destination, on fresh ordinals per endpoint. */
+    /**
+     * Draws one edge from each upstream vertex into the destination, on fresh ordinals per endpoint, and
+     * routes every one of them to the single processor the destination runs.
+     *
+     * <p>Every destination this builder draws to - a stateless step, a union, a view sink, a serve sink -
+     * is pinned to total parallelism one, because a sink acks an ordered stream of positions and a second
+     * lane would break that order. That pin puts the one processor on the member owning the vertex's name,
+     * and leaves the rest of the cluster running a stand-in that refuses input. So the routing here is not
+     * a tuning choice: an edge that hands items to whatever is local delivers everything produced on any
+     * other member to that stand-in, and the job dies on the first such event.
+     *
+     * <p>The key is the destination's own name, which is exactly what the vertex was pinned by. Nothing
+     * checks that the two agree, and on one member nothing can: there the local processor is the only
+     * place input can come from, so a mis-keyed edge and a correct one are the same graph.
+     */
     private static void connect(DAG dag, List<Vertex> upstream, Vertex destination,
             Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal) {
         for (Vertex source : upstream) {
             int from = outboundOrdinal.merge(source, 1, Integer::sum) - 1;
             int to = inboundOrdinal.merge(destination, 1, Integer::sum) - 1;
-            dag.edge(Edge.from(source, from).to(destination, to));
+            dag.edge(Edge.from(source, from).to(destination, to)
+                    .distributed().allToOne(destination.getName()));
         }
     }
 }

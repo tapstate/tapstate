@@ -584,7 +584,7 @@ class EngineTest {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("src", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of((SupplierEx<Processor>) EmitOneRowSource::new)));
-        Vertex sink = dag.newVertex("serve.out", SinkProcessor.metaSupplier(RefusingWriter::new));
+        Vertex sink = dag.newVertex("serve.out", SinkProcessor.metaSupplier("serve.out", RefusingWriter::new));
         dag.edge(Edge.between(source, sink));
         return dag;
     }

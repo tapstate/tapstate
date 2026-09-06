@@ -78,14 +78,24 @@ public final class JoinDag {
         return vertex;
     }
 
-    /** One passthrough that gathers several producers of one source, so the join sees a single edge. */
+    /**
+     * One passthrough that gathers several producers of one source, so the join sees a single edge.
+     *
+     * <p>The gathering is pinned to total parallelism one, which places its only processor on the member
+     * owning the vertex's name and leaves every other member running a stand-in that refuses input. An
+     * edge handing items to whatever is local therefore delivers everything produced on another member to
+     * a stand-in, and the job dies on the first such event - so every edge into it is addressed to the
+     * member that runs it. There is no key to spread by here: one processor is the point. On a single
+     * member the two are indistinguishable, which is why this is spelled out rather than left to a test.
+     */
     private static Vertex merged(DAG dag, Vertex destination, String source, List<Vertex> producers,
             ToIntFunction<Vertex> nextOutbound) {
-        Vertex merge = dag.newVertex(destination.getName() + ":" + source,
-                PassthroughProcessor.metaSupplier());
+        String name = destination.getName() + ":" + source;
+        Vertex merge = dag.newVertex(name, PassthroughProcessor.metaSupplier(name));
         int ordinal = 0;
         for (Vertex producer : producers) {
-            dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(merge, ordinal++));
+            dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(merge, ordinal++)
+                    .distributed().allToOne(name));
         }
         return merge;
     }
