@@ -176,9 +176,11 @@ final class LocalStack {
 
     /**
      * Brings the stack up and waits until the server answers, then returns the admin to sign in as.
-     * Preflight first, so a machine without Docker is refused before anything is written; the compose
-     * file is rewritten every time (it is the CLI's, and carries the CLI's version), the {@code .env}
-     * and the jars are written only when absent.
+     * Preflight first, so a machine without Docker is refused before anything is written - which is why
+     * the preflight runs from wherever the CLI was started, not from the stack directory: on a first run
+     * that directory does not exist yet, and no program can be started in a directory that is not there.
+     * The compose file is rewritten every time (it is the CLI's, and carries the CLI's version), the
+     * {@code .env} and the jars are written only when absent.
      *
      * @param prose where to say that the wait has started, or null when nobody is reading
      * @throws TapstateException {@code cli.docker-unavailable}, with what went wrong in {@code reason}
@@ -187,7 +189,7 @@ final class LocalStack {
         if (!dockerOnPath.getAsBoolean()) {
             throw unavailable("no docker command is on the PATH");
         }
-        ProcessRunner.Result compose = run("docker", "compose", "version");
+        ProcessRunner.Result compose = run(null, "docker", "compose", "version");
         if (!compose.succeeded() || compose.stdout().isBlank()) {
             throw unavailable("docker compose is not available"
                     + (compose.stderr().isBlank() ? "" : ": " + compose.stderr().strip()));
@@ -200,7 +202,7 @@ final class LocalStack {
             prose.println("Starting the local development stack in Docker; the first start pulls images and can take a few minutes.");
             prose.flush();
         }
-        ProcessRunner.Result up = run("docker", "compose", "up", "-d");
+        ProcessRunner.Result up = run(dir, "docker", "compose", "up", "-d");
         if (!up.succeeded()) {
             throw unavailable("docker compose up failed" + (up.stderr().isBlank() ? "" : ": " + up.stderr().strip()));
         }
@@ -229,9 +231,10 @@ final class LocalStack {
         return answer;
     }
 
-    private ProcessRunner.Result run(String... command) {
+    /** Runs {@code command} in {@code where}, or from the CLI's own directory when that is null. */
+    private ProcessRunner.Result run(Path where, String... command) {
         try {
-            return runner.run(dir, List.of(command));
+            return runner.run(where, List.of(command));
         } catch (IOException notStarted) {
             throw unavailable(String.join(" ", command) + " could not be run: " + notStarted.getMessage());
         }

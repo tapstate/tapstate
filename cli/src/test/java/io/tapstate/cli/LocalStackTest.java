@@ -160,8 +160,9 @@ class LocalStackTest {
         LocalStack.Admin admin = stack(home, runner, downloads, probe).start(null);
 
         Path dir = dir(home);
+        // the preflight runs from wherever the CLI is: the stack directory does not exist yet on a first run
         assertThat(runner.calls).containsExactly(
-                dir + ": docker compose version",
+                "(cwd): docker compose version",
                 dir + ": docker compose up -d");
         assertThat(Files.readString(dir.resolve("docker-compose.yml"))).isEqualTo(COMPOSE_GOLDEN);
         // the three engines the release publishes jars for, from the release location, into the seed dir
