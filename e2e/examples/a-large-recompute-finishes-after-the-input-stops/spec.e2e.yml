@@ -1,15 +1,29 @@
 # One dimension row with four hundred orders under it, changed once -- and then nothing else is fed.
 #
-# The claim is about what happens after the input stops. A dimension change owes every fact row under
-# it, and four hundred rows do not leave the operator in one go: it hands back control part way and has
-# to pick the rest up with nothing arriving. If it only makes progress when something is delivered to
-# it, the target sits permanently half old and half new. That state reports nothing -- the job is
-# RUNNING, no error is counted, and the rows that did update look exactly right.
+# What this witnesses is convergence. A dimension change owes every fact row under it, and after the
+# input stops every one of those rows still arrives at the new value, with nothing double-written on
+# the way. The state it rules out is a target left permanently half old and half new, which reports
+# nothing -- the job is RUNNING, no error is counted, and the rows that did update look exactly right.
 #
-# Nothing is fed after the change on purpose. The source is a change stream, so it stays open and idle;
-# every reading below is therefore about progress made with no input at all.
+# What it does NOT witness, and no longer claims to, is the idle path: the operator picking the rest
+# of a fan-out up on a call where nothing was delivered to it. Measured, with
+# JoinProcessor.tryProcess() replaced by a no-op that returns true: the whole published-example suite
+# stays green, at four hundred rows under the key and again at three thousand. The reason is
+# structural rather than a matter of size -- the sink drains the outbox concurrently, so a fan-out
+# leaves within the call that delivered the change and the idle path is never reached at this layer.
+# Raising the fan-out cannot change that, because it is a question of rate and not of how many rows
+# there are.
 #
-# What the assertions have to discriminate:
+# That half is witnessed where it can be discriminated, by
+# JoinProcessorTest.theRestOfARecomputeGoesOutWhenNothingArrives: it holds the outbox to two so the
+# fan-out cannot go out in one call, then drives the idle call until the recompute finishes and
+# asserts that it took more than one of them. Under the same no-op mutation that leaves this example
+# green, that test is the one failure among its thirty-one.
+#
+# Nothing is fed after the change on purpose. The source is a change stream, so it stays open and
+# idle; every reading below is therefore taken with no input arriving.
+#
+# What the assertions here have to discriminate:
 #
 # - The count before the change is the control: four hundred rows are actually there to be revisited,
 #   so a run that converges trivially because it never built them fails first.
