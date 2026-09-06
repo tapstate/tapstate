@@ -165,6 +165,30 @@ class StoreBackedSinkAckFactoryTest {
                 .hasMessageContaining("unknown_table");
     }
 
+    @Test
+    void aChangeThatNamesNoPositionIsAckedByItsOrderAloneRatherThanRefused() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        // A chain with no cdc start, which is every chain a cdc_only read ever has: only the snapshot
+        // phase writes where changes begin, and that mode does not run one.
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+
+        // A source names a position for a run of changes when it has one and names none when it has not,
+        // and that absence is load-bearing: the contract has a recipient carry on rather than invent one,
+        // because an invented position claims changes were read that were not. Reaching for the chain's
+        // cdc start here instead crashed the whole job, with nothing ever delivered to the target.
+        ack.advance("orders", at(7, null));
+
+        ChainPosition acked = ackedChainPosition(store, "mc-orders", "pipe-1");
+        // Both halves, because each fails on its own: an ack quietly dropped would leave the frontier
+        // with no input and still not throw, and a token conjured from somewhere would resume a later
+        // run past changes it never delivered.
+        assertThat(acked.order()).isEqualTo(new SourceOrder(1, 7));
+        assertThat(acked.token()).isNull();
+    }
+
     /** One change's position: the order the engine assigned it, and the token the connector gave. */
     private static ChainPosition at(long seq, String token) {
         return new ChainPosition(new SourceOrder(1, seq), token);
@@ -176,6 +200,14 @@ class StoreBackedSinkAckFactoryTest {
         HazelcastInstance member = mock(HazelcastInstance.class);
         when(member.getUserContext()).thenReturn(context);
         return member;
+    }
+
+    private static ChainPosition ackedChainPosition(SrsMetaStore store, String chainId, String pipelineId) {
+        return store.read(chainId).orElseThrow().consumerOffsets().stream()
+                .filter(offset -> offset.pipelineId().equals(pipelineId))
+                .map(ConsumerOffset::sinkAcked)
+                .findFirst()
+                .orElse(null);
     }
 
     private static String ackedPosition(SrsMetaStore store, String chainId, String pipelineId) {

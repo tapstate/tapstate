@@ -24,10 +24,19 @@ import java.util.Map;
  * sink still runs before the assembly layer makes the member SRS-capable. A stream the map does not carry
  * is a builder-side wiring defect (the sink saw a chain the pipeline never sourced) and crashes bare.
  *
- * <p>A position that carries no token is a snapshot row, and what is persisted for it is the chain's cdc
+ * <p>A snapshot row is ordered but carries no token, and what is persisted for it is the chain's cdc
  * start position: the read has confirmed rows of a snapshot but no change at all, so a resume belongs
  * where changes begin. Resolving it here rather than at the sink is what keeps the durable store out of
  * the engine — the sink says which position it reached, this says what that spells on disk.
+ *
+ * <p>A change can carry no token too, and it is not the same case. A source names a position for a run
+ * of changes when it has one and names none when it has not, and that absence is load-bearing: the
+ * recipient carries on rather than inventing a position, because an invented one claims changes were
+ * read that were not, and a later run would resume past them. So a change with no position of its own
+ * is acked by its order alone — which is all a frontier ranks on, and all the durable record needs.
+ * Reading the two cases as one reached for a cdc start that only a snapshot phase ever writes, so a
+ * cdc_only pipeline, which runs no snapshot, died on its first acknowledged change with the target
+ * still empty.
  */
 final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
@@ -53,7 +62,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 throw new IllegalStateException(
                         "sink acked a chain the pipeline never sourced: '" + chain + "'");
             }
-            String token = position.token() != null ? position.token() : cdcStart(meta, miningChainId);
+            String token = position.token() != null ? position.token()
+                    : isSnapshotOf(position) ? cdcStart(meta, miningChainId) : null;
             meta.advanceSinkAcked(miningChainId, pipelineId, new ChainPosition(position.order(), token));
             if (isSnapshotOf(position)) {
                 meta.markSnapshotComplete(miningChainId, pipelineId, chain);
@@ -88,6 +98,6 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         return meta.read(miningChainId)
                 .map(SrsMeta::cdcStartPosition)
                 .orElseThrow(() -> new IllegalStateException("sink acked snapshot rows of mining chain '"
-                        + miningChainId + "', which has no meta record to resume from"));
+                        + miningChainId + "', which has no recorded position for changes to begin at"));
     }
 }
