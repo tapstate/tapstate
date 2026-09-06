@@ -188,7 +188,8 @@ can rely on it:
 
 A workspace directory laid out by kind — `source/<id>.tap.yml`, `pipeline/<id>.tap.yml`,
 and so on — plus `.env` and `.gitignore` when a secret was entered. Existing files are never
-overwritten; `--force` is the only way to replace one, and it says which files it replaced.
+overwritten; `--force` is the only way to replace one, and the summary marks the files it
+replaced.
 
 ### Non-interactive form
 
@@ -202,7 +203,10 @@ never guesses.
 The last thing printed, in this order:
 
 1. **Where the workspace is, and what is in it** — every file, one line each, with what that
-   file is for (the same wording `desc` uses for it).
+   file is for: `<kind> <id>: ` followed by the same one-line summary `ls` prints for it (so
+   the two never disagree), and ` — assumed <what>; edit if the table is keyed otherwise` on a file
+   the recipe had to assume something for. Under `--force` a line ends `(replaced)` or, for a
+   dotfile that was extended, `(updated)` — a run that overwrote something says which files.
 2. **State** — "not running yet".
 3. **What you can do next**, as commands: open a file and edit it; `tapstate validate`;
    `tapstate ls` / `tapstate desc <id>`; `tapstate up`.
