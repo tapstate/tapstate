@@ -1,14 +1,17 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.ddl.table.TapNewFieldEvent;
 import io.tapdata.entity.event.dml.TapDeleteRecordEvent;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
+import io.tapdata.entity.schema.value.TapStringValue;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
@@ -30,6 +33,18 @@ class TapEventCodecGoldenTest {
     /** No connector registered a conversion here: this pins the projection, not the value lanes. */
     private static final TapCodecsRegistry CODECS = new TapCodecsRegistry();
 
+    /** A driver's own type, standing in for the ones a real client hands back. */
+    private record DriverKey(String hex) implements Serializable {
+    }
+
+    /**
+     * The other lane, so the golden holds a row that met a connector conversion as well as rows that
+     * met none. Without a sample decoded through a registry that has something in it, every value here
+     * takes the bare lane and no change to the carried form could ever show up as a diff.
+     */
+    private static final TapCodecsRegistry CONNECTOR_CODECS = new TapCodecsRegistry()
+            .registerToTapValue(DriverKey.class, (value, tapType) ->
+                    new TapStringValue(((DriverKey) value).hex()));
 
     private static final Path GOLDEN =
             Path.of("src", "test", "resources", "golden", "tapevent-codec.golden.json");
@@ -50,13 +65,17 @@ class TapEventCodecGoldenTest {
         ddl.setTableId("orders");
         ddl.setReferenceTime(1000L);
         ddl.setOriginDDL("ALTER TABLE orders ADD note VARCHAR(64)");
+        TapInsertRecordEvent carried = TapInsertRecordEvent.create()
+                .table("orders").referenceTime(1000L)
+                .after(ordered("_id", new DriverKey("64f0c0de"), "region", "eu"));
 
         return List.of(
                 TapEventCodec.decodeChange(insert, CODECS),
                 TapEventCodec.decodeChange(update, CODECS),
                 TapEventCodec.decodeChange(delete, CODECS),
                 TapEventCodec.decodeSnapshotRow(row, CODECS),
-                TapEventCodec.decodeChange(ddl, CODECS));
+                TapEventCodec.decodeChange(ddl, CODECS),
+                TapEventCodec.decodeChange(carried, CONNECTOR_CODECS));
     }
 
     @Test
@@ -130,6 +149,14 @@ class TapEventCodecGoldenTest {
     private static String value(Object v) {
         if (v == null) {
             return "null";
+        }
+        if (v instanceof ConvertedValue carrier) {
+            // Both halves are contract: the portable value every reader downstream binds to, and the
+            // driver's own object riding along for the write side. The second is rendered as its type
+            // rather than its contents - what the write side needs from the golden is that it is there
+            // and what it is, and a driver object's own rendering is not ours to lock.
+            return "{\"value\": " + value(carrier.value())
+                    + ", \"origin\": " + quote(carrier.origin().getClass().getSimpleName()) + "}";
         }
         if (v instanceof Number || v instanceof Boolean) {
             return v.toString();
