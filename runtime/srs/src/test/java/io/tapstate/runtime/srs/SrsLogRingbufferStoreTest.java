@@ -113,7 +113,7 @@ class SrsLogRingbufferStoreTest {
      * here and, if the source has since aged its own retention out, gone everywhere.
      */
     @Test
-    @DisplayName("hands back a change the ring has overwritten, so a consumer that fell behind loses nothing")
+    @DisplayName("serves a change the ring has overwritten from the record, which is the ring's contract")
     void readsBackAChangeTheRingNoLongerHolds() {
         RecordingLog log = new RecordingLog();
         withMember(log, member -> {

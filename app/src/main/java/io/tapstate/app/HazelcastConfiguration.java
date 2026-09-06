@@ -204,8 +204,11 @@ class HazelcastConfiguration {
                 .setTimeToLiveSeconds(0)
                 .setBackupCount(0);
         // Put the change log behind them when there is one. The ring writes through it before admitting a
-        // change, so every change in the ring is already written down and a restart has something to replay
-        // -- without it the ring is the only copy and a stop loses whatever it held.
+        // change, so every change in the ring is already written down, and a ring rebuilt on a later member
+        // numbers on from what the record holds rather than reusing sequences it already named.
+        //
+        // Not a replay path, and nothing here reads a change back out: a restart re-mines the ring from the
+        // durable source read offset instead.
         //
         // A factory rather than a single store: the ring's store hook is told a sequence and an item but
         // never which ring is asking, and only the factory call is given the name. A live instance is

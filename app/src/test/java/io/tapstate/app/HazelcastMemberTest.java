@@ -7,6 +7,7 @@ import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.MapStoreConfig;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
@@ -15,16 +16,20 @@ import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.SrsLogRecord;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -124,6 +129,36 @@ class HazelcastMemberTest {
         assertThat(ring.getBackupCount()).isZero();
         assertThat(ring.getInMemoryFormat()).isEqualTo(InMemoryFormat.OBJECT);
         assertThat(ring.getCapacity()).isEqualTo(1024);
+    }
+
+    @Test
+    void memberConfigPutsTheChangeLogBehindTheChangeRingWhenThereIsOne() {
+        // Both of what the record buys are properties of this wiring rather than of the store: the ring
+        // writes through it before admitting a change, and a ring rebuilt later numbers on from what the
+        // record holds instead of reusing sequences it already named. Neither survives the config being
+        // left off, and the store's own cases all build their ring themselves -- so with no case here,
+        // removing these four lines is green everywhere.
+        Config config = HazelcastConfiguration.memberConfig(
+                new HazelcastProperties(), null, NestSettings.defaults(), new SentinelLogStore());
+        RingbufferStoreConfig store =
+                config.getRingbufferConfigs().get("srs.*").getRingbufferStoreConfig();
+        assertThat(store.isEnabled()).isTrue();
+        assertThat(store.getFactoryImplementation())
+                .describedAs("the ring is told a sequence and an item but never which ring is asking, "
+                        + "so only a factory can bind the name")
+                .isInstanceOf(SrsLogRingbufferStoreFactory.class);
+    }
+
+    @Test
+    void memberConfigLeavesTheChangeRingUnbackedWhenThereIsNoChangeLog() {
+        // A member with no store runs on the ring alone, and that shape has to be reached by there being
+        // no store to put behind it -- never by one wired in that writes nowhere, which would report a
+        // change as written down when nothing holds it.
+        Config config = HazelcastConfiguration.memberConfig(
+                new HazelcastProperties(), null, NestSettings.defaults(), null);
+        assertThat(config.getRingbufferConfigs().get("srs.*").getRingbufferStoreConfig().isEnabled())
+                .describedAs("a ring with nothing behind it carries no enabled store")
+                .isFalse();
     }
 
     @Test
@@ -314,6 +349,32 @@ class HazelcastMemberTest {
     }
 
     /** A sentinel meta store: an identity to assert the user-context binding; its facets are never invoked here. */
+    /** A change log that is only ever asked to be there. */
+    private static final class SentinelLogStore implements SrsLogStore {
+
+        @Override
+        public void store(String ring, long seq, SrsLogRecord record) {
+        }
+
+        @Override
+        public void storeAll(String ring, long firstSeq, List<SrsLogRecord> records) {
+        }
+
+        @Override
+        public Optional<SrsLogRecord> load(String ring, long seq) {
+            return Optional.empty();
+        }
+
+        @Override
+        public long largestSequence(String ring) {
+            return -1;
+        }
+
+        @Override
+        public void trim(String ring, long throughSeq) {
+        }
+    }
+
     private static final class SentinelMetaStore implements SrsMetaStore {
         @Override
         public java.util.List<String> miningChainIdsWithConsumer(String pipelineId) {

@@ -19,6 +19,20 @@ import java.util.Objects;
  * with no reconciliation pass of our own -- and it is the ring's own guarantee, not one this class
  * arranges.
  *
+ * <p><strong>What the record buys, and what it does not.</strong> Two things, and replay is not among
+ * them. One is the ordering above: "in the ring" means "already written down". The other is the sequence
+ * space -- a ring rebuilt on a later member numbers on from {@link #getLargestSequence()} rather than
+ * reusing sequences the record already named, so a sequence written down before a restart still names the
+ * change it named.
+ *
+ * <p><strong>No caller in the product reads a change back out.</strong> A restart re-mines the ring from
+ * the durable source read offset; a reader placed at the earliest point starts at the ring head; and a
+ * start instant the ring can no longer reach is refused rather than served from below it. Nor can a
+ * consumer be overwritten while it still holds a cursor: the write side compares against the slowest
+ * durable cursor and parks rather than evicting. So {@link #load(long)} is the ring's own contract
+ * honoured -- a sequence below the head is answered rather than dropped -- and the situation a replay
+ * would serve is one the write side prevents instead.
+ *
  * <p>The position crosses as its opaque token. The item holds it as a source position; the log holds the
  * token alone, because a record outlives the process that wrote it and only the connector that issued
  * the offset can interpret it.
