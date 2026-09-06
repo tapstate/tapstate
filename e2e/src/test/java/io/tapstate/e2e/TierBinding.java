@@ -22,6 +22,18 @@ public interface TierBinding {
     void registerConnector(String connectorId);
 
     /**
+     * Arranges {@code table}'s store to stop sending the row an update replaces, after it is seeded.
+     *
+     * <p>Default-refused rather than default-ignored: a binding that cannot do it and says nothing
+     * would run the case against a table that still sends them, which passes every assertion an
+     * example about their absence could make while testing the opposite.
+     */
+    default void withoutBeforeImages(TableAlias table) {
+        throw new EnvelopeException(
+                "this binding cannot stop " + table + " from sending the row an update replaces");
+    }
+
+    /**
      * Applies product resource files, by path relative to the specification, as one batch.
      *
      * <p>The batch is deliberate, not a convenience: the product resolves references within the set

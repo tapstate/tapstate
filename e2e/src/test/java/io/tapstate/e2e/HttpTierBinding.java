@@ -131,6 +131,12 @@ final class HttpTierBinding implements TierBinding {
     }
 
     @Override
+    public void withoutBeforeImages(TableAlias table) {
+        Endpoint endpoint = endpoint(table);
+        endpoint.driver().withoutBeforeImages(endpoint.address(), table.table());
+    }
+
+    @Override
     public Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where) {
         Endpoint endpoint = endpoint(table);
         return endpoint.driver().fetch(endpoint.address(), table.table(), where);
