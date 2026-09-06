@@ -84,7 +84,7 @@ jobs:
           -Dapi.version=1.44
           -Dtapstate.e2e.connectors-dir="${{ runner.temp }}/connectors"
           -Dtest=ZzzNoSuchSurefireSelector -Dsurefire.failIfNoSpecifiedTests=false
-          -Dit.test=PublishedExamplesIT,RealMysqlToMongo*IT,Nest*IT,DataBrowser*IT,Watch*IT
+          -Dit.test=PublishedExamplesIT,RealMysqlToMongo*IT,Nest*IT,DataBrowser*IT,Watch*IT,AnObjectIdReadsBackTheSameThroughBothFacesIT,SinkValueRoundTripIT
           -Dfailsafe.failIfNoSpecifiedTests=false
       # The scene each failing example left behind, before its containers went away. This lane is where
       # the examples actually run - the default CI build skips them for want of connector jars - so it is
@@ -119,7 +119,9 @@ jobs:
         run: |
           expected=$(ls e2e/src/test/java/io/tapstate/e2e/PublishedExamplesIT.java \
                         e2e/src/test/java/io/tapstate/e2e/RealMysqlToMongo*IT.java \
-                        e2e/src/test/java/io/tapstate/e2e/Nest*IT.java 2>/dev/null | wc -l | tr -d ' ')
+                        e2e/src/test/java/io/tapstate/e2e/Nest*IT.java \
+                        e2e/src/test/java/io/tapstate/e2e/AnObjectIdReadsBackTheSameThroughBothFacesIT.java \
+                        e2e/src/test/java/io/tapstate/e2e/SinkValueRoundTripIT.java 2>/dev/null | wc -l | tr -d ' ')
           ran=$(ls e2e/target/failsafe-reports/*.txt 2>/dev/null | wc -l | tr -d ' ')
           echo "witness classes present: $expected, ran: $ran"
           if [ "$ran" -lt "$expected" ]; then
