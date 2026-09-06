@@ -47,12 +47,21 @@ class JoinStateIsSharedAcrossMembersTest {
     private static final long SETTLE_BUDGET_MS = 60_000;
 
     /**
-     * A pair of ports for this run, well clear of the range a stray cluster occupies. Each run of
-     * this class takes the next pair, so two of them overlapping in one build do not collide.
+     * A pair of ports for this run, clear of two ranges rather than one. Each run of this class takes
+     * the next pair, so two of them overlapping in one build do not collide.
+     *
+     * <p><b>Below 32768, which is not arbitrary.</b> A fixed port that lies inside the operating
+     * system's ephemeral range is one the kernel may already have handed to some unrelated outbound
+     * socket -- including the connection these two members open to each other -- and binding is
+     * refused with auto-increment off, which it has to be for the member list below to name the
+     * right addresses. Measured: Linux hands out 32768-60999, macOS 49152-65535. The range this
+     * started on, 34000 upward, was inside the first and outside the second, so it could only ever
+     * fail where the build runs and never where it was written; it did, on a port in that range,
+     * with the member reporting the address as already in use.
      */
     private static final java.util.concurrent.atomic.AtomicInteger BASE_PORT =
             new java.util.concurrent.atomic.AtomicInteger(
-                    34_000 + 2 * new java.util.Random().nextInt(1_000));
+                    20_000 + 2 * new java.util.Random().nextInt(1_000));
 
     private HazelcastInstance one;
     private HazelcastInstance two;
