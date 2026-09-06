@@ -154,12 +154,21 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.logs", "logs"));
 
     /**
-     * Verbs that chain several registered operations rather than projecting one ({@code run} is apply
-     * then start), and are not implemented yet. They are registered so they stay discoverable, but they
-     * report that they do not exist yet — not that a connection is missing, which would be false in both
-     * states: connecting does not implement them.
+     * Verbs that chain several registered operations rather than projecting one, and are not
+     * implemented yet. They are registered so they stay discoverable, but they report that they do not
+     * exist yet — not that a connection is missing, which would be false in both states: connecting
+     * does not implement them. A composite that ships leaves this list for {@link #COMPOSITE_VERBS}
+     * under its final name; the placeholder is not kept beside it.
      */
-    static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("run", "export", "diff", "edit");
+    static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("export", "diff", "edit");
+
+    /**
+     * The composite verbs that exist: each chains registered operations over one connection — {@code up}
+     * is apply, discover, apply, start — and projects no operation of its own, which is why none of them
+     * is in {@link #VERB_BY_OPERATION}. They are the opposite of offline: every stage is a call the
+     * server answers, so they route through the session like the projected verbs do.
+     */
+    static final List<String> COMPOSITE_VERBS = List.of("up");
 
     /**
      * The live views over a collection. They project no registered operation and never will: each is a
@@ -255,10 +264,12 @@ public final class Cli implements Runnable {
                     "Watch one row in place until Ctrl-C; needs a terminal.")),
             Map.entry("tail", new VerbHelp("<source>.<collection> [<filter>]",
                     "Follow a whole collection's changes until Ctrl-C; pipes fine.")),
+            // The composite that ships. The operands are the flags it takes, since it names no resource:
+            // the bound workspace is the operand.
+            Map.entry("up", new VerbHelp("[--server <url>] [--yes] [-o text|json|yaml] [-w <dir>]",
+                    "Bring the bound workspace to running: apply, discover, apply, start.")),
             // The reserved verbs. Each says what it is reserved for: "not implemented yet" answers the
             // question only once the reader knows what was going to be there.
-            Map.entry("run", new VerbHelp("[<path>]",
-                    "Apply a workspace and start its pipelines in one step.")),
             Map.entry("export", new VerbHelp("<id>",
                     "Write a stored artifact back out as canonical YAML.")),
             Map.entry("diff", new VerbHelp("<file>",
@@ -329,6 +340,7 @@ public final class Cli implements Runnable {
         for (String verb : UNIMPLEMENTED_COMPOSITE_VERBS) {
             commandLine.addSubcommand(verb, new UnimplementedVerb());
         }
+        commandLine.addSubcommand("up", new UpCmd());
         // The version belongs to the binary, not to any one verb, so every verb reports the same one.
         // Set centrally rather than annotated per class: the standard help mixin registers -V wherever
         // it is applied, and a spec with no version answers that advertised option with an empty line
@@ -485,10 +497,20 @@ public final class Cli implements Runnable {
     private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                                   Supplier<Prompter> prompter, ContextResolver resolver,
                                   AuthService authService) {
+        return runSession(launch, controlPlane, prompter, resolver, authService, newCommandLine());
+    }
+
+    /**
+     * The fully injected form: the command table is handed in, so a test can capture what a one-shot
+     * writes without redirecting the process streams — the session writes to the table's own writers.
+     */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver,
+                          AuthService authService, CommandLine commandLine) {
         Prompter oneShotPrompter = null;
         try {
             if (launch.hasConflictingTargets()) {
-                Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
+                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
                 return EXIT_USAGE;
             }
             if (launch.isOneShot() && launch.command().size() >= 2
@@ -502,7 +524,7 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
-            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
+            Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
                     new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
             String machineToken = launch.machineToken();
