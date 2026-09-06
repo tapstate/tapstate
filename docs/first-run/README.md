@@ -232,8 +232,13 @@ lifecycle.
   readable, the connector each source needs registered on that server, each source
   reachable. Anything missing is reported with the stage, a stable error code, and the next
   action — before anything is applied.
-- **A failure names its stage.** "Discovery failed on `orders_db`: <code> — <next action>",
-  never the internal command that happened to be running.
+- **The stages are exactly** `preflight`, `apply sources`, `discover`, `apply workspace`, `start`,
+  in that order; a run stops at the first one that fails.
+- **`.env` is read first.** Before anything is submitted, a `${NAME}` reference in a workspace file
+  is resolved from `<workspace>/.env` (the file `new` wrote the secrets to), and only then from the
+  process environment. Nothing else reads that file.
+- **A failure names its stage.** "`up: discover failed on orders_src: <code> — <message>`" followed
+  by the catalog's next action, never the internal command that happened to be running.
 - Flags: `--server <url>` overrides the bound server for this run; `--yes` for scripts.
 
 What `up` says afterwards follows the same shape as `new`: the workspace, the pipeline and
