@@ -52,18 +52,19 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       beside it: that one is read off the index as pages times a page, so it is an upper bound and is
  *       exact only for a single-page bucket. This is the assertion that would catch a reading written to
  *       report what a rebuild set out to do rather than what it did.</li>
- *   <li><b>Most of the twelve thousand rows carry the new name.</b> The readings above are about a
- *       rebuild; this is what says a rebuild is what happened, and it is what would fail if the edit
- *       reached nothing at all.</li>
+ *   <li><b>Every one of the twelve thousand rows carries the new name.</b> The readings above are
+ *       about a rebuild; this is what says a rebuild is what happened. Counted rather than sampled:
+ *       a rebuild that stops a handful of rows short leaves those rows holding a value nothing will
+ *       ever correct, and leaves every other reading saying healthy.</li>
  * </ul>
  *
- * <p><b>What this case deliberately does not assert, and why.</b> The rebuild does not reach every row:
- * measured three times here, it republishes 11,993 of the 12,000 under the key and the same seven keep
- * the old value however many times the dimension row is edited afterwards. That is a defect of the
- * rebuild and it is filed on its own; holding this case to it would mean a reading whose entire job is
- * to say how far a rebuild got could not be witnessed until the rebuild got all the way. What is
- * asserted instead is stronger against the failure this reading actually has: that it agrees with the
- * target rather than with the estimate.
+ * <p><b>Two assertions here look like one, and dropping either leaves a hole.</b> The rows-sent
+ * reading is held to the target's own count, and the target's count is held to every row under the key.
+ * Without the first, a reading written to report what a rebuild set out to do rather than what it did
+ * passes. Without the second, a rebuild that quietly stops short passes as long as its reading is honest
+ * about stopping short - which is what this case saw while the walk still had a defect in it: 11,993 of
+ * 12,000, with the same seven rows keeping the old value however often the dimension row was edited
+ * afterwards, because the walk had dropped them from the index it finds rows through.
  *
  * <pre>
  *   mvn -pl e2e -am verify -Dapi.version=1.44 \
@@ -165,17 +166,10 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
                     .hasEntrySatisfying(EXPECTED + subject, rows -> assertThat(rows)
                             .isGreaterThanOrEqualTo(LOUD_ORDERS));
 
-            // A rebuild is what happened, rather than a pair of numbers about one - and it reached
-            // every row, which is asserted by counting them rather than by sampling: seven rows left
-            // holding the old name is what the rows-sent reading looks like when it is telling the
-            // truth about a rebuild that quietly stopped short.
-            // What this case is about: the reading tells the truth about the rebuild. It is asserted
-            // against the target rather than against the size beside it, and the difference matters -
-            // measured here, this rebuild reaches 11993 of the 12000 rows under the key and stops, so a
-            // reading that had been written to report the size would say 12000 and be believed. That
-            // shortfall is a defect of the rebuild rather than of this reading, is filed separately,
-            // and is deliberately not what fails this case: a reading whose whole job is to say how far
-            // a rebuild got must not be held to the rebuild getting all the way.
+            // The reading is held against the target rather than against the size beside it, and the
+            // difference is the point: the size is read off the index as pages times a page, so a
+            // reading written to report what the rebuild set out to do would say 12000 and be believed
+            // whatever the rebuild actually managed.
             Await.until("the rebuild to stop advancing", SETTLE,
                     () -> {
                         Long done = control.metricsNamed(PIPELINE_ID, DONE).get(DONE + subject);
@@ -188,9 +182,11 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
 
             long carried = mongo.count(target, TARGET, Map.of("customer_name", "adelaide"));
             assertThat(carried)
-                    .as("a rebuild is what happened, rather than a pair of numbers about one: most of "
-                            + "the twelve thousand rows under the key carry the new name")
-                    .isGreaterThan(LOUD_ORDERS * 9L / 10);
+                    .as("a rebuild is what happened, rather than a pair of numbers about one: every one "
+                            + "of the twelve thousand rows under the key carries the new name. Counted, "
+                            + "not sampled - a rebuild that stops a handful short leaves those rows on "
+                            + "a value nothing corrects, with every other reading saying healthy")
+                    .isEqualTo(LOUD_ORDERS);
 
             Map<String, Long> settled = rebuildReadings(control);
             assertThat(settled.get(DONE + subject))
@@ -205,11 +201,10 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
             // Read after the rebuild has demonstrably finished, so this is its final figure.
             Map<String, Long> finished = rebuildReadings(control);
             assertThat(finished.get(DONE + subject))
-                    .as("the rows-sent reading ends up on the rebuild that happened. Not equal to the "
-                            + "size beside it, and it must not be asserted to be: that one is read off "
-                            + "the index as pages times a page, which is an upper bound and is exact "
-                            + "only for a single-page bucket - measured here as 12000 against 11993 "
-                            + "rows actually walked. What it may not do is stop short of them")
+                    .as("the rows-sent reading ends up on the rebuild that happened. Held to the target "
+                            + "above rather than to the size beside it, which is read off the index as "
+                            + "pages times a page and is therefore an upper bound, exact only for a "
+                            + "single-page bucket. What it may not do is stop short of the rows walked")
                     .isNotNull()
                     .isGreaterThan(0L)
                     .isLessThanOrEqualTo(finished.get(EXPECTED + subject));

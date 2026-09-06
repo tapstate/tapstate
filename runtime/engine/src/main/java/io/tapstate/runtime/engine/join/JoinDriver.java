@@ -467,7 +467,9 @@ public final class JoinDriver {
             // wearing the batch's name. Reading far more keys than there are partitions is what turns
             // it back into a batch.
             int through = recompute.page();
-            List<String> gathered = new ArrayList<>();
+            // The keys this read is about to ask for, kept so that what it answers can be told apart
+            // from what it was never asked. A page walked below may have grown since it was read here.
+            Set<String> gathered = new LinkedHashSet<>();
             int pages = stores.indexPageCount(source, dimensionKey);
             while (through < pages && gathered.size() < keysPerRead) {
                 gathered.addAll(stores.indexPage(source, dimensionKey, through));
@@ -475,7 +477,7 @@ public final class JoinDriver {
             }
             Map<String, Map<String, Object>> rows = stores.factsUnder(gathered);
             while (recompute.page() < through) {
-                if (!emit(recompute, dimension, rows, sink)) {
+                if (!emit(recompute, dimension, rows, gathered, sink)) {
                     return false;
                 }
             }
@@ -486,15 +488,35 @@ public final class JoinDriver {
     /**
      * Walks what is left of one page, emitting from {@code rows} - which was read for this page and
      * several after it. Returns false when the sink refused, leaving the bookmark where it stopped.
+     *
+     * <p><b>{@code asked} is what {@code rows} was read for, and the two are separate arguments because
+     * a batch read answers only about what it was given.</b> The page is read again here rather than
+     * carried from the gather, so it may name keys that read never carried; absent from {@code rows}
+     * then means "nobody asked", not "the row is gone", and the two need opposite handling. The same
+     * distinction is what {@link #mirrored} draws between a primed key holding null and a key that was
+     * never primed.
      */
     private boolean emit(Recompute recompute, Dimension dimension,
-            Map<String, Map<String, Object>> rows, JoinSink sink) {
+            Map<String, Map<String, Object>> rows, Set<String> asked, JoinSink sink) {
         List<String> factKeys =
                 stores.indexPage(dimension.source(), recompute.dimensionKey(), recompute.page());
         List<String> stale = new ArrayList<>();
         while (recompute.at() < factKeys.size()) {
             String factKey = factKeys.get(recompute.at());
             Map<String, Object> factRow = rows.get(factKey);
+            if (factRow == null && !asked.contains(factKey)) {
+                // This key joined the page after the batch read was taken. It is the ordinary shape of
+                // a run rather than an oddity: the fact edge and the dimension edge are partitioned by
+                // different keys, so the instance taking a fact row in is never the one rebuilding its
+                // dimension row, and a first load reaches a dimension row with its fact rows still
+                // arriving. A read that was never asked for a key says nothing about whether the row is
+                // there, while the branch below reads absence as gone - and that costs the row its
+                // index entry for good, because nothing ever adds one back: a fact row already in the
+                // mirror re-arriving finds its dimension key unchanged and appends nothing. The row
+                // then keeps whatever it was last published with, and every later change to this
+                // dimension row walks past it, with the job running and nothing reported.
+                factRow = stores.fact(factKey);
+            }
             // The index is derived; the fact row's own foreign key is the truth. A bucket may name a
             // row that has gone or that now points elsewhere - emitting either would publish it
             // against a dimension row it has nothing to do with, and the row would look ordinary.

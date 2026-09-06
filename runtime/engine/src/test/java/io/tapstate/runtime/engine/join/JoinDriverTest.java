@@ -12,6 +12,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -253,6 +254,86 @@ class JoinDriverTest {
         assertThat(fixture.published()).isEmpty();
         assertThat(fixture.stores.indexPageCount("c", bucket))
                 .as("and it is gone, so the bucket does not grow for ever").isZero();
+    }
+
+    /**
+     * The narrow half of the rule the case below turns on, and the only shape that reaches it: a
+     * bucket naming a key the mirror holds nothing for. The walk reads such a key by itself <em>only</em>
+     * where its batch was never asked about it - a key the batch did ask about and did not answer is a
+     * row that is gone, and is stale on that evidence alone. Widened to every absent key, the reading
+     * becomes a round trip per stale entry on the one path the batching exists for, and nothing but the
+     * clock would say so.
+     *
+     * <p>The neighbouring case cannot hold this: the row it leaves in the bucket is re-pointed rather
+     * than gone, so it is in the mirror, and the branch never runs there whatever it says.
+     */
+    @Test
+    @DisplayName("a bucket entry whose row is gone is stale on the batch's evidence, with no read of its own")
+    void aVanishedFactRowIsFoundStaleWithoutASecondRead() {
+        Fixture fixture = new Fixture(JoinKind.LEFT);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        String bucket = fixture.dimensionKeyOf(1L);
+        // Named in the bucket with nothing behind it in the mirror: what a fact row deleted while its
+        // removal from the bucket was lost leaves, and the one shape a rebuilt index also leaves.
+        fixture.stores.indexAdd("c", bucket, fixture.factKeyOf(11L));
+        fixture.stores.forgetCounts();
+
+        fixture.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+
+        assertThat(fixture.published()).as("there is no row to publish").isEmpty();
+        assertThat(fixture.stores.indexPageCount("c", bucket))
+                .as("and the entry is dropped, so the bucket does not grow for ever").isZero();
+        assertThat(fixture.stores.singleReads)
+                .as("and it was found stale from the batch the walk had already read, not from a read "
+                        + "made for it alone")
+                .isZero();
+    }
+
+    /**
+     * The other half of the case above, and the two look identical from inside the walk. A rebuild
+     * reads a run of pages, asks the mirror for every key on them in one go, and then walks each page
+     * again as it emits - so a key appended in between is on the page and absent from the answer. Read
+     * as "this row is gone" it costs the row its index entry, and nothing ever puts one back: the row
+     * keeps whatever it was last published with, and every later edit to its dimension row walks
+     * straight past it, with the pipeline running and nothing reported.
+     *
+     * <p><b>The window is the ordinary shape of a run rather than a contrived one.</b> The fact edge
+     * and the dimension edge are partitioned by different keys, so the instance taking in an order is
+     * never the instance rebuilding that order's customer - and a first load reaches a dimension row
+     * with its fact rows still arriving. It is opened here on purpose, so what the case turns on is
+     * arithmetic rather than timing.
+     */
+    @Test
+    @DisplayName("a fact row arriving mid-rebuild keeps its place in the bucket, so later edits reach it")
+    void aRowArrivingMidRebuildIsNotMistakenForAStaleEntry() {
+        ArrivesMidWalk stores = new ArrivesMidWalk(new MapJoinStores(4));
+        Fixture fixture = new Fixture(JoinKind.LEFT, stores);
+        fixture.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        for (long id = 0; id < 10; id++) {
+            fixture.apply(fact(insert(Map.of("id", id, "cust_id", 1L))));
+        }
+        String bucket = fixture.dimensionKeyOf(1L);
+        String arriving = fixture.factKeyOf(100L);
+        // Exactly what another instance leaves behind when it takes in an order for this customer:
+        // the row in the mirror and its key on the bucket's last page - which this walk has already
+        // read the keys of and is about to walk again.
+        stores.onNextBatchRead(() -> {
+            stores.putFact(arriving, Map.of("id", 100L, "cust_id", 1L));
+            stores.indexAdd("c", bucket, arriving);
+        });
+
+        fixture.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+        fixture.clear();
+        fixture.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Grace"), Map.of("id", 1L, "name", "Hopper"))));
+
+        assertThat(fixture.published())
+                .as("the row that arrived while the bucket was being walked is still named in it, so "
+                        + "the next edit reaches it")
+                .contains(Map.entry(Op.INSERT,
+                        Map.of("order_id", 100L, "customer_name", "Hopper")));
     }
 
     /**
@@ -697,6 +778,88 @@ class JoinDriverTest {
         }
     }
 
+    /**
+     * The state, plus one fact row that joins a bucket in the window a rebuild leaves open between
+     * reading a page's keys and walking them. Nothing here is concurrent: the arrival is run inside the
+     * batch read, which is where a run's own race would land it, so the case has one outcome rather
+     * than a likely one.
+     */
+    private static final class ArrivesMidWalk implements JoinStores {
+
+        private final JoinStores held;
+        private Runnable arrival;
+
+        ArrivesMidWalk(JoinStores held) {
+            this.held = held;
+        }
+
+        /** Runs {@code arrival} once, as the next batch read is answered. */
+        void onNextBatchRead(Runnable arrival) {
+            this.arrival = arrival;
+        }
+
+        @Override
+        public Map<String, Map<String, Object>> factsUnder(Collection<String> factKeys) {
+            Map<String, Map<String, Object>> rows = held.factsUnder(factKeys);
+            Runnable arriving = arrival;
+            arrival = null;
+            if (arriving != null) {
+                arriving.run();
+            }
+            return rows;
+        }
+
+        @Override
+        public Map<String, Object> fact(String factKey) {
+            return held.fact(factKey);
+        }
+
+        @Override
+        public void putFact(String factKey, Map<String, Object> row) {
+            held.putFact(factKey, row);
+        }
+
+        @Override
+        public void removeFact(String factKey) {
+            held.removeFact(factKey);
+        }
+
+        @Override
+        public Map<String, Object> dimensionRow(String source, String dimensionKey) {
+            return held.dimensionRow(source, dimensionKey);
+        }
+
+        @Override
+        public void putDimensionRow(String source, String dimensionKey, Map<String, Object> row) {
+            held.putDimensionRow(source, dimensionKey, row);
+        }
+
+        @Override
+        public void removeDimensionRow(String source, String dimensionKey) {
+            held.removeDimensionRow(source, dimensionKey);
+        }
+
+        @Override
+        public int indexPageCount(String source, String dimensionKey) {
+            return held.indexPageCount(source, dimensionKey);
+        }
+
+        @Override
+        public List<String> indexPage(String source, String dimensionKey, int page) {
+            return held.indexPage(source, dimensionKey, page);
+        }
+
+        @Override
+        public void indexAdd(String source, String dimensionKey, String factKey) {
+            held.indexAdd(source, dimensionKey, factKey);
+        }
+
+        @Override
+        public void indexRemove(String source, String dimensionKey, String factKey) {
+            held.indexRemove(source, dimensionKey, factKey);
+        }
+    }
+
     private static Map<String, Object> rowOf(String first, Object firstValue, String second,
             Object secondValue) {
         Map<String, Object> row = new LinkedHashMap<>();
@@ -744,6 +907,13 @@ class JoinDriverTest {
         Fixture(JoinKind kind, int pageSize) {
             this.withNote = true;
             this.stores = new CountingJoinStores(pageSize);
+            this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores);
+        }
+
+        /** Over the state handed in, for a case about what the state does under the driver. */
+        Fixture(JoinKind kind, JoinStores held) {
+            this.withNote = true;
+            this.stores = new CountingJoinStores(held);
             this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores);
         }
 
