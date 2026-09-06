@@ -104,9 +104,17 @@ class SinkAckMetaSupplierTest {
                 .isInstanceOf(NullPointerException.class);
     }
 
-    /** Resolves the meta-supplier down to the one processor it pins, binding the member into the context. */
+    /**
+     * Resolves the meta-supplier down to the one processor it pins, binding the member into the context.
+     *
+     * <p>The address is read off the running member rather than written down. The vertex is pinned to
+     * whichever member owns its name's partition, so a fabricated address is the real one only while the
+     * member happens to have taken the port that was guessed - and when it has not, this resolves to the
+     * stand-in that stands in for "the vertex is elsewhere", which fails as a cast rather than as anything
+     * about a sink.
+     */
     private SinkProcessor resolveOnMember(ProcessorMetaSupplier meta) throws Exception {
-        List<Address> addresses = List.of(Address.createUnresolvedAddress("127.0.0.1", 5701));
+        List<Address> addresses = List.of(member.getCluster().getLocalMember().getAddress());
         meta.init(new TestProcessorMetaSupplierContext()
                 .setHazelcastInstance(member).setTotalParallelism(1).setLocalParallelism(1));
         ProcessorSupplier supplier = meta.get(addresses).apply(addresses.get(0));
