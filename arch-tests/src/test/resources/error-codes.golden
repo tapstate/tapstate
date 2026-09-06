@@ -81,7 +81,9 @@ cli.unknown-connector
 cli.verb-not-implemented
 cli.version-mismatch
 cli.watch-needs-a-terminal
+cli.workspace-has-no-pipeline
 cli.workspace-not-writable
+cli.workspace-unreadable
 connector.ambiguous-connector-class
 connector.ambiguous-registration
 connector.api-level-incompatible

@@ -35,6 +35,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.OptionalInt;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -44,6 +45,7 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * The offline REPL: a JLine read loop over the same command table the one-shot mode uses, so a verb
@@ -2086,11 +2088,8 @@ final class Repl {
             return Cli.EXIT_DIAGNOSTIC;
         }
 
-        final String connectionId = parsed.id();
         OutputFormat chosen = parsed.format();
-        ConnectionTestOutcome outcome = withFailover(() -> controlPlane.test(
-                session.landingNode(), session.credential(), connectionId, source.connector(), source.config()),
-                o -> o instanceof ConnectionTestOutcome.Unreachable);
+        ConnectionTestOutcome outcome = testConnectionFor(parsed.id(), source.connector(), source.config());
         return switch (outcome) {
             case ConnectionTestOutcome.Tested tested -> {
                 renderReport(tested.report(), chosen);
@@ -3577,6 +3576,12 @@ final class Repl {
      * Carried as the canonical code string, the way every server code reaches this ring.
      */
     private static final String CONNECTOR_NOT_REGISTERED = "connector.not-registered";
+    /**
+     * The server's code for a connector that could not complete its connection test, carried as a
+     * string for the same reason: it is the server's word, and a preflight that reports a check the
+     * connector failed without a code of its own reports it under the code the server would have used.
+     */
+    private static final String CONNECTOR_TEST_FAILED = "connector.test-failed";
 
     /** The pipeline state under which there is nothing left to start, as the server spells it. */
     private static final String RUNNING = "RUNNING";
@@ -3741,18 +3746,21 @@ final class Repl {
         }
 
         /**
-         * Everything that can be found wrong before anything is written: the server answers, the
-         * workspace reads and holds a pipeline whose sources it also holds, and every connector those
-         * sources need is registered on that server.
+         * Everything that can be found wrong before anything is written: the workspace reads and holds
+         * a pipeline whose sources it also holds, the server answers, every connector those sources need
+         * is registered on that server, and every source's own database answers the connector's test.
+         *
+         * <p>The workspace is read before the server is asked anything: it is local, and a workspace
+         * that cannot be read or has nothing to start needs no server to be refused.
          */
         private int preflight() {
-            if (!connectedHere && !controlPlane.isHealthy(session.landingNode())) {
-                return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()), CliError.CONNECT_FAILED,
-                        Map.of("seeds", hostPort(session.landingNode())));
-            }
             int read = readWorkspace();
             if (read != Cli.EXIT_OK) {
                 return read;
+            }
+            if (!connectedHere && !controlPlane.isHealthy(session.landingNode())) {
+                return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()), CliError.CONNECT_FAILED,
+                        Map.of("seeds", hostPort(session.landingNode())));
             }
             Set<String> local = sources().stream().map(UpDraft::id).collect(Collectors.toSet());
             for (UpDraft pipeline : pipelines()) {
@@ -3782,7 +3790,66 @@ final class Repl {
                             MessageCatalog.bundled().render(CONNECTOR_NOT_REGISTERED, params).message(), params);
                 }
             }
+            for (UpDraft source : sources()) {
+                int reachable = reachable(source);
+                if (reachable != Cli.EXIT_OK) {
+                    return reachable;
+                }
+            }
             return Cli.EXIT_OK;
+        }
+
+        /**
+         * Asks the connector, through the same call {@code test} makes, whether one source's database
+         * answers with the settings the workspace declares. Every source is tested on every run,
+         * converged ones included: the database is the one thing in the workspace that can go away
+         * between two runs without any file changing, and the stages after this one all knock on it.
+         *
+         * <p>A report that did not pass is reported from its first failing check: the connector's own
+         * code when it gave one, else the catalog's connector-test code, with the check's message as
+         * the message and the check's reason and remedy as the next action. Passing is decided the way
+         * {@code test} decides its exit status - any outcome but {@code FAILED} - so the two verbs can
+         * never disagree about the same report.
+         */
+        private int reachable(UpDraft source) {
+            SourceResource declared = (SourceResource) source.resource();
+            switch (testConnectionFor(source.id(), declared.connector(), declared.config())) {
+                case ConnectionTestOutcome.Tested tested -> {
+                    ConnectionReport report = tested.report();
+                    if (reportStatus(report) == Cli.EXIT_OK) {
+                        return Cli.EXIT_OK;
+                    }
+                    ConnectionReport.Check failed = report.checks().stream()
+                            .filter(c -> "FAILED".equalsIgnoreCase(c.status()))
+                            .findFirst().orElse(null);
+                    if (failed == null) {
+                        Map<String, Object> params = Map.of("connector", declared.connector(),
+                                "detail", "the report names no failing check");
+                        return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CONNECTOR_TEST_FAILED,
+                                MessageCatalog.bundled().render(CONNECTOR_TEST_FAILED, params).message(), params);
+                    }
+                    String headline = readable(failed.message());
+                    String message = headline != null ? headline : failed.name();
+                    List<String> remedy = Stream.of(readable(failed.reason()), readable(failed.solution()))
+                            .filter(Objects::nonNull).toList();
+                    if (present(failed.connectorErrorCode())) {
+                        return failure(UpCmd.STAGE_PREFLIGHT, source.id(), failed.connectorErrorCode().trim(), message,
+                                Map.of("check", failed.name()), remedy);
+                    }
+                    Map<String, Object> params = Map.of("connector", declared.connector(), "detail", message);
+                    return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CONNECTOR_TEST_FAILED, message, params, remedy);
+                }
+                case ConnectionTestOutcome.Rejected rejected -> {
+                    return failure(UpCmd.STAGE_PREFLIGHT, source.id(), rejected.code(), rejected.message(), Map.of());
+                }
+                case ConnectionTestOutcome.TimedOut ignored -> {
+                    return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CliError.REQUEST_TIMED_OUT,
+                            Map.of("server", hostPort(session.landingNode())));
+                }
+                case ConnectionTestOutcome.Unreachable ignored -> {
+                    return unreachable(UpCmd.STAGE_PREFLIGHT, source.id());
+                }
+            }
         }
 
         /**
@@ -3791,14 +3858,13 @@ final class Repl {
          * what each reads. The server stays the parser of record: what it is sent is the draft text.
          */
         private int readWorkspace() {
-            PrintWriter err = commandLine.getErr();
             List<LocalDraft> read;
             try {
                 read = collectDrafts(workspace, DotEnv.layered(workspace, env));
             } catch (IOException e) {
-                err.println("up: preflight: cannot read " + workspace + ": " + e.getMessage());
-                err.flush();
-                return Cli.EXIT_USAGE;
+                String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.WORKSPACE_UNREADABLE,
+                        Map.of("path", workspace.toString(), "reason", reason));
             } catch (DslException e) {
                 return failure(UpCmd.STAGE_PREFLIGHT, e.source(), e.code(), e.args());
             }
@@ -3813,10 +3879,8 @@ final class Repl {
             }
             drafts = parsed;
             if (pipelines().isEmpty()) {
-                err.println("up: preflight: no pipeline in " + workspace
-                        + " (a *.tap.yml with kind: pipeline); there is nothing to bring up");
-                err.flush();
-                return Cli.EXIT_USAGE;
+                return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.WORKSPACE_HAS_NO_PIPELINE,
+                        Map.of("path", workspace.toString()));
             }
             return Cli.EXIT_OK;
         }
@@ -3984,15 +4048,29 @@ final class Repl {
          * stage and the resource.
          */
         private int failure(String stage, String on, String code, String message, Map<String, Object> params) {
-            String solution = MessageCatalog.bundled().render(code, params).solution();
-            boolean remedy = present(solution) && !hasUnboundName(solution);
+            return failure(stage, on, code, message, params, List.of());
+        }
+
+        /**
+         * The same report, with the next action supplied by the caller — a connector's own reason and
+         * remedy for a check it failed — ahead of the catalog's. The catalog is asked only when the
+         * caller had none: the connector was there and the catalog was not.
+         */
+        private int failure(String stage, String on, String code, String message, Map<String, Object> params,
+                List<String> nextAction) {
+            List<String> remedyLines = nextAction;
+            if (remedyLines.isEmpty()) {
+                String solution = MessageCatalog.bundled().render(code, params).solution();
+                remedyLines = present(solution) && !hasUnboundName(solution) ? List.of(solution) : List.of();
+            }
+            boolean remedy = !remedyLines.isEmpty();
             if (format != OutputFormat.TEXT) {
                 Map<String, Object> document = new LinkedHashMap<>();
                 document.put("code", code);
                 document.put("severity", "ERROR");
                 document.put("message", message);
                 if (remedy) {
-                    document.put("solution", solution);
+                    document.put("solution", String.join(" ", remedyLines));
                 }
                 if (!params.isEmpty()) {
                     document.put("params", new TreeMap<>(params));
@@ -4007,8 +4085,8 @@ final class Repl {
             PrintWriter err = commandLine.getErr();
             err.println(Ansi.AUTO.string("@|bold,red error:|@") + " up: " + stage + " failed on " + on
                     + ": " + code + " — " + message);
-            if (remedy) {
-                err.println("  " + solution);
+            for (String line : remedyLines) {
+                err.println("  " + line);
             }
             err.println("  (" + session.versions() + ")");
             err.flush();
@@ -4035,6 +4113,13 @@ final class Repl {
         return withFailover(() -> controlPlane.discoverSchema(
                 session.landingNode(), session.credential(), connectionId, connector, config),
                 o -> o instanceof ConnectionDiscoverSchemaOutcome.Unreachable);
+    }
+
+    /** Runs the connector's connection test for a connection with the connector and settings it declares. */
+    private ConnectionTestOutcome testConnectionFor(String connectionId, String connector, Map<String, Object> config) {
+        return withFailover(() -> controlPlane.test(
+                session.landingNode(), session.credential(), connectionId, connector, config),
+                o -> o instanceof ConnectionTestOutcome.Unreachable);
     }
 
     /** Reads a connection's stored discovered model, without running a discovery. */
