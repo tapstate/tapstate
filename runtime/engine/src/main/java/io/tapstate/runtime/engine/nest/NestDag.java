@@ -55,10 +55,11 @@ public final class NestDag {
             ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
         if (topology.isPassthrough()) {
             List<Vertex> sources = upstream.apply(rootAlias);
-            Vertex passthrough = dag.newVertex(nodeId, gathering(frontier, rootAlias, sources.size()));
+            Vertex passthrough =
+                    dag.newVertex(nodeId, gathering(nodeId, frontier, rootAlias, sources.size()));
             int ordinal = 0;
             for (Vertex source : sources) {
-                dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(passthrough, ordinal++));
+                gather(dag, source, passthrough, ordinal++, nextOutbound);
             }
             return passthrough;
         }
@@ -130,13 +131,14 @@ public final class NestDag {
                 : gatheredInto(dag, vertex, lookup.referrerAlias(), referrers, nextOutbound, frontier);
         draw(dag, referrer, vertex, LookupProcessor.REGISTRATIONS,
                 fieldKey(lookup.referenceFields()), nextOutbound);
-        if (lookup.referrerTracksKeyChanges()) {
-            // The same rows a second time, keyed by what they pointed at before, so a row that now names
-            // something else lands where the entry recording the old one is held. Only drawn where those
-            // rows carry what they replace - without that there is nothing to key this copy by.
-            draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
-                    leavingKey(lookup.referenceFields()), nextOutbound);
-        }
+        // The same rows a second time, keyed by what they pointed at before, so a row that now names
+        // something else lands where the entry recording the old one is held. Drawn for every referenced
+        // embed rather than only where structural key changes are followed: that switch is about a
+        // different key entirely - a tree that never re-parents anything still re-points - and hanging
+        // this on it threw away an earlier row the source had already sent. A row carrying none is keyed
+        // by what it carries, which lands it beside its twin, and is refused there rather than passed over.
+        draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
+                leavingKey(lookup.referenceFields()), nextOutbound);
 
         Vertex pointing = built.get(lookup.referrerPathId());
         if (pointing == null) {
@@ -160,11 +162,11 @@ public final class NestDag {
     /** One passthrough gathering several producers of an alias, so the vertex below sees a single edge. */
     private static Vertex gatheredInto(DAG dag, Vertex destination, String alias, List<Vertex> sources,
             ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
-        Vertex merge = dag.newVertex(destination.getName() + ":" + alias,
-                gathering(frontier, alias, sources.size()));
+        String name = destination.getName() + ":" + alias;
+        Vertex merge = dag.newVertex(name, gathering(name, frontier, alias, sources.size()));
         int ordinal = 0;
         for (Vertex source : sources) {
-            dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(merge, ordinal++));
+            gather(dag, source, merge, ordinal++, nextOutbound);
         }
         return merge;
     }
@@ -237,11 +239,11 @@ public final class NestDag {
      */
     private static Vertex merged(DAG dag, Vertex destination, NestInbound edge, List<Vertex> sources,
             ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
-        Vertex merge = dag.newVertex(destination.getName() + ":" + edge.alias(),
-                gathering(frontier, edge.alias(), sources.size()));
+        String name = destination.getName() + ":" + edge.alias();
+        Vertex merge = dag.newVertex(name, gathering(name, frontier, edge.alias(), sources.size()));
         int ordinal = 0;
         for (Vertex source : sources) {
-            dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(merge, ordinal++));
+            gather(dag, source, merge, ordinal++, nextOutbound);
         }
         return merge;
     }
@@ -255,9 +257,10 @@ public final class NestDag {
      * drawn from one reading and its frontier from another; the edges would then be told about chains
      * that arrive elsewhere, so it tears down rather than compiling a promise nobody can keep.
      */
-    private static ProcessorMetaSupplier gathering(NestFrontier frontier, String alias, int producers) {
+    private static ProcessorMetaSupplier gathering(String vertexName, NestFrontier frontier, String alias,
+            int producers) {
         if (frontier == null) {
-            return PassthroughProcessor.metaSupplier();
+            return PassthroughProcessor.metaSupplier(vertexName);
         }
         List<List<String>> chains = frontier.chainsOfAliasByProducer().apply(alias);
         if (chains.size() != producers) {
@@ -268,7 +271,24 @@ public final class NestDag {
         for (int ordinal = 0; ordinal < chains.size(); ordinal++) {
             byOrdinal.put(ordinal, chains.get(ordinal));
         }
-        return PassthroughProcessor.metaSupplier(frontier.axes(), byOrdinal);
+        return PassthroughProcessor.metaSupplier(vertexName, frontier.axes(), byOrdinal);
+    }
+
+    /**
+     * Draws one edge into a gathering vertex, routed to the single processor that vertex runs.
+     *
+     * <p>A gathering is pinned to total parallelism one - it exists so the level below it sees one edge
+     * per stream, and a second lane would put that stream back into several. The pin places the one
+     * processor on the member owning the vertex's name and leaves every other member running a stand-in
+     * that refuses input, so an edge handing items to whatever is local delivers everything produced
+     * elsewhere to that stand-in and the job dies on the first such event. Unlike the edges into an
+     * assembly vertex, which are partitioned by the key that decides where the state sits, there is no
+     * key to spread by here: one processor is the point.
+     */
+    private static void gather(DAG dag, Vertex source, Vertex destination, int ordinal,
+            ToIntFunction<Vertex> nextOutbound) {
+        dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(destination, ordinal)
+                .distributed().allToOne(destination.getName()));
     }
 
     private static void draw(DAG dag, Vertex source, Vertex destination, int ordinal,

@@ -132,7 +132,7 @@ class GatheringPassesOnEveryChainsBoundTest {
                 senders("from-left", new Bound(AXES.axisOf(LEFT_ONLY), 100))).localParallelism(1);
         Vertex right = dag.newVertex("right",
                 senders("from-right", new Bound(AXES.axisOf(RIGHT_ONLY), 200))).localParallelism(1);
-        Vertex gathering = dag.newVertex("gathering", PassthroughProcessor.metaSupplier(
+        Vertex gathering = dag.newVertex("gathering", PassthroughProcessor.metaSupplier("gathering",
                 AXES, Map.of(0, List.of(LEFT_ONLY), 1, List.of(RIGHT_ONLY))));
         Vertex collector = dag.newVertex("collector",
                 ProcessorSupplier.of((SupplierEx<Processor>) Collector::new)).localParallelism(1);
@@ -150,7 +150,7 @@ class GatheringPassesOnEveryChainsBoundTest {
                 senders("from-left", new Bound(AXES.axisOf(BOTH), 50))).localParallelism(1);
         Vertex right = dag.newVertex("right",
                 senders("from-right", new Bound(AXES.axisOf(BOTH), 70))).localParallelism(1);
-        Vertex gathering = dag.newVertex("gathering", PassthroughProcessor.metaSupplier(
+        Vertex gathering = dag.newVertex("gathering", PassthroughProcessor.metaSupplier("gathering",
                 AXES, Map.of(0, List.of(BOTH), 1, List.of(BOTH))));
         Vertex collector = dag.newVertex("collector",
                 ProcessorSupplier.of((SupplierEx<Processor>) Collector::new)).localParallelism(1);

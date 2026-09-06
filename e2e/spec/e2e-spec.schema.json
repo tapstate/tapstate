@@ -107,6 +107,14 @@
                 "type": "integer",
                 "description": "How many generated rows to lay down: ids 1..N, each with seq equal to its id.",
                 "minimum": 0
+              },
+              "before_image": {
+                "type": "string",
+                "description": "Whether this table's source sends the row an update replaces. Absent means 'full', which is what a seeded table is arranged for; 'none' asks the driver to put it back to what a change stream does on its own.",
+                "enum": [
+                  "full",
+                  "none"
+                ]
               }
             }
           },
@@ -141,6 +149,14 @@
                     "description": "An integer or a string; wider value types are a widening of the vocabulary."
                   }
                 }
+              },
+              "before_image": {
+                "type": "string",
+                "description": "Whether this table's source sends the row an update replaces. Absent means 'full', which is what a seeded table is arranged for; 'none' asks the driver to put it back to what a change stream does on its own.",
+                "enum": [
+                  "full",
+                  "none"
+                ]
               }
             }
           }

@@ -113,7 +113,7 @@ class LevelPassesOnEveryChainsBoundTest {
                 new Bound(AXES.axisOf(LEFT_ONLY), 100), new Bound(AXES.axisOf(BOTH), 50)));
         Vertex right = dag.newVertex("right", senders(
                 new Bound(AXES.axisOf(RIGHT_ONLY), 200), new Bound(AXES.axisOf(BOTH), 70)));
-        Vertex level = dag.newVertex("level", TransformProcessor.metaSupplier(
+        Vertex level = dag.newVertex("level", TransformProcessor.metaSupplier("level",
                 () -> (TransformPort) List::of, AXES,
                 Map.of(0, List.of(LEFT_ONLY, BOTH), 1, List.of(RIGHT_ONLY, BOTH))));
         Vertex collector = dag.newVertex("collector",
