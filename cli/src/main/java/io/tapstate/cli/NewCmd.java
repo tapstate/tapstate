@@ -47,8 +47,9 @@ import java.util.concurrent.Callable;
  * stdout, and {@code -o json|yaml} reports a structured result envelope.
  *
  * <p>Bare {@code new} at a terminal, and {@code new <recipe>}, are the guided first run instead
- * ({@code docs/first-run/README.md}): which server, then which outcome. {@link GuidedNew} carries
- * that flow; this class only decides which of the two entries a given invocation is.
+ * ({@code docs/first-run/README.md}): which server, then which outcome, then the recipe's own
+ * questions and its files. {@link GuidedNew} carries the two questions and {@link RecipeRun} the
+ * recipe; this class only decides which of the two entries a given invocation is, and reports.
  */
 @Command(name = "new", mixinStandardHelpOptions = true,
         description = "Scaffold a new artifact (source, pipeline, transform, view or serve) as a canonical *.tap.yml.")
@@ -114,6 +115,14 @@ final class NewCmd implements Callable<Integer> {
             description = "Target source id to sync the pipeline output to (pipeline kind; repeatable).")
     List<String> syncTo = new ArrayList<>();
 
+    @Option(names = "--table", paramLabel = "NAME",
+            description = "The table to mirror (mirrored-table recipe).")
+    String table;
+
+    @Option(names = "--view", paramLabel = "ID",
+            description = "Id of the view the recipe writes (default: the table name).")
+    String view;
+
     @Option(names = "--out", paramLabel = "DIR",
             description = "Write the artifact flat into this exact directory, bypassing the workspace layout.")
     String out;
@@ -151,6 +160,11 @@ final class NewCmd implements Callable<Integer> {
         }
         if (server != null) {
             err.println("new: --server is only valid for the guided first run (bare new, or new <recipe>)");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        if (table != null || view != null) {
+            err.println("new: --table/--view are only valid for the guided first run (new <recipe>)");
             err.flush();
             return EXIT_USAGE;
         }
@@ -230,15 +244,25 @@ final class NewCmd implements Callable<Integer> {
         return !nonInteractive && (prompter != null || System.console() != null);
     }
 
+    /**
+     * A recipe takes {@code --connector}, {@code --set} and {@code --force} in their ordinary meanings;
+     * the flags that shape a single artifact by kind have no reading here and are refused.
+     */
     private int callGuided(PrintWriter err) {
-        if (kind != null || hasScaffoldingFlags()) {
-            err.println("new: a recipe cannot be combined with --kind/--type/--connector/--id/--mode/--set"
-                    + "/--source/--sync-to/--out/--force/--dry-run");
+        if (kind != null || type != null || id != null || mode != null || !sources.isEmpty() || !syncTo.isEmpty()
+                || out != null || dryRun) {
+            err.println("new: a recipe cannot be combined with --kind/--type/--id/--mode"
+                    + "/--source/--sync-to/--out/--dry-run");
             err.flush();
             return EXIT_USAGE;
         }
         if (recipe != null && Recipe.byId(recipe).isEmpty()) {
             err.println("new: unknown recipe '" + recipe + "'; run 'new --list' to see the catalog");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        if (recipe != null && !RecipeRun.available(recipe)) {
+            err.println("new: " + RecipeRun.notAvailable(recipe).getMessage());
             err.flush();
             return EXIT_USAGE;
         }
@@ -258,12 +282,18 @@ final class NewCmd implements Callable<Integer> {
                 : new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home"))));
         // an injected probe belongs to whoever injected it; only the one opened here is closed here
         ControlPlaneClient probe = controlPlane != null ? controlPlane : new HttpControlPlaneClient();
+        RecipeRun.Flags flags = new RecipeRun.Flags(connector, config, table, view);
         try {
-            String selected = guidedInteractive()
-                    ? runGuided(contexts, probe, prose, serverUrl)
-                    : new GuidedNew(contexts, probe, null, prose).run(workspace.root(), recipe, serverUrl);
-            emitSelected(selected);
+            RecipeRun.Result result = guidedInteractive()
+                    ? runGuided(contexts, probe, prose, serverUrl, flags)
+                    : runRecipe(new GuidedNew(contexts, probe, null, prose).run(workspace.root(), recipe, serverUrl),
+                            null, flags);
+            emitResult(result);
             return 0;
+        } catch (RecipeRun.Usage e) {
+            err.println("new: " + e.getMessage());
+            err.flush();
+            return EXIT_USAGE;
         } catch (TapstateException e) {
             return emitDiagnostic(e);
         } catch (IOException e) {
@@ -277,28 +307,66 @@ final class NewCmd implements Callable<Integer> {
         }
     }
 
-    private String runGuided(ContextManager contexts, ControlPlaneClient probe, PrintWriter prose, URI serverUrl)
-            throws IOException {
+    private RecipeRun.Result runGuided(ContextManager contexts, ControlPlaneClient probe, PrintWriter prose,
+                                       URI serverUrl, RecipeRun.Flags flags) throws IOException {
         if (prompter != null) {
-            return new GuidedNew(contexts, probe, prompter, prose).run(workspace.root(), recipe, serverUrl);
+            String chosen = new GuidedNew(contexts, probe, prompter, prose).run(workspace.root(), recipe, serverUrl);
+            return runRecipe(chosen, prompter, flags);
         }
         try (JLinePrompter jline = JLinePrompter.system()) {
-            return new GuidedNew(contexts, probe, jline, prose).run(workspace.root(), recipe, serverUrl);
+            String chosen = new GuidedNew(contexts, probe, jline, prose).run(workspace.root(), recipe, serverUrl);
+            return runRecipe(chosen, jline, flags);
         }
     }
 
-    /** The chosen recipe, and nothing else yet: the recipe's own questions and its files come later. */
-    private void emitSelected(String recipeId) {
+    /** The chosen recipe, run; one the picker landed on that is not available yet is refused by name. */
+    private RecipeRun.Result runRecipe(String chosen, Prompter asker, RecipeRun.Flags flags) {
+        if (!RecipeRun.available(chosen)) {
+            throw RecipeRun.notAvailable(chosen);
+        }
+        return RecipeRun.run(chosen, workspace.root(), asker, flags, force);
+    }
+
+    /**
+     * What {@code new} says once the recipe has written: one line per file, in write order, then where
+     * the workspace is. A file that was already there and was replaced under {@code --force} says so;
+     * a file the recipe extended rather than owned reads as updated. The machine forms carry the files
+     * and their roles and none of the prose.
+     */
+    private void emitResult(RecipeRun.Result result) {
         PrintWriter o = CliIo.out(spec);
-        Map<String, Object> env = new LinkedHashMap<>();
-        env.put("status", "selected");
-        env.put("recipe", recipeId);
         switch (output) {
-            case JSON -> o.println(JsonOut.write(env));
-            case YAML -> o.println(YamlOut.write(env));
-            default -> o.println("selected " + recipeId);
+            case JSON -> o.println(JsonOut.write(resultEnvelope(result)));
+            case YAML -> o.println(YamlOut.write(resultEnvelope(result)));
+            default -> {
+                for (RecipeRun.Created file : result.files()) {
+                    String verb = !file.replaced() ? "created"
+                            : "env".equals(file.kind()) || "gitignore".equals(file.kind()) ? "updated" : "replaced";
+                    o.println(verb + " " + file.path() + (file.note() == null ? "" : "  (" + file.note() + ")"));
+                }
+                o.println("workspace: " + result.root());
+            }
         }
         o.flush();
+    }
+
+    private static Map<String, Object> resultEnvelope(RecipeRun.Result result) {
+        Map<String, Object> env = new LinkedHashMap<>();
+        env.put("status", "created");
+        env.put("recipe", result.recipe());
+        env.put("workspace", result.root().toString());
+        List<Map<String, Object>> files = new ArrayList<>();
+        for (RecipeRun.Created file : result.files()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("path", file.path().toString());
+            entry.put("kind", file.kind());
+            if (file.replaced()) {
+                entry.put("replaced", true);
+            }
+            files.add(entry);
+        }
+        env.put("files", files);
+        return env;
     }
 
     private int callSource(PrintWriter err) {

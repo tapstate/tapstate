@@ -8,9 +8,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.URI;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -40,50 +38,6 @@ class NewGuidedTest {
         }
     }
 
-    /**
-     * A control plane that answers the health probe with a fixed verdict and remembers what was probed.
-     * Every other call fails the test: the guided flow has no business talking to the server beyond the
-     * probe in this slice.
-     */
-    private static final class FakeControlPlane implements ControlPlaneClient {
-        private final boolean healthy;
-        final List<URI> probed = new ArrayList<>();
-
-        FakeControlPlane(boolean healthy) {
-            this.healthy = healthy;
-        }
-
-        @Override
-        public boolean isHealthy(URI baseUrl) {
-            probed.add(baseUrl);
-            return healthy;
-        }
-
-        @Override public String serverVersion(URI baseUrl) { throw new AssertionError(); }
-        @Override public LoginOutcome login(URI baseUrl, String username, String password) { throw new AssertionError(); }
-        @Override public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) { throw new AssertionError(); }
-        @Override public GetOutcome get(URI baseUrl, String credential, String id) { throw new AssertionError(); }
-        @Override public DeleteOutcome delete(URI baseUrl, String credential, String id, String hash) { throw new AssertionError(); }
-        @Override public ListOutcome list(URI baseUrl, String credential, String kind) { throw new AssertionError(); }
-        @Override public ConnectionTestOutcome test(URI u, String c, String id, String connector, Map<String, Object> s) { throw new AssertionError(); }
-        @Override public ConnectionTestResultOutcome testResult(URI u, String c, String id) { throw new AssertionError(); }
-        @Override public ConnectionDiscoverSchemaOutcome discoverSchema(URI u, String c, String id, String connector, Map<String, Object> s) { throw new AssertionError(); }
-        @Override public ConnectionSchemaOutcome schema(URI u, String c, String id) { throw new AssertionError(); }
-        @Override public ConnectorRegisterOutcome register(URI u, String c, byte[] a) { throw new AssertionError(); }
-        @Override public ConnectorListOutcome connectorList(URI u, String c) { throw new AssertionError(); }
-        @Override public DataBrowserOutcome.Collections collections(URI u, String c, String id) { throw new AssertionError(); }
-        @Override public DataBrowserOutcome.Stats stats(URI u, String c, String id, String collection) { throw new AssertionError(); }
-        @Override public DataBrowserOutcome.Find find(URI u, String c, String id, String collection, Object f, DataBrowserCall.Order o, Integer l) { throw new AssertionError(); }
-        @Override public LifecycleOutcome lifecycle(URI u, String c, String id, String v) { throw new AssertionError(); }
-        @Override public StatusOutcome status(URI u, String c, String id) { throw new AssertionError(); }
-        @Override public MetricsOutcome metrics(URI u, String c, String id) { throw new AssertionError(); }
-        @Override public SnapshotOutcome snapshot(URI u, String c, String id) { throw new AssertionError(); }
-        @Override public LogsOutcome logs(URI u, String c, String id) { throw new AssertionError(); }
-        @Override public String watchStatus(URI u, String c, String id, StatusStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
-        @Override public String followLogs(URI u, String c, String id, LogStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
-        @Override public String tail(URI u, String c, String id, String collection, Object f, TailStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
-    }
-
     private static Run run(Path home, Prompter prompter, ControlPlaneClient controlPlane, String... args) {
         CommandLine cl = Cli.newCommandLine();
         NewCmd cmd = cl.getSubcommands().get("new").getCommand();
@@ -105,8 +59,8 @@ class NewGuidedTest {
     @Test
     void bareNewAsksTheServerThenTheRecipeAndBindsTheWorkspace(@TempDir Path home, @TempDir Path ws) {
         // an empty reply to the server question takes the default; the second scripted answer is the recipe
-        ScriptedPrompter prompter = new ScriptedPrompter("", "Mirror one table, as it changes");
-        FakeControlPlane controlPlane = new FakeControlPlane(true);
+        ScriptedPrompter prompter = new ScriptedPrompter("", "Nothing generated - I will write it myself");
+        FakeHealthProbe controlPlane = new FakeHealthProbe(true);
 
         Run r = run(home, prompter, controlPlane, "new", "-w", ws.toString());
 
@@ -114,7 +68,7 @@ class NewGuidedTest {
         assertThat(r.err()).isEmpty();
         // the opening line says what is being built, before any question
         assertThat(r.out()).startsWith("Building a workspace: a directory of .tap.yml files you can read and edit.");
-        assertThat(r.out()).endsWith("selected mirrored-table\n");
+        assertThat(r.out()).endsWith("workspace: " + ws + "\n");
         // the server question was asked, the default was probed, and only then was anything registered
         assertThat(prompter.asked).hasSize(1);
         assertThat(prompter.asked.get(0)).containsIgnoringCase("server");
@@ -131,13 +85,13 @@ class NewGuidedTest {
         ContextManager manager = manager(home);
         manager.create("local", List.of(DEFAULT_SERVER), true);
         manager.bind(ws, "local");
-        ScriptedPrompter prompter = new ScriptedPrompter("Mirror one table, as it changes");
-        FakeControlPlane controlPlane = new FakeControlPlane(true);
+        ScriptedPrompter prompter = new ScriptedPrompter("Nothing generated - I will write it myself");
+        FakeHealthProbe controlPlane = new FakeHealthProbe(true);
 
         Run r = run(home, prompter, controlPlane, "new", "-w", ws.toString());
 
         assertThat(r.code()).isZero();
-        assertThat(r.out()).endsWith("selected mirrored-table\n");
+        assertThat(r.out()).endsWith("workspace: " + ws + "\n");
         assertThat(prompter.asked).isEmpty();
         assertThat(controlPlane.probed).isEmpty();
         assertThat(prompter.offered).containsExactly(TITLES);
@@ -145,9 +99,9 @@ class NewGuidedTest {
 
     @Test
     void nothingListeningStopsWithConnectFailedAndWritesNoBinding(@TempDir Path home, @TempDir Path ws) {
-        ScriptedPrompter prompter = new ScriptedPrompter("", "Mirror one table, as it changes");
+        ScriptedPrompter prompter = new ScriptedPrompter("", "Nothing generated - I will write it myself");
 
-        Run r = run(home, prompter, new FakeControlPlane(false), "new", "-w", ws.toString());
+        Run r = run(home, prompter, new FakeHealthProbe(false), "new", "-w", ws.toString());
 
         assertThat(r.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
         assertThat(r.err()).contains("cli.connect-failed");
@@ -159,9 +113,9 @@ class NewGuidedTest {
 
     @Test
     void nothingListeningReportsConnectFailedInTheJsonEnvelope(@TempDir Path home, @TempDir Path ws) {
-        ScriptedPrompter prompter = new ScriptedPrompter("", "Mirror one table, as it changes");
+        ScriptedPrompter prompter = new ScriptedPrompter("", "Nothing generated - I will write it myself");
 
-        Run r = run(home, prompter, new FakeControlPlane(false), "new", "-w", ws.toString(), "-o", "json");
+        Run r = run(home, prompter, new FakeHealthProbe(false), "new", "-w", ws.toString(), "-o", "json");
 
         assertThat(r.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
         assertThat(r.out()).contains("\"status\": \"error\"").contains("cli.connect-failed");
@@ -173,13 +127,13 @@ class NewGuidedTest {
     void yesWithARecipeIdNeverPromptsAndBindsToTheDefaultServer(@TempDir Path home, @TempDir Path ws) {
         // a prompter is injected on purpose: --yes must win over it, so a recorded question is a failure
         ScriptedPrompter prompter = new ScriptedPrompter();
-        FakeControlPlane controlPlane = new FakeControlPlane(true);
+        FakeHealthProbe controlPlane = new FakeHealthProbe(true);
 
-        Run r = run(home, prompter, controlPlane, "new", "mirrored-table", "--yes", "-w", ws.toString());
+        Run r = run(home, prompter, controlPlane, "new", "blank", "--yes", "-w", ws.toString());
 
         assertThat(r.code()).isZero();
         assertThat(r.err()).isEmpty();
-        assertThat(r.out()).isEqualTo("selected mirrored-table\n");
+        assertThat(r.out()).isEqualTo("workspace: " + ws + "\n");
         assertThat(prompter.asked).isEmpty();
         assertThat(prompter.offered).isEmpty();
         assertThat(prompter.secretQuestions).isEmpty();
@@ -189,8 +143,8 @@ class NewGuidedTest {
 
     @Test
     void yesWithNothingListeningStopsWithConnectFailedAndStartsNothing(@TempDir Path home, @TempDir Path ws) {
-        Run r = run(home, new ScriptedPrompter(), new FakeControlPlane(false),
-                "new", "mirrored-table", "--yes", "-w", ws.toString());
+        Run r = run(home, new ScriptedPrompter(), new FakeHealthProbe(false),
+                "new", "blank", "--yes", "-w", ws.toString());
 
         assertThat(r.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
         assertThat(r.err()).contains("cli.connect-failed");
@@ -200,13 +154,13 @@ class NewGuidedTest {
 
     @Test
     void serverFlagProbesThatUrlAndBindsUnderTheHostName(@TempDir Path home, @TempDir Path ws) {
-        FakeControlPlane controlPlane = new FakeControlPlane(true);
+        FakeHealthProbe controlPlane = new FakeHealthProbe(true);
 
         Run r = run(home, new ScriptedPrompter(), controlPlane,
-                "new", "mirrored-table", "--yes", "--server", "http://example:9999", "-w", ws.toString());
+                "new", "blank", "--yes", "--server", "http://example:9999", "-w", ws.toString());
 
         assertThat(r.code()).isZero();
-        assertThat(r.out()).isEqualTo("selected mirrored-table\n");
+        assertThat(r.out()).isEqualTo("workspace: " + ws + "\n");
         assertThat(controlPlane.probed).containsExactly(URI.create("http://example:9999"));
         assertThat(manager(home).suggestions()).extracting(ContextManager.ContextChoice::name).containsExactly("example");
         assertThat(manager(home).suggestions().get(0).definition().seeds())
@@ -217,12 +171,12 @@ class NewGuidedTest {
     @Test
     void aRecipeIdWithoutYesAsksOnlyTheServerQuestion(@TempDir Path home, @TempDir Path ws) {
         ScriptedPrompter prompter = new ScriptedPrompter("");
-        FakeControlPlane controlPlane = new FakeControlPlane(true);
+        FakeHealthProbe controlPlane = new FakeHealthProbe(true);
 
-        Run r = run(home, prompter, controlPlane, "new", "mirrored-table", "-w", ws.toString());
+        Run r = run(home, prompter, controlPlane, "new", "blank", "-w", ws.toString());
 
         assertThat(r.code()).isZero();
-        assertThat(r.out()).endsWith("selected mirrored-table\n");
+        assertThat(r.out()).endsWith("workspace: " + ws + "\n");
         assertThat(prompter.asked).hasSize(1);
         // the recipe is already answered by the positional, so the picker is not shown
         assertThat(prompter.offered).isEmpty();
@@ -231,7 +185,7 @@ class NewGuidedTest {
 
     @Test
     void anUnknownRecipeIdIsAUsageErrorPointingAtList(@TempDir Path home, @TempDir Path ws) {
-        FakeControlPlane controlPlane = new FakeControlPlane(true);
+        FakeHealthProbe controlPlane = new FakeHealthProbe(true);
 
         Run r = run(home, new ScriptedPrompter(), controlPlane, "new", "nope", "--yes", "-w", ws.toString());
 
@@ -248,8 +202,8 @@ class NewGuidedTest {
         ContextManager manager = manager(home);
         manager.create("local", List.of(DEFAULT_SERVER), true);
 
-        Run r = run(home, new ScriptedPrompter(), new FakeControlPlane(true),
-                "new", "mirrored-table", "--yes", "-w", ws.toString());
+        Run r = run(home, new ScriptedPrompter(), new FakeHealthProbe(true),
+                "new", "blank", "--yes", "-w", ws.toString());
 
         assertThat(r.code()).isZero();
         assertThat(manager(home).suggestions()).extracting(ContextManager.ContextChoice::name).containsExactly("local");

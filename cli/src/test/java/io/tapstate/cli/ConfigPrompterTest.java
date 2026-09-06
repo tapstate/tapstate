@@ -102,4 +102,42 @@ class ConfigPrompterTest {
         assertThat(cfg).containsEntry("password", "s3cr3t");
         assertThat(p.secretQuestions).hasSize(1);
     }
+
+    /**
+     * The essentials-only walk the guided first run takes. The host sits behind an optional deployment
+     * mode that is never asked, so its gate is judged by that field's default; the required port takes
+     * its default on an empty reply; the optional field is neither asked nor written; the secret is
+     * asked masked. A flag answer wins over the prompt, and the walk with no prompter at all lands on
+     * the same map - which is what lets the scripted form and the interactive one agree byte for byte.
+     */
+    @Test
+    void essentialWalkAsksRequiredAndSecretFieldsOnlyAndReadsGatesByDefault() {
+        ConfigField mode = new ConfigField("deploymentMode", ConfigType.STRING, Map.of("en_US", "mode"), false,
+                "standalone", false, List.of(opt("standalone"), opt("cluster")), null);
+        ConfigField host = new ConfigField("host", ConfigType.STRING, Map.of("en_US", "host"), true, null, false,
+                List.of(), new VisibleWhen("deploymentMode", List.of("standalone")));
+        ConfigField port = new ConfigField("port", ConfigType.NUMBER, Map.of("en_US", "port"), true, "3306", false,
+                List.of(), null);
+        ConfigField extra = new ConfigField("charset", ConfigType.STRING, Map.of("en_US", "charset"), false, "utf8",
+                false, List.of(), null);
+        ConfigField secret = new ConfigField("password", ConfigType.STRING, Map.of("en_US", "password"), false, null,
+                true, List.of(), null);
+        List<ConfigField> fields = List.of(mode, host, port, extra, secret);
+
+        ScriptedPrompter asked = new ScriptedPrompter("db", "", "s");
+        Map<String, Object> interactive = new ConfigPrompter().collectEssential(fields, Map.of(), asked);
+
+        assertThat(interactive).containsExactly(
+                Map.entry("host", "db"), Map.entry("port", 3306), Map.entry("password", "s"));
+        assertThat(asked.asked).containsExactly("host", "port");
+        assertThat(asked.secretQuestions).containsExactly("password");
+        assertThat(asked.offered).as("the optional mode is never offered").isEmpty();
+
+        Map<String, String> given = Map.of("host", "db", "password", "s");
+        assertThat(new ConfigPrompter().collectEssential(fields, given, null)).isEqualTo(interactive);
+        ScriptedPrompter notAsked = new ScriptedPrompter();
+        assertThat(new ConfigPrompter().collectEssential(fields, given, notAsked)).isEqualTo(interactive);
+        assertThat(notAsked.asked).as("a flag answer is not asked again; only the port's default is taken")
+                .containsExactly("port");
+    }
 }
