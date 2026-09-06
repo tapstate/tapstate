@@ -156,7 +156,22 @@ can rely on it:
 - connection fields are written as the canonical writer renders the connector's catalog types (a
   `string`-typed port comes out as `port: "3306"`); the demo files are hand-written and differ in
   such spacing, which is fine — they are copied, never generated;
-- a choice list's default is its first entry (for the recipe question, `sample`).
+- a choice list's default is its first entry (for the recipe question, `sample`);
+- `reshaped-table`: "columns to keep" is written as identity renames (`region: $region`) — a `map`
+  step lets unlisted fields through, so keeping fixes the order but does not trim; "drop" is an
+  explicit drop (`internal_note: false`); a rename wins over a keep of the same column. The step ids
+  are `reshape` (map) and `keep` (filter); with nothing to reshape the recipe writes exactly what
+  `mirrored-table` writes;
+- `nested-json`: one `nest` step `assemble`; a child that shares the root's database is a second
+  table on the **same** source, a child elsewhere gets its own `<child>_src`; each embed's
+  `arrayKey` is assumed `[id]` (the summary line says so); the view id defaults to `<root>_state`.
+  The flag form (`--child …`, `--child-connector`, `--child-set`) names at most one other database —
+  mixed placement is interactive only;
+- `consolidated-table`: sources are `<table>_1_src`, `<table>_2_src`, …; the `union` step
+  `consolidate` addresses them as `<source_id>.<table>`, because a bare table name held by two
+  sources is ambiguous to the reference closure; the view id defaults to `<table>_all`. The
+  interactive form asks for two databases before offering "another?"; the flag form is `--db
+  <connector>[,key=value…]`, repeated.
 
 **Answer semantics, the same in every question:**
 
