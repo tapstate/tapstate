@@ -272,6 +272,56 @@ class PdkTypeMappingTest {
         assertThat(PdkTypeMapping.of(column.getTapType())).isNotEqualTo(TapstateType.UNKNOWN);
     }
 
+    /**
+     * The column shapes behind the driver types a connector registers a value conversion for, each
+     * declaration verbatim from that connector's own spec.
+     *
+     * <p>These are the columns whose values do not arrive as ordinary Java boxes, so a reader that has
+     * to know what it is holding has only the resolved type to go on. A column that resolves to nothing
+     * is not merely undescribed: the fill answers with the framework's raw fallback, which maps onto
+     * unknown, and a downstream comparison of two sides that both read unknown agrees for the wrong
+     * reason. Asserting "not unknown" is therefore the claim that matters, and the named type is
+     * asserted alongside it so a wrong-but-known answer does not pass either.
+     *
+     * <p>The seventh, the 128-bit decimal, has a case of its own above: its declared bounds are what
+     * broke the resolution, so it is weighed rather than tabulated.
+     */
+    static Stream<Arguments> driverNativeColumnShapes() {
+        return Stream.of(
+                arguments("OBJECT_ID", """
+                        {"dataTypes": {"OBJECT_ID": {"to": "TapString", "byte": "24", "queryOnly": true}}}""",
+                        TapstateType.STRING),
+                arguments("BINARY", """
+                        {"dataTypes": {"BINARY": {"to": "TapBinary", "byte": "16m"}}}""",
+                        TapstateType.BINARY),
+                arguments("JAVASCRIPT", """
+                        {"dataTypes": {"JAVASCRIPT": {"to": "TapString", "byte": "16m", "queryOnly": true}}}""",
+                        TapstateType.STRING),
+                arguments("SYMBOL", """
+                        {"dataTypes": {"SYMBOL": {"to": "TapString", "byte": "16m", "queryOnly": true}}}""",
+                        TapstateType.STRING),
+                arguments("TIMESTAMP", """
+                        {"dataTypes": {"TIMESTAMP": {"to": "TapDateTime",\
+                         "range": ["1970-01-01 00:00:00", "2038-01-19 03:14:07"], "pattern": "yyyy-MM-dd HH:mm:ss",\
+                         "fraction": [0, 3], "defaultFraction": 3, "withTimeZone": true, "queryOnly": true}}}""",
+                        TapstateType.DATETIME),
+                arguments("REGULAR_EXPRESSION", """
+                        {"dataTypes": {"REGULAR_EXPRESSION": {"to": "TapString", "queryOnly": true}}}""",
+                        TapstateType.STRING));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("driverNativeColumnShapes")
+    void aColumnWhoseValuesTakeTheConnectorsOwnLaneStillResolvesToANamedType(
+            String dataType, String spec, TapstateType expected) {
+        TapField column = filled(spec, "value", dataType);
+
+        assertThat(PdkTypeMapping.of(column.getTapType()))
+                .as("a column carrying a driver's own type must not be the one nothing can name")
+                .isNotEqualTo(TapstateType.UNKNOWN)
+                .isEqualTo(expected);
+    }
+
     /** Discovers one column of the given database type through a connector declaring {@code spec}. */
     private TapField filled(String spec, String column, String dataType) {
         ConnectorRef ref = new ConnectorRef(
