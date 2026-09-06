@@ -81,6 +81,21 @@ enum CliError implements TapstateErrorCode {
      */
     DOCKER_UNAVAILABLE("cli.docker-unavailable", Set.of(Names.REASON)),
 
+    /**
+     * {@code up} was asked to bring up a workspace that names no server, with nobody to ask which one;
+     * {@code server} is the default it declined to assume. Refused rather than defaulted: adopting the
+     * loopback address would bind a script to whatever happens to be listening on that machine, which
+     * is a different server on every machine the script runs on.
+     */
+    SERVER_NOT_NAMED("cli.server-not-named", Set.of("server")),
+
+    /**
+     * Signing in to {@code server} needs a password that was neither asked for nor supplied;
+     * {@code variable} names the environment variable a script puts it in. Its own code rather than a
+     * login refusal: nothing was sent, so the credential was never wrong - it was never given.
+     */
+    PASSWORD_REQUIRED("cli.password-required", Set.of("server", "variable")),
+
     /** A connector id supplied to the wizard that is not in the bundled catalog. */
     UNKNOWN_CONNECTOR("cli.unknown-connector", Set.of("connector")),
 

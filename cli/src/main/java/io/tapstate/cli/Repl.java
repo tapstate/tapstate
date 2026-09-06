@@ -3133,17 +3133,23 @@ final class Repl {
             binding.bind(workspace, named, options.startLocal(), options.user());
             return Cli.EXIT_OK;
         } catch (io.tapstate.core.common.TapstateException refused) {
-            Diagnostics.printText(commandLine.getErr(), refused.code(), refused.args(), session.versions());
-            return Cli.EXIT_DIAGNOSTIC;
-        } catch (RecipeRun.Usage missing) {
-            commandLine.getErr().println("up: " + missing.getMessage());
-            commandLine.getErr().flush();
-            return Cli.EXIT_USAGE;
+            // Reported as preflight: binding is what "the server is reachable" means before there is a
+            // server to reach, and the run has five stages by contract - this is not a sixth.
+            return reportBindFailure(options.format(), workspace, refused.code(), refused.args());
         } catch (java.io.IOException unreadable) {
-            commandLine.getErr().println("up: cannot bind the workspace: " + unreadable.getMessage());
-            commandLine.getErr().flush();
-            return Cli.EXIT_DIAGNOSTIC;
+            return reportBindFailure(options.format(), workspace, CliError.WORKSPACE_UNREADABLE,
+                    Map.of("path", workspace.toString(), "reason", String.valueOf(unreadable.getMessage())));
         }
+    }
+
+    /** One binding failure, rendered in whichever form the run asked for, the way a stage failure is. */
+    private int reportBindFailure(OutputFormat format, Path workspace, TapstateErrorCode code,
+            Map<String, Object> args) {
+        MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(code, args);
+        String solution = rendered.solution();
+        List<String> remedy = present(solution) && !hasUnboundName(solution) ? List.of(solution) : List.of();
+        return reportUpFailure(format, UpCmd.STAGE_PREFLIGHT, workspace.toString(), code.code(),
+                rendered.message(), args, remedy);
     }
 
     /** Parses {@code up}'s flags; a usage line and {@code null} on anything else. It takes no operand. */
@@ -3613,35 +3619,46 @@ final class Repl {
                 String solution = MessageCatalog.bundled().render(code, params).solution();
                 remedyLines = present(solution) && !hasUnboundName(solution) ? List.of(solution) : List.of();
             }
-            boolean remedy = !remedyLines.isEmpty();
-            if (format != OutputFormat.TEXT) {
-                Map<String, Object> document = new LinkedHashMap<>();
-                document.put("code", code);
-                document.put("severity", "ERROR");
-                document.put("message", message);
-                if (remedy) {
-                    document.put("solution", String.join(" ", remedyLines));
-                }
-                if (!params.isEmpty()) {
-                    document.put("params", new TreeMap<>(params));
-                }
-                document.put("stage", stage);
-                document.put("on", on);
-                PrintWriter out = commandLine.getOut();
-                out.println(format == OutputFormat.JSON ? JsonOut.write(document) : YamlOut.write(document));
-                out.flush();
-                return Cli.EXIT_DIAGNOSTIC;
+            return reportUpFailure(format, stage, on, code, message, params, remedyLines);
+        }
+    }
+
+    /**
+     * One {@code up} failure, in whichever form the run asked for: the machine forms carry the same
+     * fields as every coded diagnostic plus the stage and the resource, and the text form names the
+     * stage first because that is what a reader searches the help for. Held outside {@code UpRun}
+     * because the stage that binds the workspace runs before there is an {@code UpRun} to report it,
+     * and a failure there owes a caller reading {@code -o json} the same envelope as any other.
+     */
+    private int reportUpFailure(OutputFormat format, String stage, String on, String code, String message,
+            Map<String, Object> params, List<String> remedyLines) {
+        if (format != OutputFormat.TEXT) {
+            Map<String, Object> document = new LinkedHashMap<>();
+            document.put("code", code);
+            document.put("severity", "ERROR");
+            document.put("message", message);
+            if (!remedyLines.isEmpty()) {
+                document.put("solution", String.join(" ", remedyLines));
             }
-            PrintWriter err = commandLine.getErr();
-            err.println(Ansi.AUTO.string("@|bold,red error:|@") + " up: " + stage + " failed on " + on
-                    + ": " + code + " — " + message);
-            for (String line : remedyLines) {
-                err.println("  " + line);
+            if (!params.isEmpty()) {
+                document.put("params", new TreeMap<>(params));
             }
-            err.println("  (" + session.versions() + ")");
-            err.flush();
+            document.put("stage", stage);
+            document.put("on", on);
+            PrintWriter out = commandLine.getOut();
+            out.println(format == OutputFormat.JSON ? JsonOut.write(document) : YamlOut.write(document));
+            out.flush();
             return Cli.EXIT_DIAGNOSTIC;
         }
+        PrintWriter err = commandLine.getErr();
+        err.println(Ansi.AUTO.string("@|bold,red error:|@") + " up: " + stage + " failed on " + on
+                + ": " + code + " — " + message);
+        for (String line : remedyLines) {
+            err.println("  " + line);
+        }
+        err.println("  (" + session.versions() + ")");
+        err.flush();
+        return Cli.EXIT_DIAGNOSTIC;
     }
 
     // ---- the calls the online verbs share --------------------------------------------------------------

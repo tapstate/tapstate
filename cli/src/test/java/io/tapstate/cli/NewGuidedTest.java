@@ -40,11 +40,10 @@ class NewGuidedTest {
         }
     }
 
-    static Run run(Path home, Prompter prompter, String... args) {
+    static Run run(Path unusedHome, Prompter prompter, String... args) {
         CommandLine cl = Cli.newCommandLine();
         NewCmd cmd = cl.getSubcommands().get("new").getCommand();
         cmd.prompter = prompter;
-        cmd.home = home;
         StringWriter out = new StringWriter();
         StringWriter err = new StringWriter();
         cl.setOut(new PrintWriter(out));

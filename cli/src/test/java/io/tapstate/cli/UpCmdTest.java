@@ -196,8 +196,58 @@ class UpCmdTest {
         Run r = up(home, client, "up", "--yes", "-w", ws.toString());
 
         assertThat(r.code()).isNotZero();
-        assertThat(r.err()).contains("not bound to a server");
+        assertThat(r.err()).contains("cli.server-not-named");
         assertThat(new ContextManager(ContextConfigStore.underHome(home)).contextBoundExactlyTo(ws)).isEmpty();
+    }
+
+    /**
+     * The wiring for the flags that came over with the server question: --server names where to bind,
+     * -u who to sign in as, and the password comes from the environment. Proven by the sign-in being
+     * attempted with that user against that server - what it answers is the binding's business, held
+     * in ServerBindingTest.
+     */
+    @Test
+    void serverAndUserOnUpsLineReachTheBinding(@TempDir Path home, @TempDir Path ws) {
+        NewRecipeTest.Run written = NewRecipeTest.run(home, new ScriptedPrompter(),
+                "new", "mirrored-table", "--yes", "--connector", "mysql",
+                "--set", "host=db", "--set", "username=u", "--set", "password=s",
+                "--table", "orders", "--view", "orders_view", "-w", ws.toString());
+        assertThat(written.code()).as(written.all()).isZero();
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        UnaryOperator<String> env = name -> "TAPSTATE_PASSWORD".equals(name) ? "from-env" : null;
+
+        Run r = up(home, client, env, "up", "--server", "http://127.0.0.1:8080", "-u", "ada",
+                "--yes", "-w", ws.toString());
+
+        assertThat(client.calls).as(r.all()).contains("login ada");
+        assertThat(r.err()).contains("cli.auth-login-rejected");
+        assertThat(new ContextManager(ContextConfigStore.underHome(home)).contextBoundExactlyTo(ws)).isEmpty();
+    }
+
+    /**
+     * A binding failure owes a caller reading -o json the same envelope as any other stage failure.
+     * It used to print a human sentence to stderr while stdout stayed empty, so a script that parses
+     * stdout saw a successful-looking silence.
+     */
+    @Test
+    void aBindingFailureIsTheDiagnosticEnvelopeWhenJsonWasAsked(@TempDir Path home, @TempDir Path ws) {
+        NewRecipeTest.Run written = NewRecipeTest.run(home, new ScriptedPrompter(),
+                "new", "mirrored-table", "--yes", "--connector", "mysql",
+                "--set", "host=db", "--set", "username=u", "--set", "password=s",
+                "--table", "orders", "--view", "orders_view", "-w", ws.toString());
+        assertThat(written.code()).as(written.all()).isZero();
+        FakeUpControlPlane client = new FakeUpControlPlane();
+
+        Run r = up(home, client, "up", "--yes", "-o", "json", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.out())
+                .contains("\"code\": \"cli.server-not-named\"")
+                .contains("\"severity\": \"ERROR\"")
+                .contains("\"stage\": \"preflight\"")
+                .contains("\"on\": \"" + ws + "\"")
+                .contains("\"solution\"");
+        assertThat(r.err()).as("the machine form carries it all; nothing is left on stderr").isEmpty();
     }
 
     // ---- .env ---------------------------------------------------------------------------------------
@@ -340,8 +390,8 @@ class UpCmdTest {
 
         Run r = up(home, client, "up", "-w", ws.toString());
 
-        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_USAGE);
-        assertThat(r.err()).contains("--server").contains("--start-local");
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).contains("cli.server-not-named").contains("preflight failed on " + ws);
         assertThat(new ContextManager(ContextConfigStore.underHome(home)).contextBoundExactlyTo(ws)).isEmpty();
         assertThat(client.calls).as("no stage ran").doesNotContain("apply[source]");
     }
@@ -553,6 +603,9 @@ class UpCmdTest {
         /** Whether the server answers its health probe; false is how an unbound run is refused. */
         boolean healthy = true;
 
+        /** What a sign-in during binding answers; refused by default, so a test says when it succeeds. */
+        LoginOutcome loginOutcome = new LoginOutcome.Rejected("control.auth-failed", "admin");
+
         @Override
         public boolean isHealthy(URI baseUrl) {
             calls.add("isHealthy");
@@ -625,6 +678,12 @@ class UpCmdTest {
         }
 
         @Override public LoginOutcome login(URI baseUrl, String username, String password) { throw new AssertionError(); }
+
+        @Override
+        public LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
+            calls.add("login " + username);
+            return loginOutcome;
+        }
         @Override public GetOutcome get(URI baseUrl, String credential, String id) { throw new AssertionError(); }
         @Override public DeleteOutcome delete(URI baseUrl, String credential, String id, String hash) { throw new AssertionError(); }
         @Override public ListOutcome list(URI baseUrl, String credential, String kind) { throw new AssertionError(); }
