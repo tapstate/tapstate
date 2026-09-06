@@ -483,9 +483,8 @@ public final class Cli implements Runnable {
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter) {
         Path home = Path.of(System.getProperty("user.home"));
-        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
-        AuthService authService = new AuthService(
-                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        ContextResolver resolver = HomeStores.resolver(home, launch::environment);
+        AuthService authService = HomeStores.auth(home, controlPlane, java.time.Clock.systemUTC());
         return runSession(launch, controlPlane, prompter, resolver, authService);
     }
 
@@ -526,7 +525,7 @@ public final class Cli implements Runnable {
             }
             Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
-                    new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
+                    HomeStores.contexts(Path.of(System.getProperty("user.home"))));
             String machineToken = launch.machineToken();
             if (machineToken != null) {
                 repl.installMachineToken(machineToken);
