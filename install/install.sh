@@ -117,13 +117,49 @@ $platform
 fetch() {
     _part="$2.part"
     _try=0
+    # Two failures this download used to have, and they are the same failure wearing different
+    # clothes: it said nothing while it worked, and it said nothing while it was dead.
+    #
+    # Silence was the whole user experience of the first step anyone takes with this product. The
+    # binary is tens of megabytes; on an ordinary connection that is a minute or more of a terminal
+    # that has printed nothing since the disclosure line, and the reader's only move is to guess
+    # whether it is working. Measured: someone waited two minutes and then asked whether it had hung.
+    # It had not.
+    #
+    # And there was no timeout of any kind, so a transfer that stalled outright hung forever and
+    # looked EXACTLY like one that was merely slow. Two states that want opposite reactions, rendered
+    # identically.
+    #
+    # So: show progress where a person is watching, and fail a dead transfer rather than hanging on
+    # it. The speed floor is deliberately far below any working connection -- 1 KB/s averaged over 15
+    # seconds -- because the job is to end a transfer that is not moving, NOT to punish a slow one.
+    # A flat --max-time would do the opposite and cut off exactly the slow-but-working case that
+    # needs the patience.
+    #
+    # Progress goes to stderr and only when stderr is a terminal. The quickstart drops this script's
+    # stdout but shows its stderr, so a person piping the one-liner sees the bar; a log, a CI run and
+    # anything reading the output stay byte-for-byte as quiet as before.
+    if [ -t 2 ]; then
+        _curl_out="--progress-bar"; _wget_out="-q --show-progress"
+    else
+        _curl_out="-sS"; _wget_out="-q"
+    fi
+    # A local, not an environment variable: the smoke lifts this function out with sed and rewrites
+    # the number so its case runs in seconds instead of minutes. Making it settable from outside would
+    # put a knob on the shipped installer that exists only for a test.
+    _stall_secs=15
     while [ "$_try" -lt 3 ]; do
         _try=$((_try + 1))
         [ "$_try" -lt 3 ] || rm -f "$_part"
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSL --retry 2 -C - "$1" -o "$_part" && { mv -f "$_part" "$2"; return 0; }
+            # shellcheck disable=SC2086  # deliberately split: one flag or two, chosen just above
+            curl -fL $_curl_out --retry 2 -C - \
+                 --connect-timeout 20 --speed-limit 1024 --speed-time "$_stall_secs" \
+                 "$1" -o "$_part" && { mv -f "$_part" "$2"; return 0; }
         elif command -v wget >/dev/null 2>&1; then
-            wget -q -c "$1" -O "$_part" && { mv -f "$_part" "$2"; return 0; }
+            # shellcheck disable=SC2086  # same
+            wget $_wget_out -c --connect-timeout=20 --read-timeout="$_stall_secs" \
+                 "$1" -O "$_part" && { mv -f "$_part" "$2"; return 0; }
         else
             die "neither curl nor wget is available to download $1."
         fi

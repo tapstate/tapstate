@@ -651,6 +651,193 @@ case "${TAPSTATE_TELEMETRY_URL:-}" in
   *)              ok  "the suite's own install events go nowhere near the production endpoint" ;;
 esac
 
+# --- a download that stalls ends, instead of hanging forever -----------------------------------------
+# The first step anyone takes with this product is this download, and it used to have no timeout of any
+# kind. A connection that opened and then delivered nothing hung indefinitely and looked EXACTLY like
+# one that was merely slow -- two states wanting opposite reactions, rendered identically, and the
+# reader's only move was to guess.
+#
+# fetch() is exercised on its own rather than through the whole installer: the installer pulls several
+# files, so driving it at a stalling server multiplies one timeout into many and turns a test into a
+# five-minute wait. What is under test is the one function.
+#
+# Seeded as the real thing: a server that sends headers, promises a large body, and then never sends a
+# byte. Not a close -- a close is an error curl reports at once, which is the case that already worked.
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "stalled download: python3 is needed for the stalling server"
+else
+  SD="$(mktemp -d)"
+  # stdout to a file, never to this suite's own. A helper that outlives the run and holds the pipe
+  # makes the caller wait for output that will never end -- which is how a killed suite still hangs
+  # whoever ran it.
+  python3 - "$SD" >"$SD/server.log" 2>&1 <<'PYEOF' &
+import http.server, os, sys, time
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "50000000")
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except Exception:
+            return
+        time.sleep(900)
+    def log_message(self, *a): pass
+# Threading, not the default single-threaded server: the handler blocks for the whole test, so a
+# single-threaded one would accept the first attempt and leave every later attempt queued in the
+# backlog, never served. Those attempts would then fail on something other than the stall this case
+# exists to seed -- and pass, for the wrong reason, while taking four times as long.
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+srv.daemon_threads = True
+with open(os.path.join(d, "port"), "w") as fh:
+    fh.write(str(srv.server_address[1]))
+srv.serve_forever()
+PYEOF
+  SD_PID=$!
+  for _ in $(seq 1 50); do [ -s "$SD/port" ] && break; sleep 0.1; done
+
+  # The function as it actually ships, lifted out of the script rather than restated here -- a copy of
+  # fetch() in this file would pass while the shipped one hung. Only the stall window is rewritten,
+  # and only so this takes seconds: at the shipped 15s the attempts compound to about 160, which would
+  # make this one case twenty times the rest of the suite. The shipped value is pinned separately just
+  # below, so shrinking it here cannot hide its removal.
+  {
+    # shellcheck disable=SC2016  # deliberately literal: this text is the shim, not this shell's job
+    printf 'die() { printf "%%s\\n" "$1" >&2; exit 1; }\n'
+    sed -n '/^fetch() {/,/^}/p' "$INSTALL_SH" | sed 's/^    _stall_secs=15$/    _stall_secs=2/'
+    # shellcheck disable=SC2016  # same: literal shim text
+    printf 'fetch "$1" "$2"\n'
+  } > "$SD/fetch.sh"
+
+  # Bounded here rather than by a watchdog that kills the suite. A killed suite reports nothing --
+  # no summary, no failing case, and a caller left waiting on a pipe some background helper still
+  # holds. The bound has to turn a hang into a FAILING CASE, which means waiting on the transfer
+  # rather than on this script.
+  stall_start="$(date +%s)"
+  sh "$SD/fetch.sh" "http://127.0.0.1:$(cat "$SD/port")/blob" "$SD/blob" >"$SD/out" 2>"$SD/err" &
+  FETCH_PID=$!
+  stall_deadline=$(( stall_start + 120 ))
+  stall_hung=0
+  while kill -0 "$FETCH_PID" 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$stall_deadline" ]; then
+      stall_hung=1
+      # The shim's children too: killing the shell leaves curl holding the transfer, and an orphan
+      # that outlives the case is what turns the next run's timing into a mystery.
+      pkill -P "$FETCH_PID" 2>/dev/null
+      kill -9 "$FETCH_PID" 2>/dev/null
+      break
+    fi
+    sleep 1
+  done
+  wait "$FETCH_PID" 2>/dev/null; fetch_rc=$?
+  stall_secs=$(( $(date +%s) - stall_start ))
+
+  if [ "$stall_hung" = "1" ]; then
+    bad "a download that never delivered a byte was still going after ${stall_secs}s -- it does not give up"
+  elif [ "$fetch_rc" = "0" ]; then
+    bad "a download that never delivered a byte reported success"
+  else
+    ok "a stalled download fails instead of hanging"
+  fi
+
+  if grep -q 'could not download' "$SD/err"; then
+    ok "and it names the download it gave up on"
+  else
+    bad "a failed download said nothing about what it was fetching: $(head -2 "$SD/err")"
+  fi
+
+  # Nothing half-transferred sits at the real path, where a later run would take it for a finished file.
+  if [ -e "$SD/blob" ]; then
+    bad "a stalled download left something at the destination path"
+  else
+    ok "a stalled download leaves nothing at the destination path"
+  fi
+  printf '  note  the stalled download gave up after %ss\n' "$stall_secs"
+
+  kill "$SD_PID" 2>/dev/null; wait "$SD_PID" 2>/dev/null
+  rm -rf "$SD"
+fi
+
+# --- progress where a person is watching, silence everywhere else ------------------------------------
+# The headline of this change, and the half a drift check cannot see: removing the progress bar from
+# both copies at once would leave every other case green.
+#
+# Asserted through a curl that records its own arguments rather than by looking at the rendering: what
+# is being decided here is which flags fetch() chooses, and a stub says that exactly. The decision is
+# `[ -t 2 ]`, so the two runs differ only in whether stderr is a terminal -- one redirected to a file,
+# one through a pty.
+PD="$(mktemp -d)"
+mkdir -p "$PD/bin"
+cat > "$PD/bin/curl" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "${ARGLOG:?}"
+exit 1
+STUB
+chmod +x "$PD/bin/curl"
+{
+  # shellcheck disable=SC2016  # literal shim text
+  printf 'die() { printf "%%s\\n" "$1" >&2; exit 1; }\n'
+  sed -n '/^fetch() {/,/^}/p' "$INSTALL_SH" | sed 's/^    _stall_secs=15$/    _stall_secs=1/'
+  # shellcheck disable=SC2016
+  printf 'fetch "$1" "$2" || true\n'
+} > "$PD/probe.sh"
+
+ARGLOG="$PD/plain.args" PATH="$PD/bin:$PATH" sh "$PD/probe.sh" http://127.0.0.1:1/x "$PD/out" \
+  >/dev/null 2>"$PD/plain.err" || true
+if grep -q -- '-sS' "$PD/plain.args" && ! grep -q -- '--progress-bar' "$PD/plain.args"; then
+  ok "with stderr redirected the download stays silent, as logs and CI need"
+else
+  bad "a non-terminal run did not choose the quiet flags: $(head -1 "$PD/plain.args")"
+fi
+
+# A pty, so `[ -t 2 ]` is actually true. Allocated with python rather than script(1): script needs a
+# real terminal on its OWN stdin to copy the settings from, and dies with "tcgetattr/ioctl" under any
+# non-interactive runner -- which is every CI job, so that route would have failed exactly where this
+# has to work. openpty gives the child a terminal without caring what the parent has.
+cat > "$PD/onpty.py" <<'PYEOF'
+import os, pty, subprocess, sys
+master, slave = pty.openpty()
+with open(os.devnull) as devnull:
+    proc = subprocess.Popen(sys.argv[1:], stdin=devnull, stdout=slave, stderr=slave)
+    rc = proc.wait()
+os.close(slave)
+os.close(master)
+sys.exit(rc)
+PYEOF
+ARGLOG="$PD/tty.args" PATH="$PD/bin:$PATH" \
+  python3 "$PD/onpty.py" sh "$PD/probe.sh" http://127.0.0.1:1/x "$PD/out2" >/dev/null 2>&1 || true
+if [ ! -s "$PD/tty.args" ]; then
+  bad "the terminal case never ran -- nothing here says whether progress is shown"
+elif grep -q -- '--progress-bar' "$PD/tty.args"; then
+  ok "on a terminal the download shows progress instead of minutes of silence"
+else
+  bad "a terminal run did not ask for progress: $(head -1 "$PD/tty.args")"
+fi
+rm -rf "$PD"
+
+# The behaviour above is proved with a two-second window, so the shipped one is pinned here. Without
+# this, deleting the timeout outright would still pass: the test rewrites that line, and a line that
+# is not there is not rewritten either.
+for f in "$INSTALL_SH" "$HERE/../deploy/quickstart/quickstart.sh"; do
+  if grep -q '^    _stall_secs=15$' "$f"; then
+    ok "$(basename "$f") ships a fifteen-second stall window"
+  else
+    bad "$(basename "$f") does not ship the stall window the behaviour above was proved with"
+  fi
+done
+
+# The quickstart carries fetch() verbatim, and the header of both says so. Nothing checked it, so a
+# change to one -- this one included -- could silently leave the other with the old behaviour, which
+# the comment describes exactly: the same dead install to whoever ran the one-liner.
+qs_fetch="$(sed -n '/^fetch() {/,/^}/p' "$HERE/../deploy/quickstart/quickstart.sh" | sed 's/quickstart:/PREFIX:/')"
+in_fetch="$(sed -n '/^fetch() {/,/^}/p' "$INSTALL_SH" | sed 's/install:/PREFIX:/')"
+if [ "$qs_fetch" = "$in_fetch" ]; then
+  ok "the quickstart's copy of fetch() is still the same function, message prefix aside"
+else
+  bad "fetch() has drifted between install.sh and quickstart.sh"
+fi
+
 # --- summary ----------------------------------------------------------------------------------------
 echo
 printf '\033[1minstall smoke: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
