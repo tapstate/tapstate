@@ -254,7 +254,7 @@ public final class TapEventCodec {
     private static Object restored(ConvertedValue carrier, TapCodecsRegistry codecs) {
         Object origin = carrier.origin();
         ToTapValueCodec<?> spoken = codecs.getCustomToTapValueCodec(origin.getClass());
-        if (spoken == null) {
+        if (spoken == null || !speaksTheSameCopyOf(spoken, origin)) {
             return carrier.value();
         }
         TapValue<?, ?> value = spoken.toTapValue(origin, null);
@@ -266,6 +266,29 @@ public final class TapEventCodec {
         FromTapValueCodec<TapValue<?, ?>> back =
                 codecs.getFromTapValueCodec((Class<TapValue<?, ?>>) value.getClass());
         return back == null ? carrier.value() : back.fromTapValue(value);
+    }
+
+    /**
+     * Whether the target's conversion would be handed a driver object it can actually read.
+     *
+     * <p>Conversions are looked up by class <em>name</em>, and each connector runs in a loader of its
+     * own, so a name lookup matches across two of them: a source's driver object finds the target's
+     * conversion for a same-named class, and that conversion casts it to the copy its own loader
+     * defines. The two are unrelated types, so the cast fails - and it fails inside the write, which
+     * takes the whole run down rather than one row. Same name is therefore not the question; same copy
+     * of the class is, and where they differ the target is a target that cannot read this object, which
+     * is a case with an answer already: it is handed the portable value.
+     *
+     * <p>This does not make an identity survive between two connectors of the same kind - the portable
+     * value is what lands, so the target's own column type is still not restored. What it stops is a
+     * run dying on the first row, and the difference between the two is what a reader of a failed job
+     * has to work out from a cast error naming one class twice.
+     */
+    private static boolean speaksTheSameCopyOf(ToTapValueCodec<?> spoken, Object origin) {
+        ClassLoader defining = origin.getClass().getClassLoader();
+        return defining == null                                  // a platform type: one copy, everywhere
+                || defining == spoken.getClass().getClassLoader()  // this connector's own
+                || defining == TapEventCodec.class.getClassLoader();  // the shared layer every connector sees
     }
 
     /**

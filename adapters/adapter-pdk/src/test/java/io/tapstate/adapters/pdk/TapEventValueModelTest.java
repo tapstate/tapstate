@@ -20,6 +20,7 @@ import org.bson.types.Decimal128;
 import org.bson.types.ObjectId;
 import org.bson.types.Symbol;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -28,6 +29,7 @@ import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
@@ -342,6 +344,45 @@ class TapEventValueModelTest {
         // A sub-document's fields are as reachable to a target as a top-level column is, and the way in
         // converted them. Restoring only the top level writes the carrier itself one level down.
         assertThat(encoded.getAfter().get("doc")).isEqualTo(Map.of("ref", key));
+    }
+
+    @Test
+    void aDriverObjectFromAnotherConnectorsLoaderIsNotHandedToThisOnesConversion(@TempDir Path dir)
+            throws ClassNotFoundException {
+        // Two connectors, two isolated loaders, one class name. Conversions are looked up by name, so
+        // the target's conversion for this name is found and would then cast the source's object to its
+        // own copy of the class - a cast that cannot succeed, thrown inside the write, taking the whole
+        // run down rather than one row. Measured on a real pair before this guard: a mongodb-to-mongodb
+        // run died on its first row with a cast error naming org.bson.types.ObjectId twice.
+        Path jar = SyntheticJar.compileToJar(dir, "synthetic.Key",
+                "package synthetic; public class Key implements java.io.Serializable {"
+                        + " public String toString() { return \"key-1\"; } }");
+        try (ConnectorClassLoader theOtherConnector = ConnectorClassLoader.open(List.of(jar))) {
+            Object foreign = instanceOf(theOtherConnector.load("synthetic.Key"));
+            TapCodecsRegistry codecs = new TapCodecsRegistry()
+                    .registerToTapValue(foreign.getClass(), (value, tapType) ->
+                            new TapStringValue(String.valueOf(value)))
+                    .registerFromTapValue(TapStringValue.class, TapValue::getValue);
+            Envelope decoded = insert(row("_id", foreign), codecs);
+            assertThat(decoded.after().get("_id")).as("the row carries it").isInstanceOf(ConvertedValue.class);
+
+            TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(
+                    decoded, new TapCodecsRegistry().registerToTapValue(String.class, (value, tapType) ->
+                            new TapStringValue(String.valueOf(value))));
+
+            // Handed the portable value, which is the answer already written for a target that cannot
+            // read this object. Not a restored identity - that is a separate thing this does not do -
+            // but a row that lands rather than a run that stops.
+            assertThat(encoded.getAfter().get("_id")).isEqualTo("key-1");
+        }
+    }
+
+    private static Object instanceOf(Class<?> type) {
+        try {
+            return type.getDeclaredConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("could not construct " + type, e);
+        }
     }
 
     // ---- the seven driver types one real connector registers -------------------------------------
