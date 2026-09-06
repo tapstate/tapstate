@@ -170,6 +170,7 @@ class UpCmdTest {
                 "--table", "orders", "--view", "orders_view", "-w", ws.toString());
         assertThat(first.code()).as(first.all()).isZero();
         FakeUpControlPlane client = new FakeUpControlPlane();
+        client.principal = "admin";
 
         Run r = up(home, client, "up", "-w", ws.toString());
 
@@ -368,6 +369,8 @@ class UpCmdTest {
         ConnectionSchemaOutcome schemaOutcome = new ConnectionSchemaOutcome.Absent();
         ConnectionDiscoverSchemaOutcome discoverOutcome = new ConnectionDiscoverSchemaOutcome.Discovered(schema);
         String pipelineState = "RUNNING";
+        /** Whom the saved session belongs to, as the exchange answers it; the record's principal must match. */
+        String principal = "alice";
 
         @Override
         public boolean isHealthy(URI baseUrl) {
@@ -389,7 +392,7 @@ class UpCmdTest {
         @Override
         public SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
             exchanged.add(sessionToken);
-            return new SessionExchangeOutcome.Success("jwt-resumed", NOW.plusSeconds(900), ISSUER, "alice",
+            return new SessionExchangeOutcome.Success("jwt-resumed", NOW.plusSeconds(900), ISSUER, principal,
                     List.of("read", "write"));
         }
 

@@ -213,7 +213,7 @@ class NewRecipeShapesTest {
                 "mysql", "db", "", "", "u", "s", "orders", "orders_view",
                 "id, region, amount", "amount=total", "internal_note", "after.region == 'US'");
 
-        NewRecipeTest.Run r = run(home, prompter, "new", "reshaped-table", "--server", "http://127.0.0.1:8080",
+        NewRecipeTest.Run r = run(home, prompter, "new", "reshaped-table", "--server", "http://127.0.0.1:8080", "--user", "admin",
                 "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isZero();
@@ -328,7 +328,7 @@ class NewRecipeShapesTest {
                 "", "shipments", "order_id=id", "array", "", "",
                 "");
 
-        NewRecipeTest.Run r = run(home, prompter, "new", "nested-json", "--server", "http://127.0.0.1:8080",
+        NewRecipeTest.Run r = run(home, prompter, "new", "nested-json", "--server", "http://127.0.0.1:8080", "--user", "admin",
                 "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isZero();
@@ -349,7 +349,7 @@ class NewRecipeShapesTest {
                 "n", "mysql", "db2", "", "", "u2", "s2", "invoices", "order_id=order_no", "object", "invoice", "",
                 "");
 
-        NewRecipeTest.Run r = run(home, prompter, "new", "nested-json", "--server", "http://127.0.0.1:8080",
+        NewRecipeTest.Run r = run(home, prompter, "new", "nested-json", "--server", "http://127.0.0.1:8080", "--user", "admin",
                 "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isZero();
@@ -540,7 +540,7 @@ class NewRecipeShapesTest {
                 "mysql", "db2", "", "", "u", "s2", "",
                 "");
 
-        NewRecipeTest.Run r = run(home, prompter, "new", "consolidated-table", "--server", "http://127.0.0.1:8080",
+        NewRecipeTest.Run r = run(home, prompter, "new", "consolidated-table", "--server", "http://127.0.0.1:8080", "--user", "admin",
                 "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isZero();

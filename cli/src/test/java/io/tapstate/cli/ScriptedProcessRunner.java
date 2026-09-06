@@ -28,6 +28,12 @@ final class ScriptedProcessRunner implements ProcessRunner {
         return this;
     }
 
+    /** The same, unless the test already scripted that command - for a helper's defaults. */
+    ScriptedProcessRunner answerUnlessScripted(String command, Result result) {
+        answers.putIfAbsent(command, result);
+        return this;
+    }
+
     /** Runs {@code hook} whenever {@code command} (the words joined by spaces) is run. */
     ScriptedProcessRunner when(String command, Runnable hook) {
         hooks.put(command, hook);

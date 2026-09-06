@@ -56,6 +56,15 @@ enum CliError implements TapstateErrorCode {
      */
     ALIAS_LINK_FAILED("cli.alias-link-failed", Set.of("path", Names.REASON)),
 
+    /**
+     * The local development stack the guided first run starts in Docker could not be started, or was
+     * started and never answered; {@code reason} says which - no {@code docker} on the PATH, no Compose
+     * plugin, what {@code docker compose} said, or where the stack is and how to stop it when it came
+     * up and stayed silent. One code for the whole route rather than one per step: what a reader does
+     * about any of them is the same - fix Docker, or point the workspace at a server they already run.
+     */
+    DOCKER_UNAVAILABLE("cli.docker-unavailable", Set.of(Names.REASON)),
+
     /** A connector id supplied to the wizard that is not in the bundled catalog. */
     UNKNOWN_CONNECTOR("cli.unknown-connector", Set.of("connector")),
 
