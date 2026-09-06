@@ -93,9 +93,10 @@ final class RecipeSupport {
      * and the ignore line when a secret was answered. The artifacts go through the canonical writer;
      * the other two are line-oriented files the recipe extends rather than owns.
      *
-     * @param note what the summary says beside the pipeline, or null
+     * @param assumed what the pipeline assumes without having asked, named beside its file in the
+     *                summary, or null when it assumed nothing
      */
-    static List<RecipeRun.Output> outputs(List<PlannedSource> sources, PipelineResource pipeline, String note,
+    static List<RecipeRun.Output> outputs(List<PlannedSource> sources, PipelineResource pipeline, String assumed,
                                           WorkspaceFiles workspace) {
         CanonicalWriter writer = new CanonicalWriter();
         Map<String, String> secrets = new LinkedHashMap<>();
@@ -109,7 +110,7 @@ final class RecipeSupport {
         }
         outputs.add(new RecipeRun.Output(
                 WorkspaceWrite.File.owned("pipeline/" + pipeline.id() + ".tap.yml", writer.write(pipeline)),
-                "pipeline", note));
+                "pipeline", assumed));
         if (!secrets.isEmpty()) {
             outputs.add(new RecipeRun.Output(workspace.env(secrets), "env", null));
             WorkspaceWrite.File ignore = workspace.gitignoreEnv();

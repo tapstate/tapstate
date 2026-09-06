@@ -1,6 +1,8 @@
 package io.tapstate.cli;
 
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.Resource;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -26,11 +28,20 @@ final class RecipeRun {
         }
     }
 
-    /** One planned file with the role the report names it by, and a note the text summary prints beside it. */
-    record Output(WorkspaceWrite.File file, String kind, String note) {}
+    /**
+     * One planned file with the kind the report names it by, and what it assumed without asking
+     * ({@code primary_key: id}, say) - null when nothing.
+     */
+    record Output(WorkspaceWrite.File file, String kind, String assumed) {}
 
-    /** One file after the write. */
-    record Created(Path path, String kind, boolean replaced, String note) {}
+    /**
+     * One file after the write.
+     *
+     * @param name    the path as the recipe planned it, relative to the workspace root
+     * @param role    what the file is for, in the words the summary describes it by
+     * @param assumed what the file assumed without asking, or null
+     */
+    record Created(Path path, String name, String kind, boolean replaced, String role, String assumed) {}
 
     /** What a recipe left behind. */
     record Result(String recipe, Path root, List<Created> files) {}
@@ -98,9 +109,38 @@ final class RecipeRun {
                 root, outputs.stream().map(Output::file).toList(), force, CliError.ARTIFACT_EXISTS);
         List<Created> created = new ArrayList<>();
         for (int i = 0; i < outputs.size(); i++) {
-            created.add(new Created(written.get(i).path(), outputs.get(i).kind(), written.get(i).replaced(),
-                    outputs.get(i).note()));
+            Output output = outputs.get(i);
+            created.add(new Created(written.get(i).path(), output.file().path(), output.kind(),
+                    written.get(i).replaced(), role(output), output.assumed()));
         }
         return new Result(recipeId, root, created);
+    }
+
+    /**
+     * What a file is for, in one line. An artifact is described in the words {@code ls} lists it by -
+     * its kind and id, then {@code ls}'s summary of it - read back from the bytes just written rather
+     * than from the recipe's plan, because {@code sample} copies files it never parsed and because it
+     * is the listing the user meets next that the description has to agree with. The two dotfiles are
+     * described by what owns them.
+     */
+    private static String role(Output output) {
+        return switch (output.kind()) {
+            case "env" -> WorkspaceFiles.ENV_ROLE;
+            case "gitignore" -> WorkspaceFiles.GITIGNORE_ROLE;
+            default -> {
+                Resource resource;
+                try {
+                    resource = new DslParser().parse(output.file().content());
+                } catch (RuntimeException unreadable) {
+                    // a recipe writes what it rendered, so this is a defect; listed as ls would list it
+                    resource = null;
+                }
+                WorkspaceScan.Artifact artifact =
+                        new WorkspaceScan.Artifact(output.kind(), Path.of(output.file().path()), resource);
+                String summary = LsCmd.summary(artifact);
+                String named = output.kind() + " " + artifact.id();
+                yield summary.isEmpty() ? named : named + ": " + summary;
+            }
+        };
     }
 }

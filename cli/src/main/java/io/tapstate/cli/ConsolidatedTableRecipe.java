@@ -117,6 +117,6 @@ final class ConsolidatedTableRecipe {
         ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal("consolidate"), "id", null, null);
         PipelineResource pipeline = new PipelineResource(stem + "_sync", null,
                 sources.stream().map(s -> s.resource().id()).toList(), List.of(consolidate), view, null, null, null);
-        return RecipeSupport.outputs(sources, pipeline, MirroredTableRecipe.PRIMARY_KEY_NOTE, workspace);
+        return RecipeSupport.outputs(sources, pipeline, MirroredTableRecipe.ASSUMED_PRIMARY_KEY, workspace);
     }
 }

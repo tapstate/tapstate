@@ -30,7 +30,8 @@ final class MirroredTableRecipe {
     static final String DEFAULT_CONNECTOR = RecipeSupport.DEFAULT_CONNECTOR;
 
     /** What the summary says beside the pipeline, because the key it carries was not discovered. */
-    static final String PRIMARY_KEY_NOTE = "primary_key: id assumed; edit it if the table's key is another column";
+    /** What the pipeline assumes without asking, as the summary names it beside the file. */
+    static final String ASSUMED_PRIMARY_KEY = "primary_key: id";
 
     /** The recipe's answers, from whichever path collected them. */
     record Answers(String connector, Map<String, Object> config, String table, String view) {}
@@ -78,7 +79,7 @@ final class MirroredTableRecipe {
         ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal(answers.table()), "id", null, null);
         PipelineResource pipeline = new PipelineResource(pipelineId(answers), null,
                 List.of(source.resource().id()), null, view, null, null, null);
-        return RecipeSupport.outputs(List.of(source), pipeline, PRIMARY_KEY_NOTE, workspace);
+        return RecipeSupport.outputs(List.of(source), pipeline, ASSUMED_PRIMARY_KEY, workspace);
     }
 
     /** {@code <table>_src} over the one table, secrets taken out. */

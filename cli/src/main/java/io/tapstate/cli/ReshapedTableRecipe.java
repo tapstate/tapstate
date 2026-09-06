@@ -98,6 +98,6 @@ final class ReshapedTableRecipe {
         ViewBlock view = new ViewBlock.Inline(answers.table().view(), FromRef.literal(upstream), "id", null, null);
         PipelineResource pipeline = new PipelineResource(MirroredTableRecipe.pipelineId(answers.table()), null,
                 List.of(source.resource().id()), steps.isEmpty() ? null : steps, view, null, null, null);
-        return RecipeSupport.outputs(List.of(source), pipeline, MirroredTableRecipe.PRIMARY_KEY_NOTE, workspace);
+        return RecipeSupport.outputs(List.of(source), pipeline, MirroredTableRecipe.ASSUMED_PRIMARY_KEY, workspace);
     }
 }
