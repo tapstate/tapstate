@@ -19,28 +19,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class NestKeysTest {
 
-    /**
-     * Stands in for what a connector's conversion actually produces: an object with no equality of its
-     * own, so two of them holding the same value are two different things. A stand-in that <em>had</em>
-     * equality would give the carrier around it equality too, and every case below would pass whether
-     * or not anything unwrapped.
-     */
-    private static final class DriverKey {
-        private final String hex;
-
-        private DriverKey(String hex) {
-            this.hex = hex;
-        }
-
-        @Override
-        public String toString() {
-            return hex;
-        }
-    }
-
     @Test
     void aKeyBuiltFromACarriedValueMatchesOneBuiltFromThePlainValue() {
-        Map<String, Object> carried = Map.of("_id", new ConvertedValue("64f0c0de", new DriverKey("64f0c0de")));
+        Map<String, Object> carried = Map.of("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"));
         Map<String, Object> plain = Map.of("_id", "64f0c0de");
 
         // The two sides of a join reach this from different places: one side's rows came through a
@@ -51,15 +32,16 @@ class NestKeysTest {
     }
 
     @Test
-    void twoRowsCarryingTheSameValueProduceTheSameKey() {
-        Map<String, Object> left = Map.of("_id", new ConvertedValue("64f0c0de", new DriverKey("64f0c0de")));
-        Map<String, Object> right = Map.of("_id", new ConvertedValue("64f0c0de", new DriverKey("64f0c0de")));
+    void twoRowsCarryingTheSameValueProduceTheSameKeyEvenFromDifferentColumns() {
+        Map<String, Object> left = Map.of("ref", new ConvertedValue("64f0c0de", "OBJECT_ID"));
+        Map<String, Object> right = Map.of("ref", new ConvertedValue("64f0c0de", "STRING(24)"));
 
-        // Both sides converted, which is the ordinary case when a document store joins to itself. Two
-        // rows read at different moments hold two conversions of the one key, and what a conversion
-        // produces does not compare by its contents - so the carriers around them do not either.
-        assertThat(NestKeys.valuesOf(left, List.of("_id")))
-                .isEqualTo(NestKeys.valuesOf(right, List.of("_id")));
+        // Both sides converted, which is the ordinary case when a document store joins to itself - and
+        // the two sides need not agree on what their schemas call the column. The key is the value, so
+        // it must not be. The two declared names differ on purpose: with them equal this case would
+        // pass on an implementation that never unwrapped, because a carrier compares by its parts.
+        assertThat(NestKeys.valuesOf(left, List.of("ref")))
+                .isEqualTo(NestKeys.valuesOf(right, List.of("ref")));
     }
 
     @Test

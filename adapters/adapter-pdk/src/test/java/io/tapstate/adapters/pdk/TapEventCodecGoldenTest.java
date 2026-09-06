@@ -70,12 +70,16 @@ class TapEventCodecGoldenTest {
                 .after(ordered("_id", new DriverKey("64f0c0de"), "region", "eu"));
 
         return List.of(
-                TapEventCodec.decodeChange(insert, CODECS),
-                TapEventCodec.decodeChange(update, CODECS),
-                TapEventCodec.decodeChange(delete, CODECS),
-                TapEventCodec.decodeSnapshotRow(row, CODECS),
-                TapEventCodec.decodeChange(ddl, CODECS),
-                TapEventCodec.decodeChange(carried, CONNECTOR_CODECS));
+                TapEventCodec.decodeChange(insert, CODECS, Map.of()),
+                TapEventCodec.decodeChange(update, CODECS, Map.of()),
+                TapEventCodec.decodeChange(delete, CODECS, Map.of()),
+                TapEventCodec.decodeSnapshotRow(row, CODECS, Map.of()),
+                TapEventCodec.decodeChange(ddl, CODECS, Map.of()),
+                // Decoded with a schema that names the column, so the golden holds the whole carrier -
+                // both what travels for readers and what the write side rebuilds the driver type from.
+                // Left unnamed, the second half would be locked as absent and no change to it could
+                // ever show up as a diff.
+                TapEventCodec.decodeChange(carried, CONNECTOR_CODECS, Map.of("_id", "OBJECT_ID")));
     }
 
     @Test
@@ -152,11 +156,11 @@ class TapEventCodecGoldenTest {
         }
         if (v instanceof ConvertedValue carrier) {
             // Both halves are contract: the portable value every reader downstream binds to, and the
-            // driver's own object riding along for the write side. The second is rendered as its type
-            // rather than its contents - what the write side needs from the golden is that it is there
-            // and what it is, and a driver object's own rendering is not ours to lock.
+            // name the source's schema gave the column, which is what the write side rebuilds the
+            // driver's own type from. A column the schema did not describe carries no name, and that
+            // absence is locked here too - it is what decides whether a target can restore the type.
             return "{\"value\": " + value(carrier.value())
-                    + ", \"origin\": " + quote(carrier.origin().getClass().getSimpleName()) + "}";
+                    + ", \"originType\": " + value(carrier.originType()) + "}";
         }
         if (v instanceof Number || v instanceof Boolean) {
             return v.toString();

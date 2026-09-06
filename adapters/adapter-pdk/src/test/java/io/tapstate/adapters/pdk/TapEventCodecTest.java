@@ -40,7 +40,7 @@ class TapEventCodecTest {
     void decodesInsertToOpInsertWithAfterRow() {
         TapInsertRecordEvent event = TapInsertRecordEvent.create()
                 .table("orders").referenceTime(1000L).after(Map.of("id", 1, "region", "eu"));
-        Envelope env = TapEventCodec.decodeChange(event, CODECS);
+        Envelope env = TapEventCodec.decodeChange(event, CODECS, java.util.Map.of());
         assertThat(env.op()).isEqualTo(Op.INSERT);
         assertThat(env.ts()).isEqualTo(1000L);
         assertThat(env.src()).isEqualTo("orders");
@@ -53,7 +53,7 @@ class TapEventCodecTest {
         TapUpdateRecordEvent event = TapUpdateRecordEvent.create()
                 .table("orders").referenceTime(1000L)
                 .before(Map.of("id", 1, "region", "eu")).after(Map.of("id", 1, "region", "us"));
-        Envelope env = TapEventCodec.decodeChange(event, CODECS);
+        Envelope env = TapEventCodec.decodeChange(event, CODECS, java.util.Map.of());
         assertThat(env.op()).isEqualTo(Op.UPDATE);
         assertThat(env.before()).isEqualTo(Map.of("id", 1L, "region", "eu"));
         assertThat(env.after()).isEqualTo(Map.of("id", 1L, "region", "us"));
@@ -63,7 +63,7 @@ class TapEventCodecTest {
     void decodesDeleteToOpDeleteWithBeforeOnly() {
         TapDeleteRecordEvent event = TapDeleteRecordEvent.create()
                 .table("orders").referenceTime(1000L).before(Map.of("id", 1));
-        Envelope env = TapEventCodec.decodeChange(event, CODECS);
+        Envelope env = TapEventCodec.decodeChange(event, CODECS, java.util.Map.of());
         assertThat(env.op()).isEqualTo(Op.DELETE);
         assertThat(env.before()).isEqualTo(Map.of("id", 1L));
         assertThat(env.after()).isNull();
@@ -77,7 +77,7 @@ class TapEventCodecTest {
         event.setTableId("orders");
         event.setReferenceTime(1000L);
         event.setOriginDDL("ALTER TABLE orders ADD note VARCHAR(64)");
-        Envelope env = TapEventCodec.decodeChange(event, CODECS);
+        Envelope env = TapEventCodec.decodeChange(event, CODECS, java.util.Map.of());
         assertThat(env).isNotNull();
         assertThat(env.op()).isEqualTo(Op.DDL);
         assertThat(env.src()).isEqualTo("orders");
@@ -91,7 +91,7 @@ class TapEventCodecTest {
         TapNewFieldEvent event = new TapNewFieldEvent();
         event.setTableId("orders");
         event.setReferenceTime(1000L);
-        Envelope env = TapEventCodec.decodeChange(event, CODECS);
+        Envelope env = TapEventCodec.decodeChange(event, CODECS, java.util.Map.of());
         assertThat(env.op()).isEqualTo(Op.DDL);
         assertThat(env.schema()).isEqualTo(Map.of());
     }
@@ -102,7 +102,7 @@ class TapEventCodecTest {
     void decodesSnapshotRowToOpRead() {
         TapInsertRecordEvent row = TapInsertRecordEvent.create()
                 .table("orders").referenceTime(1000L).after(Map.of("id", 7));
-        Envelope env = TapEventCodec.decodeSnapshotRow(row, CODECS);
+        Envelope env = TapEventCodec.decodeSnapshotRow(row, CODECS, java.util.Map.of());
         assertThat(env.op()).isEqualTo(Op.READ);
         assertThat(env.after()).isEqualTo(Map.of("id", 7L));
         assertThat(env.before()).isNull();
@@ -118,7 +118,7 @@ class TapEventCodecTest {
                 "nested", Map.of("map_value", nestedMap),
                 "items", List.of(nestedList)));
 
-        Envelope env = TapEventCodec.decodeChange(event, CODECS);
+        Envelope env = TapEventCodec.decodeChange(event, CODECS, java.util.Map.of());
 
         assertThat(env.after()).isEqualTo(Map.of(
                 "top_level", Date.from(topLevel.toInstant()),
@@ -133,11 +133,11 @@ class TapEventCodecTest {
         TapInsertRecordEvent withRef = TapInsertRecordEvent.create().table("t").after(Map.of("a", 1));
         withRef.setReferenceTime(1000L);
         withRef.setTime(500L);
-        assertThat(TapEventCodec.decodeChange(withRef, CODECS).ts()).isEqualTo(1000L);
+        assertThat(TapEventCodec.decodeChange(withRef, CODECS, java.util.Map.of()).ts()).isEqualTo(1000L);
 
         TapInsertRecordEvent noRef = TapInsertRecordEvent.create().table("t").after(Map.of("a", 1));
         noRef.setTime(500L);
-        assertThat(TapEventCodec.decodeChange(noRef, CODECS).ts()).isEqualTo(500L);
+        assertThat(TapEventCodec.decodeChange(noRef, CODECS, java.util.Map.of()).ts()).isEqualTo(500L);
     }
 
     // ---- decode rejects a phase/type mismatch (bare crash, not a silent mis-projection) ----
@@ -145,7 +145,7 @@ class TapEventCodecTest {
     @Test
     void snapshotRowDecodeRejectsANonInsertEvent() {
         TapDeleteRecordEvent delete = TapDeleteRecordEvent.create().table("t").before(Map.of("id", 1));
-        assertThatThrownBy(() -> TapEventCodec.decodeSnapshotRow(delete, CODECS))
+        assertThatThrownBy(() -> TapEventCodec.decodeSnapshotRow(delete, CODECS, java.util.Map.of()))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -159,25 +159,25 @@ class TapEventCodecTest {
     @Test
     void insertRoundTrips() {
         Envelope env = Envelope.insert(1000L, "orders", Map.of("id", 1L, "region", "eu"), null);
-        assertThat(TapEventCodec.decodeChange(TapEventCodec.encode(env, CODECS), CODECS)).isEqualTo(env);
+        assertThat(TapEventCodec.decodeChange(TapEventCodec.encode(env, CODECS), CODECS, java.util.Map.of())).isEqualTo(env);
     }
 
     @Test
     void updateRoundTrips() {
         Envelope env = Envelope.update(1000L, "orders", Map.of("id", 1L), Map.of("id", 1L, "n", 2L), null);
-        assertThat(TapEventCodec.decodeChange(TapEventCodec.encode(env, CODECS), CODECS)).isEqualTo(env);
+        assertThat(TapEventCodec.decodeChange(TapEventCodec.encode(env, CODECS), CODECS, java.util.Map.of())).isEqualTo(env);
     }
 
     @Test
     void deleteRoundTrips() {
         Envelope env = Envelope.delete(1000L, "orders", Map.of("id", 1L), null);
-        assertThat(TapEventCodec.decodeChange(TapEventCodec.encode(env, CODECS), CODECS)).isEqualTo(env);
+        assertThat(TapEventCodec.decodeChange(TapEventCodec.encode(env, CODECS), CODECS, java.util.Map.of())).isEqualTo(env);
     }
 
     @Test
     void readRoundTripsThroughTheSnapshotPhase() {
         Envelope env = Envelope.read(1000L, "orders", Map.of("id", 7L), null);
-        assertThat(TapEventCodec.decodeSnapshotRow(TapEventCodec.encode(env, CODECS), CODECS)).isEqualTo(env);
+        assertThat(TapEventCodec.decodeSnapshotRow(TapEventCodec.encode(env, CODECS), CODECS, java.util.Map.of())).isEqualTo(env);
     }
 
     @Test
@@ -185,7 +185,7 @@ class TapEventCodecTest {
         Envelope env = Envelope.ddl(1000L, "orders", Map.of("origin", "ALTER TABLE orders ADD note INT"));
         TapEvent encoded = TapEventCodec.encode(env, CODECS);
         assertThat(encoded).isInstanceOf(TapDDLUnknownEvent.class);
-        assertThat(TapEventCodec.decodeChange(encoded, CODECS)).isEqualTo(env);
+        assertThat(TapEventCodec.decodeChange(encoded, CODECS, java.util.Map.of())).isEqualTo(env);
     }
 
     /**

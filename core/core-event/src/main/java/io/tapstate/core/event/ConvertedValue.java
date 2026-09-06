@@ -9,41 +9,43 @@ import java.util.Objects;
 import java.util.function.Function;
 
 /**
- * A row value the source connector converted for travel, carried together with the connector's own
- * object that produced it.
+ * A row value the source connector converted for travel, carried together with the name its own
+ * schema gave the column it came out of.
  *
  * <p>A connector declares how its driver's own types — a document store's key, a binary column, a
  * decimal the driver has its own class for — become values anything can read. The conversion's result
  * is what every reader downstream wants: it compares, it renders, it joins, it goes into an expression.
- * The object it was converted from is what the write side wants, and only the write side: a target of
- * the same kind puts the value back the way it arrived by reading it, so a key that travelled as text
- * is written as a key rather than as text. Carrying both is what lets each side have the one it needs
- * without asking the other to give its up.
+ * The column's declared name is what the write side wants, and only the write side: a connector's own
+ * way back from a converted value reads it to decide what to rebuild, so a key that travelled as text
+ * is written as a key rather than as text. Carrying both is what lets each side have the one it needs.
  *
- * <p><b>{@code origin} is deliberately untyped.</b> The type it holds belongs to the driver the source
- * connector speaks, which one module owns and no other may name; a field declared as that type here
- * would pull the whole contract into the kernel and into every ring above it. What is in there is only
- * ever read back by the module that put it in, which knows what it is.
+ * <p><b>What is carried is a name, never the driver's object.</b> Two connectors on one pipeline are two
+ * isolated class loaders, so the source's object is a type the target cannot read even when both speak
+ * the same driver — the classes share a name and nothing else. Handing it over threw a cast error that
+ * named one class twice and took the whole run down on the first row. A name crosses both a loader
+ * boundary and a serializer, which is why the object is not here and the object's *column type* is.
  *
- * <p><b>A carrier exists only where the driver's own object can cross a serializer.</b> Decode and encode
- * sit on opposite sides of at least one — a distributed edge, the change-log store — so an object that
- * cannot cross one would take the whole row down at the first hop rather than reach the target it was
- * being kept for. Where there is nothing to carry, the portable value travels alone, which is also what
- * a target of another kind is handed.
+ * <p><b>{@code originType} is null where the schema said nothing about that column</b> — a value nested
+ * inside a document, or a column discovery could not describe. Null rather than empty on purpose: a
+ * connector's way back tests it, and "no declared type" and "a type spelled with no characters" must not
+ * arrive as the same answer.
  *
  * <p><b>Every boundary that uses a row value <i>as a value</i> unwraps first</b>, through
  * {@link #unwrap} — comparing, keying, rendering, binding into an expression. Nothing warns when one
- * does not: this carrier has no {@code equals} worth the name for the value inside it, so a join keyed
- * on an unwrapped column simply never matches and an expression comparing one simply never holds, both
- * without an error. Pass-through paths — anything moving a whole row map along — need no unwrapping and
+ * does not, and the way it goes wrong is quiet: a carrier never equals the plain value inside it, so a
+ * join between a side that met a conversion and a side that did not simply never matches, and an
+ * expression comparing one simply never holds, both without an error. Two carriers do compare by their
+ * parts, which makes the failure worse rather than better — a join with conversions on both sides works
+ * until the two schemas spell the column differently, and then stops matching for a reason nothing on
+ * that path names. Pass-through paths — anything moving a whole row map along — need no unwrapping and
  * must not do it, or the write side loses what it is owed.
  */
-public record ConvertedValue(Object value, Object origin) implements Serializable {
+public record ConvertedValue(Object value, String originType) implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
     public ConvertedValue {
-        Objects.requireNonNull(origin, "origin");
+        Objects.requireNonNull(value, "value");
     }
 
     /**
@@ -57,7 +59,7 @@ public record ConvertedValue(Object value, Object origin) implements Serializabl
 
     /**
      * The same walk, with each carrier replaced by what {@code carried} makes of it rather than by the
-     * value inside — for the one side that wants the object the value was converted from. Every other
+     * value inside — for the one side that rebuilds the driver's own type from it. Every other
      * caller wants {@link #unwrap(Object)}, which is this with the value.
      */
     public static Object unwrap(Object value, Function<ConvertedValue, Object> carried) {

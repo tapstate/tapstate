@@ -44,7 +44,7 @@
     "ts": 1000,
     "src": "orders",
     "before": null,
-    "after": {"_id": {"value": "64f0c0de", "origin": "DriverKey"}, "region": "eu"},
+    "after": {"_id": {"value": "64f0c0de", "originType": "OBJECT_ID"}, "region": "eu"},
     "schema": null
   }
 ]

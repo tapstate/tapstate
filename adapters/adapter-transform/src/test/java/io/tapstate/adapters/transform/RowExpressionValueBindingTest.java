@@ -37,8 +37,8 @@ class RowExpressionValueBindingTest {
     @DisplayName("a value a connector converted is compared as the value, not as what carries it")
     void aCarriedValueIsBoundAsTheValueInside() {
         Map<String, Object> row = new LinkedHashMap<>();
-        row.put("_id", new ConvertedValue("64f0c0de", "the-driver-object"));
-        row.put("tags", List.of(new ConvertedValue("eu", "the-driver-object")));
+        row.put("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"));
+        row.put("tags", List.of(new ConvertedValue("eu", "OBJECT_ID")));
 
         // The failure this pins is the quiet one: an expression over a carrier neither fails nor warns,
         // it is simply false for every row - so a filter drops everything and a computed flag is never

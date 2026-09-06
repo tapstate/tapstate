@@ -1,6 +1,5 @@
 package io.tapstate.adapters.pdk;
 
-import java.io.Serializable;
 import java.math.BigInteger;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
@@ -15,6 +14,12 @@ import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.FromTapValueCodec;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.ToTapValueCodec;
+import io.tapdata.entity.schema.value.ByteData;
+import io.tapdata.entity.schema.value.DateTime;
+import io.tapdata.entity.schema.value.TapBinaryValue;
+import io.tapdata.entity.schema.value.TapDateTimeValue;
+import io.tapdata.entity.schema.value.TapNumberValue;
+import io.tapdata.entity.schema.value.TapStringValue;
 import io.tapdata.entity.schema.value.TapValue;
 import io.tapdata.entity.event.TapBaseEvent;
 import io.tapdata.entity.event.TapEvent;
@@ -56,17 +61,20 @@ public final class TapEventCodec {
      *
      * @throws IllegalArgumentException if the event is not a mapped change type
      */
-    public static Envelope decodeChange(TapEvent event, TapCodecsRegistry codecs) {
+    public static Envelope decodeChange(
+            TapEvent event, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
         Objects.requireNonNull(codecs, "codecs");
+        Objects.requireNonNull(columnTypes, "columnTypes");
         if (event instanceof TapInsertRecordEvent insert) {
-            return Envelope.insert(ts(insert), src(insert), row(insert.getAfter(), codecs), null);
+            return Envelope.insert(ts(insert), src(insert), row(insert.getAfter(), codecs, columnTypes), null);
         }
         if (event instanceof TapUpdateRecordEvent update) {
             return Envelope.update(ts(update), src(update),
-                    row(update.getBefore(), codecs), row(update.getAfter(), codecs), null);
+                    row(update.getBefore(), codecs, columnTypes), row(update.getAfter(), codecs, columnTypes),
+                    null);
         }
         if (event instanceof TapDeleteRecordEvent delete) {
-            return Envelope.delete(ts(delete), src(delete), row(delete.getBefore(), codecs), null);
+            return Envelope.delete(ts(delete), src(delete), row(delete.getBefore(), codecs, columnTypes), null);
         }
         if (event instanceof TapDDLEvent ddl) {
             return Envelope.ddl(ts(ddl), src(ddl), ddlSchema(ddl));
@@ -79,10 +87,12 @@ public final class TapEventCodec {
      *
      * @throws IllegalArgumentException if the event is not insert-shaped
      */
-    public static Envelope decodeSnapshotRow(TapEvent event, TapCodecsRegistry codecs) {
+    public static Envelope decodeSnapshotRow(
+            TapEvent event, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
         Objects.requireNonNull(codecs, "codecs");
+        Objects.requireNonNull(columnTypes, "columnTypes");
         if (event instanceof TapInsertRecordEvent read) {
-            return Envelope.read(ts(read), src(read), row(read.getAfter(), codecs), null);
+            return Envelope.read(ts(read), src(read), row(read.getAfter(), codecs, columnTypes), null);
         }
         throw new IllegalArgumentException(
                 "snapshot rows are insert-shaped; got: " + event.getClass().getName());
@@ -113,9 +123,19 @@ public final class TapEventCodec {
      * binary floating point type drops digits silently, which is the one loss nothing downstream
      * could detect.
      */
-    @SuppressWarnings("unchecked")
-    private static Map<String, Object> row(Map<String, Object> row, TapCodecsRegistry codecs) {
-        return row == null ? null : (Map<String, Object>) converted(row, codecs);
+    private static Map<String, Object> row(
+            Map<String, Object> row, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
+        if (row == null) {
+            return null;
+        }
+        Map<String, Object> out = new LinkedHashMap<>(row.size());
+        boolean changed = false;
+        for (Map.Entry<String, Object> column : row.entrySet()) {
+            Object value = converted(column.getValue(), codecs, columnTypes.get(column.getKey()));
+            changed |= value != column.getValue();
+            out.put(column.getKey(), value);
+        }
+        return changed ? out : row;
     }
 
     /**
@@ -123,8 +143,8 @@ public final class TapEventCodec {
      * array's elements are as reachable from a reader as a top-level column is; a container whose
      * contents all pass through unchanged is returned as it is, so the ordinary row costs no copy.
      */
-    private static Object converted(Object value, TapCodecsRegistry codecs) {
-        Object registered = registered(value, codecs);
+    private static Object converted(Object value, TapCodecsRegistry codecs, String originType) {
+        Object registered = registered(value, codecs, originType);
         if (registered != null) {
             return registered;
         }
@@ -144,7 +164,9 @@ public final class TapEventCodec {
             Map<Object, Object> converted = new LinkedHashMap<>(map.size());
             boolean changed = false;
             for (Map.Entry<?, ?> entry : map.entrySet()) {
-                Object element = converted(entry.getValue(), codecs);
+                // A field inside a document has no declared type of its own: the schema describes the
+                // column, not its interior. Null says so rather than lending it the column's.
+                Object element = converted(entry.getValue(), codecs, null);
                 changed |= element != entry.getValue();
                 converted.put(entry.getKey(), element);
             }
@@ -154,7 +176,7 @@ public final class TapEventCodec {
             List<Object> converted = new ArrayList<>(list.size());
             boolean changed = false;
             for (Object element : list) {
-                Object next = converted(element, codecs);
+                Object next = converted(element, codecs, null);
                 changed |= next != element;
                 converted.add(next);
             }
@@ -185,7 +207,7 @@ public final class TapEventCodec {
      * value's own class, and every conversion a connector registers is free to be handed no declared
      * type, which is already what happens for a column the schema did not describe.
      */
-    private static Object registered(Object value, TapCodecsRegistry codecs) {
+    private static Object registered(Object value, TapCodecsRegistry codecs, String originType) {
         if (value == null) {
             return null;
         }
@@ -194,16 +216,14 @@ public final class TapEventCodec {
             return null;
         }
         TapValue<?, ?> converted = codec.toTapValue(value, null);
-        if (converted == null) {
+        if (converted == null || converted.getValue() == null) {
             return null;
         }
-        // Handed on inside a carrier the rest of the tree can name. The driver's type belongs to the
-        // connector contract, which only this module may reference, and a row travels through rings
-        // that may not - so what travels is the portable result plus the object it came from, and the
-        // reader that needs the second one is the only one that knows what it is.
-        return value instanceof Serializable
-                ? new ConvertedValue(converted.getValue(), value)
-                : converted.getValue();
+        // Handed on inside a carrier the rest of the tree can name, holding the portable result and the
+        // name the source's own schema gave this column. The driver's object is deliberately not in
+        // there: the target runs in a class loader of its own, so the object would be a type it cannot
+        // read, while the name crosses both that boundary and the serializer a row meets on the way.
+        return new ConvertedValue(converted.getValue(), originType);
     }
 
     /**
@@ -239,56 +259,56 @@ public final class TapEventCodec {
     /**
      * One carried value as the target should receive it.
      *
-     * <p>The target's own registry decides, exactly as the source's did on the way in. Where the target
-     * speaks the driver type the value came from, its own conversion pair is run over the driver object
-     * the row carried: to the portable form the pair is keyed on, then back — which is where a key
-     * becomes a key again rather than the text it travelled as, since a connector's own way back reads
-     * the object it started from. Anything else is a target that has never heard of this driver type,
-     * and it is handed the portable value instead of an object it could not write.
+     * <p>The target's own way back decides, exactly as the source's way in decided what travelled. The
+     * contract value the pair is keyed on is rebuilt here from what the row carries — the portable value
+     * and the column's declared name — and handed to the way back the target registered for that value's
+     * kind. That is where a key becomes a key again rather than the text it travelled as: a connector's
+     * way back reads the declared name to decide what to rebuild.
      *
-     * <p>Running the target's own way in, rather than shipping the source's result of it, is what makes
-     * this survive the wire: that result cannot carry its state across one, and a row reaches a sink
-     * from another step in every deployment but the smallest.
+     * <p><b>Rebuilt rather than carried, because the source's own objects cannot come here.</b> Two
+     * connectors are two isolated class loaders; the source's driver object and the target's conversion
+     * for it are unrelated types that share a name, and handing one to the other threw a cast error that
+     * took the whole run down on the first row. Nothing driver-owned crosses between them now.
+     *
+     * <p>A target that registered no way back for this kind of value is a target that cannot write the
+     * driver's type, and it is handed the portable value — the same answer as for a target of another
+     * kind. The framework's own fallback is deliberately not consulted: for these values it hands back
+     * exactly the portable value anyway, and reaching for it drags in a runtime that only a loaded
+     * connector has.
      */
     @SuppressWarnings("unchecked")
     private static Object restored(ConvertedValue carrier, TapCodecsRegistry codecs) {
-        Object origin = carrier.origin();
-        ToTapValueCodec<?> spoken = codecs.getCustomToTapValueCodec(origin.getClass());
-        if (spoken == null || !speaksTheSameCopyOf(spoken, origin)) {
-            return carrier.value();
-        }
-        TapValue<?, ?> value = spoken.toTapValue(origin, null);
+        TapValue<?, ?> value = contractValue(carrier.value());
         if (value == null) {
             return carrier.value();
         }
-        value.setOriginValue(origin);
-        value.setOriginType(origin.getClass().getSimpleName());
+        value.setOriginType(carrier.originType());
         FromTapValueCodec<TapValue<?, ?>> back =
-                codecs.getFromTapValueCodec((Class<TapValue<?, ?>>) value.getClass());
+                codecs.getCustomFromTapValueCodec((Class<TapValue<?, ?>>) value.getClass());
         return back == null ? carrier.value() : back.fromTapValue(value);
     }
 
     /**
-     * Whether the target's conversion would be handed a driver object it can actually read.
+     * The contract value a portable value of this kind belongs in, or null where the contract names none.
      *
-     * <p>Conversions are looked up by class <em>name</em>, and each connector runs in a loader of its
-     * own, so a name lookup matches across two of them: a source's driver object finds the target's
-     * conversion for a same-named class, and that conversion casts it to the copy its own loader
-     * defines. The two are unrelated types, so the cast fails - and it fails inside the write, which
-     * takes the whole run down rather than one row. Same name is therefore not the question; same copy
-     * of the class is, and where they differ the target is a target that cannot read this object, which
-     * is a case with an answer already: it is handed the portable value.
+     * <p>The pairing is the frozen surface's own, read off the value classes it declares: each names the
+     * one portable type it holds, and this is that reading in reverse. It is spelled out rather than
+     * looked up because the lookup the surface offers goes through a registry whose defaults are
+     * deliberately half switched off, and because a name-to-class resolution here would be reflection on
+     * a path that has to hold up in a native image.
      *
-     * <p>This does not make an identity survive between two connectors of the same kind - the portable
-     * value is what lands, so the target's own column type is still not restored. What it stops is a
-     * run dying on the first row, and the difference between the two is what a reader of a failed job
-     * has to work out from a cast error naming one class twice.
+     * <p>Null for anything else, which is the honest answer: a connector free to convert into any value
+     * class may produce a portable type this does not name, and guessing one would hand the target a
+     * value of the wrong kind rather than the one it can already write.
      */
-    private static boolean speaksTheSameCopyOf(ToTapValueCodec<?> spoken, Object origin) {
-        ClassLoader defining = origin.getClass().getClassLoader();
-        return defining == null                                  // a platform type: one copy, everywhere
-                || defining == spoken.getClass().getClassLoader()  // this connector's own
-                || defining == TapEventCodec.class.getClassLoader();  // the shared layer every connector sees
+    private static TapValue<?, ?> contractValue(Object portable) {
+        return switch (portable) {
+            case ByteData bytes -> new TapBinaryValue(bytes);
+            case DateTime instant -> new TapDateTimeValue(instant);
+            case String text -> new TapStringValue(text);
+            case Double number -> new TapNumberValue(number);
+            default -> null;
+        };
     }
 
     /**

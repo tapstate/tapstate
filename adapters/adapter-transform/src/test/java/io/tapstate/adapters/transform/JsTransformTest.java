@@ -37,7 +37,7 @@ class JsTransformTest {
         TransformPort js = js(
                 "function process(r, ctx) { r.after.hit = (r.after._id === '64f0c0de'); return r; }");
         Envelope row = Envelope.insert(1L, "orders", new LinkedHashMap<>(
-                Map.of("_id", new ConvertedValue("64f0c0de", "the-driver-object"))), null);
+                Map.of("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"))), null);
 
         // A guest cannot see into a host object it was not taught about, so the comparison is false for
         // every row - and a script that neither throws nor logs is indistinguishable from data that

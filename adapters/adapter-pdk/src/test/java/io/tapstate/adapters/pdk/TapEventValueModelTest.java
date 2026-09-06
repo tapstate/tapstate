@@ -63,10 +63,15 @@ class TapEventValueModelTest {
     private record DriverStamp(long seconds) {
     }
 
+    /** What a schema calls the column those keys live in - the one thing the way back has to go on. */
+    private static final String KEY_COLUMN = "DRIVER_KEY";
+
     /**
      * What a connector registers: its own types become portable values, the ordinary boxes are left,
      * and the pair is closed on the way out - a value that arrived as a key is written back as a key.
-     * A real connector's from-conversion reads exactly these two, which is why it is mirrored here.
+     * The way back reads the column's declared name and nothing else, which is what a real connector's
+     * does and the only thing that can work: the object a value was converted from belongs to the
+     * source's class loader, and the target runs in one of its own.
      */
     private static final TapCodecsRegistry CODECS = new TapCodecsRegistry()
             .registerToTapValue(DriverKey.class, (value, tapType) ->
@@ -74,7 +79,9 @@ class TapEventValueModelTest {
             .registerToTapValue(DriverStamp.class, (value, tapType) ->
                     new TapStringValue(Long.toString(((DriverStamp) value).seconds())))
             .registerFromTapValue(TapStringValue.class, tapValue ->
-                    tapValue.getOriginValue() instanceof DriverKey key ? key : tapValue.getValue());
+                    KEY_COLUMN.equals(tapValue.getOriginType())
+                            ? new DriverKey(tapValue.getValue())
+                            : tapValue.getValue());
 
     @Test
     void anIntegerColumnArrivesAsTheSixtyFourBitIntegerItsTypeSaysItIs() {
@@ -183,7 +190,7 @@ class TapEventValueModelTest {
                 .table("orders").referenceTime(1000L)
                 .before(row("qty", 5)).after(row("qty", 6));
 
-        Envelope env = TapEventCodec.decodeChange(event, CODECS);
+        Envelope env = TapEventCodec.decodeChange(event, CODECS, Map.of());
 
         assertThat(env.before().get("qty")).isEqualTo(5L);
         assertThat(env.after().get("qty")).isEqualTo(6L);
@@ -194,7 +201,7 @@ class TapEventValueModelTest {
         TapInsertRecordEvent event = TapInsertRecordEvent.create()
                 .table("orders").referenceTime(1000L).after(row("qty", 5));
 
-        Envelope env = TapEventCodec.decodeSnapshotRow(event, CODECS);
+        Envelope env = TapEventCodec.decodeSnapshotRow(event, CODECS, Map.of());
 
         // The phase says which op a row carries, never what its values are.
         assertThat(env.after().get("qty")).isEqualTo(5L);
@@ -216,26 +223,28 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void theObjectTheValueWasConvertedFromTravelsOnTheConvertedValue() {
-        DriverKey key = new DriverKey("64f0c0de");
+    void theNameTheSchemaGaveTheColumnTravelsOnTheConvertedValue() {
+        Envelope env = insert(row("_id", new DriverKey("64f0c0de")), CODECS, Map.of("_id", KEY_COLUMN));
 
-        Envelope env = insert(row("_id", key));
-
-        // A sink of the same kind puts the value back the way it arrived by reading this. Without it the
-        // write side has only the text and writes a key as a string - silently, and only on the target,
-        // where the read-side cases cannot see it.
-        assertThat(((ConvertedValue) env.after().get("_id")).origin()).isSameAs(key);
+        // A sink of the same kind rebuilds the driver's type by reading this. Without it the write side
+        // has only the text and writes a key as a string - silently, and only on the target, where the
+        // read-side cases cannot see it.
+        assertThat(((ConvertedValue) env.after().get("_id")).originType()).isEqualTo(KEY_COLUMN);
     }
 
     @Test
-    void aValueWhoseDriverObjectCannotTravelIsNotCarriedAtAll() {
-        Envelope env = insert(row("at", new DriverStamp(1_700_000_000L)));
+    void nothingTheDriverOwnsTravelsOnTheRow() {
+        Envelope env = insert(row("at", new DriverStamp(1_700_000_000L)), CODECS, Map.of("at", "STAMP"));
 
-        // The carrier exists to get the driver's own object to the target, and a row crosses a wire to
-        // get there. An object that cannot cross it would take the whole row down at the first hop - so
-        // where there is nothing to carry, the portable value travels on its own and the write side
-        // hands the target that, exactly as it does for a target of another kind.
-        assertThat(env.after().get("at")).isEqualTo("1700000000").isNotInstanceOf(ConvertedValue.class);
+        // A row leaves this module for rings that cannot name a driver type, crosses at least one
+        // serializer, and is finally handed to a second connector in a class loader of its own. A
+        // driver object in the row fails at all three, the last one as a cast error naming one class
+        // twice. What travels is the portable value and the column's name - this type is not
+        // serializable, and it makes no difference, because nothing driver-owned is carried anyway.
+        Object carried = env.after().get("at");
+        assertThat(carried).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) carried).value()).isEqualTo("1700000000");
+        assertThat(((ConvertedValue) carried).originType()).isEqualTo("STAMP");
     }
 
     @Test
@@ -295,7 +304,7 @@ class TapEventValueModelTest {
     @Test
     void aKeyIsWrittenBackAsTheKeyTheSourceHandedOver() {
         DriverKey key = new DriverKey("64f0c0de");
-        Envelope decoded = insert(row("_id", key, "qty", 5));
+        Envelope decoded = insert(row("_id", key, "qty", 5), CODECS, Map.of("_id", KEY_COLUMN));
 
         TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
 
@@ -309,7 +318,7 @@ class TapEventValueModelTest {
     @Test
     void aKeyIsStillWrittenBackAsAKeyAfterTheRowHasCrossedAWire() {
         DriverKey key = new DriverKey("64f0c0de");
-        Envelope decoded = insert(row("_id", key));
+        Envelope decoded = insert(row("_id", key), CODECS, Map.of("_id", KEY_COLUMN));
 
         TapInsertRecordEvent encoded =
                 (TapInsertRecordEvent) TapEventCodec.encode(overTheWire(decoded), CODECS);
@@ -335,15 +344,17 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aCarriedValueNestedInADocumentIsRestoredToo() {
-        DriverKey key = new DriverKey("64f0c0de");
-        Envelope decoded = insert(row("doc", new LinkedHashMap<>(Map.of("ref", key))));
+    void aCarriedValueInsideADocumentReachesTheTargetAsItsPortableValue() {
+        Envelope decoded = insert(row("doc", new LinkedHashMap<>(Map.of("ref", new DriverKey("64f0c0de")))),
+                CODECS, Map.of("doc", KEY_COLUMN));
 
         TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
 
-        // A sub-document's fields are as reachable to a target as a top-level column is, and the way in
-        // converted them. Restoring only the top level writes the carrier itself one level down.
-        assertThat(encoded.getAfter().get("doc")).isEqualTo(Map.of("ref", key));
+        // A schema describes a column, not the inside of one, so a value one level down carries no
+        // declared name and the way back has nothing to key on. It lands as the text it travelled as -
+        // a lesser answer than the top-level column gets, and asserted rather than left to be found,
+        // because the way in does reach in and convert these and a reader would expect the way out to.
+        assertThat(encoded.getAfter().get("doc")).isEqualTo(Map.of("ref", "64f0c0de"));
     }
 
     @Test
@@ -500,9 +511,10 @@ class TapEventValueModelTest {
     void aRegularExpressionBecomesItsSlashDelimitedForm() {
         Object decoded = decodedByMongo(new BsonRegularExpression("^eu", "i"));
 
-        // Nothing carries it: this driver type cannot cross a wire, so only the text travels and a
-        // target of the same kind is handed the text rather than the expression.
-        assertThat(decoded).isEqualTo("/^eu/i").isNotInstanceOf(ConvertedValue.class);
+        // Carried like every other converted value: what travels is the text plus the column's name,
+        // and neither is the driver's object, so there is no longer a type that cannot travel.
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value()).isEqualTo("/^eu/i");
     }
 
     @Test
@@ -519,12 +531,11 @@ class TapEventValueModelTest {
         Object value = ((ConvertedValue) decoded).value();
         assertThat(value).isInstanceOf(Double.class);
         assertThat(new java.math.BigDecimal(value.toString())).isNotEqualByComparingTo(exact.bigDecimalValue());
-        // The exact number is still on the row - this type can cross a wire, so it is carried. What is
-        // missing is a way back: the conversion pair the write side runs is keyed on the portable form,
-        // and this connector registers no way back from a number, so a target of the same kind is
-        // handed the double anyway. That half is not asserted here: reaching the fallback needs the
-        // plugin runtime, which no unit case stands up, and it is witnessed by hand on a live pair.
-        assertThat(((ConvertedValue) decoded).origin()).isSameAs(exact);
+        // What is missing is a way back: the one the write side runs is keyed on the portable form, and
+        // this connector registers none from a number, so a target of the same kind is handed the double
+        // anyway. The exact value is not on the row to fall back on either - nothing driver-owned
+        // travels, because a second connector could not read it.
+        assertThat(((ConvertedValue) decoded).originType()).isNull();
     }
 
     @Test
@@ -537,8 +548,10 @@ class TapEventValueModelTest {
         // The same decision as the decimal above, with a worse shape: not a loss of precision but a
         // wrong value, off by a factor of a thousand, and the counter dropped entirely. Left alone the
         // value is right. Pinned for the same reason - a fix upstream reddens this and nothing else.
-        assertThat(decoded).isInstanceOf(DateTime.class).isNotInstanceOf(ConvertedValue.class);
-        assertThat(((DateTime) decoded).toInstant()).isEqualTo(Instant.ofEpochMilli(1_767_225_600L));
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        Object instant = ((ConvertedValue) decoded).value();
+        assertThat(instant).isInstanceOf(DateTime.class);
+        assertThat(((DateTime) instant).toInstant()).isEqualTo(Instant.ofEpochMilli(1_767_225_600L));
     }
 
     @Test
@@ -599,8 +612,15 @@ class TapEventValueModelTest {
     }
 
     private static Envelope insert(Map<String, Object> after, TapCodecsRegistry codecs) {
+        return insert(after, codecs, Map.of());
+    }
+
+    /** The same, for a case that needs the schema to have named the column - which the way back reads. */
+    private static Envelope insert(
+            Map<String, Object> after, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
         return TapEventCodec.decodeChange(
-                TapInsertRecordEvent.create().table("orders").referenceTime(1000L).after(after), codecs);
+                TapInsertRecordEvent.create().table("orders").referenceTime(1000L).after(after),
+                codecs, columnTypes);
     }
 
     private static Map<String, Object> row(Object... kv) {
