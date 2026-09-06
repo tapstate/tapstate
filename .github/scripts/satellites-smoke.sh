@@ -126,7 +126,6 @@ case "$out" in
     *) pass "the list is what decides, not a built-in default" ;;
 esac
 
-
 # --- when the API call itself fails -----------------------------------------------------------
 
 # `gh api` writes the error body to stdout, not stderr, when a request fails. An output taken
@@ -186,6 +185,7 @@ contains "branch says which ref it could not read" "cannot read main" "$out"
 
 out="$(stubbed "" release 0.4.0 --notes-url https://example.invalid/notes)"
 contains "release says the branch it would tag is not there" "has no ws/release-0.4.0 to tag" "$out"
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "satellites-smoke: all cases passed"
