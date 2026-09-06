@@ -10,6 +10,8 @@
 # Editing this file is editing the release contract. Removing a line must say why in the commit.
 a-cdc-failure-is-observable on IN_PROCESS
 a-cdc-failure-is-observable on REAL_PROCESS
+a-cdc-only-pipeline-carries-its-changes on IN_PROCESS
+a-cdc-only-pipeline-carries-its-changes on REAL_PROCESS
 a-child-collection-arrives-from-another-engine on IN_PROCESS
 a-child-collection-arrives-from-another-engine on REAL_PROCESS
 a-child-collection-from-another-engine-lands-in-the-managed-store on IN_PROCESS
