@@ -190,9 +190,8 @@ class ServerBindingTest {
         Fakes fakes = new Fakes(true);
 
         assertThatThrownBy(() -> binding(home, null, fakes).bind(ws, null, false, null))
-                .isInstanceOf(RecipeRun.Usage.class)
-                .hasMessageContaining("--server")
-                .hasMessageContaining("--start-local");
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.SERVER_NOT_NAMED));
         assertThat(fakes.probe.logins).isEmpty();
         assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
     }
@@ -228,8 +227,9 @@ class ServerBindingTest {
 
         assertThatThrownBy(() -> binding(home, null, new Fakes(probe))
                 .bind(ws, URI.create("https://example:9999"), false, "u"))
-                .isInstanceOf(RecipeRun.Usage.class)
-                .hasMessageContaining("TAPSTATE_PASSWORD");
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.PASSWORD_REQUIRED))
+                .satisfies(e -> assertThat(((TapstateException) e).args()).containsEntry("variable", "TAPSTATE_PASSWORD"));
         assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
     }
 
@@ -245,6 +245,32 @@ class ServerBindingTest {
 
         assertThat(fakes.probe.logins).containsExactly("u:from-env");
         assertThat(manager(home).contextBoundExactlyTo(ws)).contains("example");
+    }
+
+    @Test
+    void aTypedServerThatDoesNotAnswerIsRefusedWithoutStartingAnything(@TempDir Path home, @TempDir Path ws) {
+        // nothing here can start a server somewhere else, so an unreachable typed URL is the end of it
+        Fakes fakes = new Fakes(false);
+
+        assertThatThrownBy(() -> binding(home, null, fakes)
+                .bind(ws, URI.create("https://example:9999"), false, "u"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.CONNECT_FAILED));
+        assertThat(fakes.runner.calls).isEmpty();
+        assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
+    }
+
+    @Test
+    void theDefaultNamedExplicitlyWithNothingListeningIsRefusedRatherThanStarted(@TempDir Path home,
+            @TempDir Path ws) {
+        // naming the default is not the same as asking for a container: --start-local is
+        Fakes fakes = new Fakes(false);
+
+        assertThatThrownBy(() -> binding(home, null, fakes).bind(ws, DEFAULT_SERVER, false, null))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.CONNECT_FAILED));
+        assertThat(fakes.runner.calls).isEmpty();
+        assertThat(stackDir(home)).doesNotExist();
     }
 
     // ---- the stack's own failures -----------------------------------------------------------------

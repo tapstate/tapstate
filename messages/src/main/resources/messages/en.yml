@@ -131,7 +131,13 @@ cli.connect-failed:
   solution: "Check the addresses are correct and that a Tapstate server is running there, then try connect again."
 cli.docker-unavailable:
   message: "The local development stack cannot be run in Docker: {reason}."
-  solution: "Install Docker with the Compose v2 plugin and make sure it is running, then run `tapstate new` again - or bind the workspace to a server you already run with --server."
+  solution: "Install Docker with the Compose v2 plugin and make sure it is running, then run `tapstate up` again - or point the workspace at a server you already run with --server."
+cli.server-not-named:
+  message: "This workspace is not bound to a server, and there is nothing to ask."
+  solution: "Pass --server <url> to name the server to use, or --start-local to start the local development stack on {server}."
+cli.password-required:
+  message: "Signing in to {server} needs a password, and there is nothing to ask."
+  solution: "Set {variable} in the environment, or pass --server for a server you are already signed in to."
 cli.request-timed-out:
   message: "The request to {server} timed out before the server answered."
   solution: "The server may be busy or the upload large. It may have completed there anyway — re-running a register is safe (it is idempotent). Wait and retry, or check the server logs."

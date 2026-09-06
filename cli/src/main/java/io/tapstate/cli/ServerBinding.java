@@ -89,9 +89,8 @@ final class ServerBinding {
         // Nobody to ask, and nothing said which server: the default is a guess, and adopting it would bind
         // a script to whatever happens to be listening on this machine. Say what to pass instead.
         if (serverUrl == null && prompter == null && !startLocal) {
-            throw new RecipeRun.Usage("this workspace is not bound to a server, and there is nothing to ask:"
-                    + " pass --server <url>, or --start-local to start the local development stack on "
-                    + DEFAULT_SERVER_TEXT);
+            throw new TapstateException(CliError.SERVER_NOT_NAMED,
+                    Map.of("server", DEFAULT_SERVER_TEXT), null);
         }
         bindServer(workspace, serverUrl != null ? serverUrl : askServer(), startLocal, user);
     }
@@ -167,8 +166,8 @@ final class ServerBinding {
         String password = env.apply(PASSWORD_ENV);
         if (password == null || password.isEmpty()) {
             if (prompter == null) {
-                throw new RecipeRun.Usage("signing in to " + server + " needs a password: set " + PASSWORD_ENV
-                        + " (with --yes, nothing is asked), or pass --server for a different server");
+                throw new TapstateException(CliError.PASSWORD_REQUIRED,
+                        Map.of("server", server.toString(), "variable", PASSWORD_ENV), null);
             }
             password = prompter.secret(PASSWORD_QUESTION);
         }

@@ -185,12 +185,6 @@ final class NewCmd implements Callable<Integer> {
     /** Test seam: an injected prompter forces the interactive path; production opens a JLine one. */
     Prompter prompter;
 
-    /**
-     * Test seam: the home directory the guided flow's stores live under - the context store, the saved
-     * session and the local stack; production uses the user's.
-     */
-    Path home;
-
     @Override
     public Integer call() {
         PrintWriter err = CliIo.err(spec);
