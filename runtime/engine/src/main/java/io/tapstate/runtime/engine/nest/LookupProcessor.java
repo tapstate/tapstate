@@ -54,8 +54,9 @@ final class LookupProcessor extends AbstractProcessor {
 
     /**
      * The twin of that edge, carrying the same rows keyed by what they pointed at <em>before</em>, so a row
-     * that now names something else can be taken out of where it was. Drawn only where the pointing stream
-     * carries the row it replaces, since that is the only thing that says where it was.
+     * that now names something else can be taken out of where it was. Drawn for every referenced embed: the
+     * earlier row is the only thing that says where it was, so a stream arriving without one is refused
+     * here rather than leaving the record to grow unnoticed.
      */
     static final int DEPARTED_REGISTRATIONS = 2;
 
@@ -356,6 +357,10 @@ final class LookupProcessor extends AbstractProcessor {
     private void unregister(Envelope event, Map<String, Object> row) {
         Map<String, Object> was = event.before();
         if (was == null) {
+            // An insert points somewhere for the first time and has nothing to leave. An update is the
+            // other thing that reaches here without an earlier row, and it is the one that cannot be
+            // passed over.
+            NestKeys.requireBeforeImageWhereReferencesAreRecorded(lookup, event);
             return;
         }
         List<Object> left = NestKeys.valuesOf(was, lookup.referenceFields());

@@ -131,13 +131,14 @@ public final class NestDag {
                 : gatheredInto(dag, vertex, lookup.referrerAlias(), referrers, nextOutbound, frontier);
         draw(dag, referrer, vertex, LookupProcessor.REGISTRATIONS,
                 fieldKey(lookup.referenceFields()), nextOutbound);
-        if (lookup.referrerTracksKeyChanges()) {
-            // The same rows a second time, keyed by what they pointed at before, so a row that now names
-            // something else lands where the entry recording the old one is held. Only drawn where those
-            // rows carry what they replace - without that there is nothing to key this copy by.
-            draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
-                    leavingKey(lookup.referenceFields()), nextOutbound);
-        }
+        // The same rows a second time, keyed by what they pointed at before, so a row that now names
+        // something else lands where the entry recording the old one is held. Drawn for every referenced
+        // embed rather than only where structural key changes are followed: that switch is about a
+        // different key entirely - a tree that never re-parents anything still re-points - and hanging
+        // this on it threw away an earlier row the source had already sent. A row carrying none is keyed
+        // by what it carries, which lands it beside its twin, and is refused there rather than passed over.
+        draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
+                leavingKey(lookup.referenceFields()), nextOutbound);
 
         Vertex pointing = built.get(lookup.referrerPathId());
         if (pointing == null) {
