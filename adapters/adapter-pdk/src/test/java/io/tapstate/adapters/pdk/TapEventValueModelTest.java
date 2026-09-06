@@ -9,6 +9,11 @@ import io.tapdata.entity.schema.value.TapStringValue;
 import io.tapdata.entity.schema.value.TapValue;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.LinkedHashMap;
@@ -34,13 +39,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TapEventValueModelTest {
 
     /** A driver's own type, standing in for the ones a real client hands back. */
-    private record DriverKey(String hex) {
+    private record DriverKey(String hex) implements Serializable {
     }
 
-    /** What a connector registers: its own types become portable values, the ordinary boxes are left. */
+    /** A driver type whose own object cannot be serialized - which several real ones are not. */
+    private record DriverStamp(long seconds) {
+    }
+
+    /**
+     * What a connector registers: its own types become portable values, the ordinary boxes are left,
+     * and the pair is closed on the way out - a value that arrived as a key is written back as a key.
+     * A real connector's from-conversion reads exactly these two, which is why it is mirrored here.
+     */
     private static final TapCodecsRegistry CODECS = new TapCodecsRegistry()
             .registerToTapValue(DriverKey.class, (value, tapType) ->
-                    new TapStringValue(((DriverKey) value).hex()));
+                    new TapStringValue(((DriverKey) value).hex()))
+            .registerToTapValue(DriverStamp.class, (value, tapType) ->
+                    new TapStringValue(Long.toString(((DriverStamp) value).seconds())))
+            .registerFromTapValue(TapStringValue.class, tapValue ->
+                    tapValue.getOriginValue() instanceof DriverKey key ? key : tapValue.getValue());
 
     @Test
     void anIntegerColumnArrivesAsTheSixtyFourBitIntegerItsTypeSaysItIs() {
@@ -182,17 +199,26 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void theOriginalValueAndTheTypeItCameInAsTravelOnTheConvertedValue() {
+    void theObjectTheValueWasConvertedFromTravelsOnTheConvertedValue() {
         DriverKey key = new DriverKey("64f0c0de");
 
         Envelope env = insert(row("_id", key));
 
-        // A sink of the same kind puts the value back the way it arrived by reading these two. Without
-        // them the write side has only the text and writes a key as a string - silently, and only on
-        // the target, where the read-side cases cannot see it.
-        TapValue<?, ?> origin = (TapValue<?, ?>) ((ConvertedValue) env.after().get("_id")).origin();
-        assertThat(origin.getOriginValue()).isSameAs(key);
-        assertThat(origin.getOriginType()).isEqualTo("DriverKey");
+        // A sink of the same kind puts the value back the way it arrived by reading this. Without it the
+        // write side has only the text and writes a key as a string - silently, and only on the target,
+        // where the read-side cases cannot see it.
+        assertThat(((ConvertedValue) env.after().get("_id")).origin()).isSameAs(key);
+    }
+
+    @Test
+    void aValueWhoseDriverObjectCannotTravelIsNotCarriedAtAll() {
+        Envelope env = insert(row("at", new DriverStamp(1_700_000_000L)));
+
+        // The carrier exists to get the driver's own object to the target, and a row crosses a wire to
+        // get there. An object that cannot cross it would take the whole row down at the first hop - so
+        // where there is nothing to carry, the portable value travels on its own and the write side
+        // hands the target that, exactly as it does for a target of another kind.
+        assertThat(env.after().get("at")).isEqualTo("1700000000").isNotInstanceOf(ConvertedValue.class);
     }
 
     @Test
@@ -250,15 +276,78 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void whatATargetIsHandedIsTheValue() {
-        Envelope decoded = insert(row("_id", new DriverKey("64f0c0de"), "qty", 5));
+    void aKeyIsWrittenBackAsTheKeyTheSourceHandedOver() {
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(row("_id", key, "qty", 5));
 
         TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
 
-        // A target writes what it is given. Handed the box a value travelled in, it writes the box -
-        // and the row lands, the write reports success, and only the target's own contents are wrong.
-        assertThat(encoded.getAfter().get("_id")).isEqualTo("64f0c0de");
+        // A target writes what it is given. Handed the text the key travelled as, it writes text - the
+        // row lands, the write reports success, and only the target's own key column is the wrong type.
+        assertThat(encoded.getAfter().get("_id")).isEqualTo(key);
+        // The ordinary box took the bare lane in and must take it out: nothing converts it either way.
         assertThat(encoded.getAfter().get("qty")).isEqualTo(5L);
+    }
+
+    @Test
+    void aKeyIsStillWrittenBackAsAKeyAfterTheRowHasCrossedAWire() {
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(row("_id", key));
+
+        TapInsertRecordEvent encoded =
+                (TapInsertRecordEvent) TapEventCodec.encode(overTheWire(decoded), CODECS);
+
+        // Decode and encode sit on opposite sides of at least one serializer - a distributed edge, the
+        // change-log store - so what the carrier holds has to survive one. Held as the connector's own
+        // converted object it does not: that type's whole state is declared on a supertype that is not
+        // serializable, so it arrives an empty shell and the write side restores nothing, while every
+        // case that never crosses a wire stays green.
+        assertThat(encoded.getAfter().get("_id")).isEqualTo(key);
+    }
+
+    @Test
+    void aTargetThatDoesNotSpeakTheDriversTypeIsHandedTheValue() {
+        Envelope decoded = insert(row("_id", new DriverKey("64f0c0de")));
+
+        TapInsertRecordEvent encoded =
+                (TapInsertRecordEvent) TapEventCodec.encode(decoded, new TapCodecsRegistry());
+
+        // The target's own registry decides, as the source's did on the way in. A target that has never
+        // heard of this driver type cannot be handed its object; it gets the portable value instead.
+        assertThat(encoded.getAfter().get("_id")).isEqualTo("64f0c0de");
+    }
+
+    @Test
+    void aCarriedValueNestedInADocumentIsRestoredToo() {
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(row("doc", new LinkedHashMap<>(Map.of("ref", key))));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        // A sub-document's fields are as reachable to a target as a top-level column is, and the way in
+        // converted them. Restoring only the top level writes the carrier itself one level down.
+        assertThat(encoded.getAfter().get("doc")).isEqualTo(Map.of("ref", key));
+    }
+
+    /** One row through a serializer, the way an envelope reaches a sink from anywhere but the same step. */
+    private static Envelope overTheWire(Envelope env) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        env.after().forEach((name, value) -> row.put(name, roundTrip(value)));
+        return Envelope.insert(env.ts(), env.src(), row, null);
+    }
+
+    private static Object roundTrip(Object value) {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+                out.writeObject(value);
+            }
+            try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+                return in.readObject();
+            }
+        } catch (Exception e) {
+            throw new AssertionError("a row value must survive a serializer: " + value, e);
+        }
     }
 
     private static Envelope insert(Map<String, Object> after) {

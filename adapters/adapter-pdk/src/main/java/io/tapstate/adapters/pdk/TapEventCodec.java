@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import java.io.Serializable;
 import java.math.BigInteger;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
@@ -11,6 +12,7 @@ import java.util.Objects;
 
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
+import io.tapdata.entity.codec.FromTapValueCodec;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.ToTapValueCodec;
 import io.tapdata.entity.schema.value.TapValue;
@@ -170,12 +172,18 @@ public final class TapEventCodec {
      * every driver type nobody taught us about into a wrapper the rest of the pipeline would have to
      * unwrap for no gain, and would put the ordinary Java boxes in one too.
      *
-     * <p>The original value and the name of the type it came in as are recorded on the result. They
-     * are what lets a sink of the same kind put the value back the way it arrived — a key converted
-     * to text for travel is written back as a key, not as text — and nothing else on this path writes
-     * them. The declared column type is not consulted, and is not needed: a conversion is chosen by
-     * the value's own class, and every conversion a connector registers is free to be handed no
-     * declared type, which is already what happens for a column the schema did not describe.
+     * <p>The driver's own object rides along with the result. It is what lets a sink of the same kind
+     * put the value back the way it arrived — a key converted to text for travel is written back as a
+     * key, not as text — and nothing else on this path keeps it. The conversion's own result object is
+     * not what travels: the whole of its state is declared on a supertype that is not serializable, so
+     * one crossing a wire arrives an empty shell, and the write side would restore nothing while every
+     * case that never crosses one stayed green. A driver object that cannot cross a wire itself is not
+     * carried at all — there would be nothing to restore from, and putting it in the row would take the
+     * row down at the first hop instead of at the target.
+     *
+     * <p>The declared column type is not consulted, and is not needed: a conversion is chosen by the
+     * value's own class, and every conversion a connector registers is free to be handed no declared
+     * type, which is already what happens for a column the schema did not describe.
      */
     private static Object registered(Object value, TapCodecsRegistry codecs) {
         if (value == null) {
@@ -189,13 +197,13 @@ public final class TapEventCodec {
         if (converted == null) {
             return null;
         }
-        converted.setOriginValue(value);
-        converted.setOriginType(value.getClass().getSimpleName());
-        // Handed on inside a carrier the rest of the tree can name. The conversion's own type belongs
-        // to the connector contract, which only this module may reference, and a row travels through
-        // rings that may not - so what travels is the portable result plus the object it came from,
-        // and the reader that needs the second one is the only one that knows what it is.
-        return new ConvertedValue(converted.getValue(), converted);
+        // Handed on inside a carrier the rest of the tree can name. The driver's type belongs to the
+        // connector contract, which only this module may reference, and a row travels through rings
+        // that may not - so what travels is the portable result plus the object it came from, and the
+        // reader that needs the second one is the only one that knows what it is.
+        return value instanceof Serializable
+                ? new ConvertedValue(converted.getValue(), value)
+                : converted.getValue();
     }
 
     /**
@@ -207,26 +215,57 @@ public final class TapEventCodec {
         Objects.requireNonNull(codecs, "codecs");
         return switch (env.op()) {
             case INSERT, READ -> TapInsertRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after()))
+                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), codecs))
                     .removedFields(dropped(env));
             case UPDATE -> TapUpdateRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before())).after(mutable(env.after()))
+                    .table(env.src()).referenceTime(env.ts())
+                    .before(mutable(env.before(), codecs)).after(mutable(env.after(), codecs))
                     .removedFields(dropped(env));
             case DELETE -> TapDeleteRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before()));
+                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), codecs));
             case DDL -> encodeDdl(env);
         };
     }
 
     /**
-     * A fresh mutable copy PDK can write through in place, or {@code null} when the map is absent.
-     *
-     * <p>Carriers are unwrapped on the way out: what a target is handed is the value, not the box a
-     * row travelled in. This restores what the value looked like to a target before conversions were
-     * applied at all - a key arrives as its text. Handing the box on instead would write the box.
+     * A fresh mutable copy PDK can write through in place, or {@code null} when the map is absent, with
+     * every carried value put back the way the target wants it.
      */
-    private static Map<String, Object> mutable(Map<String, Object> map) {
-        return map == null ? null : new LinkedHashMap<>(ConvertedValue.unwrapRow(map));
+    private static Map<String, Object> mutable(Map<String, Object> map, TapCodecsRegistry codecs) {
+        return map == null ? null
+                : new LinkedHashMap<>(ConvertedValue.unwrapRow(map, carrier -> restored(carrier, codecs)));
+    }
+
+    /**
+     * One carried value as the target should receive it.
+     *
+     * <p>The target's own registry decides, exactly as the source's did on the way in. Where the target
+     * speaks the driver type the value came from, its own conversion pair is run over the driver object
+     * the row carried: to the portable form the pair is keyed on, then back — which is where a key
+     * becomes a key again rather than the text it travelled as, since a connector's own way back reads
+     * the object it started from. Anything else is a target that has never heard of this driver type,
+     * and it is handed the portable value instead of an object it could not write.
+     *
+     * <p>Running the target's own way in, rather than shipping the source's result of it, is what makes
+     * this survive the wire: that result cannot carry its state across one, and a row reaches a sink
+     * from another step in every deployment but the smallest.
+     */
+    @SuppressWarnings("unchecked")
+    private static Object restored(ConvertedValue carrier, TapCodecsRegistry codecs) {
+        Object origin = carrier.origin();
+        ToTapValueCodec<?> spoken = codecs.getCustomToTapValueCodec(origin.getClass());
+        if (spoken == null) {
+            return carrier.value();
+        }
+        TapValue<?, ?> value = spoken.toTapValue(origin, null);
+        if (value == null) {
+            return carrier.value();
+        }
+        value.setOriginValue(origin);
+        value.setOriginType(origin.getClass().getSimpleName());
+        FromTapValueCodec<TapValue<?, ?>> back =
+                codecs.getFromTapValueCodec((Class<TapValue<?, ?>>) value.getClass());
+        return back == null ? carrier.value() : back.fromTapValue(value);
     }
 
     /**

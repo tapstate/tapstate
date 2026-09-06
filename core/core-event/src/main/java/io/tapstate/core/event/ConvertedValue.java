@@ -6,6 +6,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Function;
 
 /**
  * A row value the source connector converted for travel, carried together with the connector's own
@@ -19,10 +20,16 @@ import java.util.Objects;
  * is written as a key rather than as text. Carrying both is what lets each side have the one it needs
  * without asking the other to give its up.
  *
- * <p><b>{@code origin} is deliberately untyped.</b> The type it holds belongs to the connector contract,
- * which one module owns and no other may name; a field declared as that type here would pull the whole
- * contract into the kernel and into every ring above it. What is in there is only ever read back by the
- * module that put it in, which knows what it is.
+ * <p><b>{@code origin} is deliberately untyped.</b> The type it holds belongs to the driver the source
+ * connector speaks, which one module owns and no other may name; a field declared as that type here
+ * would pull the whole contract into the kernel and into every ring above it. What is in there is only
+ * ever read back by the module that put it in, which knows what it is.
+ *
+ * <p><b>A carrier exists only where the driver's own object can cross a serializer.</b> Decode and encode
+ * sit on opposite sides of at least one — a distributed edge, the change-log store — so an object that
+ * cannot cross one would take the whole row down at the first hop rather than reach the target it was
+ * being kept for. Where there is nothing to carry, the portable value travels alone, which is also what
+ * a target of another kind is handed.
  *
  * <p><b>Every boundary that uses a row value <i>as a value</i> unwraps first</b>, through
  * {@link #unwrap} — comparing, keying, rendering, binding into an expression. Nothing warns when one
@@ -45,14 +52,23 @@ public record ConvertedValue(Object value, Object origin) implements Serializabl
      * met a connector conversion costs nothing to pass through this.
      */
     public static Object unwrap(Object value) {
-        if (value instanceof ConvertedValue carried) {
-            return unwrap(carried.value());
+        return unwrap(value, ConvertedValue::value);
+    }
+
+    /**
+     * The same walk, with each carrier replaced by what {@code carried} makes of it rather than by the
+     * value inside — for the one side that wants the object the value was converted from. Every other
+     * caller wants {@link #unwrap(Object)}, which is this with the value.
+     */
+    public static Object unwrap(Object value, Function<ConvertedValue, Object> carried) {
+        if (value instanceof ConvertedValue carrier) {
+            return unwrap(carried.apply(carrier), carried);
         }
         if (value instanceof Map<?, ?> map) {
             Map<Object, Object> unwrapped = new LinkedHashMap<>(map.size());
             boolean changed = false;
             for (Map.Entry<?, ?> entry : map.entrySet()) {
-                Object element = unwrap(entry.getValue());
+                Object element = unwrap(entry.getValue(), carried);
                 changed |= element != entry.getValue();
                 unwrapped.put(entry.getKey(), element);
             }
@@ -62,7 +78,7 @@ public record ConvertedValue(Object value, Object origin) implements Serializabl
             List<Object> unwrapped = new ArrayList<>(list.size());
             boolean changed = false;
             for (Object element : list) {
-                Object next = unwrap(element);
+                Object next = unwrap(element, carried);
                 changed |= next != element;
                 unwrapped.add(next);
             }
@@ -72,8 +88,13 @@ public record ConvertedValue(Object value, Object origin) implements Serializabl
     }
 
     /** One row with every value unwrapped, or {@code null} when the map is absent. */
-    @SuppressWarnings("unchecked")
     public static Map<String, Object> unwrapRow(Map<String, Object> row) {
-        return row == null ? null : (Map<String, Object>) unwrap(row);
+        return unwrapRow(row, ConvertedValue::value);
+    }
+
+    /** One row with each carrier replaced by what {@code carried} makes of it. */
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> unwrapRow(Map<String, Object> row, Function<ConvertedValue, Object> carried) {
+        return row == null ? null : (Map<String, Object>) unwrap(row, carried);
     }
 }
