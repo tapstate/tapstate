@@ -100,15 +100,16 @@ curated, worded by outcome, not by mechanism:
 | `reshaped-table` | Mirror a table, renamed / filtered / trimmed | as above, plus `map` and/or `filter` steps | `cdc`, `map`, `filter` |
 | `nested-json` | Assemble several tables into one object | one or more sources, one pipeline with a `nest` step, one view | `nest` |
 | `consolidated-table` | Consolidate the same table from several databases | one source per database, one pipeline with a `union` step, one view | `union` |
-| `blank` | Nothing generated - I will write it myself | an empty workspace directory | — |
+| `blank` | Skeleton files only - I will write it myself | one source and one pipeline, as skeletons with placeholder values | — |
 
 Rules the catalog follows, so that the next recipe added behaves like these:
 
 - **An id names what you end up with**, `<past-participle>-<noun>`, never how it is done.
   Internal type names (`nest`, `union`, `join`) are not ids.
 - **Every listed recipe runs today.** A capability that is not shipped yet does not appear
-  greyed out; it is added when it ships. `blank` is the deliberate exception — it produces
-  nothing to run, and sits last because it means "none of the above", not "start here".
+  greyed out; it is added when it ships. `blank` is the deliberate exception — its skeletons
+  carry placeholders that connect to nothing, so it is the one entry that is not `runnable`,
+  and it sits last because it means "none of the above", not "start here".
 - **Every recipe starts from an empty directory.** Recipes that add to an existing workspace
   are a different class; if one is ever added it declares that, and the picker does not offer
   it in an empty directory.
@@ -130,7 +131,7 @@ points:
     { "id": "reshaped-table",    "title": "Mirror a table, renamed / filtered / trimmed",     "runnable": true,  "uses": ["cdc", "map", "filter"] },
     { "id": "nested-json",       "title": "Assemble several tables into one object",          "runnable": true,  "uses": ["nest"] },
     { "id": "consolidated-table","title": "Consolidate the same table from several databases","runnable": true,  "uses": ["union"] },
-    { "id": "blank",             "title": "Nothing generated - I will write it myself",       "runnable": false, "uses": [] }
+    { "id": "blank",             "title": "Skeleton files only - I will write it myself",       "runnable": false, "uses": [] }
   ]
 }
 ```
@@ -151,7 +152,7 @@ and are not asked. Ids are suggested and taken on an empty reply.
 | `reshaped-table` | as `mirrored-table`, then: columns to keep or rename, columns to drop, an optional row filter. No script step — a transform that needs code is written by hand after `blank` or by editing the file |
 | `nested-json` | the root table (connector · connection · table · key), then one or more child tables (connector · connection · table · the columns that join it to the root · one-to-one or one-to-many) |
 | `consolidated-table` | the table name once, then two or more databases (connector · connection) that hold it |
-| `blank` | nothing beyond the workspace directory |
+| `blank` | nothing — the skeletons are written as they stand, for you to edit |
 
 **What the generated files are called, and what is assumed** — fixed here so scripts and goldens
 can rely on it:
@@ -223,9 +224,23 @@ The last thing printed, in this order:
 4. **One line saying an AI assistant can take it from here** — pointing at the published
    documentation, never at a specific integration.
 
-`blank` prints the same shape with an empty file list and says so in words. `-o json` and
+A recipe the catalog marks `runnable: false` — today only `blank` — prints the same shape and
+adds one line after its file list saying its files are skeletons to fill in. `-o json` and
 `-o yaml` return the created files and their roles as structured fields and carry none of
 the prose.
+
+### What a skeleton must satisfy
+
+**A skeleton validates as written.** `tapstate validate` on a freshly written `blank` workspace
+passes: the placeholders are values of the right shape (`your_database`, `your_table`), not gaps,
+and the pipeline's `view.from` names the table its source declares, so the reference closure
+resolves. This is pinned rather than left to taste — the summary's own first next step is
+`tapstate validate`, and the one recipe whose whole purpose is a clean starting point must not
+open with a list of errors.
+
+**A skeleton does not connect.** The placeholder host resolves to nothing, so `tapstate up` on an
+unedited skeleton fails at the connection test with the ordinary actionable error. That is the
+difference `runnable: false` records: valid to parse, not ready to run.
 
 ## `tapstate up`
 

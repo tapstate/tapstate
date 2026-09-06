@@ -29,7 +29,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NewGuidedTest {
 
     private static final URI DEFAULT_SERVER = URI.create("http://127.0.0.1:8080");
-    private static final String BLANK = "Nothing generated - I will write it myself";
+    private static final String BLANK = "Skeleton files only - I will write it myself";
 
     private static final List<String> TITLES = List.of(
             "Try it with sample data",
