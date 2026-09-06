@@ -120,7 +120,12 @@ jobs:
             # still pins the release before it, and a leg that reads both from the tag runs an older
             # release consistently and passes. It announced "the published release v0.4.1" and ran
             # 0.3.0, on the same run, two lines apart, while the published one-liner could not log in.
-            curl -fsSL https://install.tapstate.dev/ -o "$script"
+            #
+            # /demo, not the root: the root installs the CLI and nothing else, and the demo has its
+            # own name. The CLI_VERSION read below is what refuses the installer if a deploy ever
+            # routes the root here again -- the installer pins PINNED_VERSION, so the read comes back
+            # empty and the leg stops rather than running the wrong script.
+            curl -fsSL https://install.tapstate.dev/demo -o "$script"
             curl -fsSL "$raw/deploy/quickstart/docker-compose.yml" -o "$RUNNER_TEMP/script/compose.yml"
             compose="$RUNNER_TEMP/script/compose.yml"
             echo "leg: the published release $tag -- script from the install site, assets from that tag"
