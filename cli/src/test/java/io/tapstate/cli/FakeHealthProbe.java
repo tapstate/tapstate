@@ -1,18 +1,32 @@
 package io.tapstate.cli;
 
 import java.net.URI;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
- * A control plane that answers the health probe with a fixed verdict and remembers what was probed.
- * Every other call fails the test: the guided first run has no business talking to the server beyond
- * the probe, so a second call is a defect, not something to stub.
+ * A control plane for the guided first run: it answers the health probe with a verdict a test can
+ * flip, and the sign-in that follows a healthy answer - issuer discovery and the login itself, with
+ * whatever outcome the test scripted (a saved-session success by default). It remembers what was
+ * probed and every login attempted, so a test can assert the order and the credentials. Every other
+ * call fails the test: the first run has no business talking to the server beyond these, so another
+ * call is a defect, not something to stub.
  */
 final class FakeHealthProbe implements ControlPlaneClient {
-    private final boolean healthy;
+
+    static final String ISSUER = "urn:tapstate:cluster:test-cluster";
+
+    /** What the probe answers; a test flips it when the fake stack it scripted "comes up". */
+    boolean healthy;
+    /** When set, only a server on this host answers the probe, whatever {@link #healthy} says. */
+    String healthyHost;
     final List<URI> probed = new ArrayList<>();
+    /** Every login attempted, as {@code <username>:<password>}, in order. */
+    final List<String> logins = new ArrayList<>();
+    /** What a login is answered with; null means a success carrying a persistent session. */
+    LoginOutcome loginOutcome;
 
     FakeHealthProbe(boolean healthy) {
         this.healthy = healthy;
@@ -21,7 +35,25 @@ final class FakeHealthProbe implements ControlPlaneClient {
     @Override
     public boolean isHealthy(URI baseUrl) {
         probed.add(baseUrl);
-        return healthy;
+        return healthyHost != null ? healthyHost.equals(baseUrl.getHost()) : healthy;
+    }
+
+    @Override
+    public DiscoveryOutcome discover(URI baseUrl) {
+        return new DiscoveryOutcome.Discovered(ISSUER, "test-cluster", "tapstate/v1",
+                List.of("password", "machine_token"));
+    }
+
+    @Override
+    public LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
+        logins.add(username + ":" + password);
+        if (loginOutcome != null) {
+            return loginOutcome;
+        }
+        Instant now = Instant.now();
+        return new LoginOutcome.Success("jwt-first-run", now.plusSeconds(900), ISSUER, username,
+                List.of("read", "write"), "tss_s01.first-run-secret",
+                now.plusSeconds(2_592_000), now.plusSeconds(7_776_000));
     }
 
     @Override public String serverVersion(URI baseUrl) { throw new AssertionError(); }

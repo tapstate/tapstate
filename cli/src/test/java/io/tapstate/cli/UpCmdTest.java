@@ -160,6 +160,27 @@ class UpCmdTest {
         assertThat(r.out()).contains("State: running\n").doesNotContain("nothing to do");
     }
 
+    @Test
+    void theSessionAGuidedNewSignedInWithIsReusedWithoutAnyCredentialFlag(@TempDir Path home, @TempDir Path ws) {
+        // the first run signs in through the guided entry; no session is written by hand here
+        NewGuidedTest.Run first = NewGuidedTest.run(home, new ScriptedPrompter(), new NewGuidedTest.Fakes(true),
+                NewGuidedTest.PASSWORD_IN_ENV,
+                "new", "mirrored-table", "--yes", "--connector", "mysql",
+                "--set", "host=db", "--set", "username=u", "--set", "password=s",
+                "--table", "orders", "--view", "orders_view", "-w", ws.toString());
+        assertThat(first.code()).as(first.all()).isZero();
+        FakeUpControlPlane client = new FakeUpControlPlane();
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isZero();
+        assertThat(r.err()).isEmpty();
+        // the session the first run saved is the one presented, and the stages ran on it
+        assertThat(client.exchanged).containsExactly("tss_s01.first-run-secret");
+        assertThat(client.calls).startsWith("isHealthy", "connectorList").endsWith("status orders_sync");
+        assertThat(r.out()).contains("State: running\n");
+    }
+
     // ---- .env ---------------------------------------------------------------------------------------
 
     @Test
@@ -332,6 +353,8 @@ class UpCmdTest {
      */
     static final class FakeUpControlPlane implements ControlPlaneClient {
         final List<String> calls = new ArrayList<>();
+        /** Every session token presented for exchange, in order. */
+        final List<String> exchanged = new ArrayList<>();
         /** The drafts each apply carried, kept whole: what reaches the wire is the thing under test. */
         final List<List<LocalDraft>> applied = new ArrayList<>();
         List<String> registeredConnectors = List.of("mysql", "postgres");
@@ -365,6 +388,7 @@ class UpCmdTest {
 
         @Override
         public SessionExchangeOutcome exchangeSession(URI baseUrl, String sessionToken) {
+            exchanged.add(sessionToken);
             return new SessionExchangeOutcome.Success("jwt-resumed", NOW.plusSeconds(900), ISSUER, "alice",
                     List.of("read", "write"));
         }
