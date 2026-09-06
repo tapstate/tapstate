@@ -20,6 +20,12 @@ target: https://tapstate.dev/docs/quickstart-online
 > installer names what the build expects and continues, and whether it runs from there
 > is yours to own.
 
+> **If you just want to see it run.** The guided path is two commands after installing
+> the CLI — `tapstate new`, then `tapstate up` — and is written up in
+> [First run](first-run/README.md). The one-line demo that brings up this page's whole
+> stack is `curl -sSL https://install.tapstate.dev/demo | sh`. This page is the same
+> flow by hand, for when you want to see each verb.
+
 What you'll do: bring up a Docker Compose stack — databases, the server, and the
 first-admin bootstrap all seeded and started together — then drive two sources through
 one pipeline from the CLI, so that rows from two different database engines are assembled
@@ -41,7 +47,7 @@ the demo workspace, brings the stack up, and runs the pipeline — then prints t
 target row count and the commands to drive CDC and tear down:
 
 ```sh
-curl -sSL https://install.tapstate.dev | sh
+curl -sSL https://install.tapstate.dev/demo | sh
 ```
 
 To read the script before running it, download it into a directory of your own
@@ -49,7 +55,7 @@ first — it then works right there:
 
 ```sh
 mkdir tapstate-demo && cd tapstate-demo
-curl -sSL https://install.tapstate.dev -o quickstart.sh
+curl -sSL https://install.tapstate.dev/demo -o quickstart.sh
 sh quickstart.sh
 ```
 
