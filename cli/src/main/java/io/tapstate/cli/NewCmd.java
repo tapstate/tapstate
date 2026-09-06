@@ -123,6 +123,49 @@ final class NewCmd implements Callable<Integer> {
             description = "Id of the view the recipe writes (default: the table name).")
     String view;
 
+    @Option(names = "--keep", paramLabel = "COLS",
+            description = "Columns to keep, comma-separated (reshaped-table recipe; default: all).")
+    String keep;
+
+    @Option(names = "--rename", paramLabel = "OLD=NEW[,...]",
+            description = "Columns to rename, old=new comma-separated (reshaped-table recipe).")
+    String rename;
+
+    @Option(names = "--drop", paramLabel = "COLS",
+            description = "Columns to drop, comma-separated (reshaped-table recipe).")
+    String drop;
+
+    @Option(names = "--where", paramLabel = "EXPR",
+            description = "Row filter as a CEL expression, e.g. after.region == 'US' (reshaped-table recipe).")
+    String where;
+
+    @Option(names = "--root", paramLabel = "TABLE",
+            description = "The root table (nested-json recipe).")
+    String root;
+
+    @Option(names = "--key", paramLabel = "COL",
+            description = "Key column of the root table (nested-json recipe; default: id).")
+    String key;
+
+    @Option(names = "--child", paramLabel = "SPEC",
+            description = "A child table as <table>:<childcol>=<rootcol>[:array|object][:<path>] "
+                    + "(nested-json recipe; repeatable).")
+    List<String> children = new ArrayList<>();
+
+    @Option(names = "--child-connector", paramLabel = "ID",
+            description = "Connector of the database the child tables sit in, when it is not the root's "
+                    + "(nested-json recipe).")
+    String childConnector;
+
+    @Option(names = "--child-set", paramLabel = "KEY=VALUE",
+            description = "A connection entry of the child tables' database, when it is not the root's "
+                    + "(nested-json recipe; repeatable).")
+    Map<String, String> childSet = new LinkedHashMap<>();
+
+    @Option(names = "--db", paramLabel = "CONNECTOR[,KEY=VALUE...]",
+            description = "One database holding the table (consolidated-table recipe; repeatable, at least two).")
+    List<String> databases = new ArrayList<>();
+
     @Option(names = "--out", paramLabel = "DIR",
             description = "Write the artifact flat into this exact directory, bypassing the workspace layout.")
     String out;
@@ -165,6 +208,12 @@ final class NewCmd implements Callable<Integer> {
         }
         if (table != null || view != null) {
             err.println("new: --table/--view are only valid for the guided first run (new <recipe>)");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        if (hasRecipeShapeFlags()) {
+            err.println("new: --keep/--rename/--drop/--where/--root/--key/--child/--child-connector/--child-set/--db"
+                    + " are only valid for the guided first run (new <recipe>)");
             err.flush();
             return EXIT_USAGE;
         }
@@ -230,6 +279,12 @@ final class NewCmd implements Callable<Integer> {
         return kind == null && !hasScaffoldingFlags() && guidedInteractive();
     }
 
+    /** Whether any flag that only one of the shaped recipes reads was given. */
+    private boolean hasRecipeShapeFlags() {
+        return keep != null || rename != null || drop != null || where != null || root != null || key != null
+                || !children.isEmpty() || childConnector != null || !childSet.isEmpty() || !databases.isEmpty();
+    }
+
     /** Whether any flag that shapes a single artifact was given; {@code -w} and {@code -o} are not ones. */
     private boolean hasScaffoldingFlags() {
         return type != null || connector != null || id != null || mode != null || !config.isEmpty()
@@ -261,11 +316,6 @@ final class NewCmd implements Callable<Integer> {
             err.flush();
             return EXIT_USAGE;
         }
-        if (recipe != null && !RecipeRun.available(recipe)) {
-            err.println("new: " + RecipeRun.notAvailable(recipe).getMessage());
-            err.flush();
-            return EXIT_USAGE;
-        }
         URI serverUrl = null;
         if (server != null) {
             serverUrl = GuidedNew.serverUrl(server);
@@ -282,7 +332,9 @@ final class NewCmd implements Callable<Integer> {
                 : new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home"))));
         // an injected probe belongs to whoever injected it; only the one opened here is closed here
         ControlPlaneClient probe = controlPlane != null ? controlPlane : new HttpControlPlaneClient();
-        RecipeRun.Flags flags = new RecipeRun.Flags(connector, config, table, view);
+        RecipeRun.Flags flags = new RecipeRun.Flags(connector, config, table, view,
+                new RecipeRun.Flags.Reshape(keep, rename, drop, where),
+                new RecipeRun.Flags.Nested(root, key, children, childConnector, childSet), databases);
         try {
             RecipeRun.Result result = guidedInteractive()
                     ? runGuided(contexts, probe, prose, serverUrl, flags)
@@ -319,11 +371,8 @@ final class NewCmd implements Callable<Integer> {
         }
     }
 
-    /** The chosen recipe, run; one the picker landed on that is not available yet is refused by name. */
+    /** The chosen recipe, run. */
     private RecipeRun.Result runRecipe(String chosen, Prompter asker, RecipeRun.Flags flags) {
-        if (!RecipeRun.available(chosen)) {
-            throw RecipeRun.notAvailable(chosen);
-        }
         return RecipeRun.run(chosen, workspace.root(), asker, flags, force);
     }
 

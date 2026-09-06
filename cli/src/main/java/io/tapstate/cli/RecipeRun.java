@@ -12,15 +12,12 @@ import java.util.Map;
  * through the all-or-none writer. Every recipe lands on the same {@link Result}, so {@code new} has one
  * thing to report whichever recipe ran.
  *
- * <p>Three recipes run today. {@code sample} copies the bundled demo files verbatim - the same bytes
- * {@code demo} writes, through the same writer, so the two cannot drift. {@code blank} writes nothing
- * and makes the directory. {@code mirrored-table} asks its questions and renders two artifacts. The
- * rest of the catalog is refused by name until it is implemented.
+ * <p>{@code sample} copies the bundled demo files verbatim - the same bytes {@code demo} writes,
+ * through the same writer, so the two cannot drift. {@code blank} writes nothing and makes the
+ * directory. The other four ask their questions - or read them from {@link Flags} - and render their
+ * sources and pipeline through the canonical writer.
  */
 final class RecipeRun {
-
-    /** The recipes that write a workspace today; the catalog's others are refused by name. */
-    static final List<String> AVAILABLE = List.of("sample", "mirrored-table", "blank");
 
     /** A request that cannot be carried out as given - a missing answer with no prompter to ask. */
     static final class Usage extends RuntimeException {
@@ -38,19 +35,24 @@ final class RecipeRun {
     /** What a recipe left behind. */
     record Result(String recipe, Path root, List<Created> files) {}
 
-    /** The answers a script supplies instead of being asked. */
-    record Flags(String connector, Map<String, String> set, String table, String view) {}
+    /**
+     * The answers a script supplies instead of being asked. The first four are shared by the table
+     * recipes; the rest belong to one recipe each and are ignored by the others.
+     *
+     * @param databases the {@code --db} specs of {@code consolidated-table}
+     */
+    record Flags(String connector, Map<String, String> set, String table, String view,
+                 Reshape reshape, Nested nested, List<String> databases) {
+
+        /** {@code reshaped-table}'s four answers, each null when not given. */
+        record Reshape(String keep, String rename, String drop, String where) {}
+
+        /** {@code nested-json}'s answers: the root, its key, the {@code --child} specs, and the children's database when it is not the root's. */
+        record Nested(String root, String key, List<String> children, String childConnector,
+                      Map<String, String> childSet) {}
+    }
 
     private RecipeRun() {
-    }
-
-    static boolean available(String recipeId) {
-        return AVAILABLE.contains(recipeId);
-    }
-
-    /** Temporary, while the rest of the catalog is being built: a refusal by name, before anything is written. */
-    static Usage notAvailable(String recipeId) {
-        return new Usage("recipe '" + recipeId + "' is not available yet");
     }
 
     /**
@@ -66,10 +68,31 @@ final class RecipeRun {
                 TapstateCatalog catalog = TapstateCatalog.load();
                 MirroredTableRecipe.Answers answers = prompter != null
                         ? MirroredTableRecipe.ask(prompter, flags, catalog)
-                        : MirroredTableRecipe.fromFlags(flags.connector(), flags.set(), flags.table(), flags.view(), catalog);
+                        : MirroredTableRecipe.fromFlags(recipeId, flags, catalog);
                 yield MirroredTableRecipe.plan(answers, catalog, new WorkspaceFiles(root));
             }
-            default -> throw new IllegalStateException("recipe not available: " + recipeId);
+            case "reshaped-table" -> {
+                TapstateCatalog catalog = TapstateCatalog.load();
+                ReshapedTableRecipe.Answers answers = prompter != null
+                        ? ReshapedTableRecipe.ask(prompter, flags, catalog)
+                        : ReshapedTableRecipe.fromFlags(flags, catalog);
+                yield ReshapedTableRecipe.plan(answers, catalog, new WorkspaceFiles(root));
+            }
+            case "nested-json" -> {
+                TapstateCatalog catalog = TapstateCatalog.load();
+                NestedJsonRecipe.Answers answers = prompter != null
+                        ? NestedJsonRecipe.ask(prompter, flags, catalog)
+                        : NestedJsonRecipe.fromFlags(flags, catalog);
+                yield NestedJsonRecipe.plan(answers, catalog, new WorkspaceFiles(root));
+            }
+            case "consolidated-table" -> {
+                TapstateCatalog catalog = TapstateCatalog.load();
+                ConsolidatedTableRecipe.Answers answers = prompter != null
+                        ? ConsolidatedTableRecipe.ask(prompter, flags, catalog)
+                        : ConsolidatedTableRecipe.fromFlags(flags, catalog);
+                yield ConsolidatedTableRecipe.plan(answers, catalog, new WorkspaceFiles(root));
+            }
+            default -> throw new IllegalStateException("not a recipe: " + recipeId);
         };
         List<WorkspaceWrite.Written> written = WorkspaceWrite.write(
                 root, outputs.stream().map(Output::file).toList(), force, CliError.ARTIFACT_EXISTS);
