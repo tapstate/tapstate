@@ -65,13 +65,23 @@ The local development stack, when the default has to start one:
 
 - is a **pinned** version of the server and its managed store, fetched and verified from a
   single configurable artifact source (the release location by default);
-- comes with **every official connector pre-registered**, so a recipe against your own
-  MySQL / PostgreSQL / MongoDB can be applied without hunting for a jar;
+- comes with the **published connectors pre-registered** — today the MySQL, PostgreSQL and
+  MongoDB engine connectors, fetched from the same release location the demo uses (override
+  with `TAPSTATE_CONNECTORS_URL`); the other official ids have no published artifact yet and
+  are registered by hand with `register` when they ship;
 - contains **no sample data** — that is what the demo is for;
 - is started **idempotently**: a second `new` finds the running one and does not start a
   second;
+- lives in `~/.tapstate/local-stack/` (the compose file, a `.env` holding the generated
+  admin password, the staged connector jars); the first start pulls images and says so;
 - ends by printing where the stack lives on disk and the one command that stops it. There
   are no `stop` / `status` / `upgrade` verbs for it in this CLI, and there will not be.
+
+**Both answers sign in.** The local stack's admin is created by the stack and signed in with
+the generated password automatically. A server you point at asks `Username` (default `admin`)
+and `Password`; non-interactively, pass `--user` and put the password in `TAPSTATE_PASSWORD`.
+A remote server must be `https://` — plaintext is refused for anything but loopback. The
+session is saved, so `up` needs no credential.
 
 **Non-interactive runs never start containers silently.** With `--yes` and nothing listening
 on the default port, `new` stops with a named error unless `--start-local` was passed
