@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * One entry of the guided first-run catalog: a recipe is what {@code new <id>} takes, worded by the
@@ -33,6 +34,11 @@ record Recipe(String id, String title, boolean runnable, List<String> uses) {
             new Recipe("consolidated-table", "Consolidate the same table from several databases", true,
                     List.of("union")),
             new Recipe("blank", "Nothing generated - I will write it myself", false, List.of()));
+
+    /** The recipe with this id, or empty when the catalog has none — the caller says how that is refused. */
+    static Optional<Recipe> byId(String id) {
+        return CATALOG.stream().filter(recipe -> recipe.id().equals(id)).findFirst();
+    }
 
     /**
      * The catalog as the ordered tree the machine writers take: a top-level {@code recipes} array whose

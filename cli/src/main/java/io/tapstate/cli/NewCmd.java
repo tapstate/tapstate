@@ -25,10 +25,12 @@ import picocli.CommandLine.Help.Ansi;
 import picocli.CommandLine.Mixin;
 import picocli.CommandLine.Model.CommandSpec;
 import picocli.CommandLine.Option;
+import picocli.CommandLine.Parameters;
 import picocli.CommandLine.Spec;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -39,10 +41,14 @@ import java.util.concurrent.Callable;
 
 /**
  * {@code new} — the catalog-driven scaffolding wizard. One entry, two paths that produce the same
- * canonical artifact: an interactive prompt flow (bare {@code new} at a terminal) and a
+ * canonical artifact: an interactive prompt flow ({@code new --kind} at a terminal) and a
  * non-interactive flag-supplied flow (scripting / AI). Both feed a shared output contract: write
  * {@code <id>.tap.yml}, refuse to clobber unless {@code --force}, {@code --dry-run} previews on
  * stdout, and {@code -o json|yaml} reports a structured result envelope.
+ *
+ * <p>Bare {@code new} at a terminal, and {@code new <recipe>}, are the guided first run instead
+ * ({@code docs/first-run/README.md}): which server, then which outcome. {@link GuidedNew} carries
+ * that flow; this class only decides which of the two entries a given invocation is.
  */
 @Command(name = "new", mixinStandardHelpOptions = true,
         description = "Scaffold a new artifact (source, pipeline, transform, view or serve) as a canonical *.tap.yml.")
@@ -59,9 +65,18 @@ final class NewCmd implements Callable<Integer> {
     @Mixin
     WorkspaceOption workspace;
 
-    @Option(names = {"-y", "--non-interactive"},
+    @Parameters(index = "0", arity = "0..1", paramLabel = "RECIPE",
+            description = "Recipe id from `new --list` (guided first run); omit to be asked at a terminal.")
+    String recipe;
+
+    @Option(names = {"-y", "--yes", "--non-interactive"},
             description = "Never prompt; take every answer from flags (scripting / AI).")
     boolean nonInteractive;
+
+    @Option(names = "--server", paramLabel = "URL",
+            description = "Tapstate server to register and bind the workspace to (guided first run; "
+                    + "default " + GuidedNew.DEFAULT_SERVER_TEXT + ").")
+    String server;
 
     @Option(names = "--list",
             description = "Print the recipe catalog (id and title) instead of scaffolding; -o json|yaml for scripts.")
@@ -119,11 +134,25 @@ final class NewCmd implements Callable<Integer> {
     /** Test seam: an injected prompter forces the interactive path; production opens a JLine one. */
     Prompter prompter;
 
+    /** Test seam: the context store the guided flow binds through; production uses the home directory's. */
+    ContextManager contextManager;
+
+    /** Test seam: the health probe the guided flow asks before binding; production opens an HTTP one. */
+    ControlPlaneClient controlPlane;
+
     @Override
     public Integer call() {
         PrintWriter err = CliIo.err(spec);
         if (list) {
             return callList(err);
+        }
+        if (isGuided()) {
+            return callGuided(err);
+        }
+        if (server != null) {
+            err.println("new: --server is only valid for the guided first run (bare new, or new <recipe>)");
+            err.flush();
+            return EXIT_USAGE;
         }
         String resolved = kind == null ? "source" : kind;
         if (type != null && !"transform".equals(resolved)) {
@@ -172,6 +201,104 @@ final class NewCmd implements Callable<Integer> {
         }
         o.flush();
         return 0;
+    }
+
+    /**
+     * The guided first run is what a recipe id names, and what bare {@code new} means when there is
+     * someone to ask and no artifact flag has already picked the single-resource wizard. Bare {@code new}
+     * with nobody to ask keeps falling through to the source wizard's usage message, so a script that
+     * forgot its flags is told which ones.
+     */
+    private boolean isGuided() {
+        if (recipe != null) {
+            return true;
+        }
+        return kind == null && !hasScaffoldingFlags() && guidedInteractive();
+    }
+
+    /** Whether any flag that shapes a single artifact was given; {@code -w} and {@code -o} are not ones. */
+    private boolean hasScaffoldingFlags() {
+        return type != null || connector != null || id != null || mode != null || !config.isEmpty()
+                || !sources.isEmpty() || !syncTo.isEmpty() || out != null || force || dryRun;
+    }
+
+    /**
+     * Unlike the wizards, an injected prompter does not force questions here: {@code --yes} means never
+     * prompt, whatever is available to prompt with, because a script's promise is exactly that.
+     */
+    private boolean guidedInteractive() {
+        return !nonInteractive && (prompter != null || System.console() != null);
+    }
+
+    private int callGuided(PrintWriter err) {
+        if (kind != null || hasScaffoldingFlags()) {
+            err.println("new: a recipe cannot be combined with --kind/--type/--connector/--id/--mode/--set"
+                    + "/--source/--sync-to/--out/--force/--dry-run");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        if (recipe != null && Recipe.byId(recipe).isEmpty()) {
+            err.println("new: unknown recipe '" + recipe + "'; run 'new --list' to see the catalog");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        URI serverUrl = null;
+        if (server != null) {
+            serverUrl = GuidedNew.serverUrl(server);
+            if (serverUrl == null) {
+                err.println("new: --server must be an http(s) URL, e.g. " + GuidedNew.DEFAULT_SERVER_TEXT);
+                err.flush();
+                return EXIT_USAGE;
+            }
+        }
+        // prose goes to the terminal only when a person is reading it; the machine envelopes stay clean
+        PrintWriter prose = output == OutputFormat.TEXT && guidedInteractive() ? CliIo.out(spec) : null;
+        ContextManager contexts = contextManager != null
+                ? contextManager
+                : new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home"))));
+        // an injected probe belongs to whoever injected it; only the one opened here is closed here
+        ControlPlaneClient probe = controlPlane != null ? controlPlane : new HttpControlPlaneClient();
+        try {
+            String selected = guidedInteractive()
+                    ? runGuided(contexts, probe, prose, serverUrl)
+                    : new GuidedNew(contexts, probe, null, prose).run(workspace.root(), recipe, serverUrl);
+            emitSelected(selected);
+            return 0;
+        } catch (TapstateException e) {
+            return emitDiagnostic(e);
+        } catch (IOException e) {
+            err.println("new: cannot set up the workspace: " + e.getMessage());
+            err.flush();
+            return EXIT_USAGE;
+        } finally {
+            if (controlPlane == null) {
+                probe.close();
+            }
+        }
+    }
+
+    private String runGuided(ContextManager contexts, ControlPlaneClient probe, PrintWriter prose, URI serverUrl)
+            throws IOException {
+        if (prompter != null) {
+            return new GuidedNew(contexts, probe, prompter, prose).run(workspace.root(), recipe, serverUrl);
+        }
+        try (JLinePrompter jline = JLinePrompter.system()) {
+            return new GuidedNew(contexts, probe, jline, prose).run(workspace.root(), recipe, serverUrl);
+        }
+    }
+
+    /** The chosen recipe, and nothing else yet: the recipe's own questions and its files come later. */
+    private void emitSelected(String recipeId) {
+        PrintWriter o = CliIo.out(spec);
+        Map<String, Object> env = new LinkedHashMap<>();
+        env.put("status", "selected");
+        env.put("recipe", recipeId);
+        switch (output) {
+            case JSON -> o.println(JsonOut.write(env));
+            case YAML -> o.println(YamlOut.write(env));
+            default -> o.println("selected " + recipeId);
+        }
+        o.flush();
     }
 
     private int callSource(PrintWriter err) {
