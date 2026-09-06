@@ -106,7 +106,10 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/DataBrowserCollectionsIT.java", 1L),
             entry("test/java/io/tapstate/e2e/DataBrowserDottedFieldIT.java", 1L),
             entry("test/java/io/tapstate/e2e/TailIT.java", 1L),
-            entry("test/java/io/tapstate/e2e/WatchRedrawsIT.java", 1L));
+            entry("test/java/io/tapstate/e2e/WatchRedrawsIT.java", 1L),
+            // The guided first run's own bounded read of the view its recipe materializes into: one
+            // named sleep() called from a deadline loop whose count condition decides the outcome.
+            entry("test/java/io/tapstate/e2e/GuidedFirstRunIT.java", 1L));
 
     private static final Pattern SLEEP = Pattern.compile(
             "Thread\\s*\\.\\s*sleep\\s*\\(|TimeUnit\\s*\\.\\s*[A-Z_]+\\s*\\.\\s*sleep\\s*\\(");

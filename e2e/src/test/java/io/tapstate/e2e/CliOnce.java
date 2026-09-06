@@ -42,10 +42,20 @@ final class CliOnce {
 
     /** Launches the CLI with its password supplied outside the command line. */
     static Run runWithPassword(String password, String... args) {
-        List<String> command = new ArrayList<>(List.of(
-                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                "-cp", classpath(),
-                "io.tapstate.cli.Cli"));
+        return runWithPassword(password, List.of(), args);
+    }
+
+    /**
+     * The same, with options for the JVM the CLI runs in, placed ahead of the class name so they are
+     * the JVM's and never the CLI's. What a test mostly needs here is {@code -Duser.home}: the saved
+     * servers, the saved sign-ins and the local stack all live under the home directory, and a test
+     * that lets the CLI find the real one reads and writes whoever is running the build.
+     */
+    static Run runWithPassword(String password, List<String> jvmArgs, String... args) {
+        List<String> command = new ArrayList<>();
+        command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+        command.addAll(jvmArgs);
+        command.addAll(List.of("-cp", classpath(), "io.tapstate.cli.Cli"));
         command.addAll(List.of(args));
         try {
             Path outFile = Files.createTempFile("cli-out", ".txt");
