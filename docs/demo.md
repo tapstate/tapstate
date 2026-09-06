@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/demo
+---
+
 # The demo, shot by shot
 
 This is the recording's script and its audit trail. One row per shot: what is typed, what a viewer
@@ -44,7 +50,7 @@ Timestamps are filled in from the finished recording; they are also what the REA
 
 | # | At | Typed | On screen | Evidence for |
 |---|---|---|---|---|
-| 1 | 00:00 | `curl -sSL https://install.tapstate.dev \| sh` | The stack comes up: two source engines, the server, and the managed store. Ends with a line naming the orders assembled and the shipments inside them | Milestone criterion 2 — a clean machine reaches a reproducible cross-source demo from one command |
+| 1 | 00:00 | `curl -sSL https://install.tapstate.dev/demo \| sh` | The stack comes up: two source engines, the server, and the managed store. Ends with a line naming the orders assembled and the shipments inside them | Milestone criterion 2 — a clean machine reaches a reproducible cross-source demo from one command |
 | 2 | 00:12 | `tapstate -w work` then `connect` / `login` | A prompt. **No database URI is typed, here or anywhere later** | Criterion 3 — the CLI reads live state without being handed a store address |
 | 3 | 00:18 | `show collections` | Three lines: the two source tables, and `views.order_state`. **One** collection in the store — no intermediate, no staging collection — and no address was typed for any of the three | Criterion 3, positive half (the negative half is the query plan's own case) |
 | 4 | 00:24 | `views.order_state.find({id:1})` | One order with its shipments **inside it** — a document assembled from two different database engines | Criterion 2 — the assembly, not two syncs standing side by side |
@@ -53,7 +59,7 @@ Timestamps are filled in from the finished recording; they are also what the REA
 | 7 | 00:48 | *(second pane)* `UPDATE orders SET customer=… ` in MySQL | The same object's own column flips, and the array stays where it is | Criterion 2 — both directions ripple, and neither rebuild drops the other's half |
 | 8 | 00:56 | *(second pane)* `DELETE FROM shipments WHERE id=7` in PostgreSQL | The array shrinks back to what it was, in the same object | Criterion 2 — a removal crosses too, which is the half a growing array never shows |
 | 9 | 01:12 | An MCP client asking "current state of order 1?" | The agent answers out of the same materialized object, through `data_browser_collections` / `data_browser_find` | Criterion 6 — the state-query MCP reaches the same object |
-| 10 | 01:20 | — | Closing frame: what this was, and the one-line install again | — |
+| 10 | 01:20 | — | Closing frame: what this was, and the one-line demo command again | — |
 
 ## Which shots a test is watching, and which are only watched here
 

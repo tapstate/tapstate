@@ -22,7 +22,7 @@ code and is read by running it.
 | Start here | |
 |---|---|
 | [First run](first-run/) | The guided path: install the CLI, answer a few questions, and bring a workspace to running - the contract every step is held to. |
-| [Quickstart](quickstart-online.md) | Bring up the stack and run a real MySQL to MongoDB sync, snapshot then CDC. |
+| [Quickstart](quickstart-online.md) | The full demo (`install.tapstate.dev/demo`): sample databases, the server, and a live object assembled from two engines - and the same flow by hand, verb by verb, as the reference for what the guided path does. |
 | [Running on your own databases](running-on-your-own-databases.md) | Run the server as a process on your machine, against a MySQL and a MongoDB you already have. |
 | [Tutorials](tutorials/) | Worked scenarios, each with its own sample data, run end to end. |
 
