@@ -74,7 +74,7 @@ class SinkAckMetaSupplierTest {
         SinkAckFactory factory = m -> (SinkAck) m.getUserContext().get(ACK_KEY);
 
         ProcessorMetaSupplier meta =
-                SinkProcessor.metaSupplier(() -> new RecordingWriter(), factory, ContiguousPrefix::new);
+                SinkProcessor.metaSupplier("sink", () -> new RecordingWriter(), factory, ContiguousPrefix::new);
         SinkProcessor sink = resolveOnMember(meta);
         sink.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext());
 
@@ -88,7 +88,7 @@ class SinkAckMetaSupplierTest {
 
     @Test
     void pins_the_ack_sink_vertex_to_a_single_instance_across_the_cluster() throws Exception {
-        ProcessorMetaSupplier meta = SinkProcessor.metaSupplier(
+        ProcessorMetaSupplier meta = SinkProcessor.metaSupplier("sink",
                 () -> new RecordingWriter(), member -> (chain, position) -> { }, ContiguousPrefix::new);
 
         assertThat(TotalParallelismOne.pins(meta, 3)).isTrue();
@@ -96,10 +96,10 @@ class SinkAckMetaSupplierTest {
 
     @Test
     void rejects_a_null_factory_or_frontier() {
-        assertThatThrownBy(() -> SinkProcessor.metaSupplier(
+        assertThatThrownBy(() -> SinkProcessor.metaSupplier("sink",
                 () -> new RecordingWriter(), null, ContiguousPrefix::new))
                 .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> SinkProcessor.metaSupplier(
+        assertThatThrownBy(() -> SinkProcessor.metaSupplier("sink",
                 () -> new RecordingWriter(), member -> (chain, position) -> { }, null))
                 .isInstanceOf(NullPointerException.class);
     }

@@ -108,33 +108,44 @@ public final class SinkProcessor extends AbstractProcessor {
     /**
      * A meta-supplier for a sink vertex that drives the writer the factory opens. The factory (not a
      * prebuilt writer) is what the DAG carries, so the writer is opened on the member that runs the
-     * vertex. The vertex is pinned to total parallelism one.
+     * vertex. The vertex is pinned to total parallelism one, on the member that owns {@code vertexName}.
+     *
+     * <p>Naming the member is half of a pair, and the other half is not optional: every edge into this
+     * vertex must be {@code distributed().allToOne(vertexName)}. Pinned says there is one processor;
+     * reachable says the items get to it. A member with no processor of this vertex answers input with an
+     * {@code IllegalStateException} the moment the first event lands, which on one member never happens -
+     * the only processor there is the local one - so nothing short of a real cluster tells the two apart.
      */
-    public static ProcessorMetaSupplier metaSupplier(SupplierEx<? extends SinkWriter> writerFactory) {
+    public static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory) {
+        Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         SupplierEx<Processor> supplier =
                 () -> new SinkProcessor(writerFactory.get(), DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE);
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
     /**
      * A meta-supplier for a sink vertex that also advances a durable sink-ack watermark. The ack is carried
      * as a {@link SinkAckFactory}, not a prebuilt {@link SinkAck}: the durable store it writes is not
      * serializable, so only the factory travels on the DAG and the store is resolved on the member that runs
-     * the vertex. The vertex is pinned to total parallelism one and keeps a single write in flight, the
+     * the vertex. The vertex is pinned to total parallelism one - on the member that owns {@code vertexName},
+     * which every edge into it must route to with {@code allToOne} - and keeps a single write in flight, the
      * order-preserving contract every shape of frontier below it depends on.
      *
      * <p>{@code frontierFactory} settles which shape that is, and it is settled here rather than run-time:
      * how far a sink may say a chain has landed depends on whether what reaches it is one chain in order or
      * an assembly of several, and that is a property of the graph that was compiled, not of any event.
      */
-    static ProcessorMetaSupplier metaSupplier(SupplierEx<? extends SinkWriter> writerFactory,
+    static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory) {
+        Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         Objects.requireNonNull(sinkAckFactory, "sinkAckFactory");
         Objects.requireNonNull(frontierFactory, "frontierFactory");
         return ProcessorMetaSupplier.forceTotalParallelismOne(
-                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory));
+                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory), vertexName);
     }
 
     /**
