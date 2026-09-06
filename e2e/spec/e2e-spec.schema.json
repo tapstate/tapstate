@@ -103,6 +103,14 @@
               "rows"
             ],
             "properties": {
+              "before_image": {
+                "type": "string",
+                "description": "Whether this table's source sends the row an update replaces. Absent means 'full', which is what a seeded table is arranged for; 'none' asks for the other one, which is what a change stream does unless it is configured otherwise.",
+                "enum": [
+                  "full",
+                  "none"
+                ]
+              },
               "rows": {
                 "type": "integer",
                 "description": "How many generated rows to lay down: ids 1..N, each with seq equal to its id.",
@@ -117,6 +125,14 @@
               "values"
             ],
             "properties": {
+              "before_image": {
+                "type": "string",
+                "description": "Whether this table's source sends the row an update replaces. Absent means 'full', which is what a seeded table is arranged for; 'none' asks for the other one, which is what a change stream does unless it is configured otherwise.",
+                "enum": [
+                  "full",
+                  "none"
+                ]
+              },
               "values": {
                 "type": "array",
                 "description": "The rows themselves, when what they hold is the point.",
