@@ -185,6 +185,12 @@ the second the id was created in - so two rows written in the same second had id
 tell apart, while the same two rows were plainly distinct in a change. Nothing was ever lost on the
 wire; the two faces spelled the same value differently, and only one of them said the whole of it.
 
+A binary column is worth the same comparison, because it used to be worse than a disagreement: both
+faces printed a Java object's own text - an identity hash, which is not the value at all and differs
+between runs over the same bytes. It reads as base64 now, the same text `mongosh` prints, so a column
+here and the same column in a shell can be compared by eye. What each of a connector's own types
+looks like, and which conversions are lossy, is in [value shapes](../../connectors/value-shapes.md).
+
 **Look at this (3 of 4): close the terminal window - do not press `Ctrl-C`.** A `tail` holds a
 connector instance open for as long as it is streaming. `Ctrl-C` is the polite exit and is well
 covered; the case worth checking by hand is the impolite one, because that is what users actually do.
