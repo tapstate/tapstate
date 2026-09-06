@@ -63,7 +63,7 @@ class TransformDagRunTest {
 
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source", insertsSource(4, "orders"));
-        Vertex transform = dag.newVertex("transform", TransformProcessor.metaSupplier(keepEvenIds));
+        Vertex transform = dag.newVertex("transform", TransformProcessor.metaSupplier("transform", keepEvenIds));
         Vertex project = dag.newVertex("project",
                 Processors.mapP((Envelope event) -> (Integer) event.after().get("id")));
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP("out"));

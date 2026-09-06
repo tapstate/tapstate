@@ -8,6 +8,7 @@ import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * A vertex that passes every item on unchanged, and works out its own frontier while doing so. It is what
@@ -44,8 +45,8 @@ public final class PassthroughProcessor extends AbstractProcessor {
     }
 
     /** A meta-supplier for a passthrough that propagates no frontier, for a job built without one. */
-    public static ProcessorMetaSupplier metaSupplier() {
-        return metaSupplier(null, null);
+    public static ProcessorMetaSupplier metaSupplier(String vertexName) {
+        return metaSupplier(vertexName, null, null);
     }
 
     /**
@@ -55,17 +56,22 @@ public final class PassthroughProcessor extends AbstractProcessor {
      * disagreed would combine promises about different chains.
      *
      * <p>Pinned to total parallelism one, like the vertices either side of it: a gathering that re-laned
-     * events would break the order a sink downstream acks positions in.
+     * events would break the order a sink downstream acks positions in. The member it is pinned to is the
+     * one that owns {@code vertexName}, and every edge into it must be
+     * {@code distributed().allToOne(vertexName)} - pinned says there is one processor, reachable says the
+     * items get to it, and a member holding no processor of this vertex throws on the first event it is
+     * handed. One member cannot tell the two apart: there the only processor is the local one.
      */
-    public static ProcessorMetaSupplier metaSupplier(ChainAxes axes,
+    public static ProcessorMetaSupplier metaSupplier(String vertexName, ChainAxes axes,
             Map<Integer, List<String>> chainsByOrdinal) {
+        Objects.requireNonNull(vertexName, "vertexName");
         SupplierEx<Processor> supplier = axes == null
                 ? PassthroughProcessor::new
                 // Holding nothing back is the whole of this vertex's own contribution: what it may promise
                 // is exactly the lowest of what its edges promised.
                 : () -> new PassthroughProcessor(
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
     @Override
