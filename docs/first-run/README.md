@@ -90,7 +90,7 @@ curated, worded by outcome, not by mechanism:
 | `reshaped-table` | Mirror a table, renamed / filtered / trimmed | as above, plus `map` and/or `filter` steps | `cdc`, `map`, `filter` |
 | `nested-json` | Assemble several tables into one object | one or more sources, one pipeline with a `nest` step, one view | `nest` |
 | `consolidated-table` | Consolidate the same table from several databases | one source per database, one pipeline with a `union` step, one view | `union` |
-| `blank` | Nothing generated — I will write it myself | an empty workspace directory | — |
+| `blank` | Nothing generated - I will write it myself | an empty workspace directory | — |
 
 Rules the catalog follows, so that the next recipe added behaves like these:
 
