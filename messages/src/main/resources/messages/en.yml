@@ -342,6 +342,9 @@ connector.load-failed:
 connector.class-not-found:
   message: "Connector '{connector}' entry class '{class}' was not found or is not a connector."
   solution: "Check the connector id resolves to a connector jar that declares this entry class."
+connector.config-type-mismatch:
+  message: "Connection setting '{field}' of connector '{connector}' must be a {expected}, but its value is '{value}'."
+  solution: "Give '{field}' a {expected} the connector can read, or remove it if the connection does not need it."
 connector.no-connector-class:
   message: "No connector class found in artifact '{artifact}'."
   solution: "Check the jar is a PDK connector: it must contain a class annotated with @TapConnectorClass."

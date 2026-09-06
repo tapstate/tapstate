@@ -137,7 +137,8 @@ final class PdkConnector implements AutoCloseable {
             TapNodeSpecification specification = new TapNodeSpecification();
             specification.setDataTypesMap(dataTypesFrom(ref.spec()));
             TapConnectorContext context = new TapConnectorContext(
-                    specification, DataMap.create(settings), null, new SilentLog());
+                    specification, DataMap.create(ConfigTypeCoercion.coerce(connectorId, ref.spec(), settings)),
+                    null, new SilentLog());
             // A connector reaches what it keeps for itself through the context's state maps during init,
             // discovery and the drive; the context leaves them null, so give it live ones or the first
             // touch NPEs. The map handed over here is the same reference for as long as this handle
