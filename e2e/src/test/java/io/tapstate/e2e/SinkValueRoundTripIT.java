@@ -121,7 +121,13 @@ class SinkValueRoundTripIT {
                     .containsExactly(BYTES);
             assertThat(arrived.get("qty"))
                     .as("the ordinary integer column, which must have stayed on the bare lane")
-                    .isEqualTo(QUANTITY);
+                    // 64-bit rather than the 32-bit it was seeded as, and that is the value model
+                    // working: the type namespace names one integer width, so the boundary that
+                    // resolves a column's type delivers a value of that width. What this asserts is
+                    // the half that would break: an implementation that boxed an ordinary value the
+                    // way it boxes a driver type would find no way back for that box and write null.
+                    .isEqualTo((long) QUANTITY)
+                    .isNotInstanceOf(String.class);
         }
     }
 
