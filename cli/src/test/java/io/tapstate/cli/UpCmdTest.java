@@ -391,7 +391,9 @@ class UpCmdTest {
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(r.err()).contains("up: preflight failed on orders_src: cli.connect-failed");
-        assertThat(client.calls).containsExactly("isHealthy", "connectorList", "test orders_src");
+        // Failover re-probes and retries the one call before giving up, as it does for every stage.
+        assertThat(client.calls).startsWith("isHealthy", "connectorList", "test orders_src")
+                .doesNotContain("apply[source]");
     }
 
     @Test

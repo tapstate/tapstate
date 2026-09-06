@@ -36,6 +36,22 @@ enum CliError implements TapstateErrorCode {
     WORKSPACE_NOT_WRITABLE("cli.workspace-not-writable", Set.of("path", Names.REASON)),
 
     /**
+     * A workspace {@code up} was asked to bring up could not be read; {@code path} is the workspace and
+     * {@code reason} is what the filesystem said - typically the directory or file under it that refused.
+     * Its own code rather than the write one above: the two ask for opposite fixes (grant reading,
+     * grant writing), and a reader who is told "could not write" about a command that writes nothing
+     * goes looking in the wrong place.
+     */
+    WORKSPACE_UNREADABLE("cli.workspace-unreadable", Set.of("path", Names.REASON)),
+
+    /**
+     * A workspace {@code up} was asked to bring up holds no pipeline, so there is nothing to start;
+     * {@code path} is the workspace. A refusal rather than a quiet no-op: an empty or half-written
+     * workspace is the state a first run most often gets stuck in, and the way out is a scaffold.
+     */
+    WORKSPACE_HAS_NO_PIPELINE("cli.workspace-has-no-pipeline", Set.of("path")),
+
+    /**
      * The optional {@code tap} shortcut cannot be managed because that name belongs to something else;
      * {@code path} is where it sits. Refused rather than replaced or deleted: the name is a working
      * command on that machine, and a convenience shortcut does not get to remove one.

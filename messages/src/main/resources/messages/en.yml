@@ -87,6 +87,12 @@ cli.demo-workspace-exists:
 cli.workspace-not-writable:
   message: "Could not write {path}: {reason}"
   solution: "Check that the directory exists, is writable, and that no plain file is sitting where a directory is needed. Demo files this run wrote were removed and any it overwrote were put back, though empty directories it created can remain."
+cli.workspace-unreadable:
+  message: "Could not read the workspace at {path}: {reason}"
+  solution: "Check that the workspace directory and every directory and *.tap.yml file under it can be read, then run `tapstate up` again."
+cli.workspace-has-no-pipeline:
+  message: "The workspace at {path} holds no pipeline (a *.tap.yml with kind: pipeline), so there is nothing to bring up."
+  solution: "Run `tapstate new` to write one, or point -w at a workspace that holds a pipeline."
 cli.unknown-connector:
   message: "No connector '{connector}' in the catalog."
   solution: "Pick a connector id from the catalog; run `tapstate new` interactively to choose one."
