@@ -374,14 +374,12 @@ class CaptureToSinkAckFrontierTest {
         actuator.start(PIPELINE);
         actuator.start(DIRECT_PIPELINE);
         try {
-            // Fed until both have delivered rather than once. A start returns before the pipeline it
-            // started is reading, and the directly-read one reads the source live -- so a change made
-            // before it attached is not late for it, it is before its beginning and it never sees one.
-            // With a single change fed, that pipeline waits for a second that is never made: measured at
-            // roughly one run in three, and the run that passes is the one where both happened to be
-            // attached first.
-            awaitBothSinksFed(gatedSource);
-            awaitConsumers(meta, chainId, 2);
+            // Fed until the chain knows both of them, rather than until two changes have arrived
+            // somewhere. A start returns before the pipeline it started is reading, and the directly-read
+            // one reads the source live -- so a change made before it attached is not late for it, it is
+            // before its beginning and it never sees one. Nothing else says when that attach finished,
+            // which is why this keeps making changes rather than waiting for one.
+            awaitBothConsumersAcked(gatedSource, meta, chainId);
 
             assertThat(meta.consumerOffsets(chainId))
                     .as("the consumers the chain knows about: the switch decides where a pipeline reads "
@@ -398,12 +396,18 @@ class CaptureToSinkAckFrontierTest {
                     new SourceOrder(acked.order().epoch(), acked.order().seq() + 1_000), "src-far");
             meta.advanceSinkAcked(chainId, PIPELINE, farAhead);
 
-            assertThat(SrsDurableFrontier.safeAdvance(farAhead, meta.consumerOffsets(chainId)))
+            // One reading of the record, so the set the minimum is taken over and the value it is
+            // compared against come from the same moment. The wait above ends as soon as the direct
+            // pipeline has acked once, which is while it may still be acking: taken from two readings,
+            // this would compare a minimum over the later one against a position read from the earlier,
+            // and differ for that reason alone.
+            List<ConsumerOffset> offsets = meta.consumerOffsets(chainId);
+            assertThat(SrsDurableFrontier.safeAdvance(farAhead, offsets))
                     .as("what the chain may forget once one consumer has run far ahead: the direct one is "
                             + "still in the minimum, so the answer is where it got to and not where the "
                             + "fast one did. Left out of the set, this is the fast one's position and the "
                             + "record moves past changes the direct pipeline has not landed")
-                    .contains(acked);
+                    .contains(directAckedIn(offsets));
         } finally {
             actuator.stop(DIRECT_PIPELINE, true);
             actuator.stop(PIPELINE, true);
@@ -412,7 +416,12 @@ class CaptureToSinkAckFrontierTest {
 
     /** The direct pipeline's acked position, or null while it has acked nothing. */
     private static ChainPosition directAckedPosition(SrsMetaStore meta, String chainId) {
-        return meta.consumerOffsets(chainId).stream()
+        return directAckedIn(meta.consumerOffsets(chainId));
+    }
+
+    /** The direct pipeline's acked position within one reading of the chain's consumers. */
+    private static ChainPosition directAckedIn(List<ConsumerOffset> offsets) {
+        return offsets.stream()
                 .filter(offset -> DIRECT_PIPELINE.equals(offset.pipelineId()))
                 .map(ConsumerOffset::sinkAcked)
                 .filter(java.util.Objects::nonNull)
@@ -420,15 +429,33 @@ class CaptureToSinkAckFrontierTest {
                 .orElse(null);
     }
 
-    private void awaitConsumers(SrsMetaStore meta, String chainId, int expected) {
+    /**
+     * Feeds changes until the chain knows both pipelines and the directly-read one has acked.
+     *
+     * <p>What it waits on is per pipeline and read off the chain record, and that is the whole of it. It
+     * replaced a count of what had reached the sinks -- one static queue of bare positions with no
+     * pipeline on them -- in which "two changes arrived" and "both pipelines delivered one" were the same
+     * reading. Two deliveries to the buffered pipeline therefore ended the feeding while the directly-read
+     * one had never seen a change, and it then never could: feeding had stopped, and a live reader is only
+     * reachable by a change made after it attached. Measured on a developer machine before this changed,
+     * one repeat in twelve ended exactly there -- two positions collected, one consumer on the chain --
+     * which is the reading both of the runs that led here also produced.
+     */
+    private void awaitBothConsumersAcked(GatedSource source, SrsMetaStore meta, String chainId) {
         long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        while (meta.consumerOffsets(chainId).size() < expected
-                || directAckedPosition(meta, chainId) == null) {
+        int fed = 0;
+        while (meta.consumerOffsets(chainId).size() < 2 || directAckedPosition(meta, chainId) == null) {
             if (System.nanoTime() > deadline) {
-                throw new AssertionError("timed out waiting for " + expected
-                        + " consumers with the direct one having acked; the chain knew "
-                        + meta.consumerOffsets(chainId));
+                // The chain's own rows, which name whichever pipeline is missing or has acked nothing,
+                // and a count rather than the sinks' contents: this feeds for as long as the deadline
+                // allows, so what they took runs to hundreds of positions and would bury the one line
+                // that says which reading this is.
+                throw new AssertionError("timed out waiting for both pipelines to join the chain after "
+                        + "feeding " + fed + " changes; the chain knew " + meta.consumerOffsets(chainId)
+                        + " and the sinks had taken " + CapturingSinkWriter.collected().size()
+                        + " changes");
             }
+            source.feed(change(fed++));
             park();
         }
     }
@@ -455,27 +482,6 @@ class CaptureToSinkAckFrontierTest {
 
     private static Envelope change(int id) {
         return Envelope.insert(id, TABLE, Map.of("id", (long) id), Map.of());
-    }
-
-    /**
-     * Feeds changes until every sink on the chain has delivered one, and no fewer.
-     *
-     * <p>Two pipelines read this source, so two deliveries are what "both are running" looks like. What
-     * this does not do is assume the two starts finished: it keeps making changes until the second one
-     * shows up, which is the only thing that distinguishes a pipeline that has attached from one that is
-     * about to.
-     */
-    private void awaitBothSinksFed(GatedSource source) {
-        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        int id = 0;
-        while (CapturingSinkWriter.collected().size() < 2) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("timed out waiting for both pipelines to deliver a change, got "
-                        + CapturingSinkWriter.collected() + " after feeding " + id + " of them");
-            }
-            source.feed(change(id++));
-            park();
-        }
     }
 
     private void awaitSinkSize(int size) {
