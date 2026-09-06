@@ -40,9 +40,12 @@ class JoinKeyTest {
         JoinKey anotherRowsNull = JoinKey.of(Arrays.asList("a", null));
 
         assertThat(poisoned.matchable()).isFalse();
-        assertThat(poisoned)
-                .as("still equal to itself, so a carrier may hold it in a map like any other key")
-                .isEqualTo(poisoned);
+        // Stated as the lookup rather than as `isEqualTo(poisoned)`: the claim is that a carrier can
+        // hold one of these, and holding it needs hashCode to agree with equals on the identity
+        // branch as well. An equality against the same expression never reaches hashCode at all.
+        assertThat(Map.of(poisoned, "held"))
+                .as("still finds itself, so a carrier may hold it in a map like any other key")
+                .containsEntry(poisoned, "held");
         assertThat(poisoned)
                 .as("the other side's null must not match this one -- SQL never matches null to null")
                 .isNotEqualTo(anotherRowsNull);
