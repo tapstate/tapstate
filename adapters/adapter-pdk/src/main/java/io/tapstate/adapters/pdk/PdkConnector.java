@@ -98,8 +98,14 @@ final class PdkConnector implements AutoCloseable {
             } finally {
                 Thread.currentThread().setContextClassLoader(restore);
             }
+            // The config map becomes what the connector reads here, so this is where a value spelled as
+            // text is converted to the type the connector's own form declares for it. Every path that
+            // drives a connector - discovery, the connection test, the browser, capture and sink - opens
+            // through this method, so coercing here covers all of them and no path can be missed.
             TapConnectorContext context = new TapConnectorContext(
-                    new TapNodeSpecification(), DataMap.create(settings), null, new SilentLog());
+                    new TapNodeSpecification(),
+                    DataMap.create(ConfigTypeCoercion.coerce(connectorId, ref.spec(), settings)),
+                    null, new SilentLog());
             // A connector reaches per-run scratch through the context's state maps during init, discovery
             // and the drive; the context leaves them null, so give it live ones or the first touch NPEs.
             context.setStateMap(new InMemoryStateMap());
