@@ -108,9 +108,9 @@ class GuidedFirstRunIT {
 
     @Test
     @Order(1)
-    void newWritesABoundWorkspaceAndUpBringsItToRunningWithNothingOnItsLine() throws IOException {
-        CliOnce.Run created = cli(PASSWORD, "new", "mirrored-table", "--yes",
-                "--server", server.baseUrl().toString(), "--user", USER,
+    void newWritesAWorkspaceOfflineAndUpBindsItAndBringsItToRunning() throws IOException {
+        // `new` is given no server, no user and no password: it writes files and reaches nothing.
+        CliOnce.Run created = cli(null, "new", "mirrored-table", "--yes",
                 "--connector", "mysql",
                 "--set", "host=" + mysql.get("host"),
                 "--set", "port=" + mysql.get("port"),
@@ -134,9 +134,11 @@ class GuidedFirstRunIT {
                 .as("the password may not be written into the source artifact")
                 .doesNotContainPattern("(?m)^\\s*password:\\s*\"?" + Pattern.quote(String.valueOf(mysql.get("password"))));
 
-        // No server, no user, no password on this line and none in the environment: what new saved
-        // under the home directory is the whole credential.
-        CliOnce.Run up = cli(null, "up", "-w", workspace.toString());
+        // The workspace is unbound, because `new` binds nothing: this first `up` is where the server is
+        // named, signed in to and bound, and the second one below runs with none of it on its line.
+        CliOnce.Run up = cli(PASSWORD, "up",
+                "--server", server.baseUrl().toString(), "--user", USER,
+                "-w", workspace.toString());
         assertThat(up.exitCode()).as(report("up", up)).isZero();
         assertThat(up.stdout()).contains("State: running");
         awaitCount(VIEW, SEEDED_ROWS);
@@ -145,6 +147,7 @@ class GuidedFirstRunIT {
     @Test
     @Order(2)
     void upAgainConvergesOnAWorkspaceThatIsAlreadyUpAndChangesNothing() {
+        // nothing on this line and nothing in the environment: what the first up saved is the whole credential
         CliOnce.Run again = cli(null, "up", "-w", workspace.toString());
         assertThat(again.exitCode()).as(report("up (again)", again)).isZero();
         assertThat(again.stdout()).contains("State: running (nothing to do)");
