@@ -45,7 +45,8 @@ final class NestedJsonRecipe {
     static final String ON_USAGE = "the join columns are childcol=rootcol, comma-separated (--child in scripts)";
 
     /** What the summary says beside the pipeline, because the children's keys were not discovered. */
-    static final String ARRAY_KEY_NOTE = "arrayKey: [id] assumed on each embedded table; edit it if a child is keyed otherwise";
+    /** What every one-to-many embed assumes without asking, as the summary names it beside the file. */
+    static final String ASSUMED_ARRAY_KEY = "arrayKey: [id]";
 
     /** One connection: where a table is read from. */
     record Database(String connector, Map<String, Object> config) {}
@@ -212,6 +213,6 @@ final class NestedJsonRecipe {
         ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal("assemble"), answers.key(), null, null);
         PipelineResource pipeline = new PipelineResource(RecipeSupport.identifier(answers.rootTable()) + "_sync", null,
                 sources.stream().map(s -> s.resource().id()).toList(), List.of(assemble), view, null, null, null);
-        return RecipeSupport.outputs(sources, pipeline, anyArray ? ARRAY_KEY_NOTE : null, workspace);
+        return RecipeSupport.outputs(sources, pipeline, anyArray ? ASSUMED_ARRAY_KEY : null, workspace);
     }
 }

@@ -68,7 +68,7 @@ class NewGuidedTest {
         assertThat(r.err()).isEmpty();
         // the opening line says what is being built, before any question
         assertThat(r.out()).startsWith("Building a workspace: a directory of .tap.yml files you can read and edit.");
-        assertThat(r.out()).endsWith("workspace: " + ws + "\n");
+        assertThat(r.out()).endsWith(FirstRunSummary.AI_LINE + "\n");
         // the server question was asked, the default was probed, and only then was anything registered
         assertThat(prompter.asked).hasSize(1);
         assertThat(prompter.asked.get(0)).containsIgnoringCase("server");
@@ -91,7 +91,7 @@ class NewGuidedTest {
         Run r = run(home, prompter, controlPlane, "new", "-w", ws.toString());
 
         assertThat(r.code()).isZero();
-        assertThat(r.out()).endsWith("workspace: " + ws + "\n");
+        assertThat(r.out()).endsWith(FirstRunSummary.AI_LINE + "\n");
         assertThat(prompter.asked).isEmpty();
         assertThat(controlPlane.probed).isEmpty();
         assertThat(prompter.offered).containsExactly(TITLES);
@@ -133,7 +133,7 @@ class NewGuidedTest {
 
         assertThat(r.code()).isZero();
         assertThat(r.err()).isEmpty();
-        assertThat(r.out()).isEqualTo("workspace: " + ws + "\n");
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n").endsWith(FirstRunSummary.AI_LINE + "\n");
         assertThat(prompter.asked).isEmpty();
         assertThat(prompter.offered).isEmpty();
         assertThat(prompter.secretQuestions).isEmpty();
@@ -160,7 +160,9 @@ class NewGuidedTest {
                 "new", "blank", "--yes", "--server", "http://example:9999", "-w", ws.toString());
 
         assertThat(r.code()).isZero();
-        assertThat(r.out()).isEqualTo("workspace: " + ws + "\n");
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n").endsWith(FirstRunSummary.AI_LINE + "\n");
+        // the up line names the server the directory was just bound to, read back from the binding
+        assertThat(r.out()).contains("  tapstate up  bring it to running against http://example:9999\n");
         assertThat(controlPlane.probed).containsExactly(URI.create("http://example:9999"));
         assertThat(manager(home).suggestions()).extracting(ContextManager.ContextChoice::name).containsExactly("example");
         assertThat(manager(home).suggestions().get(0).definition().seeds())
@@ -176,7 +178,7 @@ class NewGuidedTest {
         Run r = run(home, prompter, controlPlane, "new", "blank", "-w", ws.toString());
 
         assertThat(r.code()).isZero();
-        assertThat(r.out()).endsWith("workspace: " + ws + "\n");
+        assertThat(r.out()).endsWith(FirstRunSummary.AI_LINE + "\n");
         assertThat(prompter.asked).hasSize(1);
         // the recipe is already answered by the positional, so the picker is not shown
         assertThat(prompter.offered).isEmpty();

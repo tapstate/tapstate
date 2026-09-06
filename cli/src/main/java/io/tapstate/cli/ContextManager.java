@@ -100,6 +100,18 @@ final class ContextManager {
         return Optional.ofNullable(current.workspaceBindings().get(canonical(workspaceRoot).toString()));
     }
 
+    /**
+     * The server of the context bound exactly to {@code workspaceRoot} - its first seed - or empty
+     * when the directory is not bound. Read here, from the same store the binding was written to, so
+     * what a command tells the user it will connect to is what its connection would actually use.
+     */
+    synchronized Optional<URI> serverBoundTo(Path workspaceRoot) {
+        ContextConfig current = store.load();
+        String name = current.workspaceBindings().get(canonical(workspaceRoot).toString());
+        ContextDefinition definition = name == null ? null : current.contexts().get(name);
+        return definition == null ? Optional.empty() : Optional.of(definition.seeds().get(0));
+    }
+
     synchronized DeletionImpact previewDelete(String name) {
         ContextConfig current = store.load();
         ContextDefinition definition = required(current, name);

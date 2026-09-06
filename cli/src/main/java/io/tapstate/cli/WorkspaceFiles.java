@@ -22,6 +22,10 @@ final class WorkspaceFiles {
     static final String ENV = ".env";
     static final String GITIGNORE = ".gitignore";
 
+    /** What each of the two is for, in the words the guided first run describes it by. */
+    static final String ENV_ROLE = "secrets for the files above; not committed";
+    static final String GITIGNORE_ROLE = "keeps .env out of version control";
+
     private final Path root;
 
     WorkspaceFiles(Path root) {

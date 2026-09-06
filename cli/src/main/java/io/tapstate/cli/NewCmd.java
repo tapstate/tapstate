@@ -340,7 +340,7 @@ final class NewCmd implements Callable<Integer> {
                     ? runGuided(contexts, probe, prose, serverUrl, flags)
                     : runRecipe(new GuidedNew(contexts, probe, null, prose).run(workspace.root(), recipe, serverUrl),
                             null, flags);
-            emitResult(result);
+            emitResult(result, contexts);
             return 0;
         } catch (RecipeRun.Usage e) {
             err.println("new: " + e.getMessage());
@@ -377,45 +377,20 @@ final class NewCmd implements Callable<Integer> {
     }
 
     /**
-     * What {@code new} says once the recipe has written: one line per file, in write order, then where
-     * the workspace is. A file that was already there and was replaced under {@code --force} says so;
-     * a file the recipe extended rather than owned reads as updated. The machine forms carry the files
-     * and their roles and none of the prose.
+     * What {@code new} says once the recipe has written: the files and what each is for, the state, the
+     * next steps against the server the directory is now bound to, and the handover line. The server is
+     * read back from the binding rather than from the answer, so the two cannot disagree.
      */
-    private void emitResult(RecipeRun.Result result) {
+    private void emitResult(RecipeRun.Result result, ContextManager contexts) {
+        URI server = contexts.serverBoundTo(result.root())
+                .orElseThrow(() -> new IllegalStateException("the guided run left " + result.root() + " unbound"));
         PrintWriter o = CliIo.out(spec);
         switch (output) {
-            case JSON -> o.println(JsonOut.write(resultEnvelope(result)));
-            case YAML -> o.println(YamlOut.write(resultEnvelope(result)));
-            default -> {
-                for (RecipeRun.Created file : result.files()) {
-                    String verb = !file.replaced() ? "created"
-                            : "env".equals(file.kind()) || "gitignore".equals(file.kind()) ? "updated" : "replaced";
-                    o.println(verb + " " + file.path() + (file.note() == null ? "" : "  (" + file.note() + ")"));
-                }
-                o.println("workspace: " + result.root());
-            }
+            case JSON -> o.println(JsonOut.write(FirstRunSummary.envelope(result, server)));
+            case YAML -> o.println(YamlOut.write(FirstRunSummary.envelope(result, server)));
+            default -> FirstRunSummary.text(o, result, server);
         }
         o.flush();
-    }
-
-    private static Map<String, Object> resultEnvelope(RecipeRun.Result result) {
-        Map<String, Object> env = new LinkedHashMap<>();
-        env.put("status", "created");
-        env.put("recipe", result.recipe());
-        env.put("workspace", result.root().toString());
-        List<Map<String, Object>> files = new ArrayList<>();
-        for (RecipeRun.Created file : result.files()) {
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("path", file.path().toString());
-            entry.put("kind", file.kind());
-            if (file.replaced()) {
-                entry.put("replaced", true);
-            }
-            files.add(entry);
-        }
-        env.put("files", files);
-        return env;
     }
 
     private int callSource(PrintWriter err) {

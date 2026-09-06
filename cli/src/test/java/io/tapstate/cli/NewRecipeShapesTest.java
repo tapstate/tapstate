@@ -196,9 +196,9 @@ class NewRecipeShapesTest {
         assertThat(Files.readString(ws.resolve("pipeline/orders_sync.tap.yml"))).isEqualTo(RESHAPED_SYNC);
         assertThat(Files.readString(ws.resolve(".env"))).isEqualTo("ORDERS_SRC_PASSWORD=s\n");
         assertThat(Files.readString(ws.resolve(".gitignore"))).isEqualTo(".env\n");
-        assertThat(r.out()).startsWith("created " + ws.resolve("source/orders_src.tap.yml") + "\n"
-                + "created " + ws.resolve("pipeline/orders_sync.tap.yml"));
-        assertThat(r.out()).contains("primary_key: id");
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+                + "  source/orders_src.tap.yml  source orders_src: mysql, cdc\n"
+                + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed primary_key: id;");
     }
 
     /**
@@ -310,8 +310,9 @@ class NewRecipeShapesTest {
         assertThat(Files.readString(ws.resolve(".env"))).isEqualTo("ORDERS_SRC_PASSWORD=s\n");
         assertThat(Files.readString(ws.resolve(".gitignore"))).isEqualTo(".env\n");
         assertThat(ws.resolve("source/shipments_src.tap.yml")).doesNotExist();
-        assertThat(r.out()).startsWith("created " + ws.resolve("source/orders_src.tap.yml") + "\n"
-                + "created " + ws.resolve("pipeline/orders_sync.tap.yml"));
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+                + "  source/orders_src.tap.yml  source orders_src: mysql, cdc\n"
+                + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed arrayKey: [id];");
     }
 
     /**
@@ -493,7 +494,8 @@ class NewRecipeShapesTest {
                 .contains("\"kind\": \"pipeline\"")
                 .contains("\"kind\": \"env\"")
                 .contains("\"kind\": \"gitignore\"")
-                .doesNotContain("created ");
+                .contains("\"assumed\": \"arrayKey: [id]\"")
+                .doesNotContain("Workspace:");
     }
 
     // ---- consolidated-table ---------------------------------------------------------------------
@@ -519,9 +521,10 @@ class NewRecipeShapesTest {
         assertThat(Files.readString(ws.resolve(".env")))
                 .isEqualTo("ORDERS_1_SRC_PASSWORD=s1\nORDERS_2_SRC_PASSWORD=s2\n");
         assertThat(Files.readString(ws.resolve(".gitignore"))).isEqualTo(".env\n");
-        assertThat(r.out()).startsWith("created " + ws.resolve("source/orders_1_src.tap.yml") + "\n"
-                + "created " + ws.resolve("source/orders_2_src.tap.yml") + "\n"
-                + "created " + ws.resolve("pipeline/orders_sync.tap.yml"));
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+                + "  source/orders_1_src.tap.yml  source orders_1_src: mysql, cdc\n"
+                + "  source/orders_2_src.tap.yml  source orders_2_src: mysql, cdc\n"
+                + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 2 sources, view — assumed primary_key: id;");
     }
 
     /**
@@ -607,7 +610,8 @@ class NewRecipeShapesTest {
 
         assertThat(forced.code()).as(forced.all()).isZero();
         assertThat(Files.readString(ws.resolve("pipeline/orders_sync.tap.yml"))).isEqualTo(CONSOLIDATED_SYNC);
-        assertThat(forced.out()).contains("replaced " + ws.resolve("pipeline/orders_sync.tap.yml"));
-        assertThat(forced.out()).contains("updated " + ws.resolve(".env"));
+        assertThat(forced.out())
+                .contains("  pipeline/orders_sync.tap.yml  pipeline orders_sync: 2 sources, view (replaced) — assumed")
+                .contains("  .env  secrets for the files above; not committed (updated)\n");
     }
 }

@@ -106,11 +106,10 @@ class NewRecipeTest {
                     .isEqualTo(DemoCmd.bundled(resource))
                     .isEqualTo(Files.readString(demoDir.resolve(resource)));
         }
-        assertThat(r.out()).isEqualTo(
-                "created " + ws.resolve("source/orders_db.tap.yml") + "\n"
-                        + "created " + ws.resolve("source/fulfillment_db.tap.yml") + "\n"
-                        + "created " + ws.resolve("pipeline/order_pipeline.tap.yml") + "\n"
-                        + "workspace: " + ws + "\n");
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+                + "  source/orders_db.tap.yml  source orders_db: mysql, cdc\n"
+                + "  source/fulfillment_db.tap.yml  source fulfillment_db: postgres, cdc\n"
+                + "  pipeline/order_pipeline.tap.yml  pipeline order_pipeline: 2 sources, view\n");
     }
 
     @Test
@@ -138,7 +137,8 @@ class NewRecipeTest {
 
         assertThat(forced.code()).isZero();
         assertThat(Files.readString(edited)).isEqualTo(DemoCmd.bundled("pipeline/order_pipeline.tap.yml"));
-        assertThat(forced.out()).contains("replaced " + edited);
+        assertThat(forced.out())
+                .contains("  pipeline/order_pipeline.tap.yml  pipeline order_pipeline: 2 sources, view (replaced)\n");
     }
 
     // ---- blank ----------------------------------------------------------------------------------
@@ -155,7 +155,7 @@ class NewRecipeTest {
         try (var entries = Files.list(ws)) {
             assertThat(entries).isEmpty();
         }
-        assertThat(r.out()).isEqualTo("workspace: " + ws + "\n");
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n  (empty");
     }
 
     // ---- mirrored-table -------------------------------------------------------------------------
@@ -174,13 +174,10 @@ class NewRecipeTest {
         assertThat(Files.readString(ws.resolve("source/orders_src.tap.yml")))
                 .contains("password: ${ORDERS_SRC_PASSWORD}")
                 .doesNotContain(": s\n");
-        assertThat(r.out()).startsWith("created " + ws.resolve("source/orders_src.tap.yml") + "\n"
-                + "created " + ws.resolve("pipeline/orders_sync.tap.yml"));
-        assertThat(r.out()).contains("primary_key: id");
-        assertThat(r.out()).endsWith(
-                "created " + ws.resolve(".env") + "\n"
-                        + "created " + ws.resolve(".gitignore") + "\n"
-                        + "workspace: " + ws + "\n");
+        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+                + "  source/orders_src.tap.yml  source orders_src: mysql, cdc\n"
+                + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed primary_key: id;");
+        assertThat(r.out()).contains("\n  .env  ").contains("\n  .gitignore  ");
     }
 
     /**
@@ -297,7 +294,7 @@ class NewRecipeTest {
                 .contains("\"kind\": \"pipeline\"")
                 .contains("\"kind\": \"env\"")
                 .contains("\"kind\": \"gitignore\"")
-                .doesNotContain("created ");
+                .doesNotContain("Workspace:");
         assertThat(r.out().indexOf("\"kind\": \"source\""))
                 .isLessThan(r.out().indexOf("\"kind\": \"pipeline\""));
         assertThat(r.out().indexOf("\"kind\": \"pipeline\""))
