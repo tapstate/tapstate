@@ -266,7 +266,8 @@ public final class Cli implements Runnable {
                     "Follow a whole collection's changes until Ctrl-C; pipes fine.")),
             // The composite that ships. The operands are the flags it takes, since it names no resource:
             // the bound workspace is the operand.
-            Map.entry("up", new VerbHelp("[--server <url>] [--yes] [-o text|json|yaml] [-w <dir>]",
+            Map.entry("up", new VerbHelp(
+                    "[--server <url>] [-u <name>] [--start-local] [--yes] [-o text|json|yaml] [-w <dir>]",
                     "Bring the bound workspace to running: apply, discover, apply, start.")),
             // The reserved verbs. Each says what it is reserved for: "not implemented yet" answers the
             // question only once the reader knows what was going to be there.
@@ -506,6 +507,19 @@ public final class Cli implements Runnable {
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, ContextResolver resolver,
                           AuthService authService, CommandLine commandLine) {
+        return runSession(launch, controlPlane, prompter, resolver, authService, commandLine,
+                Path.of(System.getProperty("user.home")));
+    }
+
+    /**
+     * The same, with the home directory named. Every store the session writes - contexts, saved
+     * sessions, the local development stack - lives under it, so a test that hands in its own home
+     * writes nowhere near the real one. {@code up} is why this has to be a parameter: it binds a
+     * workspace, and a binding written to the wrong home is written to the person running the tests.
+     */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver,
+                          AuthService authService, CommandLine commandLine, Path home) {
         Prompter oneShotPrompter = null;
         try {
             if (launch.hasConflictingTargets()) {
@@ -523,9 +537,17 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
+            // `up` asks which server the first time a workspace is brought up, so a one-shot run of it at
+            // a terminal needs a prompter too; without a terminal it asks nothing and refuses instead.
+            if (launch.isOneShot() && !launch.command().isEmpty()
+                    && launch.command().get(0).equals("up")
+                    && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
             Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
-                    HomeStores.contexts(Path.of(System.getProperty("user.home"))));
+                    HomeStores.contexts(home));
+            repl.homeDir = home;
             String machineToken = launch.machineToken();
             if (machineToken != null) {
                 repl.installMachineToken(machineToken);

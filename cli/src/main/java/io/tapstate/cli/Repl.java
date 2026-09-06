@@ -164,6 +164,12 @@ final class Repl {
      */
     private final UnaryOperator<String> env;
 
+    /** Where the context store, the saved sessions and the local development stack live. */
+    Path homeDir = Path.of(System.getProperty("user.home"));
+
+    /** Test seam: the local development stack {@code up} may start; built under {@link #homeDir} when null. */
+    LocalStack localStack;
+
     /**
      * Set by the terminal's interrupt handler to stop an in-flight {@code --watch} / {@code --follow}
      * stream; reset at the start of each stream. Volatile because the interrupt handler runs on another
@@ -3038,7 +3044,8 @@ final class Repl {
     private static final String UNCHANGED = "UNCHANGED";
 
     /** What {@code up}'s words asked for. */
-    private record UpOptions(String server, Path workdir, OutputFormat format) {
+    private record UpOptions(String server, Path workdir, OutputFormat format, boolean startLocal, String user,
+                             boolean yes) {
     }
 
     /**
@@ -3066,7 +3073,17 @@ final class Repl {
                 Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", "up"), session.versions());
                 return Cli.EXIT_VERB_UNAVAILABLE;
             }
-            int resolved = resolveTarget("up", options.server(), workspace);
+            // The workspace's first up is where the server question is asked - and the only place. All
+            // contact with a server belongs to this verb; `new` wrote files and learned nothing. On a
+            // workspace that is already bound, --server keeps its old meaning: an override for this run.
+            boolean bindHere = contextManager != null && !boundAlready(workspace);
+            if (bindHere) {
+                int bound = bindWorkspace(workspace, options);
+                if (bound != Cli.EXIT_OK) {
+                    return bound;
+                }
+            }
+            int resolved = resolveTarget("up", bindHere ? null : options.server(), workspace);
             if (resolved != Cli.EXIT_OK) {
                 return resolved;
             }
@@ -3083,12 +3100,61 @@ final class Repl {
         return new UpRun(workspace, options.format(), connectedHere).run();
     }
 
+    /**
+     * Binds {@code workspace} to the server {@code --server} names, or to the one asked for at a
+     * terminal. Reached only while the directory is unbound, so the question is asked once per
+     * workspace rather than once per run. A script that named neither a server nor {@code --start-local}
+     * is refused rather than bound to whatever happens to be listening on this machine.
+     *
+     * @return {@link Cli#EXIT_OK} when the workspace is bound, or the code the failure is reported with
+     */
+    /** Whether the workspace already names a server, which is what makes the question a first-run one. */
+    private boolean boundAlready(Path workspace) {
+        return java.nio.file.Files.isDirectory(workspace)
+                && contextManager.contextBoundExactlyTo(workspace).isPresent();
+    }
+
+    private int bindWorkspace(Path workspace, UpOptions options) {
+        ControlPlaneClient probe = controlPlane;
+        AuthService auth = authService != null ? authService
+                : HomeStores.auth(homeDir, probe, java.time.Clock.systemUTC());
+        LocalStack stack = localStack != null ? localStack : LocalStack.under(homeDir, probe, env);
+        PrintWriter out = commandLine.getOut();
+        ServerBinding binding = new ServerBinding(contextManager, probe, auth, stack, env,
+                options.yes() ? null : prompter, quiet ? null : out);
+        URI named = options.server() == null ? null : ServerBinding.serverUrl(options.server());
+        if (options.server() != null && named == null) {
+            commandLine.getErr().println("up: --server must be an http(s) URL, e.g. "
+                    + ServerBinding.DEFAULT_SERVER_TEXT);
+            commandLine.getErr().flush();
+            return Cli.EXIT_USAGE;
+        }
+        try {
+            binding.bind(workspace, named, options.startLocal(), options.user());
+            return Cli.EXIT_OK;
+        } catch (io.tapstate.core.common.TapstateException refused) {
+            Diagnostics.printText(commandLine.getErr(), refused.code(), refused.args(), session.versions());
+            return Cli.EXIT_DIAGNOSTIC;
+        } catch (RecipeRun.Usage missing) {
+            commandLine.getErr().println("up: " + missing.getMessage());
+            commandLine.getErr().flush();
+            return Cli.EXIT_USAGE;
+        } catch (java.io.IOException unreadable) {
+            commandLine.getErr().println("up: cannot bind the workspace: " + unreadable.getMessage());
+            commandLine.getErr().flush();
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
     /** Parses {@code up}'s flags; a usage line and {@code null} on anything else. It takes no operand. */
     private UpOptions parseUpOptions(List<String> words) {
         PrintWriter err = commandLine.getErr();
         String server = null;
         Path target = null;
         OutputFormat format = OutputFormat.TEXT;
+        boolean startLocal = false;
+        String user = null;
+        boolean yes = false;
         for (int i = 1; i < words.size(); i++) {
             String word = words.get(i);
             if (word.equals("--server")) {
@@ -3114,20 +3180,30 @@ final class Repl {
                     return upUsage("unknown output format '" + words.get(i) + "' (expected text|json|yaml)");
                 }
                 format = chosen;
+            } else if (word.equals("--start-local")) {
+                startLocal = true;
+            } else if (word.equals("-u") || word.equals("--user")) {
+                if (i + 1 >= words.size()) {
+                    return upUsage(word + " needs a name");
+                }
+                user = words.get(++i);
+            } else if (word.startsWith("-u=") || word.startsWith("--user=")) {
+                user = word.substring(word.indexOf('=') + 1);
             } else if (word.equals("-y") || word.equals("--yes")) {
-                // accepted for scripts; up asks nothing either way
+                yes = true;
             } else if (word.startsWith("-")) {
                 return upUsage("unknown option '" + word + "'");
             } else {
                 return upUsage("unexpected operand '" + word + "'");
             }
         }
-        return new UpOptions(server, target, format);
+        return new UpOptions(server, target, format, startLocal, user, yes);
     }
 
     private UpOptions upUsage(String reason) {
         PrintWriter err = commandLine.getErr();
-        err.println("up: " + reason + " (usage: up [--server <url>] [--yes] [-o text|json|yaml] [-w <dir>])");
+        err.println("up: " + reason
+                + " (usage: up [--server <url>] [-u <name>] [--start-local] [--yes] [-o text|json|yaml] [-w <dir>])");
         err.flush();
         return null;
     }

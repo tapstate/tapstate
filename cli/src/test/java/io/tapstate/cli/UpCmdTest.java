@@ -63,6 +63,17 @@ class UpCmdTest {
                 "--set", "host=db", "--set", "username=u", "--set", "password=s",
                 "--table", "orders", "--view", "orders_view", "-w", ws.toString());
         assertThat(r.code()).as(r.all()).isZero();
+        bind(home, ws);
+    }
+
+    /**
+     * Registers and binds the workspace the way {@code up}'s own first run would. {@code new} writes
+     * files and learns no server, so a test that wants a bound workspace says so itself.
+     */
+    private static void bind(Path home, Path ws) {
+        ContextManager contexts = new ContextManager(ContextConfigStore.underHome(home));
+        contexts.create("local", List.of(URI.create("http://127.0.0.1:8080")), true);
+        contexts.bind(ws, "local");
     }
 
     /** Saves a session for the bound context, so the run resumes it exactly as any online verb does. */
@@ -83,7 +94,7 @@ class UpCmdTest {
         StringWriter err = new StringWriter();
         cl.setOut(new PrintWriter(out));
         cl.setErr(new PrintWriter(err));
-        int code = Cli.runSession(launch, client, () -> new ScriptedPrompter(), resolver, auth, cl);
+        int code = Cli.runSession(launch, client, () -> new ScriptedPrompter(), resolver, auth, cl, home);
         return new Run(code, out.toString(), err.toString());
     }
 
@@ -168,26 +179,25 @@ class UpCmdTest {
         assertThat(r.out()).contains("State: running\n").doesNotContain("nothing to do");
     }
 
+    /**
+     * The wiring, not the binding itself ({@link ServerBindingTest} holds that): a script that never
+     * asked for a prompt or a container is refused on an unbound workspace, and nothing is written.
+     * Before the server question moved here, this ended with `new` having bound the directory already.
+     */
     @Test
-    void theSessionAGuidedNewSignedInWithIsReusedWithoutAnyCredentialFlag(@TempDir Path home, @TempDir Path ws) {
-        // the first run signs in through the guided entry; no session is written by hand here
-        NewGuidedTest.Run first = NewGuidedTest.run(home, new ScriptedPrompter(), new NewGuidedTest.Fakes(true),
-                NewGuidedTest.PASSWORD_IN_ENV,
+    void aScriptOnAnUnboundWorkspaceIsRefusedAndBindsNothing(@TempDir Path home, @TempDir Path ws) {
+        NewRecipeTest.Run written = NewRecipeTest.run(home, new ScriptedPrompter(),
                 "new", "mirrored-table", "--yes", "--connector", "mysql",
                 "--set", "host=db", "--set", "username=u", "--set", "password=s",
                 "--table", "orders", "--view", "orders_view", "-w", ws.toString());
-        assertThat(first.code()).as(first.all()).isZero();
+        assertThat(written.code()).as(written.all()).isZero();
         FakeUpControlPlane client = new FakeUpControlPlane();
-        client.principal = "admin";
 
-        Run r = up(home, client, "up", "-w", ws.toString());
+        Run r = up(home, client, "up", "--yes", "-w", ws.toString());
 
-        assertThat(r.code()).as(r.all()).isZero();
-        assertThat(r.err()).isEmpty();
-        // the session the first run saved is the one presented, and the stages ran on it
-        assertThat(client.exchanged).containsExactly("tss_s01.first-run-secret");
-        assertThat(client.calls).startsWith("isHealthy", "connectorList").endsWith("status orders_sync");
-        assertThat(r.out()).contains("State: running\n");
+        assertThat(r.code()).isNotZero();
+        assertThat(r.err()).contains("not bound to a server");
+        assertThat(new ContextManager(ContextConfigStore.underHome(home)).contextBoundExactlyTo(ws)).isEmpty();
     }
 
     // ---- .env ---------------------------------------------------------------------------------------
@@ -323,14 +333,17 @@ class UpCmdTest {
     }
 
     @Test
-    void anUnboundDirectoryIsRefusedTheWayEveryOnlineVerbRefusesIt(@TempDir Path home, @TempDir Path ws) {
+    void anUnboundDirectoryWithNoWayToSignInIsRefusedBeforeAnyStageRuns(@TempDir Path home, @TempDir Path ws) {
+        // An unbound workspace is where up asks which server; with no terminal to ask at and no password
+        // anywhere, it stops at that question rather than binding to whatever happens to be listening.
         FakeUpControlPlane client = new FakeUpControlPlane();
 
         Run r = up(home, client, "up", "-w", ws.toString());
 
-        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_VERB_UNAVAILABLE);
-        assertThat(r.err()).contains("cli.context-required").contains("`up`");
-        assertThat(client.calls).isEmpty();
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(r.err()).contains("--server").contains("--start-local");
+        assertThat(new ContextManager(ContextConfigStore.underHome(home)).contextBoundExactlyTo(ws)).isEmpty();
+        assertThat(client.calls).as("no stage ran").doesNotContain("apply[source]");
     }
 
     @Test
@@ -537,10 +550,13 @@ class UpCmdTest {
         /** Whom the saved session belongs to, as the exchange answers it; the record's principal must match. */
         String principal = "alice";
 
+        /** Whether the server answers its health probe; false is how an unbound run is refused. */
+        boolean healthy = true;
+
         @Override
         public boolean isHealthy(URI baseUrl) {
             calls.add("isHealthy");
-            return true;
+            return healthy;
         }
 
         @Override

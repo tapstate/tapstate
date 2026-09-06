@@ -207,9 +207,9 @@ final class LocalStack {
         if (!up.succeeded()) {
             throw unavailable("docker compose up failed" + (up.stderr().isBlank() ? "" : ": " + up.stderr().strip()));
         }
-        Boolean healthy = retryWhile(() -> probe.isHealthy(GuidedNew.DEFAULT_SERVER), answered -> !answered);
+        Boolean healthy = retryWhile(() -> probe.isHealthy(ServerBinding.DEFAULT_SERVER), answered -> !answered);
         if (!healthy) {
-            throw unavailable("the stack in " + dir + " was started but did not answer on " + GuidedNew.DEFAULT_SERVER_TEXT
+            throw unavailable("the stack in " + dir + " was started but did not answer on " + ServerBinding.DEFAULT_SERVER_TEXT
                     + " within " + (healthPolls * POLL_MILLIS / 1_000) + " s; look at its logs with"
                     + " docker compose -f " + dir.resolve(COMPOSE_FILE) + " logs, or stop it with " + stopCommand());
         }

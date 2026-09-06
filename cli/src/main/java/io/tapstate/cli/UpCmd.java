@@ -18,6 +18,11 @@ import java.util.concurrent.Callable;
  * <p>The stages are named in the description because they are the words a failure names; a reader
  * who meets "apply workspace failed" should be able to find, from the help alone, where in the order
  * that was.
+ *
+ * <p>This verb owns every contact the CLI makes with a server outside the verbs that talk to one: the
+ * first run on an unbound workspace asks which server to use, starts the local development stack
+ * behind that default when nothing is listening, signs in and binds. The scaffolding verbs write
+ * files and learn nothing.
  */
 @Command(mixinStandardHelpOptions = true,
         description = "Stages, in order: preflight, apply sources, discover, apply workspace, start. "
@@ -40,8 +45,20 @@ final class UpCmd implements Callable<Integer> {
     String server;
 
     @Option(names = {"-y", "--yes"},
-            description = "Never prompt (accepted for scripts; up asks nothing either way).")
+            description = "Never prompt. The workspace must already be bound, or --server must name a "
+                    + "server; the local development stack is never started without --start-local.")
     boolean yes;
+
+    @Option(names = "--start-local",
+            description = "Start the local development stack in Docker when nothing is listening on "
+                    + ServerBinding.DEFAULT_SERVER_TEXT + ". Never started without it in a script.")
+    boolean startLocal;
+
+    @Option(names = {"-u", "--user"}, paramLabel = "NAME",
+            description = "Sign in as this user when the workspace is bound for the first time "
+                    + "(default admin). The password comes from $" + ServerBinding.PASSWORD_ENV
+                    + " or a masked prompt.")
+    String user;
 
     @Option(names = {"-o", "--output"}, paramLabel = "FORMAT",
             description = "Output format: text (default), json or yaml.")

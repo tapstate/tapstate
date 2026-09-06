@@ -93,7 +93,7 @@ class FirstRunWordingGatesTest {
     private static final Pattern DEMO = Pattern.compile("(?i)\\bdemo\\b");
 
     /** The guided classes whose string constants are questions or lines a person reads. */
-    private static final List<String> GUIDED_CLASSES = List.of("GuidedNew", "RecipeSupport");
+    private static final List<String> GUIDED_CLASSES = List.of("GuidedNew", "ServerBinding", "RecipeSupport");
 
     /** The constants that reach a person: every question, and the lines around them. */
     private static final List<String> SPOKEN_CONSTANTS = List.of("OPENING_LINE", "LOCAL_STACK_OFFER");
@@ -119,11 +119,13 @@ class FirstRunWordingGatesTest {
         // Positive controls: the questions were found under their own names, and the documents read
         // are the ones with the first run in them. A scan over an empty map passes on nothing.
         assertThat(surfaces.keySet())
-                .contains("GuidedNew.SERVER_QUESTION", "GuidedNew.OPENING_LINE", "GuidedNew.RECIPE_QUESTION",
+                .contains("ServerBinding.SERVER_QUESTION", "GuidedNew.OPENING_LINE", "GuidedNew.RECIPE_QUESTION",
                         "MirroredTableRecipe.TABLE_QUESTION", "RecipeSupport.CONNECTOR_QUESTION");
         assertThat(surfaces.get("README.md " + TRY_IT_HEADING)).contains("tapstate new").contains("tapstate up");
         assertThat(surfaces.get(relative(FIRST_RUN_CONTRACT))).contains("tapstate up");
-        assertThat(surfaces.get("new --help")).contains("--server");
+        // `new` scaffolds and reaches nothing, so its anchor is its own catalog flag; --server is up's,
+        // which is where every question about a server now lives
+        assertThat(surfaces.get("new --help")).contains("--list");
         assertThat(surfaces.get("up --help")).contains("--server");
 
         List<String> offenders = new ArrayList<>();

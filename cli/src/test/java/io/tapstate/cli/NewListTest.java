@@ -152,14 +152,18 @@ class NewListTest {
         assertThat(Recipe.CATALOG).extracting(Recipe::id).containsExactlyElementsOf(onPage);
     }
 
-    /** The first column of the catalog table under "Step 2", in order: every row whose first cell is a backticked id. */
+    /**
+     * The first column of the catalog table, in order: every row whose first cell is a backticked id.
+     * The section is found by what its heading says rather than by the step number it happens to carry,
+     * so renumbering the steps moves the table without silently emptying this guard.
+     */
     private static List<String> catalogIdsOnPage(String page) {
-        int step2 = page.indexOf("### Step 2");
-        int step3 = page.indexOf("### Step 3", step2);
-        assertThat(step2).isNotNegative();
-        assertThat(step3).isGreaterThan(step2);
+        int catalog = page.indexOf("— which outcome");
+        int after = page.indexOf("— the recipe's questions", catalog);
+        assertThat(catalog).as("the catalog section is on the page").isNotNegative();
+        assertThat(after).as("the section after it is on the page").isGreaterThan(catalog);
         List<String> ids = new ArrayList<>();
-        Matcher m = Pattern.compile("(?m)^\\| `([a-z-]+)` \\|").matcher(page.substring(step2, step3));
+        Matcher m = Pattern.compile("(?m)^\\| `([a-z-]+)` \\|").matcher(page.substring(catalog, after));
         while (m.find()) {
             ids.add(m.group(1));
         }

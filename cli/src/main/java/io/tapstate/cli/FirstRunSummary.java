@@ -20,7 +20,7 @@ import java.util.Map;
  * silent about what it overwrote. A fresh run carries neither word.
  *
  * <p>The machine forms carry the same facts as fields - each file's role and assumption, the state,
- * the server, the next verbs - and none of the prose. They extend the envelope {@code new} already
+ * the next verbs - and none of the prose. No server is among them: scaffolding never learns one. They extend the envelope {@code new} already
  * reported; no existing key moves.
  *
  * <p>What {@code up} says afterwards ({@code docs/first-run/README.md}, "tapstate up") is the same
@@ -120,7 +120,7 @@ final class FirstRunSummary {
      *
      * @param server the server the workspace is bound to, which is what {@code up} will bring it to
      */
-    static void text(PrintWriter o, RecipeRun.Result result, URI server) {
+    static void text(PrintWriter o, RecipeRun.Result result) {
         o.println("Workspace: " + result.root());
         for (RecipeRun.Created file : result.files()) {
             String replaced = !file.replaced() ? ""
@@ -139,12 +139,12 @@ final class FirstRunSummary {
         o.println("  edit any file above  they are ordinary YAML; the guided commands never hide them");
         o.println("  tapstate validate  check the workspace without a server");
         o.println("  tapstate ls / tapstate desc <id>  see what is here and what each file declares");
-        o.println("  tapstate up  bring it to running against " + server);
+        o.println("  tapstate up  bring it to running; it asks which server the first time");
         o.println(AI_LINE);
     }
 
     /** The structured form, as the tree the JSON and YAML writers render. */
-    static Map<String, Object> envelope(RecipeRun.Result result, URI server) {
+    static Map<String, Object> envelope(RecipeRun.Result result) {
         Map<String, Object> env = new LinkedHashMap<>();
         env.put("status", "created");
         env.put("recipe", result.recipe());
@@ -165,7 +165,6 @@ final class FirstRunSummary {
         }
         env.put("files", files);
         env.put("state", STATE);
-        env.put("server", server.toString());
         env.put("next", NEXT);
         return env;
     }
