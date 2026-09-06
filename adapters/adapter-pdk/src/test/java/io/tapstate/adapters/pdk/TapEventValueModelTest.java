@@ -357,18 +357,29 @@ class TapEventValueModelTest {
         Path jar = SyntheticJar.compileToJar(dir, "synthetic.Key",
                 "package synthetic; public class Key implements java.io.Serializable {"
                         + " public String toString() { return \"key-1\"; } }");
-        try (ConnectorClassLoader theOtherConnector = ConnectorClassLoader.open(List.of(jar))) {
-            Object foreign = instanceOf(theOtherConnector.load("synthetic.Key"));
-            TapCodecsRegistry codecs = new TapCodecsRegistry()
-                    .registerToTapValue(foreign.getClass(), (value, tapType) ->
-                            new TapStringValue(String.valueOf(value)))
-                    .registerFromTapValue(TapStringValue.class, TapValue::getValue);
-            Envelope decoded = insert(row("_id", foreign), codecs);
+        try (ConnectorClassLoader readingConnector = ConnectorClassLoader.open(List.of(jar));
+                ConnectorClassLoader writingConnector = ConnectorClassLoader.open(List.of(jar))) {
+            Class<?> asTheSourceSeesIt = readingConnector.load("synthetic.Key");
+            Class<?> asTheTargetSeesIt = writingConnector.load("synthetic.Key");
+            assertThat(asTheTargetSeesIt)
+                    .as("two connectors over one jar hold two unrelated classes of the same name")
+                    .isNotSameAs(asTheSourceSeesIt);
+
+            Object foreign = instanceOf(asTheSourceSeesIt);
+            Envelope decoded = insert(row("_id", foreign), new TapCodecsRegistry()
+                    .registerToTapValue(asTheSourceSeesIt, (value, tapType) ->
+                            new TapStringValue(asTheSourceSeesIt.cast(value).toString())));
             assertThat(decoded.after().get("_id")).as("the row carries it").isInstanceOf(ConvertedValue.class);
 
-            TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(
-                    decoded, new TapCodecsRegistry().registerToTapValue(String.class, (value, tapType) ->
-                            new TapStringValue(String.valueOf(value))));
+            // The target's own conversion, written the way a real one is: it casts what it is handed to
+            // the class its own loader defines. Registered under the same name, which is all the lookup
+            // compares.
+            TapCodecsRegistry target = new TapCodecsRegistry()
+                    .registerToTapValue(asTheTargetSeesIt, (value, tapType) ->
+                            new TapStringValue(asTheTargetSeesIt.cast(value).toString()))
+                    .registerFromTapValue(TapStringValue.class, TapValue::getValue);
+
+            TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, target);
 
             // Handed the portable value, which is the answer already written for a target that cannot
             // read this object. Not a restored identity - that is a separate thing this does not do -
