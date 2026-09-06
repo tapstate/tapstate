@@ -21,6 +21,16 @@ interface Prompter {
     String choose(String question, List<String> options);
 
     /**
+     * Pick exactly one of {@code options}, with {@code defaultOption} marked as the one an empty reply
+     * takes. The two-argument form reads an empty reply as the last option because the wizards' lists
+     * end with a skip sentinel; a picker whose default is not last uses this one. Implementations that
+     * cannot show a default fall back to the two-argument form, which is what this default does.
+     */
+    default String choose(String question, List<String> options, String defaultOption) {
+        return choose(question, options);
+    }
+
+    /**
      * Capture a multi-line block (e.g. SQL or a JS body); returns the joined lines with no trailing
      * newline (the caller normalizes block-scalar layout). An immediately-finished / skipped block
      * returns the empty string.
