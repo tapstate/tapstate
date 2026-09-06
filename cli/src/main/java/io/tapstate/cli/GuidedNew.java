@@ -10,8 +10,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
+import java.util.stream.Collectors;
 
 /**
  * The guided first run ({@code docs/first-run/README.md}): which server, then which outcome. Two
@@ -185,7 +187,9 @@ final class GuidedNew {
      * Registers the context when it is new, signs in through the same service every other sign-in
      * uses, and only then binds the directory. {@code justStarted} says the server is a stack that came
      * up a moment ago: its bootstrap creates the admin right after the server first answers, so a
-     * refused login there is retried for as long as the stack was given to answer at all.
+     * refused login there is retried for as long as the stack was given to answer at all - and once
+     * signed in, the binding waits for the stack's boot-time sweep to register the bundled connectors,
+     * so the first {@code up} never lands in the seconds between the server listening and them existing.
      */
     private void signInAndBind(Path workspace, URI server, Credentials credentials, boolean justStarted)
             throws IOException {
@@ -202,7 +206,10 @@ final class GuidedNew {
                 ? stack.retryWhile(attempt, outcome -> outcome instanceof AuthService.LoginResult.Rejected)
                 : attempt.get();
         switch (result) {
-            case AuthService.LoginResult.Success ignored -> {
+            case AuthService.LoginResult.Success success -> {
+                if (justStarted) {
+                    stack.awaitConnectors(() -> registeredConnectors(success.session()));
+                }
             }
             case AuthService.LoginResult.Rejected rejected -> throw new TapstateException(
                     CliError.AUTH_LOGIN_REJECTED,
@@ -213,6 +220,23 @@ final class GuidedNew {
         // the binding is keyed by the directory's real path, so the directory has to be there first
         Files.createDirectories(workspace);
         contexts.bind(workspace, name);
+    }
+
+    /**
+     * The connectors the server reports as actually loaded for {@code session}; none while the list
+     * cannot be read. A stack that has just come up lists its whole bundled catalog at once - the staged
+     * jars among them show as {@code bundled} until the boot-time sweep loads them and flips them to
+     * {@code registered}. Only the latter can be tested against, so the id of a merely bundled entry
+     * does not count as ready.
+     */
+    private Set<String> registeredConnectors(AuthService.ActiveSession session) {
+        return switch (probe.connectorList(session.seed(), session.accessToken())) {
+            case ConnectorListOutcome.Listed listed -> listed.connectors().stream()
+                    .filter(connector -> "registered".equals(connector.origin()))
+                    .map(CatalogConnector::id)
+                    .collect(Collectors.toSet());
+            default -> Set.of();
+        };
     }
 
     private static TapstateException connectFailed(URI server) {
