@@ -63,8 +63,10 @@ class NewRecipeTest {
         CommandLine cl = Cli.newCommandLine();
         NewCmd cmd = cl.getSubcommands().get("new").getCommand();
         cmd.prompter = prompter;
-        cmd.contextManager = new ContextManager(ContextConfigStore.underHome(home));
+        cmd.home = home;
         cmd.controlPlane = new FakeHealthProbe(true);
+        // the default server is listening and the sign-in it takes is answered from the environment
+        cmd.env = NewGuidedTest.PASSWORD_IN_ENV;
         StringWriter out = new StringWriter();
         StringWriter err = new StringWriter();
         cl.setOut(new PrintWriter(out));
