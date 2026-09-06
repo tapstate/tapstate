@@ -3596,7 +3596,7 @@ final class Repl {
     /**
      * {@code up [--server <url>] [--yes] [-o text|json|yaml] [-w <dir>]} — brings the bound workspace to
      * running through the same calls the individual verbs make, in a fixed order: reach and check the
-     * server, apply the sources, discover each source the pipelines read, apply the rest of the workspace,
+     * server, apply the sources, discover each source the pipelines read, apply the workspace,
      * start every pipeline. It stops at the first stage that fails and names the stage, the resource and
      * the code. Run on a workspace that is already up it changes nothing and says so.
      *
@@ -3733,7 +3733,7 @@ final class Repl {
                 status = discover();
             }
             if (status == Cli.EXIT_OK) {
-                status = apply(UpCmd.STAGE_APPLY_WORKSPACE, rest());
+                status = apply(UpCmd.STAGE_APPLY_WORKSPACE, workspaceBatch(), rest());
             }
             if (status == Cli.EXIT_OK) {
                 status = start();
@@ -3893,19 +3893,45 @@ final class Repl {
             return drafts.stream().filter(d -> d.kind().equals("pipeline")).toList();
         }
 
+        /** What the workspace apply stage answers for: everything the apply-sources stage did not. */
         private List<UpDraft> rest() {
             return drafts.stream().filter(d -> !d.kind().equals("source")).toList();
         }
 
+        /**
+         * What that stage sends, which is the whole workspace. An apply batch is one closure - every
+         * reference in it resolves inside it - so a batch of pipelines alone is refused: their
+         * {@code source:} references name resources that are stored but are not in the batch. The sources
+         * were applied a stage earlier so discovery could run, and they ride along here unchanged.
+         */
+        private List<UpDraft> workspaceBatch() {
+            return drafts;
+        }
+
         /** Applies one batch as {@code apply} would, recording each item's change; an empty batch is skipped. */
         private int apply(String stage, List<UpDraft> batch) {
+            return apply(stage, batch, batch);
+        }
+
+        /**
+         * The same, for a stage whose batch is wider than what the stage is about: {@code subjects} are
+         * the resources the stage answers for, and a refusal that names none of its own is reported
+         * against them rather than against everything the batch had to carry.
+         */
+        private int apply(String stage, List<UpDraft> batch, List<UpDraft> subjects) {
             if (batch.isEmpty()) {
                 return Cli.EXIT_OK;
             }
-            List<String> ids = batch.stream().map(UpDraft::id).toList();
+            List<String> ids = subjects.stream().map(UpDraft::id).toList();
             switch (applyDrafts(batch.stream().map(UpDraft::draft).toList())) {
                 case ApplyOutcome.Applied applied -> {
                     for (ApplyOutcome.Item item : applied.items()) {
+                        // A resource an earlier stage already applied keeps that stage's verdict: it is
+                        // carried again only to close this batch's references, and the echo would report
+                        // the source that was just created as unchanged.
+                        if (changes.containsKey(item.id())) {
+                            continue;
+                        }
                         changes.put(item.id(), item.change());
                         if (item.change().equalsIgnoreCase(UNCHANGED)) {
                             note(item.id(), "apply: unchanged");
