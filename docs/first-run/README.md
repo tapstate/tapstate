@@ -199,7 +199,9 @@ the prose.
 **A skeleton validates as written.** `tapstate validate` on a freshly written `blank` workspace
 passes: the placeholders are values of the right shape (`your_database`, `your_table`), not gaps,
 and the pipeline's `view.from` names the table its source declares, so the reference closure
-resolves. This is pinned rather than left to taste — the summary's own first next step is
+resolves. The password is the one field written as a `${...}` reference rather than a placeholder
+value, because a template that ships a literal in that position teaches the wrong thing; `up`
+resolves it from a `.env` beside the file, which the author writes. This is pinned rather than left to taste — the summary's own first next step is
 `tapstate validate`, and the one recipe whose whole purpose is a clean starting point must not
 open with a list of errors.
 
