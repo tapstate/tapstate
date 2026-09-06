@@ -2,6 +2,7 @@ package io.tapstate.cli;
 
 import java.io.PrintWriter;
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,6 +21,11 @@ import java.util.Map;
  * <p>The machine forms carry the same facts as fields - each file's role and assumption, the state,
  * the server, the next verbs - and none of the prose. They extend the envelope {@code new} already
  * reported; no existing key moves.
+ *
+ * <p>What {@code up} says afterwards ({@code docs/first-run/README.md}, "tapstate up") is the same
+ * shape with the running things in place of the files: the workspace, one line per pipeline with its
+ * state and one per source, the state, the commands that do the same thing one step at a time, and the
+ * handover. Rendered here so the two endings read alike and cannot drift apart.
  */
 final class FirstRunSummary {
 
@@ -31,7 +37,81 @@ final class FirstRunSummary {
     /** The verbs of the next steps, in the order they are printed, as the machine forms name them. */
     static final List<String> NEXT = List.of("validate", "ls", "desc", "up");
 
+    /** What {@code up} reports once the workspace is running, and its machine spelling. */
+    static final String UP_STATE_TEXT = "running";
+    static final String UP_STATE = "running";
+    /** The same, when there was nothing to do: everything was already applied and running. */
+    static final String UP_UNCHANGED_TEXT = "running (nothing to do)";
+    static final String UP_UNCHANGED = "running-unchanged";
+
+    /** The verbs {@code up}'s next steps name, in the order they are printed. */
+    static final List<String> UP_NEXT = List.of("status", "logs", "apply", "start", "up");
+
+    /** The operand the next-step lines carry when there is not exactly one pipeline to name. */
+    private static final String ANY_PIPELINE = "<pipeline-id>";
+
+    /**
+     * One pipeline as {@code up} left it: its state as the server reports it, and what the stages had
+     * to say about it — {@code apply: unchanged}, {@code start: already running} — empty when they did
+     * something.
+     */
+    record UpPipeline(String id, String state, List<String> notes) {
+    }
+
+    /** One source as {@code up} left it, with the stages' notes, empty when they did something. */
+    record UpSource(String id, List<String> notes) {
+    }
+
     private FirstRunSummary() {
+    }
+
+    /**
+     * The text form of what {@code up} says afterwards.
+     *
+     * @param nothingToDo whether every stage found its work already done, which the state line says
+     */
+    static void upText(PrintWriter o, Path root, List<UpPipeline> pipelines, List<UpSource> sources,
+                       boolean nothingToDo) {
+        o.println("Workspace: " + root);
+        for (UpPipeline pipeline : pipelines) {
+            o.println("  pipeline " + pipeline.id() + ": " + pipeline.state() + notes(pipeline.notes()));
+        }
+        for (UpSource source : sources) {
+            o.println("  source " + source.id() + ": applied" + notes(source.notes()));
+        }
+        o.println("State: " + (nothingToDo ? UP_UNCHANGED_TEXT : UP_STATE_TEXT));
+        String pipeline = pipelines.size() == 1 ? pipelines.get(0).id() : ANY_PIPELINE;
+        o.println("Next:");
+        o.println("  tapstate status " + pipeline + "  watch it");
+        o.println("  tapstate logs " + pipeline + "  see what it is doing");
+        o.println("  tapstate apply / tapstate start  the same thing, one step at a time");
+        o.println("  edit any file above, then tapstate up again  it converges");
+        o.println(AI_LINE);
+    }
+
+    /** The stages' notes on one line, in parentheses, or nothing when the stages did something. */
+    private static String notes(List<String> notes) {
+        return notes.isEmpty() ? "" : " (" + String.join("; ", notes) + ")";
+    }
+
+    /** The structured form of what {@code up} says afterwards: the same facts, none of the prose. */
+    static Map<String, Object> upEnvelope(Path root, List<UpPipeline> pipelines, List<UpSource> sources,
+                                          boolean nothingToDo) {
+        Map<String, Object> env = new LinkedHashMap<>();
+        env.put("status", "up");
+        env.put("workspace", root.toString());
+        List<Map<String, Object>> lines = new ArrayList<>();
+        for (UpPipeline pipeline : pipelines) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("id", pipeline.id());
+            entry.put("state", pipeline.state());
+            lines.add(entry);
+        }
+        env.put("pipelines", lines);
+        env.put("sources", sources.stream().map(UpSource::id).toList());
+        env.put("state", nothingToDo ? UP_UNCHANGED : UP_STATE);
+        env.put("next", UP_NEXT);
+        return env;
     }
 
     /**
