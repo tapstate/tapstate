@@ -522,6 +522,9 @@ nest.migration-parking-limit-exceeded:
 nest.reference-fanout-limit-exceeded:
   message: "Row {identity} behind embed {refPath} is referenced by {referrers} rows, past the per-row limit of {limit}."
   solution: "One change to that row rewrites that many documents, which is what this bounds - it is not a limit on storage, so widening how the references are held does not lift it. Raise the limit if the data really is this wide, or embed the row from the other side so the change travels with one document instead of all of them."
+nest.reference-tracking-requires-before-image:
+  message: "Stream {alias} behind embed {refPath} sent an update carrying no earlier row, so where that row pointed before is not known."
+  solution: "Rows pointing at an embedded row are recorded against it, and taking that record back out needs the row the update replaces. Configure that stream's source to send before images - on most databases that is a full replica identity on the table. Without them a re-pointed row stays recorded against the row it left, which is then never reclaimed and counts for ever against the per-row reference limit."
 nest.pending-limit-exceeded:
   message: "Key {key} of nest state {namespace} holds {pending} changes waiting for something that has not arrived, past the limit of {limit}."
   solution: "Check whether the parent rows are simply late or are never coming - a load reading children before their parents fills these queues and empties them again, where a broken reference fills them for good. Raise the limit if the wait is real and this deep."

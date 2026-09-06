@@ -83,6 +83,17 @@ final class PostgresEndpoints implements Endpoints {
     }
 
     /**
+     * Puts the table back to what PostgreSQL does unless it is told otherwise, which is to send the key
+     * columns of the old row and nothing else. The seed above turns that up to the whole row; this is
+     * the one case that wants it left alone, and it is spelled as an undoing of the seed rather than as
+     * a branch inside it so that the seed keeps saying one thing.
+     */
+    @Override
+    public void withoutBeforeImages(EndpointAddress address, String table) {
+        execute(connection(address), "ALTER TABLE " + quoted(table) + " REPLICA IDENTITY DEFAULT");
+    }
+
+    /**
      * The table the first row describes: {@code id} is the primary key, integers become BIGINT and
      * strings VARCHAR. The parser has already held every row to one shape and to these two scalar
      * types, so the first row speaks for all of them.

@@ -80,6 +80,51 @@ final class NestKeys {
     }
 
     /**
+     * Stops the job on an update of a stream whose rows are recorded against what they point at, where
+     * that update arrives without the row it replaces.
+     *
+     * <p>Where a row points is read off the row itself, so recording it needs nothing more. Taking that
+     * record back out is the other half, and only the earlier row can say which entry to take it out of -
+     * an update naming a different row and an update that only edited a column arrive looking the same.
+     *
+     * <p><b>Refused rather than passed over, because passing over it is invisible.</b> Every document
+     * still renders correctly and every count downstream is right; what grows is the record of who points
+     * where, and nothing reads that out loud. Left alone it surfaces as one of two things much later - a
+     * row nothing points at any more kept for the life of the job, or an edit refused on a fanout that was
+     * never real.
+     *
+     * <p>Only updates are refused, for the same reason as the tracking above: an insert points somewhere
+     * for the first time and leaves nothing behind, and a deletion is taken out on the other edge, where it
+     * happens whether this one carried an earlier row or not.
+     */
+    static void requireBeforeImageWhereReferencesAreRecorded(NestLookup lookup, Envelope event) {
+        if (event.op() != Op.UPDATE || saysWhereItPointed(event.before(), lookup)) {
+            return;
+        }
+        throw new TapstateException(NestError.REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE,
+                Map.of("alias", lookup.referrerAlias(), "refPath", NestTopology.render(lookup.pathId())),
+                null);
+    }
+
+    /**
+     * Whether an earlier row says enough to find the entry to take out - the columns holding the
+     * reference, and the ones identifying the row making it.
+     *
+     * <p><b>Which columns are there, not whether the row is.</b> A change stream with no pre-image
+     * configured sends an earlier row that is present and holds nothing, which is the shape most sources
+     * actually produce and is a different value from none at all. Read as a row it says this one used to
+     * point at null, so the entry taken out is one nobody ever wrote while the real one stays - the same
+     * leak, reached through the branch that looks like it is handling it.
+     *
+     * <p>A column that is genuinely null is left alone, which is why this asks for the key and never for
+     * the value: the column is present, so the key built from it is the key the entry was written under.
+     */
+    private static boolean saysWhereItPointed(Map<String, Object> was, NestLookup lookup) {
+        return was != null && was.keySet().containsAll(lookup.referenceFields())
+                && was.keySet().containsAll(lookup.referrerIdentity());
+    }
+
+    /**
      * The row this event replaces, where there is one to compare against and the author asked for it to be
      * compared. Absent everywhere else, which is what keeps a tree that tracks nothing on exactly the path
      * it was on before: no comparison is made, so no source has to send anything more.

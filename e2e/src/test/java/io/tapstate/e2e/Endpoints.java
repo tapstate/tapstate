@@ -32,6 +32,18 @@ interface Endpoints extends AutoCloseable {
     void seed(EndpointAddress address, String table, List<Map<String, Object>> rows);
 
     /**
+     * Stops a seeded table's change stream carrying the row an update replaces.
+     *
+     * <p>Refused by default. Only a store that arranges them in the first place can take them away
+     * again, and a driver that quietly did nothing here would leave a case asserting on their absence
+     * running against a table that still sends them.
+     */
+    default void withoutBeforeImages(EndpointAddress address, String table) {
+        throw new EnvelopeException(
+                "this store has no way to stop " + table + " sending the row an update replaces");
+    }
+
+    /**
      * Produces {@code rows} changes of one kind against a table that is already seeded. The change
      * generators assume the generated row shape (an id and a sequence); driving them against a table
      * seeded with other columns fails loudly rather than inventing a change.

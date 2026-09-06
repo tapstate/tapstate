@@ -160,6 +160,7 @@ nest.migration-parking-limit-exceeded
 nest.parent-absent
 nest.pending-limit-exceeded
 nest.reference-fanout-limit-exceeded
+nest.reference-tracking-requires-before-image
 nest.referenced-level-carries-embeds
 nest.resolver-vertex-limit-exceeded
 nest.root-fanout-limit-exceeded
