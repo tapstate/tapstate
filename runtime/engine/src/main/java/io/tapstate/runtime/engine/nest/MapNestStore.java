@@ -26,7 +26,9 @@ import java.util.Set;
  * whole assembled document every time; handing it to the key it belongs to serializes none of it, because
  * the key is on the member the write is made from and what travels is a reference. Measured on both:
  * carried, a write costs nothing that grows with the document, where a put costs one full copy of it and
- * so grows with every row the document has ever absorbed.
+ * so grows with every row the document has ever absorbed. The single exception is a write onto a key a
+ * read has just found nothing under, where the copy buys back a round trip nothing reads - see the write
+ * that takes that word.
  *
  * <p>It is a whole state that is carried, not a description of what changed in it, so a write still
  * replaces what was there in one step: nothing is left half-applied by a write that fails partway. Getting
@@ -125,6 +127,36 @@ final class MapNestStore<S> implements NestStore<S> {
     }
 
     /**
+     * The same write onto a key a read has just found nothing under, put across the map rather than carried
+     * to it. <b>It is the one place a put is the cheaper of the two</b>, and what decides it is what a
+     * carried write is handed: an entry processor is given the current entry, so on a key that is not
+     * resident the substrate fetches it from the layer behind the map before the processor runs - and this
+     * processor overwrites what it is handed without reading it. Measured, a root row arriving where nothing
+     * was held cost two trips behind the map in the one event, of which the second carried nothing anybody
+     * read.
+     *
+     * <p>A put makes no such fetch, and pays one serialization and one deserialization of the state for it.
+     * That trade is a loss on an ordinary write, which is why it is banned everywhere else: a document grows
+     * with every row it has ever absorbed, and writes happen per event where first touches do not. It is not
+     * a loss here. Nothing was held under this key, so the state being written holds only what the drain
+     * that reached it brought - the smallest this key's state will be - and what the copy replaces is a
+     * round trip to another process.
+     *
+     * <p>Both forms replace whatever is under the key, so a caller wrong about the word pays a copy it did
+     * not need or a trip it could have avoided, and never a value.
+     */
+    @Override
+    public void save(Object key, S state, boolean nothingHeldThere) {
+        if (!nothingHeldThere) {
+            save(key, state);
+            return;
+        }
+        countAccess();
+        map.set(key, state);
+        publishReading();
+    }
+
+    /**
      * Grows the set at its own key rather than across the map, the same way a state is written: what
      * travels is the one element being added, so registering a row costs the same whether it is the first
      * to point at that row or the thousandth. One reach, not the read-then-write pair the default is.
@@ -175,9 +207,10 @@ final class MapNestStore<S> implements NestStore<S> {
     /**
      * Counts one reach for the state, whichever kind it is. A write counts as much as a read because a
      * write can miss as thoroughly: a state carried to a key that is not in memory sends the substrate to
-     * the layer behind first, exactly as a read does. Measured, a key touched for the first time costs two
-     * trips in the one event - one for the read and one for the write that follows it - so a ratio taken
-     * over reads alone would report more of the reading served from memory than ever was.
+     * the layer behind first, exactly as a read does, so a ratio taken over reads alone would report more of
+     * the reading served from memory than ever was. That is still true of every carried write; the one it
+     * stopped being true of is the write onto a key a read has just found nothing under, which is put across
+     * the map for exactly this reason and makes no trip at all.
      */
     private void countAccess() {
         if (stats != null) {
