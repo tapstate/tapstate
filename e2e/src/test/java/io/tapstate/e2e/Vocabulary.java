@@ -65,7 +65,7 @@ final class Vocabulary {
     static final Set<String> DATABASE_KEYS = Set.of("kind");
 
     /** The keys a seed entry may carry - a generated count, or the rows themselves. */
-    static final Set<String> SEED_KEYS = Set.of("rows", "values");
+    static final Set<String> SEED_KEYS = Set.of("rows", "values", "before_image");
 
     /** The keys a doc matcher body carries: how to find the document, and what to hold it to. */
     static final Set<String> DOC_KEYS = Set.of("where", "expect", "size");
