@@ -65,6 +65,10 @@ final class NewCmd implements Callable<Integer> {
             description = "Never prompt; take every answer from flags (scripting / AI).")
     boolean nonInteractive;
 
+    @Option(names = "--list",
+            description = "Print the recipe catalog (id and title) instead of scaffolding; -o json|yaml for scripts.")
+    boolean list;
+
     @Option(names = "--kind", paramLabel = "KIND",
             description = "Resource kind to scaffold: source, pipeline, transform, view or serve.")
     String kind;
@@ -120,6 +124,9 @@ final class NewCmd implements Callable<Integer> {
     @Override
     public Integer call() {
         PrintWriter err = CliIo.err(spec);
+        if (list) {
+            return callList(err);
+        }
         String resolved = kind == null ? "source" : kind;
         if (type != null && !"transform".equals(resolved)) {
             err.println("new: --type is only valid for --kind transform");
@@ -138,6 +145,35 @@ final class NewCmd implements Callable<Integer> {
                 yield EXIT_USAGE;
             }
         };
+    }
+
+    /**
+     * {@code --list} prints the recipe catalog and scaffolds nothing, so every flag that shapes an
+     * artifact is a contradiction rather than an ignorable extra: refused, the way the kind checks refuse.
+     */
+    private int callList(PrintWriter err) {
+        boolean scaffolding = kind != null || type != null || connector != null || id != null || mode != null
+                || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty() || out != null || force || dryRun;
+        if (scaffolding) {
+            err.println("new: --list cannot be combined with --kind/--type/--connector/--id/--mode/--set"
+                    + "/--source/--sync-to/--out/--force/--dry-run");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        PrintWriter o = CliIo.out(spec);
+        switch (output) {
+            case JSON -> o.println(JsonOut.write(Recipe.catalogTree()));
+            case YAML -> o.println(YamlOut.write(Recipe.catalogTree()));
+            default -> {
+                // plain text, no colour: this rendering is held to a golden
+                int width = Recipe.CATALOG.stream().mapToInt(r -> r.id().length()).max().orElse(0);
+                for (Recipe recipe : Recipe.CATALOG) {
+                    o.println(String.format("%-" + width + "s  %s", recipe.id(), recipe.title()));
+                }
+            }
+        }
+        o.flush();
+        return 0;
     }
 
     private int callSource(PrintWriter err) {
