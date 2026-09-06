@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/tutorials/browsing-live-data-by-hand
+---
+
 # Browsing live data by hand
 
 Tapstate can show you the data it is keeping current, without a `mongosh` and without you knowing
