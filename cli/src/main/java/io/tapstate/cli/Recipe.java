@@ -19,7 +19,7 @@ import java.util.Optional;
  * @param id       what the user ends up with, {@code <past-participle>-<noun>}; never an internal type name
  * @param title    the wording the picker shows
  * @param runnable whether the workspace it writes can be brought up as it stands; only {@code blank}
- *                 is not, because it writes nothing to run
+ *                 is not, because what it writes are skeletons whose placeholders connect to nothing
  * @param uses     the transform types the generated pipeline relies on, empty when none
  */
 record Recipe(String id, String title, boolean runnable, List<String> uses) {
@@ -33,7 +33,7 @@ record Recipe(String id, String title, boolean runnable, List<String> uses) {
             new Recipe("nested-json", "Assemble several tables into one object", true, List.of("nest")),
             new Recipe("consolidated-table", "Consolidate the same table from several databases", true,
                     List.of("union")),
-            new Recipe("blank", "Nothing generated - I will write it myself", false, List.of()));
+            new Recipe("blank", "Skeleton files only - I will write it myself", false, List.of()));
 
     /** The recipe with this id, or empty when the catalog has none — the caller says how that is refused. */
     static Optional<Recipe> byId(String id) {

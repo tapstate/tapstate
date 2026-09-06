@@ -1,0 +1,12 @@
+# A source says which database to read and which tables to read from it.
+# Every value below is a placeholder: replace them, then run `tapstate validate`.
+version: tapstate/v1
+kind: source
+id: example_source
+# Any id that `tapstate connectors` lists; mysql is only a starting point.
+connector: mysql
+# Prefer ${SOME_VAR} over a literal password, with the value in a .env beside this file.
+config: { host: your-database-host, port: "3306", database: your_database, username: your_user, password: change-me }
+# snapshot | cdc | snapshot_and_cdc
+mode: cdc
+tables: [ your_table ]

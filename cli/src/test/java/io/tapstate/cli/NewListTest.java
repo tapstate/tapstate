@@ -53,7 +53,7 @@ class NewListTest {
                 reshaped-table      Mirror a table, renamed / filtered / trimmed
                 nested-json         Assemble several tables into one object
                 consolidated-table  Consolidate the same table from several databases
-                blank               Nothing generated - I will write it myself
+                blank               Skeleton files only - I will write it myself
                 """);
     }
 
@@ -110,7 +110,7 @@ class NewListTest {
                     },
                     {
                       "id": "blank",
-                      "title": "Nothing generated - I will write it myself",
+                      "title": "Skeleton files only - I will write it myself",
                       "runnable": false,
                       "uses": []
                     }

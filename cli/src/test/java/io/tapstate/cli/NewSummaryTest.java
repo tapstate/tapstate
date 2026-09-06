@@ -65,7 +65,7 @@ class NewSummaryTest {
     }
 
     @Test
-    void blankSaysTheWorkspaceIsEmptyInWords(@TempDir Path home, @TempDir Path parent) {
+    void blankListsItsTwoSkeletonsAndSaysToFillThem(@TempDir Path home, @TempDir Path parent) {
         Path ws = parent.resolve("fresh");
 
         NewRecipeTest.Run r = NewRecipeTest.run(home, new ScriptedPrompter(), "new", "blank", "--yes", "-w", ws.toString());
@@ -74,7 +74,11 @@ class NewSummaryTest {
         assertThat(r.err()).isEmpty();
         assertThat(r.out()).isEqualTo(
                 "Workspace: " + ws + "\n"
-                        + "  (empty — write your first file, or run tapstate new again for a starter)\n"
+                        + """
+                          source/example_source.tap.yml  source example_source: mysql, cdc
+                          pipeline/example_pipeline.tap.yml  pipeline example_pipeline: 1 source, view
+                          (skeletons — replace the placeholder values, then run tapstate validate)
+                        """
                         + ENDING);
     }
 

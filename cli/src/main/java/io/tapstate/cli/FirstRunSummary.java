@@ -12,7 +12,8 @@ import java.util.Map;
  * What {@code new} says once a recipe has written ({@code docs/first-run/README.md}, "What new says
  * afterwards"), in the order a first run reads it: where the workspace is and what every file in it
  * is for, that nothing is running yet, the four things to do next, and the one line handing over to
- * an AI assistant. A blank workspace prints the same shape and says in words that it is empty.
+ * an AI assistant. A recipe the catalog marks not runnable adds one line saying its files are
+ * skeletons to fill in.
  *
  * <p>A file that was already there and was replaced under {@code --force} says so on its line, and
  * one the recipe extended rather than owned reads as updated: a flag that overwrites must not be
@@ -31,7 +32,7 @@ final class FirstRunSummary {
 
     static final String STATE_TEXT = "not running yet";
     static final String STATE = "not-running";
-    static final String EMPTY_LINE = "(empty — write your first file, or run tapstate new again for a starter)";
+    static final String SKELETON_LINE = "(skeletons — replace the placeholder values, then run tapstate validate)";
     static final String AI_LINE = "An AI assistant can take it from here: https://tapstate.dev/docs/first-run";
 
     /** The verbs of the next steps, in the order they are printed, as the machine forms name them. */
@@ -121,15 +122,17 @@ final class FirstRunSummary {
      */
     static void text(PrintWriter o, RecipeRun.Result result, URI server) {
         o.println("Workspace: " + result.root());
-        if (result.files().isEmpty()) {
-            o.println("  " + EMPTY_LINE);
-        }
         for (RecipeRun.Created file : result.files()) {
             String replaced = !file.replaced() ? ""
                     : "env".equals(file.kind()) || "gitignore".equals(file.kind()) ? " (updated)" : " (replaced)";
             String assumed = file.assumed() == null ? ""
                     : " — assumed " + file.assumed() + "; edit if the table is keyed otherwise";
             o.println("  " + file.name() + "  " + file.role() + replaced + assumed);
+        }
+        // A recipe the catalog marks not runnable wrote a starting point, not a working workspace; saying
+        // so here is what keeps its files from reading as ready to run.
+        if (Recipe.byId(result.recipe()).filter(recipe -> !recipe.runnable()).isPresent()) {
+            o.println("  " + SKELETON_LINE);
         }
         o.println("State: " + STATE_TEXT);
         o.println("Next:");

@@ -146,18 +146,38 @@ class NewRecipeTest {
     // ---- blank ----------------------------------------------------------------------------------
 
     @Test
-    void blankCreatesTheDirectoryAndWritesNoFile(@TempDir Path home, @TempDir Path parent) throws IOException {
+    void blankWritesTheTwoSkeletonsVerbatim(@TempDir Path home, @TempDir Path parent) throws IOException {
         Path ws = parent.resolve("fresh");
 
         Run r = run(home, new ScriptedPrompter(), "new", "blank", "--yes", "-w", ws.toString());
 
-        assertThat(r.code()).isZero();
+        assertThat(r.code()).as(r.all()).isZero();
         assertThat(r.err()).isEmpty();
-        assertThat(ws).isDirectory();
+        assertThat(Files.readString(ws.resolve("source/example_source.tap.yml")))
+                .isEqualTo(BlankRecipe.bundled("source/example_source.tap.yml"));
+        assertThat(Files.readString(ws.resolve("pipeline/example_pipeline.tap.yml")))
+                .isEqualTo(BlankRecipe.bundled("pipeline/example_pipeline.tap.yml"));
+        // the escape hatch writes exactly these two and nothing else - no .env, no .gitignore
         try (var entries = Files.list(ws)) {
-            assertThat(entries).isEmpty();
+            assertThat(entries).hasSize(2);
         }
-        assertThat(r.out()).startsWith("Workspace: " + ws + "\n  (empty");
+    }
+
+    /**
+     * The stance the contract page pins: a skeleton is a workspace you edit, not a list of errors you
+     * clear first, so it parses and validates as written. Were it to arrive invalid, the very first
+     * thing the summary tells a reader to run would fail on the recipe whose whole point is being a
+     * clean starting point.
+     */
+    @Test
+    void theBlankSkeletonValidatesAsWritten(@TempDir Path home, @TempDir Path parent) {
+        Path ws = parent.resolve("fresh");
+        run(home, new ScriptedPrompter(), "new", "blank", "--yes", "-w", ws.toString());
+
+        Run validated = run(home, new ScriptedPrompter(), "validate", ws.toString());
+
+        assertThat(validated.code()).as(validated.all()).isZero();
+        assertThat(validated.out()).contains("2 resources");
     }
 
     // ---- mirrored-table -------------------------------------------------------------------------

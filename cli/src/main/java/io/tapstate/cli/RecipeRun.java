@@ -15,8 +15,7 @@ import java.util.Map;
  * thing to report whichever recipe ran.
  *
  * <p>{@code sample} copies the bundled demo files verbatim - the same bytes {@code demo} writes,
- * through the same writer, so the two cannot drift. {@code blank} writes nothing and makes the
- * directory. The other four ask their questions - or read them from {@link Flags} - and render their
+ * through the same writer, so the two cannot drift. {@code blank} copies its two skeletons the same way. The other four ask their questions - or read them from {@link Flags} - and render their
  * sources and pipeline through the canonical writer.
  */
 final class RecipeRun {
@@ -74,7 +73,9 @@ final class RecipeRun {
             case "sample" -> DemoCmd.bundledFiles().stream()
                     .map(file -> new Output(file, file.path().substring(0, file.path().indexOf('/')), null))
                     .toList();
-            case "blank" -> List.of();
+            case "blank" -> BlankRecipe.bundledFiles().stream()
+                    .map(file -> new Output(file, file.path().substring(0, file.path().indexOf('/')), null))
+                    .toList();
             case "mirrored-table" -> {
                 TapstateCatalog catalog = TapstateCatalog.load();
                 MirroredTableRecipe.Answers answers = prompter != null
