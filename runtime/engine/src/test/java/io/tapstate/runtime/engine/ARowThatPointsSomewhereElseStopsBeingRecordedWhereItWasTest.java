@@ -123,7 +123,8 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
     @Test
     @DisplayName("re-pointing is taken back out even where key changes are not being followed")
     void anIdentityIsTakenOutWhereverTheEarlierRowTravels() {
-        member.getJet().newJob(anOrderThatChangesWhoItPointsAt(false, true)).join();
+        member.getJet().newJob(anOrderThatChangesWhoItPointsAt(false,
+                row("order_id", 1, "cust_ref", LEFT_BEHIND))).join();
 
         assertThat(recordedAgainst(LEFT_BEHIND))
                 .describedAs("the source sent the row this update replaces, so where the order pointed "
@@ -141,11 +142,25 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
     @DisplayName("an update that cannot say where the row pointed before fails the job")
     void anUpdateCarryingNoEarlierRowIsRefused() {
         assertThatThrownBy(() -> member.getJet()
-                .newJob(anOrderThatChangesWhoItPointsAt(false, false)).join())
+                .newJob(anOrderThatChangesWhoItPointsAt(false, null)).join())
                 .describedAs("nothing on this event says where the order pointed before, so the entry it "
                         + "left cannot be found - and carrying on would grow the record for the life of "
                         + "the job while every document stayed correct, which is the one failure nothing "
                         + "downstream can notice")
+                .hasMessageContaining("nest.reference-tracking-requires-before-image");
+    }
+
+    @Test
+    @DisplayName("an earlier row carrying no columns is refused like one that never came")
+    void anEarlierRowCarryingNoColumnsIsRefused() {
+        assertThatThrownBy(() -> member.getJet()
+                .newJob(anOrderThatChangesWhoItPointsAt(false, Map.of())).join())
+                .describedAs("a change stream with no pre-image configured sends an earlier row that is "
+                        + "there and holds nothing, which is a different value from none at all and the "
+                        + "one most sources actually produce. Read as an earlier row it says the order "
+                        + "used to point at nothing, so the entry taken out is one nobody ever wrote and "
+                        + "the real one stays - the leak this refuses, arrived at through the branch that "
+                        + "looked like it was handling it")
                 .hasMessageContaining("nest.reference-tracking-requires-before-image");
     }
 
@@ -178,17 +193,18 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
 
     /** One order, pointed first at one customer and then at another. */
     private static DAG anOrderThatChangesWhoItPointsAt() {
-        return anOrderThatChangesWhoItPointsAt(true, true);
+        return anOrderThatChangesWhoItPointsAt(true, row("order_id", 1, "cust_ref", LEFT_BEHIND));
     }
 
     /**
-     * The same order, with the two things that decide whether the entry it left can come back out: whether
-     * the author asked for structural key changes to be followed, and whether the source sends the row the
-     * update replaces.
+     * The same order, with the two things that decide whether the entry it left can come back out:
+     * whether the author asked for structural key changes to be followed, and what the source sends as
+     * the row the update replaces. {@code earlier} is that row - the real one, none at all, or one that
+     * arrived carrying no columns, which is what a change stream with no pre-image configured produces
+     * and is a different value from none at all.
      */
     private static DAG anOrderThatChangesWhoItPointsAt(boolean trackKeyChanges,
-            boolean carryingWhatItReplaces) {
-        Map<String, Object> was = row("order_id", 1, "cust_ref", LEFT_BEHIND);
+            Map<String, Object> earlier) {
         Map<String, Object> now = row("order_id", 1, "cust_ref", POINTED_AT_NOW);
 
         Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
@@ -209,9 +225,9 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
         sources.put("orders", rowsSource("orders", List.of(
-                new Timed(List.of(was), Duration.ofMillis(400), null),
-                new Timed(List.of(now), Duration.ofMillis(1200),
-                        carryingWhatItReplaces ? was : null, true))));
+                new Timed(List.of(row("order_id", 1, "cust_ref", LEFT_BEHIND)),
+                        Duration.ofMillis(400), null),
+                new Timed(List.of(now), Duration.ofMillis(1200), earlier, true))));
         sources.put("customers", rowsSource("customers", List.of(new Timed(List.of(
                 row("customer_id", LEFT_BEHIND, "name", "Ada"),
                 row("customer_id", POINTED_AT_NOW, "name", "Grace")), Duration.ZERO, null))));

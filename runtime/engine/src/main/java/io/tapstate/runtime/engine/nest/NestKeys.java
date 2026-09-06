@@ -98,12 +98,30 @@ final class NestKeys {
      * happens whether this one carried an earlier row or not.
      */
     static void requireBeforeImageWhereReferencesAreRecorded(NestLookup lookup, Envelope event) {
-        if (event.op() != Op.UPDATE || event.before() != null) {
+        if (event.op() != Op.UPDATE || saysWhereItPointed(event.before(), lookup)) {
             return;
         }
         throw new TapstateException(NestError.REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE,
                 Map.of("alias", lookup.referrerAlias(), "refPath", NestTopology.render(lookup.pathId())),
                 null);
+    }
+
+    /**
+     * Whether an earlier row says enough to find the entry to take out - the columns holding the
+     * reference, and the ones identifying the row making it.
+     *
+     * <p><b>Which columns are there, not whether the row is.</b> A change stream with no pre-image
+     * configured sends an earlier row that is present and holds nothing, which is the shape most sources
+     * actually produce and is a different value from none at all. Read as a row it says this one used to
+     * point at null, so the entry taken out is one nobody ever wrote while the real one stays - the same
+     * leak, reached through the branch that looks like it is handling it.
+     *
+     * <p>A column that is genuinely null is left alone, which is why this asks for the key and never for
+     * the value: the column is present, so the key built from it is the key the entry was written under.
+     */
+    private static boolean saysWhereItPointed(Map<String, Object> was, NestLookup lookup) {
+        return was != null && was.keySet().containsAll(lookup.referenceFields())
+                && was.keySet().containsAll(lookup.referrerIdentity());
     }
 
     /**

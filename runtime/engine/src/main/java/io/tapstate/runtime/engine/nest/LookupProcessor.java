@@ -355,12 +355,13 @@ final class LookupProcessor extends AbstractProcessor {
      * happens whether or not this one was drawn at all.
      */
     private void unregister(Envelope event, Map<String, Object> row) {
+        // Ahead of the read rather than inside the absent branch: an earlier row that is present and
+        // carries none of the columns this needs is the shape a change stream with no pre-image sends,
+        // and it walks straight past a test for absence into a removal of an entry nobody wrote.
+        NestKeys.requireBeforeImageWhereReferencesAreRecorded(lookup, event);
         Map<String, Object> was = event.before();
         if (was == null) {
-            // An insert points somewhere for the first time and has nothing to leave. An update is the
-            // other thing that reaches here without an earlier row, and it is the one that cannot be
-            // passed over.
-            NestKeys.requireBeforeImageWhereReferencesAreRecorded(lookup, event);
+            // An insert points somewhere for the first time and has nothing to leave.
             return;
         }
         List<Object> left = NestKeys.valuesOf(was, lookup.referenceFields());
