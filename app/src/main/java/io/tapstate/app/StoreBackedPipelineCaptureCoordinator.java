@@ -220,10 +220,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // rows its previous run happened to load.
         snapshotsByPipeline.remove(pipelineId);
         snapshotTablesByPipeline.remove(pipelineId);
-        List<CaptureRun> runs = runsByPipeline.remove(pipelineId);
-        if (runs == null) {
-            return;
-        }
+        // Holding no runs is not the same as having nothing to release. A pipeline whose start threw part
+        // way, and one whose process was replaced, both arrive here with no handles and a record that is
+        // still all there -- and a stop asked to clear the state has that record to clear. Returning on the
+        // absent handle is what made the verb report success and take nothing, in the one state a caller
+        // reaches for it most: after a run has died.
+        List<CaptureRun> runs = Objects.requireNonNullElse(runsByPipeline.remove(pipelineId), List.of());
         RuntimeException cleanupFailure = closeRuns(runs, pipelineId, purgeState);
         if (cleanupFailure != null) {
             throw cleanupFailure;
@@ -246,6 +248,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      *
      * <p>Every step runs even when an earlier one throws, and the first failure carries the rest as
      * suppressed. A release abandoned half way is what leaves a chain nobody owns and a daemon nobody stops.
+     *
+     * <p>A clearing then sweeps whatever the record still holds for this pipeline beyond those runs, which
+     * is the whole of it when there were no runs to hold anything.
      */
     private RuntimeException closeRuns(List<CaptureRun> runs, String pipelineId, boolean purgeState) {
         RuntimeException firstFailure = null;
@@ -293,7 +298,50 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                         () -> storePort.meta().detachConsumer(chainId.value(), pipelineId), firstFailure);
             }
         }
+        if (purgeState) {
+            // What is left to clear is asked of the record, because the handles above cannot answer it.
+            // A pipeline holds no run here after a start that threw part way, and after a process came
+            // up over an earlier one's work -- and in both, the cursor it left and everything the chain
+            // accumulated for it are exactly what clearing the state was asked to take. Deriving the
+            // work from the handles alone answers "nothing" for both while reporting that it worked,
+            // which is the one state a caller most wants cleared: the one after a run died.
+            //
+            // Asked after the loop above rather than instead of it, so nothing is reached twice: a chain
+            // that loop dropped has no record left to name, and one it detached no longer carries this
+            // pipeline. The loop keeps deciding from the release itself for the chains it holds, where
+            // that reading is the one that cannot go stale under a consumer attaching in between.
+            for (String chainId : storePort.meta().miningChainIdsWithConsumer(pipelineId)) {
+                firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, firstFailure);
+            }
+        }
         return firstFailure;
+    }
+
+    /**
+     * Clears one chain's record of a pipeline this coordinator holds no run for: the whole chain when
+     * nobody else is on it, and only that pipeline's own cursor otherwise -- the same two branches a stop
+     * takes for a chain it does hold, decided from the durable record instead of from the release.
+     *
+     * <p>"Nobody else" is asked of the record <em>and</em> of this process, because neither answers it
+     * alone. The record does not name a consumer that has attached but not yet written anything of its
+     * own; this process does not know a consumer running on any other member. Taking a chain away from a
+     * pipeline still reading it is not an error that pipeline reports -- it reads its whole source again,
+     * quietly -- so the two are read together and only their agreement licenses the drop.
+     */
+    private RuntimeException purgeWhatTheRecordStillHolds(
+            String chainId, String pipelineId, RuntimeException firstFailure) {
+        boolean lastOneOff = storePort.meta().consumerOffsets(chainId).stream()
+                        .allMatch(offset -> offset.pipelineId().equals(pipelineId))
+                && !srsCoordinator.isProvisioned(new MiningChainId(chainId));
+        return runCleanup(
+                () -> {
+                    if (lastOneOff) {
+                        storePort.meta().dropChain(chainId);
+                    } else {
+                        storePort.meta().detachConsumer(chainId, pipelineId);
+                    }
+                },
+                firstFailure);
     }
 
     /** Runs one release step, keeping the first failure and hanging any later one off it as suppressed. */
