@@ -252,6 +252,26 @@ class PdkTypeMappingTest {
         assertThat(PdkTypeMapping.of(column.getTapType())).isEqualTo(expected);
     }
 
+    @Test
+    void aColumnWhoseDeclaredBoundsExceedADoubleStillResolvesToItsNamedType() {
+        // Verbatim from a real connector's spec: a 128-bit decimal states bounds far past a double. Read
+        // as doubles they become infinities, and the type's own parser gives up on the whole entry at the
+        // "I" - so the column resolves to nothing while every column with ordinary bounds still resolves,
+        // which reads as "that one type is unsupported" rather than as a parse fault.
+        TapField column = filled("""
+                {"dataTypes": {"DECIMAL128": {
+                    "to": "TapNumber",
+                    "value": [-1E+6145, 1E+6145],
+                    "precision": [1, 65],
+                    "scale": [0, 30],
+                    "defaultPrecision": 30,
+                    "defaultScale": 10,
+                    "fixed": true
+                }}}""", "amount", "DECIMAL128");
+
+        assertThat(PdkTypeMapping.of(column.getTapType())).isNotEqualTo(TapstateType.UNKNOWN);
+    }
+
     /** Discovers one column of the given database type through a connector declaring {@code spec}. */
     private TapField filled(String spec, String column, String dataType) {
         ConnectorRef ref = new ConnectorRef(

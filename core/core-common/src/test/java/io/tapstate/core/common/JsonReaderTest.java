@@ -33,6 +33,18 @@ class JsonReaderTest {
     }
 
     @Test
+    void parsesDecimalsBeyondDoublesRangeExactlyRatherThanAsAnInfinity() {
+        // A connector's spec states a column's bounds as literals, and a 128-bit decimal's are far past
+        // what a double holds. Parsed as one they become an infinity, whose text form is the word
+        // "Infinity" - not a number at all, and rejected by whatever reads the bound back, which drops
+        // the whole type rather than the bound. Same call this already makes for an integer past long.
+        assertThat(JsonReader.parse("1E+6145")).isEqualTo(new java.math.BigDecimal("1E+6145"));
+        assertThat(JsonReader.parse("-1E+6145")).isEqualTo(new java.math.BigDecimal("-1E+6145"));
+        // What a double does hold is still a double: this widens nothing that already worked.
+        assertThat(JsonReader.parse("1.5")).isInstanceOf(Double.class);
+    }
+
+    @Test
     void parsesStringEscapesAndUnicode() {
         assertThat(JsonReader.parse("\"a\\\"b\\\\c\\n\"")).isEqualTo("a\"b\\c\n");
         assertThat(JsonReader.parse("\"\\u20ac\"")).isEqualTo("€");
