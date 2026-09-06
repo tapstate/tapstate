@@ -195,7 +195,10 @@ class DemoCmdTest {
         Run r = run("demo", "-w", dir.toString(), "--print-steps");
 
         assertThat(r.code()).isZero();
-        assertThat(r.out()).contains("curl -sSL https://install.tapstate.dev")
+        // The demo stack is one route of the install site and the CLI-only install is another; the
+        // walkthrough has to name the one that brings the stack up, not the one that installs a binary.
+        assertThat(r.out()).contains("curl -sSL https://install.tapstate.dev/demo | sh")
+                .doesNotContain("install.tapstate.dev | sh")
                 .contains("start order_pipeline")
                 .contains("views.order_state");
         assertThat(dir.resolve("source/orders_db.tap.yml"))
