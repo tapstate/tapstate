@@ -126,6 +126,16 @@
       <artifactId>adapter-pdk</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The bridge's test classes, for its synthetic connectors alone: the sink-writer factory built here
+         can only be driven end to end against a connector, and those are the only ones in the build that
+         need no real jar. Test scope and a test-jar, so nothing from it reaches the shipped artifact. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>adapter-pdk</artifactId>
+      <version>${revision}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
     <!-- The PDK runtime, on the host classpath so a real connector's base class can bootstrap TapRuntime
          through the host loader (a single-arg Class.forName resolved by the host, not the isolated
          connector loader). Runtime scope, not compile: adapter-pdk still compiles against the frozen API
