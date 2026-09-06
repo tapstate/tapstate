@@ -356,12 +356,12 @@ final class NewCmd implements Callable<Integer> {
         // prose goes to the terminal only when a person is reading it; the machine envelopes stay clean
         PrintWriter prose = output == OutputFormat.TEXT && guidedInteractive() ? CliIo.out(spec) : null;
         Path homeDir = home != null ? home : Path.of(System.getProperty("user.home"));
-        ContextManager contexts = new ContextManager(ContextConfigStore.underHome(homeDir));
+        ContextManager contexts = HomeStores.contexts(homeDir);
         // an injected probe belongs to whoever injected it; only the one opened here is closed here
         ControlPlaneClient probe = controlPlane != null ? controlPlane : new HttpControlPlaneClient();
         // the session is saved through the same service and store every other sign-in uses, so that
         // what `up` resumes is exactly what was signed in here
-        AuthService auth = new AuthService(probe, AuthFileStore.underHome(homeDir), Clock.systemUTC());
+        AuthService auth = HomeStores.auth(homeDir, probe, Clock.systemUTC());
         LocalStack stack = localStack != null ? localStack : LocalStack.under(homeDir, probe, env);
         RecipeRun.Flags flags = new RecipeRun.Flags(connector, config, table, view,
                 new RecipeRun.Flags.Reshape(keep, rename, drop, where),

@@ -3758,7 +3758,7 @@ final class Repl {
             if (read != Cli.EXIT_OK) {
                 return read;
             }
-            if (!connectedHere && !controlPlane.isHealthy(session.landingNode())) {
+            if (!connectedHere && !landingAnswers()) {
                 return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()), CliError.CONNECT_FAILED,
                         Map.of("seeds", hostPort(session.landingNode())));
             }
@@ -4142,6 +4142,15 @@ final class Repl {
     }
 
     /** Reads one pipeline's lifecycle state. */
+    /**
+     * Whether the node this session landed on answers its health probe. The one reachability check a
+     * composite stage may make, held here with the other shared calls so that no verb dials the
+     * control plane on its own.
+     */
+    private boolean landingAnswers() {
+        return controlPlane.isHealthy(session.landingNode());
+    }
+
     private StatusOutcome readStatus(String pipelineId) {
         return withFailover(() -> controlPlane.status(session.landingNode(), session.credential(), pipelineId),
                 o -> o instanceof StatusOutcome.Unreachable);
