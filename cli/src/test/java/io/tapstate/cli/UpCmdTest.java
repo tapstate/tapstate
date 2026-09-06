@@ -1,5 +1,6 @@
 package io.tapstate.cli;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
@@ -10,12 +11,15 @@ import java.io.StringWriter;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
 
@@ -102,6 +106,7 @@ class UpCmdTest {
         assertThat(client.calls).containsExactly(
                 "isHealthy",
                 "connectorList",
+                "test orders_src",
                 "apply[source]",
                 "discoverSchema orders_src",
                 "apply[pipeline]",
@@ -130,7 +135,10 @@ class UpCmdTest {
 
         assertThat(r.code()).as(r.all()).isZero();
         assertThat(r.err()).isEmpty();
-        assertThat(client.calls).doesNotContain("lifecycle start orders_sync")
+        // Reachability is checked on every run: a converged workspace whose database has since gone
+        // away is exactly the case the preflight exists to catch before anything else is asked.
+        assertThat(client.calls).contains("test orders_src")
+                .doesNotContain("lifecycle start orders_sync")
                 .doesNotContain("discoverSchema orders_src");
         assertThat(r.out()).isEqualTo(
                 "Workspace: " + ws + "\n"
@@ -298,9 +306,124 @@ class UpCmdTest {
 
         Run r = up(home, client, "up", "-w", ws.toString());
 
-        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_USAGE);
-        assertThat(r.err()).contains("up: preflight: no pipeline");
-        assertThat(client.calls).doesNotContain("apply[source]");
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.workspace-has-no-pipeline")
+                .contains("tapstate new");
+        // Nothing beyond the connect's own probe: the workspace is read before the server is asked anything.
+        assertThat(client.calls).containsExactly("isHealthy");
+        assertThat(r.out()).isEmpty();
+    }
+
+    @Test
+    void anUnreadableWorkspaceIsRefusedAtPreflightWithACode(@TempDir Path home, @TempDir Path ws) throws IOException {
+        scaffold(home, ws);
+        signIn(home);
+        Path pipelines = ws.resolve("pipeline");
+        Set<PosixFilePermission> restored = Files.getPosixFilePermissions(pipelines);
+        Files.setPosixFilePermissions(pipelines, Set.of());
+        // Running as a user the permission bits do not bind (root) makes the directory readable anyway.
+        Assumptions.assumeFalse(Files.isReadable(pipelines));
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        try {
+            Run r = up(home, client, "up", "-w", ws.toString());
+
+            assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+            assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.workspace-unreadable")
+                    .contains(pipelines.toString());
+            assertThat(client.calls).containsExactly("isHealthy");
+            assertThat(r.out()).isEmpty();
+        } finally {
+            Files.setPosixFilePermissions(pipelines, restored);
+        }
+    }
+
+    // ---- each source reachable, through the test verb's own call --------------------------------------
+
+    @Test
+    void aSourceWhoseTestFailsStopsPreflightWithTheConnectorsCodeAndRemedy(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.testOutcome = new ConnectionTestOutcome.Tested(new ConnectionReport("orders_src", "mysql", "FAILED",
+                List.of(new ConnectionReport.Check("Connect", "PASSED", null, null, null, null),
+                        new ConnectionReport.Check("Read privilege", "FAILED", "Cannot read table orders",
+                                "The account u has no SELECT grant on shop.orders.",
+                                "Grant SELECT on shop.orders to u, then test again.", "MYSQL-1142")),
+                0L));
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).startsWith(
+                """
+                error: up: preflight failed on orders_src: MYSQL-1142 — Cannot read table orders
+                  The account u has no SELECT grant on shop.orders.
+                  Grant SELECT on shop.orders to u, then test again.
+                """);
+        assertThat(client.calls).containsExactly("isHealthy", "connectorList", "test orders_src");
+        assertThat(r.out()).isEmpty();
+    }
+
+    @Test
+    void aSourceTestTheServerRefusesStopsPreflightWithTheServersCode(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.testOutcome = new ConnectionTestOutcome.Rejected("connector.auth-failed",
+                "Authentication failed for user u.");
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).startsWith(
+                "error: up: preflight failed on orders_src: connector.auth-failed — Authentication failed for user u.\n");
+        assertThat(client.calls).containsExactly("isHealthy", "connectorList", "test orders_src");
+    }
+
+    @Test
+    void aSourceTestThatCannotReachTheServerIsTheConnectFailedCode(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.testOutcome = new ConnectionTestOutcome.Unreachable();
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).contains("up: preflight failed on orders_src: cli.connect-failed");
+        assertThat(client.calls).containsExactly("isHealthy", "connectorList", "test orders_src");
+    }
+
+    @Test
+    void aSourceTestThatTimesOutIsTheTimedOutCode(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.testOutcome = new ConnectionTestOutcome.TimedOut();
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).contains("up: preflight failed on orders_src: cli.request-timed-out");
+        assertThat(client.calls).containsExactly("isHealthy", "connectorList", "test orders_src");
+    }
+
+    @Test
+    void aSourceTestFailureInJsonIsTheDiagnosticEnvelopeWithTheStage(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.testOutcome = new ConnectionTestOutcome.Rejected("connector.auth-failed",
+                "Authentication failed for user u.");
+
+        Run r = up(home, client, "up", "-w", ws.toString(), "-o", "json");
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.out())
+                .contains("\"code\": \"connector.auth-failed\"")
+                .contains("\"stage\": \"preflight\"")
+                .contains("\"on\": \"orders_src\"");
+        assertThat(r.err()).isEmpty();
     }
 
     // ---- the machine surface and the help -----------------------------------------------------------
@@ -369,6 +492,10 @@ class UpCmdTest {
         ConnectionSchemaOutcome schemaOutcome = new ConnectionSchemaOutcome.Absent();
         ConnectionDiscoverSchemaOutcome discoverOutcome = new ConnectionDiscoverSchemaOutcome.Discovered(schema);
         String pipelineState = "RUNNING";
+        /** What each source's connection test answers: a passing report unless a test scripts otherwise. */
+        ConnectionTestOutcome testOutcome = new ConnectionTestOutcome.Tested(new ConnectionReport(
+                "orders_src", "mysql", "PASSED",
+                List.of(new ConnectionReport.Check("Connect", "PASSED", null, null, null, null)), 0L));
         /** Whom the saved session belongs to, as the exchange answers it; the record's principal must match. */
         String principal = "alice";
 
@@ -447,7 +574,12 @@ class UpCmdTest {
         @Override public GetOutcome get(URI baseUrl, String credential, String id) { throw new AssertionError(); }
         @Override public DeleteOutcome delete(URI baseUrl, String credential, String id, String hash) { throw new AssertionError(); }
         @Override public ListOutcome list(URI baseUrl, String credential, String kind) { throw new AssertionError(); }
-        @Override public ConnectionTestOutcome test(URI u, String c, String id, String connector, Map<String, Object> s) { throw new AssertionError(); }
+        @Override
+        public ConnectionTestOutcome test(URI u, String c, String id, String connector, Map<String, Object> s) {
+            calls.add("test " + id);
+            return testOutcome;
+        }
+
         @Override public ConnectionTestResultOutcome testResult(URI u, String c, String id) { throw new AssertionError(); }
         @Override public ConnectorRegisterOutcome register(URI u, String c, byte[] a) { throw new AssertionError(); }
         @Override public DataBrowserOutcome.Collections collections(URI u, String c, String id) { throw new AssertionError(); }
