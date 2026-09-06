@@ -109,7 +109,7 @@ class UpCmdTest {
                 "test orders_src",
                 "apply[source]",
                 "discoverSchema orders_src",
-                "apply[pipeline]",
+                "apply[pipeline,source]",
                 "lifecycle start orders_sync",
                 "status orders_sync");
         assertThat(r.out()).isEqualTo(
@@ -265,7 +265,43 @@ class UpCmdTest {
         assertThat(r.err()).contains(
                 "up: apply workspace failed on orders_sync: actuation.source-schema-not-discovered — "
                         + "Source `orders_src` needs a discovered schema before its tables can be selected.");
-        assertThat(client.calls).contains("apply[pipeline]").doesNotContain("lifecycle start orders_sync");
+        assertThat(client.calls).contains("apply[pipeline,source]").doesNotContain("lifecycle start orders_sync");
+    }
+
+    @Test
+    void theWorkspaceApplyCarriesTheSourcesItsPipelinesReference(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isZero();
+        // An apply batch is one closure: every reference in it resolves inside it, and a server refuses
+        // a batch where one does not. The sources were applied a stage earlier so discovery could run,
+        // which does not put them in this batch - so the workspace apply carries the whole workspace,
+        // and the pipeline's `source:` resolves. Sending the pipeline alone is refused by a real server
+        // with a dangling-reference diagnostic naming the source it was just handed.
+        assertThat(client.applied).hasSize(2);
+        assertThat(client.applied.get(1).stream().map(LocalDraft::source))
+                .as("the workspace apply batch")
+                .contains("source/orders_src.tap.yml", "pipeline/orders_sync.tap.yml");
+    }
+
+    @Test
+    void aResourceAppliedByAnEarlierStageKeepsThatStagesVerdict(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isZero();
+        // The source is created by the apply-sources stage and then carried through the workspace batch,
+        // where it comes back unchanged because it is already stored. What the run reports for it is what
+        // the stage that did the work found, not the echo - so the line reads the same as it always did.
+        assertThat(r.out()).contains("source orders_src: applied\n");
+        assertThat(r.out()).doesNotContain("apply: unchanged");
     }
 
     @Test
