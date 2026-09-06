@@ -215,9 +215,10 @@ class NewGuidedTest {
         assertThat(r.out()).contains("Nothing is listening on http://127.0.0.1:8080; press Enter to start a local"
                 + " development stack in Docker, or type the URL of a server you already run.\n");
         assertThat(prompter.asked).hasSize(2).allSatisfy(q -> assertThat(q).containsIgnoringCase("server"));
-        // compose was checked, then the stack was brought up, in the stack directory
+        // compose was checked from wherever the CLI is (the stack directory does not exist yet), then the
+        // stack was brought up, in the stack directory
         assertThat(fakes.runner.calls).containsExactly(
-                dir + ": docker compose version",
+                "(cwd): docker compose version",
                 dir + ": docker compose up -d");
         assertThat(Files.readString(dir.resolve("docker-compose.yml"))).isEqualTo(LocalStackTest.COMPOSE_GOLDEN);
         Map<String, String> env = DotEnv.read(dir.resolve(".env"));

@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -12,10 +13,14 @@ import java.util.Map;
  * directory it was to run in, and answers what the test scripted for that command line - exit 0 and no
  * output unless told otherwise. A hook fires when a command runs, so a test can make the world change
  * the way a real {@code docker compose up -d} changes it (the health probe starts answering).
+ *
+ * <p>One thing it does not script away: a directory that does not exist. The real runner cannot start
+ * any program there and throws before the program is looked up at all, so this one throws the same way,
+ * or a caller that runs its preflight in a directory it has not created yet would only fail in production.
  */
 final class ScriptedProcessRunner implements ProcessRunner {
 
-    /** Every command run, as {@code <dir>: <words joined by spaces>}, in order. */
+    /** Every command run, as {@code <dir>: <words joined by spaces>}, in order; {@code (cwd)} for no directory. */
     final List<String> calls = new ArrayList<>();
 
     private final Map<String, Result> answers = new LinkedHashMap<>();
@@ -49,9 +54,13 @@ final class ScriptedProcessRunner implements ProcessRunner {
     @Override
     public Result run(Path dir, List<String> command) throws IOException {
         String words = String.join(" ", command);
-        calls.add(dir + ": " + words);
+        calls.add((dir == null ? "(cwd)" : dir.toString()) + ": " + words);
         if (failure != null) {
             throw failure;
+        }
+        if (dir != null && !Files.isDirectory(dir)) {
+            throw new IOException("Cannot run program \"" + command.get(0) + "\" (in directory \"" + dir
+                    + "\"): error=2, No such file or directory");
         }
         Runnable hook = hooks.get(words);
         if (hook != null) {

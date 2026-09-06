@@ -22,16 +22,23 @@ interface ProcessRunner {
     }
 
     /**
-     * Runs {@code command} (the program and its arguments, one word each) in {@code dir} and waits for
-     * it to finish. Throws only when the program could not be started at all - a missing binary, an
-     * unusable directory; a program that ran and failed is a {@link Result} with a non-zero exit.
+     * Runs {@code command} (the program and its arguments, one word each) in {@code dir} - or in this
+     * process's own working directory when {@code dir} is null - and waits for it to finish. Throws only
+     * when the program could not be started at all - a missing binary, a directory that does not exist;
+     * a program that ran and failed is a {@link Result} with a non-zero exit. A probe whose answer does
+     * not depend on where it runs passes null: a directory is a precondition, and one that the caller has
+     * not created yet fails the run before the program is even looked up.
      */
     Result run(Path dir, List<String> command) throws IOException;
 
     /** The one that starts real processes. */
     static ProcessRunner system() {
         return (dir, command) -> {
-            Process process = new ProcessBuilder(command).directory(dir.toFile()).start();
+            ProcessBuilder builder = new ProcessBuilder(command);
+            if (dir != null) {
+                builder.directory(dir.toFile());
+            }
+            Process process = builder.start();
             // stderr is drained on its own thread: a program that writes a lot there while stdout is
             // being read to the end would otherwise fill its pipe and block, and never exit
             byte[][] errBytes = new byte[1][];
