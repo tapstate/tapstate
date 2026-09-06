@@ -344,17 +344,46 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aCarriedValueInsideADocumentReachesTheTargetAsItsPortableValue() {
+    void aCarriedValueInsideADocumentIsRestoredWhenTheSchemaNamesItsPath() {
+        // Discovery names a field inside a document by its dotted path, in the same field map the
+        // top-level columns come from - measured against a real connector: a document holding a key
+        // reports `meta.ref` beside `meta` itself. So the interior does have a declared name, and the
+        // way back has something to key on, as long as the lookup is by path rather than by column.
+        Envelope decoded = insert(row("doc", new LinkedHashMap<>(Map.of("ref", new DriverKey("64f0c0de")))),
+                CODECS, Map.of("doc.ref", KEY_COLUMN));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        // Restored as a key, the same answer the identical value gets as a top-level column. The
+        // discriminating half is the type: the portable text and the restored key print alike, and
+        // only one of them is what a target of this kind stores.
+        assertThat(encoded.getAfter().get("doc")).isEqualTo(Map.of("ref", new DriverKey("64f0c0de")));
+    }
+
+    @Test
+    void aCarriedValueInsideADocumentTheSchemaDoesNotNameReachesTheTargetAsItsPortableValue() {
+        // The column is named, its interior is not - which is what discovery reports for a document
+        // nobody sampled to that depth. Lending the interior the column's own declared name would
+        // rebuild it as whatever the column is, so the absence is honoured rather than filled in.
         Envelope decoded = insert(row("doc", new LinkedHashMap<>(Map.of("ref", new DriverKey("64f0c0de")))),
                 CODECS, Map.of("doc", KEY_COLUMN));
 
         TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
 
-        // A schema describes a column, not the inside of one, so a value one level down carries no
-        // declared name and the way back has nothing to key on. It lands as the text it travelled as -
-        // a lesser answer than the top-level column gets, and asserted rather than left to be found,
-        // because the way in does reach in and convert these and a reader would expect the way out to.
         assertThat(encoded.getAfter().get("doc")).isEqualTo(Map.of("ref", "64f0c0de"));
+    }
+
+    @Test
+    void aCarriedValueInsideAnArrayReachesTheTargetAsItsPortableValue() {
+        // An array is named as an array and its elements are not named at all, so an element has no
+        // path of its own to look up. Pinned rather than left to be found: the way in converts these
+        // as readily as it converts a document's fields, and only the way out stops short.
+        Envelope decoded = insert(row("refs", List.of(new DriverKey("64f0c0de"))),
+                CODECS, Map.of("refs", KEY_COLUMN));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("refs")).isEqualTo(List.of("64f0c0de"));
     }
 
     @Test

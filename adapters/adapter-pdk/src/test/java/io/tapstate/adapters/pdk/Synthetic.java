@@ -17,6 +17,16 @@ final class Synthetic {
 
     /** The shared source scaffold: a connector whose ctor and registered functions the caller fills in. */
     private static String source(String simpleName, String ctorBody, String registerBody) {
+        return source(simpleName, ctorBody, registerBody, "");
+    }
+
+    /**
+     * The same, plus {@code members} spliced into the class body — for a connector that has to own a
+     * type of its own. A driver's box is a class the driver ships, so a connector standing in for one
+     * has to ship a class too; a JDK type would be one this side of the boundary already knows.
+     */
+    private static String source(
+            String simpleName, String ctorBody, String registerBody, String members) {
         return ""
                 + "package synthetic;"
                 + "import io.tapdata.pdk.apis.TapConnector;"
@@ -56,6 +66,7 @@ final class Synthetic {
                 + "    return ConnectionOptions.create();"
                 + "  }"
                 + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + members
                 + "}";
     }
 
@@ -277,6 +288,47 @@ final class Synthetic {
                 + "  consumer.streamReadEnded();"
                 + "});";
         return SyntheticJar.compileToJar(dir, "synthetic.CodecValue", source("CodecValue", "", register));
+    }
+
+    /**
+     * A connector that serves the same row on both read faces, holding a binary column. Shaped after a
+     * real one: the driver hands its bytes over in its own box, and the conversion the connector
+     * registers turns that into the portable binary value. Both halves matter — the box is what the
+     * query face used to be handed raw, and the portable value is what the follow face was handed —
+     * and neither is text, so a renderer with nothing to say about them says the same identity hash
+     * about both.
+     */
+    static Path binaryValueSource(Path dir) {
+        // The driver's own box, not a byte[]: a byte[] is a type this side of the boundary can name, so
+        // a face that never ran the conversion could still render one and the test could not tell the
+        // two apart. A real driver's box cannot be named here, and that is the whole point of it.
+        String blob = "public static class Blob { public final byte[] b;"
+                + " public Blob(byte[] b) { this.b = b; } }";
+        String bytes = "new Blob(new byte[]{(byte)222,(byte)173,(byte)190,(byte)239})";
+        String register = ""
+                + "codecs.registerToTapValue(Blob.class, (v, t) ->"
+                + "  new io.tapdata.entity.schema.value.TapBinaryValue("
+                + "    new io.tapdata.entity.schema.value.ByteData(((Blob) v).b)));"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 7);"
+                + "  r.put(\"blob\", " + bytes + ");"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "  consumer.streamReadEnded();"
+                + "});"
+                + "functions.supportExecuteCommandFunction((c, command, consumer) -> {"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 7);"
+                + "  r.put(\"blob\", " + bytes + ");"
+                + "  List<Map<String,Object>> batch = new ArrayList<>(); batch.add(r);"
+                + "  consumer.accept(new io.tapdata.pdk.apis.entity.ExecuteResult"
+                + "    <List<Map<String,Object>>>().result(batch));"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.BinaryValue",
+                source("BinaryValue", "", register, blob));
     }
 
     /** A connector whose batchRead emits a delete-shaped event — unprojectable as a snapshot row. */

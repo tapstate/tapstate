@@ -1,5 +1,7 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapdata.entity.codec.TapCodecsRegistry;
+import io.tapdata.entity.schema.value.ByteData;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -34,6 +36,7 @@ import io.tapdata.pdk.apis.functions.connector.source.ExecuteCommandFunction;
 
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.StringJoiner;
@@ -162,7 +165,8 @@ public final class PdkDataBrowser implements DataBrowser {
                 TapExecuteCommand command = TapExecuteCommand.create()
                         .command(QUERY_COMMAND)
                         .params(params(config, query, beyond(query.limit())));
-                execute.execute(connector.context(), command, result -> collect(result, rows, reported));
+                execute.execute(connector.context(), command,
+                        result -> collect(result, rows, reported, connector.codecs()));
                 return null;
             });
             Throwable failure = reported.get();
@@ -309,6 +313,13 @@ public final class PdkDataBrowser implements DataBrowser {
             case String text -> text;
             case Number number -> number;
             case Boolean flag -> flag;
+            // Bytes are the one value neither face could say anything about: not text, not a number,
+            // not a boolean, so both fell through and printed an object's own text - an identity hash,
+            // which is not the value and is not even stable between runs of the same bytes. Base64 is
+            // what a mongo shell prints for the same column, so the read face and the shell can be
+            // compared by eye, and it is the same answer on both faces.
+            case ByteData bytes -> Base64.getEncoder().encodeToString(bytes.getValue());
+            case byte[] bytes -> Base64.getEncoder().encodeToString(bytes);
             default -> String.valueOf(value);
         };
     }
@@ -541,7 +552,7 @@ public final class PdkDataBrowser implements DataBrowser {
 
     /** Accumulates one result batch, remembering the first failure a batch reports instead of its rows. */
     private static void collect(ExecuteResult<?> result, List<Map<String, Object>> rows,
-                                AtomicReference<Throwable> reported) {
+                                AtomicReference<Throwable> reported, TapCodecsRegistry codecs) {
         if (result == null) {
             return;
         }
@@ -557,9 +568,16 @@ public final class PdkDataBrowser implements DataBrowser {
                 // The same spelling the follow face gives a value. Handing these over as the driver
                 // returned them is what made one face render a key as its own text and the other as
                 // whatever a serializer made of the driver's object - the same row, read two ways.
+                //
+                // Rendering alone was not enough to make the two agree, because the two faces were not
+                // holding the same thing: a followed row has been through the connector's own
+                // conversion and a queried one had not, so the renderer met a portable value on one
+                // face and the driver's own object on the other. Those conversions run here too, and
+                // from there one renderer answers for both. Only those: a read reports what the
+                // database holds, so the widths a pipeline row speaks are none of its business.
                 Map<String, Object> copy = new LinkedHashMap<>();
-                fields.forEach((name, value) -> copy.put(String.valueOf(name), writableValue(value)));
-                rows.add(copy);
+                fields.forEach((name, value) -> copy.put(String.valueOf(name), value));
+                rows.add(writable(TapEventCodec.connectorConverted(copy, codecs)));
             }
         }
     }

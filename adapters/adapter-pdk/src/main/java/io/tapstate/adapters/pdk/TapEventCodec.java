@@ -125,13 +125,33 @@ public final class TapEventCodec {
      */
     private static Map<String, Object> row(
             Map<String, Object> row, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
+        return walk(row, codecs, columnTypes, true);
+    }
+
+    /**
+     * The connector's own conversions applied to a row, at any depth, and nothing else — the widths the
+     * type namespace speaks are left exactly as the driver handed them over.
+     *
+     * <p>This is what a read face wants. It reports what the database holds rather than what a pipeline
+     * row speaks, so widening an integer there would answer a question nobody asked; but the registered
+     * conversions still have to run, because without them the face is handed the driver's own objects
+     * and has nothing to render but their addresses. No declared types are supplied: those name what a
+     * sink would rebuild, and a read rebuilds nothing.
+     */
+    static Map<String, Object> connectorConverted(Map<String, Object> row, TapCodecsRegistry codecs) {
+        return walk(row, codecs, Map.of(), false);
+    }
+
+    private static Map<String, Object> walk(Map<String, Object> row, TapCodecsRegistry codecs,
+            Map<String, String> columnTypes, boolean toNamespaceWidths) {
         if (row == null) {
             return null;
         }
         Map<String, Object> out = new LinkedHashMap<>(row.size());
         boolean changed = false;
         for (Map.Entry<String, Object> column : row.entrySet()) {
-            Object value = converted(column.getValue(), codecs, columnTypes.get(column.getKey()));
+            Object value =
+                    converted(column.getValue(), codecs, columnTypes, column.getKey(), toNamespaceWidths);
             changed |= value != column.getValue();
             out.put(column.getKey(), value);
         }
@@ -142,31 +162,44 @@ public final class TapEventCodec {
      * One value in that model. Nested values are converted too, since a document's own fields and an
      * array's elements are as reachable from a reader as a top-level column is; a container whose
      * contents all pass through unchanged is returned as it is, so the ordinary row costs no copy.
+     *
+     * <p>{@code path} is how the schema names this value, which is the column's own name at the top
+     * level and the dotted path below it — the spelling discovery itself uses for a field inside a
+     * document, reported in the same field map the top-level columns come from. It is null where the
+     * schema names nothing, and a null path looks nothing up rather than falling back to an enclosing
+     * name: rebuilding a value as whatever its container is declared to be is worse than handing over
+     * the portable value, because it succeeds.
      */
-    private static Object converted(Object value, TapCodecsRegistry codecs, String originType) {
-        Object registered = registered(value, codecs, originType);
+    private static Object converted(Object value, TapCodecsRegistry codecs,
+            Map<String, String> columnTypes, String path, boolean toNamespaceWidths) {
+        Object registered =
+                registered(value, codecs, path == null ? null : columnTypes.get(path));
         if (registered != null) {
             return registered;
         }
-        if (value instanceof ZonedDateTime zonedDateTime) {
-            return Date.from(zonedDateTime.toInstant());
-        }
-        if (value instanceof Integer || value instanceof Short || value instanceof Byte) {
-            return ((Number) value).longValue();
-        }
-        if (value instanceof Float f) {
-            return f.doubleValue();
-        }
-        if (value instanceof BigInteger big && big.bitLength() < Long.SIZE) {
-            return big.longValue();
+        if (toNamespaceWidths) {
+            if (value instanceof ZonedDateTime zonedDateTime) {
+                return Date.from(zonedDateTime.toInstant());
+            }
+            if (value instanceof Integer || value instanceof Short || value instanceof Byte) {
+                return ((Number) value).longValue();
+            }
+            if (value instanceof Float f) {
+                return f.doubleValue();
+            }
+            if (value instanceof BigInteger big && big.bitLength() < Long.SIZE) {
+                return big.longValue();
+            }
         }
         if (value instanceof Map<?, ?> map) {
             Map<Object, Object> converted = new LinkedHashMap<>(map.size());
             boolean changed = false;
             for (Map.Entry<?, ?> entry : map.entrySet()) {
-                // A field inside a document has no declared type of its own: the schema describes the
-                // column, not its interior. Null says so rather than lending it the column's.
-                Object element = converted(entry.getValue(), codecs, null);
+                // A field inside a document is named by the path that reaches it, which is what the
+                // lookup is keyed by. Below a value the schema does not name, the path stays null and
+                // stays null all the way down.
+                Object element = converted(entry.getValue(), codecs, columnTypes,
+                        path == null ? null : path + "." + entry.getKey(), toNamespaceWidths);
                 changed |= element != entry.getValue();
                 converted.put(entry.getKey(), element);
             }
@@ -176,7 +209,10 @@ public final class TapEventCodec {
             List<Object> converted = new ArrayList<>(list.size());
             boolean changed = false;
             for (Object element : list) {
-                Object next = converted(element, codecs, null);
+                // An element has no name of its own — the schema names the array and stops — so there
+                // is nothing to look up, and lending it the array's own name would rebuild it as
+                // whatever the array is declared to be.
+                Object next = converted(element, codecs, columnTypes, null, toNamespaceWidths);
                 changed |= next != element;
                 converted.add(next);
             }

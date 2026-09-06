@@ -325,6 +325,39 @@ class PdkDataBrowserTest {
 
 
     @Test
+    void aBinaryColumnReadsAsItsBytesOnBothFacesRatherThanAsAnObjectsOwnText(@TempDir Path dir)
+            throws Exception {
+        // Measured on a real mongodb collection before this: the same binary column came back as
+        // "org.bson.types.Binary@648980dd" on the query face and as
+        // "io.tapdata.entity.schema.value.ByteData@19171102" on the follow face. Neither is the value,
+        // the two faces named two different classes, and the text is an identity hash - so it also
+        // differed between runs of the same bytes. The renderer had cases for text, numbers and
+        // booleans and fell back to an object's own text for everything else; a binary value is none
+        // of the three on either face.
+        PdkDataBrowser reader = reader(Synthetic.binaryValueSource(dir), "synthetic.BinaryValue");
+        List<DataBrowserChange> handed = java.util.Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch delivered = new CountDownLatch(1);
+
+        try (DataBrowserSubscription following = reader.tail(config(),
+                new DataBrowserTailRequest("t1"), change -> {
+                    handed.add(change);
+                    delivered.countDown();
+                })) {
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+        Map<String, Object> row = reader.find(config(), new DataBrowserQuery("t1", null, 10)).rows().get(0);
+
+        // Base64, which is what a mongo shell prints for the same column, so the two can be compared by
+        // eye. The bytes are 0xDEADBEEF: an assertion on the encoding rather than on "not a hash", so a
+        // renderer that stringified the object differently would not satisfy it.
+        assertThat(row.get("blob")).as("the query face").isEqualTo("3q2+7w==");
+        assertThat(handed.get(0).after().get("blob")).as("the follow face").isEqualTo("3q2+7w==");
+        // The half that discriminates: rendering every unhandled value as text would satisfy both of
+        // the above by accident only if it happened to produce base64, and would turn this into text.
+        assertThat(row.get("id")).as("a number stays a number").isInstanceOf(Number.class);
+    }
+
+    @Test
     void findPinsTheCommandToExecuteQuery(@TempDir Path dir) {
         // The command name is the connector's dispatch key: "execute" and "update" reach write paths on
         // the same function. It is assembled here and is not a caller input, so the read face has no
