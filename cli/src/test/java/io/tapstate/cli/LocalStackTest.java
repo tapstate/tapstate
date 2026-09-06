@@ -131,9 +131,13 @@ class LocalStackTest {
         }
     }
 
-    /** A stack over fakes: Docker on the PATH, every command exit 0, the probe healthy once {@code up -d} ran. */
+    /** What an installed Compose plugin answers its version probe with. */
+    static final ProcessRunner.Result COMPOSE_PRESENT = new ProcessRunner.Result(0, "Docker Compose version v2.29.1\n", "");
+
+    /** A stack over fakes: Docker and Compose present, every command exit 0, the probe healthy once {@code up -d} ran. */
     private static LocalStack stack(Path home, ScriptedProcessRunner runner, FakeDownloader downloads,
                                     FakeHealthProbe probe, UnaryOperator<String> env, int polls) {
+        runner.answerUnlessScripted("docker compose version", COMPOSE_PRESENT);
         runner.when("docker compose up -d", () -> probe.healthy = true);
         return new LocalStack(home, runner, downloads, () -> true, probe, env, millis -> { }, polls);
     }
@@ -277,6 +281,7 @@ class LocalStackTest {
     @Test
     void aFailedUpIsRefusedWithWhatComposeSaid(@TempDir Path home) {
         ScriptedProcessRunner runner = new ScriptedProcessRunner()
+                .answer("docker compose version", COMPOSE_PRESENT)
                 .answer("docker compose up -d", new ProcessRunner.Result(1, "", "Cannot connect to the Docker daemon"));
         FakeHealthProbe probe = new FakeHealthProbe(false);
         LocalStack stack = new LocalStack(home, runner, new FakeDownloader(), () -> true, probe,
@@ -292,7 +297,7 @@ class LocalStackTest {
 
     @Test
     void aStackThatNeverAnswersIsRefusedNamingWhereItIsAndHowToStopIt(@TempDir Path home) {
-        ScriptedProcessRunner runner = new ScriptedProcessRunner();
+        ScriptedProcessRunner runner = new ScriptedProcessRunner().answer("docker compose version", COMPOSE_PRESENT);
         FakeHealthProbe probe = new FakeHealthProbe(false);
         List<Long> slept = new ArrayList<>();
         LocalStack stack = new LocalStack(home, runner, new FakeDownloader(), () -> true, probe,

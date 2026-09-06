@@ -14,7 +14,6 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -112,7 +111,7 @@ final class DemoCmd implements Callable<Integer> {
      * step the reader takes will work, and the answer is worth one line now instead of an error three
      * commands from here.
      */
-    java.util.function.BooleanSupplier dockerIsOnThePath = DemoCmd::dockerIsInstalled;
+    java.util.function.BooleanSupplier dockerIsOnThePath = DockerBinary::isOnThePath;
 
     @Spec
     CommandSpec spec;
@@ -161,24 +160,6 @@ final class DemoCmd implements Callable<Integer> {
     /** The three files as they are written: bundled bytes, verbatim, in the order a reader meets them. */
     static List<WorkspaceWrite.File> bundledFiles() {
         return RESOURCES.stream().map(resource -> WorkspaceWrite.File.owned(resource, bundled(resource))).toList();
-    }
-
-    /**
-     * Whether {@code docker} resolves on the PATH. Nothing is executed - a version probe would start a
-     * process, and on a machine where the daemon is down it would hang the one command that has no
-     * reason to touch it at all.
-     */
-    private static boolean dockerIsInstalled() {
-        String path = System.getenv("PATH");
-        if (path == null || path.isBlank()) {
-            return false;
-        }
-        for (String entry : path.split(java.io.File.pathSeparator)) {
-            if (!entry.isBlank() && Files.isExecutable(Path.of(entry, "docker"))) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /** One bundled resource. Absent means a broken build, not a user error, so it crashes bare. */

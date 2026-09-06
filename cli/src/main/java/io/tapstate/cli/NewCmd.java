@@ -35,11 +35,13 @@ import java.io.PrintWriter;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.function.UnaryOperator;
 
 /**
  * {@code new} — the catalog-driven scaffolding wizard. One entry, two paths that produce the same
@@ -80,6 +82,16 @@ final class NewCmd implements Callable<Integer> {
             description = "Tapstate server to register and bind the workspace to (guided first run; "
                     + "default " + GuidedNew.DEFAULT_SERVER_TEXT + ").")
     String server;
+
+    @Option(names = "--start-local",
+            description = "With --yes: start the local development stack in Docker when nothing is listening on "
+                    + "the default server (guided first run). Never started without it.")
+    boolean startLocal;
+
+    @Option(names = {"-u", "--user"}, paramLabel = "NAME",
+            description = "Sign in to the server as this user (guided first run; default admin). The password "
+                    + "comes from $" + GuidedNew.PASSWORD_ENV + " or a masked prompt.")
+    String user;
 
     @Option(names = "--list",
             description = "Print the recipe catalog (id and title) instead of scaffolding; -o json|yaml for scripts.")
@@ -188,11 +200,20 @@ final class NewCmd implements Callable<Integer> {
     /** Test seam: an injected prompter forces the interactive path; production opens a JLine one. */
     Prompter prompter;
 
-    /** Test seam: the context store the guided flow binds through; production uses the home directory's. */
-    ContextManager contextManager;
+    /**
+     * Test seam: the home directory the guided flow's stores live under - the context store, the saved
+     * session and the local stack; production uses the user's.
+     */
+    Path home;
 
     /** Test seam: the health probe the guided flow asks before binding; production opens an HTTP one. */
     ControlPlaneClient controlPlane;
+
+    /** Test seam: the local development stack the default answer starts; production runs Docker. */
+    LocalStack localStack;
+
+    /** Test seam: the process environment the guided flow reads the sign-in password from. */
+    UnaryOperator<String> env = System::getenv;
 
     @Override
     public Integer call() {
@@ -205,6 +226,11 @@ final class NewCmd implements Callable<Integer> {
         }
         if (server != null) {
             err.println("new: --server is only valid for the guided first run (bare new, or new <recipe>)");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        if (startLocal || user != null) {
+            err.println("new: --start-local/--user are only valid for the guided first run (bare new, or new <recipe>)");
             err.flush();
             return EXIT_USAGE;
         }
@@ -329,18 +355,22 @@ final class NewCmd implements Callable<Integer> {
         }
         // prose goes to the terminal only when a person is reading it; the machine envelopes stay clean
         PrintWriter prose = output == OutputFormat.TEXT && guidedInteractive() ? CliIo.out(spec) : null;
-        ContextManager contexts = contextManager != null
-                ? contextManager
-                : new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home"))));
+        Path homeDir = home != null ? home : Path.of(System.getProperty("user.home"));
+        ContextManager contexts = new ContextManager(ContextConfigStore.underHome(homeDir));
         // an injected probe belongs to whoever injected it; only the one opened here is closed here
         ControlPlaneClient probe = controlPlane != null ? controlPlane : new HttpControlPlaneClient();
+        // the session is saved through the same service and store every other sign-in uses, so that
+        // what `up` resumes is exactly what was signed in here
+        AuthService auth = new AuthService(probe, AuthFileStore.underHome(homeDir), Clock.systemUTC());
+        LocalStack stack = localStack != null ? localStack : LocalStack.under(homeDir, probe, env);
         RecipeRun.Flags flags = new RecipeRun.Flags(connector, config, table, view,
                 new RecipeRun.Flags.Reshape(keep, rename, drop, where),
                 new RecipeRun.Flags.Nested(root, key, children, childConnector, childSet), databases);
         try {
             RecipeRun.Result result = guidedInteractive()
-                    ? runGuided(contexts, probe, prose, serverUrl, flags)
-                    : runRecipe(new GuidedNew(contexts, probe, null, prose).run(workspace.root(), recipe, serverUrl),
+                    ? runGuided(contexts, probe, auth, stack, prose, serverUrl, flags)
+                    : runRecipe(new GuidedNew(contexts, probe, auth, stack, env, null, prose)
+                                    .run(workspace.root(), recipe, serverUrl, startLocal, user),
                             null, flags);
             emitResult(result, contexts);
             return 0;
@@ -361,14 +391,17 @@ final class NewCmd implements Callable<Integer> {
         }
     }
 
-    private RecipeRun.Result runGuided(ContextManager contexts, ControlPlaneClient probe, PrintWriter prose,
-                                       URI serverUrl, RecipeRun.Flags flags) throws IOException {
+    private RecipeRun.Result runGuided(ContextManager contexts, ControlPlaneClient probe, AuthService auth,
+                                       LocalStack stack, PrintWriter prose, URI serverUrl, RecipeRun.Flags flags)
+            throws IOException {
         if (prompter != null) {
-            String chosen = new GuidedNew(contexts, probe, prompter, prose).run(workspace.root(), recipe, serverUrl);
+            String chosen = new GuidedNew(contexts, probe, auth, stack, env, prompter, prose)
+                    .run(workspace.root(), recipe, serverUrl, startLocal, user);
             return runRecipe(chosen, prompter, flags);
         }
         try (JLinePrompter jline = JLinePrompter.system()) {
-            String chosen = new GuidedNew(contexts, probe, jline, prose).run(workspace.root(), recipe, serverUrl);
+            String chosen = new GuidedNew(contexts, probe, auth, stack, env, jline, prose)
+                    .run(workspace.root(), recipe, serverUrl, startLocal, user);
             return runRecipe(chosen, jline, flags);
         }
     }

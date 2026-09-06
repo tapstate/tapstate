@@ -10,6 +10,7 @@ import java.io.StringWriter;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Map;
 import java.util.function.UnaryOperator;
@@ -58,7 +59,12 @@ class NewGuidedTest {
         int polls = LocalStack.HEALTH_POLLS;
 
         Fakes(boolean listening) {
-            probe = new FakeHealthProbe(listening);
+            this(new FakeHealthProbe(listening));
+        }
+
+        Fakes(FakeHealthProbe probe) {
+            this.probe = probe;
+            runner.answerUnlessScripted("docker compose version", LocalStackTest.COMPOSE_PRESENT);
             runner.when("docker compose up -d", () -> probe.healthy = true);
         }
 
@@ -87,9 +93,8 @@ class NewGuidedTest {
         return run(home, prompter, fakes, name -> null, args);
     }
 
-    private static Run run(Path home, Prompter prompter, ControlPlaneClient controlPlane, String... args) {
-        Fakes fakes = new Fakes(((FakeHealthProbe) controlPlane).healthy);
-        return run(home, prompter, fakes, args);
+    private static Run run(Path home, Prompter prompter, FakeHealthProbe controlPlane, String... args) {
+        return run(home, prompter, new Fakes(controlPlane), args);
     }
 
     private static ContextManager manager(Path home) {
@@ -158,6 +163,9 @@ class NewGuidedTest {
     @Test
     void aStackFromAnEarlierRunSignsInWithItsSavedPasswordWithoutAsking(@TempDir Path home, @TempDir Path ws)
             throws IOException {
+        // as an earlier run leaves it: the .tapstate root owner-only, the way the stores demand it
+        Files.createDirectories(home.resolve(".tapstate"),
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
         Files.createDirectories(stackDir(home));
         Files.writeString(stackDir(home).resolve(".env"),
                 "TAPSTATE_ADMIN_USER=admin\nTAPSTATE_ADMIN_PASSWORD=saved-earlier-xxxxxxxxxxxx\n");
