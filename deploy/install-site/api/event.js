@@ -134,12 +134,56 @@ function defaultSleep(ms) {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
+// Read the request body ourselves rather than trusting the platform to have parsed it.
+//
+// Measured in production on 0.4.4: a well-formed event answered 400, every time, because `req.body`
+// was not a parsed object here -- so buildEvent's first line refused it before any field was looked
+// at. Every install event was rejected, the installer swallows the status by design, and the
+// denominator would have stayed empty forever while the endpoint reported itself healthy.
+//
+// Returns the parsed object, or null when there is no readable JSON body at all. Those two are
+// answered with different statuses by the handler, and that distinction is the only thing that makes
+// the difference observable from outside: "the validator rejected this" and "the body never arrived"
+// were the same 400, which is why the deployment probe passed while nothing worked.
+async function readBody(req) {
+  if (req.body && typeof req.body === 'object') return req.body;
+
+  let raw = typeof req.body === 'string' ? req.body : null;
+  if (raw === null) {
+    raw = '';
+    try {
+      for await (const chunk of req) {
+        raw += chunk;
+        // Refused while streaming, not after buffering it all -- the point of a bound is not to
+        // measure what someone sent, it is to stop reading it.
+        if (raw.length > MAX_BODY_BYTES) return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'method not allowed' });
     return;
   }
-  const { event, error } = buildEvent(req.body, req.headers);
+  const body = await readBody(req);
+  if (body === null) {
+    // Not 400. A caller that sent no readable JSON has not made a bad event -- it has not made an
+    // event at all, and saying so separately is what lets a probe prove the parsing works without
+    // storing anything. It teaches a prober nothing about what shape to send.
+    res.status(415).end();
+    return;
+  }
+  const { event, error } = buildEvent(body, req.headers);
   if (error) {
     // The reason is not echoed to the caller: this endpoint is public, and a validator that explains
     // itself is a validator that teaches whoever is probing it what shape to send next.

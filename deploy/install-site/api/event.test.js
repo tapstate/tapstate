@@ -95,10 +95,14 @@ test('the timestamp is taken from the request only when it is well formed', () =
 
 const NO_SLEEP = () => Promise.resolve();
 
-function withToken(fn) {
+// AWAITS fn. A non-async version restores the variable the moment fn returns its promise -- which is
+// before anything inside it has run past its first await. That held together only while every caller
+// read the token synchronously; the first one that did not saw an unset token and a 500, and the
+// helper looked innocent because the tests it broke were not the ones it was written for.
+async function withToken(fn) {
   const before = process.env.FUNNEL_STORE_TOKEN;
   process.env.FUNNEL_STORE_TOKEN = 'test-token';
-  try { return fn(); } finally {
+  try { return await fn(); } finally {
     if (before === undefined) delete process.env.FUNNEL_STORE_TOKEN;
     else process.env.FUNNEL_STORE_TOKEN = before;
   }
@@ -201,4 +205,75 @@ test('ordinary clock drift is still accepted', () => {
 test('a body far larger than any valid event is refused before it is parsed field by field', () => {
   const huge = { ...good, padding: 'x'.repeat(MAX_BODY_BYTES * 2) };
   assert.ok(buildEvent(huge, headers, NOW).error);
+});
+
+// --- reading the body ------------------------------------------------------------------------------
+// The shape the platform hands over is not ours to assume. Measured in production on 0.4.4: req.body
+// was not a parsed object, so a perfectly valid event answered 400 -- every event rejected, the
+// installer swallowing the status by design, and the deployment probe green throughout because
+// "rejected by the validator" and "never read at all" were the same 400.
+
+function streamReq(text, extra = {}) {
+  // an IncomingMessage-shaped request whose body is only available by reading it
+  return {
+    method: 'POST',
+    headers,
+    ...extra,
+    async *[Symbol.asyncIterator]() { yield text; },
+  };
+}
+
+test('a body the platform did not parse is read from the request', async () => {
+  await withToken(async () => {
+    let stored = null;
+    globalThis.fetch = async (url, init) => { stored = init; return { ok: true, status: 201 }; };
+    const res = fakeRes();
+    await handler(streamReq(JSON.stringify(nowEvent())), res);
+    assert.equal(res.code, 204, 'a valid event arriving as an unparsed stream must be stored');
+    assert.ok(stored, 'nothing was written');
+  });
+});
+
+test('a body handed over as a string is parsed rather than refused', async () => {
+  await withToken(async () => {
+    globalThis.fetch = async () => ({ ok: true, status: 201 });
+    const res = fakeRes();
+    await handler({ method: 'POST', headers, body: JSON.stringify(nowEvent()) }, res);
+    assert.equal(res.code, 204);
+  });
+});
+
+// The distinction the deployment probe depends on: 400 means the JSON was read and the event was
+// wrong; 415 means nothing readable arrived. Collapsing them is what hid the outage.
+test('a request with no readable JSON body answers 415, not 400', async () => {
+  const res = fakeRes();
+  await handler(streamReq(''), res);
+  assert.equal(res.code, 415);
+});
+
+test('a body that is not JSON at all answers 415, not 400', async () => {
+  const res = fakeRes();
+  await handler(streamReq('not json at all'), res);
+  assert.equal(res.code, 415);
+});
+
+test('JSON that reads fine but is not a valid event still answers 400', async () => {
+  const res = fakeRes();
+  await handler(streamReq(JSON.stringify({ installation_id: 'no' })), res);
+  assert.equal(res.code, 400, 'this is what proves the parsing ran at all');
+});
+
+test('a streamed body past the bound is refused while streaming, not after', async () => {
+  const res = fakeRes();
+  const huge = 'x'.repeat(MAX_BODY_BYTES * 3);
+  let yielded = 0;
+  const req = {
+    method: 'POST', headers,
+    async *[Symbol.asyncIterator]() {
+      for (let i = 0; i < 3; i += 1) { yielded += 1; yield huge; }
+    },
+  };
+  await handler(req, res);
+  assert.equal(res.code, 415);
+  assert.equal(yielded, 1, 'it kept reading after the bound was already exceeded');
 });
