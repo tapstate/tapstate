@@ -40,8 +40,8 @@ final class UpCmd implements Callable<Integer> {
     CommandSpec spec;
 
     @Option(names = "--server", paramLabel = "URL",
-            description = "Reach this server for this run instead of the one the workspace is bound to; "
-                    + "the binding is not changed.")
+            description = "On a workspace that is not bound yet: the server to sign in to and bind it to. "
+                    + "On one that is: reach this server for this run instead, leaving the binding alone.")
     String server;
 
     @Option(names = {"-y", "--yes"},

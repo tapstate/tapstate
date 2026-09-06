@@ -231,7 +231,9 @@ lifecycle.
   process environment. Nothing else reads that file.
 - **A failure names its stage.** "`up: discover failed on orders_src: <code> — <message>`" followed
   by the catalog's next action, never the internal command that happened to be running.
-- Flags: `--server <url>` overrides the bound server for this run; `-u <name>` and
+- Flags: `--server <url>` has one meaning per state — on an unbound workspace it names the server
+  to sign in to and bind to, and on a bound one it overrides the target for this run and leaves the
+  binding alone (there is nothing to override before a binding exists); `-u <name>` and
   `--start-local` belong to the server question below; `--yes` never prompts.
 - **This verb owns every contact with a server.** Probing one, starting the local development
   stack, signing in and binding the workspace all happen here and nowhere else: `new` and the
