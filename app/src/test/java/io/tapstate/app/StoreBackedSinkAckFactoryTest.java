@@ -189,6 +189,64 @@ class StoreBackedSinkAckFactoryTest {
         assertThat(acked.token()).isNull();
     }
 
+    @Test
+    void anAcknowledgedChangeIsWhereTheChainSaysItsSourceHasBeenRead() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+
+        ack.advance("orders", at(7, "w7"));
+
+        // How far a chain may say its source has been read is the lowest of what was read and what every
+        // consumer has landed, and it used to be worked out only while a run of changes was being
+        // forwarded -- against the acknowledgements that existed at that instant, which on a first forward
+        // is none. This acknowledgement arrives afterwards and nothing carried it back, so the record kept
+        // whatever an earlier forward had resolved: one delivery behind while changes kept coming, and
+        // nothing at all once the source went quiet. A cdc-only read has no snapshot start to fall back on
+        // either, so a run restarted from that state re-attached at the present moment and everything
+        // written while it was down was gone, with nothing thrown and nothing logged.
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isEqualTo("w7");
+    }
+
+    @Test
+    void theRecordedReadDoesNotPassAConsumerThatHasLandedLess() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+
+        // A second pipeline on the same chain, three changes behind the first.
+        new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-2").resolve(member)
+                .advance("orders", at(4, "w4"));
+        new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member)
+                .advance("orders", at(7, "w7"));
+
+        // The faster one's acknowledgement must not carry the chain past what the slower one holds: a
+        // change that sink has not written is one this chain still has to be able to hand out again, and
+        // an offset that stepped over it would mean nothing ever fetches it.
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isEqualTo("w4");
+    }
+
+    @Test
+    void aConsumerThatHasLandedNothingLeavesTheReadUnrecorded() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        // A consumer on the chain that has acked nothing at all: the state of every pipeline before its
+        // first write lands, and of one whose sink is failing.
+        store.upsertConsumerOffset("mc-orders", new ConsumerOffset("pipe-2", Map.of(), null));
+        HazelcastInstance member = memberWith(store);
+
+        new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member)
+                .advance("orders", at(7, "w7"));
+
+        // Green before this file learned to record the read as well as the ack, and that is what it is
+        // for: it holds the half that must not change. Nothing is known about how far that consumer has
+        // got, so nothing may be written -- a chain that read past it would drop changes it was never
+        // handed.
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isNull();
+    }
+
     /** One change's position: the order the engine assigned it, and the token the connector gave. */
     private static ChainPosition at(long seq, String token) {
         return new ChainPosition(new SourceOrder(1, seq), token);

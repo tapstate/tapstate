@@ -171,6 +171,17 @@ class CaptureToSinkAckFrontierTest {
             // Closed by the bound rather than by a higher change: nothing higher was ever fed.
             assertThat(ackedPosition(meta, chainId)).isEqualTo("src-3");
 
+            // The same place, said from the chain's side rather than the consumer's: how far it may claim
+            // its source has been read. The two are resolved from the same acknowledgements, and this one
+            // used to be resolved only while a run of changes was being forwarded -- so the last change
+            // fed, whose acknowledgement arrives after the forward that carried it, was never recorded
+            // here at all, and the source going quiet is what makes that permanent. A cdc-only read has no
+            // recorded start for changes to fall back on, so a run resumed from that state re-attached at
+            // the present moment and everything written while it was down was gone, with nothing thrown
+            // and nothing logged. Awaited rather than read straight off, because the two are written one
+            // after the other and the wait above returns on the first of them.
+            awaitSourceRead(meta, chainId, "src-3");
+
             // The observation position resolver reads back exactly that durable sink-acked position, keyed by
             // the source's table, so the read face projects what the real sink advanced -- not a stand-in.
             assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE))
@@ -505,6 +516,23 @@ class CaptureToSinkAckFrontierTest {
             }
             park();
         }
+    }
+
+    /** Waits for the chain's own record of how far its source has been read to reach {@code expected}. */
+    private void awaitSourceRead(SrsMetaStore meta, String chainId, String expected) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        while (!expected.equals(sourceRead(meta, chainId))) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("timed out waiting for the chain to record its source read at "
+                        + expected + ", last observed=" + sourceRead(meta, chainId)
+                        + ", this pipeline had acked=" + ackedPosition(meta, chainId));
+            }
+            park();
+        }
+    }
+
+    private static String sourceRead(SrsMetaStore meta, String chainId) {
+        return meta.read(chainId).map(record -> record.sourceReadOffset()).orElse(null);
     }
 
     private static String ackedPosition(SrsMetaStore meta, String chainId) {

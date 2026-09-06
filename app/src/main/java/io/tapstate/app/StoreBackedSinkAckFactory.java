@@ -6,9 +6,11 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.runtime.srs.SrsDurableFrontier;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The production sink-ack factory carried onto the DAG: it advances one consumer pipeline's durable
@@ -56,6 +58,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         if (!(bound instanceof SrsMetaStore meta)) {
             return (chain, position) -> { };
         }
+        Map<String, ChainPosition> recorded = new ConcurrentHashMap<>();
         return (chain, position) -> {
             String miningChainId = chainIdByTable.get(chain);
             if (miningChainId == null) {
@@ -64,11 +67,58 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             }
             String token = position.token() != null ? position.token()
                     : isSnapshotOf(position) ? cdcStart(meta, miningChainId) : null;
-            meta.advanceSinkAcked(miningChainId, pipelineId, new ChainPosition(position.order(), token));
+            ChainPosition acked = new ChainPosition(position.order(), token);
+            meta.advanceSinkAcked(miningChainId, pipelineId, acked);
             if (isSnapshotOf(position)) {
                 meta.markSnapshotComplete(miningChainId, pipelineId, chain);
+            } else {
+                recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, recorded);
             }
         };
+    }
+
+    /**
+     * Works out again, now that this acknowledgement has landed, how far the chain may say its source has
+     * been read.
+     *
+     * <p>That value is the lowest of what the source read and what every consumer has durably landed, and
+     * it used to be resolved only while a run of changes was being forwarded — against the acknowledgements
+     * that existed at that instant, which on a first forward is none at all. The acknowledgement arrives
+     * here, afterwards, and nothing carried it back: the record kept whatever an earlier forward had
+     * resolved, one delivery behind while changes kept arriving and nothing whatsoever once the source went
+     * quiet. A cdc-only read has no recorded start for changes to fall back on either, so a run restarted
+     * from that state re-attached at the present moment and everything written while it was down was gone,
+     * with nothing thrown and nothing logged. Resolving it here is the carry-back: the input that was
+     * missing is the one that has just landed.
+     *
+     * <p>The position just acknowledged is the candidate because it is itself one of those
+     * acknowledgements, so the lowest of it and the rest is the lowest of the rest — the same clamp, from
+     * the side the late input arrives on. It can never pass what was read: a sink acknowledges only a
+     * change that reached it, and a change reaches it only by being read.
+     *
+     * <p>A snapshot row does not come here. What this value means while a load runs is the reader's own
+     * business and nothing states it from this side; the change acknowledgements that follow the load carry
+     * it from there.
+     *
+     * <p>The consumers are asked for on their own rather than read off the whole record, because the record
+     * also carries a schema history that grows for the life of the chain and this path would then pay for
+     * it on every acknowledged batch. Unchanged from last time means the slowest consumer has landed
+     * nothing since, so the write would say what the record already holds — the same round trip for nothing
+     * that the forwarding side skips. Two members acking at once can still both write; the store's own
+     * guarantee that this value only ever moves forward is what makes that harmless, and it is the same
+     * guarantee that lets a reader and a sink write it at all.
+     */
+    private static void recordHowFarTheSourceHasBeenRead(
+            SrsMetaStore meta,
+            String miningChainId,
+            ChainPosition acked,
+            Map<String, ChainPosition> recorded) {
+        SrsDurableFrontier.safeAdvance(acked, meta.consumerOffsets(miningChainId)).ifPresent(safe -> {
+            if (!safe.equals(recorded.get(miningChainId))) {
+                meta.advanceSourceReadOffset(miningChainId, safe);
+                recorded.put(miningChainId, safe);
+            }
+        });
     }
 
     /**
