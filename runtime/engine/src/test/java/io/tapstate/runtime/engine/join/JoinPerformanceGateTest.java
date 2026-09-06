@@ -105,6 +105,12 @@ class JoinPerformanceGateTest {
      * between 434 and 557 milliseconds, while the heap arm's stayed within a tenth of a millisecond of
      * itself - and the recorded number is one of those five, because recording is one run.
      *
+     * <p><b>That reading of the heap arm held only because those five runs measured one row each.</b>
+     * Across the rows of one run it moves by more than this whole window, for the reason written on
+     * {@link #HEAP_WARMUPS}, which is what the warm-up is there to take out. The window above is a
+     * statement about the carrier arm's spread and nothing else, and it is only the whole story once
+     * the denominator holds still.
+     *
      * <ul>
      *   <li><b>Above 1.42, or it reddens on nothing.</b> The worst case is a low recording against a
      *       high reading: 142 measured against 100 recorded, both of which have been seen.
@@ -144,6 +150,48 @@ class JoinPerformanceGateTest {
     private static final int CARRIER_SAMPLES = 3;
 
     private static final int HEAP_SAMPLES = 8;
+
+    /**
+     * Heap samples run and thrown away before the timed ones start.
+     *
+     * <p><b>Without it the denominator is the compiler's progress, not the operator's.</b> The arm
+     * does its work in about two milliseconds once it is warm, and the eight samples above were sized
+     * on the belief that eight is enough to get there. Eight is enough only for the first row of a
+     * run. Measured on one idle machine, one JVM, F1 on the three tiers in order: the carrier arm read
+     * 455, 409 and 469 milliseconds - flat, as it should be - while the heap arm read 4.9, 2.2 and
+     * 1.9, and the ratio therefore climbed 93.5, 187.8, 249.1. The same three tiers in the reverse
+     * order gave 4.5, 2.9, 1.9: the arm tracks its position in the run and not the tier, so the same
+     * tier reads 4.9 when it goes first and 1.9 when it goes last.
+     *
+     * <p>That is a 2.7-fold spread over unchanged code, against a margin sized at 1.6, and it decides
+     * the verdict on its own: a lane running one row sees a cold arm and passes, and the same lane
+     * running the whole matrix sees a warm one three rows later and fails. Both were observed - the
+     * ordinary build, which runs F1 first, has been green throughout, while the full matrix reddened
+     * on F1 at the second and third tier with heap readings of 2.9 and 2.7.
+     *
+     * <p><b>Two hundred because that is where the floor stops moving, and sixteen is not.</b> The same
+     * two runs with warm-ups in place, heap readings by position:
+     *
+     * <pre>
+     *   warm-ups    forwards           backwards          spread
+     *   none        4.9 / 2.2 / 1.9    4.5 / 2.9 / 1.9    2.6x
+     *   16          3.1 / 1.9 / 1.7    3.0 / 1.7 / 1.7    1.8x
+     *   200         1.6 / 1.7 / 1.6    1.6 / 1.6 / 1.6    1.06x
+     * </pre>
+     *
+     * <p>Sixteen settles every row but the first, which is the row that matters: it is the one the
+     * ordinary build measures. What is left at two hundred is the carrier arm's own spread, which is
+     * what {@link #MARGIN} was sized against and the only spread this comparison was ever meant to
+     * carry. A heap sample builds nothing - two milliseconds each, and only the timed scenarios take
+     * any - so the whole warm-up costs about four tenths of a second against a carrier sample's six
+     * seconds.
+     *
+     * <p><b>The recorded ratios move with this, so the golden is re-recorded in the same change
+     * set.</b> That is not a red being cleared: the denominator is a different measurement now, and
+     * leaving the old numbers would compare today's warm floor against yesterday's warm-up state,
+     * which is the defect this removes.
+     */
+    private static final int HEAP_WARMUPS = 200;
 
     @Test
     void theOperatorStillReadsAndCostsWhatItIsRecordedTo() throws IOException {
@@ -201,6 +249,9 @@ class JoinPerformanceGateTest {
         JoinBenchRun.Result carrier = null;
         JoinBenchRun.Result heap = null;
 
+        for (int i = 0; timed && i < HEAP_WARMUPS; i++) {
+            JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.HEAP);
+        }
         for (int i = 0; i < (timed ? HEAP_SAMPLES : 1); i++) {
             heap = JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.HEAP);
             heapNanos = Math.min(heapNanos, heap.nanos());
