@@ -14,10 +14,11 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The recipes that write a workspace: {@code sample}, {@code mirrored-table} and {@code blank}. Each
- * is held to what {@code docs/first-run/README.md} says it writes - the demo files byte for byte, a
- * source and a pipeline byte for byte against inline goldens, or nothing at all - and to the rules
- * shared by all of them: never overwrite without {@code --force}, secrets go to {@code .env} and not
+ * The first three recipes that write a workspace: {@code sample}, {@code mirrored-table} and
+ * {@code blank}; the shaped ones are in {@code NewRecipeShapesTest}. Each is held to what
+ * {@code docs/first-run/README.md} says it writes - the demo files byte for byte, a source and a
+ * pipeline byte for byte against inline goldens, or nothing at all - and to the rules shared by all
+ * of them: never overwrite without {@code --force}, secrets go to {@code .env} and not
  * into the artifact, the interactive and the flag-supplied forms produce the same bytes.
  *
  * <p>The server binding is rooted in a temporary home and probed through a fake, so no socket opens.
@@ -51,14 +52,14 @@ class NewRecipeTest {
               primary_key: id
             """;
 
-    /** Captured outcome of one one-shot CLI invocation. */
-    private record Run(int code, String out, String err) {
+    /** Captured outcome of one one-shot CLI invocation; shared with the other recipe tests. */
+    record Run(int code, String out, String err) {
         String all() {
             return out + err;
         }
     }
 
-    private static Run run(Path home, Prompter prompter, String... args) {
+    static Run run(Path home, Prompter prompter, String... args) {
         CommandLine cl = Cli.newCommandLine();
         NewCmd cmd = cl.getSubcommands().get("new").getCommand();
         cmd.prompter = prompter;
@@ -303,16 +304,5 @@ class NewRecipeTest {
                 .isLessThan(r.out().indexOf("\"kind\": \"env\""));
         assertThat(r.out().indexOf("\"kind\": \"env\""))
                 .isLessThan(r.out().indexOf("\"kind\": \"gitignore\""));
-    }
-
-    // ---- the recipes that are not here yet ------------------------------------------------------
-
-    @Test
-    void aRecipeNotAvailableYetStopsBeforeWritingAnything(@TempDir Path home, @TempDir Path ws) {
-        Run r = run(home, new ScriptedPrompter(), "new", "reshaped-table", "--yes", "-w", ws.toString());
-
-        assertThat(r.code()).isEqualTo(NewCmd.EXIT_USAGE);
-        assertThat(r.out()).isEmpty();
-        assertThat(r.err()).isEqualTo("new: recipe 'reshaped-table' is not available yet\n");
     }
 }
