@@ -19,12 +19,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * assistant is pointed at. The file descriptions are {@code ls}'s own one-liners, so {@code ls} is held
  * to a golden here too: the summary it shares must not move under the refactor that shared it.
  *
- * <p>Every run binds a temporary home to the default server through a fake probe, so the URL the
- * {@code up} line names is known and no socket opens.
+ * <p>No run here reaches a server, because {@code new} cannot: scaffolding writes files and learns
+ * nothing, so the summary names no server and the {@code up} line says the question comes later.
  */
 class NewSummaryTest {
-
-    private static final String SERVER = "http://127.0.0.1:8080";
 
     /** The tail every recipe run ends with once the file list is out. */
     private static final String ENDING =
@@ -34,7 +32,7 @@ class NewSummaryTest {
               edit any file above  they are ordinary YAML; the guided commands never hide them
               tapstate validate  check the workspace without a server
               tapstate ls / tapstate desc <id>  see what is here and what each file declares
-              tapstate up  bring it to running against http://127.0.0.1:8080
+              tapstate up  bring it to running; it asks which server the first time
             An AI assistant can take it from here: https://tapstate.dev/docs/first-run
             """;
 
@@ -103,7 +101,7 @@ class NewSummaryTest {
      * on this ring, so the envelope is held to the writer's deterministic layout instead of parsed.
      */
     @Test
-    void jsonCarriesRolesStateServerAndNextAsFieldsAndNoProse(@TempDir Path home, @TempDir Path ws) {
+    void jsonCarriesRolesStateAndNextAsFieldsAndNoProse(@TempDir Path home, @TempDir Path ws) {
         NewRecipeTest.Run r = mirrored(home, ws, "-o", "json");
 
         assertThat(r.code()).as(r.all()).isZero();
@@ -117,7 +115,6 @@ class NewSummaryTest {
                 .contains("\"role\": \"secrets for the files above; not committed\"")
                 .contains("\"role\": \"keeps .env out of version control\"")
                 .contains("\"state\": \"not-running\"")
-                .contains("\"server\": \"" + SERVER + "\"")
                 .contains("\"next\": [\n    \"validate\",\n    \"ls\",\n    \"desc\",\n    \"up\"\n  ]")
                 .doesNotContain("Next:")
                 .doesNotContain("State:")
@@ -141,7 +138,6 @@ class NewSummaryTest {
                 .contains("role: \"source orders_src: mysql, cdc\"")
                 .contains("assumed: \"primary_key: id\"")
                 .contains("state: not-running")
-                .contains("server: \"" + SERVER + "\"")
                 .contains("next:\n  - validate\n  - ls\n  - desc\n  - up\n")
                 .doesNotContain("Next:")
                 .doesNotContain("State:")

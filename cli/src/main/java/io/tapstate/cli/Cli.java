@@ -286,7 +286,8 @@ public final class Cli implements Runnable {
                     "Follow a whole collection's changes until Ctrl-C; pipes fine.")),
             // The composite that ships. The operands are the flags it takes, since it names no resource:
             // the bound workspace is the operand.
-            Map.entry("up", new VerbHelp("[--server <url>] [--yes] [-o text|json|yaml] [-w <dir>]",
+            Map.entry("up", new VerbHelp(
+                    "[--server <url>] [-u <name>] [--start-local] [--yes] [-o text|json|yaml] [-w <dir>]",
                     "Bring the bound workspace to running: apply, discover, apply, start.")),
             // The reserved verbs. Each says what it is reserved for: "not implemented yet" answers the
             // question only once the reader knows what was going to be there.
@@ -530,7 +531,8 @@ public final class Cli implements Runnable {
     private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                                   Supplier<Prompter> prompter, ContextResolver resolver,
                                   AuthService authService, BooleanSupplier terminal) {
-        return runSession(launch, controlPlane, prompter, resolver, authService, terminal, newCommandLine());
+        return runSession(launch, controlPlane, prompter, resolver, authService, terminal, newCommandLine(),
+                Path.of(System.getProperty("user.home")));
     }
 
     /** The injected command table keeps one-shot output observable without redirecting process streams. */
@@ -538,12 +540,20 @@ public final class Cli implements Runnable {
                           Supplier<Prompter> prompter, ContextResolver resolver,
                           AuthService authService, CommandLine commandLine) {
         return runSession(launch, controlPlane, prompter, resolver, authService,
-                () -> System.console() != null, commandLine);
+                () -> System.console() != null, commandLine, Path.of(System.getProperty("user.home")));
+    }
+
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver,
+                          AuthService authService, CommandLine commandLine, Path home) {
+        return runSession(launch, controlPlane, prompter, resolver, authService,
+                () -> System.console() != null, commandLine, home);
     }
 
     private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                                   Supplier<Prompter> prompter, ContextResolver resolver,
-                                  AuthService authService, BooleanSupplier terminal, CommandLine commandLine) {
+                                  AuthService authService, BooleanSupplier terminal, CommandLine commandLine,
+                                  Path home) {
         Prompter oneShotPrompter = null;
         try {
             if (launch.hasConflictingTargets()) {
@@ -561,9 +571,17 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
+            // `up` asks which server the first time a workspace is brought up, so a one-shot run of it at
+            // a terminal needs a prompter too; without a terminal it asks nothing and refuses instead.
+            if (launch.isOneShot() && !launch.command().isEmpty()
+                    && launch.command().get(0).equals("up")
+                    && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
             Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
-                    HomeStores.contexts(Path.of(System.getProperty("user.home"))));
+                    HomeStores.contexts(home));
+            repl.homeDir = home;
             repl.terminalCheck(terminal);
             repl.prompterSource(prompter);
             String machineToken = launch.machineToken();

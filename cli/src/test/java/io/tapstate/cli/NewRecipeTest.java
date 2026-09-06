@@ -64,9 +64,6 @@ class NewRecipeTest {
         NewCmd cmd = cl.getSubcommands().get("new").getCommand();
         cmd.prompter = prompter;
         cmd.home = home;
-        cmd.controlPlane = new FakeHealthProbe(true);
-        // the default server is listening and the sign-in it takes is answered from the environment
-        cmd.env = NewGuidedTest.PASSWORD_IN_ENV;
         StringWriter out = new StringWriter();
         StringWriter err = new StringWriter();
         cl.setOut(new PrintWriter(out));
@@ -240,7 +237,7 @@ class NewRecipeTest {
         ScriptedPrompter prompter = new ScriptedPrompter(
                 "mysql", "db", "", "", "u", "s", "orders", "orders_view");
 
-        Run r = run(home, prompter, "new", "mirrored-table", "--server", "http://127.0.0.1:8080", "--user", "admin", "-w", ws.toString());
+        Run r = run(home, prompter, "new", "mirrored-table", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isZero();
         assertThat(prompter.secretQuestions).hasSize(1);

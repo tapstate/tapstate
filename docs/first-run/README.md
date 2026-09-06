@@ -16,8 +16,8 @@ The whole path, on a clean machine:
 
 ```
 curl -sSL https://install.tapstate.dev | sh    # installs the CLI, nothing else
-tapstate new                                   # which server? which outcome? -> writes a workspace
-tapstate up                                    # brings that workspace to RUNNING
+tapstate new                                   # which outcome? -> writes a workspace, offline
+tapstate up                                    # which server? -> brings that workspace to RUNNING
 ```
 
 No resource YAML has to be read or written to get there. The workspace that `new` writes
@@ -43,51 +43,16 @@ server's own lifecycle is managed outside this CLI.
 
 ## `tapstate new`
 
+**`new` never reaches a server.** It asks what the workspace is for, writes files, and stops;
+which server those files are brought up against is `up`'s question, asked the first time you run
+it. Nothing here probes, starts, signs in or binds.
+
 Bare `new` at a terminal runs the guided flow. `new --kind <kind>` keeps its existing
 meaning — scaffold one resource — and is unchanged. The bare form used to enter the
 single-resource wizard; from this release it enters the recipe picker. That is a deliberate
 change to a released command and is called out in the release note.
 
-### Step 1 — which server
-
-The first question is only asked when the current directory is not already bound to a
-server. Two answers:
-
-| Answer | Meaning |
-|---|---|
-| **(a)** `http://127.0.0.1:8080` — the default, taken on an empty reply | Use the server on this machine. If nothing is listening there, start a local development stack in Docker on that port, wait for it to be healthy, then register and bind it. |
-| **(b)** a URL you type | Use a server you already run. You are asked to sign in. |
-
-Either answer is saved as a registered server and bound to the workspace directory, so the
-question is not asked again in that directory and `up` knows where to go.
-
-The local development stack, when the default has to start one:
-
-- is a **pinned** version of the server and its managed store, fetched and verified from a
-  single configurable artifact source (the release location by default);
-- comes with the **published connectors pre-registered** — today the MySQL, PostgreSQL and
-  MongoDB engine connectors, fetched from the same release location the demo uses (override
-  with `TAPSTATE_CONNECTORS_URL`); the other official ids have no published artifact yet and
-  are registered by hand with `register` when they ship;
-- contains **no sample data** — that is what the demo is for;
-- is started **idempotently**: a second `new` finds the running one and does not start a
-  second;
-- lives in `~/.tapstate/local-stack/` (the compose file, a `.env` holding the generated
-  admin password, the staged connector jars); the first start pulls images and says so;
-- ends by printing where the stack lives on disk and the one command that stops it. There
-  are no `stop` / `status` / `upgrade` verbs for it in this CLI, and there will not be.
-
-**Both answers sign in.** The local stack's admin is created by the stack and signed in with
-the generated password automatically. A server you point at asks `Username` (default `admin`)
-and `Password`; non-interactively, pass `--user` and put the password in `TAPSTATE_PASSWORD`.
-A remote server must be `https://` — plaintext is refused for anything but loopback. The
-session is saved, so `up` needs no credential.
-
-**Non-interactive runs never start containers silently.** With `--yes` and nothing listening
-on the default port, `new` stops with a named error unless `--start-local` was passed
-explicitly. Scripts either pass that flag or pass `--server <url>`.
-
-### Step 2 — which outcome
+### Step 1 — which outcome
 
 The wizard states what it is building — *a workspace: a directory of `.tap.yml` files you
 can read and edit* — and then asks what that workspace is for. The catalog is short and
@@ -139,7 +104,7 @@ points:
 Keys are stable; new keys may be added, existing ones are not renamed. The text output is
 generated from the same list and is held to a golden, so wording cannot drift between the two.
 
-### Step 3 — the recipe's questions
+### Step 2 — the recipe's questions
 
 Each recipe asks only what it needs. Connection fields come from the connector's catalog
 entry: the required ones and the secret ones are asked, optional ones take their defaults
@@ -264,7 +229,52 @@ lifecycle.
   process environment. Nothing else reads that file.
 - **A failure names its stage.** "`up: discover failed on orders_src: <code> — <message>`" followed
   by the catalog's next action, never the internal command that happened to be running.
-- Flags: `--server <url>` overrides the bound server for this run; `--yes` for scripts.
+- Flags: `--server <url>` overrides the bound server for this run; `-u <name>` and
+  `--start-local` belong to the server question below; `--yes` never prompts.
+- **This verb owns every contact with a server.** Probing one, starting the local development
+  stack, signing in and binding the workspace all happen here and nowhere else: `new` and the
+  scaffolding verbs write files and learn nothing. A workspace can therefore be authored with
+  no server in existence, which is what makes offline authoring a real path rather than a claim.
+
+### The server question
+
+Asked once per workspace, on the first `up` in a directory that is not bound to a server yet,
+and not at all when `--server` names one for the run. Two answers:
+
+| Answer | Meaning |
+|---|---|
+| **(a)** `http://127.0.0.1:8080` — the default, taken on an empty reply | Use the server on this machine. If nothing is listening there, start a local development stack in Docker on that port, wait for it to be healthy, then register and bind it. |
+| **(b)** a URL you type | Use a server you already run. You are asked to sign in. |
+
+Either answer is saved as a registered server and bound to the workspace directory, so the
+question is not asked again in that directory and `up` knows where to go.
+
+The local development stack, when the default has to start one:
+
+- is a **pinned** version of the server and its managed store, fetched and verified from a
+  single configurable artifact source (the release location by default);
+- comes with the **published connectors pre-registered** — today the MySQL, PostgreSQL and
+  MongoDB engine connectors, fetched from the same release location the demo uses (override
+  with `TAPSTATE_CONNECTORS_URL`); the other official ids have no published artifact yet and
+  are registered by hand with `register` when they ship;
+- contains **no sample data** — that is what the demo is for;
+- is started **idempotently**: a second `up` finds the running one and does not start a
+  second;
+- lives in `~/.tapstate/local-stack/` (the compose file, a `.env` holding the generated
+  admin password, the staged connector jars); the first start pulls images and says so;
+- ends by printing where the stack lives on disk and the one command that stops it. There
+  are no `stop` / `status` / `upgrade` verbs for it in this CLI, and there will not be.
+
+**Both answers sign in.** The local stack's admin is created by the stack and signed in with
+the generated password automatically. A server you point at asks `Username` (default `admin`)
+and `Password`; non-interactively, pass `--user` and put the password in `TAPSTATE_PASSWORD`.
+A remote server must be `https://` — plaintext is refused for anything but loopback. The
+session is saved, so `up` needs no credential.
+
+**Non-interactive runs never start containers silently.** With `--yes`, or anywhere there is no
+terminal to ask at, `up` stops with a named error rather than starting anything, unless
+`--start-local` was passed explicitly. Scripts either pass that flag, pass `--server <url>`, or
+work in a directory that is already bound.
 
 What `up` says afterwards follows the same shape as `new`: the workspace, the pipeline and
 source names with their state, the commands that do the same thing one step at a time, and

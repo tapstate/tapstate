@@ -78,21 +78,6 @@ final class NewCmd implements Callable<Integer> {
             description = "Never prompt; take every answer from flags (scripting / AI).")
     boolean nonInteractive;
 
-    @Option(names = "--server", paramLabel = "URL",
-            description = "Tapstate server to register and bind the workspace to (guided first run; "
-                    + "default " + GuidedNew.DEFAULT_SERVER_TEXT + ").")
-    String server;
-
-    @Option(names = "--start-local",
-            description = "With --yes: start the local development stack in Docker when nothing is listening on "
-                    + "the default server (guided first run). Never started without it.")
-    boolean startLocal;
-
-    @Option(names = {"-u", "--user"}, paramLabel = "NAME",
-            description = "Sign in to the server as this user (guided first run; default admin). The password "
-                    + "comes from $" + GuidedNew.PASSWORD_ENV + " or a masked prompt.")
-    String user;
-
     @Option(names = "--list",
             description = "Print the recipe catalog (id and title) instead of scaffolding; -o json|yaml for scripts.")
     boolean list;
@@ -206,15 +191,6 @@ final class NewCmd implements Callable<Integer> {
      */
     Path home;
 
-    /** Test seam: the health probe the guided flow asks before binding; production opens an HTTP one. */
-    ControlPlaneClient controlPlane;
-
-    /** Test seam: the local development stack the default answer starts; production runs Docker. */
-    LocalStack localStack;
-
-    /** Test seam: the process environment the guided flow reads the sign-in password from. */
-    UnaryOperator<String> env = System::getenv;
-
     @Override
     public Integer call() {
         PrintWriter err = CliIo.err(spec);
@@ -223,16 +199,6 @@ final class NewCmd implements Callable<Integer> {
         }
         if (isGuided()) {
             return callGuided(err);
-        }
-        if (server != null) {
-            err.println("new: --server is only valid for the guided first run (bare new, or new <recipe>)");
-            err.flush();
-            return EXIT_USAGE;
-        }
-        if (startLocal || user != null) {
-            err.println("new: --start-local/--user are only valid for the guided first run (bare new, or new <recipe>)");
-            err.flush();
-            return EXIT_USAGE;
         }
         if (table != null || view != null) {
             err.println("new: --table/--view are only valid for the guided first run (new <recipe>)");
@@ -344,35 +310,16 @@ final class NewCmd implements Callable<Integer> {
             err.flush();
             return EXIT_USAGE;
         }
-        URI serverUrl = null;
-        if (server != null) {
-            serverUrl = GuidedNew.serverUrl(server);
-            if (serverUrl == null) {
-                err.println("new: --server must be an http(s) URL, e.g. " + GuidedNew.DEFAULT_SERVER_TEXT);
-                err.flush();
-                return EXIT_USAGE;
-            }
-        }
         // prose goes to the terminal only when a person is reading it; the machine envelopes stay clean
         PrintWriter prose = output == OutputFormat.TEXT && guidedInteractive() ? CliIo.out(spec) : null;
-        Path homeDir = home != null ? home : Path.of(System.getProperty("user.home"));
-        ContextManager contexts = HomeStores.contexts(homeDir);
-        // an injected probe belongs to whoever injected it; only the one opened here is closed here
-        ControlPlaneClient probe = controlPlane != null ? controlPlane : new HttpControlPlaneClient();
-        // the session is saved through the same service and store every other sign-in uses, so that
-        // what `up` resumes is exactly what was signed in here
-        AuthService auth = HomeStores.auth(homeDir, probe, Clock.systemUTC());
-        LocalStack stack = localStack != null ? localStack : LocalStack.under(homeDir, probe, env);
         RecipeRun.Flags flags = new RecipeRun.Flags(connector, config, table, view,
                 new RecipeRun.Flags.Reshape(keep, rename, drop, where),
                 new RecipeRun.Flags.Nested(root, key, children, childConnector, childSet), databases);
         try {
             RecipeRun.Result result = guidedInteractive()
-                    ? runGuided(contexts, probe, auth, stack, prose, serverUrl, flags)
-                    : runRecipe(new GuidedNew(contexts, probe, auth, stack, env, null, prose)
-                                    .run(workspace.root(), recipe, serverUrl, startLocal, user),
-                            null, flags);
-            emitResult(result, contexts);
+                    ? runGuided(prose, flags)
+                    : runRecipe(new GuidedNew(null, prose).chooseRecipe(recipe), null, flags);
+            emitResult(result);
             return 0;
         } catch (RecipeRun.Usage e) {
             err.println("new: " + e.getMessage());
@@ -381,28 +328,19 @@ final class NewCmd implements Callable<Integer> {
         } catch (TapstateException e) {
             return emitDiagnostic(e);
         } catch (IOException e) {
-            err.println("new: cannot set up the workspace: " + e.getMessage());
+            // only the terminal the picker is read from can raise this; the recipe itself writes later
+            err.println("new: cannot read from the terminal: " + e.getMessage());
             err.flush();
             return EXIT_USAGE;
-        } finally {
-            if (controlPlane == null) {
-                probe.close();
-            }
         }
     }
 
-    private RecipeRun.Result runGuided(ContextManager contexts, ControlPlaneClient probe, AuthService auth,
-                                       LocalStack stack, PrintWriter prose, URI serverUrl, RecipeRun.Flags flags)
-            throws IOException {
+    private RecipeRun.Result runGuided(PrintWriter prose, RecipeRun.Flags flags) throws IOException {
         if (prompter != null) {
-            String chosen = new GuidedNew(contexts, probe, auth, stack, env, prompter, prose)
-                    .run(workspace.root(), recipe, serverUrl, startLocal, user);
-            return runRecipe(chosen, prompter, flags);
+            return runRecipe(new GuidedNew(prompter, prose).chooseRecipe(recipe), prompter, flags);
         }
         try (JLinePrompter jline = JLinePrompter.system()) {
-            String chosen = new GuidedNew(contexts, probe, auth, stack, env, jline, prose)
-                    .run(workspace.root(), recipe, serverUrl, startLocal, user);
-            return runRecipe(chosen, jline, flags);
+            return runRecipe(new GuidedNew(jline, prose).chooseRecipe(recipe), jline, flags);
         }
     }
 
@@ -416,14 +354,12 @@ final class NewCmd implements Callable<Integer> {
      * next steps against the server the directory is now bound to, and the handover line. The server is
      * read back from the binding rather than from the answer, so the two cannot disagree.
      */
-    private void emitResult(RecipeRun.Result result, ContextManager contexts) {
-        URI server = contexts.serverBoundTo(result.root())
-                .orElseThrow(() -> new IllegalStateException("the guided run left " + result.root() + " unbound"));
+    private void emitResult(RecipeRun.Result result) {
         PrintWriter o = CliIo.out(spec);
         switch (output) {
-            case JSON -> o.println(JsonOut.write(FirstRunSummary.envelope(result, server)));
-            case YAML -> o.println(YamlOut.write(FirstRunSummary.envelope(result, server)));
-            default -> FirstRunSummary.text(o, result, server);
+            case JSON -> o.println(JsonOut.write(FirstRunSummary.envelope(result)));
+            case YAML -> o.println(YamlOut.write(FirstRunSummary.envelope(result)));
+            default -> FirstRunSummary.text(o, result);
         }
         o.flush();
     }
