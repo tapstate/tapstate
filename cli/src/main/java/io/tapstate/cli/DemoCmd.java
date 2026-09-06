@@ -82,8 +82,8 @@ final class DemoCmd implements Callable<Integer> {
      * because this is the copy a user can ask for at any moment, on the machine they are on.
      */
     private static final List<String> STEPS = List.of(
-            "1. Install and bring up the stack (databases, server and store, seeded):",
-            "     curl -sSL https://install.tapstate.dev | sh",
+            "1. Bring up the demo stack (databases, server and store, seeded):",
+            "     curl -sSL https://install.tapstate.dev/demo | sh",
             "2. Write the demo workspace - orders in MySQL, shipments in PostgreSQL:",
             "     tapstate demo -w work",
             "3. Go online, register the connectors this demo reads, and apply it:",
