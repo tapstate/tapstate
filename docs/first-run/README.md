@@ -137,11 +137,26 @@ and are not asked. Ids are suggested and taken on an empty reply.
 | Recipe | Asks |
 |---|---|
 | `sample` | nothing |
-| `mirrored-table` | connector (official list) · connection fields · one table · view id (defaults to the table name) |
+| `mirrored-table` | connector (official list, default `mysql`) · connection fields · one table (no default; a blank answer is refused, not re-asked) · view id (defaults to the table name) |
 | `reshaped-table` | as `mirrored-table`, then: columns to keep or rename, columns to drop, an optional row filter. No script step — a transform that needs code is written by hand after `blank` or by editing the file |
 | `nested-json` | the root table (connector · connection · table · key), then one or more child tables (connector · connection · table · the columns that join it to the root · one-to-one or one-to-many) |
 | `consolidated-table` | the table name once, then two or more databases (connector · connection) that hold it |
 | `blank` | nothing beyond the workspace directory |
+
+**What the generated files are called, and what is assumed** — fixed here so scripts and goldens
+can rely on it:
+
+- ids are derived, never asked: source `<table>_src`, pipeline `<table>_sync`; the view id is the one
+  answer the user gives (default: the table name);
+- a view's `from` is the **table name**, because that is what the pipeline's reference closure
+  resolves (a step id or a table name, never a bare source id);
+- the view's `primary_key` is written as `id` — the real key is not known until discovery runs, and
+  the summary line for that file says so; edit it if the table is keyed otherwise;
+- secret environment names are `<SOURCE_ID>_<FIELD>` upper-cased, e.g. `ORDERS_SRC_PASSWORD`;
+- connection fields are written as the canonical writer renders the connector's catalog types (a
+  `string`-typed port comes out as `port: "3306"`); the demo files are hand-written and differ in
+  such spacing, which is fine — they are copied, never generated;
+- a choice list's default is its first entry (for the recipe question, `sample`).
 
 **Answer semantics, the same in every question:**
 
