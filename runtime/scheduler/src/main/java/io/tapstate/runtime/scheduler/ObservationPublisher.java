@@ -97,6 +97,21 @@ public final class ObservationPublisher {
      */
     private static final String NEST_DEAD_LETTERED_PREFIX = "nestDeadLettered.";
 
+    /**
+     * How far a rebuild of one dimension key's fan-out has got, and about how far it has to go, with the
+     * namespace and the key it is about appended. Two numbers because the whole of what a rebuild says is
+     * the distance between them; either alone is a number with nothing to be read against.
+     *
+     * <p>Published only while a rebuild large enough to be a wait is under way, so an absence here is the
+     * quiet state rather than an unwired one. That is the opposite choice from the readings above, and it
+     * is made for the same reason they made theirs: a rebuild reported on every dimension edit is a
+     * constant stream, and a reader who has learned to scroll past it is a reader this cannot reach on the
+     * one occasion it matters - an edit to a single row that owes a million rows of writing, throughout
+     * which the pipeline runs, counts no error, and holds half the old value and half the new one.
+     */
+    private static final String JOIN_RECOMPUTE_DONE_PREFIX = "joinRecomputeRowsDone.";
+    private static final String JOIN_RECOMPUTE_EXPECTED_PREFIX = "joinRecomputeRowsExpected.";
+
     private final StateStore state;
     private final ObservationStore observations;
     private final Function<String, OptionalLong> recordCounts;
@@ -106,6 +121,8 @@ public final class ObservationPublisher {
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
     private final Function<String, Map<String, Long>> nestDeadLetters;
+    private final Function<String, Map<String, Long>> joinRecomputeDone;
+    private final Function<String, Map<String, Long>> joinRecomputeExpected;
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
 
@@ -240,6 +257,36 @@ public final class ObservationPublisher {
             Function<String, Map<String, Long>> frontierStalls,
             FrontierStallWatch frontierStall,
             Function<String, Map<String, Long>> nestDeadLetters) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, id -> Map.of(), id -> Map.of());
+    }
+
+    /**
+     * A publisher also wired to how far each large join rebuild has got: {@code joinRecomputeDone} yields
+     * the rows already sent and {@code joinRecomputeExpected} about how many there are, both keyed by the
+     * namespace and dimension key the rebuild is about (empty when none large enough to report is
+     * running). The ninth and tenth ports, for the same reason as the others.
+     *
+     * <p>Two ports rather than one carrying both numbers, following the two frontier readings above: what
+     * rides between here and the run is numbers by name, and a pair fetched as a pair would still have
+     * arrived as two names. Nothing is lost by keeping them apart, because they are only ever read
+     * together against each other, and a rebuild that reported one of them and not the other would be a
+     * broken publish on either arrangement.
+     */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected) {
+        this.joinRecomputeDone = Objects.requireNonNull(joinRecomputeDone, "joinRecomputeDone");
+        this.joinRecomputeExpected =
+                Objects.requireNonNull(joinRecomputeExpected, "joinRecomputeExpected");
         this.nestDeadLetters = Objects.requireNonNull(nestDeadLetters, "nestDeadLetters");
         this.state = Objects.requireNonNull(state, "state");
         this.observations = Objects.requireNonNull(observations, "observations");
@@ -283,7 +330,9 @@ public final class ObservationPublisher {
             Map<String, Long> gaps = frontierGaps.apply(pipelineId);
             Map<String, Long> pinned = frontierStalls.apply(pipelineId);
             observations.save(new Observation(pipelineId, actual,
-                    metrics(pipelineId, actual, readings, gaps, pinned, nestDeadLetters.apply(pipelineId)),
+                    metrics(pipelineId, actual, readings, gaps, pinned, nestDeadLetters.apply(pipelineId),
+                            joinRecomputeDone.apply(pipelineId),
+                            joinRecomputeExpected.apply(pipelineId)),
                     snapshots.apply(pipelineId), positions.apply(pipelineId), carried));
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
@@ -319,7 +368,7 @@ public final class ObservationPublisher {
      */
     private Map<String, Long> metrics(String pipelineId, PipelineState actual,
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
-            Map<String, Long> discarded) {
+            Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected) {
         Map<String, Long> metrics = new HashMap<>();
         metrics.put("errorCount", actual == PipelineState.FAILED ? 1L : 0L);
         recordCounts.apply(pipelineId).ifPresent(count -> metrics.put("recordCount", count));
@@ -347,6 +396,13 @@ public final class ObservationPublisher {
         // document leave no other trace, so a reader has only this to go on, and a zero published on every
         // pass is what an unwired count would look like too.
         discarded.forEach((namespace, count) -> metrics.put(NEST_DEAD_LETTERED_PREFIX + namespace, count));
+        // One pair per rebuild large enough to be worth telling anybody about, and nothing at all for a
+        // pipeline where none is running. Both halves are published from their own map rather than one
+        // being defaulted from the other: a rebuild whose size arrived without its progress would read as
+        // one that has sent no rows, which is the shape of a rebuild that is stuck.
+        rebuildDone.forEach((subject, rows) -> metrics.put(JOIN_RECOMPUTE_DONE_PREFIX + subject, rows));
+        rebuildExpected.forEach(
+                (subject, rows) -> metrics.put(JOIN_RECOMPUTE_EXPECTED_PREFIX + subject, rows));
         return metrics;
     }
 }

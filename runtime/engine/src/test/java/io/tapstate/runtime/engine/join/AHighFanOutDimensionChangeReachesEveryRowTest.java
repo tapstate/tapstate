@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.join;
 
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.SourceColumn;
 import io.tapstate.core.sql.SourceTable;
@@ -9,6 +10,7 @@ import io.tapstate.core.sql.SqlFrontEnd;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,6 +33,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * offer to get them -- the operator handed back control and was able to pick up where it stopped.
  * The second is the one that needs a sink with a limit on it, because a sink that always accepts
  * lets a driver that never yields look identical to one that does.
+ *
+ * <p>The third case here is about the same wait seen from outside. Yielding is what makes the fan-out
+ * survivable and it is also what makes it long, and for the whole of it the pipeline reads healthy: the
+ * job runs, nothing errors, and the target holds half the old value and half the new one. What the
+ * operator is told about that is asserted where it can be pinned down exactly -- a bounded sink makes
+ * the number of steps arithmetic rather than timing -- and the reading reaching a real read face is
+ * left to the end-to-end case, which is the only place the whole path exists.
  */
 class AHighFanOutDimensionChangeReachesEveryRowTest {
 
@@ -88,6 +97,99 @@ class AHighFanOutDimensionChangeReachesEveryRowTest {
         assertThat(sink.ordersCarrying("Ada"))
                 .as("and none is left holding the old one")
                 .isEmpty();
+    }
+
+    /**
+     * Enough rows under one key to be worth reporting and to take several pages, and no more: what is
+     * under test is the sequence of readings, and the sequence has the same shape at twelve pages as at
+     * a hundred.
+     */
+    private static final int REPORTABLE_FACT_ROWS = 12_000;
+
+    @Test
+    @DisplayName("a rebuild says how far it has got while it is still going, not once it is over")
+    void theRebuildReportsItsProgressWhileItIsStillGoing() {
+        JoinPlan plan = SqlFrontEnd.derive(
+                "SELECT o.o_id AS order_id, c.c_name AS customer_name "
+                        + "FROM orders o JOIN customers c ON o.o_cust_id = c.c_id", TABLES);
+        RecordingGauge gauge = new RecordingGauge();
+        JoinDriver driver = new JoinDriver(plan, List.of("o_id"), "order_state",
+                new CountingJoinStores(ReverseIndex.DEFAULT_PAGE_SIZE),
+                JoinDriver.DEFAULT_KEYS_PER_READ, gauge);
+        BoundedSink sink = new BoundedSink();
+
+        feed(driver, sink, new SourceChange("c", Envelope.insert(1L, "src",
+                row("c_id", 1L, "c_name", "Ada"), null)));
+        for (int i = 0; i < REPORTABLE_FACT_ROWS; i++) {
+            feed(driver, sink, new SourceChange("o", Envelope.insert(1L, "src",
+                    row("o_id", (long) i, "o_cust_id", 1L), null)));
+        }
+
+        gauge.forget();
+        feed(driver, sink, new SourceChange("c", Envelope.update(1L, "src",
+                row("c_id", 1L, "c_name", "Ada"), row("c_id", 1L, "c_name", "Bo"), null)));
+
+        assertThat(gauge.keysReported())
+                .as("the reading is about one dimension key, and says which - as the driver holds it, "
+                        + "which is the encoding everything else files that key under; rendering it for "
+                        + "a person to read happens where it is reported and not here")
+                .containsExactly(JoinKey.of(List.of(1L)).name());
+        assertThat(gauge.sizes())
+                .as("its size is read off the index as an upper bound, and is what a reporting "
+                        + "threshold is applied to; a rebuild that understated it would be filtered "
+                        + "out of every face by a threshold it should have passed")
+                .allMatch(rows -> rows >= REPORTABLE_FACT_ROWS);
+        assertThat(gauge.progress())
+                .as("progress only ever moves forward, so two readings taken apart can be subtracted")
+                .isSorted();
+        assertThat(gauge.progress())
+                .as("and it is reported part way, which is the whole point of it: a number that "
+                        + "arrives when the rebuild ends describes a wait that is already over")
+                .anyMatch(done -> done > 0 && done < REPORTABLE_FACT_ROWS);
+        assertThat(gauge.progress().get(gauge.progress().size() - 1))
+                .as("finishing at the size it was walking is what says the two numbers are about "
+                        + "the same rebuild")
+                .isEqualTo((long) REPORTABLE_FACT_ROWS);
+    }
+
+    /** Keeps every rebuild reading in the order it was made, which is what the sequence is read from. */
+    private static final class RecordingGauge implements JoinGauge {
+
+        private final List<String> keys = new ArrayList<>();
+        private final List<Long> progress = new ArrayList<>();
+        private final List<Long> sizes = new ArrayList<>();
+
+        @Override
+        public void bucketWalked(String source, String dimensionKey, int pages) {
+        }
+
+        @Override
+        public void recomputing(String source, String dimensionKey, long rowsDone, long rowsExpected) {
+            if (!keys.contains(dimensionKey)) {
+                keys.add(dimensionKey);
+            }
+            progress.add(rowsDone);
+            sizes.add(rowsExpected);
+        }
+
+        /** Drops what the build-up reported, so the assertions read the one edit under test. */
+        void forget() {
+            keys.clear();
+            progress.clear();
+            sizes.clear();
+        }
+
+        List<String> keysReported() {
+            return keys;
+        }
+
+        List<Long> progress() {
+            return progress;
+        }
+
+        List<Long> sizes() {
+            return sizes;
+        }
     }
 
     /**

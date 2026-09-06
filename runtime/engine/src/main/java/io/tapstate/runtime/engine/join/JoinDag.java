@@ -7,6 +7,8 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
+import com.hazelcast.jet.core.metrics.Metric;
+import com.hazelcast.jet.core.metrics.Metrics;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinPlan;
@@ -18,6 +20,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.function.ToIntFunction;
 
@@ -184,17 +187,46 @@ public final class JoinDag {
             // Metered from here and nowhere else: this is the one place a job is what the state is
             // being bound for, and a reading can only be left from a thread running its processors.
             JoinStateStats stats = JoinStateStats.of(context.hazelcastInstance());
+            // Handles are kept once obtained, so a reading costs one lookup and one write per number.
+            // Concurrent because one gauge serves every processor this vertex runs on this member, and
+            // each of them reports from a thread of its own.
+            Map<String, Metric> handles = new ConcurrentHashMap<>();
             gauge = new JoinGauge() {
                 @Override
                 public void bucketWalked(String source, String dimensionKey, int pages) {
                     stats.widestBucket(JoinMaps.reverseIndex(pipelineId, stepId, source), pages);
                 }
 
+                /**
+                 * Left among the job's own statistics rather than counted on the member. The engine
+                 * already collects those on a cadence and hands them out with the job, so a reading
+                 * left here is readable from outside the run, and from any member, without a second
+                 * channel to keep alive - which a rebuild needs, because whichever member owns the
+                 * key's partition is the one doing the work and no other member knows it is happening.
+                 *
+                 * <p>Under a name carrying the key rather than one slot per namespace: two members
+                 * rebuilding two keys would otherwise report one key's name against the other's
+                 * progress, which is the one reading here nobody could tell was wrong.
+                 */
                 @Override
                 public void recomputing(String source, String dimensionKey, long rowsDone,
                         long rowsExpected) {
-                    stats.recomputing(JoinMaps.reverseIndex(pipelineId, stepId, source), dimensionKey,
-                            rowsDone, rowsExpected);
+                    if (!JoinRecomputeMetricNames.worthReporting(rowsExpected)) {
+                        return;
+                    }
+                    String namespace = JoinMaps.reverseIndex(pipelineId, stepId, source);
+                    // Rendered rather than filed under: a key is matched by an encoding of its columns,
+                    // and someone told a rebuild of "AAAAATE" is running cannot say whether it is the row
+                    // they just edited - which is the only question this reading is here to answer. Done
+                    // past the threshold, so an ordinary edit pays nothing for it.
+                    String readable = JoinKey.describe(dimensionKey);
+                    handle(JoinRecomputeMetricNames.doneNameOf(namespace, readable)).set(rowsDone);
+                    handle(JoinRecomputeMetricNames.expectedNameOf(namespace, readable))
+                            .set(rowsExpected);
+                }
+
+                private Metric handle(String name) {
+                    return handles.computeIfAbsent(name, Metrics::metric);
                 }
             };
         }

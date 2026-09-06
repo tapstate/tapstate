@@ -97,4 +97,44 @@ class JoinKeyTest {
                 .as("control: different bytes are still different keys")
                 .isNotEqualTo(JoinKey.of(List.of(new byte[]{1, 3})));
     }
+    /**
+     * A key filed under a name is read back as the column values it was built from.
+     *
+     * <p>The name is what every place that keeps state by name holds, so it is also what any reading
+     * about one key can carry. Base64 of a length-prefixed encoding identifies a key perfectly and tells
+     * a person nothing: someone told that a rebuild of "AAAAATE" is under way cannot say whether it is
+     * the row they just edited. The two directions are tested against each other rather than against a
+     * literal, because what has to hold is that they are inverses - a fixed expected string would go on
+     * passing if both ends changed together and stop the day only the encoding did.
+     */
+    @Test
+    @DisplayName("a key name reads back as the values it was built from")
+    void aNameReadsBackAsItsColumnValues() {
+        assertThat(JoinKey.describe(JoinKey.of(List.of(1L)).name())).isEqualTo("1");
+        assertThat(JoinKey.describe(JoinKey.of(List.of("ada", 7L)).name())).isEqualTo("ada, 7");
+    }
+
+    /**
+     * And the boundary the encoding exists to protect survives the reading. Two column sets that plain
+     * concatenation would put on one key have to read back as two different things here too, or the
+     * rendering hands back the ambiguity the encoding removed.
+     */
+    @Test
+    @DisplayName("two column sets that concatenate the same do not read back the same")
+    void theColumnBoundarySurvivesBeingRead() {
+        assertThat(JoinKey.describe(JoinKey.of(List.of("ab", "c")).name()))
+                .isNotEqualTo(JoinKey.describe(JoinKey.of(List.of("a", "bc")).name()));
+    }
+
+    /**
+     * A name that is not one of these is handed back untouched rather than refused. Its only caller is a
+     * reading being made ready for a person to look at, and a rendering that threw would take out the
+     * pipeline's whole observation for the sake of one label on it.
+     */
+    @Test
+    @DisplayName("something that is not a key name is left as it is")
+    void anythingElseIsLeftAlone() {
+        assertThat(JoinKey.describe("not-a-key")).isEqualTo("not-a-key");
+        assertThat(JoinKey.describe("")).isEmpty();
+    }
 }

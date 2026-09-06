@@ -35,6 +35,9 @@ import java.util.List;
  */
 public final class JoinKey {
 
+    /** What separates two columns where a key is rendered for reading, never where one is matched. */
+    private static final String SEPARATOR = ", ";
+
     /** The encoded columns, or null once a null column poisoned the key. */
     private final byte[] encoded;
 
@@ -84,6 +87,48 @@ public final class JoinKey {
                     "a key with a null column matches nothing, so it is never filed under a name");
         }
         return Base64.getUrlEncoder().withoutPadding().encodeToString(encoded);
+    }
+
+    /**
+     * The column values a key filed under {@code name} was built from, rendered for a person to read;
+     * {@code name} itself when it is not one of these names.
+     *
+     * <p><b>The inverse of {@link #name()}, and it lives here so it cannot be written anywhere else.</b>
+     * The name is what state kept by name holds, so it is also what any reading about one key can carry
+     * outward - and base64 of a length-prefixed encoding identifies a key perfectly while telling a
+     * person nothing. Someone told that a rebuild of {@code AAAAATE} is under way cannot say whether it
+     * is the row they edited a moment ago, which is the only question they were going to ask.
+     *
+     * <p><b>For reading, never for matching.</b> Two keys can render the same way - a column holding
+     * the separator below, bytes that are not text - so nothing may compare renderings or take one back
+     * apart. What is compared is the name, which the encoding keeps injective.
+     *
+     * <p>Anything that does not decode is handed back unchanged rather than refused. The caller is a
+     * label being made ready for someone to look at, and a rendering that threw would cost a pipeline
+     * its whole reading for the sake of one word in it.
+     */
+    public static String describe(String name) {
+        byte[] decoded;
+        try {
+            decoded = Base64.getUrlDecoder().decode(name);
+        } catch (IllegalArgumentException notOneOfThese) {
+            return name;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(decoded);
+        StringBuilder rendered = new StringBuilder();
+        while (buffer.remaining() >= Integer.BYTES) {
+            int length = buffer.getInt();
+            if (length < 0 || length > buffer.remaining()) {
+                return name;
+            }
+            byte[] part = new byte[length];
+            buffer.get(part);
+            if (rendered.length() > 0) {
+                rendered.append(SEPARATOR);
+            }
+            rendered.append(new String(part, StandardCharsets.UTF_8));
+        }
+        return buffer.hasRemaining() ? name : rendered.toString();
     }
 
     @Override
