@@ -174,6 +174,20 @@ final class JoinConformance implements AutoCloseable {
     }
 
     /**
+     * The rows the carrier has published, folded on the identity columns and spelled the way
+     * {@link #differences()} spells them.
+     *
+     * <p>For a case comparing two runs to each other rather than each to the database. Normalising
+     * here is what keeps that comparison on the same footing as the one against the source: two runs
+     * must not be allowed to agree over a spelling neither of them would have been allowed to publish.
+     */
+    Map<List<Object>, Map<String, Object>> publishedRows() {
+        Map<List<Object>, Map<String, Object>> rows = new LinkedHashMap<>();
+        published.forEach((identity, row) -> rows.put(identity, normalised(row)));
+        return rows;
+    }
+
+    /**
      * Writes one row to {@code table} and hands the carrier the same change.
      *
      * <p>Both images are read back out of the database rather than assembled here, which is what a

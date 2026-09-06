@@ -70,6 +70,15 @@ class JoinConformanceIT {
             SELECT o.id AS order_id, c.name AS customer_name, o.qty * o.price AS amt
             FROM orders o JOIN customers c ON o.customer_ref = c.ref_no""";
 
+    /**
+     * The same join as {@link #LEFT_JOIN}, written the other way round. A right outer join has no
+     * execution operator of its own: the front end swaps the two sides and reports it as a left one,
+     * so this text and that one have to run to the same rows.
+     */
+    private static final String RIGHT_JOIN = """
+            SELECT o.id AS order_id, c.name AS customer_name, o.qty * o.price AS amt
+            FROM customers c RIGHT JOIN orders o ON c.ref_no = o.customer_ref""";
+
     /** Every carrier this run holds to the same answer. A new one is a row here and nothing else. */
     static Stream<Arguments> carriers() {
         BiFunction<List<String>, String, JoinExecutor> builtin =
@@ -91,6 +100,54 @@ class JoinConformanceIT {
     void aRandomSequenceAgreesOnAnInnerJoin(String carrier,
             BiFunction<List<String>, String, JoinExecutor> factory) throws Exception {
         walkASequence("joinconf_inner_" + carrier, INNER_JOIN, factory);
+    }
+
+    /**
+     * The third of the three join shapes, and the only one where what a person wrote is not what runs:
+     * a right outer join is turned into a left one over swapped sides before anything executes it.
+     *
+     * <p>Both halves are asserted and neither is the other. <b>Against the database</b> is what catches
+     * a swap that is wrong - a key pair left pointing at the side it came from probes the mirror under
+     * a key nobody stored, and the symptom is rows that quietly fail to match rather than anything that
+     * reports. <b>Against the swap written out by hand</b> is the promise being made to whoever wrote
+     * the SQL: that the rewrite is invisible to them. Comparing only to the database would leave "both
+     * spellings are right" and "the two spellings mean different things and this corpus cannot tell
+     * them apart" looking alike.
+     *
+     * <p>One draw, handed to both runs, rather than two generators seeded alike: the latter holds only
+     * while nothing between them consumes the sequence differently, which is a property of the code
+     * under test rather than of the corpus.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("carriers")
+    @DisplayName("a right join agrees with the source, and with the swap a person would have written")
+    void aRandomSequenceAgreesOnARightJoinAndOnItsHandWrittenSwap(String carrier,
+            BiFunction<List<String>, String, JoinExecutor> factory) throws Exception {
+        Map<String, Object> written = SharedMySql.settings("joinconf_right_" + carrier);
+        Map<String, Object> byHand = SharedMySql.settings("joinconf_rightswap_" + carrier);
+        try (Connection writtenDb = SharedMySql.connect(written);
+                Connection byHandDb = SharedMySql.connect(byHand)) {
+            createSchema(writtenDb);
+            createSchema(byHandDb);
+            try (JoinConformance asWritten =
+                         JoinConformance.of(writtenDb, RIGHT_JOIN, List.of("order_id"), factory);
+                    JoinConformance asSwapped =
+                         JoinConformance.of(byHandDb, LEFT_JOIN, List.of("order_id"), factory)) {
+                Random random = new Random(SEED);
+                for (int round = 1; round <= ROUNDS; round++) {
+                    String change = mutate(List.of(asWritten, asSwapped), random);
+                    assertThat(asWritten.differences())
+                            .as("round %d, the right join as written, after %s", round, change)
+                            .isEmpty();
+                    assertThat(asSwapped.differences())
+                            .as("round %d, the hand-written swap, after %s", round, change)
+                            .isEmpty();
+                    assertThat(asWritten.publishedRows())
+                            .as("round %d, after %s", round, change)
+                            .isEqualTo(asSwapped.publishedRows());
+                }
+            }
+        }
     }
 
     /**
@@ -135,7 +192,7 @@ class JoinConformanceIT {
                          JoinConformance.of(db, sql, List.of("order_id"), factory)) {
                 Random random = new Random(SEED);
                 for (int round = 1; round <= ROUNDS; round++) {
-                    String change = mutate(conformance, random);
+                    String change = mutate(List.of(conformance), random);
                     assertThat(conformance.differences())
                             .as("round %d, after %s", round, change)
                             .isEmpty();
@@ -144,29 +201,40 @@ class JoinConformanceIT {
         }
     }
 
-    /** One change drawn from the sequence, described so a failure names what produced it. */
-    private static String mutate(JoinConformance conformance, Random random) throws SQLException {
+    /**
+     * One change drawn from the sequence, applied to every run given, and described so a failure names
+     * what produced it.
+     */
+    private static String mutate(List<JoinConformance> runs, Random random) throws SQLException {
         int draw = random.nextInt(10);
         if (draw < 4) {
             Map<String, Object> row = order(random.nextInt(ORDERS),
                     random.nextInt(CUSTOMERS + 2) - 1, random);
-            conformance.upsert("orders", row);
+            for (JoinConformance run : runs) {
+                run.upsert("orders", row);
+            }
             return "upsert orders " + row;
         }
         if (draw < 6) {
             long id = random.nextInt(ORDERS);
-            conformance.delete("orders", Map.of("id", id));
+            for (JoinConformance run : runs) {
+                run.delete("orders", Map.of("id", id));
+            }
             return "delete orders " + id;
         }
         if (draw < 9) {
             long id = random.nextInt(CUSTOMERS);
             Map<String, Object> row = customer(id, refOf(id, random), "name-" + random.nextInt(4),
                     "note-" + random.nextInt(4));
-            conformance.upsert("customers", row);
+            for (JoinConformance run : runs) {
+                run.upsert("customers", row);
+            }
             return "upsert customers " + row;
         }
         long id = random.nextInt(CUSTOMERS);
-        conformance.delete("customers", Map.of("id", id));
+        for (JoinConformance run : runs) {
+            run.delete("customers", Map.of("id", id));
+        }
         return "delete customers " + id;
     }
 
