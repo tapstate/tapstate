@@ -42,7 +42,7 @@ expect() { # expect <name> <fork?> <want code> <want text>
   local out code
   out="$(PR_IS_FORK="$fork" DCO_RANGE="main..HEAD" bash "$gate" 2>&1)"
   code=$?
-  if [ "$code" = "$want_code" ] && printf '%s' "$out" | grep -qF "$want_text"; then
+  if [ "$code" = "$want_code" ] && grep -qF "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"
     passed=$((passed + 1))
   else
@@ -55,7 +55,7 @@ expect() { # expect <name> <fork?> <want code> <want text>
 refute() { # refute <name> <fork?> <unwanted text>
   local name="$1" fork="$2" unwanted="$3" out
   out="$(PR_IS_FORK="$fork" DCO_RANGE="main..HEAD" bash "$gate" 2>&1)"
-  if printf '%s' "$out" | grep -qF "$unwanted"; then
+  if grep -qF "$unwanted" <<<"$out"; then
     printf '  FAIL  %s\n        did not want %s, got: %s\n' "$name" "$unwanted" "$out"
     failed=$((failed + 1))
   else
@@ -116,7 +116,7 @@ fresh_repo
 commit "signed one" -s
 out="$(PR_IS_FORK=true DCO_RANGE="no-such-base..HEAD" bash "$gate" 2>&1)"
 code=$?
-if [ "$code" = 1 ] && printf '%s' "$out" | grep -qF "nothing was checked"; then
+if [ "$code" = 1 ] && grep -qF "nothing was checked" <<<"$out"; then
   printf '  ok    %s\n' "an unresolvable range is refused, not reported clean"
   passed=$((passed + 1))
 else

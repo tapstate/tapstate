@@ -11,6 +11,8 @@ import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.Envelope;
+import io.tapstate.runtime.engine.EnvelopeSerializer;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
@@ -188,6 +190,14 @@ class HazelcastConfiguration {
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(SrsItem.class)
                 .setImplementation(new SrsItemSerializer()));
+        // And a change itself, for the same reason and one more: a change is three row images of names to
+        // whatever the source had, which the zero-configuration mechanism refuses outright. Registered
+        // here rather than where it is needed, because where it is needed is any edge between two
+        // members - and a member that cannot write one only finds out on the first event of the first
+        // graph to be spread across two of them, at the edge carrying its root stream.
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(Envelope.class)
+                .setImplementation(new EnvelopeSerializer()));
         RingbufferConfig rings = new RingbufferConfig("srs.*")
                 .setCapacity(SRS_RING_CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)

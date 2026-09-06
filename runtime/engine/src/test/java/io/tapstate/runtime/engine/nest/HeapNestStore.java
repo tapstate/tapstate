@@ -1,7 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
-import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A nest store that keeps everything on the heap of the member running the vertex - a test double, and
@@ -15,10 +15,24 @@ import java.util.Map;
  *
  * <p>What it is good for: driving a vertex whose subject is not durability, where a real store would add
  * a container and tell the case nothing.
+ *
+ * <p><b>Concurrent because it is shared, not because any case asked for it.</b> One of these stands behind
+ * a namespace several vertices reach, and each vertex runs a processor per unit of parallelism on a thread
+ * of its own, so these entries are written and read from several threads at once. Partitioning makes every
+ * key one processor's alone, so no two threads ever touch the same entry - and that is not what an
+ * unsynchronised map loses. What it loses is a write to a key nobody else was touching, because another
+ * thread was growing the same table at that moment: measured with four writers on keys of their own,
+ * entries written and then read back absent, up to a quarter of them in one run.
+ *
+ * <p><b>What that cost, and why a plain map here is worse than useless.</b> The store this stands in for
+ * is a distributed map, where those writes cannot collide, so a lost one is a red that the product has no
+ * way of producing. One such loss made a lookup file a row while the registration naming it was gone,
+ * so the row read as one nobody points at, no word of its arrival was sent, and the document waiting for
+ * it waited for ever - the job running, nothing thrown, every other document correct.
  */
 public final class HeapNestStore<S> implements NestStore<S> {
 
-    private final Map<Object, S> entries = new LinkedHashMap<>();
+    private final Map<Object, S> entries = new ConcurrentHashMap<>();
 
     @Override
     public S load(Object key) {

@@ -174,13 +174,13 @@ case "$MODE" in
       exit 1
     fi
 
-    if [ -n "$msgs" ] && printf '%s' "$msgs" | grep -qEi "$pattern"; then
+    if [ -n "$msgs" ] && grep -qEi "$pattern" <<<"$msgs"; then
       echo "::error::agent footer found in commit message(s):"
       printf '%s' "$msgs" | grep -Ei "$pattern" || true
       fail=1
     fi
 
-    if [ -n "${PR_BODY:-}" ] && printf '%s' "$PR_BODY" | grep -qEi "$pattern"; then
+    if [ -n "${PR_BODY:-}" ] && grep -qEi "$pattern" <<<"$PR_BODY"; then
       echo "::error::agent footer found in the PR body."
       fail=1
     fi

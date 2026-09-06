@@ -217,6 +217,7 @@ class NestSendsAChangeTheBoundHasPassedRatherThanFoldingItTest {
                 new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))));
 
         Vertex sink = dag.newVertex("sink", SinkProcessor.metaSupplier(
+                "sink",
                 (SupplierEx<SinkWriter>) TakesEverything::new,
                 (SinkAckFactory) resolved ->
                         (SinkAck) NestSendsAChangeTheBoundHasPassedRatherThanFoldingItTest::record,

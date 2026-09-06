@@ -78,18 +78,34 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     }
 
     /**
-     * The keys of {@code keys} that the store has, asked for one at a time. It is only ever called with
-     * keys the map already named, so it stays per-key work and never becomes a scan.
+     * The keys of {@code keys} that the store has, asked for in one reach. It is only ever called with keys
+     * the map already named, so it stays work over named keys and never becomes a scan.
+     *
+     * <p><b>One trip, and counted as one.</b> This used to ask the store per key, which made a batch read
+     * cost as many trips as it had keys while every count above here still said one reach - the shape a
+     * batch that has quietly become a loop always has. Measured on the two paths that use it, a batch of
+     * forty identities cost forty trips and a wake-up reading sixty-four buckets cost twenty-nine.
+     *
+     * <p>The keys are carried both ways: the store is asked with the names the keys render to, and what
+     * comes back is put under the key objects the caller passed, because that is what the map above files
+     * entries by.
      */
     @Override
     public Map<Object, Object> loadAll(Collection<Object> keys) {
-        Map<Object, Object> loaded = new LinkedHashMap<>();
-        for (Object key : keys) {
-            Object state = load(key);
-            if (state != null) {
-                loaded.put(key, state);
-            }
+        if (keys.isEmpty()) {
+            return Map.of();
         }
+        Map<String, Object> byName = new LinkedHashMap<>();
+        for (Object key : keys) {
+            byName.put(NestStateKeys.nameOf(key), key);
+        }
+        long began = System.nanoTime();
+        Map<String, byte[]> found = store.loadAll(namespace, byName.keySet());
+        if (stats != null) {
+            stats.backfill(namespace, System.nanoTime() - began);
+        }
+        Map<Object, Object> loaded = new LinkedHashMap<>();
+        found.forEach((name, state) -> loaded.put(byName.get(name), fromBytes(state)));
         return loaded;
     }
 

@@ -37,6 +37,55 @@ class MapTransformTest {
         return out.after();
     }
 
+    /**
+     * That a removal declared upstream survives this projection.
+     *
+     * <p><b>A projection rebuilds the row, and rebuilding it is where a removal declared before it gets
+     * lost.</b> What travels beside a row is the set of fields the producer said the row no longer has -
+     * the only way a target ever hears that a field went, because a row that stopped carrying a field and
+     * one that never had it are the same row. A step that builds a fresh row and does not carry that set
+     * forward silently withdraws the statement: the target keeps the old value, and the pipeline that
+     * shows it is one with an extra step in the middle, which is the last place anyone would look.
+     *
+     * <p><b>This does not make a dropped field into a removal, and must not.</b> Dropping a field here
+     * means it is not carried onward, not that a target should delete what it already holds. The set is
+     * passed through exactly as received - never added to.
+     */
+    @Test
+    @DisplayName("a removal declared upstream is still declared after the projection")
+    void aRemovalDeclaredUpstreamSurvivesTheProjection() {
+        Envelope in = new Envelope(Op.INSERT, 1L, "orders", null,
+                Map.of("id", 1, "name", "Ada"), null)
+                .withRemoved(java.util.Set.of("customer"));
+
+        Envelope out = map(fields("id", FieldRule.rename("id"))).transform(in).get(0);
+
+        assertThat(out.removed())
+                .describedAs("the upstream step said this field is gone; a projection that forgets it "
+                        + "leaves the target holding the old value, with every row that arrives correct")
+                .containsExactly("customer");
+    }
+
+    /**
+     * That dropping a field here does not turn into an instruction to delete it in the target.
+     *
+     * <p>Dropping means the field is not carried onward. Whether a target should also lose what it
+     * already holds is a different promise, and this port does not make it.
+     */
+    @Test
+    @DisplayName("dropping a field does not declare it removed")
+    void droppingAFieldIsNotARemoval() {
+        Envelope in = new Envelope(Op.INSERT, 1L, "orders", null,
+                Map.of("id", 1, "ssn", "123"), null);
+
+        Envelope out = map(fields("ssn", FieldRule.drop())).transform(in).get(0);
+
+        assertThat(afterOf(out)).doesNotContainKey("ssn");
+        assertThat(out.removed())
+                .describedAs("dropping is 'not carried onward', not 'delete it where it already is'")
+                .isEmpty();
+    }
+
     @Test
     @DisplayName("renames a source field and consumes it from the passthrough")
     void renamesAndConsumesSource() {

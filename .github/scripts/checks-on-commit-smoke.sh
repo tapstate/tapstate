@@ -267,10 +267,23 @@ pulls "$head_sha"
 trees deadbeef 0ther777
 expect "a head carrying a different tree does not answer"        3 "different tree" --sha "$sha" --required build,dco
 expect "and it names the head it declined to read"               3 "$head_sha" --sha "$sha" --required build,dco
+# Stating the fault without stating the repair is what made this cost a release run to work out. The
+# wrong repair is the expensive one and it looks right: release an older commit that IS answered.
+# That fails later, in the gate that waits for a lane which takes a ref and can never be dispatched
+# at a bare commit -- so the message has to rule it out by name, not merely omit it.
+expect "and it says to merge an up-to-date pull request"         3 "up to date" --sha "$sha" --required build,dco
+expect "and it rules out releasing an older commit instead"      3 "Releasing an older commit" --sha "$sha" --required build,dco
 # The two refusals must not read alike. "was not dispatched" is a statement about a lane that never
 # started; this one is about an answer that exists and is about different code, and the repair is
 # not the same -- one is re-run something, the other is release a different commit.
 refute "and it is not called a check that was not dispatched"      "was not dispatched" --sha "$sha" --required build,dco
+
+# Only when this is the cause. A lane that was never dispatched has a different repair, and offering
+# this one there would send the reader to merge a pull request that changes nothing about it.
+reset
+runs $'build\tcompleted\tsuccess'
+pulls ""
+refute "the remedy is not offered when nothing was dispatched"     "up to date" --sha "$sha" --required build,dco
 
 reset
 runs $'build\tcompleted\tsuccess'

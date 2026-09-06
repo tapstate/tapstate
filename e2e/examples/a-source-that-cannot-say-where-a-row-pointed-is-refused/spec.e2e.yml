@@ -1,0 +1,63 @@
+# An order carries the customer it points at, and is then re-pointed at another one by a source that
+# cannot say which customer it pointed at before. The run is refused, by name.
+#
+# This is the second embed direction: the parent row holds the child's identity, so one customer row is
+# kept once and an index records which orders name it. That index is what wakes every document holding
+# a customer when the customer changes, and it only comes back down when a re-pointed order can be
+# taken out of what it left - which needs the row the update replaces.
+#
+# What discriminates, and why it is the run's state rather than a document:
+#
+# - No document can show this. The re-pointed order renders from the customer it now names and is
+#   correct whether or not the entry it left came out; the customer it walked away from is still filed
+#   and still renders for anyone else. An implementation that recorded the order against every customer
+#   it had ever pointed at would satisfy every assertion anyone could write about the documents here.
+#
+# - What the leak costs arrives much later and looks like a different fault: every edit to the customer
+#   left behind redraws a document that no longer names it, and the count of orders pointing at one
+#   customer only ever rises, so a pipeline whose real fan-out is well inside the limit is one day
+#   failed on a number that was never real. Waiting for that here would mean driving that limit, which
+#   is not something a specification can set.
+#
+# - So the assertion is the refusal itself, and failure_code rather than merely FAILED: a run that fell
+#   over for any other reason - the source unreachable, the store refusing, the embed direction read
+#   the wrong way round - is also FAILED and carries a code that is not this one.
+#
+# The first await is the control. It holds the document to the customer it started with, so a run where
+# the pipeline never assembled anything cannot be mistaken for one that assembled and then refused the
+# update. Without it, a run that failed before a single document was drawn would satisfy everything
+# below.
+#
+# `before_image: none` on the orders table is the whole setup. A seeded table is arranged to send the
+# whole previous row, which is what every other example needs and what no source does by default; this
+# one puts that table back to what PostgreSQL does on its own - the key columns of the old row and
+# nothing else - which is the ordinary deployment this is about rather than a broken one. The customers
+# table is left as it is: it is the side being pointed at, and nothing about it is in question.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: a-source-that-cannot-say-where-a-row-pointed-is-refused
+setup:
+  databases:
+    src: { kind: postgres }
+    store: { kind: mongo }
+  connectors: [postgres, mongodb]
+  apply: [src_point_orders.tap.yml, src_point_customers.tap.yml, views.tap.yml, pipeline.tap.yml]
+  discover: [src_point_orders, src_point_customers]
+pipeline: pipeline.tap.yml
+seed:
+  src_point_customers.point_customers:
+    values:
+      - { id: 100, name: ada }
+      - { id: 200, name: grace }
+  src_point_orders.point_orders:
+    before_image: none
+    values:
+      - { id: 1, cust_ref: 100 }
+steps:
+  - start
+  - await: { doc: { views.point_state: { where: { id: 1 }, expect: { customer.id: 100, customer.name: ada } } } }
+  - cdc: { src_point_orders.point_orders: { update: { where: { id: 1 }, set: { cust_ref: 200 } } } }
+  - await: { state: FAILED }
+  - assert: { failure_code: nest.reference-tracking-requires-before-image }
+  - assert: { count: { views.point_state: 1 } }

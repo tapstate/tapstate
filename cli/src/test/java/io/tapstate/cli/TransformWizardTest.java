@@ -4,6 +4,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -144,7 +145,7 @@ class TransformWizardTest {
                 "addr_shape", "nest",
                 "customer", "",                       // root: from, no key
                 "embed",
-                "address", "CUST_ID", "id", "",       // address: from, on, end on
+                "address", "CUST_ID", "id", "", // address: from, on, end on
                 "object", "address",                  // as object, path (no arrayKey asked)
                 "(done)",                             // address has no children
                 "(done)");                            // root has no more children

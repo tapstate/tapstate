@@ -75,6 +75,13 @@ final class MapPort implements TransformPort {
                 out.put(field, value);
             }
         });
-        return List.of(new Envelope(event.op(), event.ts(), event.src(), event.before(), out, event.schema()));
+        // Carried through, not added to. What travels beside a row is the set of fields an earlier step
+        // said the row no longer has, and it is the only way a target ever hears that one went - so a
+        // projection that rebuilds the row and forgets it silently withdraws the statement, leaving the
+        // target on the old value with every row that arrives still correct. Dropping a field here is a
+        // different thing and deliberately adds nothing: it means the field is not carried onward, never
+        // that a target should delete what it already holds.
+        return List.of(new Envelope(event.op(), event.ts(), event.src(), event.before(), out,
+                event.schema()).withRemoved(event.removed()));
     }
 }

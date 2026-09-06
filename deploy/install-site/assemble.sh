@@ -20,7 +20,17 @@ mkdir -p "$out"
 cp "$repo/deploy/quickstart/quickstart.sh" "$out/quickstart.sh"
 cp "$repo/install/install.sh"              "$out/install.sh"
 cp "$here/vercel.json"                     "$out/vercel.json"
+# The event receiver. It is a function, not content: it adds a route (/e) and touches neither of the
+# two script routes, which is what keeps the byte-for-byte promise intact by construction rather than
+# by care. Tests are not deployed.
+mkdir -p "$out/api"
+cp "$here/api/event.js"                    "$out/api/event.js"
+
+# The same gate the release path runs. Assembling by hand and deploying that is a real path, and it
+# must not be the one where a function with no route slips through.
+"$here/check-site.sh" "$out" >/dev/null
 
 echo "assembled into $out:"
 echo "  /     <- deploy/quickstart/quickstart.sh"
 echo "  /cli  <- install/install.sh"
+echo "  /e    <- deploy/install-site/api/event.js (install event receiver)"

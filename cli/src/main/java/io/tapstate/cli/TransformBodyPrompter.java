@@ -112,7 +112,7 @@ final class TransformBodyPrompter {
         List<String> arrayKey = as == EmbedAs.ARRAY
                 ? askKeyList("Array key (comma-separated, blank for none)")
                 : null;
-        return new Embed(from, on, as, path, arrayKey, null, null, askEmbeds());
+        return new Embed(from, on, as, path, null, arrayKey, null, null, askEmbeds());
     }
 
     /** The child-to-parent join field map; a blank child field ends the list. */

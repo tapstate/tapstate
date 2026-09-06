@@ -44,7 +44,7 @@ import org.junit.jupiter.api.Test;
  * Its name keeps it out of the default surefire selection, so it costs a build nothing and is run
  * deliberately:
  *
- * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestStateAccessCostBench -DfailIfNoTests=false}</pre>
+ * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestStateAccessCostBench -Dsurefire.failIfNoSpecifiedTests=false}</pre>
  */
 class NestStateAccessCostBench {
 
@@ -114,6 +114,8 @@ class NestStateAccessCostBench {
             report(size, "changed-in-place", changedInPlace(size));
             report(size, "carried-in-place", carriedInPlace(size));
             report(size, "read-out-of-object", readOutOfObject(size));
+            report(size, "object-put-back", objectPutBack(size));
+            report(size, "object-carry-back", objectCarryBack(size));
         }
     }
 
@@ -206,6 +208,60 @@ class NestStateAccessCostBench {
         long start = System.nanoTime();
         for (int i = 0; i < RUNS; i++) {
             map.get(key);
+        }
+        return new Sample(System.nanoTime() - start, CountedState.WRITES.get(), CountedState.READS.get());
+    }
+
+    /**
+     * The pair a level actually performs, on the format the state maps actually run: read the state out of
+     * an object map, change it, and put it back. The row below is the same pair with the write carried by a
+     * processor instead, and the two together are the only comparison of the two ways of writing that says
+     * anything - a carried write measured on its own leaves out the read that always precedes it, and the
+     * pair measured on the binary map above is measuring a carrier this operator does not use.
+     */
+    private Sample objectPutBack(int size) {
+        IMap<String, CountedState> map = member.getMap(IN_PLACE_MAP);
+        map.clear();
+        String key = "root";
+        map.set(key, new CountedState(size));
+
+        for (int i = 0; i < WARMUP; i++) {
+            CountedState state = map.get(key);
+            state.change();
+            map.set(key, state);
+        }
+
+        CountedState.WRITES.set(0);
+        CountedState.READS.set(0);
+        long start = System.nanoTime();
+        for (int i = 0; i < RUNS; i++) {
+            CountedState state = map.get(key);
+            state.change();
+            map.set(key, state);
+        }
+        return new Sample(System.nanoTime() - start, CountedState.WRITES.get(), CountedState.READS.get());
+    }
+
+    /** The same pair on the same format, with the write carried to the key rather than put across the map. */
+    private Sample objectCarryBack(int size) {
+        IMap<String, CountedState> map = member.getMap(IN_PLACE_MAP);
+        map.clear();
+        String key = "root";
+        map.set(key, new CountedState(size));
+
+        for (int i = 0; i < WARMUP; i++) {
+            CountedState state = map.get(key);
+            state.change();
+            map.executeOnKey(key, new CarryInPlace(state));
+        }
+
+        CountedState.WRITES.set(0);
+        CountedState.READS.set(0);
+        long start = System.nanoTime();
+        for (int i = 0; i < RUNS; i++) {
+            CountedState state = map.get(key);
+            state.change();
+            map.executeOnKey(key, new CarryInPlace(state));
         }
         return new Sample(System.nanoTime() - start, CountedState.WRITES.get(), CountedState.READS.get());
     }

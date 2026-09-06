@@ -44,8 +44,15 @@
           "description": "Target field path under the parent where the embedded child is placed.",
           "type": "string"
         },
+        "key": {
+          "description": "Fields that identify one row of this embed's stream. Absent means the stream's own declared key is used, and a stream that declares none is refused.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "arrayKey": {
-          "description": "Fields that uniquely identify an element within an embedded array.",
+          "description": "Fields that tell one element apart from the others in the same array, which may be unique only within that array. Absent means the row identity above is used.",
           "type": "array",
           "items": {
             "type": "string"

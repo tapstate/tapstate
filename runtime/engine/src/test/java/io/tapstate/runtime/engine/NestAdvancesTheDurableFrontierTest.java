@@ -215,14 +215,14 @@ class NestAdvancesTheDurableFrontierTest {
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
                 new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))));
 
-        Vertex sink = dag.newVertex("sink", SinkProcessor.metaSupplier(
+        Vertex sink = dag.newVertex("sink", SinkProcessor.metaSupplier("sink",
                 (SupplierEx<SinkWriter>) TakesEverything::new,
                 (SinkAckFactory) resolved -> (SinkAck) NestAdvancesTheDurableFrontierTest::record,
                 () -> new SettledFloor(AXES, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)));
         dag.edge(Edge.from(assembled, outbound.merge(assembled, 1, Integer::sum) - 1)
                 .to(sink, 0).distributed());
         // Named so the run's statistics can be read back the way the read face reads them - by pipeline.
-        job = member.getJet().newJob(dag, new JobConfig().setName("nest-frontier"));
+        job = JetJobs.submit(member, dag, "nest-frontier");
     }
 
     /** One row a source emits, with the order the engine would have stamped on it. */

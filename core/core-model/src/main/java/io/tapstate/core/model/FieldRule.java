@@ -34,7 +34,18 @@ public sealed interface FieldRule {
         }
     }
 
-    /** {@code output: false} — remove the field. */
+    /**
+     * {@code output: false} — the field is not carried onward from this step.
+     *
+     * <p><b>It says nothing about what a target already holds.</b> Rows written from here on do not carry
+     * the field, so a target populated from them never gains it; a target that already has a value for it,
+     * written before this rule existed or by something else, keeps that value. Clearing what is already
+     * there is a separate act and this is not it.
+     *
+     * <p>Worth stating because the other reading is the natural one, and it is wrong in a way nothing
+     * reports: a rule added to stop sending a field leaves whatever was sent before exactly where it is,
+     * beside fields that go on updating normally.
+     */
     @YamlForm(YamlForm.Form.FALSE)
     record Drop() implements FieldRule {
     }

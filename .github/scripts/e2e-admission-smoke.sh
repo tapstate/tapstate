@@ -40,7 +40,7 @@ expect() {
   local out code
   out="$(BASE_REF=main PR_LABELS="$labels" bash "$gate" 2>&1)"
   code=$?
-  if [ "$code" = "$want_code" ] && printf '%s' "$out" | grep -qF "$want_text"; then
+  if [ "$code" = "$want_code" ] && grep -qF "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"
     passed=$((passed + 1))
   else

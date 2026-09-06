@@ -44,6 +44,13 @@ concurrency:
   group: quickstart-live-${{ github.ref }}
   cancel-in-progress: true
 
+# This lane pipes the published installer, so it completes real installs on every run. Their events
+# would land in the funnel's one denominator as installs no person performed. Pointed at a port
+# nothing listens on, the send is refused instantly and the installer swallows it -- the same path a
+# user with no network takes.
+env:
+  TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e
+
 jobs:
   quickstart-live:
     # Two legs over one set of steps. They differ in exactly one variable -- where the server comes from --

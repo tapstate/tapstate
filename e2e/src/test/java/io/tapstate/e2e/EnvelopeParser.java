@@ -105,9 +105,30 @@ public final class EnvelopeParser {
                         (alias, spec) -> {
                             Map<String, Object> entry = mapping(spec, "seed." + alias);
                             rejectUnknownKeys(entry.keySet(), Vocabulary.SEED_KEYS, "seed." + alias);
-                            seeds.add(new Seed(alias(alias), seedRows(entry, "seed." + alias)));
+                            seeds.add(new Seed(alias(alias), seedRows(entry, "seed." + alias),
+                                    beforeImages(entry, "seed." + alias)));
                         });
         return seeds;
+    }
+
+    /**
+     * Whether this table's source sends the row an update replaces. Spelled as the two states a store
+     * is actually in rather than as a boolean: {@code full} is what a seeded table is arranged for and
+     * needs no writing down, and {@code none} is the case asking for the other one.
+     */
+    private static boolean beforeImages(Map<String, Object> entry, String at) {
+        Object node = entry.get("before_image");
+        if (node == null) {
+            return true;
+        }
+        if ("full".equals(node)) {
+            return true;
+        }
+        if ("none".equals(node)) {
+            return false;
+        }
+        throw new EnvelopeException(
+                at + ".before_image is '" + node + "'; a source either sends 'full' images or 'none'");
     }
 
     /**

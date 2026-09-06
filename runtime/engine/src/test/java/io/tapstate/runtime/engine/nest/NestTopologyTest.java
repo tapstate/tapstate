@@ -51,6 +51,73 @@ class NestTopologyTest {
         return NestTopology.compile(PIPELINE, NODE, branchingTree(), tables());
     }
 
+    /**
+     * The whole compiled shape of a tree with no reference in it, written out and compared word for word.
+     *
+     * <p><b>Every part of this is asserted somewhere below, and that is not the same thing.</b> The cases
+     * below each pick a property and check it holds; between them they cannot notice a property nobody
+     * thought to pick, and the carrier all these trees share has since been changed to make room for a
+     * second direction. What that change must not have done is move anything here - and the part of it
+     * that would be worst to move is the quietest: a namespace renamed reads as a tree that compiles fine,
+     * runs fine, and cannot find a word of the state a previous run left, which is a fault that only
+     * happens on an upgrade and looks like an empty first run.
+     *
+     * <p>Written as one block rather than a file beside the test, because a block is read in the diff of
+     * the change that moves it - which is the only moment anyone should be deciding whether it may move.
+     */
+    @Test
+    void theShapeATreeWithNoReferenceCompilesToIsWordForWordWhatItWas() {
+        assertThat(describe(compiled()))
+                .describedAs("a line moved here is a change to state the running system files under these "
+                        + "names. If it is deliberate, the change that moves it says which name moved and "
+                        + "what happens to entries already written under the old one")
+                .isEqualTo("""
+                        vertex nest:assemble:policies.claims \
+                        map nest.orders_to_docs.assemble.policies.claims \
+                        path [policies, claims] key [claim_id] parentKey [policy_id]
+                          in 0 claim [policies, claims] key [claim_id] element [claim_id]
+                          in 1 document [policies, claims, documents] key [claim_id] element [document_id]
+                        vertex nest:assemble:policies map nest.orders_to_docs.assemble.policies \
+                        path [policies] key [policy_id] parentKey [customer_id]
+                          in 0 policy [policies] key [policy_id] element [policy_no]
+                          in 1 <cascade> [policies, claims] key [] element []
+                        vertex nest:assemble:orders map nest.orders_to_docs.assemble.orders \
+                        path [orders] key [order_id] parentKey [customer_id]
+                          in 0 order [orders] key [order_id] element [order_id]
+                          in 1 item [orders, items] key [order_id] element [item_id]
+                        vertex nest:assemble map nest.orders_to_docs.assemble.$root \
+                        path [] key [customer_id] parentKey []
+                          in 0 customer [] key [customer_id] element []
+                          in 1 <cascade> [policies] key [] element []
+                          in 2 <cascade> [orders] key [] element []
+                          in 3 profile [profile] key [customer_id] element [customer_id]
+                        statePaths [$root, policies.claims.documents, policies.claims, policies, \
+                        orders.items, orders, profile]""");
+    }
+
+    /** The compiled tree as text: one line per vertex, one indented line per edge, in compiled order. */
+    private static String describe(NestTopology topology) {
+        StringBuilder out = new StringBuilder();
+        for (NestVertex vertex : topology.vertices()) {
+            out.append("vertex ").append(vertex.name())
+                    .append(" map ").append(vertex.mapName())
+                    .append(" path ").append(vertex.pathId())
+                    .append(" key ").append(vertex.partitionKey())
+                    .append(" parentKey ").append(vertex.parentKeyFields())
+                    .append('\n');
+            for (NestInbound edge : vertex.inbound()) {
+                out.append("  in ").append(edge.ordinal())
+                        .append(' ').append(edge.alias() == null ? "<cascade>" : edge.alias())
+                        .append(' ').append(edge.pathId())
+                        .append(" key ").append(edge.keyFields())
+                        .append(" element ").append(edge.elementKey())
+                        .append('\n');
+            }
+        }
+        out.append("statePaths ").append(topology.statePaths());
+        return out.toString();
+    }
+
     @Test
     void buildsOneResolverPerNonLeafEmbedAndOneAssembler() {
         NestTopology topology = compiled();
