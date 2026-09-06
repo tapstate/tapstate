@@ -277,3 +277,15 @@ test('a streamed body past the bound is refused while streaming, not after', asy
   assert.equal(res.code, 415);
   assert.equal(yielded, 1, 'it kept reading after the bound was already exceeded');
 });
+
+// A platform that fails to parse and leaves an empty object behind is indistinguishable from one
+// handed an empty body -- so an empty object is not taken as the body. Without this, a valid event
+// would be refused without the request ever being read, which is the shape that shipped.
+test('an empty parsed body is not taken as the event; the request is read instead', async () => {
+  await withToken(async () => {
+    globalThis.fetch = async () => ({ ok: true, status: 201 });
+    const res = fakeRes();
+    await handler(streamReq(JSON.stringify(nowEvent()), { body: {} }), res);
+    assert.equal(res.code, 204, 'req.body was {} and the real event was in the stream');
+  });
+});

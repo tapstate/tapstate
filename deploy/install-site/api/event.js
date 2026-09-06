@@ -146,7 +146,12 @@ function defaultSleep(ms) {
 // the difference observable from outside: "the validator rejected this" and "the body never arrived"
 // were the same 400, which is why the deployment probe passed while nothing worked.
 async function readBody(req) {
-  if (req.body && typeof req.body === 'object') return req.body;
+  // An object WITH FIELDS is a parse that succeeded. An empty one is not evidence of anything: a
+  // platform that failed to parse and set {} looks identical to one that was handed {}, and treating
+  // it as the body would refuse a real event without ever reading the request. Falling through costs
+  // nothing when the body really was empty -- the stream is empty too, and the answer is 415 either
+  // way.
+  if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) return req.body;
 
   let raw = typeof req.body === 'string' ? req.body : null;
   if (raw === null) {
