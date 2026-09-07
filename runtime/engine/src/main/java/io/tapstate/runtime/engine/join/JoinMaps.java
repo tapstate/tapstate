@@ -48,10 +48,23 @@ public final class JoinMaps {
     public static final String NAMESPACE_PREFIX = "join.";
 
     /**
-     * How many entries one member holds of one join map before it starts evicting to the layer behind
-     * it. Provisional, and deliberately the same order as the nest default: the budget counts entries
-     * rather than bytes, and a reverse-index page and a mirrored row are not the same size - which is
-     * exactly why the index is paged, so that an entry stays within an order of magnitude of any other.
+     * How many entries of one join map a member keeps in memory, per record store, before it starts
+     * evicting to the layer behind it. Provisional, and deliberately the same order as the nest default:
+     * the budget counts entries rather than bytes, and a reverse-index page and a mirrored row are not
+     * the same size - which is exactly why the index is paged, so that an entry stays within an order of
+     * magnitude of any other.
+     *
+     * <p><b>Per record store, and a member has two of them for one map, so it holds close to twice this
+     * number.</b> The budget governs the primaries a member owns and, separately, the replicas it keeps
+     * for other members - and these maps do keep a replica, unlike the nest ones. This used to read "how
+     * many entries one member holds", which is true only while there is one member: measured on clusters
+     * of two, three and four, over a dimension ten times the budget, a member held about 3 950 of its own
+     * and about 3 950 more as backup, at every one of those member counts. Size a member's heap from
+     * twice this figure per join map it runs.
+     *
+     * <p><b>Nor is it exactly this number.</b> It is divided over the partitions and the per-partition
+     * share is a whole number, so what a member holds is that share times the partitions it owns: about
+     * 3 794 when alone, rising towards this figure as members are added and the rounding loss shrinks.
      */
     public static final long DEFAULT_ENTRIES_HELD_IN_MEMORY = 4_000;
 
