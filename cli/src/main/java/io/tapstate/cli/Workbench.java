@@ -8,6 +8,7 @@ import dev.tamboui.tui.TuiConfig;
 import dev.tamboui.tui.TuiRunner;
 import dev.tamboui.tui.event.Event;
 import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.MouseEvent;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 
@@ -71,13 +72,13 @@ final class Workbench {
         render(frame, WorkbenchState.initial());
     }
 
-    private static void render(Frame frame, WorkbenchState state) {
+    private static TabBar render(Frame frame, WorkbenchState state) {
         Rect area = frame.area();
         if (area.width() < MIN_WIDTH || area.height() < MIN_HEIGHT) {
             renderTooSmall(frame, area);
-            return;
+            return null;
         }
-        renderShell(frame, area, state);
+        return renderShell(frame, area, state);
     }
 
     private static void renderTooSmall(Frame frame, Rect area) {
@@ -93,18 +94,19 @@ final class Workbench {
         writeCentered(frame, area, startY + 4, minimum, Style.EMPTY);
     }
 
-    private static void renderShell(Frame frame, Rect area, WorkbenchState state) {
+    private static TabBar renderShell(Frame frame, Rect area, WorkbenchState state) {
         frame.buffer().setString(area.x(), area.y(), "Tapstate workbench", Style.EMPTY.bold());
-        renderTabs(frame, area, state.selectedTab());
+        TabBar tabBar = renderTabs(frame, area, state.selectedTab());
         renderActiveTab(frame, area, state.selectedTab());
         frame.buffer().setString(area.x(), area.y() + area.height() - 1,
                 "1 overview  2 pipelines  3 sources  Left/Right switch  q quit", Style.EMPTY.dim());
+        return tabBar;
     }
 
-    private static void renderTabs(Frame frame, Rect area, WorkbenchState.WorkbenchTab selected) {
+    private static TabBar renderTabs(Frame frame, Rect area, WorkbenchState.WorkbenchTab selected) {
         int x = area.x();
         for (WorkbenchState.WorkbenchTab tab : WorkbenchState.WorkbenchTab.values()) {
-            String label = tab.shortcut() + " " + tab.label();
+            String label = tab.displayLabel();
             Style style = tab == selected ? Style.EMPTY.bold().reversed() : Style.EMPTY.dim();
             frame.buffer().setString(x, area.y() + 1, label, style);
             x += label.length();
@@ -113,6 +115,7 @@ final class Workbench {
                 x += 3;
             }
         }
+        return new TabBar(area.x(), area.y() + 1);
     }
 
     private static void renderActiveTab(Frame frame, Rect area, WorkbenchState.WorkbenchTab selected) {
@@ -138,19 +141,57 @@ final class Workbench {
         }
     }
 
+    /** The tab bar hit map from the most recently rendered frame. */
+    private record TabBar(int x, int y) {
+
+        private WorkbenchState.WorkbenchTab clickedTab(MouseEvent mouse) {
+            if (!mouse.isClick() || mouse.y() != y) {
+                return null;
+            }
+            int offset = mouse.x() - x;
+            if (offset < 0) {
+                return null;
+            }
+            for (WorkbenchState.WorkbenchTab tab : WorkbenchState.WorkbenchTab.values()) {
+                int labelWidth = tab.displayLabel().length();
+                if (offset < labelWidth) {
+                    return tab;
+                }
+                offset -= labelWidth;
+                if (tab != WorkbenchState.WorkbenchTab.SOURCES) {
+                    if (offset < 3) {
+                        return null;
+                    }
+                    offset -= 3;
+                }
+            }
+            return null;
+        }
+    }
+
     /** The sole mutable holder for input-derived state during one runner lifecycle. */
     private static final class Session {
         private WorkbenchState state = WorkbenchState.initial();
+        private TabBar tabBar;
 
         private boolean handleEvent(Event event, TuiRunner runner) {
-            if (!(event instanceof KeyEvent key)) {
-                return false;
+            if (event instanceof KeyEvent key) {
+                if (key.isCharIgnoreCase('q') || key.isCtrlC()) {
+                    runner.quit();
+                    return true;
+                }
+                return updateState(state.reduce(key));
             }
-            if (key.isCharIgnoreCase('q') || key.isCtrlC()) {
-                runner.quit();
-                return true;
+            if (event instanceof MouseEvent mouse && tabBar != null) {
+                WorkbenchState.WorkbenchTab clicked = tabBar.clickedTab(mouse);
+                if (clicked != null) {
+                    return updateState(state.select(clicked));
+                }
             }
-            WorkbenchState next = state.reduce(key);
+            return false;
+        }
+
+        private boolean updateState(WorkbenchState next) {
             if (next == state) {
                 return false;
             }
@@ -159,7 +200,7 @@ final class Workbench {
         }
 
         private void render(Frame frame) {
-            Workbench.render(frame, state);
+            tabBar = Workbench.render(frame, state);
         }
     }
 }

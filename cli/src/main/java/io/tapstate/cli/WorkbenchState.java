@@ -14,6 +14,10 @@ record WorkbenchState(WorkbenchTab selectedTab) {
         return next == selectedTab ? this : new WorkbenchState(next);
     }
 
+    WorkbenchState select(WorkbenchTab tab) {
+        return tab == selectedTab ? this : new WorkbenchState(tab);
+    }
+
     private WorkbenchTab switchTab(KeyEvent key) {
         if (key.isChar('1')) {
             return WorkbenchTab.OVERVIEW;
@@ -63,6 +67,10 @@ record WorkbenchState(WorkbenchTab selectedTab) {
 
         String emptyMessage() {
             return emptyMessage;
+        }
+
+        String displayLabel() {
+            return shortcut + " " + label;
         }
 
         WorkbenchTab previous() {
