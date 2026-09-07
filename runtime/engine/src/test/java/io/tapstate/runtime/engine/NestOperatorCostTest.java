@@ -99,9 +99,10 @@ import org.junit.jupiter.api.Test;
  *
  * <ul>
  *   <li><b>Exact.</b> What one event costs where the operator does not fold: the two touches of a state
- *       that is read out and written back, the one write behind it, the one document out. Also the trips
- *       a batch of references turns into, which is fixed by how many distinct rows were asked for and by
- *       nothing else - not by how many documents asked.</li>
+ *       that is read out and written back, the one read behind the map that a key reached for the first
+ *       time costs, the one write behind it, the one document out. Also the trips a batch of references
+ *       turns into, which is fixed by how many distinct rows were asked for and by nothing else - not by
+ *       how many documents asked.</li>
  *   <li><b>A ratio, because the absolute number floats.</b> Where rows fold into one drain, how many
  *       drains a phase happens to take moves every absolute count with it (measured across reruns of one
  *       unchanged tree: 404/202/201 one round, 400/200/200 the next). What does not move is the cost of
@@ -217,7 +218,7 @@ class NestOperatorCostTest {
                 .describedAs("a root arriving is a document; %d arrived and %d came out",
                         ROOTS, arrivals.emitted())
                 .isEqualTo(ROOTS);
-        assertOneRowPerEvent(arrivals, root, 2);
+        assertOneRowPerEvent(arrivals, root, 1);
         assertFoldedIntoDrains(children, root);
     }
 
@@ -246,7 +247,7 @@ class NestOperatorCostTest {
         print("1:1 phase 1 - a root row arriving where nothing was held for it", arrivals);
         print("1:1 phase 2 - a single row gathered into an object under a root already there", children);
         assertMeasured(children);
-        assertOneRowPerEvent(arrivals, root, 2);
+        assertOneRowPerEvent(arrivals, root, 1);
         // Nothing folds here - one row per root - so this phase is asserted as an unfolded cost, and the
         // root it lands under is resident from the phase before, which is what makes the cold reads zero.
         assertOneRowPerEvent(children, root, 0);
@@ -293,7 +294,7 @@ class NestOperatorCostTest {
                         + "cold numbers below are about a path nothing walked")
                 .isPositive();
 
-        assertOneRowPerEvent(report, root, 2);
+        assertOneRowPerEvent(report, root, 1);
         // The reading this whole shape exists to pin. A pointed-at row is fetched once because it is one
         // row, not once per document that points at it: REFERENCED_ROWS rows were asked for by ROOTS
         // documents, and it is the first number that decides the trips. Were it the second, every reading
@@ -437,7 +438,7 @@ class NestOperatorCostTest {
         assertMeasured(report);
         // The level's own cost, held to the same price as any other level holding one row per event. The
         // parking asks below are counted apart from it, and a total over the two would let either drift.
-        assertOneRowPerEvent(report, level, 2);
+        assertOneRowPerEvent(report, level, 1);
 
         Counters parked = report.namespaces().get(parking);
         assertThat(parked.accesses())
@@ -536,10 +537,13 @@ class NestOperatorCostTest {
      * over all of them: a shape that costs more is a shape whose carrier grew a touch nobody asked for.
      *
      * @param coldReadsPerEvent what the same event costs behind the map, which is a different question
-     *     with a different answer per phase. A key reached for the first time is asked for and then
-     *     written to, and both go behind a map that has nothing for it; a key already resident costs
-     *     none. So this is a parameter rather than a constant, and passing the wrong one is caught by
-     *     the run rather than by review.
+     *     with a different answer per phase. A key reached for the first time costs one - the read that
+     *     finds nothing there - and a key already resident costs none. The write that follows the read
+     *     used to be a second one: a write is carried to its key, an entry processor is handed the
+     *     current entry, so a key that is not resident was fetched from behind the map for a value the
+     *     processor overwrites without reading. Told by the read that the key holds nothing, the store
+     *     puts the state across the map instead and fetches nothing. So this is a parameter rather than
+     *     a constant, and passing the wrong one is caught by the run rather than by review.
      */
     private static void assertOneRowPerEvent(Report report, String namespace, long coldReadsPerEvent) {
         long events = report.events();

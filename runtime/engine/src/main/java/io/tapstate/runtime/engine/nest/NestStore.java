@@ -46,6 +46,23 @@ public interface NestStore<S> extends Serializable {
     void save(Object key, S state);
 
     /**
+     * The same write, told that a read has just answered that this key holds nothing.
+     *
+     * <p><b>The two forms store the same thing and may be used interchangeably.</b> Both replace whatever
+     * is under the key, so nothing about what is held afterwards depends on which was called. What the
+     * extra word buys is a carrier: a write onto a key holding nothing has no previous value for anything
+     * to be handed, and saying so lets an implementation with a layer behind it stop fetching one that is
+     * not there and would not be read. Being wrong about it costs a copy or a trip, never a value - which
+     * is what makes it a hint a caller may pass on rather than a claim anything has to check.
+     *
+     * <p>Ignored by default, which is right wherever a write cannot cost a fetch: a store on the same heap
+     * has nothing behind it to fetch from, so the distinction has nowhere to show up.
+     */
+    default void save(Object key, S state, boolean nothingHeldThere) {
+        save(key, state);
+    }
+
+    /**
      * Adds {@code element} to the set held under {@code key}, creating the entry if there is none. Only a
      * namespace whose entries are sets is ever asked this, which is why it is expressed over {@code S}
      * rather than parameterised again - the one that is, is the record of which rows point at another.
