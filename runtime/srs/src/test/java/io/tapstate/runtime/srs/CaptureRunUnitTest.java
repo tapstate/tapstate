@@ -331,6 +331,41 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A pipeline new to a chain begins its tail at the seam its own load sampled, not at the one the
+     * chain was created at.
+     *
+     * <p>The same reckoning as the load above, one field over. A recorded seam says where the snapshot
+     * that recorded it began, and that snapshot belongs to one pipeline. A pipeline new to the chain has
+     * a seam of its own, sampled by its own bounded read moments ago, while the recorded one may be days
+     * old -- and a source keeps its change log for a window and refuses a start from before it. Handed
+     * the chain's, every join to a chain older than that window fails; and where a source answers such a
+     * start with an empty stream instead of a refusal, the pipeline comes up healthy, reports running and
+     * delivers nothing, which is the same shape as a source that has no changes for it.
+     *
+     * <p>Reaching back to the chain's birth buys a joiner nothing either. What a chain shares is the
+     * mining; the initial load is not part of that, so the joiner reads the source in full for itself and
+     * every change before its own seam is already covered by that read.
+     */
+    @Test
+    void aPipelineNewToAChainBeginsItsTailAtItsOwnSeamNotTheOneTheChainWasCreatedAt() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-chain-began-at");
+        CaptureRun firstRun = runUnit(first, meta)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { });
+        String chainId = firstRun.chainId().orElseThrow().value();
+        // Stands in for pipe-a's sink confirming the table -- the only thing that ever marks one done.
+        meta.markSnapshotComplete(chainId, "pipe-a", "orders");
+
+        FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-joiner-began-at");
+        runUnit(joiner, meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { });
+
+        assertThat(joiner.cdcStart)
+                .as("the joiner's tail begins where its own load began, not where the chain did")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-joiner-began-at")));
+    }
+
+    /**
      * A pipeline told to re-read everything does, on a chain another pipeline is still using -- and the
      * other one is not made to re-read anything.
      *
@@ -768,6 +803,8 @@ class CaptureRunUnitTest {
     private static final class FakeSource implements CapturePort {
         private final List<Envelope> snapshotRows;
         private final List<Envelope> changes;
+        /** The position this source samples before its bounded read -- where a tail of it must join. */
+        private final String seam;
         private Throwable cdcError;
         boolean cdcStarted;
         /** Where the run asked this source to begin -- the whole of what a resume is observable as. */
@@ -775,8 +812,14 @@ class CaptureRunUnitTest {
         boolean cdcClosed;
 
         FakeSource(List<Envelope> snapshotRows, List<Envelope> changes) {
+            this(snapshotRows, changes, "seam-0");
+        }
+
+        /** A source whose bounded read samples a named seam, so two runs of one chain can differ in it. */
+        FakeSource(List<Envelope> snapshotRows, List<Envelope> changes, String seam) {
             this.snapshotRows = snapshotRows;
             this.changes = changes;
+            this.seam = seam;
         }
 
         /** Makes this source's cdc stream report a failure through the listener rather than deliver changes. */
@@ -792,7 +835,7 @@ class CaptureRunUnitTest {
             // that ignored the selection would answer each of those reads with the whole source.
             List<String> selected = config.streams();
             return new FakeBatch(selected.isEmpty() ? snapshotRows
-                    : snapshotRows.stream().filter(row -> selected.contains(row.src())).toList());
+                    : snapshotRows.stream().filter(row -> selected.contains(row.src())).toList(), seam);
         }
 
         @Override
@@ -823,9 +866,11 @@ class CaptureRunUnitTest {
     /** A bounded snapshot batch over a fixed list of events. */
     private static final class FakeBatch implements CaptureBatch {
         private final Iterator<Envelope> events;
+        private final String seam;
 
-        FakeBatch(List<Envelope> events) {
+        FakeBatch(List<Envelope> events, String seam) {
             this.events = events.iterator();
+            this.seam = seam;
         }
 
         @Override
@@ -843,7 +888,7 @@ class CaptureRunUnitTest {
             // The source sampled this before reading its first row; the run under test refuses to start a
             // tail without one, because a tail that begins wherever it likes loses every change made while
             // the snapshot ran.
-            return Optional.of(new SourcePosition("seam-0"));
+            return Optional.of(new SourcePosition(seam));
         }
 
         @Override

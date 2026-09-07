@@ -130,6 +130,11 @@ public final class CaptureRunUnit {
             }
 
             long snapshotCount = 0;
+            // The seam this run's own load began at, for the tail that follows it -- null when no load ran
+            // here. Carried from the phase rather than read back off the chain, because the chain records
+            // one seam for however many pipelines load from it: read back, a pipeline new to the chain
+            // gets whichever load reached the record first and starts its tail where that one began.
+            String ownSeam = null;
             Map<String, Long> snapshotCounts = new LinkedHashMap<>();
             // Which tables a resuming run still owes is asked once, by the snapshot phase, of this
             // pipeline's own record on the chain -- so it survives the process that answered it last, and a
@@ -145,10 +150,14 @@ public final class CaptureRunUnit {
                 };
                 // A chainless read has no ring and so no generation to order its rows against: they carry no
                 // order at all, which a stateful node downstream rejects rather than guesses at.
-                snapshotCount = chainId != null
-                        ? SnapshotPhase.run(port, spec.config(), chainId.value(), spec.pipelineId(),
-                                tables, epoch, meta, snapshotPassthrough)
-                        : SnapshotPhase.drain(port, spec.config(), snapshotPassthrough);
+                if (chainId != null) {
+                    SnapshotPhase.Outcome loaded = SnapshotPhase.run(port, spec.config(), chainId.value(),
+                            spec.pipelineId(), tables, epoch, meta, snapshotPassthrough);
+                    snapshotCount = loaded.rows();
+                    ownSeam = loaded.tailSeam();
+                } else {
+                    snapshotCount = SnapshotPhase.drain(port, spec.config(), snapshotPassthrough);
+                }
             }
 
             CaptureHealth health = new CaptureHealth();
@@ -183,7 +192,7 @@ public final class CaptureRunUnit {
                     LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
                     routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
                 }
-                CaptureStart minerStart = tailStart(meta, cid, CaptureStart.present());
+                CaptureStart minerStart = tailStart(meta, cid, ownSeam, CaptureStart.present());
                 refuseAnInstantThisBufferWillNeverReach(
                         spec.startFrom(), minerStart, spec.retention());
                 subscription = Optional.of(CdcPhase.run(
@@ -215,7 +224,7 @@ public final class CaptureRunUnit {
                 AtomicLong forwarded = new AtomicLong();
                 AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
                 subscription = Optional.of(port.cdc(
-                        spec.config(), tailStart(meta, directChain, sourceStart(spec.startFrom())),
+                        spec.config(), tailStart(meta, directChain, ownSeam, sourceStart(spec.startFrom())),
                         health.recording((events, position) -> forwardDirect(
                                 events, position, directChain, directEpoch, forwarded,
                                 directConsumers, directLastWritten, passthrough))));
@@ -328,22 +337,35 @@ public final class CaptureRunUnit {
     /**
      * Where this chain's tail begins, read back from the durable record rather than assumed.
      *
-     * <p>Three states, in this order, and the order is the whole of it:
+     * <p>Four states, in this order, and the order is the whole of it:
      *
      * <ol>
+     *   <li>a load that just ran here — {@code ownSnapshotSeam} is where it began, and the tail has to
+     *       cover every change since, or a row this load read and the source then changed is left at the
+     *       value the load saw;</li>
      *   <li>a recorded read offset — the tail ran before and got this far, so it picks up there;</li>
      *   <li>no read offset but a recorded seam — the snapshot ran and the tail has not advanced past
      *       where the snapshot began, so it starts at the seam and the idempotent sink absorbs the
      *       overlap;</li>
-     *   <li>neither — nothing has read this chain, so {@code firstRun} decides: the start the
+     *   <li>none of those — nothing has read this chain, so {@code firstRun} decides: the start the
      *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
      *
-     * <p>Taking the present in any of the first two states is the silent loss this exists to prevent: the
-     * tail comes up healthy, and every change between where it had reached and now is simply gone.
+     * <p>This run's own seam outranks the recorded read offset, and the order matters in exactly one
+     * shape: a chain someone else is already mining. That offset moves as they mine, so by the time this
+     * run's load finishes it can name a point later than the seam this load began at — and starting there
+     * skips the changes in between. They are in the shared ring, mined by whoever is already on the
+     * chain, but this run's own reader enters that ring at its own cursor and never looks behind it.
+     * Starting at the earlier of the two only ever costs an overlap the idempotent sink absorbs.
+     *
+     * <p>Taking the present in any of the first three states is the silent loss this exists to prevent:
+     * the tail comes up healthy, and every change between where it had reached and now is simply gone.
      */
     private static CaptureStart tailStart(
-            SrsMetaStore meta, String miningChainId, CaptureStart firstRun) {
+            SrsMetaStore meta, String miningChainId, String ownSnapshotSeam, CaptureStart firstRun) {
+        if (ownSnapshotSeam != null) {
+            return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
+        }
         return meta.read(miningChainId)
                 .map(record -> {
                     if (record.sourceReadOffset() != null) {

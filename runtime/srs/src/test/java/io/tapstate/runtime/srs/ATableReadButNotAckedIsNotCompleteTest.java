@@ -62,7 +62,8 @@ class ATableReadButNotAckedIsNotCompleteTest {
         ReadBackMeta meta = new ReadBackMeta();
         RereadablePort port = new RereadablePort(List.of(row(1), row(2)), "binlog.000042:1024");
 
-        long first = SnapshotPhase.run(port, config(), CHAIN, PIPE, List.of("orders"), 1L, meta, e -> { });
+        long first = SnapshotPhase.run(
+                port, config(), CHAIN, PIPE, List.of("orders"), 1L, meta, e -> { }).rows();
 
         // The read finished: every row of the table went downstream, and the batch reported its seam.
         assertThat(first).isEqualTo(2);
@@ -73,10 +74,17 @@ class ATableReadButNotAckedIsNotCompleteTest {
                 .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.list(String.class))
                 .isEmpty();
 
+        // Standing in for the sink again: it took some of those rows, which is what puts a record of this
+        // pipeline on the chain. Taking rows is not confirming the table -- the table stays owed -- but it
+        // is what makes the recorded snapshot one this pipeline started, so the rerun resumes it rather
+        // than beginning one of its own.
+        meta.upsertConsumerOffset(CHAIN, new ConsumerOffset(PIPE, Map.of(), null, List.of()));
+
         // A restart: the durable record survives, the ring it ran under does not, so a new generation is
         // opened. The table is owed, so the run is a resume and keeps the generation its rows were pinned
         // to rather than taking the one running now.
-        long second = SnapshotPhase.run(port, config(), CHAIN, PIPE, List.of("orders"), 2L, meta, e -> { });
+        long second = SnapshotPhase.run(
+                port, config(), CHAIN, PIPE, List.of("orders"), 2L, meta, e -> { }).rows();
 
         // The whole of what this case is for: a table read and never written is read again. A run that
         // skipped it here would drop every row of it that has not changed since -- silently, and for good.
@@ -96,7 +104,8 @@ class ATableReadButNotAckedIsNotCompleteTest {
         // act, made where the frontier reaches that table's rows.
         meta.markSnapshotComplete(CHAIN, PIPE, "orders");
 
-        long second = SnapshotPhase.run(port, config(), CHAIN, PIPE, List.of("orders"), 2L, meta, e -> { });
+        long second = SnapshotPhase.run(
+                port, config(), CHAIN, PIPE, List.of("orders"), 2L, meta, e -> { }).rows();
 
         // Not redoing the load is the whole of what resuming means. Without this half, a phase that never
         // resumed anything would pass the case above.
@@ -263,7 +272,16 @@ class ATableReadButNotAckedIsNotCompleteTest {
 
         @Override
         public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
-            throw new UnsupportedOperationException();
+            SrsMeta m = of(miningChainId);
+            List<ConsumerOffset> consumers = new ArrayList<>();
+            for (ConsumerOffset consumer : m.consumerOffsets()) {
+                if (!consumer.pipelineId().equals(offset.pipelineId())) {
+                    consumers.add(consumer);
+                }
+            }
+            consumers.add(offset);
+            records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
+                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
         }
 
         @Override

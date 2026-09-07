@@ -69,7 +69,7 @@ class SnapshotPhaseTest {
 
         long count = SnapshotPhase.run(
                 port, config(), "chain", PIPE, List.of("orders"),
-                1L, new RecordingMeta(new ArrayList<>()), sink::add);
+                1L, new RecordingMeta(new ArrayList<>()), sink::add).rows();
 
         // Straight through in batch order, each row stamped with the generation and otherwise untouched.
         assertThat(sink).containsExactlyElementsOf(
@@ -182,7 +182,12 @@ class SnapshotPhaseTest {
     void aSnapshotThatNeverDrainedKeepsItsGenerationWhenItRerunsUnderANewRing() {
         // The chain recorded a seam under generation 1 and this table never finished draining, so the ring
         // that is running now is a rebuild -- generation 2. The rerun's rows must stay on generation 1.
-        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null, 2L, 1L);
+        // This pipeline has a record of its own on the chain, which is what makes the recorded snapshot
+        // one it started: the seam and the generation on a chain belong to whichever pipeline recorded
+        // them, and every pipeline on a chain loads a target of its own.
+        SrsMeta interrupted = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of())),
+                "binlog.000042:1024", List.of(), null, 2L, 1L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
         List<Envelope> sink = new ArrayList<>();
 
@@ -201,7 +206,9 @@ class SnapshotPhaseTest {
     void aSnapshotThatNeverDrainedResumesFromTheSeamItRecordedRatherThanTheOneSampledNow() {
         // The same interruption as above, but the source has moved on: the batch this rerun opens samples
         // a later seam than the one the interrupted run recorded.
-        SrsMeta interrupted = new SrsMeta("chain", null, List.of(), "binlog.000042:1024", List.of(), null, 2L, 1L);
+        SrsMeta interrupted = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of())),
+                "binlog.000042:1024", List.of(), null, 2L, 1L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
 
         SnapshotPhase.run(
@@ -218,6 +225,34 @@ class SnapshotPhaseTest {
     }
 
     @Test
+    void aPipelineNewToTheChainLoadsBehindItsOwnSeamAndLeavesTheRecordedOneAlone() {
+        // pipe-a recorded this seam under generation 1 and finished its load. The source has moved on
+        // since: the batch pipe-b opens samples a much later seam. pipe-b has no record of its own on the
+        // chain, so nothing written here is a snapshot it began.
+        SrsMeta anothersLoad = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset("pipe-a", Map.of(), null, List.of("orders"))),
+                "binlog.000042:1024", List.of(), null, 2L, 1L);
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>(), anothersLoad);
+        List<Envelope> sink = new ArrayList<>();
+
+        SnapshotPhase.Outcome outcome = SnapshotPhase.run(
+                new FakePort(new FakeBatch(List.of(row(1)), "binlog.000099:1")), config(), "chain", "pipe-b",
+                List.of("orders"), 2L, meta, sink::add);
+
+        // The tail pipe-b starts joins where pipe-b's own load began. Taking the recorded seam instead is a
+        // start from whenever the chain was created, and a source keeps its change log for a window: once
+        // that window has rolled past, the join is refused outright -- or, where the source answers with an
+        // empty stream rather than a refusal, comes up healthy and delivers nothing at all.
+        assertThat(outcome.tailSeam()).isEqualTo("binlog.000099:1");
+        // pipe-b's rows belong to the generation running now, not to the one pipe-a's load was pinned to.
+        assertThat(sink).extracting(event -> event.position().order())
+                .containsOnly(SourceOrder.snapshotRow(2L));
+        // And pipe-a's seam is left where pipe-a put it. Moving it forward would push where pipe-a's own
+        // tail resumes over the span between the two, which nothing else covers.
+        assertThat(meta.cdcStart).isNull();
+    }
+
+    @Test
     void readsNothingWhenEverySelectedTableIsAlreadyRecordedAsWritten() {
         // Same recorded seam, and the one selected table is recorded as written.
         SrsMeta written = new SrsMeta("chain", null,
@@ -227,7 +262,8 @@ class SnapshotPhaseTest {
         FakePort port = new FakePort(new FakeBatch(List.of(row(1)), "binlog.000099:1"));
         List<Envelope> sink = new ArrayList<>();
 
-        long count = SnapshotPhase.run(port, config(), "chain", PIPE, List.of("orders"), 2L, meta, sink::add);
+        long count = SnapshotPhase.run(
+                port, config(), "chain", PIPE, List.of("orders"), 2L, meta, sink::add).rows();
 
         // Nothing is owed, so nothing is read and nothing is written down -- not even a seam. Reading the
         // table again here would be a re-mine, and a re-mine is not something a resume decides to do on its
@@ -372,7 +408,7 @@ class SnapshotPhaseTest {
         List<Envelope> sink = new ArrayList<>();
 
         long count = SnapshotPhase.run(port, multiTableConfig(), "chain", PIPE,
-                List.of("orders", "customers"), 2L, meta, sink::add);
+                List.of("orders", "customers"), 2L, meta, sink::add).rows();
 
         // Not redoing the load is the whole of what resuming means: a table already written is not read
         // again. What the one still owed emits is pinned to the generation the snapshot began in rather
