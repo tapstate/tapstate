@@ -1,6 +1,9 @@
 package io.tapstate.cli;
 
 import dev.tamboui.backend.jline3.JLineBackend;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Style;
+import dev.tamboui.terminal.Frame;
 import dev.tamboui.tui.TuiConfig;
 import dev.tamboui.tui.TuiRunner;
 import dev.tamboui.tui.event.Event;
@@ -18,6 +21,9 @@ import java.util.Map;
  */
 final class Workbench {
 
+    private static final int MIN_WIDTH = 88;
+    private static final int MIN_HEIGHT = 24;
+
     private Workbench() {
     }
 
@@ -33,9 +39,7 @@ final class Workbench {
             }
             try (TuiRunner runner = createRunner(terminal)) {
                 terminal = null;
-                runner.run(Workbench::handleEvent, frame -> {
-                    // The initial lifecycle shell owns only terminal setup and input exit semantics.
-                });
+                runner.run(Workbench::handleEvent, Workbench::render);
                 return Cli.EXIT_OK;
             }
         } catch (Exception ignored) {
@@ -67,6 +71,40 @@ final class Workbench {
             return true;
         }
         return false;
+    }
+
+    /** Renders from the runner-owned frame so resize changes take effect without a second terminal owner. */
+    static void render(Frame frame) {
+        Rect area = frame.area();
+        if (area.width() < MIN_WIDTH || area.height() < MIN_HEIGHT) {
+            renderTooSmall(frame, area);
+            return;
+        }
+        renderShell(frame, area);
+    }
+
+    private static void renderTooSmall(Frame frame, Rect area) {
+        String title = "Terminal size too small:";
+        String actual = "Width = " + area.width() + "  Height = " + area.height();
+        String needed = "Needed for current config:";
+        String minimum = "Width = " + MIN_WIDTH + "  Height = " + MIN_HEIGHT;
+        int startY = area.y() + Math.max(0, (area.height() - 5) / 2);
+
+        writeCentered(frame, area, startY, title, Style.EMPTY.bold());
+        writeCentered(frame, area, startY + 1, actual, Style.EMPTY);
+        writeCentered(frame, area, startY + 3, needed, Style.EMPTY.bold());
+        writeCentered(frame, area, startY + 4, minimum, Style.EMPTY);
+    }
+
+    private static void renderShell(Frame frame, Rect area) {
+        frame.buffer().setString(area.x(), area.y(), "Tapstate workbench", Style.EMPTY.bold());
+        frame.buffer().setString(area.x(), area.y() + 1, "Overview | Pipelines | Sources", Style.EMPTY);
+        frame.buffer().setString(area.x(), area.y() + area.height() - 1, "q quit", Style.EMPTY.dim());
+    }
+
+    private static void writeCentered(Frame frame, Rect area, int y, String text, Style style) {
+        int x = area.x() + Math.max(0, (area.width() - text.length()) / 2);
+        frame.buffer().setString(x, y, text, style);
     }
 
     private static void closeQuietly(Terminal terminal) {

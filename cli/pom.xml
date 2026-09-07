@@ -2,13 +2,14 @@
 <!--
   cli — the surface ring: Tapstate's offline CLI product front-end.
 
-  Dual-mode: bare `tapstate` opens an offline REPL; one-shot subcommands share the same verb
+  Dual-mode: bare `tapstate` opens the full-screen workbench; one-shot subcommands share the same verb
   table for scripting / AI. Offline verbs are a whitelist (validate / new / explain); server
   verbs are registered too but report "requires a connection" rather than going missing.
 
   Ring rule R6: the CLI talks to services over HTTP only. Its dependency surface is allowlisted
   (bannedDependencies, the coarse twin of the arch-tests R6 rule): the named core-ring modules,
-  the framework-free control HTTP client, picocli (command framework), and jline (REPL line reader).
+  the framework-free control HTTP client, picocli (command framework), JLine (terminal backend), and
+  TamboUI (full-screen runner).
   Product control services and runtime implementations remain forbidden. Every allowed artifact is
   listed explicitly, so a new dependency fails the build until its boundary is deliberately reviewed.
 -->
