@@ -199,14 +199,17 @@ public final class JoinDriver {
                 continue;
             }
             Envelope event = change.event();
-            boolean reads = (event.after() == null) != (event.before() == null);
-            if (!reads) {
-                // Both images means the change carries its own previous; neither says nothing at all.
-                continue;
-            }
             // Not factKeyOf: a row with a null in its own key is refused where it is absorbed, and
             // refusing it here instead would move the failure to before anything in the batch ran.
-            String key = keyOf(event.after() != null ? event.after() : event.before(), factKeyColumns);
+            // The before image names the row wherever it carries the key columns - which is the whole
+            // of what some connectors publish - and the after image names it otherwise. A change
+            // carrying both images is asked for too: it carries its own key but not necessarily the
+            // rest of itself, so the mirror is still read for it, and being read here is what keeps
+            // that one trip rather than one per row.
+            String key = event.before() == null ? null : keyOf(event.before(), factKeyColumns);
+            if (key == null && event.after() != null) {
+                key = keyOf(event.after(), factKeyColumns);
+            }
             if (key != null) {
                 asked.add(key);
             }
@@ -294,16 +297,31 @@ public final class JoinDriver {
             return;
         }
         String key = factKeyOf(after);
-        Map<String, Object> previous = before != null ? before : mirrored(key);
-        if (previous != null) {
-            String previousKey = factKeyOf(previous);
-            if (!previousKey.equals(key)) {
-                // The row's own identity moved, so what was published under the old one is a different
-                // row and nothing else will ever remove it.
-                queueRow(previous, event.ts(), true);
-                forget(previousKey, previous);
-                previous = null;
-            }
+        // Which row this was comes from the before image; what that row held comes from the mirror.
+        // The two are separate because a before image is not required to carry the whole row: postgres
+        // publishes the key columns alone under its default REPLICA IDENTITY, and a change stream with
+        // no pre-image configured publishes an empty map. Reading the rest of the row out of one of
+        // those reads every column it omits as null - so the dimension key it used to point at reads
+        // as "none", no old index entry is ever removed, and a new one is appended on every edit for
+        // ever. The delete path above draws the same line for the same reason.
+        String previousKey = before == null ? key : keyOf(before, factKeyColumns);
+        if (previousKey == null) {
+            // A before image with nothing in its key names no row of its own, so this change is about
+            // the row the after image names and the mirror under that key is what it used to be.
+            previousKey = key;
+        }
+        Map<String, Object> previous = mirrored(previousKey);
+        if (previous == null) {
+            // Nothing mirrored: either this key has not been seen or the mirror lost it, and the
+            // before image is then the only account of the row there is.
+            previous = before;
+        }
+        if (previous != null && !previousKey.equals(key)) {
+            // The row's own identity moved, so what was published under the old one is a different
+            // row and nothing else will ever remove it.
+            queueRow(previous, event.ts(), true);
+            forget(previousKey, previous);
+            previous = null;
         }
         for (Dimension dimension : dimensions) {
             String was = previous == null ? null : dimensionKeyIn(previous, dimension);
