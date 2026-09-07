@@ -39,7 +39,8 @@ final class Workbench {
             }
             try (TuiRunner runner = createRunner(terminal)) {
                 terminal = null;
-                runner.run(Workbench::handleEvent, Workbench::render);
+                Session workbench = new Session();
+                runner.run(workbench::handleEvent, workbench::render);
                 return Cli.EXIT_OK;
             }
         } catch (Exception ignored) {
@@ -65,22 +66,18 @@ final class Workbench {
                 .build());
     }
 
-    private static boolean handleEvent(Event event, TuiRunner runner) {
-        if (event instanceof KeyEvent key && (key.isCharIgnoreCase('q') || key.isCtrlC())) {
-            runner.quit();
-            return true;
-        }
-        return false;
-    }
-
     /** Renders from the runner-owned frame so resize changes take effect without a second terminal owner. */
     static void render(Frame frame) {
+        render(frame, WorkbenchState.initial());
+    }
+
+    private static void render(Frame frame, WorkbenchState state) {
         Rect area = frame.area();
         if (area.width() < MIN_WIDTH || area.height() < MIN_HEIGHT) {
             renderTooSmall(frame, area);
             return;
         }
-        renderShell(frame, area);
+        renderShell(frame, area, state);
     }
 
     private static void renderTooSmall(Frame frame, Rect area) {
@@ -96,10 +93,33 @@ final class Workbench {
         writeCentered(frame, area, startY + 4, minimum, Style.EMPTY);
     }
 
-    private static void renderShell(Frame frame, Rect area) {
+    private static void renderShell(Frame frame, Rect area, WorkbenchState state) {
         frame.buffer().setString(area.x(), area.y(), "Tapstate workbench", Style.EMPTY.bold());
-        frame.buffer().setString(area.x(), area.y() + 1, "Overview | Pipelines | Sources", Style.EMPTY);
-        frame.buffer().setString(area.x(), area.y() + area.height() - 1, "q quit", Style.EMPTY.dim());
+        renderTabs(frame, area, state.selectedTab());
+        renderActiveTab(frame, area, state.selectedTab());
+        frame.buffer().setString(area.x(), area.y() + area.height() - 1,
+                "1 overview  2 pipelines  3 sources  Left/Right switch  q quit", Style.EMPTY.dim());
+    }
+
+    private static void renderTabs(Frame frame, Rect area, WorkbenchState.WorkbenchTab selected) {
+        int x = area.x();
+        for (WorkbenchState.WorkbenchTab tab : WorkbenchState.WorkbenchTab.values()) {
+            String label = tab.shortcut() + " " + tab.label();
+            Style style = tab == selected ? Style.EMPTY.bold().reversed() : Style.EMPTY.dim();
+            frame.buffer().setString(x, area.y() + 1, label, style);
+            x += label.length();
+            if (tab != WorkbenchState.WorkbenchTab.SOURCES) {
+                frame.buffer().setString(x, area.y() + 1, " | ", Style.EMPTY.dim());
+                x += 3;
+            }
+        }
+    }
+
+    private static void renderActiveTab(Frame frame, Rect area, WorkbenchState.WorkbenchTab selected) {
+        frame.buffer().setString(area.x(), area.y() + 3, selected.label(), Style.EMPTY.bold());
+        frame.buffer().setString(area.x(), area.y() + 5, selected.emptyMessage(), Style.EMPTY);
+        frame.buffer().setString(area.x(), area.y() + 7,
+                "Refresh, selection, and data views will be connected by the workbench runtime.", Style.EMPTY.dim());
     }
 
     private static void writeCentered(Frame frame, Rect area, int y, String text, Style style) {
@@ -115,6 +135,31 @@ final class Workbench {
             terminal.close();
         } catch (Exception ignored) {
             // The original terminal initialization failure is the diagnosable outcome.
+        }
+    }
+
+    /** The sole mutable holder for input-derived state during one runner lifecycle. */
+    private static final class Session {
+        private WorkbenchState state = WorkbenchState.initial();
+
+        private boolean handleEvent(Event event, TuiRunner runner) {
+            if (!(event instanceof KeyEvent key)) {
+                return false;
+            }
+            if (key.isCharIgnoreCase('q') || key.isCtrlC()) {
+                runner.quit();
+                return true;
+            }
+            WorkbenchState next = state.reduce(key);
+            if (next == state) {
+                return false;
+            }
+            state = next;
+            return true;
+        }
+
+        private void render(Frame frame) {
+            Workbench.render(frame, state);
         }
     }
 }
