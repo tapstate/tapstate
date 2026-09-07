@@ -90,6 +90,15 @@
       <artifactId>assertj-core</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- The driver types a connector registers conversions for, so the value-model cases can build the
+         real ones. Whether such a type can cross a wire decides which lane its value takes, and that is
+         a property of the class itself - a stand-in would answer for the stand-in. Test scope: no
+         production code in this module names a driver type, and rule R3 keeps it that way. -->
+    <dependency>
+      <groupId>org.mongodb</groupId>
+      <artifactId>bson</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <profiles>
