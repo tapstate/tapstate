@@ -89,19 +89,29 @@ fallback_head=""
 fallback_runs=""
 fallback_declined=""
 fallback_tried=0
+# `gh api` writes the error body to stdout, not stderr, when a request fails, so a read taken
+# without its exit status hands back that document instead of the value asked for -- and it is
+# non-empty, which is the only thing the guards below test for. A failed read then walked past them
+# as if it were a sha, the trees were compared against a JSON document, and the refusal that came
+# out named that document as the head commit it had declined to read: a diagnosis nobody made,
+# printed at release time as the reason a release was refused. Every read in here is optional -- one
+# that cannot be answered means there is no fallback, never a value -- so they all go through this,
+# and a failed one comes back empty, which is what each caller already handles. The two reads above
+# are not optional and keep their own handling: they refuse, and print what the API said.
+api() { local out; out="$(gh api "$@" 2>/dev/null)" || return 1; printf '%s' "$out"; }
 resolve_fallback() {
   [ "$fallback_tried" = 0 ] || return 0
   fallback_tried=1
   local head tree head_tree
-  head="$(gh api "repos/${repo}/commits/${sha}/pulls" --jq '.[0].head.sha // empty' 2>/dev/null)"
+  head="$(api "repos/${repo}/commits/${sha}/pulls" --jq '.[0].head.sha // empty')"
   # Kept although no case witnesses it, and that is worth saying rather than leaving to be found:
   # the same input is caught downstream by the empty-runs check, so deleting this line reddens
   # nothing. It earns its place anyway -- an empty sha here would build `commits/`, which is the
   # list-commits endpoint and answers 200 with an array, and the only thing standing between that
   # and a borrowed answer would be jq failing to find a field in it.
   [ -n "$head" ] || return 0
-  tree="$(gh api "repos/${repo}/commits/${sha}" --jq '.commit.tree.sha // empty' 2>/dev/null)"
-  head_tree="$(gh api "repos/${repo}/commits/${head}" --jq '.commit.tree.sha // empty' 2>/dev/null)"
+  tree="$(api "repos/${repo}/commits/${sha}" --jq '.commit.tree.sha // empty')"
+  head_tree="$(api "repos/${repo}/commits/${head}" --jq '.commit.tree.sha // empty')"
   if [ -z "$tree" ] || [ "$tree" != "$head_tree" ]; then
     # Recorded rather than dropped. Refusing here is right, but it is a different refusal from a
     # lane that never started: the answer exists and is about different code, and what fixes it is
@@ -109,8 +119,8 @@ resolve_fallback() {
     fallback_declined="$head"
     return 0
   fi
-  fallback_runs="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" \
-      --jq '.check_runs[] | [.name, .status, .conclusion, .started_at] | @tsv' 2>/dev/null)"
+  fallback_runs="$(api --paginate "repos/${repo}/commits/${head}/check-runs" \
+      --jq '.check_runs[] | [.name, .status, .conclusion, .started_at] | @tsv')"
   [ -n "$fallback_runs" ] || return 0
   fallback_head="$head"
 }
