@@ -74,7 +74,7 @@ public final class MongoNestDeadLetterStore implements NestDeadLetterStore {
                 .append(HELD_FOR_MILLIS, record.heldForMillis())
                 .append(DISCARDED_AT, record.discardedAt());
         if (!record.deletion()) {
-            document.append(ROW, new Document(record.row()));
+            document.append(ROW, RowImages.toDocument(record.row()));
         }
         StoreIo.run(() -> collection.replaceOne(byId(record.namespace(), record.element()), document,
                 new ReplaceOptions().upsert(true)));
@@ -125,7 +125,7 @@ public final class MongoNestDeadLetterStore implements NestDeadLetterStore {
                 document.getString(ORDER),
                 document.getLong(HELD_FOR_MILLIS),
                 document.getLong(DISCARDED_AT),
-                row);
+                row == null ? null : RowImages.toRow(row));
     }
 
     private static Document byId(String namespace, String element) {

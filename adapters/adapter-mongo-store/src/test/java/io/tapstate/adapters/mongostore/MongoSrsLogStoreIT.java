@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.testsupport.RequiresDocker;
@@ -147,6 +148,24 @@ class MongoSrsLogStoreIT {
                     .as("a trim cuts the ring it names; reaching into the ring beside it would drop changes "
                             + "another table's consumers have not read")
                     .isPresent();
+        });
+    }
+
+    @Test
+    void aChangeWhoseValuesTheConnectorConvertedRoundTrips() {
+        withStore(store -> {
+            store.store(RING, 200L, new SrsLogRecord("bin.4:91827", Op.UPDATE, 42L, null,
+                    Map.of("_id", new ConvertedValue("650f1a2b3c4d5e6f70819200", "OBJECT_ID"),
+                            "amount", "12.50"),
+                    3L));
+
+            SrsLogRecord read = store.load(RING, 200L).orElseThrow();
+            assertThat(read.after())
+                    .as("a source whose key the connector converts carries one of these on every change, "
+                            + "so a log that cannot store one stores nothing at all -- and the server has "
+                            + "to accept the field names the encoding uses, which only a real one says")
+                    .containsEntry("_id", new ConvertedValue("650f1a2b3c4d5e6f70819200", "OBJECT_ID"))
+                    .containsEntry("amount", "12.50");
         });
     }
 

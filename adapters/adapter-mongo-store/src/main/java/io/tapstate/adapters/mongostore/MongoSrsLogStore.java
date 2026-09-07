@@ -13,7 +13,6 @@ import io.tapstate.spi.store.SrsLogStore;
 import org.bson.Document;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -137,10 +136,10 @@ public final class MongoSrsLogStore implements SrsLogStore {
             document.append("srcToken", record.srcToken());
         }
         if (record.before() != null) {
-            document.append("before", new Document(record.before()));
+            document.append("before", RowImages.toDocument(record.before()));
         }
         if (record.after() != null) {
-            document.append("after", new Document(record.after()));
+            document.append("after", RowImages.toDocument(record.after()));
         }
         return document;
     }
@@ -162,6 +161,6 @@ public final class MongoSrsLogStore implements SrsLogStore {
 
     private static Map<String, Object> rowImage(Document document, String field) {
         Document image = document.get(field, Document.class);
-        return image == null ? null : new LinkedHashMap<>(image);
+        return image == null ? null : RowImages.toRow(image);
     }
 }
