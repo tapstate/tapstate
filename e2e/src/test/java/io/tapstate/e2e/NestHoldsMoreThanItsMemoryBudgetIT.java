@@ -53,6 +53,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NestHoldsMoreThanItsMemoryBudgetIT {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(180);
+
+    /**
+     * How long the residency readings have to stand still before they are read as final. They climb as the
+     * run fills, and a number read on the way up is below any bound over it whether or not the budget was
+     * ever applied.
+     */
+    private static final Duration STILL = Duration.ofSeconds(8);
     private static final Duration POLL = Duration.ofMillis(250);
     private static final String PARENT_TABLE = "orders";
     private static final String CHILD_TABLE = "order_items";
@@ -184,8 +191,27 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
      * a run that lost data: nothing resident and nothing stored is a pipeline that assembled nothing.
      */
     private void assertOnlyTheBudgetIsHeldInMemory(ControlPlane control) {
-        long resident = control.metricTotal(pipelineId, "nestStateEntries.").orElse(0L);
-        long stored = control.metricTotal(pipelineId, "nestStateStored.").orElse(0L);
+        // Read once the two have stopped moving, not once. The metrics face publishes on its own cadence
+        // and these climb as the run fills, so a single read lands somewhere on the way up - and a number
+        // on the way up is under the bound below whether or not anything was ever evicted. Measured: read
+        // that way, one of the two tiers passed a run in which every entry was resident.
+        long[] settled = {-1L, -1L};
+        long[] unchangedSince = {System.nanoTime()};
+        Await.until("the state readings to stop moving for " + STILL, TIMEOUT,
+                () -> {
+                    long entries = control.metricTotal(pipelineId, "nestStateEntries.").orElse(0L);
+                    long behind = control.metricTotal(pipelineId, "nestStateStored.").orElse(0L);
+                    if (entries != settled[0] || behind != settled[1]) {
+                        settled[0] = entries;
+                        settled[1] = behind;
+                        unchangedSince[0] = System.nanoTime();
+                        return false;
+                    }
+                    return behind > 0 && System.nanoTime() - unchangedSince[0] >= STILL.toNanos();
+                },
+                () -> "resident " + settled[0] + ", behind the map " + settled[1]);
+        long resident = settled[0];
+        long stored = settled[1];
 
         assertThat(stored)
                 .describedAs("the layer behind the maps holds %d of the %d roots seeded. What is not "
@@ -201,6 +227,16 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
                         + "so what should be left is near it rather than all of them.%n  metrics: %s",
                         resident, ROOTS, MEMORY_BUDGET, control.metrics(pipelineId))
                 .isLessThanOrEqualTo(2L * MEMORY_BUDGET);
+        // The discriminating half the summed reader leaves to its caller, and it is not decoration: a name
+        // absent from the metrics answer reads as zero, so an upper bound alone is satisfied by a pipeline
+        // that published no reading at all. Measured, that is not hypothetical - it passed one of the two
+        // tiers under a run where every entry was resident.
+        assertThat(resident)
+                .describedAs("nothing at all is reported resident, which a nest holding %d roots under a "
+                        + "budget of %d cannot be: this is a reading that was never published rather than "
+                        + "a budget that was applied.%n  metrics: %s",
+                        ROOTS, MEMORY_BUDGET, control.metrics(pipelineId))
+                .isPositive();
     }
 
     private static List<Document> await(
