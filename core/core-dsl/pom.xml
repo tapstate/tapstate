@@ -46,6 +46,18 @@
       <artifactId>snakeyaml</artifactId>
     </dependency>
 
+    <!-- compile scope: the SQL front end, so a join's sql: is read and refused while the
+         artifact is being parsed rather than when a pipeline is assembled from it. The whole point
+         of that gate is that the shapes it refuses run silently wrong, so it has to sit in the
+         offline path, which is here. Only this module's narrow API is reachable: the SQL
+         library's own types stay banned in core-dsl by the fine-grained ring rule, which the
+         allowlist below cannot loosen. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-sql</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
     <!-- cel-java at compile scope: the validate layer (B4) compiles + type-checks §12 CEL
          expressions. It drags a transitive closure (guava / protobuf / antlr4 / re2j and their
          own deps); the whole closure is allowlisted to core-dsl ONLY in the enforcer below (R1). -->
@@ -107,6 +119,20 @@
                     <include>org.jspecify:jspecify</include>
                     <!-- date/time backport used by cel timestamp/duration -->
                     <include>org.threeten:threeten-extra</include>
+                    <!-- the SQL front end's closure, inherited through core-sql rather than
+                         declared here. It is repeated because this rule reads the resolved tree,
+                         not the declarations, so a transitive arrival is indistinguishable from a
+                         direct one to it. Kept identical to core-sql/pom.xml on purpose: an upgrade
+                         that drags in one of the artifacts excluded there (a runtime Java compiler,
+                         a JDBC pool, a geospatial stack) trips this gate here too. The types
+                         themselves remain out of reach, because the fine-grained R1 rule grants
+                         org.apache.calcite.. to core-sql alone and nothing in this pom widens it. -->
+                    <include>org.apache.calcite:calcite-core</include>
+                    <include>org.apache.calcite:calcite-linq4j</include>
+                    <include>org.apache.calcite.avatica:avatica-core</include>
+                    <include>org.apache.commons:commons-math3</include>
+                    <include>org.slf4j:slf4j-api</include>
+                    <include>org.checkerframework:checker-qual</include>
                   </includes>
                 </bannedDependencies>
               </rules>

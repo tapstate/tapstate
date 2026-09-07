@@ -1,0 +1,4 @@
+rule: join-sql-not-parsable
+adr: "ADR-0016 §5.2"
+path: transforms[0].sql
+note: "the sql: block does not parse; the parser's own diagnosis is carried through"

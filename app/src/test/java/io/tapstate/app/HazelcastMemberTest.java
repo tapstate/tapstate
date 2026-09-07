@@ -9,6 +9,7 @@ import com.hazelcast.config.MapStoreConfig;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -20,6 +21,7 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -351,6 +353,31 @@ class HazelcastMemberTest {
         }
         // The member's lifecycle is bound to the context: closing the context shuts it down.
         assertThat(member.getLifecycleService().isRunning()).isFalse();
+    }
+
+    /**
+     * The mirror of what {@code makeJoinCapable} is for, and a regression that would say nothing.
+     *
+     * <p>The substrate resolves a map's configuration by looking through the static configuration by
+     * pattern first and only then at what was added while the member ran. A {@code join.*} pattern left
+     * here therefore answers for every join namespace, and an exact configuration behind it is never
+     * reached - with nothing about the run saying which one was in force. The nest maps were moved out
+     * of here for exactly that; this holds the join maps to the same place before the same thing can
+     * happen to them.
+     *
+     * <p>It is not hypothetical: {@code JoinMaps.backedStateMaps(name, entries)} - the exact-name form -
+     * already exists, so the configuration that would be shadowed is one call away rather than a
+     * future design. A store is passed because that is the case that used to declare these statically;
+     * with none, there would be nothing to find either way and the case would pass vacuously.
+     */
+    @Test
+    @DisplayName("the static config declares no join state map, because a pattern here outranks an exact one added later")
+    void memberConfigDeclaresNoJoinStateMapPattern() {
+        Config config = HazelcastConfiguration.memberConfig(
+                new HazelcastProperties(), new InMemoryKeyedStateStore());
+
+        assertThat(config.getMapConfigs().keySet())
+                .noneMatch(name -> name.startsWith(JoinMaps.NAMESPACE_PREFIX));
     }
 
     /** A sentinel meta store: an identity to assert the user-context binding; its facets are never invoked here. */

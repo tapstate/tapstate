@@ -6,6 +6,7 @@ import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
@@ -29,6 +30,7 @@ final class InMemoryStorePort implements StorePort {
     private final InMemoryArtifactStore artifacts;
     private final InMemorySrsMetaStore meta = new InMemorySrsMetaStore();
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
+    private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
     private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
     private final InMemoryNestDeadLetterStore nestDeadLetters = new InMemoryNestDeadLetterStore();
 
@@ -63,6 +65,11 @@ final class InMemoryStorePort implements StorePort {
     @Override
     public SrsMetaStore meta() {
         return meta;
+    }
+
+    @Override
+    public DerivedSchemaStore derivedSchemas() {
+        return derivedSchemas;
     }
 
     @Override

@@ -100,7 +100,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "status", "metrics",
             "snapshot", "logs", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "token");
+            "connectors", "token", "derived-schema");
 
     private final CommandLine commandLine;
 
@@ -651,6 +651,12 @@ final class Repl {
         }
         if (words.get(0).equals("logs") && words.contains("--follow")) {
             return logsFollow(words);
+        }
+        // `derived-schema` carries `--accept`, the one act that moves what a start is held to, so it parses
+        // its own words rather than falling into the positional-only guard below, which would refuse the
+        // flag and leave the verb doing a plain read while reporting success.
+        if (words.get(0).equals("derived-schema")) {
+            return derivedSchemaOnline(words);
         }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
@@ -2946,6 +2952,76 @@ final class Repl {
             return null;
         }
         return words.get(1);
+    }
+
+    /**
+     * What a pipeline's join steps derive their output columns to be, three sides at a time, and — with
+     * {@code --accept} — the one act that takes today's answer as the shape to hold them to from here.
+     *
+     * <p>The accept is a flag on this verb rather than one on {@code start} deliberately. What makes the
+     * check worth having is the one moment a person looks at the difference and decides; a flag on the
+     * start is typed once and then lives in a script, which is the same as not checking.
+     */
+    private int derivedSchemaOnline(List<String> words) {
+        String id = readTargetId(words);
+        if (id == null) {
+            return Cli.EXIT_USAGE;
+        }
+        boolean accept = words.size() > 2 && "--accept".equals(words.get(2));
+        if (words.size() > 3 || (words.size() == 3 && !accept)) {
+            PrintWriter err = commandLine.getErr();
+            err.println("derived-schema: usage: derived-schema <pipeline-id> [--accept]");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        DerivedSchemaOutcome outcome = accept
+                ? withFailover(() -> controlPlane.acceptDerivedSchema(
+                        session.landingNode(), session.credential(), id),
+                        o -> o instanceof DerivedSchemaOutcome.Unreachable)
+                : withFailover(() -> controlPlane.derivedSchema(
+                        session.landingNode(), session.credential(), id),
+                        o -> o instanceof DerivedSchemaOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case DerivedSchemaOutcome.Found found -> {
+                if (found.steps().isEmpty()) {
+                    out.println("no derived columns");
+                } else {
+                    found.steps().forEach(step -> renderDerivedStep(out, step));
+                }
+                if (accept) {
+                    out.println("accepted: the columns above are what the next start is held to");
+                }
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case DerivedSchemaOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case DerivedSchemaOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /**
+     * One step's columns, three sides across: what was recorded, what is derived now, and what the
+     * target declares. An absent side prints as {@code -} rather than blank, so a column that is missing
+     * on one side cannot be misread as one whose value failed to render.
+     */
+    private static void renderDerivedStep(PrintWriter out, RemoteDerivedStep step) {
+        out.println(step.step() + "  ->  " + step.targetTable()
+                + (step.targetKnown() ? "" : "  (target columns unknown: nothing has discovered it)"));
+        out.println("  column                          recorded              derived               target");
+        step.columns().forEach(column -> out.println("  "
+                + pad(column.column(), 32) + pad(column.recorded(), 22)
+                + pad(column.derived(), 22) + cell(column.target())));
+    }
+
+    private static String pad(String value, int width) {
+        String cell = cell(value);
+        return cell.length() >= width ? cell + " " : cell + " ".repeat(width - cell.length());
+    }
+
+    /** An absent side, printed so that it reads as absent rather than as an empty value. */
+    private static String cell(String value) {
+        return value == null ? "-" : value;
     }
 
     /**

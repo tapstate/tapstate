@@ -1,0 +1,47 @@
+# How the join operator reaches its state, and what its full phase costs.
+# Regenerate with -Djoinperf.record=true; see JoinPerformanceGateTest.
+#
+# The ratios are recorded from a run of the join performance lane, on a runner, and not from a
+# developer machine. They do not transfer between the two and the counts do: measured on one run of
+# the whole matrix, all thirty-three rows of counts came back identical to what a laptop had recorded,
+# while the ratios came back between one and a half and nearly two times higher. The carrier arm is
+# held up by serialization and by trips to the layer behind memory and the heap arm is not, so a
+# machine that is slower at one and not the other moves the quotient rather than cancelling in it.
+# Recording here is what keeps the gate green where it runs: it only fails above what it recorded, so
+# a faster machine reads lower and passes, while the runner it guards is held to its own numbers.
+# Re-recording on a laptop puts every F row over its threshold on the next run.
+# ratio '-' means this row's cost is not held to a threshold, only its counts.
+# scenario	tier	batchReads	singleReads	keysRead	writes	ratio
+F1	cold	2	0	2000	6000	621.7
+F1	hot	2	0	2000	6000	699.4
+F1	mixed	2	0	2000	6000	550.6
+F2	cold	20	0	20000	42000	138.9
+F2	hot	20	0	20000	42000	100.4
+F2	mixed	20	0	20000	42000	100.3
+I1	cold	5	0	2500	5000	-
+I1	hot	5	0	2500	5000	-
+I1	mixed	5	0	2500	5000	-
+I2	cold	5	0	1665	4165	-
+I2	hot	5	0	1665	4165	-
+I2	mixed	5	0	1665	4165	-
+I3	cold	0	0	0	7500	-
+I3	hot	0	0	0	7500	-
+I3	mixed	0	0	0	7500	-
+I4	cold	5	0	2500	5000	-
+I4	hot	5	0	2500	5000	-
+I4	mixed	5	0	2500	5000	-
+R1	cold	5	0	50	5	-
+R1	hot	5	0	50	5	-
+R1	mixed	5	0	50	5	-
+R2	cold	2	0	10000	1	-
+R2	hot	2	0	10000	1	-
+R2	mixed	2	0	10000	1	-
+R3	cold	6	0	10050	5	-
+R3	hot	6	0	10050	5	-
+R3	mixed	6	0	10050	5	-
+R4	cold	2	0	10000	1	-
+R4	hot	2	0	10000	1	-
+R4	mixed	2	0	10000	1	-
+R5	cold	2	0	10000	6	-
+R5	hot	2	0	10000	6	-
+R5	mixed	2	0	10000	6	-

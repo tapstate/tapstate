@@ -220,6 +220,26 @@ interface ControlPlaneClient extends AutoCloseable {
     LogsOutcome logs(URI baseUrl, String credential, String pipelineId);
 
     /**
+     * Reads what a pipeline's join steps derive their output columns to be via
+     * {@code GET {baseUrl}/api/pipelines/{pipelineId}/derived-schema}, authenticated by the bearer
+     * {@code credential}: one report per derived step on success (empty for a pipeline with no join), a
+     * coded rejection when the server refuses, or unreachable on any I/O failure. Never throws.
+     */
+    default DerivedSchemaOutcome derivedSchema(URI baseUrl, String credential, String pipelineId) {
+        return new DerivedSchemaOutcome.Unreachable();
+    }
+
+    /**
+     * Records what a pipeline's join steps produce now as the shape to hold them to from here, via
+     * {@code POST {baseUrl}/api/pipelines/{pipelineId}:accept-derived-schema}, authenticated by the
+     * bearer {@code credential}: the report as it now stands on success, a coded rejection when the
+     * server refuses, or unreachable on any I/O failure. Never throws.
+     */
+    default DerivedSchemaOutcome acceptDerivedSchema(URI baseUrl, String credential, String pipelineId) {
+        return new DerivedSchemaOutcome.Unreachable();
+    }
+
+    /**
      * Watches a pipeline's status over a websocket ({@code /api/pipelines/{pipelineId}/status/watch}),
      * delivering each state — the current one, then each change — to {@code sink} until the stream ends or
      * {@code stop} signals (a {@code true} return between frames). On a dropped connection after a

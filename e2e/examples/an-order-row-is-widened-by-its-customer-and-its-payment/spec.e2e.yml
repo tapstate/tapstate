@@ -1,0 +1,84 @@
+# The reference workload's own shape: orders, customers and payments becoming one order_state row, both
+# dimensions merged in by a single SELECT.
+#
+# Every other published join example widens an order by one dimension, and one dimension is where the
+# two things this has to get right cannot be told apart. With one dimension there is nothing for a
+# change to reach *past*, so an implementation that only ever finds the fact rows of the dimension
+# nearest the driving source is indistinguishable from one that finds them all. And the one join kind
+# written in the statement is also the only kind any row is subject to, so applying it to everything is
+# indistinguishable from reading each join's own.
+#
+# What the assertions have to discriminate:
+#
+# - The settled count is 3 out of 4 seeded orders, and it is the reading that separates three different
+#   implementations. Order 12's payment does not exist when the run starts, so applying the statement's
+#   inner join to both dimensions drops it and settles on 2. Order 13's customer does not exist at all,
+#   so applying the outer one to both keeps it and settles on 4. Only reading each join's own kind
+#   settles on 3. Every per-row assertion below is about a row that is present, so none of them sees
+#   either mistake.
+# - Order 10 is read for customer_name and payment_method at once. A carrier that compiled only one of
+#   the two dimensions publishes the row with the other column empty, and the count does not move.
+# - The customer change is made first and read on two orders. customers is the far dimension here - its
+#   rows have to travel past the payments join to find their fact rows - and it is the one an
+#   implementation that registered a single dimension's buckets leaves silently stale.
+# - The payment then arrives for an order that was published without one, and that order is read for
+#   both columns. Reading payment_method alone would be satisfied by a rebuild that reached the row and
+#   dropped the customer half.
+# - Order 11 is read again after both changes. It belongs to neither the changed customer nor the new
+#   payment, so an implementation that re-emits every row on any dimension change - the cheap way to
+#   look correct here - fails on it.
+# - The count is read again at the end, unmoved. A re-emission that inserted rather than updated leaves
+#   duplicates, which no per-row reading above would see.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: an-order-row-is-widened-by-its-customer-and-its-payment
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, join_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: join_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: bo }
+  shop_db.payments:
+    values:
+      - { id: 100, channel: card }
+      - { id: 200, channel: transfer }
+  shop_db.orders:
+    values:
+      - { id: 10, customer_id: 1, payment_id: 100, qty: 2 }
+      - { id: 11, customer_id: 2, payment_id: 200, qty: 5 }
+      # Points at a payment that does not exist yet. The outer half of the statement owes this row
+      # anyway, with its payment column empty until one turns up.
+      - { id: 12, customer_id: 1, payment_id: 900, qty: 7 }
+      # Points at a customer that does not exist at all. The inner half owes nothing for it, ever.
+      - { id: 13, customer_id: 900, payment_id: 100, qty: 3 }
+steps:
+  - start
+  # Three of the four, for two different reasons. See the note above: this single number is what says
+  # each join in the statement was read with its own kind.
+  - await: { count: { views.order_state: 3 } }
+  # Both dimensions on one row, read together.
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: ada, payment_method: card } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo, payment_method: transfer } } } }
+  # Present and waiting for a payment, not present because it matched one.
+  - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: ada } } } }
+  # The far dimension changes. Neither orders nor payments produces an event of its own here.
+  - cdc: { shop_db.customers: { update: { where: { id: 1 }, set: { name: adelaide } } } }
+  # Both of ada's orders, and order 10 read for its payment at the same time: a rebuild that reached
+  # the row and dropped the near dimension's half would satisfy a reading of customer_name alone.
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: adelaide, payment_method: card } } } }
+  - await: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: adelaide } } } }
+  # The payment order 12 has been waiting for, arriving after that row went out without one.
+  - cdc: { shop_db.payments: { insert: { values: [ { id: 900, channel: cash } ] } } }
+  - await: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: adelaide, payment_method: cash } } } }
+  # Neither change was about this order.
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo, payment_method: transfer } } } }
+  # Still three: order 13's customer never arrived, and nothing above may have duplicated a row.
+  - assert: { count: { views.order_state: 3 } }

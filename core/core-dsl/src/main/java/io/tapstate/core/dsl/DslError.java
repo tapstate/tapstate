@@ -98,7 +98,17 @@ public enum DslError implements TapstateErrorCode {
      *  {@link #ROW_EXPRESSION_TYPE_UNSUPPORTED}: whether a table has a key is knowledge no artifact
      *  carries, only a discovered model does. */
     UPSERT_NEEDS_KEY(
-            "dsl.upsert-needs-key", Set.of("table", "source", "path"));
+            "dsl.upsert-needs-key", Set.of("table", "source", "path")),
+    /** A join's {@code sql:} is not SQL at all. {@code detail} carries the parser's own diagnosis,
+     *  which already names the line and column it stopped at. Kept apart from
+     *  {@link #JOIN_SQL_UNSUPPORTED} because the two send a reader in opposite directions: one to
+     *  their own typing, the other to what this release supports. */
+    JOIN_SQL_NOT_PARSABLE("dsl.join-sql-not-parsable", Set.of("detail", "path")),
+    /** A join's {@code sql:} parses but uses a construct this release does not run. {@code shape}
+     *  names it as SQL spells it ({@code FULL OUTER JOIN}, {@code GROUP BY}, {@code COUNT}), and
+     *  {@code line} / {@code column} locate it within the SQL text itself, not within the YAML. */
+    JOIN_SQL_UNSUPPORTED(
+            "dsl.join-sql-unsupported", Set.of("shape", "line", "column", "path"));
 
     private final String code;
     private final Set<String> placeholders;
