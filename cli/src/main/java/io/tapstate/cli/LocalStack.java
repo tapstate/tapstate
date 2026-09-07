@@ -113,7 +113,7 @@ final class LocalStack {
     record Admin(String user, String password) {
         @Override
         public String toString() {
-            return "Admin[user=" + user + ", password=<redacted>]";
+            return "Admin[user=" + user + ", secret redacted]";
         }
     }
 
