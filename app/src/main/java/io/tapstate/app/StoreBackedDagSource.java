@@ -1012,6 +1012,19 @@ final class StoreBackedDagSource implements DagSource {
         List<io.tapstate.core.sql.SourceTable> derivedFrom = List.copyOf(tables);
         io.tapstate.core.sql.JoinPlan plan =
                 io.tapstate.core.sql.SqlFrontEnd.derive(join.sql(), derivedFrom);
+        // Every source the plan carries has to be one the step declared, because the alias is what the
+        // wiring resolves an upstream through. The SQL may spell a source either way - the alias, or the
+        // table it stands for, both of which were registered above so that the front end accepts what an
+        // author writes - and only one of the two spellings survives into the plan's source names.
+        Set<String> declaredAliases = step.from() instanceof FromClause.Aliases declared
+                ? declared.aliases().keySet()
+                : Set.of();
+        for (io.tapstate.core.sql.JoinTree.Source source : plan.from().sources()) {
+            if (!declaredAliases.contains(source.name())) {
+                throw new TapstateException(ActuationError.JOIN_SOURCE_NOT_DECLARED,
+                        Map.of("step", step.id(), "name", source.name()), null);
+            }
+        }
         String driving = plan.factSource().table();
         List<String> key = keyByTable.getOrDefault(driving, List.of());
         if (key.isEmpty()) {

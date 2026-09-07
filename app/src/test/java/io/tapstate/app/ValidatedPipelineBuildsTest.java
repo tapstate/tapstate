@@ -186,6 +186,46 @@ class ValidatedPipelineBuildsTest {
               sync: [ { id: sync_1, source: orders_dest } ]
             """;
 
+    /**
+     * The same join written with the table names the aliases stand for. The SQL is legal and derives -
+     * both spellings are registered as sources - but only an alias reaches the topology.
+     */
+    private static final String BARE_TABLE_JOIN_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: wide
+            source: [ orders_src, items_src ]
+            transforms:
+              - id: widen
+                type: join
+                from: { o: orders, i: order_items }
+                engine: builtin
+                sql: |
+                  SELECT orders.id AS order_id, order_items.id AS item_id
+                  FROM orders JOIN order_items ON order_items.id = orders.id
+            serve:
+              from: widen
+              sync: [ { id: sync_1, source: orders_dest } ]
+            """;
+
+    /**
+     * A source named by its table where the step declared an alias for it. The vertex wiring looks each
+     * source up in the step's declared from-map, so a name that is not one of its keys has nowhere to be
+     * wired from - and the author never wrote the concept the failure would otherwise name.
+     */
+    @Test
+    void aJoinNamingTheTableRatherThanItsAliasIsRefusedWithACode() {
+        InMemoryStorePort store =
+                validated(SOURCE, ITEMS_SOURCE, TARGET, BARE_TABLE_JOIN_PIPELINE);
+        discovered(store, "orders_src", "orders", List.of("id"));
+        discovered(store, "items_src", "order_items", List.of("id"));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store, discardingBinder()).dagFor("wide"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
+                        .isEqualTo("actuation.join-source-not-declared"));
+    }
+
     @Test
     void aNestEmbedWhoseTableDeclaresNoKeyTellsTheAuthorToDeclareOne() {
         InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, NEST_PIPELINE);

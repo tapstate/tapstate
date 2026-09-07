@@ -225,6 +225,28 @@ class JoinProjectionTest {
                 .get().extracting(Unsupported::shape).isEqualTo("SUM");
     }
 
+    @Test
+    @DisplayName("dividing by zero answers null rather than killing the job on a row it happens to hold")
+    void divisionByZeroAnswersNull() {
+        JoinPlan plan = SqlFrontEnd.derive(
+                "SELECT o.o_price / o.o_qty AS unit_price" + FROM, TABLES);
+        Expr divide = plan.outputFields().get(0).from();
+
+        assertThat((BigDecimal) Expressions.evaluate(divide, quantity(4L)))
+                .as("an ordinary division still divides")
+                .isEqualByComparingTo("0.625");
+        assertThat(Expressions.evaluate(divide, quantity(0L)))
+                .as("and the divisor a row happens to hold does not throw out of the processor")
+                .isNull();
+    }
+
+    /** One match of the two sources, with the quantity the division is about to be handed. */
+    private static Map<String, Map<String, Object>> quantity(long quantity) {
+        return Map.of(
+                "o", Map.of("o_id", 7L, "o_qty", quantity, "o_price", new BigDecimal("2.50")),
+                "c", Map.of("c_id", 1L, "c_name", "Ada"));
+    }
+
     /** The flat row a plan publishes for one match, in the order it publishes its columns. */
     private static Map<String, Object> project(JoinPlan plan,
             Map<String, Map<String, Object>> sources) {

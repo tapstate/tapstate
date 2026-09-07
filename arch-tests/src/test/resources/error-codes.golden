@@ -9,6 +9,7 @@ actuation.join-output-key-not-published
 actuation.join-output-schema-engine-changed
 actuation.join-output-schema-source-changed
 actuation.join-source-key-missing
+actuation.join-source-not-declared
 actuation.not-a-pipeline
 actuation.pipeline-not-found
 actuation.source-schema-not-discovered

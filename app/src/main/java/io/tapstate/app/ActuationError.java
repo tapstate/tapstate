@@ -54,6 +54,16 @@ enum ActuationError implements TapstateErrorCode {
     JOIN_SOURCE_KEY_MISSING("actuation.join-source-key-missing", Set.of("step", "table")),
 
     /**
+     * A join's SQL names a source by the table it stands for, where the step declared an alias for that
+     * table; {@code step} is the join step and {@code name} the spelling the SQL used. Both spellings
+     * are legal SQL here and both derive, but only a declared alias reaches the topology - the vertex
+     * wiring resolves each source through the step's own from-map - so this one has nothing behind it.
+     * Refused while the SQL is being read, because the failure it reaches otherwise is an internal one
+     * at start, naming a concept the author never wrote.
+     */
+    JOIN_SOURCE_NOT_DECLARED("actuation.join-source-not-declared", Set.of("step", "name")),
+
+    /**
      * A join's SELECT does not publish the driving table's key, so nothing identifies a result row;
      * {@code step} is the join step, {@code table} the driving table and {@code column} the key column
      * missing from the projection. A target keyed on anything less collapses rows the SQL says are

@@ -152,7 +152,7 @@ public final class Expressions {
             // A scale of its own, because exact division has no exact answer in general: 1/3 would
             // throw rather than answer, and throwing on a value some row happens to hold is a job that
             // dies on the data instead of on the SQL.
-            case "/" -> decimal(left).divide(decimal(right), DIVISION_SCALE, java.math.RoundingMode.HALF_UP);
+            case "/" -> divide(decimal(left), decimal(right));
             case "=" -> compare(left, right) == 0;
             case "<>" -> compare(left, right) != 0;
             case "<" -> compare(left, right) < 0;
@@ -166,6 +166,22 @@ public final class Expressions {
 
     /** How many places an exact division keeps. Enough for money and for a ratio read by a person. */
     private static final int DIVISION_SCALE = 16;
+
+    /**
+     * {@code left / right}, or null where nothing divides. A zero divisor is answered rather than
+     * thrown for the same reason the scale above exists: the divisor is a value some row happens to
+     * hold, so throwing is a job that dies on the data instead of on the SQL. On a stream that is
+     * worse than it sounds - the change comes back after the restart, so the row is not skipped, it
+     * stops the job on it for good. Null is already what this evaluator answers wherever it has no
+     * value to give, and a left outer join makes every operand three-valued anyway.
+     */
+    private static BigDecimal divide(BigDecimal left, BigDecimal right) {
+        // signum, not equality: BigDecimal.equals compares the scale too, so 0.00 is not 0.
+        if (right.signum() == 0) {
+            return null;
+        }
+        return left.divide(right, DIVISION_SCALE, java.math.RoundingMode.HALF_UP);
+    }
 
     /**
      * The arguments of a CASE are the whens, then the thens, then the else - the shape the SQL library

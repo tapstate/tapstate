@@ -511,7 +511,16 @@ public final class JoinDriver {
         // Before a single row of this pass goes out, so that a rebuild is visible from its start rather
         // than from whenever the first page happens to finish.
         gauge.recomputing(source, dimensionKey, recompute.done(), recompute.expected());
-        while (recompute.page() < stores.indexPageCount(source, dimensionKey)) {
+        while (true) {
+            // Read once and used by both the test and the gather below. These sat back to back with
+            // nothing between them, so the second could only ever answer what the first just had -
+            // while costing another walk of the bucket, which on the cold layer ends in a trip that is
+            // certain to find nothing. Still read per pass rather than once: a bucket may grow while
+            // it is being walked, and the pass after has to see the pages that arrived.
+            int pages = stores.indexPageCount(source, dimensionKey);
+            if (recompute.page() >= pages) {
+                break;
+            }
             // Several pages at a time, not one. A page is sized by what one stored entry may hold; a
             // read is answered by every partition the keys fall across, each asking the layer beneath
             // for its own share. A read the size of a page is therefore a handful of keys per partition
@@ -522,7 +531,6 @@ public final class JoinDriver {
             // The keys this read is about to ask for, kept so that what it answers can be told apart
             // from what it was never asked. A page walked below may have grown since it was read here.
             Set<String> gathered = new LinkedHashSet<>();
-            int pages = stores.indexPageCount(source, dimensionKey);
             while (through < pages && gathered.size() < keysPerRead) {
                 gathered.addAll(stores.indexPage(source, dimensionKey, through));
                 through++;
