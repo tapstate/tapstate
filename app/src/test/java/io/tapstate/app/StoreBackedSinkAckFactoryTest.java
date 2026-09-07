@@ -3,7 +3,13 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.hazelcast.core.HazelcastInstance;
@@ -17,6 +23,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import org.junit.jupiter.api.Test;
+import org.mockito.AdditionalAnswers;
 
 /**
  * The production sink-ack factory maps a sink's chain (the {@code src} stream name, a table at L1) to its
@@ -245,6 +252,67 @@ class StoreBackedSinkAckFactoryTest {
         // got, so nothing may be written -- a chain that read past it would drop changes it was never
         // handed.
         assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isNull();
+    }
+
+    /**
+     * The acknowledgement path asks for the consumers on their own; it never reads the whole record.
+     *
+     * <p>Working out how far the source may be said to have been read needs every consumer's position,
+     * and the record holding them also holds a schema history that grows for the life of the chain, one
+     * entry per DDL and unbounded. Reaching for the whole record here would make every acknowledged batch
+     * pay for that history, so the cost would grow with the chain rather than with the work.
+     *
+     * <p>Counted rather than timed, for the reason the read side is: a machine's speed moves a duration
+     * and leaves a call count alone. The read side's own count lives a layer down, against the change
+     * stream; that layer cannot see this path at all, so this is the same figure for the side it misses.
+     */
+    @Test
+    void theAckPathAsksForTheConsumersOnTheirOwnRatherThanReadingTheWholeRecord() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("mc-orders", null);
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        HazelcastInstance member = memberWith(store);
+
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        for (int seq = 3; seq <= 7; seq++) {
+            ack.advance("orders", at(seq, "w" + seq));
+        }
+
+        verify(store, times(5)).consumerOffsets("mc-orders");
+        verify(store, never()).read(anyString());
+    }
+
+    /**
+     * A read offset that resolves to what was recorded last time is not written again.
+     *
+     * <p>What may be recorded is the lowest of every consumer's position, so while one consumer sits
+     * still the answer is the same on every acknowledgement the others make. Writing it again tells the
+     * record what it already holds -- a round trip per acknowledged batch, on the path every pipeline
+     * uses, bought for nothing. The forwarding side skips that write for the same reason.
+     *
+     * <p>The slow consumer is what makes this discriminate: with one consumer alone every acknowledgement
+     * raises the answer, so writing every time and writing only on a change look identical.
+     */
+    @Test
+    void aResolvedReadOffsetThatHasNotMovedIsNotWrittenAgain() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("mc-orders", null);
+        // A second consumer that has landed w2 and stays there, so it pins the lowest for all five below.
+        backing.upsertConsumerOffset("mc-orders", new ConsumerOffset("pipe-2", Map.of(), at(2, "w2")));
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        HazelcastInstance member = memberWith(store);
+
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        for (int seq = 3; seq <= 7; seq++) {
+            ack.advance("orders", at(seq, "w" + seq));
+        }
+
+        verify(store, times(1)).advanceSourceReadOffset(eq("mc-orders"), any());
+        // Both halves: a count alone would be satisfied by writing the wrong position once, and the
+        // position alone would be satisfied by writing the right one five times.
+        assertThat(backing.read("mc-orders").orElseThrow().sourceReadOffset())
+                .as("the one written is the position the slow consumer holds, not the fast one's")
+                .isEqualTo("w2");
     }
 
     /** One change's position: the order the engine assigned it, and the token the connector gave. */
