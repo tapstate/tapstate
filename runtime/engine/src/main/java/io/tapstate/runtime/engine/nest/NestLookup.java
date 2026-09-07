@@ -34,12 +34,12 @@ import java.util.Objects;
  * Both are settled while the tree is compiled, so nothing on a member works out where to send to - a graph
  * drawn from one answer and read with another would deliver every word to the wrong handling.
  *
- * <p>{@code referrerTracksKeyChanges} says whether that level's rows arrive carrying the row they replace,
- * which decides whether a row re-pointed somewhere else can be taken out of what it left. Recording where a
- * row points needs only the row; taking it back needs to know where it pointed before, and not every source
- * sends that. Where it is off the record only ever grows - the row a document walked away from goes on
- * believing it is pointed at - which is a known cost of that switch being off rather than something this
- * works around.
+ * <p><b>Taking a record back out needs the row an update replaces, and that is a requirement on the
+ * source rather than a switch here.</b> Recording where a row points needs only the row; knowing which
+ * entry to take it out of needs where it pointed before, which is on the earlier row and nowhere else. So
+ * the pointing stream's rows are delivered a second time for every referenced embed, keyed by what they
+ * pointed at before, and a source that sends no earlier row is refused rather than quietly leaving the
+ * record to grow.
  */
 public record NestLookup(
         List<String> pathId,
@@ -51,8 +51,7 @@ public record NestLookup(
         List<String> referenceFields,
         List<String> referrerIdentity,
         List<String> referrerPathId,
-        int touchOrdinal,
-        boolean referrerTracksKeyChanges) implements Serializable {
+        int touchOrdinal) implements Serializable {
 
     /**
      * How many buckets the identities pointing at one row are spread over.

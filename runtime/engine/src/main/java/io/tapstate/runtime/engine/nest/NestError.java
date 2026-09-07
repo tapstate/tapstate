@@ -211,7 +211,21 @@ public enum NestError implements TapstateErrorCode {
      * a key change cannot be told from an ordinary update and the document would silently diverge.
      */
     KEY_CHANGE_TRACKING_REQUIRES_BEFORE_IMAGE(
-            "nest.key-change-tracking-requires-before-image", Set.of("alias", "table"));
+            "nest.key-change-tracking-requires-before-image", Set.of("alias", "table")),
+
+    /**
+     * Running: the rows of a stream are recorded against the row they point at, but its source sends an
+     * update without the row it replaces, so a row re-pointed somewhere else cannot be taken out of what
+     * it left.
+     *
+     * <p>Refused rather than absorbed, and that choice is the whole of this code. Absorbing it changes no
+     * document and moves no count: what grows is the record of who points where, which nothing downstream
+     * ever reads out loud. It surfaces much later as one of two things that look like different faults -
+     * a row nothing points at any more kept for the life of the job, or an edit refused on a per-row
+     * reference count that was never real.
+     */
+    REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE(
+            "nest.reference-tracking-requires-before-image", Set.of("alias", "refPath"));
 
     private final String code;
     private final Set<String> placeholders;
