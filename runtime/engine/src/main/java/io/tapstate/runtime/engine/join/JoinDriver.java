@@ -76,6 +76,12 @@ public final class JoinDriver {
     private final String outputStream;
     private final String factSource;
     private final List<String> factKeyColumns;
+    /**
+     * Every column the driver reads off a fact row. A before image carrying all of them is as good as
+     * the mirror and is used instead of it; one carrying fewer is not, and the difference is not
+     * visible in the image itself - it looks like a row whose other columns happen to be null.
+     */
+    private final List<String> factReadColumns;
     private final List<Dimension> dimensions;
     private final Deque<Work> pending = new ArrayDeque<>();
 
@@ -126,6 +132,7 @@ public final class JoinDriver {
             throw new IllegalArgumentException("a join needs the fact row's own key to file it under");
         }
         this.factSource = plan.factSource().name();
+        this.factReadColumns = List.copyOf(plan.readColumns().getOrDefault(this.factSource, List.of()));
         this.dimensions = compile(plan.from());
     }
 
@@ -206,6 +213,13 @@ public final class JoinDriver {
             // carrying both images is asked for too: it carries its own key but not necessarily the
             // rest of itself, so the mirror is still read for it, and being read here is what keeps
             // that one trip rather than one per row.
+            if (event.after() != null && carriesTheWholeRow(event.before())) {
+                // Both images and the first one whole: the change carries its own previous, so nothing
+                // is asked for it. The predicate is the one absorbFact decides by, and it has to be:
+                // a key skipped here that is then wanted there is read on its own, which is the one
+                // shape this read ahead exists to prevent.
+                continue;
+            }
             String key = event.before() == null ? null : keyOf(event.before(), factKeyColumns);
             if (key == null && event.after() != null) {
                 key = keyOf(event.after(), factKeyColumns);
@@ -236,6 +250,24 @@ public final class JoinDriver {
      */
     private Map<String, Object> mirrored(String factKey) {
         return primed.containsKey(factKey) ? primed.remove(factKey) : stores.fact(factKey);
+    }
+
+    /**
+     * Whether {@code before} carries everything that would otherwise be read from the mirror.
+     *
+     * <p><b>A before image is not required to carry the whole row.</b> Postgres publishes the key
+     * columns alone under its default REPLICA IDENTITY and a change stream with no pre-image
+     * configured publishes an empty map, while a binlog in row format publishes all of it. The two
+     * are indistinguishable from the image: a column that was omitted and a column that held null
+     * read the same, so this asks whether the columns are present rather than whether their values
+     * look plausible.
+     *
+     * <p>Asked of the read columns rather than the published ones, because what is taken from the
+     * previous row is its join keys - which are routinely not projected - as well as whatever a
+     * removal has to republish.
+     */
+    private boolean carriesTheWholeRow(Map<String, Object> before) {
+        return before != null && before.keySet().containsAll(factReadColumns);
     }
 
     /**
@@ -310,7 +342,9 @@ public final class JoinDriver {
             // the row the after image names and the mirror under that key is what it used to be.
             previousKey = key;
         }
-        Map<String, Object> previous = mirrored(previousKey);
+        // The mirror only where the image does not already hold the row: a source that publishes all
+        // of it costs nothing here, which is what keeps this off the reads a full image never needed.
+        Map<String, Object> previous = carriesTheWholeRow(before) ? before : mirrored(previousKey);
         if (previous == null) {
             // Nothing mirrored: either this key has not been seen or the mirror lost it, and the
             // before image is then the only account of the row there is.
