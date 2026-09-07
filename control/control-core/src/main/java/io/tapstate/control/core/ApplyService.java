@@ -157,10 +157,13 @@ public final class ApplyService {
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
+        List<Resource> storedResources = store.list();
         List<Resource> candidate = new ArrayList<>();
-        for (Resource stored : store.list()) {
+        Map<String, String> workspacePreconditions = new LinkedHashMap<>();
+        for (Resource stored : storedResources) {
             if (!submittedIds.contains(stored.id())) {
                 candidate.add(stored);
+                workspacePreconditions.put(stored.id(), storedHash(stored));
             }
         }
         candidate.addAll(submitted);
@@ -196,7 +199,7 @@ public final class ApplyService {
             String canonicalForm = writer.write(recorded);
             prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(canonicalForm)));
         }
-        return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions);
+        return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
     }
 
     /**
@@ -330,11 +333,11 @@ public final class ApplyService {
         Objects.requireNonNull(resource, "resource");
         ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
-        ArtifactWrite write = switch (intent) {
+        ArtifactWrite write = (switch (intent) {
             case CREATE_ONLY -> ArtifactWrite.createOnly(prepared.resource());
             case REPLACE_ONLY -> ArtifactWrite.replaceOnly(prepared.resource(), expectedContentHash);
             case UPSERT -> throw new IllegalArgumentException("typed writes must be conditional");
-        };
+        }).guardedBy(plan.workspacePreconditions());
         ArtifactBatchWrite outcome = auditGate.dispatchAll(
                 ControlOperations.ARTIFACT_APPLY,
                 List.of(new AuditContext(principal, prepared.id(), expectedContentHash)),

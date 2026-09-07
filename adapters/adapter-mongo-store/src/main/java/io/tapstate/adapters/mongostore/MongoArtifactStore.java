@@ -109,7 +109,7 @@ public final class MongoArtifactStore implements ArtifactStore {
         if (writes.isEmpty()) {
             return ArtifactBatchWrite.applied();
         }
-        if (writes.size() == 1) {
+        if (writes.size() == 1 && writes.getFirst().readPreconditions().isEmpty()) {
             return singleWrite(writes.getFirst());
         }
         return StoreIo.call(() -> writeTransactionally(writes));
@@ -136,6 +136,13 @@ public final class MongoArtifactStore implements ArtifactStore {
         try (ClientSession session = client.startSession()) {
             session.startTransaction();
             try {
+                for (ArtifactWrite write : writes) {
+                    String stale = firstStalePrecondition(session, write.readPreconditions());
+                    if (stale != null) {
+                        session.abortTransaction();
+                        return ArtifactBatchWrite.refused(stale, ArtifactMutation.VERSION_CONFLICT);
+                    }
+                }
                 for (ArtifactWrite write : writes) {
                     ArtifactBatchWrite refusal = writeOne(session, write);
                     if (!refusal.appliedSuccessfully()) {

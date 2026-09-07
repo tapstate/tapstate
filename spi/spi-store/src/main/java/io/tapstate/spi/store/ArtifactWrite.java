@@ -3,9 +3,11 @@ package io.tapstate.spi.store;
 import io.tapstate.core.model.Resource;
 
 import java.util.Objects;
+import java.util.Map;
 
 /** One resource write and the atomic condition that must hold for it to take effect. */
-public record ArtifactWrite(Resource resource, Intent intent, String expectedContentHash) {
+public record ArtifactWrite(Resource resource, Intent intent, String expectedContentHash,
+        Map<String, String> readPreconditions) {
 
     /** The condition evaluated by the store together with the resource write. */
     public enum Intent {
@@ -17,6 +19,7 @@ public record ArtifactWrite(Resource resource, Intent intent, String expectedCon
     public ArtifactWrite {
         Objects.requireNonNull(resource, "resource");
         Objects.requireNonNull(intent, "intent");
+        readPreconditions = Map.copyOf(readPreconditions);
         if (intent == Intent.REPLACE_ONLY && expectedContentHash == null) {
             throw new IllegalArgumentException("replace-only writes require an expected content hash");
         }
@@ -27,16 +30,20 @@ public record ArtifactWrite(Resource resource, Intent intent, String expectedCon
 
     /** Creates a write that succeeds only while no artifact uses this resource id. */
     public static ArtifactWrite createOnly(Resource resource) {
-        return new ArtifactWrite(resource, Intent.CREATE_ONLY, null);
+        return new ArtifactWrite(resource, Intent.CREATE_ONLY, null, Map.of());
     }
 
     /** Creates a write that succeeds only while this resource id still holds {@code expectedContentHash}. */
     public static ArtifactWrite replaceOnly(Resource resource, String expectedContentHash) {
-        return new ArtifactWrite(resource, Intent.REPLACE_ONLY, expectedContentHash);
+        return new ArtifactWrite(resource, Intent.REPLACE_ONLY, expectedContentHash, Map.of());
     }
 
     /** Creates an unconditional apply write for CLI batch semantics. */
     public static ArtifactWrite upsert(Resource resource) {
-        return new ArtifactWrite(resource, Intent.UPSERT, null);
+        return new ArtifactWrite(resource, Intent.UPSERT, null, Map.of());
+    }
+
+    public ArtifactWrite guardedBy(Map<String, String> preconditions) {
+        return new ArtifactWrite(resource, intent, expectedContentHash, preconditions);
     }
 }
