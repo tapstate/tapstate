@@ -128,6 +128,7 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
                         .as("nor a reason to count an error")
                         .contains(0L);
                 assertLayerBehindMemoryWasRead(control);
+                assertOnlyTheBudgetIsHeldInMemory(control);
             }
         }
     }
@@ -167,6 +168,39 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
                         + "no more of these than the one a cold start gives each key.%n  metrics: %s",
                         ROOTS, MEMORY_BUDGET, control.metrics(pipelineId))
                 .isGreaterThan(ROOTS);
+    }
+
+    /**
+     * That the budget bounds what is <em>held</em>, which is the only question a budget is asked and the
+     * one nothing here has ever put.
+     *
+     * <p><b>Why this is not the reading above.</b> Trips behind the map say the layer was reached; they do
+     * not say anything left memory. Measured, they can be satisfied with every entry still resident: a key
+     * touched for the first time reaches behind the map on the way in, so a cold start over 700 roots
+     * clears a bound of 271 without a single eviction. Residency cannot be satisfied that way - an entry is
+     * either in memory or it is not.
+     *
+     * <p>Read as the entries beside what the layer behind them holds, because either alone is satisfied by
+     * a run that lost data: nothing resident and nothing stored is a pipeline that assembled nothing.
+     */
+    private void assertOnlyTheBudgetIsHeldInMemory(ControlPlane control) {
+        long resident = control.metricTotal(pipelineId, "nestStateEntries.").orElse(0L);
+        long stored = control.metricTotal(pipelineId, "nestStateStored.").orElse(0L);
+
+        assertThat(stored)
+                .describedAs("the layer behind the maps holds %d of the %d roots seeded. What is not "
+                        + "resident has to be somewhere, and this is where; a budget that bounded memory "
+                        + "by dropping state would satisfy every other reading here.%n  metrics: %s",
+                        stored, ROOTS, control.metrics(pipelineId))
+                .isEqualTo(ROOTS);
+        assertThat(resident)
+                .describedAs("%d of %d roots are still in memory under a budget of %d. A budget that "
+                        + "bounds nothing is not a slower run - it is a member that fills up with every "
+                        + "reading healthy, because the configuration reads back as the number that was "
+                        + "asked for and the substrate reports nothing. The budget is spent per partition, "
+                        + "so what should be left is near it rather than all of them.%n  metrics: %s",
+                        resident, ROOTS, MEMORY_BUDGET, control.metrics(pipelineId))
+                .isLessThanOrEqualTo(2L * MEMORY_BUDGET);
     }
 
     private static List<Document> await(
