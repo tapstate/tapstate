@@ -11,6 +11,7 @@ import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.capture.TableSchema;
+import io.tapdata.entity.event.TapBaseEvent;
 import io.tapdata.entity.event.TapEvent;
 import io.tapdata.entity.event.control.ControlEvent;
 import io.tapdata.entity.schema.TapTable;
@@ -65,8 +66,8 @@ public final class PdkCapturePort implements CapturePort {
             // invariant violation (the modes were validated upstream) and crashes bare here rather than
             // being laundered into a coded capture failure.
             BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
-            List<TapEvent> raw = read(connector, () -> batchRead(connector, config, batch));
-            List<Envelope> rows = decodeSnapshot(connector.connectorId(), raw);
+            Read raw = read(connector, () -> batchRead(connector, config, batch));
+            List<Envelope> rows = decodeSnapshot(connector, raw.events(), raw.tables());
             return new PdkCaptureBatch(rows, connector);
         } catch (RuntimeException e) {
             connector.stopQuietly();
@@ -107,7 +108,7 @@ public final class PdkCapturePort implements CapturePort {
         try {
             Probe probe = read(connector, () -> probe(connector, config));
             DiscoveredSchema schema = toDiscoveredSchema(probe.tables());
-            List<Envelope> sample = decodeSnapshot(connector.connectorId(), probe.sample());
+            List<Envelope> sample = decodeSnapshot(connector, probe.sample(), byId(probe.tables()));
             return new ConnectionReport(schema, sample);
         } finally {
             connector.stopQuietly();
@@ -134,7 +135,7 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     /** Inits the connector once, then batch-reads the configured streams (or every discovered stream). */
-    private List<TapEvent> batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
+    private Read batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
         connector.connector().init(connector.context());
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
@@ -153,7 +154,55 @@ public final class PdkCapturePort implements CapturePort {
             connector.fillFieldTypes(table);
             batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
         }
-        return raw;
+        return new Read(raw, discovered);
+    }
+
+    /**
+     * One batch read: the rows, and the tables they were read from.
+     *
+     * <p>The tables travel with the rows because decoding needs them. A connector's own way back from a
+     * converted value reads the column's declared type to decide what to rebuild, so a row decoded
+     * without its table can be written to a target of the same kind and still land as text.
+     */
+    private record Read(List<TapEvent> events, Map<String, TapTable> tables) {
+    }
+
+    /**
+     * What the source's own schema calls each column of the table this event came from, or empty where it
+     * describes none.
+     *
+     * <p>This is the one thing a connector's way back from a converted value has to go on. Its own way in
+     * turned a driver type into something portable; the way back is handed the portable value and this
+     * name, and rebuilds the driver type from the pair. Empty is a real answer - a table nothing
+     * discovered, a connector whose schema names no types - and it means the target writes the portable
+     * value, which is what it would have been handed anyway.
+     *
+     * <p><b>Read off the tables once, not once per row.</b> It depends on the table alone, and both loops
+     * that consult it run once per event: worked out inside them, a wide table's whole field map is walked
+     * and copied for every row read, on the hottest path this adapter has.
+     */
+    private static Map<String, Map<String, String>> declaredTypes(Map<String, TapTable> tables) {
+        Map<String, Map<String, String>> byTable = new LinkedHashMap<>();
+        tables.forEach((id, table) -> {
+            if (table == null || table.getNameFieldMap() == null) {
+                return;
+            }
+            Map<String, String> declared = new LinkedHashMap<>();
+            table.getNameFieldMap().forEach((column, field) -> {
+                if (field != null && field.getDataType() != null) {
+                    declared.put(column, field.getDataType());
+                }
+            });
+            byTable.put(id, declared);
+        });
+        return byTable;
+    }
+
+    /** What that reading says about the table this event came from, or empty where it describes none. */
+    private static Map<String, String> declaredTypes(
+            Map<String, Map<String, String>> byTable, TapEvent event) {
+        String tableId = event instanceof TapBaseEvent based ? based.getTableId() : null;
+        return tableId == null ? Map.of() : byTable.getOrDefault(tableId, Map.of());
     }
 
     /** Indexes discovered tables by id, keeping discovery order. */
@@ -229,6 +278,7 @@ public final class PdkCapturePort implements CapturePort {
                 tables.values().forEach(connector::fillFieldTypes);
                 connector.context().setTableMap(tableMap(tables));
                 Object startOffset = startOffset(connector);
+                Map<String, Map<String, String>> declared = declaredTypes(tables);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     for (TapEvent event : events) {
                         // A change stream also carries control events (heartbeats and the like) that signal
@@ -236,7 +286,8 @@ public final class PdkCapturePort implements CapturePort {
                         if (event instanceof ControlEvent) {
                             continue;
                         }
-                        listener.onEvent(TapEventCodec.decodeChange(event));
+                        listener.onEvent(TapEventCodec.decodeChange(
+                                event, connector.codecs(), declaredTypes(declared, event)));
                     }
                 });
                 stream.streamRead(connector.context(), config.streams(), startOffset, BATCH_SIZE, consumer);
@@ -337,15 +388,18 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     /** Projects raw snapshot rows to envelopes; a codec refusal is a projection failure, not a read failure. */
-    private static List<Envelope> decodeSnapshot(String connectorId, List<TapEvent> raw) {
+    private static List<Envelope> decodeSnapshot(
+            PdkConnector connector, List<TapEvent> raw, Map<String, TapTable> tables) {
         List<Envelope> rows = new ArrayList<>(raw.size());
+        Map<String, Map<String, String>> declared = declaredTypes(tables);
         try {
             for (TapEvent event : raw) {
-                rows.add(TapEventCodec.decodeSnapshotRow(event));
+                rows.add(TapEventCodec.decodeSnapshotRow(
+                        event, connector.codecs(), declaredTypes(declared, event)));
             }
         } catch (RuntimeException e) {
             throw new TapstateException(ConnectorError.PROJECTION_FAILED,
-                    Map.of("connector", connectorId, "detail", detail(e)), e);
+                    Map.of("connector", connector.connectorId(), "detail", detail(e)), e);
         }
         return rows;
     }

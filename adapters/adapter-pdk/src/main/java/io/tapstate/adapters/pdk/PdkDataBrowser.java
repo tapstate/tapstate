@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -21,6 +22,8 @@ import io.tapstate.spi.store.DataBrowserQuery;
 import io.tapstate.spi.store.FieldPath;
 import io.tapstate.spi.store.DataBrowserSubscription;
 import io.tapstate.spi.store.DataBrowserTailRequest;
+import io.tapstate.core.event.Bytes;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.spi.store.DataBrowserSort;
 import io.tapstate.spi.store.DataBrowserTableInfo;
 import io.tapdata.pdk.apis.entity.ExecuteResult;
@@ -33,6 +36,7 @@ import io.tapdata.pdk.apis.functions.connector.source.ExecuteCommandFunction;
 
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.StringJoiner;
@@ -161,7 +165,8 @@ public final class PdkDataBrowser implements DataBrowser {
                 TapExecuteCommand command = TapExecuteCommand.create()
                         .command(QUERY_COMMAND)
                         .params(params(config, query, beyond(query.limit())));
-                execute.execute(connector.context(), command, result -> collect(result, rows, reported));
+                execute.execute(connector.context(), command,
+                        result -> collect(result, rows, reported, connector.codecs()));
                 return null;
             });
             Throwable failure = reported.get();
@@ -270,9 +275,14 @@ public final class PdkDataBrowser implements DataBrowser {
      * <p>The rule is deliberately connector-blind: anything outside map / list / string / number /
      * boolean is rendered as its own text, whatever its type. A rule per driver type would be exact
      * for the drivers it knew and would go on producing this same failure for the first one it did
-     * not. The cost is that such a value reads as text here while the same column read one row at a
-     * time carries whatever shape the connector chose to convert it to; that difference is stated
-     * where the two faces are documented, not papered over here.
+     * not. Where the connector did supply a conversion of its own, that conversion has already run
+     * and what arrives here is its result inside a carrier; the carrier is unwrapped and the result
+     * rendered, so a connector's answer is preferred to this fallback wherever it gave one.
+     *
+     * <p><b>Both faces of this reader go through here</b>, and that is the point: the query face used
+     * to hand the driver's object on untouched while the follow face rendered it, so one document read
+     * two ways read as two documents - each face internally consistent, neither losing anything, and
+     * nothing anywhere reporting a disagreement.
      */
     private static Map<String, Object> writable(Map<String, Object> row) {
         if (row == null) {
@@ -296,9 +306,20 @@ public final class PdkDataBrowser implements DataBrowser {
                 held.forEach(each -> written.add(writableValue(each)));
                 yield written;
             }
+            // A value the connector converted for travel renders as what it converted it to, not as
+            // the carrier around it: the carrier's own text spells out its internals and would read
+            // as neither the value nor the shape the other face shows.
+            case ConvertedValue carried -> writableValue(carried.value());
             case String text -> text;
             case Number number -> number;
             case Boolean flag -> flag;
+            // Bytes are the one value neither face could say anything about: not text, not a number,
+            // not a boolean, so both fell through and printed an object's own text - an identity hash,
+            // which is not the value and is not even stable between runs of the same bytes. Base64 is
+            // what a mongo shell prints for the same column, so the read face and the shell can be
+            // compared by eye, and it is the same answer on both faces.
+            case Bytes bytes -> Base64.getEncoder().encodeToString(bytes.value());
+            case byte[] bytes -> Base64.getEncoder().encodeToString(bytes);
             default -> String.valueOf(value);
         };
     }
@@ -531,7 +552,7 @@ public final class PdkDataBrowser implements DataBrowser {
 
     /** Accumulates one result batch, remembering the first failure a batch reports instead of its rows. */
     private static void collect(ExecuteResult<?> result, List<Map<String, Object>> rows,
-                                AtomicReference<Throwable> reported) {
+                                AtomicReference<Throwable> reported, TapCodecsRegistry codecs) {
         if (result == null) {
             return;
         }
@@ -544,9 +565,19 @@ public final class PdkDataBrowser implements DataBrowser {
         }
         for (Object row : batch) {
             if (row instanceof Map<?, ?> fields) {
+                // The same spelling the follow face gives a value. Handing these over as the driver
+                // returned them is what made one face render a key as its own text and the other as
+                // whatever a serializer made of the driver's object - the same row, read two ways.
+                //
+                // Rendering alone was not enough to make the two agree, because the two faces were not
+                // holding the same thing: a followed row has been through the connector's own
+                // conversion and a queried one had not, so the renderer met a portable value on one
+                // face and the driver's own object on the other. Those conversions run here too, and
+                // from there one renderer answers for both. Only those: a read reports what the
+                // database holds, so the widths a pipeline row speaks are none of its business.
                 Map<String, Object> copy = new LinkedHashMap<>();
                 fields.forEach((name, value) -> copy.put(String.valueOf(name), value));
-                rows.add(copy);
+                rows.add(writable(TapEventCodec.connectorConverted(copy, codecs)));
             }
         }
     }
