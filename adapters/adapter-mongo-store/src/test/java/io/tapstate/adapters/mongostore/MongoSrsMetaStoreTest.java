@@ -190,6 +190,22 @@ class MongoSrsMetaStoreTest {
     }
 
     @Test
+    void sinkAckedUpdateClearsAStoredTokenWhenThePositionCarriesNone() {
+        // A change the source stated no position for is acked by its order alone. The token an earlier,
+        // lower position stored has to go with it: the two halves are read back as one position, so leaving
+        // it pairs this order with a token from beneath it. That pair is what the source-read advance both
+        // ranks and writes down -- the chain's offset would move to this order carrying the older token,
+        // and a real token arriving in between is then refused as a rewind against the inflated order.
+        Document update = MongoSrsMetaStore.sinkAckedUpdate("p1", new ChainPosition(new SourceOrder(1, 99), null));
+
+        assertThat(update.get("$set", Document.class)).containsOnly(
+                Map.entry("consumerOffsets.p1.sinkAckedEpoch", 1L),
+                Map.entry("consumerOffsets.p1.sinkAckedSeq", 99L));
+        assertThat(update.get("$unset", Document.class))
+                .containsExactly(Map.entry("consumerOffsets.p1.sinkAckedSrcpos", ""));
+    }
+
+    @Test
     void detachConsumerUpdateUnsetsOnlyThatConsumersEntryAndNothingElseOnTheChain() {
         // A detach is a path-scoped $unset of consumerOffsets.<pipelineId>: it removes the departing
         // consumer's whole entry -- not its positions -- so the consumer stops being folded into the two

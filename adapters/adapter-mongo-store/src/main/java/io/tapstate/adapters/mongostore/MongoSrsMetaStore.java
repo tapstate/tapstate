@@ -244,6 +244,15 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * <p>The three fields move together in one update. A token stored without its order can no longer be
      * ranked against anything, and an order stored without its token is nothing a read can resume from;
      * either alone would be a record no later comparison can use.
+     *
+     * <p>A position carrying no token clears the stored one rather than leaving it, and that is the same
+     * rule rather than an exception to it. A source names a position for a run of changes when it has one,
+     * so an ack with none is an order that no token belongs to; leaving the token an earlier and lower
+     * position stored pairs this order with it, and the pair is read back as one position. The source-read
+     * advance both ranks and writes that pair down, so the chain's offset moves to this order carrying a
+     * token from beneath it -- and a real token arriving in between is then refused as a rewind against an
+     * order it never reached. Cleared, the position reads back as ordered and tokenless, which that advance
+     * already declines to write down, leaving the offset where it stands.
      */
     static Document sinkAckedUpdate(String pipelineId, ChainPosition position) {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -252,10 +261,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         String path = "consumerOffsets." + pipelineId + ".";
         Document fields = new Document(path + "sinkAckedEpoch", position.order().epoch())
                 .append(path + "sinkAckedSeq", position.order().seq());
+        Document update = new Document("$set", fields);
         if (position.token() != null) {
             fields.append(path + "sinkAckedSrcpos", position.token());
+        } else {
+            update.append("$unset", new Document(path + "sinkAckedSrcpos", ""));
         }
-        return new Document("$set", fields);
+        return update;
     }
 
     @Override

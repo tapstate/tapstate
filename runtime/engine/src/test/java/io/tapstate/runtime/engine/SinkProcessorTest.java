@@ -429,6 +429,33 @@ class SinkProcessorTest {
     }
 
     @Test
+    void a_bound_held_for_one_chain_survives_a_bound_arriving_for_another() throws Exception {
+        RecordingAck ack = new RecordingAck();
+        ManualWriter writer = new ManualWriter();
+        // One write in flight, as an ack-bearing sink requires, and a batch that carries both chains: a
+        // pipeline reading two sources feeds one sink, and the batch it fills is whatever arrived.
+        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 2));
+
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(at("orders", "p1"), at("lines", "p1")));
+        processor.process(0, inbox);
+        processor.tryProcessWatermark(boundAt("orders", 1));
+        processor.tryProcessWatermark(boundAt("lines", 1));
+
+        // Neither yet: both writes are still in flight.
+        assertThat(ack.calls).isEmpty();
+
+        writer.completeAll();
+        drain(processor);
+
+        // A bound names the chain it is for, so one chain's promise is not a newer version of another's.
+        // Held in a single slot, the later bound overwrites the earlier, and the overwritten chain then
+        // waits for a strictly higher position of its own to settle -- which on a chain that has gone quiet
+        // never comes, so its last position stays open for the life of the run.
+        assertThat(ack.calls).containsExactlyInAnyOrder("orders=p1", "lines=p1");
+    }
+
+    @Test
     void a_bound_waits_for_the_rest_of_a_fan_out_to_settle() throws Exception {
         RecordingAck ack = new RecordingAck();
         ManualWriter writer = new ManualWriter();
