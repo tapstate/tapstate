@@ -221,7 +221,7 @@ public final class PipelineRepresentation {
         }
         String path = "serve";
         String use = textOrNull(value.get("use"), path + ".use");
-        FromClause from = fromClause(value(value, "from"), path + ".from");
+        FromClause from = flowFrom(value(value, "from"), path + ".from");
         String id = textOrNull(value.get("id"), path + ".id");
         if (use != null) {
             return new ServeBlock.Use(id, use, from);
@@ -370,6 +370,14 @@ public final class PipelineRepresentation {
             return FromClause.aliases(refs);
         }
         throw malformed(path + " must be a string, list, or alias map");
+    }
+
+    private static FromClause flowFrom(Object raw, String path) {
+        FromClause from = fromClause(raw, path);
+        if (from instanceof FromClause.Flow) {
+            return from;
+        }
+        throw malformed(path + " must be a string or list");
     }
 
     private static FromRef fromRef(Object raw, String path) {

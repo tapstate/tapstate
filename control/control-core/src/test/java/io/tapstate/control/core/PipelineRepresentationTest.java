@@ -13,6 +13,7 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -27,6 +28,19 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PipelineRepresentationTest {
 
     private final PipelineRepresentation representation = new PipelineRepresentation();
+
+    @Test
+    void rejectsAliasMapsForServeFromBecauseCanonicalDslOnlyAcceptsAFlow() {
+        PipelineInput input = new PipelineInput(
+                "orders_sync", null, List.of("orders"), null, null,
+                Map.of("from", Map.of("left", "orders")), null, null);
+
+        assertThatThrownBy(() -> representation.toModel(input, null))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(error.args()).containsEntry("reason", "serve.from must be a string or list");
+                });
+    }
 
     @Test
     void mapsTheStaticPipelineArtifactAndItsReferencedSourceSummaries() {
