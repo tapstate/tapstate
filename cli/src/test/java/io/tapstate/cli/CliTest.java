@@ -14,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -601,7 +602,7 @@ class CliTest {
         // -w was the sharp edge: it opens a session in a directory, but before a verb it is an error --
         // which is worth stating, since the obvious guess `tapstate -w DIR validate` is the wrong one
         Run r = run("help");
-        assertThat(r.out()).contains("open a session").contains("run one command and exit");
+        assertThat(r.out()).contains("open the full-screen workbench").contains("run one command and exit");
         assertThat(r.out()).contains("tapstate validate -w DIR");
         assertThat(r.out()).contains("$TAPSTATE_WORKDIR");
     }
@@ -879,7 +880,32 @@ class CliTest {
     }
 
     @Test
-    void workspaceOnlyArgsOpenASessionSeededWithThatWorkspace() {
+    void bareLaunchHandsTheSessionToTheWorkbenchSurface() {
+        AtomicReference<Repl> handedOff = new AtomicReference<>();
+
+        int code = Cli.runSession(LaunchOptions.parse(), new HttpControlPlaneClient(),
+                ScriptedPrompter::new, repl -> {
+                    handedOff.set(repl);
+                    return 41;
+                });
+
+        assertThat(code).isEqualTo(41);
+        assertThat(handedOff.get()).isNotNull();
+    }
+
+    @Test
+    void oneShotVerbNeverStartsTheWorkbenchSurface() {
+        int code = Cli.runSession(LaunchOptions.parse("version"), new HttpControlPlaneClient(),
+                ScriptedPrompter::new, repl -> {
+                    throw new AssertionError("one-shot verbs must not enter the workbench");
+                });
+
+        assertThat(code).isZero();
+        assertThat(Cli.newCommandLine().getSubcommands()).doesNotContainKey("tui");
+    }
+
+    @Test
+    void workspaceOnlyArgsOpenAWorkbenchSeededWithThatWorkspace() {
         assertThat(LaunchOptions.parse("-w", "foo").isOneShot()).isFalse();
         assertThat(LaunchOptions.parse("--workdir", "foo").isOneShot()).isFalse();
         assertThat(LaunchOptions.parse("--workdir=foo").isOneShot()).isFalse();

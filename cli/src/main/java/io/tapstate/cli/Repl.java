@@ -3735,6 +3735,11 @@ final class Repl {
         return builder.build();
     }
 
+    /** The command table's diagnostic stream, shared with the workbench startup boundary. */
+    PrintWriter errorOutput() {
+        return commandLine.getErr();
+    }
+
     /** Runs the interactive read loop until {@code exit} / {@code quit} or end-of-input. */
     void run() {
         PrintWriter out = commandLine.getOut();

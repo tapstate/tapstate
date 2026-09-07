@@ -91,6 +91,14 @@
       <groupId>org.jline</groupId>
       <artifactId>jline</artifactId>
     </dependency>
+    <dependency>
+      <groupId>dev.tamboui</groupId>
+      <artifactId>tamboui-tui</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.tamboui</groupId>
+      <artifactId>tamboui-jline3-backend</artifactId>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -182,12 +190,15 @@
                     <include>info.picocli:picocli</include>
                     <!-- jline aggregates its own modules under one version -->
                     <include>org.jline:*</include>
+                    <!-- the pinned full-screen runner and the only permitted terminal backend -->
+                    <include>dev.tamboui:tamboui-tui</include>
+                    <include>dev.tamboui:tamboui-jline3-backend</include>
                     <!-- test scope never ships -->
                     <include>*:*:*:*:test</include>
                   </includes>
                   <message>
-Dependency outside the cli surface-ring allowlist (rule R6). Only io.tapstate modules, picocli and
-jline are allowed; the CLI must reach services over HTTP, never via a compile dependency on
+Dependency outside the cli surface-ring allowlist (rule R6). Only io.tapstate modules, picocli, jline,
+and the pinned TamboUI runner/JLine backend are allowed; the CLI must reach services over HTTP, never via a compile dependency on
 control / runtime modules. Amend the recorded allowlist decision before adding an exception.
                   </message>
                 </bannedDependencies>

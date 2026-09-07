@@ -103,6 +103,12 @@ enum CliError implements TapstateErrorCode {
      */
     WATCH_NEEDS_A_TERMINAL("cli.watch-needs-a-terminal", Set.of()),
 
+    /** The full-screen workbench cannot safely render into redirected or non-terminal output. */
+    WORKBENCH_NEEDS_A_TERMINAL("cli.workbench-needs-a-terminal", Set.of()),
+
+    /** The local terminal could not initialize the full-screen workbench. */
+    WORKBENCH_UNAVAILABLE("cli.workbench-unavailable", Set.of()),
+
     /**
      * A version precondition was offered for a batch holding more than one resource; {@code count} is how
      * many it holds. One hash names one version, so there is no resource it could be describing.

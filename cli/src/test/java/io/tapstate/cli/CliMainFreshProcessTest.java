@@ -49,6 +49,17 @@ class CliMainFreshProcessTest {
     private static final String ISSUER = "urn:tapstate:cluster:TEST";
 
     @Test
+    void bareMainRefusesRedirectedOutputWithoutWritingTerminalControlCodes(@TempDir Path home) throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+
+        ProcessResult result = runCli(home, workspace, Map.of());
+
+        assertThat(result.exitCode()).isEqualTo(1);
+        assertThat(result.stdout()).isEmpty();
+        assertThat(result.stderr()).contains("cli.workbench-needs-a-terminal").doesNotContain("\u001b");
+    }
+
+    @Test
     void offlineMainBypassesConfiguredTransportAndAuth(@TempDir Path home) throws Exception {
         Path workspace = Files.createDirectory(home.resolve("orders"));
         Path sourceDir = Files.createDirectory(workspace.resolve("source"));

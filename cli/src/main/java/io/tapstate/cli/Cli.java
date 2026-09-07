@@ -12,11 +12,12 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
  * The Tapstate CLI: the surface-ring product front-end. Dual-mode — bare {@code tapstate} opens the
- * offline REPL; one-shot subcommands share the same verb table for scripting / AI.
+ * full-screen workbench; one-shot subcommands share the same verb table for scripting / AI.
  *
  * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code explain} / {@code ls} /
  * {@code desc} run fully without any server. The server-state verbs are registered too, so they are
@@ -30,12 +31,12 @@ import java.util.function.Supplier;
                 DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class},
         // the second line is indented by hand under the "Usage: " heading picocli prints before the first
         customSynopsis = {
-                "tapstate [LAUNCH]                   open a session (interactive)",
+                "tapstate [LAUNCH]                   open the full-screen workbench",
                 "       tapstate [LAUNCH] COMMAND [ARGS...]  run one command and exit"},
         description = {
                 "",
-                "With no command, opens a session: a prompt that holds a workspace and, once you",
-                "connect, a server connection. The session commands are listed below.",
+                "With no command, opens the full-screen workbench in the selected workspace. Its",
+                "interactive views own the terminal until you quit.",
                 "",
                 "With a command, runs it once and exits -- the form for scripts. A command takes",
                 "its own options, so the workspace is `tapstate validate -w DIR`, not",
@@ -55,12 +56,12 @@ import java.util.function.Supplier;
                 ""},
         footerHeading = "%nExamples:%n",
         footer = {
-                "  tapstate                      open a session in the default workspace",
-                "  tapstate -w ./work            open a session in ./work",
+                "  tapstate                      open the workbench in the default workspace",
+                "  tapstate -w ./work            open the workbench in ./work",
                 "  tapstate validate ./work      validate a workspace and exit",
                 "  tapstate help apply           describe one command",
                 "  TAPSTATE_PASSWORD=secret tapstate -c localhost:8080 -u admin",
-                "                                open a session already signed in",
+                "                                open the workbench already signed in",
                 "  tapstate -c localhost:8080 -u admin ls",
                 "                                run one command against a server and exit"},
         exitCodeListHeading = "%nExit codes:%n",
@@ -364,7 +365,7 @@ public final class Cli implements Runnable {
         int column = BUILTIN_HELP.entrySet().stream().mapToInt(e -> call(e).length()).max().orElse(0);
         commandLine.getHelpSectionMap().put(SECTION_REPL_BUILTINS, help -> {
             StringBuilder text = new StringBuilder(String.format(
-                    "%nSession commands (type these at the prompt, after starting `tapstate`):%n"));
+                    "%nInteractive actions (being migrated into the workbench):%n"));
             // sorted by name so the rendering is stable across runs
             BUILTIN_HELP.entrySet().stream()
                     .sorted(Map.Entry.comparingByKey())
@@ -462,9 +463,9 @@ public final class Cli implements Runnable {
 
     /**
      * Runs whatever the launch options asked for: establish the connection they name, then either run
-     * the one command they carry and leave, or open the session and hand over to the read loop.
+     * the one command they carry and leave, or open the full-screen workbench.
      *
-     * <p>A failed connection or sign-in stops there. Dropping into a session that is not connected after
+     * <p>A failed connection or sign-in stops there. Dropping into a workbench that is not connected after
      * being asked for one would look like it had worked, and running the command anyway would report a
      * missing connection rather than the reason there is none.
      */
@@ -474,17 +475,27 @@ public final class Cli implements Runnable {
         ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
         AuthService authService = new AuthService(
                 controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
-        return runSession(launch, controlPlane, prompter, resolver, authService);
+        return runSession(launch, controlPlane, prompter, resolver, authService, Workbench::run);
     }
 
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, ContextResolver resolver) {
-        return runSession(launch, controlPlane, prompter, resolver, null);
+        return runSession(launch, controlPlane, prompter, resolver, null, Workbench::run);
+    }
+
+    /** Test seam for the bare-command workbench handoff. */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, Function<Repl, Integer> workbench) {
+        Path home = Path.of(System.getProperty("user.home"));
+        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
+        AuthService authService = new AuthService(
+                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        return runSession(launch, controlPlane, prompter, resolver, authService, workbench);
     }
 
     private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                                   Supplier<Prompter> prompter, ContextResolver resolver,
-                                  AuthService authService) {
+                                  AuthService authService, Function<Repl, Integer> workbench) {
         Prompter oneShotPrompter = null;
         try {
             if (launch.hasConflictingTargets()) {
@@ -522,8 +533,7 @@ public final class Cli implements Runnable {
                 repl.dispatch(launch.command(), true);
                 return repl.lastExitCode();
             }
-            repl.run();
-            return EXIT_OK;
+            return workbench.apply(repl);
         } finally {
             if (oneShotPrompter instanceof JLinePrompter jline) {
                 jline.close();
