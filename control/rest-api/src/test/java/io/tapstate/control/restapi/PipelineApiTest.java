@@ -391,13 +391,14 @@ class PipelineApiTest {
         });
 
         assertThat(projectedPipelineVerbs)
-                .as("the full pipeline surface — four lifecycle writes, four observation reads and the two "
-                        + "position verbs — projects onto the authenticated /api surface (this test boots "
-                        + "the whole face bundle)")
+                .as("the full pipeline surface — four lifecycle writes, four observation reads, the two "
+                        + "position verbs and the two derived-schema verbs — projects onto the "
+                        + "authenticated /api surface (this test boots the whole face bundle)")
                 .containsExactlyInAnyOrder(
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
-                        "pipeline.position", "pipeline.set-position");
+                        "pipeline.position", "pipeline.set-position",
+                        "pipeline.derived-schema", "pipeline.accept-derived-schema");
 
         // The other direction, and it is the one that was missing. Above, every projected verb is checked
         // to be a registered one; nothing checked that every registered one is projected. A controller
@@ -471,6 +472,7 @@ class PipelineApiTest {
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
             PipelinePositionTestConfiguration.class,
+            DerivedSchemaTestConfiguration.class,
             AuditedSourceServiceTestConfiguration.class})
     static class TestApp {
 

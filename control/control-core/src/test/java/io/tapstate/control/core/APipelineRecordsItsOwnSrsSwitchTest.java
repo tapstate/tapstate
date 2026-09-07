@@ -218,7 +218,7 @@ class APipelineRecordsItsOwnSrsSwitchTest {
                   - id: joined
                     type: join
                     from: { o: orders, c: customers }
-                    engine: duckdb
+                    engine: builtin
                     sql: SELECT o.id AS id FROM o JOIN c ON c.id = o.customer_id
                 view:
                   id: p1

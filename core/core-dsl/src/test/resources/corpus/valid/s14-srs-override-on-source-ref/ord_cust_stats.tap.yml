@@ -10,10 +10,10 @@ transforms:
   - id: ord_by_cust
     type: join
     from: { o: orders, c: customers }
-    engine: duckdb
+    engine: builtin
     sql: |
-      SELECT c.id AS customer_id, count(*) AS order_cnt
-      FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id
+      SELECT c.id AS customer_id, o.id AS order_id
+      FROM c JOIN o ON o.customer_id = c.id
 view:
   id: ord_cust_stats
   from: ord_by_cust

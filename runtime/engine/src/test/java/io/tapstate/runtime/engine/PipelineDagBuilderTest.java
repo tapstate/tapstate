@@ -275,7 +275,7 @@ class PipelineDagBuilderTest {
     void join_step_draws_one_vertex_and_one_edge_per_source() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src", "customers_src"),
+                List.of(SourceRef.bare("orders_src"), SourceRef.bare("customers_src")),
                 List.of(joinStep("j", FromRef.literal("orders_src"), FromRef.literal("customers_src"))),
                 null,
                 serve(FromRef.literal("j"), sync("sync_1", "orders_dest")),
