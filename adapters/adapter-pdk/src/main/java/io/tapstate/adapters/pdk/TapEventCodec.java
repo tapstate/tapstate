@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
+import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.FromTapValueCodec;
@@ -259,7 +260,21 @@ public final class TapEventCodec {
         // name the source's own schema gave this column. The driver's object is deliberately not in
         // there: the target runs in a class loader of its own, so the object would be a type it cannot
         // read, while the name crosses both that boundary and the serializer a row meets on the way.
-        return new ConvertedValue(converted.getValue(), originType);
+        //
+        // One portable result is translated on the way in rather than passed along: the contract's box
+        // for bytes declares no equality of its own, so a join key built from a binary column would
+        // compare by identity and match nothing, silently. Its tag comes along, because a target of the
+        // same kind writes it back, and the way out builds the box again.
+        return new ConvertedValue(portable(converted.getValue()), originType);
+    }
+
+    /**
+     * The portable result as a value the rest of the tree can compare. Everything the contract hands over
+     * already behaves like one - text, a number, an instant - except its box for bytes, which declares
+     * neither equality nor a hash and would key a join by identity.
+     */
+    private static Object portable(Object value) {
+        return value instanceof ByteData bytes ? new Bytes(bytes.getType(), bytes.getValue()) : value;
     }
 
     /**
@@ -346,7 +361,7 @@ public final class TapEventCodec {
      */
     private static TapValue<?, ?> contractValue(Object portable) {
         return switch (portable) {
-            case ByteData bytes -> new TapBinaryValue(bytes);
+            case Bytes bytes -> new TapBinaryValue(new ByteData(bytes.tag(), bytes.value()));
             case DateTime instant -> new TapDateTimeValue(instant);
             case String text -> new TapStringValue(text);
             case Double number -> new TapNumberValue(number);

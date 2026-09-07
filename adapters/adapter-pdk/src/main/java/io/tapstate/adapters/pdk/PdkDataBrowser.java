@@ -1,7 +1,6 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.codec.TapCodecsRegistry;
-import io.tapdata.entity.schema.value.ByteData;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -23,6 +22,7 @@ import io.tapstate.spi.store.DataBrowserQuery;
 import io.tapstate.spi.store.FieldPath;
 import io.tapstate.spi.store.DataBrowserSubscription;
 import io.tapstate.spi.store.DataBrowserTailRequest;
+import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.spi.store.DataBrowserSort;
 import io.tapstate.spi.store.DataBrowserTableInfo;
@@ -318,7 +318,7 @@ public final class PdkDataBrowser implements DataBrowser {
             // which is not the value and is not even stable between runs of the same bytes. Base64 is
             // what a mongo shell prints for the same column, so the read face and the shell can be
             // compared by eye, and it is the same answer on both faces.
-            case ByteData bytes -> Base64.getEncoder().encodeToString(bytes.getValue());
+            case Bytes bytes -> Base64.getEncoder().encodeToString(bytes.value());
             case byte[] bytes -> Base64.getEncoder().encodeToString(bytes);
             default -> String.valueOf(value);
         };

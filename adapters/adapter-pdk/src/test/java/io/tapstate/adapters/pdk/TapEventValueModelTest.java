@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.TapCodecsRegistry;
@@ -525,18 +526,38 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aBinaryColumnBecomesTheContractsOwnBinaryBox() {
-        Binary binary = new Binary((byte) 0, new byte[]{1, 2, 3});
+    void aBinaryColumnBecomesAValueRatherThanTheContractsOwnBox() {
+        Binary binary = new Binary((byte) 4, new byte[]{1, 2, 3});
 
         Object decoded = decodedByMongo(binary);
 
-        // Not bytes: the connector's conversion answers with the contract's own box, and a row is
-        // handed on whatever the connector answered. Which means unwrapping this one still does not
-        // leave a value in this project's namespace - the box is the contract's.
+        // The one portable result not handed on as the connector answered it. The contract's box for
+        // bytes declares no equality, so carried as it comes a binary column keys a join by identity and
+        // matches nothing - with no error, which is why it is translated here rather than guarded there.
+        // The tag comes along: a target of the same kind writes it back, and bytes alone would arrive
+        // tagged as whatever the default is.
         assertThat(decoded).isInstanceOf(ConvertedValue.class);
         Object value = ((ConvertedValue) decoded).value();
-        assertThat(value).isInstanceOf(ByteData.class);
-        assertThat(((ByteData) value).getValue()).containsExactly(1, 2, 3);
+        assertThat(value).isEqualTo(new Bytes((byte) 4, new byte[]{1, 2, 3}));
+        assertThat(((Bytes) value).value()).containsExactly(1, 2, 3);
+        assertThat(((Bytes) value).tag()).isEqualTo((byte) 4);
+    }
+
+    @Test
+    void aBinaryColumnsTagReachesATargetOfTheSameKind() {
+        Envelope decoded = insert(row("payload", new Binary((byte) 4, new byte[]{1, 2, 3})), MONGO);
+        TapCodecsRegistry target = mongoCodecs(Set.of())
+                .registerFromTapValue(TapBinaryValue.class, TapValue::getValue);
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, target);
+
+        // Out the far side the contract's box again, tag and all. Translating on the way in is only
+        // worth doing if it is undone on the way out: a uuid column that came back tagged as a plain
+        // blob would be a different column from the one that was read.
+        Object written = encoded.getAfter().get("payload");
+        assertThat(written).isInstanceOf(ByteData.class);
+        assertThat(((ByteData) written).getType()).isEqualTo((byte) 4);
+        assertThat(((ByteData) written).getValue()).containsExactly(1, 2, 3);
     }
 
     @Test

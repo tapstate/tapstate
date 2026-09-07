@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine.nest;
 
+import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
 import org.junit.jupiter.api.Test;
 
@@ -29,6 +30,37 @@ class NestKeysTest {
         // carriers instead would compare identities - false for every row, on every pair.
         assertThat(NestKeys.valuesOf(carried, List.of("_id")))
                 .isEqualTo(NestKeys.valuesOf(plain, List.of("_id")));
+    }
+
+    @Test
+    void twoRowsKeyedOnTheSameBytesProduceTheSameKeyAndTheSameHash() {
+        Map<String, Object> left = Map.of("uid", new ConvertedValue(new Bytes((byte) 4, new byte[]{1, 2, 3}), "BINARY"));
+        Map<String, Object> right = Map.of("uid", new ConvertedValue(new Bytes((byte) 4, new byte[]{1, 2, 3}), "BINARY"));
+
+        // Two arrays holding the same bytes are two objects. Keyed on what a binary column arrives in
+        // unchanged, the two sides of a join compare by identity and never match, and nothing says so.
+        assertThat(NestKeys.valuesOf(left, List.of("uid")))
+                .isEqualTo(NestKeys.valuesOf(right, List.of("uid")));
+        // The hash is the other half and the one a single-member test would miss: it picks the member a
+        // key routes to, so an identity hash sends the two sides of one join to two places.
+        assertThat(NestKeys.valuesOf(left, List.of("uid")).hashCode())
+                .isEqualTo(NestKeys.valuesOf(right, List.of("uid")).hashCode());
+    }
+
+    @Test
+    void aKeyOnBytesStillTellsDifferentBytesApart() {
+        Map<String, Object> row = Map.of("uid", new ConvertedValue(new Bytes((byte) 4, new byte[]{1, 2, 3}), "BINARY"));
+
+        // Which is the half that makes the case above mean something: equal for the same bytes is free
+        // if everything is equal to everything.
+        assertThat(NestKeys.valuesOf(row, List.of("uid")))
+                .isNotEqualTo(NestKeys.valuesOf(
+                        Map.of("uid", new ConvertedValue(new Bytes((byte) 4, new byte[]{1, 2, 4}), "BINARY")),
+                        List.of("uid")))
+                // ...and a tag is part of what a binary column is, not decoration on it.
+                .isNotEqualTo(NestKeys.valuesOf(
+                        Map.of("uid", new ConvertedValue(new Bytes((byte) 0, new byte[]{1, 2, 3}), "BINARY")),
+                        List.of("uid")));
     }
 
     @Test
