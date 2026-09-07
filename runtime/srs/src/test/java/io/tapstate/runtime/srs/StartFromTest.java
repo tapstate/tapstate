@@ -79,6 +79,33 @@ class StartFromTest {
                 .isEqualTo(StartFrom.at(Instant.parse("+292278994-08-17T07:12:55Z")));
     }
 
+    /**
+     * The parsed start carries the converted form, rather than leaving each place that resolves a start to
+     * convert again. That conversion is the range check the two tests above pin, so carrying it is what
+     * makes the check and the value it proves one thing: what a reader positions by is the very value the
+     * parse proved addressable, not a second conversion nobody checked.
+     */
+    @Test
+    void theParsedInstantCarriesItsEpochMillisecondForm() {
+        StartFrom parsed = StartFrom.parse("2026-07-11T00:00:00Z");
+        assertThat(parsed).isInstanceOf(StartFrom.At.class);
+        assertThat(((StartFrom.At) parsed).epochMilli())
+                .isEqualTo(Instant.parse("2026-07-11T00:00:00Z").toEpochMilli());
+    }
+
+    /**
+     * The two components cannot be made to disagree. Holding the same moment twice is two chances to hold
+     * different ones, so a mismatched pair is refused where it is built. It is an invariant violation by
+     * whoever wrote the call rather than a user-facing setting error, so it crashes bare instead of
+     * carrying a code.
+     */
+    @Test
+    void aPairWhoseMillisecondsDoNotMatchItsInstantIsRefused() {
+        Instant instant = Instant.parse("2026-07-11T00:00:00Z");
+        assertThatThrownBy(() -> new StartFrom.At(instant, instant.toEpochMilli() + 1))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     @Test
     void rejectsNullAsAProgrammerErrorNotACode() {
         // A null start_from is an invariant violation (the setting defaults to a value); it stays a bare NPE

@@ -37,10 +37,27 @@ public sealed interface StartFrom extends Serializable permits StartFrom.Earlies
     record Latest() implements StartFrom {
     }
 
-    /** Start from the first change whose event time is at or after {@code instant}. */
-    record At(Instant instant) implements StartFrom {
+    /**
+     * Start from the first change whose event time is at or after {@code instant}.
+     *
+     * <p>{@code epochMilli} is that same instant in the form changes are timestamped and addressed by,
+     * converted once on the way in instead of again at each point of use. Converting is also the range
+     * check, and it is why the pair is carried rather than the instant alone: an instant spans years far
+     * beyond the epoch milliseconds a start is addressed by, so a value can read cleanly and then overflow
+     * later, on whichever member ran the read, as a bare arithmetic failure naming neither the setting nor
+     * the value that caused it. Converting while the written text is still in hand keeps the diagnosis
+     * attached to the input.
+     *
+     * <p>Build one through {@link StartFrom#at(Instant)}, which derives the pair. The canonical constructor
+     * refuses a pair that disagrees, so the two can never drift apart.
+     */
+    record At(Instant instant, long epochMilli) implements StartFrom {
         public At {
             Objects.requireNonNull(instant, "instant");
+            if (epochMilli != instant.toEpochMilli()) {
+                throw new IllegalArgumentException(
+                        "epochMilli must be the conversion of instant: got " + epochMilli + " for " + instant);
+            }
         }
     }
 
@@ -52,8 +69,13 @@ public sealed interface StartFrom extends Serializable permits StartFrom.Earlies
         return new Latest();
     }
 
+    /**
+     * The start point at {@code instant}, carrying the epoch-millisecond form alongside it.
+     *
+     * @throws ArithmeticException if the instant is too far out for that form to hold it
+     */
     static StartFrom at(Instant instant) {
-        return new At(instant);
+        return new At(instant, instant.toEpochMilli());
     }
 
     /**
@@ -76,14 +98,10 @@ public sealed interface StartFrom extends Serializable permits StartFrom.Earlies
                 return latest();
             default:
                 try {
-                    Instant instant = Instant.parse(raw);
-                    // Range check, and it has to happen here. An instant spans years far beyond the epoch
-                    // milliseconds every consumer of a start addresses it by, so a value can parse cleanly
-                    // and then overflow at the point of use -- which is a bare arithmetic failure on
-                    // whichever member ran the read, naming neither the setting nor the value that caused
-                    // it. Converting here turns that into a refusal holding the text the author wrote.
-                    instant.toEpochMilli();
-                    return at(instant);
+                    // Building the At converts, and the conversion is the range check -- see At. An instant
+                    // out of that range fails here, holding the text the author wrote, rather than later as
+                    // a bare arithmetic failure on whichever member ran the read.
+                    return at(Instant.parse(raw));
                 } catch (DateTimeParseException | ArithmeticException e) {
                     throw new TapstateException(CaptureError.START_FROM_UNPARSABLE, Map.of("value", raw), e);
                 }

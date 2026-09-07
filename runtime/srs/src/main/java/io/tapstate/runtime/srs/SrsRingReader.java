@@ -84,13 +84,17 @@ public final class SrsRingReader {
         return switch (start) {
             case StartFrom.Earliest ignored -> ring.headSequence();
             case StartFrom.Latest ignored -> ring.tailSequence() + 1;
-            case StartFrom.At at -> firstSeqAtOrAfter(ring, at.instant(), retention);
+            case StartFrom.At at ->
+                    firstSeqAtOrAfter(ring, at.instant(), at.epochMilli(), retention);
         };
     }
 
     /**
      * The first sequence whose change is at or after {@code target}, or just past the tail when every
-     * buffered change is older than it.
+     * buffered change is older than it. {@code targetMillis} is {@code target} in the form changes are
+     * timestamped by, converted once where the start was read and passed in rather than converted again
+     * here -- so what is compared against is the value that was proved to be in range, and the instant
+     * itself is kept only to quote back in the refusal below.
      *
      * <p>An instant the buffer can no longer reach is refused rather than served from the head. Serving
      * the head is silent: the reader comes up healthy and streams a different stretch than the one asked
@@ -104,10 +108,10 @@ public final class SrsRingReader {
      * against its own miner. What such a reader misses instead depends on where mining began, which is
      * decided elsewhere and is not visible from here.
      */
-    private static long firstSeqAtOrAfter(SrsRingbuffer ring, Instant target, String retention) {
+    private static long firstSeqAtOrAfter(
+            SrsRingbuffer ring, Instant target, long targetMillis, String retention) {
         long head = ring.headSequence();
         long tail = ring.tailSequence();
-        long targetMillis = target.toEpochMilli();
         if (head <= tail) {
             long oldest = ring.readOne(head).ts();
             if (oldest > targetMillis) {
