@@ -90,6 +90,7 @@ class HazelcastConfiguration {
         if (nestStateStore != null) {
             NestStateMapStoreFactory.bindTo(member, nestStateStore);
         }
+        makeNestCapable(member, nestStateStore, nestSettings);
         // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
         // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
         // reached through a handle that does not survive being written into a graph. A run with no store
@@ -99,6 +100,34 @@ class HazelcastConfiguration {
             DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
         }
         return member;
+    }
+
+    /**
+     * Declares what every nest state map on {@code member} is, once the member is already running.
+     *
+     * <p><b>After the member starts, and that is the whole of this method.</b> A namespace belongs to a
+     * pipeline, so a per-pipeline budget can only be written once there is a pipeline - which is always
+     * after this. The substrate resolves a map's configuration by looking through the static
+     * configuration by pattern first and only then at what was added while it ran, so a pattern left in
+     * the static configuration answers for every namespace and no exact configuration behind it is ever
+     * reached. Declared here instead, the pattern and the exact names sit in the same place, where an
+     * exact name wins over a pattern - which is what makes a pipeline's own number the one in force.
+     *
+     * <p>Measured before it was moved: a budget of 271 applied to a namespace read back as 271 from every
+     * way of asking, while the map ran on the process-wide 4,000 and held all 700 entries written to it.
+     * Neither the substrate nor the configuration says anything when that happens; the only trace is how
+     * many entries are resident, which nothing was reading.
+     *
+     * <p>Only with a store behind them, for the reason the store binding above gives: nest state must
+     * outlive the process, so a map that keeps it in memory alone is not a smaller version of this. A run
+     * with no store drives no pipeline, so no vertex ever asks for a state map.
+     */
+    static void makeNestCapable(HazelcastInstance member, @Nullable KeyedStateStore nestStateStore,
+            NestSettings nestSettings) {
+        if (nestStateStore == null) {
+            return;
+        }
+        member.getConfig().addMapConfig(nestSettings.backedStateMaps());
     }
 
     /**
@@ -187,19 +216,10 @@ class HazelcastConfiguration {
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
                 .setBackupCount(0));
-        // Make the member nest-capable. A nest vertex's state map is created on demand, by the name the
-        // compiled topology gave that vertex, so what those maps are has to be declared before any of them
-        // exists. The engine owns their shape -- the assembly root only installs it here, next to the ring
-        // it does the same for.
-        //
-        // Only with a store behind them. Nest state must outlive the process: it holds changes that have
-        // been let past the source's read offset on the strength of being held here, so a map that keeps
-        // them in memory alone is not a smaller version of this, it is a way to lose them silently. There
-        // is no shape for that, and nothing needs one -- a run with no store drives no pipeline, so no
-        // vertex ever asks for a state map.
-        if (nestStateStore != null) {
-            config.addMapConfig(nestSettings.backedStateMaps());
-        }
+        // What a nest state map is is NOT declared here, and the omission is load-bearing: it is declared
+        // once the member is running, by makeNestCapable. A pattern placed in this static configuration
+        // answers for every namespace and shadows the per-pipeline budget added later, which the substrate
+        // reports nowhere -- see that method.
         return config;
     }
 }
