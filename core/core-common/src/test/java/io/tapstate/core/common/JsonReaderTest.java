@@ -45,6 +45,18 @@ class JsonReaderTest {
     }
 
     @Test
+    void parsesDecimalsBelowDoublesRangeExactlyRatherThanAsZero() {
+        // The mirror of the case above, and the quieter half: a type states both of its bounds, so a
+        // literal that reaches one reaches the other. Under what a double holds the parse answers zero,
+        // which unlike an infinity is well-formed and reads as a bound somebody meant.
+        assertThat(JsonReader.parse("1E-6143")).isEqualTo(new java.math.BigDecimal("1E-6143"));
+        assertThat(JsonReader.parse("-1E-6143")).isEqualTo(new java.math.BigDecimal("-1E-6143"));
+        // A literal that is itself zero is not that, and stays the double it always was.
+        assertThat(JsonReader.parse("0.0")).isInstanceOf(Double.class);
+        assertThat(JsonReader.parse("-0.0")).isInstanceOf(Double.class);
+    }
+
+    @Test
     void parsesStringEscapesAndUnicode() {
         assertThat(JsonReader.parse("\"a\\\"b\\\\c\\n\"")).isEqualTo("a\"b\\c\n");
         assertThat(JsonReader.parse("\"\\u20ac\"")).isEqualTo("€");

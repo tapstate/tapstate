@@ -28,10 +28,11 @@ final class NestKeys {
     static List<Object> valuesOf(Map<String, Object> row, List<String> fields) {
         List<Object> values = new ArrayList<>(fields.size());
         for (String field : fields) {
-            // Unwrapped: a value a connector converted travels in a carrier, and a carrier has no
-            // equality of its own - two of them holding the same key are different objects. A key built
-            // from one matches nothing, on either side of the join, and nothing reports it: the join
-            // runs, the rows arrive, and the document simply never fills in.
+            // Unwrapped: a value a connector converted travels in a carrier, and the other side of the
+            // join need not have met a conversion at all - a carrier never equals the plain value inside
+            // it, so a key built from one matches nothing and nothing reports it: the join runs, the rows
+            // arrive, and the document simply never fills in. Two carriers do compare by their parts, so
+            // it is the mixed pairing this is here for, not the matched one.
             values.add(ConvertedValue.unwrap(row.get(field)));
         }
         return Collections.unmodifiableList(values);

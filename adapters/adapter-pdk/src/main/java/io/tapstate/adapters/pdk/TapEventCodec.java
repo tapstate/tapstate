@@ -321,7 +321,14 @@ public final class TapEventCodec {
         value.setOriginType(carrier.originType());
         FromTapValueCodec<TapValue<?, ?>> back =
                 codecs.getCustomFromTapValueCodec((Class<TapValue<?, ?>>) value.getClass());
-        return back == null ? carrier.value() : back.fromTapValue(value);
+        if (back == null) {
+            return carrier.value();
+        }
+        // A way back that answers nothing is handled like one that was never registered. A carrier cannot
+        // hold null - the constructor refuses it - so a null here is never the column having been null; it
+        // is the value being dropped, and the write would report success over a blanked column.
+        Object restored = back.fromTapValue(value);
+        return restored == null ? carrier.value() : restored;
     }
 
     /**

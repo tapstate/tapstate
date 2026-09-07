@@ -176,19 +176,33 @@ public final class PdkCapturePort implements CapturePort {
      * name, and rebuilds the driver type from the pair. Empty is a real answer - a table nothing
      * discovered, a connector whose schema names no types - and it means the target writes the portable
      * value, which is what it would have been handed anyway.
+     *
+     * <p><b>Read off the tables once, not once per row.</b> It depends on the table alone, and both loops
+     * that consult it run once per event: worked out inside them, a wide table's whole field map is walked
+     * and copied for every row read, on the hottest path this adapter has.
      */
-    private static Map<String, String> declaredTypes(Map<String, TapTable> tables, TapEvent event) {
-        TapTable table = event instanceof TapBaseEvent based ? tables.get(based.getTableId()) : null;
-        if (table == null || table.getNameFieldMap() == null) {
-            return Map.of();
-        }
-        Map<String, String> declared = new LinkedHashMap<>();
-        table.getNameFieldMap().forEach((column, field) -> {
-            if (field != null && field.getDataType() != null) {
-                declared.put(column, field.getDataType());
+    private static Map<String, Map<String, String>> declaredTypes(Map<String, TapTable> tables) {
+        Map<String, Map<String, String>> byTable = new LinkedHashMap<>();
+        tables.forEach((id, table) -> {
+            if (table == null || table.getNameFieldMap() == null) {
+                return;
             }
+            Map<String, String> declared = new LinkedHashMap<>();
+            table.getNameFieldMap().forEach((column, field) -> {
+                if (field != null && field.getDataType() != null) {
+                    declared.put(column, field.getDataType());
+                }
+            });
+            byTable.put(id, declared);
         });
-        return declared;
+        return byTable;
+    }
+
+    /** What that reading says about the table this event came from, or empty where it describes none. */
+    private static Map<String, String> declaredTypes(
+            Map<String, Map<String, String>> byTable, TapEvent event) {
+        String tableId = event instanceof TapBaseEvent based ? based.getTableId() : null;
+        return tableId == null ? Map.of() : byTable.getOrDefault(tableId, Map.of());
     }
 
     /** Indexes discovered tables by id, keeping discovery order. */
@@ -264,6 +278,7 @@ public final class PdkCapturePort implements CapturePort {
                 tables.values().forEach(connector::fillFieldTypes);
                 connector.context().setTableMap(tableMap(tables));
                 Object startOffset = startOffset(connector);
+                Map<String, Map<String, String>> declared = declaredTypes(tables);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     for (TapEvent event : events) {
                         // A change stream also carries control events (heartbeats and the like) that signal
@@ -272,7 +287,7 @@ public final class PdkCapturePort implements CapturePort {
                             continue;
                         }
                         listener.onEvent(TapEventCodec.decodeChange(
-                                event, connector.codecs(), declaredTypes(tables, event)));
+                                event, connector.codecs(), declaredTypes(declared, event)));
                     }
                 });
                 stream.streamRead(connector.context(), config.streams(), startOffset, BATCH_SIZE, consumer);
@@ -376,10 +391,11 @@ public final class PdkCapturePort implements CapturePort {
     private static List<Envelope> decodeSnapshot(
             PdkConnector connector, List<TapEvent> raw, Map<String, TapTable> tables) {
         List<Envelope> rows = new ArrayList<>(raw.size());
+        Map<String, Map<String, String>> declared = declaredTypes(tables);
         try {
             for (TapEvent event : raw) {
                 rows.add(TapEventCodec.decodeSnapshotRow(
-                        event, connector.codecs(), declaredTypes(tables, event)));
+                        event, connector.codecs(), declaredTypes(declared, event)));
             }
         } catch (RuntimeException e) {
             throw new TapstateException(ConnectorError.PROJECTION_FAILED,

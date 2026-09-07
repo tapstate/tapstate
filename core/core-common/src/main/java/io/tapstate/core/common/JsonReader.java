@@ -214,7 +214,16 @@ public final class JsonReader {
                     // line down for an integer past long. Left as the infinity the parse produces, its
                     // text form is the word "Infinity" - not a number at all - and whatever reads the
                     // value back rejects it, dropping the thing it was part of rather than the value.
-                    return Double.isInfinite(value) ? new java.math.BigDecimal(number) : value;
+                    //
+                    // Below the range is the same loss and the quieter one: the parse answers zero, which
+                    // is well-formed and reads as a value somebody meant. A type's bounds come in pairs,
+                    // so a literal that reaches the first of these reaches the second. A literal that is
+                    // itself zero is not this and stays a double.
+                    if (!Double.isInfinite(value) && value != 0.0) {
+                        return value;
+                    }
+                    java.math.BigDecimal exact = new java.math.BigDecimal(number);
+                    return Double.isInfinite(value) || exact.signum() != 0 ? exact : value;
                 }
                 try {
                     return Long.parseLong(number);

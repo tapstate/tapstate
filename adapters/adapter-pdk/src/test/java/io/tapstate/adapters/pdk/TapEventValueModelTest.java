@@ -344,6 +344,25 @@ class TapEventValueModelTest {
     }
 
     @Test
+    void aWayBackThatAnswersNothingLeavesTheValueRatherThanBlankingTheColumn() {
+        Envelope decoded = insert(row("_id", new DriverKey("64f0c0de")));
+
+        // Registered, so the lookup finds one - and it answers null, which is what a real one does for a
+        // declared name it does not recognise: the pair source and target make is only closed when both
+        // are the same kind. A carrier cannot hold null, the constructor refuses it, so a null here is
+        // never the column having been null.
+        TapCodecsRegistry answersNothing = new TapCodecsRegistry()
+                .registerFromTapValue(TapStringValue.class, tapValue -> null);
+
+        TapInsertRecordEvent encoded =
+                (TapInsertRecordEvent) TapEventCodec.encode(decoded, answersNothing);
+
+        // The portable value, the same answer as for a target that registered no way back at all. Taken
+        // at its word instead, the row would land with the key blanked and the write would report success.
+        assertThat(encoded.getAfter().get("_id")).isEqualTo("64f0c0de");
+    }
+
+    @Test
     void aCarriedValueInsideADocumentIsRestoredWhenTheSchemaNamesItsPath() {
         // Discovery names a field inside a document by its dotted path, in the same field map the
         // top-level columns come from - measured against a real connector: a document holding a key
