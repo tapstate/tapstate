@@ -221,6 +221,27 @@ class MongoArtifactStoreIT {
     }
 
     @Test
+    void workspaceGuardRefusesAPipelineCreateAfterItsSourceChanged() {
+        withStore((store, collection) -> {
+            Resource source = PARSER.parse(ORDERS);
+            Resource changedSource = PARSER.parse(ORDERS.replace("localhost", "replica"));
+            Resource pipeline = PARSER.parse(ORDERS_SYNC);
+            String sourceHash = CanonicalHash.of(WRITER.write(source));
+            store.save(source);
+            store.save(changedSource);
+
+            ArtifactBatchWrite outcome = store.writeAll(List.of(
+                    ArtifactWrite.createOnly(pipeline).guardedBy(Map.of("orders", sourceHash))));
+
+            assertThat(outcome.refusedId()).isEqualTo("orders");
+            assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+            assertThat(collection.find(new Document("_id", "orders_sync")).first()).isNull();
+            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
+                    .isEqualTo(WRITER.write(changedSource));
+        });
+    }
+
+    @Test
     void concurrentReplacementWithTheSameVersionHasOneWinnerAndLeavesItsCanonicalBytesStored() {
         withStore((store, collection) -> {
             Resource original = PARSER.parse(ORDERS);

@@ -144,6 +144,21 @@ class ArtifactStoreTest {
         assertThat(missing.refusal()).isEqualTo(ArtifactMutation.NOT_FOUND);
     }
 
+    @Test
+    void defaultWriteAllKeepsAnUpsertWorkspaceGuardAtomic() {
+        ConditionalBatchStore store = new ConditionalBatchStore();
+        Resource original = source("localhost");
+        Resource replacement = source("replica");
+        store.seed(original);
+
+        ArtifactBatchWrite outcome = store.writeAll(List.of(
+                ArtifactWrite.upsert(replacement).guardedBy(Map.of("orders", "0".repeat(64)))));
+
+        assertThat(outcome.refusedId()).isEqualTo("orders");
+        assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+        assertThat(store.storedCanonical("orders")).isEqualTo(WRITER.write(original));
+    }
+
     private static Resource source(String host) {
         return source("orders", host);
     }
@@ -163,9 +178,13 @@ class ArtifactStoreTest {
      * refuses a non-empty one, rather than quietly writing unconditionally and leaving every caller
      * believing in a check that was never made.
      */
-    private static final class DefaultingStore implements ArtifactStore {
+    private static class DefaultingStore implements ArtifactStore {
 
-        private final Map<String, Resource> resources = new LinkedHashMap<>();
+        protected final Map<String, Resource> resources = new LinkedHashMap<>();
+
+        void seed(Resource artifact) {
+            resources.put(artifact.id(), artifact);
+        }
 
         @Override
         public void saveAll(List<Resource> artifacts) {
@@ -181,6 +200,27 @@ class ArtifactStoreTest {
         public List<Resource> list() {
             return new ArrayList<>(resources.values());
         }
+
+        String storedCanonical(String id) {
+            return WRITER.write(resources.get(id));
+        }
+
+    }
+
+    private static final class ConditionalBatchStore extends DefaultingStore {
+
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+            for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
+                Resource stored = resources.get(expected.getKey());
+                if (stored == null || !hash(stored).equals(expected.getValue())) {
+                    return Optional.of(expected.getKey());
+                }
+            }
+            saveAll(artifacts);
+            return Optional.empty();
+        }
+
     }
 
     /**

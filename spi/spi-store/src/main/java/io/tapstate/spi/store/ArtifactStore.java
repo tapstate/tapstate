@@ -32,8 +32,20 @@ public interface ArtifactStore {
             return ArtifactBatchWrite.applied();
         }
         if (writes.stream().allMatch(write -> write.intent() == ArtifactWrite.Intent.UPSERT)) {
-            saveAll(writes.stream().map(ArtifactWrite::resource).toList());
-            return ArtifactBatchWrite.applied();
+            Map<String, String> preconditions = new java.util.LinkedHashMap<>();
+            for (ArtifactWrite write : writes) {
+                for (Map.Entry<String, String> precondition : write.readPreconditions().entrySet()) {
+                    String previous = preconditions.putIfAbsent(precondition.getKey(), precondition.getValue());
+                    if (previous != null && !previous.equals(precondition.getValue())) {
+                        throw new IllegalArgumentException("one batch cannot require two versions of "
+                                + precondition.getKey());
+                    }
+                }
+            }
+            Optional<String> refused = saveAll(
+                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions);
+            return refused.map(id -> ArtifactBatchWrite.refused(id, ArtifactMutation.VERSION_CONFLICT))
+                    .orElseGet(ArtifactBatchWrite::applied);
         }
         if (writes.size() == 1) {
             ArtifactWrite write = writes.getFirst();
