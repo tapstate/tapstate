@@ -111,7 +111,16 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas {
         }
         Map<String, Map<String, String>> byTable = new LinkedHashMap<>();
         Set<String> ambiguous = new LinkedHashSet<>();
+        Set<String> alreadyRead = new LinkedHashSet<>();
         for (SyncElement element : serve.sync()) {
+            // One connection is read once, however many sync elements name it. Two elements writing
+            // through the same target is ordinary - a different write mode, a different rename, an id
+            // for a query backend - and reading its tables twice would make every one of them collide
+            // with itself below, marking it ambiguous and blanking the whole column this report exists
+            // for.
+            if (!alreadyRead.add(element.source())) {
+                continue;
+            }
             Optional<SourceResource> target = storePort.artifacts().get(element.source())
                     .filter(SourceResource.class::isInstance)
                     .map(SourceResource.class::cast);

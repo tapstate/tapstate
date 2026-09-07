@@ -220,15 +220,18 @@ public final class Expressions {
         }
         String value = String.valueOf(text);
         int start = Math.max(0, ((Number) from).intValue() - 1);
-        if (start >= value.length()) {
-            return "";
-        }
         if (args.size() < 3) {
-            return value.substring(start);
+            return start >= value.length() ? "" : value.substring(start);
         }
+        // Decided before the out-of-range answer below: a null argument makes the whole call null in
+        // SQL, and answering "" for a start past the end would report a length nobody supplied as an
+        // ordinary empty string.
         Object length = evaluate(args.get(2), sources);
         if (length == null) {
             return null;
+        }
+        if (start >= value.length()) {
+            return "";
         }
         int end = Math.min(value.length(), start + Math.max(0, ((Number) length).intValue()));
         return value.substring(start, end);
