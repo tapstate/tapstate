@@ -38,5 +38,13 @@
     "before": null,
     "after": null,
     "schema": {"origin": "ALTER TABLE orders ADD note VARCHAR(64)"}
+  },
+  {
+    "op": "i",
+    "ts": 1000,
+    "src": "orders",
+    "before": null,
+    "after": {"_id": {"value": "64f0c0de", "originType": "OBJECT_ID"}, "region": "eu"},
+    "schema": null
   }
 ]

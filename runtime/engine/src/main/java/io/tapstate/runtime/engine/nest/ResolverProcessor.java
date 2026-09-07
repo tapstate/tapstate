@@ -71,6 +71,13 @@ public final class ResolverProcessor extends AbstractProcessor {
     private final ReplayFloor floor;
 
     /**
+     * The keys of this drain whose read found nothing held. It says which write stores each of them when
+     * the drain ends and nothing else: both writes store the same thing, so being wrong here costs a copy
+     * or a trip rather than a value. Emptied by that write, so it never holds more than one drain's keys.
+     */
+    private final Set<Object> heldNothing = new LinkedHashSet<>();
+
+    /**
      * Keys whose mapping is a tombstone and whose record is still kept, against what that deletion
      * covered. A tombstone occupies a key just as a live mapping does, so it is counted by whatever caps
      * this vertex, which is why dropping it once it is safe to is worth doing at all.
@@ -380,9 +387,10 @@ public final class ResolverProcessor extends AbstractProcessor {
      */
     private void settle(Map<Object, ResolverState> touched) {
         touched.forEach((key, state) -> {
-            store.save(key, state);
+            store.save(key, state, heldNothing.contains(key));
             refuseToLetOneKeyHoldMoreThanItMay(key, state.pending());
         });
+        heldNothing.clear();
     }
 
     /**
@@ -601,7 +609,7 @@ public final class ResolverProcessor extends AbstractProcessor {
         ParkedSubtree.At at = new ParkedSubtree.At(vertex.pathId(), joining);
         ParkedSubtree held = parking.load(at);
         ParkedSubtree now = new ParkedSubtree(waiting);
-        parking.save(at, held == null ? now : held.and(now));
+        parking.save(at, held == null ? now : held.and(now), held == null);
         // Emptied only now that the rows are somewhere both instances can reach. Emptying first and then
         // failing to publish stores an entry that has given up rows nothing else ever received, and the
         // replay that would rebuild them is rejected as a change already seen. A failure here instead costs
@@ -838,6 +846,10 @@ public final class ResolverProcessor extends AbstractProcessor {
         return touched.computeIfAbsent(key, k -> {
             ResolverState kept = store.load(k);
             if (kept == null) {
+                // Remembered for the write at the end of the drain rather than worked out again there.
+                // Only the read can answer it: a write that asked would make the very fetch the answer
+                // exists to save.
+                heldNothing.add(k);
                 return new ResolverState();
             }
             return kept;

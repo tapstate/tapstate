@@ -1049,6 +1049,80 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public DerivedSchemaOutcome derivedSchema(URI baseUrl, String credential, String pipelineId) {
+        HttpRequest.Builder request =
+                authed(baseUrl, "/api/pipelines/" + pipelineId + "/derived-schema", credential);
+        return derivedSchemaCall(pipelineId, request.GET().build());
+    }
+
+    @Override
+    public DerivedSchemaOutcome acceptDerivedSchema(URI baseUrl, String credential, String pipelineId) {
+        HttpRequest.Builder request =
+                authed(baseUrl, "/api/pipelines/" + pipelineId + ":accept-derived-schema", credential);
+        return derivedSchemaCall(pipelineId,
+                request.POST(HttpRequest.BodyPublishers.noBody()).build());
+    }
+
+    /**
+     * The read and the accept share this, because they answer with the same body: what a caller wants
+     * back from an accept is the shape now on record, and returning nothing would leave a scripted
+     * accept unable to say what it took.
+     */
+    private DerivedSchemaOutcome derivedSchemaCall(String pipelineId, HttpRequest request) {
+        try {
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                List<RemoteDerivedStep> steps = derivedSteps(response.body());
+                return steps == null
+                        ? new DerivedSchemaOutcome.Unreachable()
+                        : new DerivedSchemaOutcome.Found(pipelineId, steps);
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new DerivedSchemaOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new DerivedSchemaOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new DerivedSchemaOutcome.Unreachable();
+        }
+    }
+
+    /**
+     * The step reports decoded from a 200 body, or {@code null} when the body is not the array of step
+     * objects this contract promises. An empty array is a legitimate empty answer - a pipeline with no
+     * join step derives nothing - and decodes to an empty list rather than to a shape failure.
+     */
+    private static List<RemoteDerivedStep> derivedSteps(String body) {
+        if (!(JsonReader.parse(body) instanceof List<?> reports)) {
+            return null;
+        }
+        List<RemoteDerivedStep> steps = new ArrayList<>();
+        for (Object entry : reports) {
+            if (!(entry instanceof Map<?, ?> report) || !(report.get("step") instanceof String step)) {
+                return null;
+            }
+            List<RemoteDerivedColumn> columns = new ArrayList<>();
+            if (report.get("columns") instanceof List<?> cells) {
+                for (Object cell : cells) {
+                    if (cell instanceof Map<?, ?> c && c.get("column") instanceof String column) {
+                        columns.add(new RemoteDerivedColumn(column, string(c.get("recorded")),
+                                string(c.get("derived")), string(c.get("target"))));
+                    }
+                }
+            }
+            steps.add(new RemoteDerivedStep(step, string(report.get("targetTable")),
+                    Boolean.TRUE.equals(report.get("targetKnown")), columns));
+        }
+        return steps;
+    }
+
+    /** A JSON cell as a string, or null where it is absent - which is what an absent side means here. */
+    private static String string(Object value) {
+        return value instanceof String s ? s : null;
+    }
+
+    @Override
     public LogsOutcome logs(URI baseUrl, String credential, String pipelineId) {
         try {
             HttpRequest request =

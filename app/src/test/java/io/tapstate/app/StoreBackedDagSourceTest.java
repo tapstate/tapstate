@@ -576,12 +576,18 @@ class StoreBackedDagSourceTest {
         }
 
         private final SrsMetaStore meta = new InMemorySrsMetaStore();
+        private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
         private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
         private final InMemoryNestDeadLetterStore nestDeadLetters = new InMemoryNestDeadLetterStore();
 
         @Override
         public SrsMetaStore meta() {
             return meta;
+        }
+
+        @Override
+        public io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() {
+            return derivedSchemas;
         }
 
         @Override

@@ -100,4 +100,14 @@ class JsonWriterTest {
         assertThatThrownBy(() -> JsonWriter.write(new Object()))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void writesADecimalBeyondDoublesRangeBackAsANumberThatParses() {
+        // The round trip this class promises has to hold for every type the reader produces, and a
+        // magnitude past a double is one of them. Written from the infinity it used to parse as, the
+        // output was the bare word "Infinity", which is not json at all.
+        Object parsed = JsonReader.parse("1E+6145");
+
+        assertThat(JsonReader.parse(JsonWriter.write(parsed))).isEqualTo(parsed);
+    }
 }

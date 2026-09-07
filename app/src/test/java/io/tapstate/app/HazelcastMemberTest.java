@@ -9,6 +9,7 @@ import com.hazelcast.config.MapStoreConfig;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -20,6 +21,7 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -127,50 +129,90 @@ class HazelcastMemberTest {
     }
 
     @Test
-    void memberConfigDeclaresWhatNestStateMapsAre() {
-        // Nest state maps are created on demand as vertices ask for them, so what they are is decided here
-        // or not at all -- and the substrate's own defaults are wrong for state a vertex must read back: a
-        // backup replica costs a copy per write for redundancy this state does not need, and expiry would
-        // drop entries that a later event is answered from, emitting a half-built document instead of
-        // failing. Eviction is the one bound that is allowed, because the store behind the map is where an
-        // evicted entry comes back from. The wildcard applies to every map the nest naming lands under, so
-        // the engine owns its shape and the assembly root only installs it.
-        Config config = HazelcastConfiguration.memberConfig(
-                new HazelcastProperties(), new InMemoryKeyedStateStore());
-        MapConfig state = config.getMapConfigs().get(NestSettings.defaults().stateMaps().getName());
-        assertThat(state).isNotNull();
-        assertThat(state.getBackupCount()).isZero();
-        assertThat(state.getTimeToLiveSeconds()).isZero();
-        assertThat(state.getMaxIdleSeconds()).isZero();
-        assertThat(state.getMapStoreConfig().isEnabled())
-                .describedAs("the only shape this member installs is one with a store behind it")
-                .isTrue();
+    void theRunningMemberDeclaresWhatNestStateMapsAre() {
+        // Nest state maps are created on demand as vertices ask for them, so what they are is decided
+        // before any of them exists -- and the substrate's own defaults are wrong for state a vertex must
+        // read back: a backup replica costs a copy per write for redundancy this state does not need, and
+        // expiry would drop entries a later event is answered from, emitting a half-built document instead
+        // of failing. Eviction is the one bound that is allowed, because the store behind the map is where
+        // an evicted entry comes back from.
+        //
+        // Read through the lookup with a real namespace rather than out of the configuration map by
+        // pattern, because resolution is the thing at stake: a shape that is present but never resolved is
+        // a map running on the substrate's defaults with every way of asking saying otherwise.
+        HazelcastInstance member = new HazelcastConfiguration().hazelcastMember(
+                new HazelcastProperties(), null, null, null, new InMemoryKeyedStateStore(),
+                NestSettings.defaults(), null);
+        try {
+            MapConfig state = member.getConfig().findMapConfig("nest.a-pipeline.a-step.$root");
+            assertThat(state.getName())
+                    .describedAs("a namespace that resolved to something other than the nest shape is on "
+                            + "the substrate's defaults")
+                    .isEqualTo(NestSettings.defaults().stateMaps().getName());
+            assertThat(state.getBackupCount()).isZero();
+            assertThat(state.getTimeToLiveSeconds()).isZero();
+            assertThat(state.getMaxIdleSeconds()).isZero();
+            assertThat(state.getMapStoreConfig().isEnabled())
+                    .describedAs("the only shape this member installs is one with a store behind it")
+                    .isTrue();
+        } finally {
+            member.shutdown();
+        }
     }
 
     @Test
-    void memberConfigPutsTheStoreBehindTheStateMapsWhenThereIsOne() {
+    void theStaticConfigurationCarriesNoNestPatternAtAll() {
+        // The regression this placement exists for. The substrate resolves a map's configuration by
+        // matching the static configuration by pattern first and only then looking at what was added while
+        // the member ran -- so a nest pattern left in here answers for every namespace and shadows the
+        // per-pipeline budget, which is added later because pipelines do not exist at startup. Measured
+        // when it was here: a budget of 271 read back as 271 from every way of asking while its map ran on
+        // the process-wide 4,000 and held all 700 entries written to it, with nothing reporting it.
+        assertThat(HazelcastConfiguration.memberConfig(
+                        new HazelcastProperties(), new InMemoryKeyedStateStore()).getMapConfigs())
+                .describedAs("a nest pattern in the static configuration shadows every budget added after "
+                        + "it, silently")
+                .doesNotContainKey(NestSettings.defaults().stateMaps().getName());
+    }
+
+    @Test
+    void theRunningMemberPutsTheStoreBehindTheStateMapsWhenThereIsOne() {
         // With a store, nest state is written through it as a key is handled and read back per key on the
         // way up: a restart resumes instead of re-reading the sources, which is what the cold layer is for.
         // Write-through is the decision -- a queued write would live in memory, and these maps keep no
         // replica of it, so a crash would lose the tail with nothing reporting it.
-        Config config = HazelcastConfiguration.memberConfig(
-                new HazelcastProperties(), new InMemoryKeyedStateStore());
-        MapStoreConfig store = config.getMapConfigs().get(NestSettings.defaults().stateMaps().getName()).getMapStoreConfig();
-        assertThat(store).isNotNull();
-        assertThat(store.isEnabled()).isTrue();
-        assertThat(store.getWriteDelaySeconds()).isZero();
+        HazelcastInstance member = new HazelcastConfiguration().hazelcastMember(
+                new HazelcastProperties(), null, null, null, new InMemoryKeyedStateStore(),
+                NestSettings.defaults(), null);
+        try {
+            MapStoreConfig store = member.getConfig()
+                    .findMapConfig("nest.a-pipeline.a-step.$root").getMapStoreConfig();
+            assertThat(store).isNotNull();
+            assertThat(store.isEnabled()).isTrue();
+            assertThat(store.getWriteDelaySeconds()).isZero();
+        } finally {
+            member.shutdown();
+        }
     }
 
     @Test
-    void memberConfigDeclaresNoStateMapsAtAllWhenThereIsNoStore() {
+    void aMemberWithNoStoreDeclaresNoStateMapsAtAll() {
         // Nest state that outlives nothing is not a lesser version of nest state, it is a way to emit a
         // half-built document and call it whole. So there is no shape for it: without a store there are no
-        // state maps to declare. Nothing is lost by their absence -- a run with no store drives no pipeline,
-        // so no vertex ever asks for one.
-        Config config = HazelcastConfiguration.memberConfig(new HazelcastProperties(), null);
-        assertThat(config.getMapConfigs())
-                .describedAs("a state map with nothing behind it is not a shape this member offers")
-                .doesNotContainKey(NestSettings.defaults().stateMaps().getName());
+        // state maps to declare. Nothing is lost by their absence -- a run with no store drives no
+        // pipeline, so no vertex ever asks for one.
+        //
+        // Asked of the running member, not of the static configuration: the static configuration carries
+        // no nest pattern in either case, so asking it could not tell the two apart.
+        HazelcastInstance member = new HazelcastConfiguration().hazelcastMember(
+                new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+        try {
+            assertThat(member.getConfig().getMapConfigs())
+                    .describedAs("a state map with nothing behind it is not a shape this member offers")
+                    .doesNotContainKey(NestSettings.defaults().stateMaps().getName());
+        } finally {
+            member.shutdown();
+        }
     }
 
     @Test
@@ -311,6 +353,31 @@ class HazelcastMemberTest {
         }
         // The member's lifecycle is bound to the context: closing the context shuts it down.
         assertThat(member.getLifecycleService().isRunning()).isFalse();
+    }
+
+    /**
+     * The mirror of what {@code makeJoinCapable} is for, and a regression that would say nothing.
+     *
+     * <p>The substrate resolves a map's configuration by looking through the static configuration by
+     * pattern first and only then at what was added while the member ran. A {@code join.*} pattern left
+     * here therefore answers for every join namespace, and an exact configuration behind it is never
+     * reached - with nothing about the run saying which one was in force. The nest maps were moved out
+     * of here for exactly that; this holds the join maps to the same place before the same thing can
+     * happen to them.
+     *
+     * <p>It is not hypothetical: {@code JoinMaps.backedStateMaps(name, entries)} - the exact-name form -
+     * already exists, so the configuration that would be shadowed is one call away rather than a
+     * future design. A store is passed because that is the case that used to declare these statically;
+     * with none, there would be nothing to find either way and the case would pass vacuously.
+     */
+    @Test
+    @DisplayName("the static config declares no join state map, because a pattern here outranks an exact one added later")
+    void memberConfigDeclaresNoJoinStateMapPattern() {
+        Config config = HazelcastConfiguration.memberConfig(
+                new HazelcastProperties(), new InMemoryKeyedStateStore());
+
+        assertThat(config.getMapConfigs().keySet())
+                .noneMatch(name -> name.startsWith(JoinMaps.NAMESPACE_PREFIX));
     }
 
     /** A sentinel meta store: an identity to assert the user-context binding; its facets are never invoked here. */

@@ -14,6 +14,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -264,8 +265,42 @@ class PipelineDagBuilderTest {
                 edge("orders_src", "serve.sync_2", 1, 0));
     }
 
+    /**
+     * The positive control for the case below: with the binding supplied, the join is drawn rather than
+     * refused - one vertex, and one edge per source its plan reads, each arriving on its own ordinal so
+     * the vertex can tell which side a change came from.
+     */
     @Test
-    void stateful_join_step_is_out_of_scope_and_rejected() {
+    void join_step_draws_one_vertex_and_one_edge_per_source() {
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of("orders_src", "customers_src"),
+                List.of(joinStep("j", FromRef.literal("orders_src"), FromRef.literal("customers_src"))),
+                null,
+                serve(FromRef.literal("j"), sync("sync_1", "orders_dest")),
+                null, null);
+
+        DAG dag = PipelineDagBuilder.build(pipeline, bindings(Map.of(
+                FromRef.literal("orders_src"), List.of("orders_src"),
+                FromRef.literal("customers_src"), List.of("customers_src"),
+                FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()));
+
+        assertThat(vertexNames(dag))
+                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "serve.sync_1");
+        assertThat(edges(dag)).contains(
+                edge("orders_src", "j", 0, 0),
+                edge("customers_src", "j", 0, 1),
+                edge("j", "serve.sync_1", 0, 0));
+    }
+
+    /**
+     * A join draws its own vertex and its own edges, and what it needs to do that - the compiled plan,
+     * the driving source's key columns, where its state lives - comes from the assembly root. A builder
+     * handed a join and no binding cannot make any of it up, and inventing a default would be a graph
+     * that runs and holds its state somewhere nobody chose.
+     */
+    @Test
+    void join_step_without_its_binding_is_a_wiring_mistake() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
                 List.of("orders_src"),
@@ -277,8 +312,8 @@ class PipelineDagBuilderTest {
         assertThatThrownBy(() -> PipelineDagBuilder.build(pipeline, bindings(Map.of(
                 FromRef.literal("orders_src"), List.of("orders_src"),
                 FromRef.literal("j"), List.of("j")))))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("j");
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("no join binding was supplied");
     }
 
     @Test
@@ -444,8 +479,42 @@ class PipelineDagBuilderTest {
     }
 
     private static Step joinStep(String id, FromRef from) {
-        TransformBody body = new TransformBody.Join("duckdb", "SELECT 1");
+        TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN, "SELECT 1");
         return Step.inline(id, FromClause.aliases(Map.of("root", from)), body, null, null);
+    }
+
+    /** A join step reading two sources, under the alias names the plan below calls them by. */
+    private static Step joinStep(String id, FromRef fact, FromRef dimension) {
+        TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN,
+                "SELECT o.id FROM orders o JOIN customers c ON o.cust_id = c.id");
+        return Step.inline(id, FromClause.aliases(new java.util.LinkedHashMap<>(
+                Map.of("o", fact, "c", dimension))), body, null, null);
+    }
+
+    /**
+     * The compiled plan and the driving source's key, as the assembly root would supply them. Built by
+     * hand rather than derived: deriving needs the SQL library, which this ring cannot see.
+     */
+    private static io.tapstate.runtime.engine.join.JoinBinding joinBinding() {
+        io.tapstate.core.sql.JoinTree from = new io.tapstate.core.sql.JoinTree.Join(
+                new io.tapstate.core.sql.JoinTree.Source("o", "orders"),
+                new io.tapstate.core.sql.JoinTree.Source("c", "customers"),
+                io.tapstate.core.sql.JoinKind.INNER,
+                List.of(new io.tapstate.core.sql.JoinTree.KeyPair(
+                        new io.tapstate.core.sql.JoinTree.ColumnRef("o", "cust_id"),
+                        new io.tapstate.core.sql.JoinTree.ColumnRef("c", "id"))),
+                false);
+        io.tapstate.core.sql.JoinPlan plan = new io.tapstate.core.sql.JoinPlan(
+                List.of(new io.tapstate.core.sql.OutputField("id",
+                        io.tapstate.core.common.TapstateType.INT64, false,
+                        new io.tapstate.core.sql.Expr.Column(
+                                new io.tapstate.core.sql.JoinTree.ColumnRef("o", "id")))),
+                from, Map.of("o", List.of("cust_id", "id"), "c", List.of("id")));
+        return new io.tapstate.runtime.engine.join.JoinBinding(
+                step -> plan,
+                step -> List.of("id"),
+                (member, pipelineId, stepId) ->
+                        new io.tapstate.runtime.engine.join.MapJoinStores());
     }
 
     private static List<String> vertexNames(DAG dag) {

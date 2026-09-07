@@ -40,12 +40,14 @@ class RingDependencyRulesTest {
     }
 
     @Test
-    @DisplayName("R1: core ring (except core-dsl) depends only on java.., itself, and jackson-annotations")
+    @DisplayName("R1: core ring (except core-dsl / core-sql) depends only on java.., itself, and jackson-annotations")
     void r1_coreRingDependsOnWhitelistOnly() {
         noClasses().that().resideInAPackage("io.tapstate.core..")
-                // core-dsl carries its own additional grant (see r1_coreDslAlsoAllowsYamlParser);
+                // core-dsl and core-sql each carry their own additional grant (see
+                // r1_coreDslAlsoAllowsYamlParserAndCel / r1_coreSqlAlsoAllowsTheSqlFrontEnd);
                 // every other core module is held to the zero-framework allowlist
                 .and().resideOutsideOfPackage("io.tapstate.core.dsl..")
+                .and().resideOutsideOfPackage("io.tapstate.core.sql..")
                 .should().dependOnClassesThat().resideOutsideOfPackages(
                         "java..",
                         "io.tapstate.core..",
@@ -82,6 +84,27 @@ class RingDependencyRulesTest {
                 .because("the YAML parser and CEL compiler are granted to core-dsl alone; the rest "
                         + "of the core ring still bans them (enforcer pom grant is the coarse twin "
                         + "of this rule)")
+                .check(tapstateClasses);
+    }
+
+    @Test
+    @DisplayName("R1 (core-sql grant): core-sql adds the SQL parser and validator, nothing more")
+    void r1_coreSqlAlsoAllowsTheSqlFrontEnd() {
+        noClasses().that().resideInAPackage("io.tapstate.core.sql..")
+                .should().dependOnClassesThat().resideOutsideOfPackages(
+                        "java..",
+                        "io.tapstate.core..",
+                        "com.fasterxml.jackson.annotation..",
+                        // R1 named grant, core-sql-only: the SQL parser, validator and type
+                        // deriver. The library's other reachable artifacts (its JDBC driver base
+                        // and a fraction arithmetic helper) are pulled in by static initializers
+                        // on that path, not referenced by anything this module writes -- so they
+                        // are named in the pom grant and deliberately not here.
+                        "org.apache.calcite.."
+                )
+                .allowEmptyShould(true)
+                .because("the SQL front end is granted to core-sql alone; the rest of the core "
+                        + "ring still bans it (enforcer pom grant is the coarse twin of this rule)")
                 .check(tapstateClasses);
     }
 
