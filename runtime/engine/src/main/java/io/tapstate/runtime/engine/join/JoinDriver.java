@@ -534,6 +534,15 @@ public final class JoinDriver {
                 }
             }
         }
+        // The walk is over, so what it reached takes the place of the estimate it set out with.
+        // That estimate is an upper bound - the last page is partial in every case but the exactly
+        // divisible one, and entries dropped as stale are never sent - so leaving it standing reports
+        // a rebuild that has finished as one stopped a page short, for ever, which is the single
+        // reading this pair exists to rule out. Where the reporting threshold is applied, this last
+        // call is filtered out for a rebuild whose true count falls below a threshold its estimate
+        // cleared; the estimate is at most one page high, so that is a band one page wide just under
+        // the threshold, and those rebuilds keep the short pair.
+        gauge.recomputing(source, dimensionKey, recompute.done(), recompute.done());
         return true;
     }
 

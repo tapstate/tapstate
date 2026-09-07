@@ -152,6 +152,50 @@ class AHighFanOutDimensionChangeReachesEveryRowTest {
                 .isEqualTo((long) REPORTABLE_FACT_ROWS);
     }
 
+    /**
+     * A fan-out that is not a whole number of pages. Every bucket is this shape except the one whose
+     * last page happens to fill exactly, and the case above is that one - twelve thousand rows over a
+     * thousand-row page - which is how it can assert the two numbers meet without the walk ever having
+     * to make them meet.
+     */
+    private static final int UNEVEN_FACT_ROWS = 11_500;
+
+    @Test
+    @DisplayName("a rebuild that has ended reports the count it reached, not the estimate it started from")
+    void theRebuildEndsOnTheCountItActuallyReached() {
+        JoinPlan plan = SqlFrontEnd.derive(
+                "SELECT o.o_id AS order_id, c.c_name AS customer_name "
+                        + "FROM orders o JOIN customers c ON o.o_cust_id = c.c_id", TABLES);
+        RecordingGauge gauge = new RecordingGauge();
+        JoinDriver driver = new JoinDriver(plan, List.of("o_id"), "order_state",
+                new CountingJoinStores(ReverseIndex.DEFAULT_PAGE_SIZE),
+                JoinDriver.DEFAULT_KEYS_PER_READ, gauge);
+        BoundedSink sink = new BoundedSink();
+
+        feed(driver, sink, new SourceChange("c", Envelope.insert(1L, "src",
+                row("c_id", 1L, "c_name", "Ada"), null)));
+        for (int i = 0; i < UNEVEN_FACT_ROWS; i++) {
+            feed(driver, sink, new SourceChange("o", Envelope.insert(1L, "src",
+                    row("o_id", (long) i, "o_cust_id", 1L), null)));
+        }
+
+        gauge.forget();
+        feed(driver, sink, new SourceChange("c", Envelope.update(1L, "src",
+                row("c_id", 1L, "c_name", "Ada"), row("c_id", 1L, "c_name", "Bo"), null)));
+
+        List<Long> progress = gauge.progress();
+        List<Long> sizes = gauge.sizes();
+        assertThat(progress.get(progress.size() - 1))
+                .as("the walk reached every row under the key, so that is what it finishes on")
+                .isEqualTo((long) UNEVEN_FACT_ROWS);
+        assertThat(sizes.get(sizes.size() - 1))
+                .as("and the estimate it started from does not outlive the walk: it is an upper bound, "
+                        + "a page's worth high wherever the last page is partial, so a rebuild that has "
+                        + "ended and left it standing reads for ever as one that stopped just short - "
+                        + "which is the reading this pair exists to rule out")
+                .isEqualTo((long) UNEVEN_FACT_ROWS);
+    }
+
     /** Keeps every rebuild reading in the order it was made, which is what the sequence is read from. */
     private static final class RecordingGauge implements JoinGauge {
 
