@@ -14,6 +14,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.EnvelopeSerializer;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
+import io.tapstate.runtime.engine.join.JoinMaps;
+import io.tapstate.runtime.engine.join.JoinStateMapStoreFactory;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -99,8 +101,14 @@ class HazelcastConfiguration {
         // with no store (mongo disabled) binds nothing, and its maps declare no store to resolve.
         if (nestStateStore != null) {
             NestStateMapStoreFactory.bindTo(member, nestStateStore);
+            // The same layer, bound again under the join's own key. One key shared between them would
+            // read as tidier and would make "these two are told about different layers" impossible to
+            // say - which is a thing a deployment may one day want to say, and a thing neither of them
+            // could then express without the other noticing.
+            JoinStateMapStoreFactory.bindTo(member, nestStateStore);
         }
         makeNestCapable(member, nestStateStore, nestSettings);
+        makeJoinCapable(member, nestStateStore);
         // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
         // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
         // reached through a handle that does not survive being written into a graph. A run with no store
@@ -140,6 +148,31 @@ class HazelcastConfiguration {
             return;
         }
         member.getConfig().addMapConfig(nestSettings.backedStateMaps());
+    }
+
+    /**
+     * Declares what every join state map on {@code member} is, once the member is already running.
+     *
+     * <p><b>After the member starts, for the reason {@link #makeNestCapable} gives.</b> The substrate
+     * resolves a map's configuration by looking through the static configuration by pattern first and
+     * only then at what was added while it ran, so a pattern left in the static configuration answers
+     * for every namespace and no exact configuration behind it is ever reached. Join state carries no
+     * per-namespace configuration today, so nothing is being shadowed yet; it is declared here so that
+     * the day one is added it is reached, rather than being ignored with nothing saying so.
+     *
+     * <p><b>Its own method rather than a line inside the nest one.</b> Nest and join are two mechanisms
+     * that happen to want the same treatment here, not one mechanism; folded together, "these two are
+     * configured differently" becomes a thing neither could express without the other noticing.
+     *
+     * <p>Only with a store behind them, for the reason the store binding gives: join state is what lets
+     * a broken target table be rebuilt without reading the source again, so a map that keeps it in
+     * memory alone is not a smaller version of this but a way to lose it quietly.
+     */
+    static void makeJoinCapable(HazelcastInstance member, KeyedStateStore joinStateStore) {
+        if (joinStateStore == null) {
+            return;
+        }
+        member.getConfig().addMapConfig(JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY));
     }
 
     /**
@@ -255,6 +288,11 @@ class HazelcastConfiguration {
         // once the member is running, by makeNestCapable. A pattern placed in this static configuration
         // answers for every namespace and shadows the per-pipeline budget added later, which the substrate
         // reports nowhere -- see that method.
+        //
+        // A join state map is declared by a pattern too, and is left out of here for the same reason and
+        // under the same rule, by makeJoinCapable. Join state carries no per-namespace budget today, so
+        // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
+        // maps were in until the day one was added.
         return config;
     }
 }

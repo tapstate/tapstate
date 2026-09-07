@@ -47,6 +47,8 @@ class ControlOperationsTest {
                         "pipeline.logs",
                         "pipeline.position",
                         "pipeline.set-position",
+                        "pipeline.derived-schema",
+                        "pipeline.accept-derived-schema",
                         "user.create",
                         "user.passwd",
                         "user.list",

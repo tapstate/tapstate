@@ -915,6 +915,44 @@ final class ControlPlane {
      * where there is something to say. It leaves the caller with the discriminating half to do: a witness
      * resting on "zero" alone would pass on a pipeline that published nothing at all.
      */
+    /**
+     * Every metric of {@code pipelineId} whose name begins with {@code prefix}, by name; empty when the
+     * pipeline has published none of them or no observation at all.
+     *
+     * <p>Keyed rather than summed, unlike {@link #metricTotal}, because these are readings whose names
+     * carry what they are about - which one of them is present is the reading. A total over them would
+     * answer "is anything happening" while losing "to what", and to what is the question a reader of a
+     * long-running rebuild is actually asking.
+     */
+    Map<String, Long> metricsNamed(String pipelineId, String prefix) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        return interpretMetricsNamed(response.statusCode(), response.body(), pipelineId, prefix);
+    }
+
+    static Map<String, Long> interpretMetricsNamed(
+            int status, String body, String pipelineId, String prefix) {
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return Map.of();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the metrics of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
+            throw new AssertionError("metrics answer carried no metrics: " + body);
+        }
+        Map<String, Long> named = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : metrics.entrySet()) {
+            if (entry.getKey() instanceof String name && name.startsWith(prefix)
+                    && entry.getValue() instanceof Number value) {
+                named.put(name, value.longValue());
+            }
+        }
+        return named;
+    }
+
     Optional<Long> metricTotal(String pipelineId, String prefix) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
         return interpretMetricTotal(response.statusCode(), response.body(), pipelineId, prefix);

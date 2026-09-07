@@ -79,7 +79,7 @@ public final class Cli implements Runnable {
      * declaration, and the version is wanted on a path that must not depend on either. The build pins it
      * to the project version, so the string here cannot quietly drift from what was released.
      */
-    static final String VERSION = "tapstate 0.4.4";
+    static final String VERSION = "tapstate 0.4.5";
 
     /**
      * Just the number out of {@link #VERSION}, for the places that print it beside another version and
@@ -154,7 +154,13 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.snapshot", "snapshot"),
             Map.entry("pipeline.logs", "logs"),
             Map.entry("pipeline.position", "position"),
-            Map.entry("pipeline.set-position", "position"));
+            Map.entry("pipeline.set-position", "position"),
+            // Both on one verb, as the three token operations are: what a reader is doing is looking at
+            // one thing, and accepting it is the same look followed by a decision. A verb of its own for
+            // the accept would be a second word for the same subject; a flag on the start would not be
+            // anybody looking at all.
+            Map.entry("pipeline.derived-schema", "derived-schema"),
+            Map.entry("pipeline.accept-derived-schema", "derived-schema"));
 
     /**
      * Verbs that chain several registered operations rather than projecting one ({@code run} is apply
@@ -256,6 +262,8 @@ public final class Cli implements Runnable {
                     "Show a pipeline's counters and per-table positions.")),
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's per-table snapshot progress.")),
+            Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
+                    "Compare a join's recorded and current output columns; --accept takes today's.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
             // "per chain" is the load-bearing half of this line. A pipeline's position is one value per

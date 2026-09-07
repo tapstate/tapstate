@@ -6,6 +6,7 @@ import com.mongodb.client.gridfs.GridFSBuckets;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
@@ -61,6 +62,14 @@ public final class MongoStorePort implements StorePort {
 
     /** The durable change log: one document per change that entered a chain's per-table ring. */
     public static final String SRS_LOG = "srs_log";
+
+    /**
+     * The collection holding one document per pipeline, carrying the versioned record of the columns
+     * each of its steps works out for itself. Keyed by pipeline id alone so both questions asked of it -
+     * one step's latest, and dropping a removed pipeline's whole record - are answered by the {@code _id}
+     * index every collection already has.
+     */
+    public static final String DERIVED_SCHEMAS = "derived_schemas";
     /** The collection holding one stateful-operator state document per key, per namespace. */
     public static final String OPERATOR_STATE = "operator_state";
 
@@ -114,6 +123,7 @@ public final class MongoStorePort implements StorePort {
     private final ObservationStore observations;
     private final SrsMetaStore meta;
     private final SrsLogStore srsLog;
+    private final DerivedSchemaStore derivedSchemas;
     private final KeyedStateStore keyedState;
     private final NestDeadLetterStore nestDeadLetters;
 
@@ -139,6 +149,7 @@ public final class MongoStorePort implements StorePort {
         this.observations = new MongoObservationStore(database.getCollection(PIPELINE_OBSERVATION));
         this.meta = new MongoSrsMetaStore(database.getCollection(SRS_META));
         this.srsLog = new MongoSrsLogStore(database.getCollection(SRS_LOG));
+        this.derivedSchemas = new MongoDerivedSchemaStore(database.getCollection(DERIVED_SCHEMAS));
         // Operator state alone sits in its own database on the same client, for the reasons on the
         // constant. Same connection, same credentials, same lifecycle - a different database. What that
         // operator could not assemble goes in the same database, being produced by the same run.
@@ -206,6 +217,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public SrsMetaStore meta() {
         return meta;
+    }
+
+    @Override
+    public DerivedSchemaStore derivedSchemas() {
+        return derivedSchemas;
     }
 
     @Override

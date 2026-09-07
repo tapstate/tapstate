@@ -217,6 +217,18 @@ public final class ControlOperations {
     public static final Operation PIPELINE_SET_POSITION = new Operation(
             "pipeline.set-position", Scope.WRITE, true, null, CLI_ONLY);
 
+    // The columns a step works out for itself, and the one act that moves what they are held to. A
+    // start is refused when a step's derived columns no longer match the ones it was recorded
+    // producing; the read is how a person sees what moved and whether the target can hold it, and the
+    // accept is how they say to carry on. The accept is write-scoped and audited because it moves what
+    // a refusal is measured against, which is the only thing standing between a changed shape and a
+    // target that silently truncates - and it is a verb of its own rather than a flag on the start,
+    // because a flag on a start lives in a script and stops being anybody looking.
+    public static final Operation PIPELINE_DERIVED_SCHEMA = new Operation(
+            "pipeline.derived-schema", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_ACCEPT_DERIVED_SCHEMA = new Operation(
+            "pipeline.accept-derived-schema", Scope.WRITE, true, null, CLI_ONLY);
+
     // security domain: all admin-scoped. The mutating ones are audited; the list queries are not.
     public static final Operation USER_CREATE = new Operation("user.create", Scope.ADMIN, true, null, CLI_ONLY);
     public static final Operation USER_PASSWD = new Operation("user.passwd", Scope.ADMIN, true, null, CLI_ONLY);
@@ -259,6 +271,8 @@ public final class ControlOperations {
             PIPELINE_LOGS,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,
+            PIPELINE_DERIVED_SCHEMA,
+            PIPELINE_ACCEPT_DERIVED_SCHEMA,
             USER_CREATE,
             USER_PASSWD,
             USER_LIST,
