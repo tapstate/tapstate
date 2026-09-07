@@ -120,9 +120,11 @@ class HazelcastConfiguration {
      *
      * <p>Only with a store behind them, for the reason the store binding above gives: nest state must
      * outlive the process, so a map that keeps it in memory alone is not a smaller version of this. A run
-     * with no store drives no pipeline, so no vertex ever asks for a state map.
+     * with no store drives no pipeline, so no vertex ever asks for a state map. {@code nestStateStore} is
+     * therefore allowed to be null and is not annotated as such: this is not a bean method, so nothing
+     * reads the annotation, and the one that would be written here is deprecated.
      */
-    static void makeNestCapable(HazelcastInstance member, @Nullable KeyedStateStore nestStateStore,
+    static void makeNestCapable(HazelcastInstance member, KeyedStateStore nestStateStore,
             NestSettings nestSettings) {
         if (nestStateStore == null) {
             return;

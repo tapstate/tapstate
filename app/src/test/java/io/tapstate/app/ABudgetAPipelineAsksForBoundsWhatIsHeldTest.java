@@ -71,19 +71,18 @@ class ABudgetAPipelineAsksForBoundsWhatIsHeldTest {
         }
 
         long resident = map.getLocalMapStats().getOwnedEntryCount();
+        // Both directions in one claim, because each rules out a different way of passing. Above the
+        // write count and the budget bounded nothing: the configuration reads back as the number asked
+        // for, the substrate reports nothing, and the only trace is this count. Far below it and
+        // something other than the budget removed the entries, or nothing was measured at all - a
+        // reading of zero would satisfy an upper bound on its own.
         assertThat(resident)
-                .describedAs("%d entries were written under a budget of %d and %d are still in memory. A "
-                        + "budget that bounds nothing is not a slower run, it is a member that fills up "
-                        + "with every reading healthy: the configuration reads back as the number asked "
-                        + "for, the substrate reports nothing, and the only trace is this count. The "
-                        + "budget is spent per partition, so what should be left is about one entry each",
-                        WRITTEN, BUDGET, resident)
-                .isLessThan(WRITTEN);
-        assertThat(resident)
-                .describedAs("%d entries left resident under a budget of %d is less than the budget itself "
-                        + "- so what is being measured is not the budget being applied but something "
-                        + "dropping entries for another reason", resident, BUDGET)
-                .isGreaterThan(BUDGET / 2);
+                .describedAs("%d entries were written under a budget of %d and %d are resident. All of "
+                        + "them means the budget bounds nothing, which is not a slower run but a member "
+                        + "that fills up with every reading healthy; almost none of them means they went "
+                        + "somewhere this case is not about. The budget is spent per partition, so what "
+                        + "should be left is near it", WRITTEN, BUDGET, resident)
+                .isBetween(BUDGET / 2, (long) WRITTEN - 1);
     }
 
     /**
