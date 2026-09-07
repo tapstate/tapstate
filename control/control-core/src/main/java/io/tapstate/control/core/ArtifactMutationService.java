@@ -80,6 +80,33 @@ public final class ArtifactMutationService {
             StateStore state,
             ObservationStore observations,
             SrsMetaStore srsMeta,
+            AuditGate auditGate,
+            DataBrowserFollows follows) {
+        this(store, desired, state, observations, srsMeta, new DerivedSchemaStore() {
+            @Override
+            public java.util.Optional<io.tapstate.spi.store.DerivedSchema> latest(
+                    String pipelineId, String stepId) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public void record(String pipelineId, String stepId, Map<String, String> schema,
+                    String statement, String derivedFrom, String derivedBy) {
+                throw new UnsupportedOperationException("derived schemas are not configured");
+            }
+
+            @Override
+            public void delete(String pipelineId) {
+            }
+        }, auditGate, follows);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            SrsMetaStore srsMeta,
             DerivedSchemaStore derivedSchemas,
             AuditGate auditGate,
             DataBrowserFollows follows) {

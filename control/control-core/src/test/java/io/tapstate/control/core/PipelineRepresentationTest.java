@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -142,7 +143,7 @@ class PipelineRepresentationTest {
                         Step.inline(
                                 "orders_with_customer",
                                 FromClause.aliases(orderCustomerAliases()),
-                                new TransformBody.Join("duckdb", "select * from order"),
+                                new TransformBody.Join(JoinEngine.BUILTIN, "select * from order"),
                                 null,
                                 null)),
                 new ViewBlock.Use("warehouse_orders", "warehouse_orders", FromRef.literal("orders_with_customer")),

@@ -8,6 +8,7 @@ import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.NestOrder;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
@@ -143,7 +144,8 @@ public final class PipelineRepresentation {
                             path + ".max_elements_per_document"),
                     nestRoot(requiredObject(payload, "root", path), path + ".root"));
             case "join" -> new TransformBody.Join(
-                    requiredText(payload, "engine", path), requiredText(payload, "sql", path));
+                    enumValue(value(payload, "engine"), JoinEngine.values(), JoinEngine::yaml, path + ".engine"),
+                    requiredText(payload, "sql", path));
             default -> throw malformed(path + ".type has unsupported transform type " + type);
         };
     }
