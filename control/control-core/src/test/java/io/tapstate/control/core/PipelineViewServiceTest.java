@@ -123,12 +123,17 @@ class PipelineViewServiceTest {
         PipelineLayoutService service = new PipelineLayoutService(pipelines, layouts);
 
         String before = pipelines.get("daily").contentHash();
-        PipelineLayout layout = service.save("daily", Map.of(
-                "source:orders", new PipelineLayout.NodePosition(120.0, 240.0)),
-                new PipelineLayout.Viewport(-10.0, 20.0, 0.75));
+        PipelineLayoutView layout = service.save("daily", Map.of(
+                "source:orders", new PipelineLayoutView.NodePosition(120.0, 240.0)),
+                new PipelineLayoutView.Viewport(-10.0, 20.0, 0.75));
 
         assertThat(service.get("daily")).isEqualTo(layout);
-        assertThat(layouts.get("daily")).contains(layout);
+        assertThat(layouts.get("daily")).hasValueSatisfying(stored -> {
+            assertThat(stored.pipelineId()).isEqualTo(layout.pipelineId());
+            assertThat(stored.nodes()).containsEntry(
+                    "source:orders", new PipelineLayout.NodePosition(120.0, 240.0));
+            assertThat(stored.viewport()).isEqualTo(new PipelineLayout.Viewport(-10.0, 20.0, 0.75));
+        });
         assertThat(pipelines.get("daily").contentHash()).isEqualTo(before);
         assertThatThrownBy(() -> service.get("ghost"))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
