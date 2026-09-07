@@ -70,6 +70,14 @@ done
 
 die() { echo "docs-release.sh: $1" >&2; exit "${2:-2}"; }
 
+# `gh api` writes the error body to stdout, not stderr, when a request fails. An output taken
+# without its exit status is therefore that body, not the value asked for -- and it is non-empty,
+# which is exactly what the reader below tests for. So a failed read used to pass the emptiness
+# check and be carried on as a sha, all the way to `release create --target`, and the run then named
+# the release as the step that could not be done rather than the read. Hand back nothing when the
+# call failed, so an empty result means what the caller already assumes it means.
+api() { local out; out="$(gh api "$@" 2>/dev/null)" || return 1; printf '%s' "$out"; }
+
 case "$verb" in
     open|settle|retire) ;;
     "") die "no verb. Expected 'open', 'settle' or 'retire'" ;;
@@ -233,7 +241,7 @@ if [ "$state" = closed ]; then
         echo "$repo  site is published: tag $tag on main, and say so on the issue"
         exit 0
     fi
-    sha="$(gh api "repos/$repo/git/ref/heads/main" --jq '.object.sha' 2>/dev/null)"
+    sha="$(api "repos/$repo/git/ref/heads/main" --jq '.object.sha')"
     if [ -z "$sha" ]; then
         echo "$repo  cannot read main; leaving $tag to $owner" >&2
         exit 0

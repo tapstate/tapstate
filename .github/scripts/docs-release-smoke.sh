@@ -365,6 +365,45 @@ else
 fi
 rm -rf "$stub_dir"
 
+# --- settle's live path: a ref read that fails is not a sha -------------------------------------
+#
+# `gh api` writes the error body to stdout, not stderr, when a request fails. An output captured
+# without its exit status is therefore that body: non-empty, and not the value that was asked for.
+# The guard below it tests the result for emptiness, so a failed read passes the guard and the blob
+# is carried on as a sha -- handed to `gh release create --target`, which then fails, and the run
+# reports the wrong step as the one that could not be done. The release token reaches everything, so
+# every real release takes the other path and this has never been executed.
+stub_dir="$(mktemp -d)"
+cat > "$stub_dir/gh" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$GH_STUB_LOG"
+case "$*" in
+  "issue list"*)
+    printf '[{"title":"%s","state":"CLOSED","number":29}]\n' "$GH_STUB_TITLE"
+    exit 0 ;;
+  "api "*git/ref*)
+    # Fails the way the real gh does: the error body on stdout, a line on stderr, exit 1.
+    echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}'
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1 ;;
+  "release create"*) exit 1 ;;
+esac
+exit 0
+STUB
+chmod +x "$stub_dir/gh"
+
+# A repository that does not exist, so a stub that somehow is not picked up still writes nothing.
+log="$stub_dir/settle-ref-unreadable"; : > "$log"
+out="$(GH_STUB_LOG="$log" GH_STUB_TITLE="Release 0.4.1: publish the documentation site" \
+       DOCS_REPO="tapstate/docs-release-smoke-no-such-repo" PATH="$stub_dir:$PATH" \
+       bash "$script" settle 0.4.1 --notes-url "$url" 2>&1)"
+if ! grep -q 'issue list' "$log"; then
+    fail "the gh stub is the one that ran" "no calls recorded; the real gh may have been used"
+else
+    contains "a ref read that fails is reported as a ref that could not be read" "cannot read main" "$out"
+fi
+rm -rf "$stub_dir"
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "docs-release-smoke: all cases passed"
