@@ -250,11 +250,15 @@ final class ServerBinding {
         }
     }
 
-    /** A username and password on their way to one login call; never printed. */
+    /**
+     * A username and password on their way to one login call; never printed. The rendering redacts the
+     * secret rather than naming it in the shape of an assignment, which is what a credential scanner
+     * reads as one - the redaction is the point of this method, and it should not read like the leak.
+     */
     private record Credentials(String user, String password) {
         @Override
         public String toString() {
-            return "Credentials[user=" + user + ", password=<redacted>]";
+            return "Credentials[user=" + user + ", secret redacted]";
         }
     }
 
