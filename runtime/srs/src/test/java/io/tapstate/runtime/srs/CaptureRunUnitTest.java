@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
@@ -43,6 +44,7 @@ import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /**
  * The capture run unit assembles the snapshot phase, cdc phase, the self-built Jet ring source and the
@@ -1111,6 +1113,82 @@ class CaptureRunUnitTest {
         assertThat(port.cdcStart)
                 .as("the miner begins at the present with nothing recorded, whatever a consumer asked for")
                 .isEqualTo(CaptureStart.present());
+    }
+
+    /**
+     * A buffered tail refuses a past instant when this run is the one that starts the mining. Nothing has
+     * been mined yet and nothing from before this moment ever will be, so the ask cannot be met -- and the
+     * reader cannot see that for itself: an empty ring is the same shape whether its oldest change has
+     * aged out or has simply not arrived, which is why the refusal belongs here, where the miner's own
+     * start is decided.
+     *
+     * <p>Served rather than refused it is silent, and the silence is the whole of the defect: the pipeline
+     * comes up healthy, reports running, and reads only what is written from now on -- every change between
+     * the instant asked for and the moment the run came up is gone, with nothing thrown and nothing logged.
+     */
+    @Test
+    void aBufferedTailRefusesAPastInstantWhenThisRunIsWhatStartsTheMining() {
+        FakeSource port = new FakeSource(List.of(), List.of());
+
+        TapstateException refused = catchThrowableOfType(() -> runUnit(port, new InMemoryMeta()).start(
+                spec(ReadMode.CDC_ONLY, true, "chain-fresh-past-instant",
+                        StartFrom.at(Instant.parse("2020-01-01T00:00:00Z"))), e -> { }),
+                TapstateException.class);
+
+        assertThat(refused.code()).isEqualTo(CaptureError.START_FROM_OUTSIDE_WINDOW);
+        assertThat(refused.args())
+                .as("the refusal names what was asked for and how far back this buffer goes")
+                .containsEntry("requested", "2020-01-01T00:00:00Z")
+                .containsEntry("retention", "unset")
+                .containsKey("earliest");
+        assertThat(port.cdcStarted)
+                .as("it refuses before opening the source's stream, not after")
+                .isFalse();
+    }
+
+    /**
+     * The control on the case above: an instant this buffer will still cover is taken, not refused. Mining
+     * begins now, so a moment at or after that is reachable by waiting rather than unreachable, and an
+     * implementation that refused every instant on a fresh chain satisfies the case above while making the
+     * setting unusable on exactly the path it was extended for.
+     */
+    @Test
+    void aBufferedTailTakesAnInstantThisBufferWillStillCover() {
+        FakeSource port = new FakeSource(List.of(), List.of());
+
+        runUnit(port, new InMemoryMeta()).start(
+                spec(ReadMode.CDC_ONLY, true, "chain-fresh-reachable-instant",
+                        StartFrom.at(Instant.now().plusSeconds(3600))), e -> { });
+
+        assertThat(port.cdcStarted)
+                .as("nothing before the mining begins is missed, so there is nothing to refuse")
+                .isTrue();
+    }
+
+    /**
+     * A chain with a position to resume from is not refused, whatever instant was asked for. How far back
+     * its buffer will reach is that recorded position -- the source's own opaque token, which says nothing
+     * about a moment -- so the reachability this refusal turns on is not knowable here, and refusing on a
+     * guess would fail runs that were going to be served.
+     *
+     * <p>This is what makes the refusal a statement about a chain whose mining starts at the present, and
+     * not about past instants in general. The two readings agree everywhere except here.
+     */
+    @Test
+    void aChainWithAPositionToResumeFromIsNotRefusedWhateverWasAskedFor() {
+        InMemoryMeta meta = new InMemoryMeta();
+        MiningChainId chainId = MiningChainId.resolve(config(), "chain-resumed-past-instant");
+        meta.create(chainId.value(), null);
+        meta.advanceSourceReadOffset(chainId.value(), new ChainPosition(new SourceOrder(1L, 7L), "src-11"));
+
+        FakeSource port = new FakeSource(List.of(), List.of());
+        runUnit(port, meta).start(
+                spec(ReadMode.CDC_ONLY, true, "chain-resumed-past-instant",
+                        StartFrom.at(Instant.parse("2020-01-01T00:00:00Z"))), e -> { });
+
+        assertThat(port.cdcStart)
+                .as("the miner resumes; where its buffer reaches back to is not a moment this can compare")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
     }
 
     /**

@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.pipeline.StreamSource;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -15,6 +16,7 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 
+import java.time.Instant;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -181,9 +183,11 @@ public final class CaptureRunUnit {
                     LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
                     routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
                 }
+                CaptureStart minerStart = tailStart(meta, cid, CaptureStart.present());
+                refuseAnInstantThisBufferWillNeverReach(
+                        spec.startFrom(), minerStart, spec.retention());
                 subscription = Optional.of(CdcPhase.run(
-                        port, spec.config(), tailStart(meta, cid, CaptureStart.present()),
-                        routes, health));
+                        port, spec.config(), minerStart, routes, health));
                 String firstTable = tables.getFirst();
                 String firstRing = SrsRingbuffer.ringName(cid, firstTable);
                 ringSource = Optional.of(SrsRingSource.create(
@@ -350,6 +354,45 @@ public final class CaptureRunUnit {
                             : CaptureStart.resume(new SourcePosition(record.cdcStartPosition()));
                 })
                 .orElse(firstRun);
+    }
+
+    /**
+     * Refuses a {@code start_from} instant this buffer will never reach back to.
+     *
+     * <p>It fires in one state and no other: the miner is starting at the present, which is what a chain
+     * with nothing recorded resolves to. Nothing from before this moment is buffered, and nothing from
+     * before it ever will be, so the ask cannot be met by waiting -- it can only be met by not having
+     * asked. The reader that positions the consumer cannot make this call for itself: it sees an empty
+     * ring, and an empty ring is the same shape whether the change it wants aged out or has simply not
+     * been written yet, so refusing there would race the miner it shares a run with. Here the miner's own
+     * start is in hand and there is no race to lose.
+     *
+     * <p>Every other state is left alone, and deliberately. A miner resuming from a recorded position
+     * reaches back to that position -- the source's own opaque token, which says nothing about a moment --
+     * so how far back the buffer will go is not knowable here, and a refusal on a guess would fail runs
+     * that were going to be served. A start that lands inside a buffer holding something is the reader's
+     * refusal instead, which is the exact one: it compares against a change that is really there.
+     *
+     * <p>Serving such a start rather than refusing it is a silent loss, and the silence is the whole of
+     * it: the pipeline comes up, reports running, and reads only what is written from now on, while every
+     * change between the instant asked for and the moment it came up is gone with nothing thrown and
+     * nothing logged. Where the boundary sits is this member's clock against the instant the author wrote,
+     * so a member whose clock disagrees with the source's moves it by that difference -- bounded, named,
+     * and not a reason to prefer the silence.
+     */
+    private static void refuseAnInstantThisBufferWillNeverReach(
+            StartFrom startFrom, CaptureStart minerStart, String retention) {
+        if (!(startFrom instanceof StartFrom.At at) || !(minerStart instanceof CaptureStart.Present)) {
+            return;
+        }
+        Instant bufferedFrom = Instant.now();
+        if (!at.instant().isBefore(bufferedFrom)) {
+            return;
+        }
+        throw new TapstateException(CaptureError.START_FROM_OUTSIDE_WINDOW, Map.of(
+                "requested", at.instant().toString(),
+                "earliest", bufferedFrom.toString(),
+                "retention", retention == null ? "unset" : retention), null);
     }
 
     /**
