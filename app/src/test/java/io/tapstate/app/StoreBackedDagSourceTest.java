@@ -169,6 +169,51 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void a_source_model_that_moves_after_the_copy_leaves_the_copy_where_it_was() {
+        // The copy is a copy, not a live view of discovery. Assembled once, then the same connection is
+        // re-discovered and the table comes back with a column it did not have. A pipeline holding a
+        // reference answers with the new column here, and its input has changed shape with nobody
+        // adopting anything - no drift reported, no verb run - which is the whole of what separating
+        // the two models buys.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(filter("keep_even", "row.id % 2 == 0", FromRef.literal("orders_src"))),
+                null,
+                serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
+                null, null));
+        store.schemas.save(discoveredOrders(1L, new SourceField("id", "bigint", TapstateType.INT64)));
+        OpenRingGenerations.forSources(store, "orders_src");
+        new StoreBackedDagSource(store).dagFor("p");
+
+        store.schemas.save(discoveredOrders(2L,
+                new SourceField("id", "bigint", TapstateType.INT64),
+                new SourceField("note", "varchar", TapstateType.STRING)));
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(store.derivedSchemas.latest("p", "orders_src.orders"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+        // The move is one the product can see: the verb that exists to adopt it takes the new column.
+        // Without this half a fixture that never changed the physical model satisfies the assertion
+        // above, and reads exactly like a copy that held.
+        new StoreBackedDagSource(store).copySourceSchemas("p");
+        assertThat(store.derivedSchemas.latest("p", "orders_src.orders"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL", "note", "STRING NULL"));
+    }
+
+    /** The one source table above, at a discovery version, carrying the fields given. */
+    private static DiscoveredSourceModel discoveredOrders(long version, SourceField... fields) {
+        return new DiscoveredSourceModel("orders_src", "mysql", version, new SourceModel(List.of(
+                new SourceTable("orders", List.of(fields), List.of("id"), List.of()))));
+    }
+
+    @Test
     void a_view_declared_by_reference_materializes_like_an_inline_one() {
         // The wizard writes this form whenever an author reuses an existing view, so it is not a
         // grammar curiosity: the reference must reach the builder already expanded.
