@@ -37,15 +37,16 @@ import java.util.function.Supplier;
 
 /**
  * The resource-type-agnostic apply pipeline. {@link #plan} is the front half — validate -> canonical
- * -> hash: it parses each draft (structural + expression checks), validates the whole batch as one
+ * -> hash: it parses each draft (structural + expression checks), validates the submitted batch as one
  * closure (duplicate ids, reference closure, mode rules, and the connector capability matrix against
  * the catalog), judges the batch's row expressions against the columns of the tables its sources were
  * discovered to hold, then emits each resource's canonical form and content hash. It writes nothing. It reads the
  * schema store — an observation of what discovery found, never the config truth layer, which apply is
- * the one writer of — and reads the artifact truth layer to overlay submitted resources on the stored
- * workspace before validation. A draft carrying a precondition also reads its stored version to report
- * a stale edit before the atomic write check; a pipeline reads back the srs switches it has already
- * recorded so that an unedited file re-applies as a no-op.
+ * the one writer of. Typed online writes additionally read the artifact truth layer so validation can
+ * include only the relevant dependency/referrer closure; offline {@link #plan} keeps the historical
+ * contract that the submitted batch itself is the closure. A draft carrying a precondition also reads
+ * its stored version to report a stale edit before the atomic write check; a pipeline reads back the srs
+ * switches it has already recorded so that an unedited file re-applies as a no-op.
  * {@link #apply} runs a plan and then upserts each artifact into the store by its id, skipping the
  * write when the stored artifact's content hash is unchanged (a no-op).
  *
@@ -55,10 +56,10 @@ import java.util.function.Supplier;
  *
  * <p>Any validation failure aborts with the first coded {@code dsl.*} diagnostic before any upsert, and a
  * draft whose precondition has gone stale aborts the same way with {@code artifact.version-conflict};
- * nothing is written on either. The refusal is of the whole batch, never of the offending draft alone —
- * a batch is one closure, so letting half of it land would store a state nothing ever validated. The
- * candidate workspace is the closure: each submission overlays its id on every stored artifact, so
- * references resolve against the state that would exist after the write.
+ * nothing is written on either. The refusal is of the whole submitted batch, never of the offending
+ * draft alone — a batch is one closure, so letting half of it land would store a state nothing ever
+ * validated. For typed online writes, the stored workspace is used only to select the validation
+ * dependency/referrer closure and to guard those exact resources against concurrent drift.
  *
  * <p>The catalog is supplied per plan rather than fixed, so the online path validates against the live
  * capability view — the bundled snapshot with registered rows overlaid — and a connector registered at
@@ -260,13 +261,13 @@ public final class ApplyService {
     }
 
     /**
-     * Selects the resources that need discovered-schema semantic gates for an online typed write.
+     * Chooses the resource set that semantic validation and discovered-schema gates inspect.
      *
-     * <p>Workspace validation above always runs over the complete post-write candidate. The
-     * discovered gates are different: a typed source edit should not re-validate an unrelated
-     * pipeline against stale schema observations. Pipelines are included when they are transitively
-     * reachable through references to the submitted source (including inline serve sinks and
-     * reusable serve definitions); all non-pipeline resources remain available for wiring lookup.
+     * <p>Offline apply/validate preserves the original contract: the submitted batch is the closure, so
+     * only submitted resources are validated and unrelated stored artifacts cannot reject or warn on it.
+     * Typed online Source/Pipeline writes additionally select the stored dependency/referrer closure they
+     * actually read for validation. That closure is also the only set guarded against concurrent drift;
+     * the rest of the store is neither revalidated nor used as a global optimistic lock.
      */
     private static List<Resource> validationResources(
             List<Resource> candidate, List<Resource> submitted, ValidationScope scope) {
@@ -414,29 +415,14 @@ public final class ApplyService {
                             storedPipeline(stored, replacement.id()), replacement);
                 }
                 toWrite.add(prepared.resource());
-                // The declared version travels with the record, so a version-checked edit is
-                // distinguishable in the audit trail from a blind overwrite of the same id. A draft that
-                // declared none records none, which is what that absence then means.
                 String declared = plan.precondition(prepared.id());
                 audited.add(new AuditContext(principal, prepared.id(), declared));
-                // Only the ids this batch actually overwrites are guarded at the write. An unchanged
-                // artifact is not written, so there is nothing for its declared version to protect —
-                // plan() already compared it, and the comparison is all a caller asked for.
                 if (declared != null) {
                     enforced.put(prepared.id(), declared);
                 }
             }
             outcomes.add(outcome);
         }
-        // The changed set is audited per artifact, then written as one atomic batch: all of it lands or,
-        // on a write failure, none does.
-        //
-        // The declared versions are handed to the write rather than only to plan(). plan()'s comparison
-        // happens before a whole workspace validation and a schema-store read, so a second author
-        // editing the same id inside that window passes the same comparison and both writes land — the
-        // first author's edit is gone, and nothing anywhere reports it. Passing them here makes the
-        // comparison and the write one store operation, which is the only form of the check that
-        // survives a concurrent writer.
         return auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
             String conflicted = store.saveAll(toWrite, enforced).orElse(null);
             if (conflicted != null) {
@@ -446,7 +432,6 @@ public final class ApplyService {
         });
     }
 
-    /** The stored Pipeline under {@code id}, or null when this apply is creating it. */
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {
         return stored.stream()
                 .filter(PipelineResource.class::isInstance)
@@ -470,36 +455,6 @@ public final class ApplyService {
         ONLINE_SOURCE
     }
 
-    /**
-     * The tables each source in the batch was discovered to hold, keyed by the source's id — which is
-     * also the connection id its discovery is stored under. A source that has never been discovered is
-     * absent from the result rather than present and empty, so the rules can tell "discovered nothing"
-     * apart from "not discovered".
-     *
-     * <p>Each table keeps its own columns. Pooling a source's tables into one column list would have to
-     * call a column two of them type differently unresolved, and one database naming a column
-     * {@code id} in two unrelated tables, typed differently, is the ordinary shape of a database rather
-     * than a corner of it — pooled, the gate would refuse most expressions on most real databases. The
-     * rules judge an expression against the table it reads, so the tables are handed over apart.
-     *
-     * <p>A model counts only when it was discovered through the connector this source now names. Types
-     * are resolved against the declaring connector's own vocabulary, so a model another connector
-     * produced carries types this source's columns were never described in - reading it would be
-     * judging one source's expression against a different source's answers. Keeping the connection's id
-     * across such a change does not make the old model apply to the new connector, so a mismatch reads
-     * as undiscovered: the author is asked to discover, and discovering is what makes it true.
-     *
-     * <p>What this does not check is whether the model is current. The stored model is what the last
-     * discovery found, and the source it describes can change afterwards without anything here
-     * changing - the connection settings can be edited, or the database itself altered under settings
-     * that never moved. The check is against the last discovery, by design, and only a fresh discovery
-     * makes it fresh.
-     *
-     * <p>A batch carrying no pipeline is answered without reading the store at all. Only a pipeline
-     * holds a row expression, so there would be nothing to judge what was read against - and a batch
-     * of endpoints alone is an ordinary thing to apply, which would otherwise pay a store round trip
-     * per source for an answer nobody consults.
-     */
     private Map<String, List<DiscoveredTable>> discoveredTables(List<Resource> resources) {
         Map<String, List<DiscoveredTable>> bySource = new LinkedHashMap<>();
         if (resources.stream().noneMatch(PipelineResource.class::isInstance)) {
@@ -518,11 +473,6 @@ public final class ApplyService {
                             for (SourceField field : table.fields()) {
                                 columns.put(field.name(), field.type());
                             }
-                            // The row count travels with the columns, absence and all: a table nobody
-                            // counted has to stay distinguishable from one counted and found empty.
-                            // The declared key travels the same way, and for the same reason a rule
-                            // about writes needs it: whether a write can be matched to an existing
-                            // row is a property of the table, decided where the table is described.
                             tables.add(new DiscoveredTable(
                                     table.name(), columns, table.primaryKey(),
                                     table.approximateRowCount()));
@@ -533,7 +483,6 @@ public final class ApplyService {
         return bySource;
     }
 
-    /** Classifies one prepared artifact without mutating the store. */
     private ArtifactOutcome outcome(PreparedArtifact prepared) {
         Optional<Resource> existing = store.get(prepared.id());
         ArtifactOutcome.Change change = existing.isEmpty()
@@ -544,17 +493,10 @@ public final class ApplyService {
         return new ArtifactOutcome(prepared.id(), prepared.kind(), change, prepared.contentHash());
     }
 
-    /** The content hash of a stored artifact, recomputed over its canonical form for the no-op check. */
     private String storedHash(Resource stored) {
         return CanonicalHash.of(writer.write(stored));
     }
 
-    /**
-     * Refuses a draft whose optional precondition no longer names the stored version. A draft without
-     * one is left alone, which is what keeps a caller that never asked for the check from ever being
-     * refused by it. An id that is not stored at all cannot match any version, and is reported as
-     * absent rather than as a conflict, so an author whose target was deleted is told what happened.
-     */
     private void requireCurrentVersion(ArtifactDraft draft, Resource parsed) {
         String expected = draft.expectedContentHash();
         if (expected == null) {
@@ -572,7 +514,6 @@ public final class ApplyService {
         try {
             return parser.parse(draft.content());
         } catch (DslException e) {
-            // A parse error is located at exactly this draft; attribute it when the origin is known.
             throw draft.source() != null ? e.withSource(draft.source()) : e;
         }
     }
