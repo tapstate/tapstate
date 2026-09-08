@@ -65,42 +65,61 @@ final class TargetModelResolver {
         Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-            for (String table : resolution.tables()) {
-                discoveredTable(source, table).map(TargetModelResolver::toTargetTable)
-                        .ifPresent(target -> targets.putIfAbsent(table, target));
-            }
+            resolveAll(source, SourceDiscovery.model(storePort, source)).forEach(targets::putIfAbsent);
         }
         return Collections.unmodifiableMap(new LinkedHashMap<>(targets));
     }
 
     /** Resolves one target model per selected table of the source that feeds a sink. */
     Map<String, TargetTable> resolveAll(String sourceId) {
-        Map<String, TargetTable> targets = new LinkedHashMap<>();
         SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-        SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-        for (String table : resolution.tables()) {
-            discoveredTable(source, table).map(TargetModelResolver::toTargetTable)
-                    .ifPresent(target -> targets.put(table, target));
-        }
-        return Collections.unmodifiableMap(targets);
+        return resolveAll(source, SourceDiscovery.model(storePort, source));
     }
 
     /** Resolves the first selected table for callers that still require a single target. */
     ResolvedTarget resolve(String sourceId) {
         SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-        String table = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source)).table();
-        return new ResolvedTarget(table, resolveAll(sourceId).get(table));
+        SourceModel discovered = SourceDiscovery.model(storePort, source);
+        String table = SourceCaptureResolution.of(source, discovered).table();
+        return new ResolvedTarget(table, resolveAll(source, discovered).get(table));
+    }
+
+    /**
+     * One source's selected tables resolved against a model already in hand.
+     *
+     * <p><b>The discovery is read once, by the caller, and handed in.</b> It is stored per connection
+     * and holds every table of that connection, so reading it again for each selected table asks the
+     * store the same question once per table for one answer - and then walks the whole model looking
+     * for a single name, which is that cost a second time. Neither shows in an answer: the resolution
+     * is identical either way, and the difference only appears on a connection with many tables, which
+     * is exactly where it is paid. The model is indexed by name here for the second half of it.
+     */
+    private Map<String, TargetTable> resolveAll(SourceResource source, SourceModel discovered) {
+        Map<String, SourceTable> byName = tablesByName(discovered);
+        Map<String, TargetTable> targets = new LinkedHashMap<>();
+        for (String table : SourceCaptureResolution.of(source, discovered).tables()) {
+            SourceTable found = byName.get(table);
+            if (found != null) {
+                targets.put(table, toTargetTable(found));
+            }
+        }
+        return Collections.unmodifiableMap(targets);
+    }
+
+    /**
+     * A discovered model's tables by name, first of a repeated name winning - which is the one the
+     * per-table search this replaces would have found.
+     */
+    private static Map<String, SourceTable> tablesByName(SourceModel discovered) {
+        Map<String, SourceTable> byName = new LinkedHashMap<>();
+        if (discovered != null) {
+            discovered.tables().forEach(table -> byName.putIfAbsent(table.name(), table));
+        }
+        return byName;
     }
 
     /** One source's table paired with the target model discovered for it, or a null model when none was. */
     record ResolvedTarget(String sourceTable, TargetTable target) {
-    }
-
-    /** The named table in the source's persisted discovery model, or empty when neither is present. */
-    private Optional<SourceTable> discoveredTable(SourceResource source, String table) {
-        return Optional.ofNullable(SourceDiscovery.model(storePort, source))
-                .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(table)).findFirst());
     }
 
     /**
