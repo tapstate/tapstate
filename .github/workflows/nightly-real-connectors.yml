@@ -8,7 +8,7 @@ on:
     - cron: "30 19 * * *"
 
 concurrency:
-  group: real-connectors-${{ github.ref }}
+  group: real-connectors-sharded-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

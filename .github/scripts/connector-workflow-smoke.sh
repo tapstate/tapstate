@@ -40,6 +40,8 @@ def check(text):
     assert 'connector-cache.sh prepare' in jars and 'connector-cache.sh seal' in jars and 'connector-cache.sh verify' in jars
     assert '-nsu -Dmaven.repo.local=' in jars
     assert '-Dit.test=' not in text  # No second selector list can drift from source inventory.
+assert 'group: real-connectors-sharded-${{ github.ref }}' in workflow
+assert 'cancel-in-progress: true' in workflow
 check(workflow)
 assert release.count('sleep 20')==2 and 'sleep 60' not in release
 for before,after in [
