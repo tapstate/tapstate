@@ -249,6 +249,35 @@ class NodeColumnsTest {
     }
 
     @Test
+    @DisplayName("down a whole chain, one column nobody can type and one step that went dark stay apart")
+    void aChainKeepsTheColumnItCannotTypeApartFromTheStepThatWentDark() {
+        // What this adds over the case above, which walks one hop off a dark node: a chain, and the
+        // two unknowns a pipeline actually produces standing in it at once. They are different in
+        // kind and are acted on differently - one column of an otherwise answered model that no type
+        // covers sends a reader to the expression that wrote it, while a step that settles its own
+        // columns while it runs sends them to the step. Folded into one answer, the first reads as
+        // the second and the whole model below it reads as unknowable.
+        NodeColumns stamped = NodeColumns.of(map(rules("stamped", FieldRule.computed("now()"))),
+                one(upstream()), null);
+        NodeColumns script = NodeColumns.of(
+                new TransformBody.Js("function process(r, ctx) { return r; }"), one(stamped), null);
+        NodeColumns end = NodeColumns.of(map(rules("area", FieldRule.rename("region"))), one(script), null);
+
+        // A timestamp is outside every type a column holds, so that one column is unknown while the
+        // model around it is still answered - the columns beside it keep the types they arrived with.
+        assertThat(stamped.known()).isTrue();
+        assertThat(stamped.columns()).containsEntry("stamped", "UNKNOWN NULL");
+        assertThat(stamped.columns()).containsEntry("region", "STRING NULL");
+        // The script is the other kind: not a column, the whole step.
+        assertThat(script.known()).isFalse();
+        assertThat(script.unknownBecause()).startsWith("js:");
+        // And at the end of the chain the reason is still the script's own, word for word, rather
+        // than the last step's - which is the step a reader would otherwise be sent to.
+        assertThat(end.known()).isFalse();
+        assertThat(end.unknownBecause()).isEqualTo(script.unknownBecause());
+    }
+
+    @Test
     @DisplayName("a serve block hands back every push node it carries, and none when it carries none")
     void aServeBlockHandsBackEveryPushNodeItCarries() {
         PushElement first = push(PushFormat.cel("record"));
