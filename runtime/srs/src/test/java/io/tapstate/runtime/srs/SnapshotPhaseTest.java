@@ -3,6 +3,7 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -75,6 +76,21 @@ class SnapshotPhaseTest {
         assertThat(sink).containsExactlyElementsOf(
                 rows.stream().map(r -> r.withOrder(SourceOrder.snapshotRow(1L))).toList());
         assertThat(count).isEqualTo(3);
+    }
+
+    @Test
+    void narrowingASnapshotReadKeepsThePipelineNodeThatScopesConnectorState() {
+        FakePort port = new FakePort(new FakeBatch(List.of(row(1)), "p0"));
+        CaptureConfig scoped = multiTableConfig().at(new PipelineNode("orders_pipeline", "orders_source"));
+
+        SnapshotPhase.run(
+                port, scoped, "chain", PIPE, List.of("orders"),
+                1L, new RecordingMeta(new ArrayList<>()), e -> { });
+
+        assertThat(port.configs).singleElement().satisfies(read -> {
+            assertThat(read.streams()).containsExactly("orders");
+            assertThat(read.node()).isEqualTo(new PipelineNode("orders_pipeline", "orders_source"));
+        });
     }
 
     @Test
@@ -520,6 +536,7 @@ class SnapshotPhaseTest {
         private final FakeBatch batch;
         private final Map<String, FakeBatch> byTable;
         final List<List<String>> asked = new ArrayList<>();
+        final List<CaptureConfig> configs = new ArrayList<>();
 
         FakePort(FakeBatch batch) {
             this.batch = batch;
@@ -534,6 +551,7 @@ class SnapshotPhaseTest {
         @Override
         public CaptureBatch snapshot(CaptureConfig config) {
             asked.add(config.streams());
+            configs.add(config);
             return byTable == null ? batch : byTable.get(config.streams().getFirst());
         }
 

@@ -198,6 +198,20 @@ public enum ConnectorError implements TapstateErrorCode {
     READ_TIMEOUT("connector.read-timeout", Set.of("connector", "timeout")),
 
     /**
+     * A connector asked to keep a value whose type this build has no encoding for. Refused where it is
+     * written rather than coerced: a value stringified on the way in reads back as text and passes for
+     * what was stored, and the connector that wrote a number finds one only when it casts.
+     */
+    STATE_VALUE_UNSUPPORTED("connector.state-value-unsupported", Set.of("type")),
+
+    /**
+     * A stored connector note cannot be read back - a format or a tag from a later build, or bytes that
+     * end early. Reported rather than treated as absent, because absent is what a connector reads as
+     * "this is my first run", and acting on that quietly discards whatever it had recorded.
+     */
+    STATE_UNREADABLE("connector.state-unreadable", Set.of("detail")),
+
+    /**
      * A connector's own stream position could not be written down, so this source has no position to
      * record and nothing a later run could resume from. {@code connector} is the connector id;
      * {@code detail} is why the position could not be rendered. Reporting no position instead would

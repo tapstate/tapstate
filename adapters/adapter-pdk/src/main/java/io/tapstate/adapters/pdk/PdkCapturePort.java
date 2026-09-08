@@ -12,6 +12,7 @@ import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.capture.TableSchema;
 import io.tapdata.entity.event.TapBaseEvent;
 import io.tapdata.entity.event.TapEvent;
@@ -56,9 +57,16 @@ public final class PdkCapturePort implements CapturePort {
     private static final long SHUTDOWN_JOIN_MILLIS = 2000;
 
     private final ConnectorProvisioner provisioner;
+    private final KeyedStateStore stateStore;
 
+    /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
+        this(provisioner, null);
+    }
+
+    public PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
         this.provisioner = provisioner;
+        this.stateStore = stateStore;
     }
 
     @Override
@@ -142,7 +150,7 @@ public final class PdkCapturePort implements CapturePort {
 
     @Override
     public ConnectionReport testConnection(CaptureConfig config) {
-        PdkConnector connector = open(config);
+        PdkConnector connector = openUnscoped(config);
         try {
             Probe probe = read(connector, () -> probe(connector, config));
             DiscoveredSchema schema = toDiscoveredSchema(probe.tables());
@@ -156,7 +164,7 @@ public final class PdkCapturePort implements CapturePort {
 
     @Override
     public DiscoveredSchema discoverSchema(CaptureConfig config) {
-        PdkConnector connector = open(config);
+        PdkConnector connector = openUnscoped(config);
         try {
             List<TapTable> tables = read(connector, () -> discover(connector, config.streams()));
             return toDiscoveredSchema(tables);
@@ -168,8 +176,28 @@ public final class PdkCapturePort implements CapturePort {
 
     // ---- drive helpers ---------------------------------------------------------------------------
 
+    /**
+     * Opens the connector for a drive that keeps notes: the node on the config says where they belong,
+     * so the full load and the change tail of one run file under one name and read each other's.
+     */
     private PdkConnector open(CaptureConfig config) {
-        return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
+        return open(config, ConnectorStateNamespace.of(config.node()));
+    }
+
+    /**
+     * Opens the connector for a drive that keeps nothing. A connection test and a schema discovery each
+     * live for the single call that made them, so there is no later drive for anything they wrote to be
+     * read back by — filing it would leave a record with no reader. The node is ignored here rather than
+     * assumed absent: whether these two scope state is decided at this seam, not by what a caller
+     * happened to put on the config.
+     */
+    private PdkConnector openUnscoped(CaptureConfig config) {
+        return open(config, null);
+    }
+
+    private PdkConnector open(CaptureConfig config, String stateNamespace) {
+        return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
+                stateNamespace, stateStore);
     }
 
     /**

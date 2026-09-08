@@ -8,6 +8,7 @@ import io.tapdata.entity.event.dml.TapRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
 import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.TapTable;
+import io.tapdata.entity.utils.cache.KVMap;
 import io.tapdata.pdk.apis.TapConnector;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
@@ -30,6 +31,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -105,6 +107,13 @@ public class CsvConnector implements TapConnector {
 
     private static final long POLL_MILLIS = 100;
 
+    /**
+     * The key this connector files its own name under, in the notepad the engine hands it. Public because
+     * the witness that reads the notepad out of the store has to name the same key, and a copy of the
+     * string in the test is a copy that can drift.
+     */
+    public static final String IDENTITY = "csv-source-identity";
+
     /** Set by {@code stop}; the tail also honours its thread's interrupt. Both signals arrive on cancel. */
     private volatile boolean stopped;
 
@@ -116,8 +125,10 @@ public class CsvConnector implements TapConnector {
         functions
                 .supportBatchRead((context, table, offset, size, consumer) ->
                         consumer.accept(snapshot(context, table.getId()), null))
-                .supportStreamRead((context, tables, offset, size, consumer) ->
-                        tail(context, tables, consumer))
+                .supportStreamRead((context, tables, offset, size, consumer) -> {
+                    mintTheIdentityOnce(context);
+                    tail(context, tables, consumer);
+                })
                 // A streaming source states where its stream stands, and this one does the same. A snapshot
                 // samples it before reading its first row and hands it on as the seam the tail joins at; a
                 // source that names no position leaves that join to guesswork, which a snapshot followed by
@@ -134,6 +145,26 @@ public class CsvConnector implements TapConnector {
                 .supportGetTableInfoFunction(CsvConnector::tableInfo)
                 .supportExecuteCommandFunction((context, command, consumer) ->
                         consumer.accept(execute(context, command)));
+    }
+
+    /**
+     * Writes the name this source knows itself by, once, and never again - the shape a real connector's
+     * own memory takes, reduced to the part the engine is responsible for. A PostgreSQL source records the
+     * replication slot it created; a change-data reader records the server name its recorded positions are
+     * filed under. Both are minted on a first run, looked up on every run after, and unrecoverable when the
+     * notepad handed over is empty: the connector concludes it has never run here and mints another.
+     *
+     * <p>Nothing in this connector ever reads the value back. Being handed back the same bytes is the whole
+     * of its job, which is what makes it usable as a witness: a fresh value where the old one should be is
+     * exactly the failure a real connector suffers, and it is visible without a real database to suffer it
+     * on. It is minted on the stream read rather than the snapshot because that is where a real one mints
+     * it - the drive that needs a name to file positions under.
+     */
+    private static void mintTheIdentityOnce(TapConnectorContext context) {
+        KVMap<Object> notes = context.getStateMap();
+        if (notes.get(IDENTITY) == null) {
+            notes.put(IDENTITY, UUID.randomUUID().toString());
+        }
     }
 
     @Override

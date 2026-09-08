@@ -1277,6 +1277,11 @@ class StorePortTest {
                 }
 
                 @Override
+                public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+                    return Optional.ofNullable(keyedState.putIfAbsent(namespace + "/" + key, state));
+                }
+
+                @Override
                 public void delete(String namespace, String key) {
                     keyedState.remove(namespace + "/" + key);
                 }

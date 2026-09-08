@@ -164,6 +164,12 @@ class AWriteOntoAKeyHoldingNothingDoesNotFetchWhatIsNotThereTest {
         }
 
         @Override
+        public synchronized Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            SAVES.incrementAndGet();
+            return Optional.ofNullable(held.putIfAbsent(key, state));
+        }
+
+        @Override
         public synchronized void delete(String namespace, String key) {
             held.remove(key);
         }

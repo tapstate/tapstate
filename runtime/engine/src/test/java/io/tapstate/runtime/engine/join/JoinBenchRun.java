@@ -820,6 +820,11 @@ class JoinBenchRun {
         }
 
         @Override
+        public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            return Optional.ofNullable(entries(namespace).putIfAbsent(key, state));
+        }
+
+        @Override
         public void delete(String namespace, String key) {
             entries(namespace).remove(key);
         }

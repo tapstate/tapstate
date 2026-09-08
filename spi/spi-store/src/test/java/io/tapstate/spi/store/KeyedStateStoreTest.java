@@ -89,6 +89,11 @@ class KeyedStateStoreTest {
         }
 
         @Override
+        public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            return Optional.ofNullable(entries.putIfAbsent(namespace + " " + key, state));
+        }
+
+        @Override
         public void delete(String namespace, String key) {
             entries.remove(namespace + " " + key);
         }

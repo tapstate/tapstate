@@ -10,6 +10,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
@@ -222,12 +223,10 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
               sync: [ { id: sync_1, source: orders_dest } ]
             """;
 
-    /**
-     * Every namespace this pipeline's holdings name, flattened. A stop clears by namespace, so what is
-     * asserted here is the union rather than which holding each one arrived under.
-     */
+    /** Every operator namespace this pipeline names, without unrelated connector holdings. */
     private static Set<String> namespacesHeldBy(InMemoryStorePort store) {
         return new StoreBackedDagSource(store).stateHeldBy(PIPELINE).stream()
+                .filter(holding -> holding.label().equals(PipelineStateInventory.OPERATOR_STATE.label()))
                 .map(PipelineStateHolding::namespaces)
                 .flatMap(Set::stream)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
