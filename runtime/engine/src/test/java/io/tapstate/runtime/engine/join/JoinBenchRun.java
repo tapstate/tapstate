@@ -200,12 +200,14 @@ class JoinBenchRun {
                 throw new AssertionError("the control and carrier reached the state differently: "
                         + control.workShape() + " / " + carrier.workShape());
             }
-            if (control.timing().equals(comparison.before())
-                    || control.timing().equals(comparison.after())) {
-                System.out.println(control.row());
-            }
         }
+        Result before = controls.stream().filter(row -> row.timing().equals(comparison.before()))
+                .findFirst().orElseThrow();
+        Result after = controls.stream().filter(row -> row.timing().equals(comparison.after()))
+                .findFirst().orElseThrow();
+        System.out.println(before.row());
         System.out.println(carrier.row());
+        System.out.println(after.row());
         System.out.printf(java.util.Locale.ROOT,
                 "# comparison %s/%s ratio=%.3f carrierMs=%.3f controlMs=%.3f%n",
                 name, tier, comparison.ratio(), carrier.nanos() / 1e6,
