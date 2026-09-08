@@ -119,6 +119,13 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
         // The copy, and nothing gated. What holds a join to the columns it was recorded producing is the
         // start's business: refusing here would refuse a whole batch of unrelated resources over one
         // pipeline whose source widened a column, which is not something the author applying can act on.
+        //
+        // Nor is this refused while a job is carrying the pipeline, where accepting is. The two are not
+        // the same act: this moves a source node's copy, which nothing running was assembled from - a
+        // join recompiles its columns from the discovery itself - so the record and the job going on
+        // still agree afterwards. That holds only while the copy has no reader below it. The day a step
+        // works its own columns out from the copy rather than from the discovery, this call starts
+        // moving what a run was assembled from, and it needs the same refusal accepting has.
         joins.copySourceSchemas(pipelineId);
     }
 
