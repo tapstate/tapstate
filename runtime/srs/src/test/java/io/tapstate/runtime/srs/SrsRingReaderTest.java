@@ -6,6 +6,7 @@ import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.AfterAll;
@@ -19,6 +20,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /**
  * The per-consumer ring reader tails one per-table change ring, advancing a run-local cursor by
@@ -267,11 +269,73 @@ class SrsRingReaderTest {
     }
 
     @Test
-    void fromAnInstantOlderThanEveryBufferedChangeReplaysFromHead() {
-        // The ring only goes back so far: an instant older than everything buffered clamps to the head —
-        // the earliest change still available — rather than inventing history the buffer no longer holds.
+    void theSameMomentWrittenInTwoZonesStartsTheRingAtTheSamePlace() {
+        // One moment, two spellings a person may reasonably write. The buffered path resolves a
+        // time-form start by walking the ring, which is not the code that hands an instant to a
+        // connector -- so the equivalence has to be said here too, or it holds on one path only.
+        String asUtc = "2026-09-01T10:00:00Z";
+        String asOffset = "2026-09-01T18:00:00+08:00";
+        long moment = Instant.parse(asUtc).toEpochMilli();
+
+        List<SrsItem> fromUtc = new ArrayList<>();
+        SrsRingReader.from(
+                        filledWith("srs.start.zones.utc", moment - 2000, moment - 1000, moment, moment + 1000),
+                        StartFrom.parse(asUtc))
+                .fill((item, seq) -> fromUtc.add(item), 10);
+
+        List<SrsItem> fromOffset = new ArrayList<>();
+        SrsRingReader.from(
+                        filledWith("srs.start.zones.offset", moment - 2000, moment - 1000, moment, moment + 1000),
+                        StartFrom.parse(asOffset))
+                .fill((item, seq) -> fromOffset.add(item), 10);
+
+        // Both assertions, and the pair is the point. An implementation that read the text against the
+        // server's own zone lands on the right two changes for the Z spelling and on a different pair
+        // for the offset one -- so the first assertion alone is green while the start is wrong.
+        assertThat(fromUtc).extracting(i -> i.after().get("id"))
+                .as("a start at the moment itself takes the changes at or after it")
+                .containsExactly(2, 3);
+        assertThat(fromOffset).extracting(i -> i.after().get("id"))
+                .as("the same moment written with an offset is the same start, not a shifted one")
+                .containsExactly(2, 3);
+    }
+
+    @Test
+    void fromAnInstantOlderThanEveryBufferedChangeRefusesRatherThanStartingAtTheHead() {
+        // The buffer only goes back so far, and starting at its head instead is silent: the reader comes
+        // up healthy and streams a different stretch than the one asked for, with nothing saying so. The
+        // refusal has to carry all three of what was asked for, what is still held, and the retention that
+        // decides how far back that goes -- with any of them missing the reader cannot act on it.
+        assertThatThrownBy(() -> SrsRingReader.from(
+                filledWith("srs.start.at-old", 100, 200),
+                StartFrom.at(Instant.ofEpochMilli(50)),
+                seq -> { },
+                "6h"))
+                .isInstanceOf(TapstateException.class)
+                .extracting(e -> ((TapstateException) e).code())
+                .isEqualTo(CaptureError.START_FROM_OUTSIDE_WINDOW);
+    }
+
+    @Test
+    void theRefusalNamesWhatWasAskedForWhatIsHeldAndTheRetention() {
+        TapstateException refused = catchThrowableOfType(() -> SrsRingReader.from(
+                filledWith("srs.start.at-old-args", 100, 200),
+                StartFrom.at(Instant.ofEpochMilli(50)),
+                seq -> { },
+                "6h"), TapstateException.class);
+
+        assertThat(refused.args())
+                .containsEntry("requested", Instant.ofEpochMilli(50).toString())
+                .containsEntry("earliest", Instant.ofEpochMilli(100).toString())
+                .containsEntry("retention", "6h");
+    }
+
+    @Test
+    void fromTheOldestBufferedChangeItselfIsStillAccepted() {
+        // The control for the two above: this is a judgement about the window, not "anything old is
+        // refused". Without it an implementation that rejects every instant would satisfy them both.
         SrsRingReader reader = SrsRingReader.from(
-                filledWith("srs.start.at-old", 100, 200), StartFrom.at(Instant.ofEpochMilli(50)));
+                filledWith("srs.start.at-head", 100, 200), StartFrom.at(Instant.ofEpochMilli(100)));
         List<SrsItem> out = new ArrayList<>();
 
         assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(2);

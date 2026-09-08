@@ -13,6 +13,7 @@ import com.hazelcast.jet.Job;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -34,8 +35,10 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -48,6 +51,7 @@ import java.time.Duration;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -122,7 +126,7 @@ class CaptureToSinkDataFlowTest {
         artifacts.save(new SourceResource(SOURCE_ID, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(TABLE)), null, null, null));
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SOURCE_ID),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE_ID, true)),
                 List.of(Step.inline("keep_even", io.tapstate.core.model.FromClause.list(FromRef.literal(SOURCE_ID)),
                         new TransformBody.Filter("after.id % 2 == 0"), null, null)),
                 null,
@@ -169,14 +173,14 @@ class CaptureToSinkDataFlowTest {
         try {
             awaitSinkSize(2);
         } finally {
-            actuator.stop(PIPELINE);
+            actuator.stop(PIPELINE, true);
         }
 
         // The sink saw exactly the even-id changes the filter kept, after the transform, in read order, each
         // carrying the injected stream name and the source position the projection lifted from the ring item.
         // Their arrival proves the whole path AND that the capture and the reader derived the same ring.
         assertThat(CapturingSinkWriter.collected())
-                .containsExactly(TABLE + "|w1|0", TABLE + "|w3|2");
+                .containsExactly(TABLE + "|src-0|0", TABLE + "|src-2|2");
 
         // Stop tore the capture down: the fake source's subscription was closed (the cdc daemon is gone, no
         // leak), the pipeline's Jet job is terminal, and the coordinator dropped the handle.
@@ -244,9 +248,9 @@ class CaptureToSinkDataFlowTest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             for (Envelope change : changes) {
-                listener.onEvent(change);
+                listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }
             return () -> cdcClosed = true;
         }
@@ -279,6 +283,13 @@ class CaptureToSinkDataFlowTest {
         @Override
         public Envelope next() {
             return events.next();
+        }
+
+        @Override
+        public Optional<SourcePosition> seam() {
+            // Sampled by the source before its first row. The run refuses to start a tail without one,
+            // because a tail that begins wherever it likes loses every change made while the snapshot ran.
+            return Optional.of(new SourcePosition("seam-0"));
         }
 
         @Override

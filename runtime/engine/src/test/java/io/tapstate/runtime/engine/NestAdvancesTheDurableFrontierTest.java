@@ -215,7 +215,7 @@ class NestAdvancesTheDurableFrontierTest {
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
                 new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))));
 
-        Vertex sink = dag.newVertex("sink", SinkProcessor.metaSupplier(
+        Vertex sink = dag.newVertex("sink", SinkProcessor.metaSupplier("sink",
                 (SupplierEx<SinkWriter>) TakesEverything::new,
                 (SinkAckFactory) resolved -> (SinkAck) NestAdvancesTheDurableFrontierTest::record,
                 () -> new SettledFloor(AXES, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)));

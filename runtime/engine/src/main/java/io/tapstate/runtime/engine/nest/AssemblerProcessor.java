@@ -866,7 +866,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
         // way through therefore leaves pieces nobody reads rather than an address promising pieces that are
         // not there - and the change that started the move is replayed, because the frontier is held below
         // it until it lands, so they are written again.
-        parking.save(at, new ParkedSubtree(first, pieces));
+        parking.save(at, new ParkedSubtree(first, pieces), held == null);
         // Kept from the first hand-over onto this address rather than reset by a later one: what the frontier
         // must stay below is the earliest change still in flight, and how long this has been outstanding is
         // measured from when it started rather than from the last thing added to it.
@@ -950,7 +950,8 @@ public final class AssemblerProcessor extends AbstractProcessor {
                 if (now - entry.getValue().awaitedSince() >= migrationProtection) {
                     RootAssembly asItStands = store.load(key);
                     if (asItStands != null) {
-                        Touched document = landed.computeIfAbsent(key, ignored -> new Touched(asItStands));
+                        Touched document = landed.computeIfAbsent(key,
+                                ignored -> new Touched(asItStands, false));
                         document.ts = Math.max(document.ts, entry.getValue().ts());
                     }
                     pending.remove();
@@ -966,7 +967,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
                 if (assembly == null) {
                     continue;
                 }
-                document = new Touched(assembly);
+                document = new Touched(assembly, false);
                 landed.put(key, document);
             }
             document.ts = Math.max(document.ts, entry.getValue().ts());
@@ -1068,7 +1069,8 @@ public final class AssemblerProcessor extends AbstractProcessor {
                             return;
                         }
                         waiting.remove(key);
-                        if (mayGoOutNow(key)) {
+                        Map<String, ChainPosition> unsent = document.assembly.lowestUnsentByChain();
+                        if (mayGoOutNow(key, unsent)) {
                             outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
                                     .withPositions(document.assembly.covered())
                                     // Said out loud, because a field that stopped being rendered and a
@@ -1078,7 +1080,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
                                     .withRemoved(RootAssembly.embedsNotRendered(slots, rendered)));
                             document.assembly.documentSent();
                         } else {
-                            windows.get(key).holds(document.ts, document.assembly.lowestUnsentByChain());
+                            windows.get(key).holds(document.ts, unsent);
                         }
                     },
                     () -> {
@@ -1094,7 +1096,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
                             waiting.remove(key);
                         }
                     });
-            store.save(key, document.assembly);
+            store.save(key, document.assembly, document.heldNothing);
             refuseToLetOneDocumentGrowPastItsWidth(key, document.assembly);
             long pending = document.assembly.pending();
             // Reported before it is weighed, so that the count that stopped the run is the one on record
@@ -1145,7 +1147,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * behind it, so a root changing less often than the window pays nothing for it at all. Trailing edge
      * would delay every change by the window to merge the ones that mostly are not there.
      */
-    private boolean mayGoOutNow(Object key) {
+    private boolean mayGoOutNow(Object key, Map<String, ChainPosition> unsent) {
         if (sending.windowMillis() <= 0) {
             return true;
         }
@@ -1155,11 +1157,36 @@ public final class AssemblerProcessor extends AbstractProcessor {
             windows.put(key, new Window(now));
             return true;
         }
-        if (now - window.openedAt < sending.windowMillis()) {
+        if (now - window.openedAt < sending.windowMillis() && !theBoundIsAlreadyPast(unsent)) {
             return false;
         }
         window.reopen(now);
         return true;
+    }
+
+    /**
+     * Whether this level has already let the frontier past something this version is carrying. Folding is a
+     * delay, and a delay is free only while the frontier is still behind what is being delayed.
+     *
+     * <p>A change waiting for an ancestor is deliberately not counted among what this level holds the
+     * frontier below - it is in this level's state, it comes back out when its ancestor arrives, and
+     * counting it would pin a source on a foreign key pointing at a row that never comes. So the bound on
+     * its chain goes on climbing past it. When the ancestor does arrive, the change joins its document, and
+     * a document that has changed and not gone out <em>is</em> counted: the same change crosses into the
+     * held set underneath a bound already published past it. Folded from there, no restart replays it - the
+     * source resumes above it - and no later version sends it either, because none is due for that root. It
+     * goes out now instead, which is the only moment left at which anything can.
+     */
+    private boolean theBoundIsAlreadyPast(Map<String, ChainPosition> unsent) {
+        if (bounds == null) {
+            return false;
+        }
+        for (Map.Entry<String, ChainPosition> held : unsent.entrySet()) {
+            if (bounds.hasPassed(held.getKey(), held.getValue().order())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1399,7 +1426,11 @@ public final class AssemblerProcessor extends AbstractProcessor {
     private Touched touched(Object key, Map<Object, Touched> touched) {
         return touched.computeIfAbsent(key, k -> {
             RootAssembly held = store.load(k);
-            return new Touched(held == null ? new RootAssembly() : held);
+            // Whether anything was there is carried to the write at the end of the drain rather than worked
+            // out again there. Only the read can answer it - a write that asked would be the very fetch the
+            // answer exists to save - and by then the state to be written is there either way, so the two
+            // cases are the same object and tell nothing apart.
+            return held == null ? new Touched(new RootAssembly(), true) : new Touched(held, false);
         });
     }
 
@@ -1417,11 +1448,20 @@ public final class AssemblerProcessor extends AbstractProcessor {
     private static final class Touched {
 
         private final RootAssembly assembly;
+
+        /**
+         * That the read starting this document found nothing under its key. It says which write this
+         * document is stored by at the end of the drain, and nothing else: both writes store the same
+         * thing, so being wrong here costs a copy or a trip rather than a value.
+         */
+        private final boolean heldNothing;
+
         private boolean rootDeleted;
         private long ts;
 
-        private Touched(RootAssembly assembly) {
+        private Touched(RootAssembly assembly, boolean heldNothing) {
             this.assembly = assembly;
+            this.heldNothing = heldNothing;
         }
     }
 

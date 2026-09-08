@@ -209,7 +209,23 @@ public enum ConnectorError implements TapstateErrorCode {
      * end early. Reported rather than treated as absent, because absent is what a connector reads as
      * "this is my first run", and acting on that quietly discards whatever it had recorded.
      */
-    STATE_UNREADABLE("connector.state-unreadable", Set.of("detail"));
+    STATE_UNREADABLE("connector.state-unreadable", Set.of("detail")),
+
+    /**
+     * A connector's own stream position could not be written down, so this source has no position to
+     * record and nothing a later run could resume from. {@code connector} is the connector id;
+     * {@code detail} is why the position could not be rendered. Reporting no position instead would
+     * claim the source has nowhere to resume from, which is a different and untrue statement.
+     */
+    POSITION_UNRENDERABLE("connector.position-unrenderable", Set.of("connector", "detail")),
+
+    /**
+     * A recorded position could not be read back into something this connector accepts — most often its
+     * position type has changed shape since the position was written. {@code connector} is the connector
+     * id; {@code detail} is why it could not be read. Refusing is deliberate: starting from the present
+     * instead would silently drop every change made since the position was recorded.
+     */
+    POSITION_UNREADABLE("connector.position-unreadable", Set.of("connector", "detail"));
 
     private final String code;
     private final Set<String> placeholders;

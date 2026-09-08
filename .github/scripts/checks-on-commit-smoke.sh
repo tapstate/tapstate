@@ -27,6 +27,19 @@ cat > "$scratch/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$SMOKE_SCRATCH/gh-log"
 [ "$(cat "$SMOKE_SCRATCH/gh-mode" 2>/dev/null || echo ok)" = fail ] && exit 1
+# One endpoint failing while the rest answer, the way the real gh fails it: the error body on
+# stdout, a line on stderr, exit 1. gh-fail holds the substring of the arguments to fail on. A
+# whole-stub failure (gh-mode) cannot witness what happens when a single read fails among calls
+# that succeed, which is the shape a token without access to one repository actually has.
+fail_on="$(cat "$SMOKE_SCRATCH/gh-fail" 2>/dev/null || true)"
+if [ -n "$fail_on" ]; then
+  case "$*" in
+    *"$fail_on"*)
+      echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}'
+      echo "gh: Not Found (HTTP 404)" >&2
+      exit 1 ;;
+  esac
+fi
 # A commit path with no sha in it is a malformed request, and the real API answers 404. The stub
 # has to as well: answering it like any other commit is what let a guard against an empty sha go
 # unwitnessed -- the case passed, and would have passed with the guard deleted.
@@ -37,7 +50,7 @@ case "$*" in
   *rules/branches*) cat "$SMOKE_SCRATCH/ruleset" 2>/dev/null || true ;;
   *pulls*) cat "$SMOKE_SCRATCH/pulls" 2>/dev/null || true ;;
   *"$SMOKE_HEAD_SHA"*) cat "$SMOKE_SCRATCH/tree-head" 2>/dev/null || true ;;
-  *commits/*) cat "$SMOKE_SCRATCH/tree" 2>/dev/null || true ;;
+  *commits/"$SMOKE_SHA"*) cat "$SMOKE_SCRATCH/tree" 2>/dev/null || true ;;
   *) exit 1 ;;
 esac
 STUB
@@ -56,7 +69,10 @@ runs_head() { printf '%s\n' "$@" > "$scratch/check-runs-head"; }
 pulls() { printf '%s\n' "$@" > "$scratch/pulls"; }
 trees() { printf '%s\n' "$1" > "$scratch/tree"; printf '%s\n' "$2" > "$scratch/tree-head"; }
 reset() { rm -f "$scratch/check-runs" "$scratch/check-runs-head" "$scratch/ruleset" \
-  "$scratch/pulls" "$scratch/tree" "$scratch/tree-head" "$scratch/gh-log"; echo ok > "$scratch/gh-mode"; }
+  "$scratch/pulls" "$scratch/tree" "$scratch/tree-head" "$scratch/gh-log" "$scratch/gh-fail"; \
+  echo ok > "$scratch/gh-mode"; }
+# The one endpoint that answers with a failure instead of a body.
+fails_on() { printf '%s' "$1" > "$scratch/gh-fail"; }
 
 # `--` before the needle: the two usage cases below look for text that starts with a dash, and
 # without it grep reads the needle as one of its own flags and answers about something else.
@@ -89,6 +105,7 @@ refute() {
 }
 
 sha=346afd52
+export SMOKE_SHA="$sha"
 
 # --- the named set --------------------------------------------------------------------------------
 reset
@@ -267,10 +284,37 @@ pulls "$head_sha"
 trees deadbeef 0ther777
 expect "a head carrying a different tree does not answer"        3 "different tree" --sha "$sha" --required build,dco
 expect "and it names the head it declined to read"               3 "$head_sha" --sha "$sha" --required build,dco
+# Stating the fault without stating the repair is what made this cost a release run to work out. The
+# wrong repair is the expensive one and it looks right: release an older commit that IS answered.
+# That fails later, in the gate that waits for a lane which takes a ref and can never be dispatched
+# at a bare commit -- so the message has to rule it out by name, not merely omit it.
+expect "and it says to merge an up-to-date pull request"         3 "up to date" --sha "$sha" --required build,dco
+expect "and it rules out releasing an older commit instead"      3 "Releasing an older commit" --sha "$sha" --required build,dco
 # The two refusals must not read alike. "was not dispatched" is a statement about a lane that never
 # started; this one is about an answer that exists and is about different code, and the repair is
 # not the same -- one is re-run something, the other is release a different commit.
 refute "and it is not called a check that was not dispatched"      "was not dispatched" --sha "$sha" --required build,dco
+
+# The same refusal, reached without either tree having been read. `gh api` writes the error body to
+# stdout when a request fails, so a read taken without its exit status hands back that body: not the
+# sha asked for, and not empty either -- which is the only thing the `[ -n "$head" ]` below it tests
+# for. So a failed read walks past that guard, the trees are compared against a JSON document, and
+# what comes out is the sentence above: a diagnosis that was never made -- the trees were not
+# compared and found different, one of the two reads never happened -- with the error body printed
+# where the head's sha belongs. This runs at release time and its output is the reason a release is
+# refused, so it is the sentence somebody acts on.
+reset
+runs $'build\tcompleted\tsuccess'
+trees deadbeef 0ther777
+fails_on pulls
+refute "a failed head read is not printed as a head sha"           "Not Found" --sha "$sha" --required build,dco
+
+# Only when this is the cause. A lane that was never dispatched has a different repair, and offering
+# this one there would send the reader to merge a pull request that changes nothing about it.
+reset
+runs $'build\tcompleted\tsuccess'
+pulls ""
+refute "the remedy is not offered when nothing was dispatched"     "up to date" --sha "$sha" --required build,dco
 
 reset
 runs $'build\tcompleted\tsuccess'

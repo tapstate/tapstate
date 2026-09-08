@@ -5,16 +5,17 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.CaptureRunSpec;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
+import io.tapstate.runtime.srs.SnapshotPhase;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
-import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -28,9 +29,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -39,16 +38,12 @@ import java.util.stream.Collectors;
  * tear them down. It derives each source run spec identically to how the topology builder derives the ring
  * the run fills, through the shared source resolution, so the capture and the reader agree on the ring.
  *
- * <p>The run spec carries L1 mock collaborators standing in for real connector machinery: a fixed cdc-start
- * token, a monotonic watermark generator, and a position order that ranks those watermark tokens by numeric
- * suffix (never lexically). The watermark token format and the position order are a matched pair. Snapshot
- * rows drain to a shared buffer keyed by the source's change-ring name; the source vertex reading that ring
+ * <p>No positions are supplied here. A run's seam and its per-change positions are the source's own and are
+ * learned from it as the read happens, so there is nothing for this layer to stand in with. Snapshot rows
+ * drain to a shared buffer keyed by the source's change-ring name; the source vertex reading that ring
  * drains the buffer and emits its rows through the same transform-to-sink chain as cdc, strictly before it.
  */
 final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoordinator {
-
-    /** The fixed cdc-start position for an L1 run: a mock stand-in for the position sampled at snapshot start. */
-    private static final SourcePosition MOCK_CDC_START = new SourcePosition("cdc-start-0");
 
     /** The schema version stamped on ring items at L1 (schema evolution is a later increment). */
     private static final long MOCK_SCHEMA_VER = 0L;
@@ -61,6 +56,16 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     /** What each running pipeline's tables loaded, keyed by pipeline then table; dropped when it stops. */
     private final Map<String, Map<String, TableSnapshot>> snapshotsByPipeline = new ConcurrentHashMap<>();
+
+    /**
+     * The tables each running pipeline's snapshot covers, per chain; dropped when it stops. Only the
+     * durable record can say whether a load reached the target, and it answers per pipeline, per chain,
+     * per table -- so what is kept here is the question rather than the answer: which tables to ask about
+     * and on which chain to ask. The map above cannot stand in for it. That one is keyed by table name
+     * alone, qualified on collision, and carries no chain; and it holds an entry for every selected table
+     * from the moment a run starts, so a set covering it is covered from the start.
+     */
+    private final Map<String, List<SnapshotOnChain>> snapshotTablesByPipeline = new ConcurrentHashMap<>();
 
     StoreBackedPipelineCaptureCoordinator(
             StorePort storePort, CaptureStarter captureStarter, SrsCoordinator srsCoordinator,
@@ -81,18 +86,25 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
         List<CaptureRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
+        List<SnapshotOnChain> snapshotTables = new ArrayList<>();
         try {
-            for (String sourceId : pipeline.sources()) {
+            for (SourceRef ref : pipeline.sources()) {
+                String sourceId = ref.id();
                 SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
                 SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-                CaptureRunSpec spec = deriveSpec(pipelineId, pipeline.settings(), source, resolution);
+                CaptureRunSpec spec = deriveSpec(
+                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref));
                 Map<String, Long> observedSnapshotCounts = new LinkedHashMap<>();
                 CaptureRun run = captureStarter.start(spec, snapshotPassthrough(resolution, observedSnapshotCounts));
                 runs.add(run);
                 recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts);
+                snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
             }
         } catch (RuntimeException | Error failure) {
-            RuntimeException cleanupFailure = closeRuns(runs, pipelineId);
+            // A start that fell over releases what it took and nothing else. It is an abandoned attempt,
+            // not somebody asking for the pipeline's position to be thrown away, and the sources that did
+            // start may have advanced it before the one that failed.
+            RuntimeException cleanupFailure = closeRuns(runs, pipelineId, false);
             if (cleanupFailure != null) {
                 failure.addSuppressed(cleanupFailure);
             }
@@ -100,6 +112,27 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
         runsByPipeline.put(pipelineId, runs);
         snapshotsByPipeline.put(pipelineId, keyByTableOrQualifyOnCollision(attributed));
+        snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
+    }
+
+    /** One source run's snapshot: the chain that records its completion, and the tables it covers. */
+    private record SnapshotOnChain(String chainId, List<String> tables) {
+    }
+
+    /**
+     * What this run contributes to the delivered question, or empty when it contributes nothing.
+     *
+     * <p>A run whose read mode has no snapshot has no load to deliver. A run with no chain is a
+     * snapshot-only read: it opens no tail, so nothing seeds a record and no completion is ever written
+     * for it. That one contributes nothing rather than counting as never delivered -- a question the
+     * record cannot answer must not be answered by guessing, and guessing that way round would re-read
+     * the whole source on every resume with no state that could ever end it.
+     */
+    private static Optional<SnapshotOnChain> snapshotOnChain(CaptureRunSpec spec, CaptureRun run) {
+        if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
+            return Optional.empty();
+        }
+        return run.chainId().map(chain -> new SnapshotOnChain(chain.value(), spec.config().streams()));
     }
 
     /** One source's attributed snapshot load: which source, which table, and what it loaded. */
@@ -156,16 +189,44 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         return snapshotsByPipeline.getOrDefault(pipelineId, Map.of());
     }
 
+    /**
+     * A load is delivered when this pipeline's own record shows every table its snapshot covers as
+     * written -- the sink's mark, made when its frontier confirms that table's rows.
+     *
+     * <p>Asked of the same reckoning a fresh start re-reads from, deliberately and not merely for tidiness:
+     * the tables a rebuild would read again are exactly the ones this reports as not delivered. Two
+     * readings of that one fact would eventually disagree, and both directions of the disagreement are
+     * silent -- a resume that rebuilds and then reads nothing, or one that carries on over a load nobody
+     * will finish.
+     *
+     * <p>Note what is deliberately not asked: whether the bounded read returned. It returned long before
+     * anyone could hold the pipeline, so that question answers yes for the whole window this one exists
+     * for.
+     */
     @Override
-    public void stopCapture(String pipelineId) {
+    public boolean loadDelivered(String pipelineId) {
+        for (SnapshotOnChain snapshot : snapshotTablesByPipeline.getOrDefault(pipelineId, List.of())) {
+            if (!SnapshotPhase.stillOwed(storePort.meta().read(snapshot.chainId()), pipelineId,
+                    snapshot.tables()).isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public void stopCapture(String pipelineId, boolean purgeState) {
         // The load belongs to the run being torn down: a stopped pipeline reports no snapshot rather than the
         // rows its previous run happened to load.
         snapshotsByPipeline.remove(pipelineId);
-        List<CaptureRun> runs = runsByPipeline.remove(pipelineId);
-        if (runs == null) {
-            return;
-        }
-        RuntimeException cleanupFailure = closeRuns(runs, pipelineId);
+        snapshotTablesByPipeline.remove(pipelineId);
+        // Holding no runs is not the same as having nothing to release. A pipeline whose start threw part
+        // way, and one whose process was replaced, both arrive here with no handles and a record that is
+        // still all there -- and a stop asked to clear the state has that record to clear. Returning on the
+        // absent handle is what made the verb report success and take nothing, in the one state a caller
+        // reaches for it most: after a run has died.
+        List<CaptureRun> runs = Objects.requireNonNullElse(runsByPipeline.remove(pipelineId), List.of());
+        RuntimeException cleanupFailure = closeRuns(runs, pipelineId, purgeState);
         if (cleanupFailure != null) {
             throw cleanupFailure;
         }
@@ -174,14 +235,24 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /**
      * Releases live runs after a stop, or after a later source prevents a multi-source start from completing.
      *
-     * <p>Close first: stops every capture daemon so no thread leaks. Then release this pipeline's consumer
-     * membership and tear the source chain down -- a shared-ring run only; a run that opened no chain has
-     * nothing to release.
+     * <p>{@code purgeState} decides only whether the source-side record is let go of as well; the hold on
+     * the chain is given back either way, because holding it is what a running pipeline does and this one
+     * has stopped.
+     *
+     * <p>Close first: stops every capture daemon so no thread leaks. Then give back this pipeline's hold on
+     * each chain it read -- a shared-ring run only; a run that opened no chain has nothing to release. The
+     * chain itself closes when the pipeline giving it back was the last one on it, which is the coordinator's
+     * to decide: a stop tears nothing down, because a chain several pipelines read is not this one's to take
+     * away. Stopping one used to remove it outright, and what that cost the others was measured -- their own
+     * stop then threw, and a pipeline restarted afterwards read under a generation of its own.
      *
      * <p>Every step runs even when an earlier one throws, and the first failure carries the rest as
      * suppressed. A release abandoned half way is what leaves a chain nobody owns and a daemon nobody stops.
+     *
+     * <p>A clearing then sweeps whatever the record still holds for this pipeline beyond those runs, which
+     * is the whole of it when there were no runs to hold anything.
      */
-    private RuntimeException closeRuns(List<CaptureRun> runs, String pipelineId) {
+    private RuntimeException closeRuns(List<CaptureRun> runs, String pipelineId, boolean purgeState) {
         RuntimeException firstFailure = null;
         Set<MiningChainId> chains = new LinkedHashSet<>();
         for (CaptureRun run : runs) {
@@ -194,10 +265,83 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // per table, which is what a pipeline over a parent and a child table is; releasing it per run would
         // have the second source release a chain the first already closed, and the release refuses that.
         for (MiningChainId chainId : chains) {
-            firstFailure = runCleanup(() -> srsCoordinator.detachConsumer(chainId, pipelineId), firstFailure);
-            firstFailure = runCleanup(() -> srsCoordinator.teardownSource(chainId), firstFailure);
+            // Whether this pipeline was the last one on the chain, which decides how much of the chain's
+            // record is this stop's to take. Read from the release itself rather than asked again after
+            // it: a consumer attaching in between would make a second reading stale, and the two answers
+            // would then disagree about a record one of them is about to delete.
+            boolean chainClosed = false;
+            try {
+                chainClosed = srsCoordinator.releaseConsumer(chainId, pipelineId);
+            } catch (RuntimeException failure) {
+                if (firstFailure == null) {
+                    firstFailure = failure;
+                } else {
+                    firstFailure.addSuppressed(failure);
+                }
+            }
+            if (!purgeState) {
+                continue;
+            }
+            if (chainClosed) {
+                // Nobody is left on it, so the whole record goes: the read offset, the seam the tail
+                // resumes from, the schema history, and which tables finished their initial load. This
+                // is what makes the next run of this pipeline read its source from the beginning, which
+                // is what asking for the state to be cleared meant.
+                firstFailure = runCleanup(() -> storePort.meta().dropChain(chainId.value()), firstFailure);
+            } else {
+                // Others are still reading it, so only this pipeline's own cursor is its to give back.
+                // Run whether or not the release above succeeded, and safe to run twice: the detach
+                // states the end condition "this consumer holds nothing here", which an absent chain and
+                // an absent cursor already satisfy. Skipping it after one failure is what leaves a cursor
+                // nobody will ever advance holding back every pipeline still on the chain.
+                firstFailure = runCleanup(
+                        () -> storePort.meta().detachConsumer(chainId.value(), pipelineId), firstFailure);
+            }
+        }
+        if (purgeState) {
+            // What is left to clear is asked of the record, because the handles above cannot answer it.
+            // A pipeline holds no run here after a start that threw part way, and after a process came
+            // up over an earlier one's work -- and in both, the cursor it left and everything the chain
+            // accumulated for it are exactly what clearing the state was asked to take. Deriving the
+            // work from the handles alone answers "nothing" for both while reporting that it worked,
+            // which is the one state a caller most wants cleared: the one after a run died.
+            //
+            // Asked after the loop above rather than instead of it, so nothing is reached twice: a chain
+            // that loop dropped has no record left to name, and one it detached no longer carries this
+            // pipeline. The loop keeps deciding from the release itself for the chains it holds, where
+            // that reading is the one that cannot go stale under a consumer attaching in between.
+            for (String chainId : storePort.meta().miningChainIdsWithConsumer(pipelineId)) {
+                firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, firstFailure);
+            }
         }
         return firstFailure;
+    }
+
+    /**
+     * Clears one chain's record of a pipeline this coordinator holds no run for: the whole chain when
+     * nobody else is on it, and only that pipeline's own cursor otherwise -- the same two branches a stop
+     * takes for a chain it does hold, decided from the durable record instead of from the release.
+     *
+     * <p>"Nobody else" is asked of the record <em>and</em> of this process, because neither answers it
+     * alone. The record does not name a consumer that has attached but not yet written anything of its
+     * own; this process does not know a consumer running on any other member. Taking a chain away from a
+     * pipeline still reading it is not an error that pipeline reports -- it reads its whole source again,
+     * quietly -- so the two are read together and only their agreement licenses the drop.
+     */
+    private RuntimeException purgeWhatTheRecordStillHolds(
+            String chainId, String pipelineId, RuntimeException firstFailure) {
+        boolean lastOneOff = storePort.meta().consumerOffsets(chainId).stream()
+                        .allMatch(offset -> offset.pipelineId().equals(pipelineId))
+                && !srsCoordinator.isProvisioned(new MiningChainId(chainId));
+        return runCleanup(
+                () -> {
+                    if (lastOneOff) {
+                        storePort.meta().dropChain(chainId);
+                    } else {
+                        storePort.meta().detachConsumer(chainId, pipelineId);
+                    }
+                },
+                firstFailure);
     }
 
     /** Runs one release step, keeping the first failure and hanging any later one off it as suppressed. */
@@ -214,16 +358,25 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /**
-     * Derives one source run spec from the source, the pipeline settings, and the shared resolution. The read
-     * axis comes from settings (read mode defaulting to snapshot-then-cdc, start position to earliest); srs is
-     * on unless the source declares it off; the L1 mock collaborators are fresh per run.
+     * Derives one source run spec from the source, the pipeline settings, the shared resolution, and this
+     * pipeline's own srs switch for that source. The read axis comes from settings (read mode defaulting to
+     * snapshot-then-cdc, start position to latest); the srs switch is passed in rather than read off the
+     * source, and there is deliberately no fallback to the source here -- one would put back exactly the
+     * coupling that made an edit to a source re-route every pipeline reading it.
+     *
+     * <p>The start position defaults to latest because that is what the setting publishes as its default and
+     * what the canonical form encodes by dropping an explicit {@code latest}. Filling in earliest instead
+     * disagreed with both, and the disagreement is not cosmetic: for a tail that reads its source directly,
+     * earliest is the oldest change the source still retains, so a first run replays the whole retention
+     * window rather than picking up from now.
      */
     static CaptureRunSpec deriveSpec(
-            String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution) {
+            String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution,
+            boolean srsEnabled) {
         ReadMode readMode = settings != null && settings.readMode() != null
                 ? settings.readMode() : ReadMode.SNAPSHOT_AND_CDC;
         String startFromRaw = settings != null && settings.startFrom() != null
-                ? settings.startFrom() : "earliest";
+                ? settings.startFrom() : "latest";
         String retention = source.srs() != null ? source.srs().retention() : null;
         return new CaptureRunSpec(
                 // Unscoped on purpose. The run scopes its own config to the pipeline and source it names,
@@ -232,14 +385,26 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 resolution.config(),
                 readMode,
                 resolution.srsKey(),
-                srsEnabled(source),
+                srsEnabled,
                 resolution.sourceId(),
                 pipelineId,
                 StartFrom.parse(startFromRaw),
-                MOCK_CDC_START,
                 retention,
-                MOCK_SCHEMA_VER,
-                monotonicWatermark());
+                MOCK_SCHEMA_VER);
+    }
+
+    /**
+     * This pipeline's own srs switch for that source. Apply records one on every reference it stores, so a
+     * reference without one has never been through apply -- an invariant violation rather than anything an
+     * author did, and so a bare crash naming both halves rather than a coded diagnostic. Guessing a value
+     * here is the one thing this must not do: it would read as a working pipeline running the other way.
+     */
+    private static boolean srsSwitchOf(String pipelineId, SourceRef ref) {
+        if (ref instanceof SourceRef.Spec spec) {
+            return spec.srs();
+        }
+        throw new IllegalStateException(
+                "pipeline '" + pipelineId + "' has no srs switch recorded for source '" + ref.id() + "'");
     }
 
     @Override
@@ -261,21 +426,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** Whether this pipeline currently has a live capture -- a test-visible view of the retained handles. */
     boolean isActive(String pipelineId) {
         return runsByPipeline.containsKey(pipelineId);
-    }
-
-    /** SRS is on unless the source declares an srs block that sets {@code enabled:false}. */
-    private static boolean srsEnabled(SourceResource source) {
-        if (source.srs() == null) {
-            return true;
-        }
-        Boolean enabled = source.srs().enabled();
-        return enabled == null || enabled;
-    }
-
-    /** A mock cdc watermark: a monotonic source-position generator (w1, w2, ...) standing in for the connector. */
-    private static Supplier<SourcePosition> monotonicWatermark() {
-        AtomicLong counter = new AtomicLong();
-        return () -> new SourcePosition("w" + counter.incrementAndGet());
     }
 
     private ArtifactStore artifacts() {

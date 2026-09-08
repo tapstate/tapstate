@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -78,7 +79,7 @@ public final class Cli implements Runnable {
      * declaration, and the version is wanted on a path that must not depend on either. The build pins it
      * to the project version, so the string here cannot quietly drift from what was released.
      */
-    static final String VERSION = "tapstate 0.4.3";
+    static final String VERSION = "tapstate 0.4.5";
 
     /**
      * Just the number out of {@link #VERSION}, for the places that print it beside another version and
@@ -151,7 +152,15 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.status", "status"),
             Map.entry("pipeline.metrics", "metrics"),
             Map.entry("pipeline.snapshot", "snapshot"),
-            Map.entry("pipeline.logs", "logs"));
+            Map.entry("pipeline.logs", "logs"),
+            Map.entry("pipeline.position", "position"),
+            Map.entry("pipeline.set-position", "position"),
+            // Both on one verb, as the three token operations are: what a reader is doing is looking at
+            // one thing, and accepting it is the same look followed by a decision. A verb of its own for
+            // the accept would be a second word for the same subject; a flag on the start would not be
+            // anybody looking at all.
+            Map.entry("pipeline.derived-schema", "derived-schema"),
+            Map.entry("pipeline.accept-derived-schema", "derived-schema"));
 
     /**
      * Verbs that chain several registered operations rather than projecting one ({@code run} is apply
@@ -160,6 +169,15 @@ public final class Cli implements Runnable {
      * states: connecting does not implement them.
      */
     static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("run", "export", "diff", "edit");
+
+    /**
+     * Verbs this face composes out of registered operations rather than projecting one. They need a
+     * connection like any other online verb, and they are listed apart from the projection because the
+     * projection is checked against the operation registry in both directions -- a composed verb has no
+     * operation of its own to be checked against, and putting one there to satisfy the check is exactly
+     * the thing composing it was meant to avoid.
+     */
+    static final List<String> COMPOSITE_VERBS = List.of("restart");
 
     /**
      * The live views over a collection. They project no registered operation and never will: each is a
@@ -230,8 +248,10 @@ public final class Cli implements Runnable {
                     "Create, list, or revoke machine tokens.")),
             Map.entry("start", new VerbHelp("<pipeline-id>",
                     "Start a pipeline.")),
-            Map.entry("stop", new VerbHelp("<pipeline-id>",
-                    "Stop a pipeline.")),
+            Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state] [-y]",
+                    "Stop a pipeline and clear what it accumulated; --keep-state keeps it.")),
+            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun] [-y]",
+                    "Cycle a pipeline and carry on; --rerun reads the whole source again.")),
             Map.entry("pause", new VerbHelp("<pipeline-id>",
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",
@@ -242,8 +262,16 @@ public final class Cli implements Runnable {
                     "Show a pipeline's counters and per-table positions.")),
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's per-table snapshot progress.")),
+            Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
+                    "Compare a join's recorded and current output columns; --accept takes today's.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
+            // "per chain" is the load-bearing half of this line. A pipeline's position is one value per
+            // mining chain, covering every table on it; the metrics face shows that value projected onto
+            // each table, and somebody reading only that would come here expecting to set two tables to
+            // two different places -- which is not a state the record can hold.
+            Map.entry("position", new VerbHelp("<pipeline-id> [-f <file>]",
+                    "Show where a pipeline resumes from, per chain; -f writes it back.")),
             // The summary is one line because picocli wraps a longer one, and a wrapped line is a line the
             // help guard cannot pin. The call grammar lives where it is needed instead: in the usage this
             // verb prints when it cannot read a call.
@@ -324,6 +352,9 @@ public final class Cli implements Runnable {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
         for (String verb : LIVE_VIEW_VERBS) {
+            commandLine.addSubcommand(verb, new ConnectedVerb());
+        }
+        for (String verb : COMPOSITE_VERBS) {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
         for (String verb : UNIMPLEMENTED_COMPOSITE_VERBS) {
@@ -470,21 +501,32 @@ public final class Cli implements Runnable {
      */
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter) {
+        return runSession(launch, controlPlane, prompter, () -> System.console() != null);
+    }
+
+    /**
+     * The same run, with the terminal question answered by the caller. A test process never has a
+     * terminal, so without this seam the one-shot face could only ever exercise the half of a
+     * confirmation that refuses -- and the half that asks is the one a person meets.
+     */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, BooleanSupplier terminal) {
         Path home = Path.of(System.getProperty("user.home"));
         ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
         AuthService authService = new AuthService(
                 controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
-        return runSession(launch, controlPlane, prompter, resolver, authService);
+        return runSession(launch, controlPlane, prompter, resolver, authService, terminal);
     }
 
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, ContextResolver resolver) {
-        return runSession(launch, controlPlane, prompter, resolver, null);
+        return runSession(launch, controlPlane, prompter, resolver, null,
+                () -> System.console() != null);
     }
 
     private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                                   Supplier<Prompter> prompter, ContextResolver resolver,
-                                  AuthService authService) {
+                                  AuthService authService, BooleanSupplier terminal) {
         Prompter oneShotPrompter = null;
         try {
             if (launch.hasConflictingTargets()) {
@@ -505,6 +547,8 @@ public final class Cli implements Runnable {
             Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
                     new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
+            repl.terminalCheck(terminal);
+            repl.prompterSource(prompter);
             String machineToken = launch.machineToken();
             if (machineToken != null) {
                 repl.installMachineToken(machineToken);

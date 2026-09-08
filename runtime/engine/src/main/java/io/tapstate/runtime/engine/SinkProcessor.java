@@ -14,7 +14,9 @@ import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -63,6 +65,19 @@ public final class SinkProcessor extends AbstractProcessor {
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
+    // Bounds that arrived while writes were still in flight, held until they settle, one per axis. A bound
+    // proves what is still coming, never what is durable: every event it covers has been taken in by the
+    // time it arrives, but the ones sitting in an unsettled batch are not written yet. Handing it to the
+    // frontier then would let one settled batch of a fan-out stand for the whole of what its change
+    // produced.
+    //
+    // One slot per axis rather than one in total, because a bound names the chain it is for: one chain's
+    // promise is not a newer version of another's, and a single slot lets whichever arrives second
+    // overwrite the first. The overwritten chain then waits for a strictly higher position of its own to
+    // settle, which on a chain that has gone quiet never comes -- so the position it was holding stays
+    // open for the life of the run, and on a snapshot that is a table nothing records as loaded and every
+    // resume reads again in full.
+    private final Map<Byte, Watermark> heldBounds = new LinkedHashMap<>();
     private boolean closed;
 
     // Resolved at init from the running job, so a failed write can be recorded against this pipeline's id
@@ -108,33 +123,44 @@ public final class SinkProcessor extends AbstractProcessor {
     /**
      * A meta-supplier for a sink vertex that drives the writer the factory opens. The factory (not a
      * prebuilt writer) is what the DAG carries, so the writer is opened on the member that runs the
-     * vertex. The vertex is pinned to total parallelism one.
+     * vertex. The vertex is pinned to total parallelism one, on the member that owns {@code vertexName}.
+     *
+     * <p>Naming the member is half of a pair, and the other half is not optional: every edge into this
+     * vertex must be {@code distributed().allToOne(vertexName)}. Pinned says there is one processor;
+     * reachable says the items get to it. A member with no processor of this vertex answers input with an
+     * {@code IllegalStateException} the moment the first event lands, which on one member never happens -
+     * the only processor there is the local one - so nothing short of a real cluster tells the two apart.
      */
-    public static ProcessorMetaSupplier metaSupplier(SupplierEx<? extends SinkWriter> writerFactory) {
+    public static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory) {
+        Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         SupplierEx<Processor> supplier =
                 () -> new SinkProcessor(writerFactory.get(), DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE);
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
     /**
      * A meta-supplier for a sink vertex that also advances a durable sink-ack watermark. The ack is carried
      * as a {@link SinkAckFactory}, not a prebuilt {@link SinkAck}: the durable store it writes is not
      * serializable, so only the factory travels on the DAG and the store is resolved on the member that runs
-     * the vertex. The vertex is pinned to total parallelism one and keeps a single write in flight, the
+     * the vertex. The vertex is pinned to total parallelism one - on the member that owns {@code vertexName},
+     * which every edge into it must route to with {@code allToOne} - and keeps a single write in flight, the
      * order-preserving contract every shape of frontier below it depends on.
      *
      * <p>{@code frontierFactory} settles which shape that is, and it is settled here rather than run-time:
      * how far a sink may say a chain has landed depends on whether what reaches it is one chain in order or
      * an assembly of several, and that is a property of the graph that was compiled, not of any event.
      */
-    static ProcessorMetaSupplier metaSupplier(SupplierEx<? extends SinkWriter> writerFactory,
+    static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory) {
+        Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         Objects.requireNonNull(sinkAckFactory, "sinkAckFactory");
         Objects.requireNonNull(frontierFactory, "frontierFactory");
         return ProcessorMetaSupplier.forceTotalParallelismOne(
-                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory));
+                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory), vertexName);
     }
 
     /**
@@ -213,10 +239,32 @@ public final class SinkProcessor extends AbstractProcessor {
     @Override
     public boolean tryProcessWatermark(Watermark watermark) {
         if (frontier != null) {
-            frontier.bound(watermark, sinkAck);
+            // The newest bound on an axis subsumes any older one held for that axis, so only the newest of
+            // each is kept. Across axes nothing subsumes anything.
+            heldBounds.put(watermark.key(), watermark);
+            releaseHeldBounds();
             reportTrailing();
         }
         return true;
+    }
+
+    /**
+     * Hands every held bound to the frontier once nothing is in flight. That is the moment every event they
+     * cover is durable: the engine delivers a bound only after the events beneath it, and this processor
+     * takes those straight from the inbox into batches, so once no batch is in flight none of them is
+     * unwritten.
+     *
+     * <p>All of them, not the newest: they are bounds on different chains, and a chain whose bound was
+     * dropped here has no second one coming while it stays quiet.
+     */
+    private void releaseHeldBounds() {
+        if (heldBounds.isEmpty() || !inFlight.isEmpty()) {
+            return;
+        }
+        for (Watermark bound : heldBounds.values()) {
+            frontier.bound(bound, sinkAck);
+        }
+        heldBounds.clear();
     }
 
     /**
@@ -263,6 +311,7 @@ public final class SinkProcessor extends AbstractProcessor {
             return true;
         });
         if (frontier != null) {
+            releaseHeldBounds();
             reportTrailing();
         }
     }

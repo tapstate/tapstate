@@ -7,25 +7,32 @@ import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.MapStoreConfig;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.SrsLogRecord;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -128,57 +135,127 @@ class HazelcastMemberTest {
     }
 
     @Test
-    void memberConfigDeclaresWhatNestStateMapsAre() {
-        // Nest state maps are created on demand as vertices ask for them, so what they are is decided here
-        // or not at all -- and the substrate's own defaults are wrong for state a vertex must read back: a
-        // backup replica costs a copy per write for redundancy this state does not need, and expiry would
-        // drop entries that a later event is answered from, emitting a half-built document instead of
-        // failing. Eviction is the one bound that is allowed, because the store behind the map is where an
-        // evicted entry comes back from. The wildcard applies to every map the nest naming lands under, so
-        // the engine owns its shape and the assembly root only installs it.
+    void memberConfigPutsTheChangeLogBehindTheChangeRingWhenThereIsOne() {
+        // Both of what the record buys are properties of this wiring rather than of the store: the ring
+        // writes through it before admitting a change, and a ring rebuilt later numbers on from what the
+        // record holds instead of reusing sequences it already named. Neither survives the config being
+        // left off, and the store's own cases all build their ring themselves -- so with no case here,
+        // removing these four lines is green everywhere.
         Config config = HazelcastConfiguration.memberConfig(
-                new HazelcastProperties(), new InMemoryKeyedStateStore());
-        MapConfig state = config.getMapConfigs().get(NestSettings.defaults().stateMaps().getName());
-        assertThat(state).isNotNull();
-        assertThat(state.getBackupCount()).isZero();
-        assertThat(state.getTimeToLiveSeconds()).isZero();
-        assertThat(state.getMaxIdleSeconds()).isZero();
-        assertThat(state.getMapStoreConfig().isEnabled())
-                .describedAs("the only shape this member installs is one with a store behind it")
-                .isTrue();
+                new HazelcastProperties(), null, NestSettings.defaults(), new SentinelLogStore());
+        RingbufferStoreConfig store =
+                config.getRingbufferConfigs().get("srs.*").getRingbufferStoreConfig();
+        assertThat(store.isEnabled()).isTrue();
+        assertThat(store.getFactoryImplementation())
+                .describedAs("the ring is told a sequence and an item but never which ring is asking, "
+                        + "so only a factory can bind the name")
+                .isInstanceOf(SrsLogRingbufferStoreFactory.class);
     }
 
     @Test
-    void memberConfigPutsTheStoreBehindTheStateMapsWhenThereIsOne() {
+    void memberConfigLeavesTheChangeRingUnbackedWhenThereIsNoChangeLog() {
+        // A member with no store runs on the ring alone, and that shape has to be reached by there being
+        // no store to put behind it -- never by one wired in that writes nowhere, which would report a
+        // change as written down when nothing holds it.
+        Config config = HazelcastConfiguration.memberConfig(
+                new HazelcastProperties(), null, NestSettings.defaults(), null);
+        assertThat(config.getRingbufferConfigs().get("srs.*").getRingbufferStoreConfig().isEnabled())
+                .describedAs("a ring with nothing behind it carries no enabled store")
+                .isFalse();
+    }
+
+    @Test
+    void theRunningMemberDeclaresWhatNestStateMapsAre() {
+        // Nest state maps are created on demand as vertices ask for them, so what they are is decided
+        // before any of them exists -- and the substrate's own defaults are wrong for state a vertex must
+        // read back: a backup replica costs a copy per write for redundancy this state does not need, and
+        // expiry would drop entries a later event is answered from, emitting a half-built document instead
+        // of failing. Eviction is the one bound that is allowed, because the store behind the map is where
+        // an evicted entry comes back from.
+        //
+        // Read through the lookup with a real namespace rather than out of the configuration map by
+        // pattern, because resolution is the thing at stake: a shape that is present but never resolved is
+        // a map running on the substrate's defaults with every way of asking saying otherwise.
+        HazelcastInstance member = new HazelcastConfiguration().hazelcastMember(
+                new HazelcastProperties(), null, null, null, new InMemoryKeyedStateStore(),
+                NestSettings.defaults(), null, null);
+        try {
+            MapConfig state = member.getConfig().findMapConfig("nest.a-pipeline.a-step.$root");
+            assertThat(state.getName())
+                    .describedAs("a namespace that resolved to something other than the nest shape is on "
+                            + "the substrate's defaults")
+                    .isEqualTo(NestSettings.defaults().stateMaps().getName());
+            assertThat(state.getBackupCount()).isZero();
+            assertThat(state.getTimeToLiveSeconds()).isZero();
+            assertThat(state.getMaxIdleSeconds()).isZero();
+            assertThat(state.getMapStoreConfig().isEnabled())
+                    .describedAs("the only shape this member installs is one with a store behind it")
+                    .isTrue();
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    @Test
+    void theStaticConfigurationCarriesNoNestPatternAtAll() {
+        // The regression this placement exists for. The substrate resolves a map's configuration by
+        // matching the static configuration by pattern first and only then looking at what was added while
+        // the member ran -- so a nest pattern left in here answers for every namespace and shadows the
+        // per-pipeline budget, which is added later because pipelines do not exist at startup. Measured
+        // when it was here: a budget of 271 read back as 271 from every way of asking while its map ran on
+        // the process-wide 4,000 and held all 700 entries written to it, with nothing reporting it.
+        assertThat(HazelcastConfiguration.memberConfig(
+                        new HazelcastProperties(), new InMemoryKeyedStateStore()).getMapConfigs())
+                .describedAs("a nest pattern in the static configuration shadows every budget added after "
+                        + "it, silently")
+                .doesNotContainKey(NestSettings.defaults().stateMaps().getName());
+    }
+
+    @Test
+    void theRunningMemberPutsTheStoreBehindTheStateMapsWhenThereIsOne() {
         // With a store, nest state is written through it as a key is handled and read back per key on the
         // way up: a restart resumes instead of re-reading the sources, which is what the cold layer is for.
         // Write-through is the decision -- a queued write would live in memory, and these maps keep no
         // replica of it, so a crash would lose the tail with nothing reporting it.
-        Config config = HazelcastConfiguration.memberConfig(
-                new HazelcastProperties(), new InMemoryKeyedStateStore());
-        MapStoreConfig store = config.getMapConfigs().get(NestSettings.defaults().stateMaps().getName()).getMapStoreConfig();
-        assertThat(store).isNotNull();
-        assertThat(store.isEnabled()).isTrue();
-        assertThat(store.getWriteDelaySeconds()).isZero();
+        HazelcastInstance member = new HazelcastConfiguration().hazelcastMember(
+                new HazelcastProperties(), null, null, null, new InMemoryKeyedStateStore(),
+                NestSettings.defaults(), null, null);
+        try {
+            MapStoreConfig store = member.getConfig()
+                    .findMapConfig("nest.a-pipeline.a-step.$root").getMapStoreConfig();
+            assertThat(store).isNotNull();
+            assertThat(store.isEnabled()).isTrue();
+            assertThat(store.getWriteDelaySeconds()).isZero();
+        } finally {
+            member.shutdown();
+        }
     }
 
     @Test
-    void memberConfigDeclaresNoStateMapsAtAllWhenThereIsNoStore() {
+    void aMemberWithNoStoreDeclaresNoStateMapsAtAll() {
         // Nest state that outlives nothing is not a lesser version of nest state, it is a way to emit a
         // half-built document and call it whole. So there is no shape for it: without a store there are no
-        // state maps to declare. Nothing is lost by their absence -- a run with no store drives no pipeline,
-        // so no vertex ever asks for one.
-        Config config = HazelcastConfiguration.memberConfig(new HazelcastProperties(), null);
-        assertThat(config.getMapConfigs())
-                .describedAs("a state map with nothing behind it is not a shape this member offers")
-                .doesNotContainKey(NestSettings.defaults().stateMaps().getName());
+        // state maps to declare. Nothing is lost by their absence -- a run with no store drives no
+        // pipeline, so no vertex ever asks for one.
+        //
+        // Asked of the running member, not of the static configuration: the static configuration carries
+        // no nest pattern in either case, so asking it could not tell the two apart.
+        HazelcastInstance member = new HazelcastConfiguration().hazelcastMember(
+                new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
+        try {
+            assertThat(member.getConfig().getMapConfigs())
+                    .describedAs("a state map with nothing behind it is not a shape this member offers")
+                    .doesNotContainKey(NestSettings.defaults().stateMaps().getName());
+        } finally {
+            member.shutdown();
+        }
     }
 
     @Test
     void hazelcastMemberBindsTheMetaStoreIntoTheUserContext() {
         SrsMetaStore meta = new SentinelMetaStore();
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), meta, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), meta, null, null, null, NestSettings.defaults(), null, null);
         try {
             // The read-cursor publisher factory resolves the store member-side from the user context, so the
             // assembly root binds it under the well-known key -- otherwise cursor publishing silently no-ops.
@@ -191,7 +268,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheUserContextUnboundWhenNoStoreIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no store (mongo disabled) binds nothing; the publisher then resolves no store and
             // cursor publishing is a documented no-op rather than a failure.
@@ -207,7 +284,7 @@ class HazelcastMemberTest {
             throw new UnsupportedOperationException("resolution is not exercised by this binding test");
         };
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, provisioner, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, provisioner, null, null, NestSettings.defaults(), null, null);
         try {
             // A sink-writer factory carried onto the Jet sink vertex resolves the provisioner member-side from
             // the user context, so the assembly root binds it under the well-known key -- otherwise the member
@@ -222,7 +299,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheProvisionerUnboundWhenNoneIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no provisioner (mongo disabled) binds nothing; the member is then not sink-capable and
             // a sink open fails loudly rather than silently dropping writes.
@@ -237,7 +314,7 @@ class HazelcastMemberTest {
     void hazelcastMemberBindsTheConnectorStateStoreIntoTheUserContext() {
         KeyedStateStore store = new InMemoryKeyedStateStore();
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, store, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, store, NestSettings.defaults(), null, null);
         try {
             // A sink-writer factory is serialized onto the sink vertex and opens its connector on whichever
             // member runs it, so the layer a connector's own notes are kept in cannot travel with the factory
@@ -253,7 +330,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheConnectorStateStoreUnboundWhenNoneIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no store (mongo disabled) binds nothing, and a sink connector then keeps its notes
             // for the life of the open -- which is what every caller got before there was anywhere to file them.
@@ -268,7 +345,7 @@ class HazelcastMemberTest {
     void hazelcastMemberBindsTheSnapshotBufferIntoTheUserContext() {
         SnapshotBuffer buffer = new SnapshotBuffer();
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, buffer, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, buffer, null, NestSettings.defaults(), null, null);
         try {
             // A source vertex resolves the buffer member-side from the user context to emit its ring's snapshot
             // rows ahead of the cdc tail, so the assembly root binds the same instance under the well-known key.
@@ -281,7 +358,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheSnapshotBufferUnboundWhenNoneIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no buffer (mongo disabled) binds nothing; a source then emits no snapshot ahead of the
             // tail rather than failing.
@@ -295,7 +372,7 @@ class HazelcastMemberTest {
     void hazelcastMemberBindsTheNestDeadLetterStoreIntoTheUserContext() {
         NestDeadLetterStore deadLetters = new InMemoryNestDeadLetterStore();
         HazelcastInstance member = new HazelcastConfiguration().hazelcastMember(
-                new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), deadLetters);
+                new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), deadLetters, null);
         try {
             // The channel carried onto a nest vertex resolves the store member-side from the user context,
             // so the assembly root binds it under the well-known key -- otherwise a vertex that cannot
@@ -310,7 +387,7 @@ class HazelcastMemberTest {
     @Test
     void hazelcastMemberLeavesTheNestDeadLetterStoreUnboundWhenNoneIsConfigured() {
         HazelcastInstance member = new HazelcastConfiguration()
-                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null);
+                .hazelcastMember(new HazelcastProperties(), null, null, null, null, NestSettings.defaults(), null, null);
         try {
             // A run with no store (mongo disabled) binds nothing. Unlike the bindings above, the consequence
             // is a refusal rather than a quiet no-op: a nest vertex on such a member fails when it reaches
@@ -345,7 +422,58 @@ class HazelcastMemberTest {
         assertThat(member.getLifecycleService().isRunning()).isFalse();
     }
 
+    /**
+     * The mirror of what {@code makeJoinCapable} is for, and a regression that would say nothing.
+     *
+     * <p>The substrate resolves a map's configuration by looking through the static configuration by
+     * pattern first and only then at what was added while the member ran. A {@code join.*} pattern left
+     * here therefore answers for every join namespace, and an exact configuration behind it is never
+     * reached - with nothing about the run saying which one was in force. The nest maps were moved out
+     * of here for exactly that; this holds the join maps to the same place before the same thing can
+     * happen to them.
+     *
+     * <p>It is not hypothetical: {@code JoinMaps.backedStateMaps(name, entries)} - the exact-name form -
+     * already exists, so the configuration that would be shadowed is one call away rather than a
+     * future design. A store is passed because that is the case that used to declare these statically;
+     * with none, there would be nothing to find either way and the case would pass vacuously.
+     */
+    @Test
+    @DisplayName("the static config declares no join state map, because a pattern here outranks an exact one added later")
+    void memberConfigDeclaresNoJoinStateMapPattern() {
+        Config config = HazelcastConfiguration.memberConfig(
+                new HazelcastProperties(), new InMemoryKeyedStateStore());
+
+        assertThat(config.getMapConfigs().keySet())
+                .noneMatch(name -> name.startsWith(JoinMaps.NAMESPACE_PREFIX));
+    }
+
     /** A sentinel meta store: an identity to assert the user-context binding; its facets are never invoked here. */
+    /** A change log that is only ever asked to be there. */
+    private static final class SentinelLogStore implements SrsLogStore {
+
+        @Override
+        public void store(String ring, long seq, SrsLogRecord record) {
+        }
+
+        @Override
+        public void storeAll(String ring, long firstSeq, List<SrsLogRecord> records) {
+        }
+
+        @Override
+        public Optional<SrsLogRecord> load(String ring, long seq) {
+            return Optional.empty();
+        }
+
+        @Override
+        public long largestSequence(String ring) {
+            return -1;
+        }
+
+        @Override
+        public void trim(String ring, long throughSeq) {
+        }
+    }
+
     private static final class SentinelMetaStore implements SrsMetaStore {
         @Override
         public java.util.List<String> miningChainIdsWithConsumer(String pipelineId) {
@@ -355,6 +483,11 @@ class HazelcastMemberTest {
         @Override
         public void detachConsumer(String miningChainId, String pipelineId) {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
+        }
+
+        @Override
+        public void dropChain(String miningChainId) {
+            throw new UnsupportedOperationException("chain removal is not exercised by this double");
         }
 
         @Override public Optional<SrsMeta> read(String miningChainId) {
@@ -377,7 +510,13 @@ class HazelcastMemberTest {
             throw new UnsupportedOperationException();
         }
 
-        @Override public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        @Override
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            // No test on this double writes a position back; a call here is a wiring mistake, not a case.
+            throw new UnsupportedOperationException("rewindSourceReadOffset");
+        }
+
+        @Override public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             throw new UnsupportedOperationException();
         }
 
@@ -393,7 +532,7 @@ class HazelcastMemberTest {
             throw new UnsupportedOperationException();
         }
 
-        @Override public void markSnapshotComplete(String miningChainId, String table) {
+        @Override public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             throw new UnsupportedOperationException();
         }
     }

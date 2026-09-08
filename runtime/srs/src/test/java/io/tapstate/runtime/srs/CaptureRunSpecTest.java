@@ -3,7 +3,6 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureConfig;
-import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -36,7 +35,7 @@ class CaptureRunSpecTest {
     private static CaptureRunSpec spec(CaptureConfig config, String pipelineId, String sourceId) {
         return new CaptureRunSpec(
                 config, ReadMode.CDC_ONLY, null, true, sourceId, pipelineId, StartFrom.earliest(),
-                new SourcePosition("cdc-start-0"), null, 0L, () -> new SourcePosition("w1"));
+                null, 0L);
     }
 
     @Test

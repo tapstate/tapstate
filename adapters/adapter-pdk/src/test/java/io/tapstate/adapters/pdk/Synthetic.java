@@ -17,6 +17,16 @@ final class Synthetic {
 
     /** The shared source scaffold: a connector whose ctor and registered functions the caller fills in. */
     private static String source(String simpleName, String ctorBody, String registerBody) {
+        return source(simpleName, ctorBody, registerBody, "");
+    }
+
+    /**
+     * The same, plus {@code members} spliced into the class body — for a connector that has to own a
+     * type of its own. A driver's box is a class the driver ships, so a connector standing in for one
+     * has to ship a class too; a JDK type would be one this side of the boundary already knows.
+     */
+    private static String source(
+            String simpleName, String ctorBody, String registerBody, String members) {
         return ""
                 + "package synthetic;"
                 + "import io.tapdata.pdk.apis.TapConnector;"
@@ -56,7 +66,204 @@ final class Synthetic {
                 + "    return ConnectionOptions.create();"
                 + "  }"
                 + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + members
                 + "}";
+    }
+
+    /**
+     * A source that states where it has read to, the way a real one does: it answers
+     * {@code timestampToStreamOffset} with an offset object of its own class, and closes each stream
+     * batch by naming one.
+     *
+     * <p>That class exists only inside the jar, so nothing on the host can name it. This is what makes it
+     * a witness rather than a fixture: a position that round-trips through it has been through the
+     * connector's own loader, which is the one thing a host-side round-trip of a host-visible class
+     * cannot show.
+     *
+     * <p>Its stream read also reports the offset it was <em>started</em> from, as the {@code id} of the
+     * row it emits — so a resume is observable from outside as "the connector was handed back the object
+     * it issued", rather than only as "the call did not throw".
+     */
+    static Path positionedSource(Path dir) {
+        String source = ""
+                + "package synthetic;"
+                + "import io.tapdata.pdk.apis.TapConnector;"
+                + "import io.tapdata.pdk.apis.functions.ConnectorFunctions;"
+                + "import io.tapdata.entity.codec.TapCodecsRegistry;"
+                + "import io.tapdata.pdk.apis.context.TapConnectionContext;"
+                + "import io.tapdata.pdk.apis.entity.ConnectionOptions;"
+                + "import io.tapdata.pdk.apis.entity.TestItem;"
+                + "import io.tapdata.entity.schema.TapTable;"
+                + "import io.tapdata.entity.schema.TapField;"
+                + "import io.tapdata.entity.event.TapEvent;"
+                + "import io.tapdata.entity.event.dml.TapInsertRecordEvent;"
+                + "import java.util.ArrayList;"
+                + "import java.util.LinkedHashMap;"
+                + "import java.util.List;"
+                + "import java.util.Map;"
+                + "import java.util.function.Consumer;"
+                + "public class PositionedSource implements TapConnector {"
+                + "  public static class Offset implements java.io.Serializable {"
+                + "    public String mark;"
+                + "    public Offset() {}"
+                + "    public Offset(String mark) { this.mark = mark; }"
+                + "  }"
+                + "  public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {"
+                + "    functions.supportTimestampToStreamOffset((context, timestamp) -> new Offset(\"seam-1\"));"
+                + "    functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "      List<TapEvent> evs = new ArrayList<>();"
+                + row("r1", 1)
+                + "      evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(r1));"
+                + "      consumer.accept(evs, null);"
+                + "    });"
+                + "    functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "      consumer.streamReadStarted();"
+                + "      String startedAt = (offset instanceof Offset) ? ((Offset) offset).mark : \"none\";"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Map<String,Object> a = new LinkedHashMap<>(); a.put(\"id\", startedAt);"
+                + "      batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "      Map<String,Object> b = new LinkedHashMap<>(); b.put(\"id\", \"second\");"
+                + "      batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(2L).after(b));"
+                + "      consumer.accept(batch, new Offset(\"batch-9\"));"
+                + "      consumer.streamReadEnded();"
+                + "    });"
+                + "  }"
+                + "  public void init(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
+                + "    TapTable table = new TapTable(\"t1\");"
+                + "    table.add(new TapField(\"id\", \"int\"));"
+                + "    List<TapTable> tables = new ArrayList<>();"
+                + "    tables.add(table);"
+                + "    s.accept(tables);"
+                + "  }"
+                + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {"
+                + "    s.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY));"
+                + "    return ConnectionOptions.create();"
+                + "  }"
+                + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.PositionedSource", source);
+    }
+
+    /**
+     * A source that reports back which instant it was asked to resolve, rather than only which offset it
+     * ended up handing out.
+     *
+     * <p>Its {@code timestampToStreamOffset} encodes its argument into the offset it returns, and its
+     * stream read emits that offset's mark as the {@code id} of its first row. So the instant a caller
+     * asked to start at is observable from outside the connector, which is the only way to tell a start
+     * that was carried through from one that was dropped on the way: a dropped instant still produces a
+     * running stream reading from the present, and every assertion about rows arriving is green either
+     * way.
+     */
+    static Path timestampEchoingSource(Path dir) {
+        String source = ""
+                + "package synthetic;"
+                + "import io.tapdata.pdk.apis.TapConnector;"
+                + "import io.tapdata.pdk.apis.functions.ConnectorFunctions;"
+                + "import io.tapdata.entity.codec.TapCodecsRegistry;"
+                + "import io.tapdata.pdk.apis.context.TapConnectionContext;"
+                + "import io.tapdata.pdk.apis.entity.ConnectionOptions;"
+                + "import io.tapdata.pdk.apis.entity.TestItem;"
+                + "import io.tapdata.entity.schema.TapTable;"
+                + "import io.tapdata.entity.schema.TapField;"
+                + "import io.tapdata.entity.event.TapEvent;"
+                + "import io.tapdata.entity.event.dml.TapInsertRecordEvent;"
+                + "import java.util.ArrayList;"
+                + "import java.util.LinkedHashMap;"
+                + "import java.util.List;"
+                + "import java.util.Map;"
+                + "import java.util.function.Consumer;"
+                + "public class TimestampEchoingSource implements TapConnector {"
+                + "  public static class Offset implements java.io.Serializable {"
+                + "    public String mark;"
+                + "    public Offset() {}"
+                + "    public Offset(String mark) { this.mark = mark; }"
+                + "  }"
+                + "  public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {"
+                + "    functions.supportTimestampToStreamOffset((context, timestamp) ->"
+                + "        new Offset(timestamp == null ? \"present\" : (\"at:\" + timestamp)));"
+                + "    functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "      consumer.streamReadStarted();"
+                + "      String startedAt = (offset instanceof Offset) ? ((Offset) offset).mark : \"none\";"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Map<String,Object> a = new LinkedHashMap<>(); a.put(\"id\", startedAt);"
+                + "      batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "      consumer.accept(batch, new Offset(\"batch-9\"));"
+                + "      consumer.streamReadEnded();"
+                + "    });"
+                + "  }"
+                + "  public void init(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
+                + "    TapTable table = new TapTable(\"t1\");"
+                + "    table.add(new TapField(\"id\", \"int\"));"
+                + "    List<TapTable> tables = new ArrayList<>();"
+                + "    tables.add(table);"
+                + "    s.accept(tables);"
+                + "  }"
+                + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {"
+                + "    s.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY));"
+                + "    return ConnectionOptions.create();"
+                + "  }"
+                + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.TimestampEchoingSource", source);
+    }
+
+    /**
+     * A source with no {@code timestampToStreamOffset} at all, but a working stream read: the shape a
+     * connector has when it can follow changes yet cannot say which position an instant corresponds to.
+     * Asking such a source to start at an instant has no answer, and the only alternatives to refusing
+     * are to start at the present or at the beginning — both of which run, report healthy, and read a
+     * different span than the caller asked for.
+     */
+    static Path offsetlessStreamSource(Path dir) {
+        String source = ""
+                + "package synthetic;"
+                + "import io.tapdata.pdk.apis.TapConnector;"
+                + "import io.tapdata.pdk.apis.functions.ConnectorFunctions;"
+                + "import io.tapdata.entity.codec.TapCodecsRegistry;"
+                + "import io.tapdata.pdk.apis.context.TapConnectionContext;"
+                + "import io.tapdata.pdk.apis.entity.ConnectionOptions;"
+                + "import io.tapdata.pdk.apis.entity.TestItem;"
+                + "import io.tapdata.entity.schema.TapTable;"
+                + "import io.tapdata.entity.schema.TapField;"
+                + "import io.tapdata.entity.event.TapEvent;"
+                + "import io.tapdata.entity.event.dml.TapInsertRecordEvent;"
+                + "import java.util.ArrayList;"
+                + "import java.util.LinkedHashMap;"
+                + "import java.util.List;"
+                + "import java.util.Map;"
+                + "import java.util.function.Consumer;"
+                + "public class OffsetlessStream implements TapConnector {"
+                + "  public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {"
+                + "    functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "      consumer.streamReadStarted();"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Map<String,Object> a = new LinkedHashMap<>(); a.put(\"id\", \"only\");"
+                + "      batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "      consumer.accept(batch, null);"
+                + "      consumer.streamReadEnded();"
+                + "    });"
+                + "  }"
+                + "  public void init(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
+                + "    TapTable table = new TapTable(\"t1\");"
+                + "    table.add(new TapField(\"id\", \"int\"));"
+                + "    List<TapTable> tables = new ArrayList<>();"
+                + "    tables.add(table);"
+                + "    s.accept(tables);"
+                + "  }"
+                + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {"
+                + "    s.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY));"
+                + "    return ConnectionOptions.create();"
+                + "  }"
+                + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.OffsetlessStream", source);
     }
 
     /** A row map {@code {id: value}} as a Java expression string. */
@@ -285,6 +492,76 @@ final class Synthetic {
                 + "});";
         return SyntheticJar.compileToJar(dir, "synthetic.OpaqueValue",
                 source("OpaqueValue", "", register));
+    }
+
+    /**
+     * Streams one insert holding a driver type the connector <em>registered its own conversion for</em>,
+     * alongside the plain boxes it registers nothing for. The conversion deliberately produces a string
+     * no other path could produce, so three outcomes stay apart: the conversion ran and its result was
+     * handed on; it never ran, and the value was rendered as its own text; it ran and the carrier around
+     * the result was handed on instead of the result.
+     */
+    static Path codecValueSource(Path dir) {
+        String opaque = "java.util.UUID.fromString(\"00000000-0000-0000-0000-00000000002a\")";
+        String register = ""
+                + "codecs.registerToTapValue(java.util.UUID.class, (v, t) ->"
+                + "  new io.tapdata.entity.schema.value.TapStringValue(\"converted:\" + v));"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 7);"
+                + "  r.put(\"name\", \"row-7\");"
+                + "  r.put(\"key\", " + opaque + ");"
+                + "  Map<String,Object> nested = new LinkedHashMap<>();"
+                + "  nested.put(\"ref\", " + opaque + ");"
+                + "  r.put(\"meta\", nested);"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "  consumer.streamReadEnded();"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.CodecValue", source("CodecValue", "", register));
+    }
+
+    /**
+     * A connector that serves the same row on both read faces, holding a binary column. Shaped after a
+     * real one: the driver hands its bytes over in its own box, and the conversion the connector
+     * registers turns that into the portable binary value. Both halves matter — the box is what the
+     * query face used to be handed raw, and the portable value is what the follow face was handed —
+     * and neither is text, so a renderer with nothing to say about them says the same identity hash
+     * about both.
+     */
+    static Path binaryValueSource(Path dir) {
+        // The driver's own box, not a byte[]: a byte[] is a type this side of the boundary can name, so
+        // a face that never ran the conversion could still render one and the test could not tell the
+        // two apart. A real driver's box cannot be named here, and that is the whole point of it.
+        String blob = "public static class Blob { public final byte[] b;"
+                + " public Blob(byte[] b) { this.b = b; } }";
+        String bytes = "new Blob(new byte[]{(byte)222,(byte)173,(byte)190,(byte)239})";
+        String register = ""
+                + "codecs.registerToTapValue(Blob.class, (v, t) ->"
+                + "  new io.tapdata.entity.schema.value.TapBinaryValue("
+                + "    new io.tapdata.entity.schema.value.ByteData(((Blob) v).b)));"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 7);"
+                + "  r.put(\"blob\", " + bytes + ");"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "  consumer.streamReadEnded();"
+                + "});"
+                + "functions.supportExecuteCommandFunction((c, command, consumer) -> {"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 7);"
+                + "  r.put(\"blob\", " + bytes + ");"
+                + "  List<Map<String,Object>> batch = new ArrayList<>(); batch.add(r);"
+                + "  consumer.accept(new io.tapdata.pdk.apis.entity.ExecuteResult"
+                + "    <List<Map<String,Object>>>().result(batch));"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.BinaryValue",
+                source("BinaryValue", "", register, blob));
     }
 
     /** A connector whose batchRead emits a delete-shaped event — unprojectable as a snapshot row. */
@@ -1079,6 +1356,36 @@ final class Synthetic {
                 + "  consumer.accept(new ExecuteResult<List<Map<String,Object>>>().result(batch5));"
                 + "});";
         return SyntheticJar.compileToJar(dir, "synthetic.ReadFace", readFace("ReadFace", register));
+    }
+
+    /**
+     * A query face whose one row holds values no JSON writer knows, at three depths — the same shapes
+     * and the same stand-in the follow face uses, so the two faces can be asked the same question and
+     * their answers compared. A document store's own key arrives from its driver as an object, and it
+     * reaches this face through a different call than the one the follow face uses.
+     *
+     * <p>The plain values beside them discriminate the same way they do there: rendering every value as
+     * text would satisfy "the driver object became a string" while turning a number into one.
+     */
+    static Path opaqueQuerySource(Path dir) {
+        String opaque = "java.util.UUID.fromString(\"00000000-0000-0000-0000-00000000002a\")";
+        String register = ""
+                + "functions.supportExecuteCommandFunction((c, command, consumer) -> {"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 7);"
+                + "  r.put(\"flag\", Boolean.TRUE);"
+                + "  r.put(\"name\", \"row-7\");"
+                + "  r.put(\"key\", " + opaque + ");"
+                + "  Map<String,Object> nested = new LinkedHashMap<>();"
+                + "  nested.put(\"ref\", " + opaque + ");"
+                + "  r.put(\"meta\", nested);"
+                + "  List<Object> refs = new ArrayList<>();"
+                + "  refs.add(" + opaque + ");"
+                + "  r.put(\"refs\", refs);"
+                + "  List<Map<String,Object>> batch = new ArrayList<>(); batch.add(r);"
+                + "  consumer.accept(new ExecuteResult<List<Map<String,Object>>>().result(batch));"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.OpaqueQuery", readFace("OpaqueQuery", register));
     }
 
     /**

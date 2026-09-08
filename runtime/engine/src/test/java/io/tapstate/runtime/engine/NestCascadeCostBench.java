@@ -18,6 +18,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -357,7 +358,7 @@ class NestCascadeCostBench {
 
         Step step = Step.inline("doc", FromClause.aliases(aliasRefs),
                 new TransformBody.Nest(null, null, root), null, null);
-        PipelineResource pipeline = new PipelineResource("bench" + depth, null, sourceIds,
+        PipelineResource pipeline = new PipelineResource("bench" + depth, null, sourceIds.stream().<SourceRef>map(SourceRef::bare).toList(),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),

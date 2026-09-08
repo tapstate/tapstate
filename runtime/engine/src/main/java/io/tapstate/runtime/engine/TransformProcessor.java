@@ -64,8 +64,9 @@ public final class TransformProcessor extends AbstractProcessor {
     }
 
     /** A meta-supplier for a vertex that propagates no frontier, for a job built without one. */
-    public static ProcessorMetaSupplier metaSupplier(SupplierEx<? extends TransformPort> portFactory) {
-        return metaSupplier(portFactory, null, null);
+    public static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends TransformPort> portFactory) {
+        return metaSupplier(vertexName, portFactory, null, null);
     }
 
     /** Resolves this pipeline's id and the shared failure registry; see {@link SinkProcessor#init}. */
@@ -80,15 +81,23 @@ public final class TransformProcessor extends AbstractProcessor {
      * A meta-supplier for a DAG vertex that runs this adapter over the port the factory builds. The
      * factory (not a prebuilt port) is what the DAG carries, so the port is constructed on the member
      * that runs the vertex. The vertex is pinned to total parallelism one so it preserves the source
-     * position order the sink acks.
+     * position order the sink acks, and it is pinned to the member that owns {@code vertexName}.
+     *
+     * <p>Naming the member is half of a pair, and the other half is not optional: every edge into this
+     * vertex must be {@code distributed().allToOne(vertexName)}. Pinned says there is one processor;
+     * reachable says the items get to it. A member with no processor of this vertex answers input with an
+     * {@code IllegalStateException} the moment the first event lands, which on one member never happens -
+     * the only processor there is the local one - so nothing short of a real cluster tells the two apart.
      *
      * <p>{@code chainsByOrdinal} says which chains each inbound edge is compiled to carry, which is what
      * the vertex waits on before promising anything about one. It travels with the graph rather than
      * being worked out on the member, for the same reason {@code axes} does: two members that disagreed
      * would combine promises about different chains.
      */
-    public static ProcessorMetaSupplier metaSupplier(SupplierEx<? extends TransformPort> portFactory,
+    public static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends TransformPort> portFactory,
             ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal) {
+        Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(portFactory, "portFactory");
         SupplierEx<Processor> supplier = axes == null
                 ? () -> new TransformProcessor(portFactory.get())
@@ -96,7 +105,7 @@ public final class TransformProcessor extends AbstractProcessor {
                 // is exactly the lowest of what its edges promised.
                 : () -> new TransformProcessor(portFactory.get(),
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
     @Override

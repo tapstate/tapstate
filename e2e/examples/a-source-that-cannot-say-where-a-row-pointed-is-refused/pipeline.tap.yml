@@ -1,0 +1,18 @@
+version: tapstate/v1
+kind: pipeline
+id: pointed_orders
+source: [ src_point_orders, src_point_customers ]
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: point_doc
+    type: nest
+    from: { o: point_orders, c: point_customers }
+    root:
+      from: o
+      key: [ id ]
+      embed:
+        - { from: c, on: { id: cust_ref }, as: object, path: customer }
+view:
+  id: point_state
+  from: point_doc
+  primary_key: id

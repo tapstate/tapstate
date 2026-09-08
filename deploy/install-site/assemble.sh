@@ -26,6 +26,10 @@ cp "$here/vercel.json"                     "$out/vercel.json"
 mkdir -p "$out/api"
 cp "$here/api/event.js"                    "$out/api/event.js"
 
+# The same gate the release path runs. Assembling by hand and deploying that is a real path, and it
+# must not be the one where a function with no route slips through.
+"$here/check-site.sh" "$out" >/dev/null
+
 echo "assembled into $out:"
 echo "  /     <- deploy/quickstart/quickstart.sh"
 echo "  /cli  <- install/install.sh"

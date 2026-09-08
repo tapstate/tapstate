@@ -7,6 +7,7 @@ import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestOrder;
 import io.tapstate.core.model.NestRoot;
@@ -23,6 +24,7 @@ import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceMode;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.SrsSchemaEvolution;
@@ -48,12 +50,17 @@ import org.yaml.snakeyaml.nodes.ScalarNode;
 import org.yaml.snakeyaml.nodes.SequenceNode;
 import org.yaml.snakeyaml.representer.Representer;
 
+import io.tapstate.core.sql.SqlFrontEnd;
+import io.tapstate.core.sql.SqlFrontEndException;
+import io.tapstate.core.sql.Unsupported;
+
 import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -96,6 +103,7 @@ public final class DslParser {
     private static final Set<String> VIEW_SCHEMA_KEYS = Set.of("enforce", "evolution");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
+    private static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
     private static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "options");
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
@@ -209,18 +217,31 @@ public final class DslParser {
                 m.freeMap("experimental"));
     }
 
-    private static List<String> sources(YamlMap m) {
+    private static List<SourceRef> sources(YamlMap m) {
         Node n = m.node("source");
         if (n instanceof ScalarNode sc) {
-            return List.of(sc.getValue());
+            return List.of(SourceRef.bare(sc.getValue()));
         }
-        List<String> ids = new ArrayList<>();
+        List<SourceRef> refs = new ArrayList<>();
         if (n instanceof SequenceNode seq) {
             for (Node item : seq.getValue()) {
-                ids.add(YamlMap.requireScalar(item, "source"));
+                refs.add(sourceRef(item));
             }
         }
-        return ids;
+        return refs;
+    }
+
+    private static SourceRef sourceRef(Node item) {
+        if (item instanceof ScalarNode sc) {
+            return SourceRef.bare(sc.getValue());
+        }
+        YamlMap ref = YamlMap.requireMapping(item, "source");
+        ref.requireOnly(SOURCE_REF_KEYS);
+        Boolean srs = boolValue(ref, "srs");
+        // An object written without the switch says exactly what a bare id says, so it normalizes
+        // to one: keeping both spellings of one state would let the same pipeline canonicalize two
+        // ways, and the materialization rule reads "has a switch" off this distinction.
+        return srs == null ? SourceRef.bare(ref.string("id")) : SourceRef.spec(ref.string("id"), srs);
     }
 
     // ---- transforms ---------------------------------------------------------------
@@ -299,7 +320,12 @@ public final class DslParser {
                     positiveIntValue(s, "entries_in_memory"),
                     positiveIntValue(s, "max_elements_per_document"),
                     nestRoot(s.mapping("root")));
-            case "join" -> new TransformBody.Join(s.string("engine"), s.string("sql"));
+            case "join" -> {
+                JoinEngine engine = enumByYaml(JoinEngine.values(), JoinEngine::yaml, s, "engine");
+                String sql = s.string("sql");
+                checkJoinSql(s, sql);
+                yield new TransformBody.Join(engine, sql);
+            }
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
                     Map.of("value", type, "expected", "a known transform type (js, map, filter, union, nest, join)"));
         };
@@ -803,6 +829,55 @@ public final class DslParser {
             sb.append(yaml.apply(values[i]));
         }
         return sb.toString();
+    }
+
+    // ---- join SQL checking (§5.2) --------------------------------------------------
+
+    /**
+     * Refuses join SQL this release cannot run, while the artifact is being read rather than when
+     * a pipeline is assembled from it.
+     *
+     * <p>Everything refused here is valid SQL that type-checks; what it is not is expressible in
+     * the plan a carrier is handed. A carrier given a plan that dropped half of what the statement
+     * said does not fail -- it publishes rows that read exactly like the answer, and nothing
+     * downstream can tell the difference. So the refusal has to happen before anything runs, which
+     * is here.
+     *
+     * <p>The two outcomes stay separate deliberately. "This is not SQL" and "this release does not
+     * do that" send a reader to opposite places, and folding them into one code sends everyone who
+     * mistyped off to read a support matrix.
+     */
+    private static void checkJoinSql(YamlMap owner, String sql) {
+        if (sql == null) {
+            return;
+        }
+        Optional<Unsupported> refused;
+        try {
+            refused = SqlFrontEnd.unsupported(sql);
+        } catch (SqlFrontEndException e) {
+            throw owner.errorAt("sql", DslError.JOIN_SQL_NOT_PARSABLE,
+                    Map.of("detail", firstLine(e.getMessage())));
+        }
+        if (refused.isPresent()) {
+            Unsupported found = refused.get();
+            throw owner.errorAt("sql", DslError.JOIN_SQL_UNSUPPORTED, Map.of(
+                    "shape", found.shape(),
+                    "line", found.line(),
+                    "column", found.column()));
+        }
+    }
+
+    /**
+     * The parser's diagnosis is its first line; what follows is a dump of every token that would
+     * have been accepted, which is longer than the artifact and tells a reader nothing they can act
+     * on.
+     */
+    private static String firstLine(String message) {
+        if (message == null) {
+            return "";
+        }
+        int end = message.indexOf('\n');
+        return (end < 0 ? message : message.substring(0, end)).trim();
     }
 
     // ---- CEL expression checking (§12) --------------------------------------------

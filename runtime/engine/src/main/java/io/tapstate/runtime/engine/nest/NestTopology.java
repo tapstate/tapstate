@@ -265,10 +265,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                         lookupName(nodeId, node.pathId()), mapName(pipelineId, nodeId, node.pathId()),
                         referenceIdentity(node.embed()), node.parentAlias(),
                         referenceFields(node.embed()), identities.get(node.parentPathId()),
-                        node.parentPathId(), touchOrdinal(pointing, node),
-                        // Read off the edge that level's own rows arrive on rather than off the tree again:
-                        // it is the same switch, and asking it twice is how the two answers start to differ.
-                        pointing.inbound().get(0).tracksKeyChanges());
+                        node.parentPathId(), touchOrdinal(pointing, node));
                 lookups.add(lookup);
                 streams.add(new NestStream(node.embed().from(), node.pathId(), 0, lookup.name(), null));
                 continue;

@@ -54,6 +54,12 @@
     </dependency>
     <dependency>
       <groupId>io.tapstate</groupId>
+      <artifactId>core-sql</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.tapstate</groupId>
       <artifactId>core-schema</artifactId>
       <version>${revision}</version>
       <scope>test</scope>

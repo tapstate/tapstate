@@ -126,23 +126,27 @@ jobs:
           # deployed to the domain the README tells people to pipe into sh.
           pinned="$(.github/scripts/site-from-tag.sh "$tag" "$site")"
           echo "publishing the entry points pinned to $pinned"
-          if git show "$tag:deploy/install-site/vercel.json" > "$site/vercel.json" 2>/dev/null; then
-            echo "routing: from $tag"
+          # The receiver and the routing that reaches it are ONE unit, taken from one source. Deciding
+          # their provenance separately is how this published a working function nobody could reach:
+          # the receiver fell back to this checkout because the tag lacked it, while the routing came
+          # from the tag -- whose vercel.json exists and simply has no /e rewrite. The fallback tests
+          # whether the file is there, not whether it mentions the route, so it never fired. Deploy
+          # succeeded, both static entry points matched byte for byte, and /e answered 404 with the
+          # function live at its default path behind it. A tag old enough to lack the receiver is old
+          # enough to lack the route that reaches it.
+          mkdir -p "$site/api"
+          if git show "$tag:deploy/install-site/api/event.js" > "$site/api/event.js" 2>/dev/null \
+             && git show "$tag:deploy/install-site/vercel.json" > "$site/vercel.json" 2>/dev/null; then
+            echo "receiver + routing: from $tag"
           else
-            echo "routing: $tag predates the checked-in routing; using this checkout's vercel.json"
+            echo "receiver + routing: $tag predates the checked-in receiver; using this checkout's copies"
+            cp deploy/install-site/api/event.js "$site/api/event.js"
             cp deploy/install-site/vercel.json "$site/vercel.json"
           fi
-          # The event receiver travels with the routing, from the tag when the tag has it. Without this
-          # the site deploys with a /e rewrite and nothing behind it: the route 404s, the installer's
-          # report fails silently by design, and no signal anywhere says the endpoint was never
-          # published. A missing function and a quiet week look identical downstream.
-          mkdir -p "$site/api"
-          if git show "$tag:deploy/install-site/api/event.js" > "$site/api/event.js" 2>/dev/null; then
-            echo "receiver: from $tag"
-          else
-            echo "receiver: $tag predates the checked-in receiver; using this checkout's copy"
-            cp deploy/install-site/api/event.js "$site/api/event.js"
-          fi
+          # And then it is checked rather than trusted. The rule above is one line of shell away from
+          # being wrong again; this refuses the result -- before anything reaches the edge -- whenever
+          # a function has no route or a route has no function.
+          deploy/install-site/check-site.sh "$site"
           ls -lR "$site"
           echo "dir=$site" >> "$GITHUB_OUTPUT"
 
@@ -214,16 +218,27 @@ jobs:
             exit 1
           fi
 
-          # Second: a POST the receiver must refuse. 400 proves the handler BODY ran -- the validator
-          # executed and rejected -- rather than only that a route exists, which is all 405 shows. A
-          # rewrite pointing at a stale or broken function can still answer 405 for a GET.
+          # Second: a POST of well-formed JSON that is not a valid event. It must answer 400, and 400
+          # here now means something specific: the body was READ and PARSED, and then the validator
+          # rejected the event. A request whose body could not be read at all answers 415.
+          #
+          # That distinction is the whole point of this probe. It used to accept 400 for either, and
+          # 0.4.4 shipped a receiver that answered 400 to EVERY request -- valid events included --
+          # because the body never arrived as a parsed object. Deploy green, both probes green, every
+          # install event rejected, and the installer swallows the status by design. Nothing anywhere
+          # said so; the first symptom would have been an install count that stayed at zero, which is
+          # indistinguishable from nobody installing.
           code="$(curl -s -o /dev/null -w '%{http_code}' \
                     -X POST -H 'Content-Type: application/json' \
                     -d '{"installation_id":"no"}' "https://$SITE_DOMAIN/e")"
           if [ "$code" = "400" ]; then
             echo "ok: the receiver validates (POST of a malformed event -> 400)"
+          elif [ "$code" = "415" ]; then
+            echo "the receiver could not read a JSON body it was handed (415)." >&2
+            echo "Every install event would be refused the same way, silently." >&2
+            exit 1
           else
-            echo "the receiver did not validate: malformed POST answered $code, expected 400" >&2
+            echo "the receiver did not validate: a well-formed JSON body answered $code, expected 400" >&2
             exit 1
           fi
 

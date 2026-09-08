@@ -240,6 +240,12 @@ class SrsCoordinatorTest {
         }
 
         @Override
+        public void dropChain(String miningChainId) {
+            throw new UnsupportedOperationException(
+                    "chain removal is not exercised by this double");
+        }
+
+        @Override
         public void detachConsumer(String miningChainId, String pipelineId) {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
         }
@@ -265,7 +271,13 @@ class SrsCoordinatorTest {
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            // No test on this double writes a position back; a call here is a wiring mistake, not a case.
+            throw new UnsupportedOperationException("rewindSourceReadOffset");
+        }
+
+        @Override
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             mutations.add("advance:" + miningChainId);
         }
 
@@ -296,7 +308,7 @@ class SrsCoordinatorTest {
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             mutations.add("snapshotComplete:" + miningChainId + "/" + table);
         }
 

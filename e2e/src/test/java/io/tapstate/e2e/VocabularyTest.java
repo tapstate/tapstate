@@ -22,6 +22,16 @@ class VocabularyTest {
     }
 
     @Test
+    void wordsTheTerminalComposesAreKeptApartFromTheProductsVerbs() {
+        // Two sets, not one, and the split is load-bearing: the product's verb set is pinned at four
+        // elsewhere, so a composed word folded into it would either break that gate or quietly widen
+        // what counts as a lifecycle verb. This is the vocabulary following the surface a person
+        // types, which is where restart lives and where the verb enum does not.
+        assertThat(Vocabulary.COMPOSED_STEPS).containsExactly("restart", "restart --rerun");
+        assertThat(Vocabulary.LIFECYCLE_STEPS).doesNotContainAnyElementsOf(Vocabulary.COMPOSED_STEPS);
+    }
+
+    @Test
     void cdcOperationsAreTheHarnessesOwnEnum() {
         assertThat(Vocabulary.CDC_OPERATIONS).containsExactly("delete", "insert", "update");
     }

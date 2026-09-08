@@ -95,7 +95,7 @@ class ASinkOpensAgainstTheStoreBoundOnItsMemberTest {
 
     private static HazelcastInstance memberWith(ConnectorProvisioner provisioner, KeyedStateStore store) {
         return new HazelcastConfiguration().hazelcastMember(
-                new HazelcastProperties(), null, provisioner, null, store, NestSettings.defaults(), null);
+                new HazelcastProperties(), null, provisioner, null, store, NestSettings.defaults(), null, null);
     }
 
     /** Resolves every connector id to one synthetic sink, compiled into a jar for this case alone. */

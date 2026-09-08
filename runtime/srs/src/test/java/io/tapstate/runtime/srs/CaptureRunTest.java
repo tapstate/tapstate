@@ -41,7 +41,7 @@ class CaptureRunTest {
         CaptureHealth health = new CaptureHealth();
         RuntimeException boom = new RuntimeException("tail boom");
         // A stream failure lands on the health through the recording listener the phase installs.
-        health.recording(e -> {
+        health.recording((e, pos) -> {
         }).onError(boom);
         CaptureRun run = new CaptureRun(
                 Optional.empty(), false, 0L, Optional.empty(), Optional.empty(), health);

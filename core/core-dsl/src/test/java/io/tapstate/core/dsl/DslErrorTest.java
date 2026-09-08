@@ -47,7 +47,11 @@ class DslErrorTest {
                 "dsl.row-expression-type-unknown",
                 // post-semantic too - whether a table declares a key is a property of the table,
                 // carried only by a discovered model and never by the document naming it
-                "dsl.upsert-needs-key");
+                "dsl.upsert-needs-key",
+                // the join SQL gate: both are raised while reading the artifact, so both are
+                // witnessed by an ordinary corpus case
+                "dsl.join-sql-not-parsable",
+                "dsl.join-sql-unsupported");
     }
 
     @Test
@@ -59,6 +63,10 @@ class DslErrorTest {
         assertThat(DslError.MODE_MISMATCH.placeholders()).containsExactlyInAnyOrder("field", "mode", "path");
         assertThat(DslError.ILLEGAL_VALUE.placeholders()).containsExactlyInAnyOrder("value", "expected", "path");
         assertThat(DslError.ILLEGAL_EXPRESSION.placeholders()).containsExactlyInAnyOrder("expr", "detail", "path");
+        assertThat(DslError.JOIN_SQL_NOT_PARSABLE.placeholders())
+                .containsExactlyInAnyOrder("detail", "path");
+        assertThat(DslError.JOIN_SQL_UNSUPPORTED.placeholders())
+                .containsExactlyInAnyOrder("shape", "line", "column", "path");
         assertThat(DslError.COMPOSITION.placeholders()).containsExactlyInAnyOrder("detail", "path");
         assertThat(DslError.DUPLICATE_ID.placeholders()).containsExactlyInAnyOrder("id", "path");
         assertThat(DslError.UNSUPPORTED_MODE.placeholders())

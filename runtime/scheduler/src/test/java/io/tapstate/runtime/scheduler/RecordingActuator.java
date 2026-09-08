@@ -9,6 +9,11 @@ import java.util.Optional;
  * as {@code "<verb>:<pipelineId>"} strings — so a test can assert exactly which data-plane operation
  * each transition drove without a real execution engine. A test can also arm a job failure, which the
  * failure() query reports without recording a call (it is a health read, not a verb).
+ *
+ * <p>A stop records what it was asked to do about the pipeline's state as well, {@code :purge} or
+ * {@code :keep}. Every road to a stopped job drives the same verb — the user's own stop, a source that
+ * ran out, a job that died — and without the suffix an assertion cannot tell the one that throws work
+ * away from the two that must not.
  */
 final class RecordingActuator implements LifecycleActuator {
 
@@ -44,8 +49,8 @@ final class RecordingActuator implements LifecycleActuator {
     }
 
     @Override
-    public void stop(String pipelineId) {
-        calls.add("stop:" + pipelineId);
+    public void stop(String pipelineId, boolean purgeState) {
+        calls.add("stop:" + pipelineId + (purgeState ? ":purge" : ":keep"));
     }
 
     @Override

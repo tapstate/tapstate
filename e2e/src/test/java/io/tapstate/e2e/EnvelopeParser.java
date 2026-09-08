@@ -105,9 +105,30 @@ public final class EnvelopeParser {
                         (alias, spec) -> {
                             Map<String, Object> entry = mapping(spec, "seed." + alias);
                             rejectUnknownKeys(entry.keySet(), Vocabulary.SEED_KEYS, "seed." + alias);
-                            seeds.add(new Seed(alias(alias), seedRows(entry, "seed." + alias)));
+                            seeds.add(new Seed(alias(alias), seedRows(entry, "seed." + alias),
+                                    beforeImages(entry, "seed." + alias)));
                         });
         return seeds;
+    }
+
+    /**
+     * Whether this table's source sends the row an update replaces. Spelled as the two states a store
+     * is actually in rather than as a boolean: {@code full} is what a seeded table is arranged for and
+     * needs no writing down, and {@code none} is the case asking for the other one.
+     */
+    private static boolean beforeImages(Map<String, Object> entry, String at) {
+        Object node = entry.get("before_image");
+        if (node == null) {
+            return true;
+        }
+        if ("full".equals(node)) {
+            return true;
+        }
+        if ("none".equals(node)) {
+            return false;
+        }
+        throw new EnvelopeException(
+                at + ".before_image is '" + node + "'; a source either sends 'full' images or 'none'");
     }
 
     /**
@@ -244,6 +265,12 @@ public final class EnvelopeParser {
 
     private static Step step(Object element) {
         if (element instanceof String verb) {
+            String spelled = verb.toLowerCase(Locale.ROOT);
+            for (ComposedVerb composed : ComposedVerb.values()) {
+                if (composed.word().equals(spelled)) {
+                    return new Step.Composed(composed);
+                }
+            }
             return new Step.Lifecycle(lifecycleVerb(verb));
         }
         Map<String, Object> mapping = mapping(element, "step");
@@ -270,7 +297,7 @@ public final class EnvelopeParser {
         if (!Vocabulary.LIFECYCLE_STEPS.contains(verb.toLowerCase(Locale.ROOT))) {
             throw new EnvelopeException(
                     "unknown step verb: " + verb + "; a step on its own is one of "
-                            + Vocabulary.LIFECYCLE_STEPS);
+                            + Vocabulary.LIFECYCLE_STEPS + " or " + Vocabulary.COMPOSED_STEPS);
         }
         return LifecycleVerb.valueOf(verb.toUpperCase(Locale.ROOT));
     }

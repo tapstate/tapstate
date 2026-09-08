@@ -33,7 +33,7 @@ enum CliError implements TapstateErrorCode {
      * ordinary condition a reader meets - a read-only directory, a name already taken by a plain file -
      * and the answer is something they can act on rather than a stack trace.
      */
-    WORKSPACE_NOT_WRITABLE("cli.workspace-not-writable", Set.of("path", "reason")),
+    WORKSPACE_NOT_WRITABLE("cli.workspace-not-writable", Set.of("path", Names.REASON)),
 
     /**
      * The optional {@code tap} shortcut cannot be managed because that name belongs to something else;
@@ -54,7 +54,7 @@ enum CliError implements TapstateErrorCode {
      * {@code reason} is what the filesystem said. Distinct from the name-taken refusal: nothing here is
      * anyone's file, the link simply could not be made.
      */
-    ALIAS_LINK_FAILED("cli.alias-link-failed", Set.of("path", "reason")),
+    ALIAS_LINK_FAILED("cli.alias-link-failed", Set.of("path", Names.REASON)),
 
     /** A connector id supplied to the wizard that is not in the bundled catalog. */
     UNKNOWN_CONNECTOR("cli.unknown-connector", Set.of("connector")),
@@ -93,7 +93,7 @@ enum CliError implements TapstateErrorCode {
     REPL_BUILTIN_ONLY("cli.repl-builtin-only", Set.of("verb")),
 
     /** The installed MCP sidecar or its required Java runtime cannot be launched. */
-    MCP_UNAVAILABLE("cli.mcp-unavailable", Set.of("reason")),
+    MCP_UNAVAILABLE("cli.mcp-unavailable", Set.of(Names.REASON)),
 
     /**
      * The in-place view was asked for where its output does not go to a terminal. Refused rather than
@@ -104,28 +104,37 @@ enum CliError implements TapstateErrorCode {
     WATCH_NEEDS_A_TERMINAL("cli.watch-needs-a-terminal", Set.of()),
 
     /**
+     * A verb that clears what a pipeline accumulated was run where there is no terminal to confirm at,
+     * and nothing said to go ahead unasked; {@code verb} names it. Refused rather than either of the
+     * two things it could have done instead: asking would stop and wait on an input that is never
+     * going to arrive, and going ahead would make an irreversible clearing the default of the one
+     * situation -- a script, a job, a container step -- where nobody is watching it happen.
+     */
+    CONFIRMATION_NEEDS_A_TERMINAL("cli.confirmation-needs-a-terminal", Set.of("verb")),
+
+    /**
      * A version precondition was offered for a batch holding more than one resource; {@code count} is how
      * many it holds. One hash names one version, so there is no resource it could be describing.
      */
     IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count")),
 
     /** The context configuration is not a valid, unambiguous versioned document. */
-    CONTEXT_CONFIG_INVALID("cli.context-config-invalid", Set.of("path", "reason")),
+    CONTEXT_CONFIG_INVALID("cli.context-config-invalid", Set.of("path", Names.REASON)),
 
     /** No registered migration can safely interpret the context configuration version. */
     CONTEXT_CONFIG_VERSION("cli.context-config-version", Set.of("path", "version")),
 
     /** The context configuration path cannot prove that only its owner may change it. */
-    CONTEXT_CONFIG_PERMISSIONS("cli.context-config-permissions", Set.of("path", "reason")),
+    CONTEXT_CONFIG_PERMISSIONS("cli.context-config-permissions", Set.of("path", Names.REASON)),
 
     /** The auth cache is not a valid, unambiguous versioned session document. */
-    AUTH_CACHE_INVALID("cli.auth-cache-invalid", Set.of("path", "reason")),
+    AUTH_CACHE_INVALID("cli.auth-cache-invalid", Set.of("path", Names.REASON)),
 
     /** No registered CLI release can safely interpret the auth cache version. */
     AUTH_CACHE_VERSION("cli.auth-cache-version", Set.of("path", "version")),
 
     /** The auth cache path cannot prove that only its owner may read or change it. */
-    AUTH_CACHE_PERMISSIONS("cli.auth-cache-permissions", Set.of("path", "reason")),
+    AUTH_CACHE_PERMISSIONS("cli.auth-cache-permissions", Set.of("path", Names.REASON)),
 
     /** A cached session could not be exchanged because the server rejected it. */
     AUTH_SESSION_REJECTED("cli.auth-session-rejected", Set.of("code", "principal")),
@@ -146,13 +155,13 @@ enum CliError implements TapstateErrorCode {
     AUTH_LOGOUT_CACHE_CHANGED("cli.auth-logout-cache-changed", Set.of("context")),
 
     /** The persistent auth namespace was invoked with an invalid action or operand shape. */
-    AUTH_USAGE("cli.auth-usage", Set.of("reason")),
+    AUTH_USAGE("cli.auth-usage", Set.of(Names.REASON)),
 
     /** The interactive context manager could not continue with the current input or terminal state. */
-    CONTEXT_USAGE("cli.context-usage", Set.of("reason")),
+    CONTEXT_USAGE("cli.context-usage", Set.of(Names.REASON)),
 
     /** A context definition supplied to the manager violates the persisted schema. */
-    CONTEXT_INVALID("cli.context-invalid", Set.of("name", "reason")),
+    CONTEXT_INVALID("cli.context-invalid", Set.of("name", Names.REASON)),
 
     /** A context manager operation named a context that does not exist. */
     CONTEXT_NOT_FOUND("cli.context-not-found", Set.of("name")),
@@ -173,7 +182,13 @@ enum CliError implements TapstateErrorCode {
     ISSUER_DISCOVERY_FAILED("cli.issuer-discovery-failed", Set.of("seed")),
 
     /** A seed answered discovery with fields that cannot identify a Tapstate cluster. */
-    ISSUER_DISCOVERY_INVALID("cli.issuer-discovery-invalid", Set.of("seed", "reason")),
+    ISSUER_DISCOVERY_INVALID("cli.issuer-discovery-invalid", Set.of("seed", Names.REASON)),
+
+    /**
+     * A seed refused anonymous discovery outright; {@code reason} carries what it said. A server older
+     * than this CLI does not serve the discovery endpoint, and answers this way every time.
+     */
+    ISSUER_DISCOVERY_REJECTED("cli.issuer-discovery-rejected", Set.of("seed", Names.REASON)),
 
     /** A cached issuer or another seed differs from the anonymously discovered issuer. */
     AUTH_ISSUER_MISMATCH("cli.auth-issuer-mismatch", Set.of("expected", "actual", "seed")),
@@ -185,6 +200,19 @@ enum CliError implements TapstateErrorCode {
      * they drift silently, and a reader who can see only one number reports it as though it were both.
      */
     VERSION_MISMATCH("cli.version-mismatch", Set.of("cli", "server"), Severity.WARNING);
+
+    /**
+     * Placeholder names carried by enough of the codes above to be worth naming once. A nested class
+     * rather than a field of the enum: an enum's constants come first in its body, so a field of the
+     * enum itself would be a forward reference from every argument list that used it, constant or not.
+     * Qualified through another class, the same value is an ordinary compile-time constant.
+     */
+    private static final class Names {
+        private static final String REASON = "reason";
+
+        private Names() {
+        }
+    }
 
     private final String code;
     private final Set<String> placeholders;

@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
@@ -15,6 +16,7 @@ import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.map.IMap;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
@@ -119,6 +121,50 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
                 .containsEntry("customer", Map.of("customer_id", POINTED_AT_NOW, "name", "Grace"));
     }
 
+    @Test
+    @DisplayName("re-pointing is taken back out even where key changes are not being followed")
+    void anIdentityIsTakenOutWhereverTheEarlierRowTravels() {
+        member.getJet().newJob(anOrderThatChangesWhoItPointsAt(false,
+                row("order_id", 1, "cust_ref", LEFT_BEHIND))).join();
+
+        assertThat(recordedAgainst(LEFT_BEHIND))
+                .describedAs("the source sent the row this update replaces, so where the order pointed "
+                        + "before is on the event and the entry can come out. Following structural key "
+                        + "changes is a different question about a different key - a tree that never "
+                        + "re-parents anything still re-points, and hanging the one on the other threw "
+                        + "away an answer that was in hand")
+                .isEmpty();
+        assertThat(recordedAgainst(POINTED_AT_NOW))
+                .describedAs("and it is recorded against the one it now names")
+                .containsExactly(List.of(1));
+    }
+
+    @Test
+    @DisplayName("an update that cannot say where the row pointed before fails the job")
+    void anUpdateCarryingNoEarlierRowIsRefused() {
+        assertThatThrownBy(() -> member.getJet()
+                .newJob(anOrderThatChangesWhoItPointsAt(false, null)).join())
+                .describedAs("nothing on this event says where the order pointed before, so the entry it "
+                        + "left cannot be found - and carrying on would grow the record for the life of "
+                        + "the job while every document stayed correct, which is the one failure nothing "
+                        + "downstream can notice")
+                .hasMessageContaining("nest.reference-tracking-requires-before-image");
+    }
+
+    @Test
+    @DisplayName("an earlier row carrying no columns is refused like one that never came")
+    void anEarlierRowCarryingNoColumnsIsRefused() {
+        assertThatThrownBy(() -> member.getJet()
+                .newJob(anOrderThatChangesWhoItPointsAt(false, Map.of())).join())
+                .describedAs("a change stream with no pre-image configured sends an earlier row that is "
+                        + "there and holds nothing, which is a different value from none at all and the "
+                        + "one most sources actually produce. Read as an earlier row it says the order "
+                        + "used to point at nothing, so the entry taken out is one nobody ever wrote and "
+                        + "the real one stays - the leak this refuses, arrived at through the branch that "
+                        + "looked like it was handling it")
+                .hasMessageContaining("nest.reference-tracking-requires-before-image");
+    }
+
     /** Every identity recorded as pointing at {@code customer}, across all of its buckets. */
     private Set<Object> recordedAgainst(int customer) {
         IMap<Object, Set<Object>> index = member.getMap(
@@ -148,15 +194,24 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
 
     /** One order, pointed first at one customer and then at another. */
     private static DAG anOrderThatChangesWhoItPointsAt() {
-        Map<String, Object> was = row("order_id", 1, "cust_ref", LEFT_BEHIND);
+        return anOrderThatChangesWhoItPointsAt(true, row("order_id", 1, "cust_ref", LEFT_BEHIND));
+    }
+
+    /**
+     * The same order, with the two things that decide whether the entry it left can come back out:
+     * whether the author asked for structural key changes to be followed, and what the source sends as
+     * the row the update replaces. {@code earlier} is that row - the real one, none at all, or one that
+     * arrived carrying no columns, which is what a change stream with no pre-image configured produces
+     * and is a different value from none at all.
+     */
+    private static DAG anOrderThatChangesWhoItPointsAt(boolean trackKeyChanges,
+            Map<String, Object> earlier) {
         Map<String, Object> now = row("order_id", 1, "cust_ref", POINTED_AT_NOW);
 
         Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
                 "customer", null, null, null, null);
         TransformBody.Nest body = new TransformBody.Nest(null, null,
-                // Key changes followed, which is what makes the earlier row travel with the update - and
-                // the earlier row is the only thing that can say which entry to take this order out of.
-                new NestRoot("order", List.of("order_id"), null, true, List.of(customer)));
+                new NestRoot("order", List.of("order_id"), null, trackKeyChanges, List.of(customer)));
 
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("order", FromRef.literal("orders"));
@@ -164,15 +219,16 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
         PipelineResource pipeline = new PipelineResource(PIPELINE, null,
-                List.of("orders", "customers"), List.of(step), null,
+                List.of(SourceRef.bare("orders"), SourceRef.bare("customers")), List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
         sources.put("orders", rowsSource("orders", List.of(
-                new Timed(List.of(was), Duration.ofMillis(400), null),
-                new Timed(List.of(now), Duration.ofMillis(1200), was))));
+                new Timed(List.of(row("order_id", 1, "cust_ref", LEFT_BEHIND)),
+                        Duration.ofMillis(400), null),
+                new Timed(List.of(now), Duration.ofMillis(1200), earlier, true))));
         sources.put("customers", rowsSource("customers", List.of(new Timed(List.of(
                 row("customer_id", LEFT_BEHIND, "name", "Ada"),
                 row("customer_id", POINTED_AT_NOW, "name", "Grace")), Duration.ZERO, null))));
@@ -203,9 +259,17 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
         return row;
     }
 
-    /** One batch of rows, when it is due, and the row each replaces where there is one. */
-    private record Timed(List<Map<String, Object>> rows, Duration after, Map<String, Object> replacing)
-            implements Serializable {
+    /**
+     * One batch of rows, when it is due, the row each replaces where there is one, and whether these are
+     * updates at all. The last is not implied by the third: an update whose source sends no earlier row
+     * carries none either, and telling that apart from an insert is the whole of what one case here needs.
+     */
+    private record Timed(List<Map<String, Object>> rows, Duration after, Map<String, Object> replacing,
+            boolean updating) implements Serializable {
+
+        private Timed(List<Map<String, Object>> rows, Duration after, Map<String, Object> replacing) {
+            this(rows, after, replacing, replacing != null);
+        }
     }
 
     /** Emits its batches in order, each held until it is due, yielding rather than sleeping. */
@@ -235,9 +299,9 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
                 }
                 while (next < due.rows().size()) {
                     Map<String, Object> row = due.rows().get(next);
-                    Envelope event = due.replacing() == null
-                            ? Envelope.insert(emitted + 1L, src, row, null)
-                            : Envelope.update(emitted + 1L, src, due.replacing(), row, null);
+                    Envelope event = due.updating()
+                            ? Envelope.update(emitted + 1L, src, due.replacing(), row, null)
+                            : Envelope.insert(emitted + 1L, src, row, null);
                     if (!tryEmit(event.withOrder(new SourceOrder(1, emitted)))) {
                         return false;
                     }

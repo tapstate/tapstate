@@ -108,6 +108,20 @@ final class SpecGenerator {
         return setup;
     }
 
+    /**
+     * Whether this table's source sends the row an update replaces. Two named states rather than a
+     * boolean, because that is what a store is actually in: absent means {@code full}, which is what a
+     * seeded table is arranged for, and {@code none} asks for what a change stream does on its own.
+     */
+    private static Map<String, Object> beforeImage() {
+        Map<String, Object> beforeImage = scalar("string",
+                "Whether this table's source sends the row an update replaces. Absent means 'full', "
+                        + "which is what a seeded table is arranged for; 'none' asks the driver to put "
+                        + "it back to what a change stream does on its own.");
+        beforeImage.put("enum", List.of("full", "none"));
+        return beforeImage;
+    }
+
     private static Map<String, Object> seedDef() {
         Map<String, Object> generated = new LinkedHashMap<>();
         generated.put("type", "object");
@@ -116,7 +130,10 @@ final class SpecGenerator {
         Map<String, Object> rowCount = scalar(
                 "integer", "How many generated rows to lay down: ids 1..N, each with seq equal to its id.");
         rowCount.put("minimum", 0);
-        generated.put("properties", Map.of("rows", rowCount));
+        Map<String, Object> generatedProperties = new LinkedHashMap<>();
+        generatedProperties.put("rows", rowCount);
+        generatedProperties.put("before_image", beforeImage());
+        generated.put("properties", generatedProperties);
 
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("type", "object");
@@ -134,7 +151,10 @@ final class SpecGenerator {
         explicit.put("type", "object");
         explicit.put("additionalProperties", false);
         explicit.put("required", List.of("values"));
-        explicit.put("properties", Map.of("values", values));
+        Map<String, Object> explicitProperties = new LinkedHashMap<>();
+        explicitProperties.put("values", values);
+        explicitProperties.put("before_image", beforeImage());
+        explicit.put("properties", explicitProperties);
 
         Map<String, Object> entry = new LinkedHashMap<>();
         entry.put("description", "A generated count, or the rows themselves - one of the two.");
@@ -162,9 +182,13 @@ final class SpecGenerator {
         lifecycle.put("type", "string");
         lifecycle.put(
                 "description",
-                "A lifecycle verb, spelled as the product spells it. There is no rewind: re-snapshotting "
-                        + "is stop then start.");
-        lifecycle.put("enum", List.copyOf(Vocabulary.LIFECYCLE_STEPS));
+                "A step written on its own: a lifecycle verb spelled as the product spells it, or a word "
+                        + "the terminal offers that expands into several of them. There is no rewind: "
+                        + "re-snapshotting is stop then start, which is what restart --rerun does.");
+        List<String> onTheirOwn = new ArrayList<>(Vocabulary.LIFECYCLE_STEPS);
+        onTheirOwn.addAll(Vocabulary.COMPOSED_STEPS);
+        onTheirOwn.sort(String::compareTo);
+        lifecycle.put("enum", List.copyOf(onTheirOwn));
         forms.add(lifecycle);
         // Exhaustive: a keyword added to the vocabulary does not compile until its shape is here.
         for (StepKeyword keyword : StepKeyword.values()) {
@@ -418,6 +442,10 @@ final class SpecGenerator {
                     ? "A lifecycle verb. Written on its own it drives the pipeline; written with one "
                             + "source id it holds or releases that stream alone."
                     : "A lifecycle verb, driven on the pipeline. Written on its own."));
+        }
+        for (String composed : Vocabulary.COMPOSED_STEPS) {
+            steps.add(word(composed, "A word the terminal offers, driven on the pipeline. It expands "
+                    + "into the product's own verbs; the vocabulary follows what a person types."));
         }
         for (String keyword : Vocabulary.BODIED_STEPS) {
             steps.add(word(keyword, bodiedStepDescription(keyword)));

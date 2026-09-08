@@ -69,6 +69,13 @@
       <artifactId>core-common</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The declarations of what state a pipeline holds, so the terminal's stop says what it is about
+         to clear, or keep, out of the same list the clearing itself works through. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-lifecycle</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The shared error-code message catalog + renderer (presentation layer); the CLI renders
          coded diagnostics through it rather than carrying its own catalog. -->
     <dependency>
@@ -176,6 +183,7 @@
                     <include>io.tapstate:core-dsl</include>
                     <include>io.tapstate:core-schema</include>
                     <include>io.tapstate:core-catalog</include>
+                    <include>io.tapstate:core-lifecycle</include>
                     <!-- the shared presentation catalog + renderer (zero third-party itself) -->
                     <include>io.tapstate:messages</include>
                     <include>io.tapstate:control-client</include>
