@@ -6,6 +6,7 @@ import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.ArtifactDraft;
 import io.tapstate.control.core.ArtifactValidationResult;
 import io.tapstate.control.core.AuditGate;
+import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ValidationDiagnostic;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
@@ -94,7 +95,11 @@ class TheAssembledApplyServiceSizesNestsTest {
                 TapstateCatalog.load(), new NoRegisteredConnectors(), specStore(), registry());
         return new ControlPlaneConfiguration().applyService(
                 new InMemoryArtifactStore(), catalog,
-                new AuditGate(record -> { }, FIXED_CLOCK), schemas, settings);
+                new AuditGate(record -> { }, FIXED_CLOCK), schemas, settings,
+                // This test is about the sizing advisory, and a derivation would need a whole store port
+                // behind it to answer at all. Named rather than defaulted, so an assembly that derives
+                // nothing says so.
+                SchemaDerivation.none());
     }
 
     /** One customer table of {@code rows} rows, plus the two the tree also reads. */

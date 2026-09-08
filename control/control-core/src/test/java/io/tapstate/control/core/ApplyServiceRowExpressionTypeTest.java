@@ -58,7 +58,7 @@ class ApplyServiceRowExpressionTypeTest {
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
     private final ApplyService service = new ApplyService(
             TapstateCatalog::load, artifacts, new AuditGate(record -> { }, FIXED_CLOCK), schemas,
-            PlanAdvisories.none());
+            PlanAdvisories.none(), SchemaDerivation.none());
 
     private static String pipeline(String expr) {
         return pipeline("orders", expr);

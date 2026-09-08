@@ -12,6 +12,7 @@ actuation.join-source-key-missing
 actuation.join-source-not-declared
 actuation.not-a-pipeline
 actuation.pipeline-not-found
+actuation.schema-sync-while-running
 actuation.source-schema-not-discovered
 actuation.source-table-ambiguous
 actuation.source-table-not-discovered

@@ -26,6 +26,30 @@ import java.util.List;
  * makes this worth having is the one moment where a person looks at the difference and says to carry
  * on, and only a verb of its own is that moment.
  *
+ * <p><b>Where a pipeline's model is worked out again, and what each of those points may do.</b> The
+ * database is the truth and a pipeline holds its own copy of it, so the copy has to be re-taken by
+ * something; the table below is the whole of that surface, and the column on the right is why it is not
+ * one behaviour everywhere.
+ *
+ * <table border="1">
+ *   <caption>The trigger surface</caption>
+ *   <tr><th>When</th><th>What happens</th></tr>
+ *   <tr><td>a start</td><td>re-copies, derives, and <em>refuses</em> a step whose columns moved for a
+ *       reason the author did not ask for. It then writes down which version the run holds</td></tr>
+ *   <tr><td>a restart</td><td>a start. There is no verb that resumes onto an assembly without building
+ *       one, so anything that re-assembles arrives here - said out loud because a reader should not
+ *       have to derive it from the absence of a second path</td></tr>
+ *   <tr><td>an apply</td><td>re-copies and derives, and refuses nothing. Unconditional: the case that
+ *       most needs it leaves the pipeline's content hash byte-identical</td></tr>
+ *   <tr><td>{@link #accept}</td><td>re-copies, derives, and records - the way past a refusal, and the
+ *       only act a person performs on purpose</td></tr>
+ *   <tr><td>a removal</td><td>drops every record the pipeline owns</td></tr>
+ *   <tr><td>while a job is carrying it</td><td>{@link #accept} is refused. The run is never at risk -
+ *       it holds the versions it was assembled from and re-reads none of them - but a record that no
+ *       longer describes the job going on sends every later reader somewhere else. A paused pipeline
+ *       is allowed; one already asked to resume is not</td></tr>
+ * </table>
+ *
  * <p>Accepting does not touch the target table. Making the target able to hold the new shape is the
  * operator's, in their own database, and it belongs before the accept rather than after: accepting
  * first and altering later leaves a window in which the pipeline is running into a table that cannot
@@ -37,9 +61,18 @@ public interface DerivedSchemas {
     List<StepReport> compare(String pipelineId);
 
     /**
-     * Records what each derived step produces now as the shape to hold it to from here, so a start
-     * refused over the difference is allowed through. It changes nothing about the pipeline, the
-     * target table or what the step will produce - only what the next start is compared against.
+     * Re-reads the sources into the pipeline's own copy of them, works every step below that out again,
+     * and records the result as the shape to hold it to from here - so a start refused over the
+     * difference is allowed through. It changes nothing about the pipeline, the target table or what
+     * the step will produce - only what the next start is compared against.
+     *
+     * <p>The copy comes first and the derivation second, and that order is what makes this one act
+     * rather than two. Deriving over source copies that were not refreshed records today's answer to
+     * yesterday's question: the record then agrees with itself and with nothing outside it.
+     *
+     * <p>Refused while a job is carrying the pipeline, or while one has been asked for. Being paused is
+     * not being carried - nothing is producing rows, and both ways out of paused build an assembly
+     * again - so a paused pipeline is accepted and one already asked to resume is not.
      *
      * <p>Audited, and attributed to {@code principal}. Moving what a refusal is measured against is the
      * one act that can turn this check off for a pipeline, so who did it and when is worth as much as

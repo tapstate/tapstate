@@ -16,6 +16,7 @@ import io.tapstate.control.core.ConnectionTestService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.Operation;
+import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
@@ -766,7 +767,7 @@ class ControlApiTest {
         @Bean
         ApplyService applyService(ArtifactStore store, AuditGate auditGate) {
             return new ApplyService(TapstateCatalog::load, store, auditGate, new EmptySchemaStore(),
-                    ControlApiTest::adviseOnWarnedArtifacts);
+                    ControlApiTest::adviseOnWarnedArtifacts, SchemaDerivation.none());
         }
 
         @Bean

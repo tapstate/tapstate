@@ -249,7 +249,7 @@ public final class Cli implements Runnable {
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's per-table snapshot progress.")),
             Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
-                    "Compare a join's recorded and current output columns; --accept takes today's.")),
+                    "Compare a join's recorded and current columns; --accept re-reads the sources.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
             // The summary is one line because picocli wraps a longer one, and a wrapped line is a line the

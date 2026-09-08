@@ -52,17 +52,20 @@ final class SourceSchemaCopy {
     }
 
     /**
-     * Records the copy of one source table's discovered model. A {@code null} model - a table nothing
-     * has discovered yet - records nothing and is not an error: authoring against an undiscovered
-     * source is allowed, and a start that needs the model refuses on its own, by name, elsewhere.
+     * Records the copy of one source table's discovered model, answering whether it recorded one. A
+     * {@code null} model - a table nothing has discovered yet - records nothing and is not an error:
+     * authoring against an undiscovered source is allowed, and a start that needs the model refuses on
+     * its own, by name, elsewhere. The answer is what keeps a caller from pinning a step that has no
+     * history to pin into.
      */
-    void copy(String pipelineId, String sourceId, String table, SourceTable discovered) {
+    boolean copy(String pipelineId, String sourceId, String table, SourceTable discovered) {
         if (discovered == null) {
-            return;
+            return false;
         }
         String nodeId = nodeId(sourceId, table);
         records.record(pipelineId, nodeId, columnsOf(discovered), fingerprintOf(nodeId),
                 fingerprintOf(discovered), DERIVED_BY);
+        return true;
     }
 
     /**

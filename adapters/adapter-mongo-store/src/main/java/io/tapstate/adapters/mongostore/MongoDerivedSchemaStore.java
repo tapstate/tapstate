@@ -1,7 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoCollection;
-import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DerivedSchemaStore;
@@ -60,6 +60,9 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
      */
     private static final char SEPARATOR = '.';
 
+    /** The field a step's document carries the version a run is holding, beside that step's history. */
+    private static final String PIN = "pin";
+
     private final MongoCollection<Document> collection;
 
     public MongoDerivedSchemaStore(MongoCollection<Document> collection) {
@@ -97,6 +100,37 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
                     last == null ? 0L : last.version() + 1, schema, statement, derivedFrom, derivedBy));
         }
         writeStep(pipelineId, stepId, versions);
+    }
+
+    @Override
+    public void pin(String pipelineId, String stepId, long version) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(stepId, "stepId");
+        String key = key(pipelineId, stepId);
+        // On the step's own document, so it is dropped by the same prefix range that drops the history
+        // it points into. A pin outliving its history would name a version nothing holds, and the read
+        // below answers empty for that rather than reaching for whatever is newest.
+        StoreIo.run(key, () -> collection.updateOne(
+                new Document("_id", key),
+                new Document("$set", new Document(PIN, version)),
+                new UpdateOptions().upsert(true)));
+    }
+
+    @Override
+    public Optional<DerivedSchema> pinned(String pipelineId, String stepId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(stepId, "stepId");
+        Document document = read(key(pipelineId, stepId));
+        if (document == null || document.get(PIN) == null) {
+            return Optional.empty();
+        }
+        long version = requireLong(document.get(PIN), pipelineId);
+        for (DerivedSchema recorded : stepVersions(pipelineId, stepId)) {
+            if (recorded.version() == version) {
+                return Optional.of(recorded);
+            }
+        }
+        return Optional.empty();
     }
 
     @Override
@@ -164,10 +198,13 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
             stored.add(toDocument(version));
         }
         String key = key(pipelineId, stepId);
-        StoreIo.run(key, () -> collection.replaceOne(
+        // Updated field by field rather than replaced whole: the pin sits on this same document, and a
+        // replace would drop it on every record - so a run would lose what it was holding the moment
+        // anybody recorded a shape, which is precisely the case the pin is read in.
+        StoreIo.run(key, () -> collection.updateOne(
                 new Document("_id", key),
-                new Document("_id", key).append("versions", stored),
-                new ReplaceOptions().upsert(true)));
+                new Document("$set", new Document("versions", stored)),
+                new UpdateOptions().upsert(true)));
     }
 
     private Document read(String id) {

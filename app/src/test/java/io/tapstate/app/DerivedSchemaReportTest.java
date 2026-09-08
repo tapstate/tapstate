@@ -3,6 +3,9 @@ package io.tapstate.app;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Workspace;
@@ -20,6 +23,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -146,6 +150,202 @@ class DerivedSchemaReportTest {
         InMemoryStorePort store = seeded();
 
         assertThat(new StoreBackedDerivedSchemas(store, auditGate).compare("plain")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a running pipeline is reported on the version its run holds, not one recorded since")
+    void aRunningPipelineIsReportedOnTheVersionItsRunHolds() {
+        // The discriminating case for holding a version at all. Something writes a second version while
+        // the job is going - the writer here stands in for whatever gets past the refusal, and the
+        // refusal is covered below. Reporting the newest record would tell whoever is looking that the
+        // running pipeline produces a decimal key, which no row it is emitting right now carries.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        running(store);
+        store.derivedSchemas().record("wide", "widen",
+                Map.of("order_id", "DECIMAL NULL", "customer_name", "STRING NULL"),
+                "another-statement", "another-source", "another-derivation");
+
+        List<DerivedSchemas.StepReport> report = new StoreBackedDerivedSchemas(store, auditGate).compare("wide");
+
+        assertThat(recordedKeyOf(report)).isEqualTo("INT64 NULL");
+    }
+
+    @Test
+    @DisplayName("with no run going on, the report is on the newest record")
+    void withNoRunGoingOnTheReportIsOnTheNewestRecord() {
+        // The other half of the pair, and what keeps the one above from passing for the wrong reason: a
+        // pin that was read whatever the pipeline was doing would freeze the report on the last run's
+        // shape forever, so a sync taken while stopped would appear not to have happened.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        store.derivedSchemas().record("wide", "widen",
+                Map.of("order_id", "DECIMAL NULL", "customer_name", "STRING NULL"),
+                "another-statement", "another-source", "another-derivation");
+
+        List<DerivedSchemas.StepReport> report = new StoreBackedDerivedSchemas(store, auditGate).compare("wide");
+
+        assertThat(recordedKeyOf(report)).isEqualTo("DECIMAL NULL");
+    }
+
+    @Test
+    @DisplayName("syncing re-copies the physical model, so every step below it derives from today's columns")
+    void syncingRecopiesThePhysicalModelBeforeDerivingBelowIt() {
+        // Without the re-copy this passes on the join alone: the join compiles from the discovery
+        // directly, so it would follow the widened column with the source node's copy left at yesterday's
+        // answer - a record that agrees with itself and with nothing outside. The source node is the half
+        // that discriminates.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        widenTheFactKeyColumn(store);
+
+        new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide");
+
+        assertThat(store.derivedSchemas().latest("wide", "orders_src.orders"))
+                .get().extracting(recorded -> recorded.schema().get("id")).isEqualTo("DECIMAL NULL");
+        assertThat(store.derivedSchemas().latest("wide", "widen"))
+                .get().extracting(recorded -> recorded.schema().get("order_id")).isEqualTo("DECIMAL NULL");
+    }
+
+    @Test
+    @DisplayName("syncing is refused while a job is carrying the pipeline, and says what it is doing")
+    void syncingIsRefusedWhileAJobIsCarryingThePipeline() {
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        running(store);
+
+        assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).isEqualTo("actuation.schema-sync-while-running");
+                    assertThat(error.args()).containsEntry("pipeline", "wide")
+                            .containsEntry("state", "RUNNING");
+                });
+        // Refused before the write, not after it: a refusal that had already re-copied would leave the
+        // record moved and the caller told it was not.
+        assertThat(audited).isEmpty();
+    }
+
+    @Test
+    @DisplayName("syncing a paused pipeline goes through - nothing is producing rows under it")
+    void syncingAPausedPipelineGoesThrough() {
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        pausedAndStayingThere(store);
+        widenTheFactKeyColumn(store);
+
+        assertThatCode(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
+                .doesNotThrowAnyException();
+
+        assertThat(store.derivedSchemas().latest("wide", "orders_src.orders"))
+                .get().extracting(recorded -> recorded.schema().get("id")).isEqualTo("DECIMAL NULL");
+    }
+
+    @Test
+    @DisplayName("a paused pipeline already asked to resume is refused - it is a run about to carry on")
+    void aPausedPipelineAlreadyAskedToResumeIsRefused() {
+        // The case a checkpoint-only reading lets through. The job is not producing anything this instant,
+        // and it is about to, under the assembly it was paused with.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        pausedWithAResumeAskedFor(store);
+
+        assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).isEqualTo("actuation.schema-sync-while-running");
+                    assertThat(error.args()).containsEntry("state", "PAUSED")
+                            .containsEntry("desired", "RUNNING");
+                });
+    }
+
+    @Test
+    @DisplayName("a sync racing a start yields to the start, which is the arbitration between them")
+    void aSyncRacingAStartYieldsToTheStart() {
+        // Recording has no compare-and-swap, so two writers of one step need an order decided somewhere.
+        // It is decided here: a start that has been asked for wins, and the sync is refused until the
+        // pipeline is at rest again. The pipeline has not begun executing - nothing has written a
+        // checkpoint yet - and that is exactly the window this covers.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        store.desired().save(new DesiredState("wide", PipelineState.RUNNING, "revision"));
+
+        assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).isEqualTo("actuation.schema-sync-while-running");
+                    assertThat(error.args()).containsEntry("state", "NEW")
+                            .containsEntry("desired", "RUNNING");
+                });
+    }
+
+    @Test
+    @DisplayName("an apply re-copies the physical model without holding any step to what it recorded")
+    void anApplyRecopiesThePhysicalModelWithoutHoldingAnyStepToIt() {
+        // What apply triggers, and what it must not: the copy follows the source, and the difference the
+        // join now shows is left standing rather than absorbed. Absorbing it here would mean an author
+        // applying an unrelated edit turns off the check on a pipeline nobody looked at.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        widenTheFactKeyColumn(store);
+
+        new StoreBackedDerivedSchemas(store, auditGate).derive("wide");
+
+        assertThat(store.derivedSchemas().latest("wide", "orders_src.orders"))
+                .get().extracting(recorded -> recorded.schema().get("id")).isEqualTo("DECIMAL NULL");
+        assertThat(store.derivedSchemas().latest("wide", "widen"))
+                .get().extracting(recorded -> recorded.schema().get("order_id")).isEqualTo("INT64 NULL");
+    }
+
+    @Test
+    @DisplayName("a half-finished re-derivation reads as a difference, and running the sync again finishes it")
+    void aHalfFinishedRederivationReadsAsADifference() {
+        // A sync re-records one step at a time, so a failure part way through leaves the steps below the
+        // failure at their old shape. That state is not hidden: the report shows the un-redone step as
+        // drifted, exactly as it shows a source that moved, and a second sync completes it. Standing in
+        // for the failure is the copy-only path, which is the same half-done state reached deliberately.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        widenTheFactKeyColumn(store);
+        new StoreBackedDerivedSchemas(store, auditGate).derive("wide");
+
+        List<DerivedSchemas.StepReport> partial =
+                new StoreBackedDerivedSchemas(store, auditGate).compare("wide");
+        assertThat(partial).singleElement().satisfies(step -> assertThat(step.columns())
+                .filteredOn(column -> column.column().equals("order_id"))
+                .singleElement()
+                .satisfies(column -> assertThat(column.drifted()).isTrue()));
+
+        new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide");
+
+        assertThat(new StoreBackedDerivedSchemas(store, auditGate).compare("wide"))
+                .singleElement()
+                .satisfies(step -> assertThat(step.columns()).noneMatch(DerivedSchemas.ColumnReport::drifted));
+    }
+
+    /** The recorded declared type of the join's key column, which is what every report above turns on. */
+    private static String recordedKeyOf(List<DerivedSchemas.StepReport> report) {
+        assertThat(report).hasSize(1);
+        return report.get(0).columns().stream()
+                .filter(column -> column.column().equals("order_id"))
+                .findFirst()
+                .orElseThrow()
+                .recorded();
+    }
+
+    /** A job is carrying the pipeline, and is meant to be. */
+    private static void running(InMemoryStorePort store) {
+        store.state().create("wide", StateJson.of(PipelineState.RUNNING), Instant.EPOCH);
+        store.desired().save(new DesiredState("wide", PipelineState.RUNNING, "revision"));
+    }
+
+    /** Suspended, with nothing asking for it back. */
+    private static void pausedAndStayingThere(InMemoryStorePort store) {
+        store.state().create("wide", StateJson.of(PipelineState.PAUSED), Instant.EPOCH);
+        store.desired().save(new DesiredState("wide", PipelineState.PAUSED, "revision"));
+    }
+
+    /** Suspended, with a resume already asked for - the job is about to carry on where it left off. */
+    private static void pausedWithAResumeAskedFor(InMemoryStorePort store) {
+        store.state().create("wide", StateJson.of(PipelineState.PAUSED), Instant.EPOCH);
+        store.desired().save(new DesiredState("wide", PipelineState.RUNNING, "revision"));
     }
 
     /**

@@ -121,6 +121,50 @@ class MongoDerivedSchemaStoreIT {
     }
 
     @Test
+    void aVersionARunPinnedSurvivesEveryLaterRecordOnThatStep() {
+        // The discriminating case, and the one the document layout is arranged for. The pin sits on the
+        // step's own document beside its history, so a write that replaced the document wholesale would
+        // take the pin with it - and the moment a pin is read is the moment somebody has just recorded a
+        // shape, which is the same moment such a write happens.
+        withStore((store, collection) -> {
+            store.record("wide", "widen", columns("id", "INT64 NOT NULL"), "sql-a", "src-v1", "calcite");
+            store.pin("wide", "widen", 0L);
+
+            store.record("wide", "widen", columns("id", "DECIMAL NOT NULL"), "sql-a", "src-v2", "calcite");
+
+            assertThat(store.latest("wide", "widen").orElseThrow().version()).isEqualTo(1L);
+            assertThat(store.pinned("wide", "widen").orElseThrow().schema())
+                    .containsExactlyEntriesOf(columns("id", "INT64 NOT NULL"));
+        });
+    }
+
+    @Test
+    void aStepNothingHasPinnedReadsBackEmptyRatherThanAsItsNewestVersion() {
+        // Never a fallback to the latest: a caller asking for the pin is asking what a run holds, and
+        // answering with whatever is newest is precisely the confusion the pin exists to end.
+        withStore((store, collection) -> {
+            store.record("wide", "widen", columns("id", "INT64 NOT NULL"), "sql-a", "src-v1", "calcite");
+
+            assertThat(store.pinned("wide", "widen")).isEmpty();
+        });
+    }
+
+    @Test
+    void deletingAPipelineTakesItsPinsWithIt() {
+        // A pin left behind would name a version of a history that is gone, and would be read as what a
+        // run of whatever is applied under this id next is holding.
+        withStore((store, collection) -> {
+            store.record("wide", "widen", columns("id", "INT64 NOT NULL"), "sql-a", "src-v1", "calcite");
+            store.pin("wide", "widen", 0L);
+
+            store.delete("wide");
+
+            assertThat(store.pinned("wide", "widen")).isEmpty();
+            assertThat(collection.countDocuments()).isZero();
+        });
+    }
+
+    @Test
     void deletingAPipelineThatRecordedNothingIsNotAnError() {
         withStore((store, collection) ->
                 assertThatCode(() -> store.delete("never-seen")).doesNotThrowAnyException());

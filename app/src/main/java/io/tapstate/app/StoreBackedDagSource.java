@@ -168,7 +168,7 @@ final class StoreBackedDagSource implements DagSource {
         // The pipeline takes its own copy of what discovery found for each table it reads, before anything
         // downstream is worked out from it. Reading the discovery directly instead would let a
         // re-discovery change the shape of this run's input while the run is already using it.
-        copySourceSchemas(pipelineId, sourceVertices);
+        List<String> derivedSteps = new ArrayList<>(copySourceSchemas(pipelineId, sourceVertices));
         Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
         Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
         Set<String> stepIds = stepIds(pipeline);
@@ -187,6 +187,13 @@ final class StoreBackedDagSource implements DagSource {
         // not at all.
         compiledJoins.forEach((stepId, compiled) -> joinSchemaDrift.checkAndRecord(
                 pipelineId, stepId, compiled.sql(), compiled.plan(), compiled.tables()));
+        // What this run will be holding on to, written down now that every step's shape is recorded and
+        // the gate above has let the start through. Nothing re-reads a derived schema once the job is
+        // submitted, so without this note a reader asking what the running pipeline produces answers
+        // with whatever was recorded most recently instead - the two agree right up to the moment
+        // somebody records a new shape, which is the only moment the question is worth asking.
+        derivedSteps.addAll(compiledJoins.keySet());
+        pinWhatThisRunHolds(pipelineId, derivedSteps);
         // A nest or a join emits under the id of the step that produced it rather than under a table name,
         // so the resolution above - which answers per source table - says nothing about it. Registering it
         // here is what lets the sink key its upsert and name the table it writes; without it the sink falls
@@ -250,12 +257,43 @@ final class StoreBackedDagSource implements DagSource {
      * undiscovered source is allowed, and a start that actually needs the model refuses by name before it
      * binds anything.
      */
-    private void copySourceSchemas(String pipelineId, Map<String, SourceVertex> sourceVertices) {
+    private List<String> copySourceSchemas(String pipelineId, Map<String, SourceVertex> sourceVertices) {
+        List<String> copied = new ArrayList<>();
         for (SourceVertex vertex : sourceVertices.values()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
             SourceModel discovered = SourceDiscovery.model(storePort, source);
-            sourceSchemaCopy.copy(pipelineId, vertex.sourceId(), vertex.table(),
-                    discovered == null ? null : discoveredTable(discovered, vertex.table()));
+            if (sourceSchemaCopy.copy(pipelineId, vertex.sourceId(), vertex.table(),
+                    discovered == null ? null : discoveredTable(discovered, vertex.table()))) {
+                copied.add(SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()));
+            }
+        }
+        return copied;
+    }
+
+    /**
+     * Re-copies the physical model of every table this pipeline reads, without assembling anything else.
+     * This is the whole of what a re-copy is - the physical model is the truth, and a pipeline's source
+     * nodes hold a copy of it - so the paths that re-copy outside a start share this one rather than
+     * each walking the pipeline their own way.
+     *
+     * <p>Nothing is pinned here. A pin says what a run is holding, and none of the callers of this is a
+     * run: pinning from one would tell a reader that a job which never saw these columns is producing
+     * them.
+     */
+    List<String> copySourceSchemas(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return copySourceSchemas(pipelineId, sourceVertices(pipeline));
+    }
+
+    /**
+     * Writes down which recorded version of each derived step this run was assembled from. Read back
+     * only while a run exists; overwritten by the next assembly, so nothing has to clear it.
+     */
+    private void pinWhatThisRunHolds(String pipelineId, List<String> stepIds) {
+        for (String stepId : stepIds) {
+            storePort.derivedSchemas().latest(pipelineId, stepId).ifPresent(recorded ->
+                    storePort.derivedSchemas().pin(pipelineId, stepId, recorded.version()));
         }
     }
 

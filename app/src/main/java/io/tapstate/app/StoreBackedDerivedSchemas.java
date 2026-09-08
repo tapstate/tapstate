@@ -4,6 +4,11 @@ import io.tapstate.control.core.AuditContext;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.DerivedSchemas;
+import io.tapstate.control.core.SchemaDerivation;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
@@ -25,7 +30,14 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Reports and accepts what a pipeline's join steps work their own columns out to be.
+ * Reports and accepts what a pipeline's steps work their own columns out to be, and re-takes the
+ * pipeline's copy of what its sources hold.
+ *
+ * <p>Three entry points, and the difference between them is only what they are allowed to refuse: the
+ * report reads, the accept re-copies and records, and the derivation an apply runs re-copies without
+ * holding anything to what it was recorded producing. The copy itself is the assembly's, borrowed
+ * rather than written a second time here - two ways of taking one copy would drift apart, and the shape
+ * that takes is a record a start then refuses.
  *
  * <p>The comparison is deliberately assembled from the same compile a start runs, borrowed rather than
  * repeated. A second implementation of the derivation would be two answers with nothing comparing
@@ -38,7 +50,7 @@ import java.util.Set;
  * as agreement - an unknown reported as agreement is the one answer here that sends someone to start a
  * pipeline that then truncates.
  */
-final class StoreBackedDerivedSchemas implements DerivedSchemas {
+final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivation {
 
     private final StorePort storePort;
     private final StoreBackedDagSource joins;
@@ -54,10 +66,15 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas {
     public List<StepReport> compare(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Map<String, Map<String, String>> targetColumns = targetColumns(pipelineId);
+        // While a job is carrying the pipeline, the recorded side is the version that job was assembled
+        // from rather than the newest one on file. The two are the same answer until somebody records a
+        // shape while the pipeline runs, and that is exactly when this report is read: answering with
+        // the newest would describe a pipeline that is not the one going on.
+        boolean live = aRunExists(pipelineId);
         List<StepReport> reports = new ArrayList<>();
         joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> {
             Map<String, String> derived = columnsOf(compiled);
-            Map<String, String> recorded = storePort.derivedSchemas().latest(pipelineId, stepId)
+            Map<String, String> recorded = heldBy(live, pipelineId, stepId)
                     .map(DerivedSchema::schema)
                     .orElse(Map.of());
             String table = compiled.factTable();
@@ -78,8 +95,14 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas {
     public void accept(String principal, String pipelineId) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
+        refuseWhileAJobIsProducing(pipelineId);
         auditGate.dispatch(ControlOperations.PIPELINE_ACCEPT_DERIVED_SCHEMA,
                 new AuditContext(principal, pipelineId), () -> {
+                    // The physical model first, then everything worked out from it. This order is what
+                    // makes the act one thing rather than two: a re-derivation over source copies that
+                    // were not refreshed records today's answer to yesterday's question, and the report
+                    // afterwards agrees with itself while agreeing with nothing outside.
+                    joins.copySourceSchemas(pipelineId);
                     // Recorded through the same class the gate records through, so accepting cannot
                     // write a shape a start would then refuse - which is what a second write path here
                     // would eventually do.
@@ -88,6 +111,72 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas {
                             pipelineId, stepId, compiled.sql(), compiled.plan(), compiled.tables()));
                     return null;
                 });
+    }
+
+    @Override
+    public void derive(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        // The copy, and nothing gated. What holds a join to the columns it was recorded producing is the
+        // start's business: refusing here would refuse a whole batch of unrelated resources over one
+        // pipeline whose source widened a column, which is not something the author applying can act on.
+        joins.copySourceSchemas(pipelineId);
+    }
+
+    /**
+     * Refuses a re-copy while a job is carrying the pipeline, or while one has been asked for.
+     *
+     * <p>The run is never the thing at risk - it holds the versions it was assembled from and re-reads
+     * none of them. What is refused is the disagreement a re-copy would leave behind: the record would
+     * say the pipeline produces one shape while the job going on produces another, and everything read
+     * off the record afterwards would describe a pipeline that is not running.
+     *
+     * <p><b>Paused is allowed and being resumed is not, and that pair is the whole judgement.</b> A
+     * paused pipeline has no job producing anything, and both ways out of paused re-read the definition
+     * - so a re-copy taken there is picked up rather than bypassed. One already asked to resume is a job
+     * about to carry on under the assembly it was paused with, which is the running case arriving a
+     * moment later. Reading only the checkpoint would let that one through.
+     */
+    private void refuseWhileAJobIsProducing(String pipelineId) {
+        PipelineState actual = actualStateOf(pipelineId);
+        PipelineState desired = desiredStateOf(pipelineId);
+        if (actual == PipelineState.RUNNING || desired == PipelineState.RUNNING) {
+            throw new TapstateException(ActuationError.SCHEMA_SYNC_WHILE_RUNNING,
+                    Map.of("pipeline", pipelineId, "state", actual.name(), "desired", desired.name()),
+                    null);
+        }
+    }
+
+    /** Whether a run of this pipeline exists to be holding anything - one going on, or one paused. */
+    private boolean aRunExists(String pipelineId) {
+        PipelineState actual = actualStateOf(pipelineId);
+        return actual == PipelineState.RUNNING || actual == PipelineState.PAUSED;
+    }
+
+    /**
+     * The derivation a reader should be shown: what the run holds while one exists, and what is on file
+     * otherwise. A run whose step was never pinned - one started before this was written down - falls
+     * back to the latest rather than reporting nothing, which is the answer that side used to give.
+     */
+    private Optional<DerivedSchema> heldBy(boolean live, String pipelineId, String stepId) {
+        if (live) {
+            Optional<DerivedSchema> pinned = storePort.derivedSchemas().pinned(pipelineId, stepId);
+            if (pinned.isPresent()) {
+                return pinned;
+            }
+        }
+        return storePort.derivedSchemas().latest(pipelineId, stepId);
+    }
+
+    private PipelineState actualStateOf(String pipelineId) {
+        return storePort.state().read(pipelineId)
+                .map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
+                .orElse(PipelineState.NEW);
+    }
+
+    private PipelineState desiredStateOf(String pipelineId) {
+        return storePort.desired().read(pipelineId)
+                .map(DesiredState::targetState)
+                .orElse(PipelineState.NEW);
     }
 
     /** The columns a join publishes: output name to declared type, in the order it publishes them. */

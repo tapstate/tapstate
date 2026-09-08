@@ -76,12 +76,13 @@ public final class ApplyService {
     private final AuditGate auditGate;
     private final SchemaStore schemas;
     private final PlanAdvisories advisories;
+    private final SchemaDerivation derivation;
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
-            PlanAdvisories advisories) {
+            PlanAdvisories advisories, SchemaDerivation derivation) {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -90,6 +91,10 @@ public final class ApplyService {
         // would be indistinguishable from one whose rules all passed, so an assembly with no rules yet
         // states that by handing over PlanAdvisories.none().
         this.advisories = Objects.requireNonNull(advisories, "advisories");
+        // Named for the same reason the advisories are: an apply that quietly re-derived nothing reads
+        // exactly like one whose pipelines were all up to date, and the case this exists for is the one
+        // where nothing was written either.
+        this.derivation = Objects.requireNonNull(derivation, "derivation");
     }
 
     /**
@@ -203,13 +208,23 @@ public final class ApplyService {
         // first author's edit is gone, and nothing anywhere reports it. Passing them here makes the
         // comparison and the write one store operation, which is the only form of the check that
         // survives a concurrent writer.
-        return auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
+        ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
             String conflicted = store.saveAll(toWrite, enforced).orElse(null);
             if (conflicted != null) {
                 throw new TapstateException(ArtifactError.VERSION_CONFLICT, Map.of("id", conflicted), null);
             }
             return new ApplyResult(outcomes, plan.warnings());
         });
+        // Every pipeline in the batch, whether or not this apply wrote it. An unchanged pipeline is
+        // precisely the case that needs re-deriving: its content hash covers the pipeline document and
+        // nothing else, so a source that moved under it leaves the hash byte-identical and the write
+        // skipped. Keying this on the write would leave it silent in the one case it is here for.
+        for (PreparedArtifact prepared : plan.artifacts()) {
+            if (prepared.resource() instanceof PipelineResource) {
+                derivation.derive(prepared.id());
+            }
+        }
+        return result;
     }
 
     /**

@@ -111,6 +111,16 @@ final class NoReclaimStores {
             }
 
             @Override
+            public void pin(String pipelineId, String stepId, long version) {
+                throw unexpected("DerivedSchemaStore.pin");
+            }
+
+            @Override
+            public Optional<DerivedSchema> pinned(String pipelineId, String stepId) {
+                throw unexpected("DerivedSchemaStore.pinned");
+            }
+
+            @Override
             public void record(String pipelineId, String stepId, Map<String, String> schema,
                     String statement, String derivedFrom, String derivedBy) {
                 throw unexpected("DerivedSchemaStore.record");

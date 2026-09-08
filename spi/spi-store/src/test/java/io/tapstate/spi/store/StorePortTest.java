@@ -920,6 +920,7 @@ class StorePortTest {
         private final Map<String, byte[]> keyedState = new HashMap<>();
         private final Map<String, NestDeadLetterRecord> deadLetters = new LinkedHashMap<>();
         private final Map<String, List<DerivedSchema>> derivedSchemas = new LinkedHashMap<>();
+        private final Map<String, Long> pins = new LinkedHashMap<>();
 
         @Override
         public ArtifactStore artifacts() {
@@ -1169,6 +1170,22 @@ class StorePortTest {
                     }
                     versions.add(new DerivedSchema(last == null ? 0L : last.version() + 1, schema,
                             statement, derivedFrom, derivedBy));
+                }
+
+                @Override
+                public void pin(String pipelineId, String stepId, long version) {
+                    pins.put(pipelineId + "/" + stepId, version);
+                }
+
+                @Override
+                public Optional<DerivedSchema> pinned(String pipelineId, String stepId) {
+                    Long version = pins.get(pipelineId + "/" + stepId);
+                    if (version == null) {
+                        return Optional.empty();
+                    }
+                    return derivedSchemas.getOrDefault(pipelineId + "/" + stepId, List.of()).stream()
+                            .filter(recorded -> recorded.version() == version)
+                            .findFirst();
                 }
 
                 @Override
