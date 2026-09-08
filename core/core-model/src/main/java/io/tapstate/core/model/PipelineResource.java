@@ -8,7 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * {@code kind: pipeline} — the composing runnable unit (ADR-0016 §1, X17): references
+ * {@code kind: pipeline} — the composing runnable unit (§1, X17): references
  * pre-created sources by id (never inline), wires transforms / view / serve, carries
  * task-level settings. Minimal composition (source + view/serve) is a validate-layer rule.
  */

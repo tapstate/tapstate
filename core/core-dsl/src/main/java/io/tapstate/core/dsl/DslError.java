@@ -6,7 +6,7 @@ import io.tapstate.core.common.Severity;
 import java.util.Set;
 
 /**
- * The {@code dsl} domain's error codes (ADR-0024 D1; the domain's first consumer, plan poc1 B3-7).
+ * The {@code dsl} domain's error codes (the domain's first consumer, plan poc1 B3-7).
  * Each constant a well-formed artifact can raise on its own maps 1:1 to a corpus rule-vocabulary key
  * (corpus/README.md) — the symbol is the vocabulary key, the canonical code prefixes it with the
  * {@code dsl.} domain.
@@ -20,7 +20,7 @@ import java.util.Set;
  *
  * <p>{@code placeholders()} is the named-argument contract: every throw site supplies a value for
  * each name, and (once the catalog lands in the presentation layer) the build-time placeholder
- * gate checks message templates against it (ADR-0024 D5-4). {@code path} is present on every semantic
+ * gate checks message templates against it. {@code path} is present on every semantic
  * code — the field path of the offending node, carried both as a typed accessor on {@link DslException}
  * and as a message argument — but absent on {@link #MALFORMED_YAML}, which is pre-semantic.
  */

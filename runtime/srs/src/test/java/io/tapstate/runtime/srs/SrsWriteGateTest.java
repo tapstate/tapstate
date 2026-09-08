@@ -65,7 +65,7 @@ class SrsWriteGateTest {
 
     @Test
     void refusesAWriteThatWouldOverwriteAnUnreadChange() {
-        // ADR worked example: capacity 1000, slowest consumer read up to seq 501, tailSeq 1501. The next
+        // Worked example: capacity 1000, slowest consumer read up to seq 501, tailSeq 1501. The next
         // write (seq 1502) would evict the still-unread seq 502 -> (1502 - 501) = 1001 > 1000 -> refuse.
         assertThat(SrsWriteGate.hasHeadroom(1501L, 1000L, 501L)).isFalse();
     }

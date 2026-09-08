@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Core ring shared kernel (ADR-0024 D3 / R1 admission: needed by >=2 modules, zero business).
+  Core ring shared kernel (R1 admission: needed by >=2 modules, zero business).
   Holds the cross-cutting error-code contract — TapstateErrorCode / TapstateException / Severity /
   the Domain registry — and nothing else. Zero third-party dependencies (not even
   jackson-annotations): this is the most foundational core module and must stay native-clean
-  (no runtime reflection, no scanning), per ADR-0024 D1.
+  (no runtime reflection, no scanning).
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"

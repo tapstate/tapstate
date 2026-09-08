@@ -23,12 +23,12 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
- * B3-6: batch reference closure. Offline, the closure is the batch (ADR-0021 §3): every
+ * B3-6: batch reference closure. Offline, the closure is the batch: every
  * reference inside a pipeline must resolve within the loaded directory. This test drives the
  * directory loader ({@link WorkspaceLoader}) — the realistic entry that parses every
  * {@code *.tap.yml}, attributes parse errors to their file, and runs closure validation.
  *
- * <p>The acceptance bar is twofold: (a) every ADR-0016 §14 valid scenario loads clean — the
+ * <p>The acceptance bar is twofold: (a) every §14 valid scenario loads clean — the
  * real false-positive guard, since the valid corpus exercises the full addressing surface
  * (bare table / step id / view id / regex / source-id list / nest+join alias maps / use
  * references); (b) the four B3-6 invalid cases raise the right rule at the right path.
@@ -43,7 +43,7 @@ class DslReferenceClosureTest {
 
     @ParameterizedTest(name = "valid/{0} loads clean")
     @MethodSource("validScenarios")
-    @DisplayName("every ADR-0016 §14 valid workspace passes closure with no false positive")
+    @DisplayName("every §14 valid workspace passes closure with no false positive")
     void validScenarioLoadsClean(String dir) {
         assertThatCode(() -> WorkspaceLoader.load(VALID.resolve(dir))).doesNotThrowAnyException();
     }
@@ -101,7 +101,7 @@ class DslReferenceClosureTest {
     @Test
     @DisplayName("an open-universe source (tables omitted) cannot prove a bare table missing")
     void openUniverseAcceptsBareTable() {
-        // tables omitted = the whole source (ADR-0016 §4, X9): offline we cannot enumerate it,
+        // tables omitted = the whole source (§4, X9): offline we cannot enumerate it,
         // so a bare from-token that is neither a step id nor a known literal is accepted, not
         // flagged missing (deferred to connect-time validation).
         String src = """
@@ -247,7 +247,7 @@ class DslReferenceClosureTest {
     void generatedStepIdShadowingATableIsRejected() {
         // The anonymous filter generates id filter_1 (canonical-form §5); src_a happens to declare a
         // table named filter_1, so the generated id shadows it — caught the same as a declared clash,
-        // proving no-shadowing runs on post-generation ids (ADR-0016 §5).
+        // proving no-shadowing runs on post-generation ids (§5).
         String src = source("src_a", "mysql", "filter_1");
         String pipe = """
                 version: tapstate/v1

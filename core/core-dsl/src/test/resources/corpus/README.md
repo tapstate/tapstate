@@ -1,31 +1,32 @@
 # DSL corpus — acceptance baseline for the core-dsl pipeline (plan poc1 B1)
 
-This corpus materializes every scenario of [ADR-0016](../../../../../../docs/adr/0016-dsl-grammar.md)
-§14 (14.1–14.11, X19 included) as loadable `.tap.yml` workspaces. It is the acceptance
-baseline for B2–B5: parse, validate, CEL checking, and canonical round-trip are all
-asserted against these files. Grammar branches the corpus does not exercise are not
-implemented defensively (plan risk R3, corpus-first).
+This corpus materializes every §14 grammar scenario (14.1–14.11, X19 included) as
+loadable `.tap.yml` workspaces. It is the acceptance baseline for B2–B5: parse, validate,
+CEL checking, and canonical round-trip are all asserted against these files. Grammar
+branches the corpus does not exercise are not implemented defensively (plan risk R3,
+corpus-first).
 
 Authoring rules:
 
 - **Only defined syntax.** Every file uses §1–§13 grammar exactly as decided; no invented
-  fields, no speculative sugar. When the grammar changes, the ADR changes first.
+  fields, no speculative sugar. The grammar is decided first; the corpus follows.
 - One file per resource, named `<top-level id>.tap.yml`, single YAML document.
-- Comments are English and cite the deciding ADR section / X-decision.
+- Comments are English and state the rule a file exercises — the grammar section or X-decision,
+  never an identifier for a document this repository does not carry.
 - `CorpusSmokeTest` guards this structural contract (well-formedness, layout, rule
   vocabulary). It does **not** check DSL semantics — that is the validate engine's job.
 
-## valid/ — one workspace directory per ADR-0016 §14 scenario
+## valid/ — one workspace directory per §14 scenario
 
 Each directory is an independently loadable workspace batch: every referenced id resolves
-inside the directory (offline closure = the batch, ADR-0021 §3). Ids may repeat across
+inside the directory (offline closure = the batch). Ids may repeat across
 directories — uniqueness is per batch.
 
 `s01`–`s11` are the original §14 scenarios; `s12`–`s13` are read_mode-amendment additions
 (§11.8) exercising grammar that amendment introduced — `read_mode: snapshot_only` bounding a
 cdc read, and `srs.enabled: false`.
 
-| Directory | ADR | Scenario | Notable grammar surface |
+| Directory | Section | Scenario | Notable grammar surface |
 |---|---|---|---|
 | `s01-mirror-rename-ddl` | §14.1 | Oracle → MySQL whole-source mirror | `serve.from: /.*/`, `sync[].rename` (map+case+prefix), `ddl: apply`, `auto_create_table` |
 | `s02-modeling-nest-rest` | §14.2 | Oracle → SRS → nest → view → REST | `srs` tuning, `map`, `nest` full tree (2-level embed), view tiers, `query: rest` |
@@ -48,7 +49,6 @@ Each case is the smallest batch that exhibits exactly one violation, plus an
 
 ```yaml
 rule: <vocabulary key>   # machine-checked against the list below
-adr:  "<deciding ADR section>"
 path: <field path of the violation>
 note: "<one-line human explanation>"
 ```
@@ -89,8 +89,8 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `g01-id-contains-dot` | illegal-value | id containing the reserved `.` separator |
 | `g02-duplicate-top-level-id` | duplicate-id | same top-level id in two files of one batch |
 | `g03-duplicate-pipeline-internal-id` | duplicate-id | two transforms steps in one pipeline share an id (internal namespace, 2026-06-15) |
-| `g04-step-id-shadows-table` | duplicate-id | step id equals a literal table name in the source (no shadowing, ADR-0016 §5) |
-| `g05-step-id-shadows-source` | duplicate-id | step id equals a referenced source id (no shadowing, ADR-0016 §5) |
+| `g04-step-id-shadows-table` | duplicate-id | step id equals a literal table name in the source (no shadowing, §5) |
+| `g05-step-id-shadows-source` | duplicate-id | step id equals a referenced source id (no shadowing, §5) |
 | `g06-cel-unknown-envelope-field` | illegal-expression | filter references `afterr`, a typo of the `after` envelope field (CEL type-check) |
 | `g07-cel-map-syntax-error` | illegal-expression | map computed value `"=after.region +"` is not well-formed CEL (CEL parse) |
 | `g08-cel-push-object-format` | illegal-expression | push object-form computed field `"=after.region +"` is not well-formed CEL (distinct `format.<field>` path) |

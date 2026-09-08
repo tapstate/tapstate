@@ -575,7 +575,7 @@ public final class DslParser {
 
     // ---- definition bodies (kind: transform / view / serve) -----------------------
 
-    /** A reusable transform body (ADR-0016 §5, X19): same payload grammar as an inline step, no wiring. */
+    /** A reusable transform body (§5, X19): same payload grammar as an inline step, no wiring. */
     private TransformResource transformDefinition(YamlMap m) {
         forbidFrom(m);
         String type = m.string("type");
@@ -590,7 +590,7 @@ public final class DslParser {
                 idOf(m), metadata(m), body(type, m), m.freeMap("options"), m.freeMap("experimental"));
     }
 
-    /** A reusable MDM sink definition (ADR-0016 §7, X19): where/how to materialize, no wiring. */
+    /** A reusable MDM sink definition (§7, X19): where/how to materialize, no wiring. */
     private ViewResource viewDefinition(YamlMap m) {
         forbidFrom(m);
         m.requireOnly(VIEW_DEF_KEYS);
@@ -599,7 +599,7 @@ public final class DslParser {
                 storage(m.mapping("storage")), viewSchema(m.mapping("schema")), m.freeMap("experimental"));
     }
 
-    /** A reusable publish-surface definition (ADR-0016 §8, X19): sync / query / push, no wiring. */
+    /** A reusable publish-surface definition (§8, X19): sync / query / push, no wiring. */
     private ServeResource serveDefinition(YamlMap m) {
         forbidFrom(m);
         m.requireOnly(SERVE_DEF_KEYS);

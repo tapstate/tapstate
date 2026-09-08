@@ -1,4 +1,3 @@
 rule: mode-mismatch
-adr: "ADR-0016 §1"
 path: settings.start_from
 note: "start_from on a bounded read (api source, no incremental tail); nothing to position a cursor into"

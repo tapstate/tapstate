@@ -227,7 +227,7 @@ class CanonicalWriterTest {
 
         @Test
         void writesRegexTableRefsAndCelTableFilterQuoted() {
-            // §4 of ADR-0016: /…/ regex form; tables[].filter is a CEL expression and
+            // §4: /…/ regex form; tables[].filter is a CEL expression and
             // CEL fields are always double-quoted (§6).
             SourceResource src = new SourceResource("src_mix", null, "mysql",
                     Map.of("host", "10.0.0.1"), SourceMode.CDC,
@@ -354,7 +354,7 @@ class CanonicalWriterTest {
 
         @Test
         void writesMapAndNestFullTreeWithSortedAliasMaps() {
-            // ADR-0016 §14.2: map projection keeps declared field order (§6); nest/join
+            // §14.2: map projection keeps declared field order (§6); nest/join
             // alias maps and on maps sort lexicographically; full-tree embed key order per §3.
             LinkedHashMap<String, FieldRule> fields = new LinkedHashMap<>();
             fields.put("customer_id", FieldRule.rename("CUST_ID"));
@@ -444,7 +444,7 @@ class CanonicalWriterTest {
 
         @Test
         void writesMultiSourceListAndJoinSqlAsLiteralBlock() {
-            // ADR-0016 §14.8: multi-source = flow list (X13); join sql is user content,
+            // §14.8: multi-source = flow list (X13); join sql is user content,
             // emitted as a literal block with value-driven chomping (§6).
             PipelineResource p = new PipelineResource("cust_stats", null,
                     List.of(SourceRef.bare("src_crm"), SourceRef.bare("src_erp")),
@@ -488,7 +488,7 @@ class CanonicalWriterTest {
 
         @Test
         void writesJsScriptAsLiteralBlockAndKeepsNonDefaultWriteMode() {
-            // ADR-0016 §14.4: js escape hatch; append is non-default so it stays.
+            // §14.4: js escape hatch; append is non-default so it stays.
             PipelineResource p = new PipelineResource("kfk2my", null, List.of(SourceRef.bare("src_kfk")),
                     List.of(Step.inline("parse", FromClause.list(FromRef.literal("orders_topic")),
                             new TransformBody.Js(
@@ -523,7 +523,7 @@ class CanonicalWriterTest {
 
         @Test
         void writesPushElementsWithCelFormatQuoted() {
-            // ADR-0016 §14.5 + X11: push element key order id, source, topic, format,
+            // §14.5 + X11: push element key order id, source, topic, format,
             // options; CEL format is always double-quoted with the = marker.
             PipelineResource p = new PipelineResource("my2kfk", null, List.of(SourceRef.bare("src_my")),
                     null, null,
@@ -664,7 +664,7 @@ class CanonicalWriterTest {
 
         @Test
         void writesTransformDefinitionWithoutFrom() {
-            // ADR-0016 §14.11 / X19: definition body = pure logic, from is forbidden;
+            // §14.11 / X19: definition body = pure logic, from is forbidden;
             // drop rule renders as boolean false.
             TransformResource t = new TransformResource("mask_pii", null,
                     new TransformBody.MapProjection(orderedFields()), null, null);
