@@ -124,6 +124,7 @@ class PipelineRepresentationTest {
         assertThat(Arrays.stream(PipelineView.class.getRecordComponents())
                 .map(component -> component.getName())
                 .toList())
+                .isNotEmpty()
                 .doesNotContain("state", "failure", "metrics", "snapshot", "positions");
     }
 

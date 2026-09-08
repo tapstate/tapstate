@@ -206,6 +206,16 @@ class ConnectorCatalogViewTest {
     }
 
     @Test
+    void iconIsAValueOverItsImageBytes() {
+        ConnectorIcon icon = new ConnectorIcon(new byte[] {4, 5, 6}, "image/png");
+
+        assertThat(icon).isEqualTo(new ConnectorIcon(new byte[] {4, 5, 6}, "image/png"));
+        assertThat(icon.hashCode())
+                .isEqualTo(new ConnectorIcon(new byte[] {4, 5, 6}, "image/png").hashCode());
+        assertThat(icon).hasToString("ConnectorIcon[bytes=[4, 5, 6], mediaType=image/png]");
+    }
+
+    @Test
     void iconIsAbsentWhenTheConnectorIsNotRegisteredInTheCatalogStore() {
         ConnectorCatalogView view = new ConnectorCatalogView(
                 BUNDLED, new InMemoryConnectorCatalogStore(), new InMemoryConnectorSpecStore(), emptyRegistry());
