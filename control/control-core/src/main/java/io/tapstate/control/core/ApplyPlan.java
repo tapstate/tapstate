@@ -18,22 +18,23 @@ import java.util.Map;
  * is written, the drafts are behind us and nothing else can say which write was version-checked.
  */
 public record ApplyPlan(List<PreparedArtifact> artifacts, List<ValidationDiagnostic> warnings,
-        Map<String, String> preconditions) {
+        Map<String, String> preconditions, Map<String, String> workspacePreconditions) {
 
     public ApplyPlan {
         artifacts = List.copyOf(artifacts);
         warnings = List.copyOf(warnings);
         preconditions = Map.copyOf(preconditions);
+        workspacePreconditions = Map.copyOf(workspacePreconditions);
     }
 
     /** A plan whose drafts declared no version preconditions. */
     public ApplyPlan(List<PreparedArtifact> artifacts, List<ValidationDiagnostic> warnings) {
-        this(artifacts, warnings, Map.of());
+        this(artifacts, warnings, Map.of(), Map.of());
     }
 
     /** A plan with nothing advisory to say and no version preconditions declared. */
     public ApplyPlan(List<PreparedArtifact> artifacts) {
-        this(artifacts, List.of(), Map.of());
+        this(artifacts, List.of(), Map.of(), Map.of());
     }
 
     /** The version the draft for {@code id} declared it was editing, or null when it declared none. */

@@ -16,6 +16,7 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.NestDeadLetterRecord;
+import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -61,7 +62,7 @@ class MongoStorePortIT {
             """;
 
     @Test
-    void aggregatesTheTenSubStoresEachOnItsOwnStorage() {
+    void aggregatesTheElevenSubStoresEachOnItsOwnStorage() {
         // The Testcontainers Mongo speaks plaintext; TLS is opt-in, so a plaintext URL connects with
         // no flag. TLS wiring itself is covered by MongoConnectionTest.
         String uri = REPLICA_SET.getReplicaSetUrl();
@@ -69,13 +70,17 @@ class MongoStorePortIT {
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
             MongoStorePort port = new MongoStorePort(connection);
+            dropAggregateStorage(uri);
 
-            // one write through each of the ten sub-stores
+            // one write through each of the eleven sub-stores
             port.artifacts().save(PARSER.parse(ORDERS));
             port.state().create("orders_sync", "{\"phase\":\"snapshot\"}", Instant.parse("2026-07-06T00:00:00Z"));
             port.desired().save(new DesiredState("orders_sync", PipelineState.RUNNING, "rev-abc"));
             port.observations().save(new Observation("orders_sync", PipelineState.RUNNING,
                     Map.of(), Map.of(), Map.of("orders", "w7")));
+            port.layouts().save(new PipelineLayout("orders_sync",
+                    Map.of("source:orders", new PipelineLayout.NodePosition(80, 120)),
+                    new PipelineLayout.Viewport(0, 0, 1)));
             port.catalog().save(new ConnectionConfig("mysql-local", "mysql", Map.of("host", "localhost")));
             port.schemas().save(new DiscoveredSourceModel("mysql-local", "mysql", 1783998000000L, new SourceModel(List.of(
                     new SourceTable("orders", List.of(), List.of(), List.of())))));
@@ -96,6 +101,8 @@ class MongoStorePortIT {
             assertThat(port.desired().read("orders_sync")).isPresent();
             assertThat(port.observations().read("orders_sync"))
                     .hasValueSatisfying(observation -> assertThat(observation.positions()).containsEntry("orders", "w7"));
+            assertThat(port.layouts().get("orders_sync"))
+                    .hasValueSatisfying(layout -> assertThat(layout.nodes()).containsKey("source:orders"));
             assertThat(port.catalog().get("mysql-local")).isPresent();
             assertThat(port.schemas().get("mysql-local")).isPresent();
             assertThat(port.connectors().list()).hasSize(1);
@@ -111,6 +118,7 @@ class MongoStorePortIT {
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_STATE).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_DESIRED).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isEqualTo(1);
+                assertThat(database.getCollection(MongoStorePort.PIPELINE_LAYOUTS).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.CONNECTIONS).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.SOURCE_SCHEMAS).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.CONNECTOR_ARTIFACTS + ".files").countDocuments())
@@ -230,6 +238,27 @@ class MongoStorePortIT {
             database.getCollection(MongoStorePort.PIPELINE_DESIRED).drop();
             database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).drop();
             database.getCollection(MongoStorePort.SRS_META).drop();
+        }
+    }
+
+    /** Empties every configuration collection asserted by the aggregate-store witness. */
+    private static void dropAggregateStorage(String uri) {
+        try (MongoClient raw = MongoClients.create(uri)) {
+            MongoDatabase database = raw.getDatabase(new ConnectionString(uri).getDatabase());
+            List.of(
+                    MongoStorePort.ARTIFACTS,
+                    MongoStorePort.PIPELINE_STATE,
+                    MongoStorePort.PIPELINE_DESIRED,
+                    MongoStorePort.PIPELINE_OBSERVATION,
+                    MongoStorePort.PIPELINE_LAYOUTS,
+                    MongoStorePort.CONNECTIONS,
+                    MongoStorePort.SOURCE_SCHEMAS,
+                    MongoStorePort.CONNECTOR_ARTIFACTS + ".files",
+                    MongoStorePort.CONNECTOR_ARTIFACTS + ".chunks",
+                    MongoStorePort.CONNECTOR_SPECS,
+                    MongoStorePort.CONNECTION_TEST_RESULTS,
+                    MongoStorePort.SRS_META
+            ).forEach(collection -> database.getCollection(collection).drop());
         }
     }
 }

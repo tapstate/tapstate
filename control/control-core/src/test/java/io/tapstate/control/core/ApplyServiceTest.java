@@ -8,10 +8,14 @@ import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import org.junit.jupiter.api.Test;
@@ -117,6 +121,18 @@ class ApplyServiceTest {
         assertThat(stored("orders_src")).contains("enabled: false");
     }
 
+    @Test
+    void typedReplaceAlsoRefusesToTurnTheReplayStoreOffWhileAReaderIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+        Resource replacement = new DslParser().parse(UNBUFFERED_SRC);
+
+        assertThatThrownBy(() -> guarded.replace(
+                "author", replacement, CanonicalHash.of(stored("orders_src"))))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
     /** A cdc source whose changes are buffered through the shared replay store. */
     private static final String BUFFERED_SRC = """
             version: tapstate/v1
@@ -124,7 +140,7 @@ class ApplyServiceTest {
             id: orders_src
             connector: mysql
             mode: cdc
-            config: { host: 10.30.0.5, username: writer, password: My_2026 }
+            config: { host: 10.30.0.5, database: orders, username: writer, password: My_2026 }
             tables: [orders]
             srs: { enabled: true }
             """;
@@ -967,6 +983,60 @@ class ApplyServiceTest {
     }
 
     @Test
+    void typedPipelineCreateRefusesWhenItsSourceChangesAfterWorkspaceValidation() {
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        Resource sourceEdit = new DslParser().parse(SRC_ORA.replace("10.20.0.15", "10.20.0.16"));
+        store.concurrentWriter = () -> store.landDirectly(sourceEdit);
+
+        ArtifactWriteResult result = service.create("bob", new DslParser().parse(PIPELINE));
+
+        assertThat(result.write().appliedSuccessfully()).isFalse();
+        assertThat(result.write().refusedId()).isEqualTo("src_ora");
+        assertThat(result.write().refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+        assertThat(store.get("ora2my_ods")).isEmpty();
+        assertThat(stored("src_ora")).isEqualTo(canonicalOf(SRC_ORA.replace("10.20.0.15", "10.20.0.16")));
+    }
+
+    @Test
+    void offlinePlanningIgnoresStoredArtifactsOutsideTheSubmittedClosure() {
+        store.landDirectly(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: stale_pipeline
+                source: missing_source
+                serve: { from: /.*/ }
+                """));
+
+        ApplyPlan plan = service.plan(List.of(draft(TGT_MY)));
+
+        assertThat(plan.artifacts()).extracting(PreparedArtifact::id).containsExactly("tgt_my");
+        assertThat(plan.workspacePreconditions()).isEmpty();
+    }
+
+    @Test
+    void typedCreateDoesNotConflictWithAnUnrelatedArtifactEdit() {
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        Resource unrelated = new DslParser().parse(PIPELINE.replace("ora2my_ods", "unrelated_pipeline"));
+        store.landDirectly(unrelated);
+        Resource unrelatedEdit = new DslParser().parse(
+                PIPELINE.replace("ora2my_ods", "unrelated_pipeline")
+                        .replace("snapshot_and_cdc", "cdc_only"));
+        store.concurrentWriter = () -> store.landDirectly(unrelatedEdit);
+        SourceResource created = (SourceResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: new_source
+                connector: mysql
+                config: { host: localhost, database: inventory, username: reader }
+                """);
+
+        ArtifactWriteResult result = service.create("bob", created);
+
+        assertThat(result.write().appliedSuccessfully()).isTrue();
+        assertThat(store.get("new_source")).contains(created);
+    }
+
+    @Test
     void validateReportsAStalePreconditionAsADiagnosticRatherThanThrowing() {
         service.apply("alice", List.of(draft(TGT_MY)));
 
@@ -1054,6 +1124,40 @@ class ApplyServiceTest {
         @Override
         public void saveAll(List<Resource> artifacts) {
             saveAll(artifacts, Map.of());
+        }
+
+        @Override
+        public synchronized ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
+            if (concurrentWriter != null) {
+                Runnable other = concurrentWriter;
+                concurrentWriter = null;
+                other.run();
+            }
+            for (ArtifactWrite write : writes) {
+                for (Map.Entry<String, String> precondition : write.readPreconditions().entrySet()) {
+                    String canonical = byId.get(precondition.getKey());
+                    if (canonical == null || !CanonicalHash.of(canonical).equals(precondition.getValue())) {
+                        return ArtifactBatchWrite.refused(precondition.getKey(), ArtifactMutation.VERSION_CONFLICT);
+                    }
+                }
+            }
+            ArtifactWrite write = writes.getFirst();
+            if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && byId.containsKey(write.resource().id())) {
+                return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
+            }
+            if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
+                String canonical = byId.get(write.resource().id());
+                if (canonical == null) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.NOT_FOUND);
+                }
+                if (!CanonicalHash.of(canonical).equals(write.expectedContentHash())) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.VERSION_CONFLICT);
+                }
+            }
+            byId.put(write.resource().id(), writer.write(write.resource()));
+            saveCount++;
+            saveAllBatches.add(List.of(write.resource().id()));
+            return ArtifactBatchWrite.applied();
         }
 
         @Override

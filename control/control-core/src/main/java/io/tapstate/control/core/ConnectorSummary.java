@@ -14,6 +14,7 @@ import io.tapstate.core.model.SourceMode;
 public record ConnectorSummary(
         String id,
         String name,
+        String icon,
         String group,
         List<String> modes,
         String discovery,
@@ -26,6 +27,7 @@ public record ConnectorSummary(
         return new ConnectorSummary(
                 entry.id(),
                 entry.displayName(),
+                entry.icon(),
                 entry.group().yaml(),
                 entry.modes().stream().map(SourceMode::yaml).toList(),
                 entry.discovery().yaml(),
