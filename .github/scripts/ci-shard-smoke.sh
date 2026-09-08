@@ -36,7 +36,11 @@ with tempfile.TemporaryDirectory() as tmp:
     generic=cmd[:-2]+['--output',str(root/'generic.json'),'--inventory',str(root/'inventory.json'),'--count','3']
     subprocess.run(generic,check=True)
     p=json.loads((root/'generic.json').read_text()); assert len(p['shards'])==3 and len(p['expected'])==6
-    loads=[s['estimated_seconds'] for s in p['shards']]; assert max(loads)<=1.5*sum(loads)/len(loads)
+    # Recompute from assigned classes; the sharder cannot certify its own load totals.
+    hints=json.loads((root/'durations.json').read_text())
+    loads=[sum(hints[t['class']] for t in s['tests']) for s in p['shards']]
+    assert loads==[s['estimated_seconds'] for s in p['shards']]
+    assert max(loads)<=1.5*sum(loads)/len(loads)
     put('bin/mvn', '#!/bin/sh\nprintf "%s\\n" "$@" > "'+str(root/'mvn-args')+'"\n')
     (root/'bin/mvn').chmod(0o755)
     subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')],check=True,env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']})
