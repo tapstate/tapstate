@@ -365,6 +365,124 @@ else
 fi
 rm -rf "$stub_dir"
 
+# --- settle's live path: a tag that was not created, reported as though it was ------------------
+#
+# The same defect the retire cases above exist for, in the half of this script that runs on every
+# release that does publish. When the site is published the tag in the documentation repository is
+# ours to create, and when that create is refused this exits 0 with its only word on stderr. The
+# caller tees stdout into the step summary, so stderr is teed nowhere: a release that tagged the
+# documentation site and one that could not leave the same green step and the same empty summary,
+# and the only way to tell them apart is to go and look at the other repository. That was measured
+# on the withdrawal verb, where it cost an open request asking for a version that was not coming;
+# here it costs a published release whose documentation carries no tag. gh's own reason is discarded
+# by the same `>/dev/null 2>&1`, so even a person who goes looking is told the fact and never why.
+#
+# gh is replaced for this. The guard refuses rather than let a PATH that did not take fall through
+# to the real gh, which would create a release in somebody else's repository.
+stub_dir="$(mktemp -d)"
+cat > "$stub_dir/gh" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$GH_STUB_LOG"
+case "$*" in
+  "issue list"*)
+    printf '[{"title":"%s","state":"CLOSED","number":29}]\n' "$GH_STUB_TITLE"
+    exit 0 ;;
+  "api repos/"*)
+    echo "1111111111111111111111111111111111111111"
+    exit 0 ;;
+  "release create"*)
+    echo "HTTP 403: Resource not accessible by personal access token (createRelease)" >&2
+    exit 1 ;;
+esac
+exit 0
+STUB
+chmod +x "$stub_dir/gh"
+
+log="$stub_dir/settle-tag-fails"; : > "$log"
+out="$(GH_STUB_LOG="$log" \
+       GH_STUB_TITLE="Release 0.4.1: publish the documentation site" \
+       PATH="$stub_dir:$PATH" \
+       bash "$script" settle 0.4.1 --notes-url "$url" 2>/dev/null)"
+if ! grep -q 'release create' "$log"; then
+    fail "the gh stub is the one that ran" "no release create recorded; the real gh may have been used"
+elif printf '%s' "$out" | grep -q '::warning::' \
+     && printf '%s' "$out" | grep -q 'v0[.]4[.]1' \
+     && printf '%s' "$out" | grep -q 'createRelease'; then
+    pass "a tag that could not be created says so where the release reports, and why"
+else
+    fail "a tag that could not be created says so where the release reports, and why" "stdout was: $out"
+fi
+rm -rf "$stub_dir"
+
+# --- settle's live path: a read that failed is not a sha ----------------------------------------
+#
+# `gh api` writes its error body to stdout, so a read taken for its output alone hands back that
+# document rather than the sha -- and it is not empty, which is all an emptiness guard tests for. The
+# document would then go to `--target`, and the tag for a published site would be cut from whatever
+# the API said instead of from `main`. The case above cannot see this: its stub answers every read.
+stub_dir="$(mktemp -d)"
+cat > "$stub_dir/gh" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$GH_STUB_LOG"
+case "$*" in
+  "issue list"*)
+    printf '[{"title":"%s","state":"CLOSED","number":29}]\n' "$GH_STUB_TITLE"
+    exit 0 ;;
+  "api repos/"*)
+    echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}'
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1 ;;
+esac
+exit 0
+STUB
+chmod +x "$stub_dir/gh"
+
+log="$stub_dir/settle-read-fails"; : > "$log"
+out="$(GH_STUB_LOG="$log" \
+       GH_STUB_TITLE="Release 0.4.1: publish the documentation site" \
+       PATH="$stub_dir:$PATH" \
+       bash "$script" settle 0.4.1 --notes-url "$url" 2>/dev/null)"
+if ! grep -q 'api repos/' "$log"; then
+    fail "the gh stub is the one that ran" "no read of main recorded; the real gh may have been used"
+elif grep -q 'release create' "$log"; then
+    fail "a main that could not be read cuts no tag" \
+         "a tag was attempted anyway: $(grep 'release create' "$log" | head -1)"
+elif printf '%s' "$out" | grep -q '::warning::' \
+     && printf '%s' "$out" | grep -q 'v0[.]4[.]1' \
+     && printf '%s' "$out" | grep -q 'Not Found'; then
+    pass "a main that could not be read cuts no tag, and says why"
+else
+    fail "a main that could not be read cuts no tag, and says why" "stdout was: $out"
+fi
+rm -rf "$stub_dir"
+
+# --- the lookup both verbs share, on the stream that is read ------------------------------------
+#
+# When the lookup cannot name a single issue it decides "not done", and both verbs act on that
+# decision. The line saying so used to go to stderr, which is teed nowhere -- the same defect as the
+# cases above, in the half the two verbs route through rather than in either of them.
+stub_dir="$(mktemp -d)"
+cat > "$stub_dir/gh" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$GH_STUB_LOG"
+case "$*" in
+  "issue list"*) echo '[]'; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$stub_dir/gh"
+
+log="$stub_dir/no-single-issue"; : > "$log"
+out="$(GH_STUB_LOG="$log" PATH="$stub_dir:$PATH" bash "$script" retire 0.4.1 2>/dev/null)"
+if ! grep -q 'issue list' "$log"; then
+    fail "the gh stub is the one that ran" "no issue list recorded; the real gh may have been used"
+elif printf '%s' "$out" | grep -q 'treating as not done'; then
+    pass "a lookup that names no single issue says so where the release reports"
+else
+    fail "a lookup that names no single issue says so where the release reports" "stdout was: $out"
+fi
+rm -rf "$stub_dir"
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "docs-release-smoke: all cases passed"
