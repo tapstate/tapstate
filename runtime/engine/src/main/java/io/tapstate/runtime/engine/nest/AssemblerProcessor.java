@@ -677,7 +677,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
             return;
         }
         Envelope event = (Envelope) item;
-        NestKeys.requireBeforeImageWhereKeysAreTracked(edge, event);
+        NestKeys.requireBeforeImageWhereKeysAreTracked(edge, event, comparedOn(edge));
         Map<String, Object> row = NestKeys.rowOf(event);
         SourceOrder order = NestKeys.orderOf(event);
         if (edge.pathId().isEmpty()) {
@@ -732,6 +732,26 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * here, the ordinary edge keyed by where the row now is and its twin keyed by where it was, so the
      * instance holding each side does its own half and neither reaches across.
      */
+    /**
+     * The columns this vertex reads off the row an update replaces, for the edge it arrived on - which is
+     * what a source tracking key changes on that edge has to send, and all it has to send.
+     *
+     * <p>Named per edge rather than as one set for the vertex, because the two edges read different rows
+     * for different reasons: the root's own rows are compared on the key that identifies a document, and a
+     * child's on the key that says which document it belongs to plus the one that says which element it is.
+     * A single set would refuse a source over a column the edge it arrived on never looks at.
+     */
+    private List<String> comparedOn(NestInbound edge) {
+        if (edge.pathId().isEmpty()) {
+            return vertex.partitionKey();
+        }
+        // A set: the two overlap on a table whose rows are identified by what they hang from, and naming
+        // a column twice in the failure would read as two different columns being absent.
+        Set<String> compared = new LinkedHashSet<>(edge.keyFields());
+        compared.addAll(edge.elementKey());
+        return List.copyOf(compared);
+    }
+
     private void handleRoot(NestInbound edge, Envelope event, Map<String, Object> row, SourceOrder order,
             Map<Object, Touched> touched) {
         List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey());
