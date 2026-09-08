@@ -35,6 +35,18 @@ import java.util.Map;
  * time anyone looks at a pipeline's model, the useful question is which step stopped being able to
  * answer rather than that some step did.
  *
+ * <p><b>An unknown here and an unknown on the value side are the same judgement.</b> A row value that
+ * met a source connector's own conversion travels in a carrier holding what that source's schema
+ * called the column it came from, and that name is absent exactly where the schema said nothing about
+ * the value. Where an arm reports a column unknown for that reason, it is reporting the same absence,
+ * and the two are not allowed to disagree - a column the model calls known while the value arrives
+ * with no declared name is a write the target rebuilds from a guess. <b>The absence has more than one
+ * cause and they must not be folded into one</b>: a value the schema cannot name at all (an element
+ * inside an array), a path the schema simply does not carry, and a lane that never consulted a schema
+ * because nothing downstream of it rebuilds anything. Only the cause says whether the schema is what
+ * needs fixing, and an arm that answers "unknown" without it sends every reader to the same wrong
+ * place.
+ *
  * <p><b>The vocabulary is the one already recorded</b> - column name to declared type, in output order,
  * rendered the way every other side that writes down a derived column renders it. A second rendering of
  * the same column would drift from that one eventually, and the shape that takes is a recorded schema
