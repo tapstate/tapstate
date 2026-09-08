@@ -12,7 +12,7 @@
     },
     {
       "word": "doc",
-      "description": "One document at an endpoint, located by equality settings and held to scalar values by path and list lengths by path - what makes 'the right rows crossed' assertable rather than only 'rows crossed'."
+      "description": "One document at an endpoint, located by equality settings and held to scalar values by path, list lengths by path, and paths that must not be there at all - what makes 'the right rows crossed' assertable rather than only 'rows crossed'. The last of the three is the only one a wider document fails: every value and length is satisfied by a document carrying extra fields beside them."
     },
     {
       "word": "error_count",
