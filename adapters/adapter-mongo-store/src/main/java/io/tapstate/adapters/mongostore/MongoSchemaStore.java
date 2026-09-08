@@ -208,7 +208,8 @@ public final class MongoSchemaStore implements SchemaStore {
             // type is null when discovery could not resolve it; stored as a null value, read back as null.
             fields.add(new Document("name", field.name())
                     .append("type", field.dataType())
-                    .append("tapstateType", field.type().name()));
+                    .append("tapstateType", field.type().name())
+                    .append("unknownBecause", field.unknownBecause()));
         }
         List<Document> indexes = new ArrayList<>();
         for (SourceIndex index : table.indexes()) {
@@ -231,17 +232,51 @@ public final class MongoSchemaStore implements SchemaStore {
      * names a type this build does not know. An unreadable type is the absence of one, never a refusal of
      * the whole read: the model is a derived observation that re-discovery replaces.
      */
-    private static TapstateType tapstateType(Document field) {
-        String name = field.getString("tapstateType");
-        if (name == null) {
-            return TapstateType.UNKNOWN;
+    /**
+     * One stored column read back, with the reason it has no resolved type where it has none.
+     *
+     * <p><b>A reason written down at discovery wins over anything this could say.</b> The connector was
+     * open then and is not now, so the cause it recorded - a shape with no member in the namespace, a
+     * number described without a width - is not recoverable here; replacing it with a storage-side
+     * remark would turn every such column into "the stored type did not resolve", which says only that
+     * the record was read.
+     *
+     * <p>The three this side can attribute are its own: a record written before a resolved type was
+     * kept, a spelling that is not a type in this build (a constant that went away), and a record that
+     * stored the unknown without saying which one it was. They are different problems - the first is
+     * ordinary and needs a re-discovery, the second is a compatibility break, the third is a record
+     * from before this component existed.
+     */
+    private static SourceField field(String name, Document stored) {
+        String declared = stored.getString("type");
+        String spelling = stored.getString("tapstateType");
+        if (spelling == null) {
+            return new SourceField(name, declared, TapstateType.UNKNOWN,
+                    "the stored record was written before a resolved type was kept");
         }
+        TapstateType type = named(spelling);
+        if (type == null) {
+            return new SourceField(name, declared, TapstateType.UNKNOWN,
+                    "the stored type '" + spelling + "' is not a tapstate type in this build");
+        }
+        if (type != TapstateType.UNKNOWN) {
+            return new SourceField(name, declared, type);
+        }
+        String because = stored.getString("unknownBecause");
+        return new SourceField(name, declared, TapstateType.UNKNOWN,
+                because == null || because.isBlank()
+                        ? "the stored record says the type is unknown and does not say which unknown"
+                        : because);
+    }
+
+    /** The type a stored spelling names, or null where this build has no such type. */
+    private static TapstateType named(String spelling) {
         for (TapstateType candidate : TapstateType.values()) {
-            if (candidate.name().equals(name)) {
+            if (candidate.name().equals(spelling)) {
                 return candidate;
             }
         }
-        return TapstateType.UNKNOWN;
+        return null;
     }
 
     /** Reconstructs a discovery from its envelope and its table documents, or fails coded when unreadable. */
@@ -279,7 +314,7 @@ public final class MongoSchemaStore implements SchemaStore {
             if (fieldName == null) {
                 throw unreadable(id);
             }
-            fields.add(new SourceField(fieldName, field.getString("type"), tapstateType(field)));
+            fields.add(field(fieldName, field));
         }
         List<SourceIndex> indexes = new ArrayList<>();
         for (Document index : documentList(table.get("indexes"), id)) {

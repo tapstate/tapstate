@@ -13,6 +13,8 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Stream;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
@@ -151,6 +153,49 @@ class MongoSchemaStoreTest {
 
         assertThat(read.model().tables().get(0).fields().get(0).type()).isEqualTo(TapstateType.UNKNOWN);
         assertThat(read.model().tables().get(0).fields().get(0).dataType()).isEqualTo("decimal(18,4)");
+    }
+
+    @Test
+    void theThreeWaysAStoredFieldComesBackWithoutATypeAreToldApart() {
+        // Three different problems arriving as one value: a record from before types were kept needs a
+        // re-discovery, a spelling this build has no type for is a compatibility break, and a stored
+        // unknown that never said which unknown it was is a record from before the reason existed.
+        // Read as one text they all say "the type did not resolve", which is the one nobody acts on.
+        DiscoveredSourceModel stored = discovered("x", new SourceModel(List.of(
+                new SourceTable("t", List.of(new SourceField("amount", "decimal(18,4)")), List.of(), List.of()))));
+
+        List<Document> beforeTypes = tableDocsOf(stored);
+        beforeTypes.get(0).getList("fields", Document.class).get(0).remove("tapstateType");
+        List<Document> notAType = tableDocsOf(stored);
+        notAType.get(0).getList("fields", Document.class).get(0).append("tapstateType", "GEOGRAPHY");
+        List<Document> unattributed = tableDocsOf(stored);
+        unattributed.get(0).getList("fields", Document.class).get(0).remove("unknownBecause");
+
+        List<String> reasons = Stream.of(beforeTypes, notAType, unattributed)
+                .map(tables -> MongoSchemaStore.toDiscovered(envelopeOf(stored), tables))
+                .map(read -> read.model().tables().get(0).fields().get(0).unknownBecause())
+                .toList();
+
+        assertThat(reasons).doesNotContainNull();
+        assertThat(Set.copyOf(reasons)).as("three routes, three attributions").hasSize(3);
+        assertThat(reasons.get(1)).as("the spelling is what names the break").contains("GEOGRAPHY");
+    }
+
+    @Test
+    void theReasonWrittenAtDiscoveryOutlivesTheRecordRatherThanBeingReplaced() {
+        // The connector was open when the reason was worked out and is not now, so nothing here could
+        // arrive at it again. Overwriting it with a storage-side remark turns every such column into
+        // "the record was read", which is the fact of least use to whoever has to fix something.
+        DiscoveredSourceModel stored = discovered("x", new SourceModel(List.of(
+                new SourceTable("t", List.of(new SourceField("shape", "geometry", TapstateType.UNKNOWN,
+                        "the connector's TapRaw has no member in the tapstate type namespace")),
+                        List.of(), List.of()))));
+
+        DiscoveredSourceModel read =
+                MongoSchemaStore.toDiscovered(envelopeOf(stored), tableDocsOf(stored));
+
+        assertThat(read.model().tables().get(0).fields().get(0).unknownBecause())
+                .isEqualTo("the connector's TapRaw has no member in the tapstate type namespace");
     }
 
     @Test
