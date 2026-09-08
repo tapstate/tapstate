@@ -1,4 +1,4 @@
-# Minimal CI: the merge-blocking build gate.
+# Sharded tests and their merge-blocking aggregate build gate.
 #   mvn verify — compile + unit tests + enforcer rules + ArchUnit ring rules + specifications
 # Docs frontmatter validation (gen-index --check) lives with the docs in the
 # separate private repo and is not run here. The zero-agent-footprint gate is a
@@ -27,75 +27,139 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  shard-plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive every test from the current reactor
+        run: .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-shard-plan
+          path: ${{ runner.temp }}/shards.json
+          if-no-files-found: error
+          retention-days: 7
+
+  test-shards:
+    needs: shard-plan
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [e2e-1, e2e-2, engine, rest]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-shard-plan
+          path: ${{ runner.temp }}
+      # Only third-party dependencies are copied from the shared cache. This job's
+      # install outputs live in its temporary repository and never enter that cache.
+      - name: Seed an isolated dependency repository
+        run: |
+          mkdir -p "$RUNNER_TEMP/m2"
+          if [ -d "$HOME/.m2/repository" ]; then
+            rsync -a --exclude='/io/tapstate/' "$HOME/.m2/repository/" "$RUNNER_TEMP/m2/"
+          fi
+      - name: Build the reactor without running tests
+        run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Execute exactly this shard
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+      - name: Validate and package this shard's evidence
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: .github/scripts/ci-aggregate.sh pack --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/ci-artifacts/$SHARD"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/ci-artifacts/
+          if-no-files-found: error
+          retention-days: 7
+      - name: The scene where a shard failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-${{ matrix.shard }}
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+            e2e/target/failure-scenes/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # This stable, non-matrix name is the required check. It admits the union,
+  # including every shard's declared report and coverage files, before reporting green.
   build:
+    needs: [shard-plan, test-shards]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # the diff-coverage step below needs a merge base with the target branch
+          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
-          # Root pom pins the toolchain by version only (21, no vendor);
-          # setup-java registers the installed JDK in ~/.m2/toolchains.xml.
           distribution: temurin
-          java-version: "21"
+          java-version: '21'
           cache: maven
-      - name: Build and test
-        run: mvn -B verify
-
-      # The MCP tool set is pinned by name inside mcp-smoke.sh, and until now the release run was the
-      # only lane that executed it. A tool added without that list following it therefore stayed
-      # invisible until a release was cut, which happened three times, most recently with
-      # system_version. The jar this needs is already produced by the verify above -- the boot
-      # repackage sits in the module's own build rather than behind a profile -- so this costs a
-      # process start and compiles nothing.
+      - name: Seed an isolated dependency repository
+        run: |
+          mkdir -p "$RUNNER_TEMP/m2"
+          if [ -d "$HOME/.m2/repository" ]; then
+            rsync -a --exclude='/io/tapstate/' "$HOME/.m2/repository/" "$RUNNER_TEMP/m2/"
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-shard-plan
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ci-test-results-*
+          path: ${{ runner.temp }}/ci-artifacts
+          merge-multiple: true
+      - name: Prepare local artifacts for report generation
+        run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Admit the complete report and coverage set
+        run: .github/scripts/ci-aggregate.sh verify --plan "$RUNNER_TEMP/shards.json" --artifacts "$RUNNER_TEMP/ci-artifacts" --restore .
+      - name: Every shard job succeeded
+        env:
+          SHARD_RESULT: ${{ needs.test-shards.result }}
+        run: test "$SHARD_RESULT" = success
       - name: MCP stdio smoke (Boot JAR sidecar)
         run: |
           jar="$(find control/mcp-server/target -maxdepth 1 -name 'mcp-server-*-boot.jar' -print -quit)"
           test -n "$jar"
           bash control/mcp-server/mcp-smoke.sh "$jar"
-
-      # Coverage of the lines this pull request adds, written to the run summary.
-      #
-      # This is the only coverage figure an outside contribution can get. The new-code coverage
-      # condition lives on the SonarQube server, a fork's workflow run is never given the token
-      # that reaches it, and that workflow consequently reports green having measured nothing. A
-      # contributor asking the one question worth asking - is what I just wrote tested? - had
-      # nowhere to read the answer. No secret, no server and no network call are involved here:
-      # the reports were already written by the verify above.
-      #
-      # The merge pass first, for the reason the sonarqube workflow spells out: each module's
-      # report otherwise describes that module's classes against that module's own runs, so a
-      # type declared in one ring and exercised from another reads as untested. Reporting every
-      # module against the merged execution data is what makes the figure mean anything.
-      #
-      # continue-on-error, because this is a report and not a gate. A coverage number that can
-      # redden the build gate is a threshold applied to outside contributions that our own pull
-      # requests are measured against somewhere else entirely.
+      - name: Merge coverage from every declared shard
+        run: |
+          mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -N jacoco:merge@jacoco-merge-reactor
+          mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" jacoco:report@jacoco-report-reactor
       - name: Diff coverage
         if: github.event_name == 'pull_request'
         continue-on-error: true
         run: |
-          set -euo pipefail
           base="origin/${{ github.base_ref }}"
           git rev-parse --verify --quiet "$base" >/dev/null 2>&1 \
             || git fetch --quiet --no-tags origin "${{ github.base_ref }}" || true
-          mvn -B -N jacoco:merge@jacoco-merge-reactor
-          mvn -B jacoco:report@jacoco-report-reactor
           DIFF_RANGE="$base...HEAD" bash .github/scripts/diff-coverage.sh >> "$GITHUB_STEP_SUMMARY"
-
-      # What the end-to-end run saw at the moment it failed, written before its containers went away.
-      # Without it a red specification leaves one assertion message and everything that would explain it
-      # is already gone, so the next move is to add a print statement and start two database engines
-      # again. The collector writes no address, and a test holds it to that: these files leave a public
-      # repository, and a connection uri carries its credentials inside it.
-      - name: The scene where an end-to-end case failed
-        if: failure()
+      - name: Preserve the admitted reports and coverage
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-failure-scenes
-          path: e2e/target/failure-scenes/
-          if-no-files-found: ignore
+          name: ci-aggregate
+          path: |
+            target/ci-shards/
+            target/jacoco-reactor.exec
+            **/target/surefire-reports/TEST-*.xml
+            **/target/failsafe-reports/TEST-*.xml
+            **/target/site/jacoco/jacoco.xml
+          if-no-files-found: error
           retention-days: 7
 
   installer:
@@ -161,7 +225,12 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh
+      - name: CI shard and aggregate cases
+        run: |
+          bash .github/scripts/ci-shard-smoke.sh
+          bash .github/scripts/ci-aggregate-smoke.sh
+          bash .github/scripts/ci-shape-smoke.sh
       - name: CI timing cases
         run: bash .github/scripts/ci-timing-smoke.sh
       - name: refresh driver cases
