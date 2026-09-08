@@ -16,6 +16,7 @@ with tempfile.TemporaryDirectory() as temporary:
     mock.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys, xml.etree.ElementTree as ET
 args = sys.argv[1:]
+assert '-U' in args, 'snapshot resolution must refresh metadata even with a warm repository'
 if os.environ.get('METADATA_WARNING'): print('[WARNING] Could not transfer metadata; using local cache')
 def value(prefix): return next(x[len(prefix):] for x in args if x.startswith(prefix))
 repo = pathlib.Path(value('-Dmaven.repo.local='))

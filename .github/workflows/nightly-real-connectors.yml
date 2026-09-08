@@ -35,14 +35,31 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: maven
+          cache-dependency-path: |
+            **/pom.xml
+            .github/scripts/connector-cache.sh
+            scripts/build-real-connectors.sh
+            .github/maven-settings-connectors.xml
       - name: Seed isolated connector dependencies
         run: |
           mkdir -p "$HOME/.m2/repository" "$RUNNER_TEMP/connector-m2"
           rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$HOME/.m2/repository/" "$RUNNER_TEMP/connector-m2/"
-      - name: Resolve current upstream source and snapshot artifacts
-        id: inputs
+      - name: Resolve current upstream source
+        id: source
         run: |
           git clone --depth 1 https://github.com/tapdata/tapdata-connectors.git "$RUNNER_TEMP/connector-source"
+          echo "sha=$(git -C "$RUNNER_TEMP/connector-source" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # These are remote dependencies only. prepare always refreshes their snapshot
+      # metadata and checks resolved bytes before a cached connector jar is eligible.
+      - name: Restore remote PDK dependencies
+        uses: actions/cache/restore@v4
+        id: pdk
+        with:
+          path: ${{ runner.temp }}/connector-m2/io/tapdata
+          key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
+      - name: Resolve current snapshot artifacts
+        id: inputs
+        run: |
           .github/scripts/connector-cache.sh prepare --checkout "$RUNNER_TEMP/connector-source" --repo-local "$RUNNER_TEMP/connector-m2" --output "$RUNNER_TEMP/connector-inputs.json"
           echo "key=$(.github/scripts/connector-cache.sh key --manifest "$RUNNER_TEMP/connector-inputs.json")" >> "$GITHUB_OUTPUT"
       # Reuse delays discovering faults outside the resolved source/snapshot inputs.
@@ -66,6 +83,12 @@ jobs:
         with:
           path: ${{ runner.temp }}/connectors
           key: ${{ steps.inputs.outputs.key }}
+      - name: Cache verified remote PDK dependencies
+        if: steps.pdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/connector-m2/io/tapdata
+          key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
       - name: Retain only third-party Maven dependencies
         if: always()
         run: rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$RUNNER_TEMP/connector-m2/" "$HOME/.m2/repository/"
