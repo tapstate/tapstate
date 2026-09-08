@@ -175,15 +175,20 @@ class NodeColumnsTest {
     @DisplayName("a computed value is typed by the expression, and one no column can hold is unknown")
     void aComputedValueIsTypedByTheExpression() {
         Map<String, FieldRule> rules = new LinkedHashMap<>();
+        rules.put("copied", FieldRule.computed("after.region"));
         rules.put("doubled", FieldRule.computed("after.qty * 2"));
         rules.put("joined", FieldRule.computed("after.region + '!'"));
         rules.put("stamped", FieldRule.computed("now()"));
 
         Map<String, String> columns = NodeColumns.of(map(rules), upstream()).columns();
 
-        // The upstream types reach the expression: 'qty' is a whole number there, so the arithmetic
-        // over it is one too. Nullable throughout - an expression over a column that may be absent may
-        // itself yield nothing.
+        // A bare column read is the assertion that carries the weight: it is the only one here whose
+        // answer differs depending on whether the upstream types reached the expression at all. The
+        // two below it do not discriminate on their own - an untyped column is checked as dyn, which
+        // unifies with the other operand, so arithmetic over an unmodelled column still checks out as
+        // arithmetic and a concatenation still checks out as text. Both were green against a build
+        // that fed the expression nothing.
+        assertThat(columns).containsEntry("copied", "STRING NULL");
         assertThat(columns).containsEntry("doubled", "INT64 NULL");
         assertThat(columns).containsEntry("joined", "STRING NULL");
         // A timestamp is a type the expression language produces and no column holds. It goes down the
@@ -266,6 +271,9 @@ class NodeColumnsTest {
         assertThat(PushFormat.class.getPermittedSubclasses()).hasSize(2);
         assertThat(ViewBlock.class.getPermittedSubclasses()).hasSize(2);
         assertThat(ServeBlock.class.getPermittedSubclasses()).hasSize(2);
+        // The projection switches over the field rules the same way and under the same ban, so a
+        // fifth kind of rule is held here too - it is the one face on this list that is not a node.
+        assertThat(FieldRule.class.getPermittedSubclasses()).hasSize(4);
     }
 
     @Test

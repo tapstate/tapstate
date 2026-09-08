@@ -57,6 +57,12 @@ import java.util.Set;
  * the same column would drift from that one eventually, and the shape that takes is a recorded schema
  * that no longer equals the one the next start computes, which reads as a difference nobody made.
  *
+ * <p><b>Every answer here is worked out from one upstream model</b> - the one that reaches the node
+ * being asked about. Which model that is, where several streams reach one step, is a question this
+ * does not answer and deliberately does not take a shape for: merging several upstreams is its own
+ * ruling, and a different one for a merge, for a nested document and for a joined table. A parameter
+ * shaped for it before a single arm reads one would be a guess at three answers at once.
+ *
  * @param columns       the node's output columns, name to declared type, in output order; empty when
  *                      nothing can be said
  * @param unknownBecause why the columns cannot be given, naming the node, or null when they are given
