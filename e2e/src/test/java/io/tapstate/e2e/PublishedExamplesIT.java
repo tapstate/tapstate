@@ -277,6 +277,7 @@ class PublishedExamplesIT {
                 case Step.Assertion assertion -> assertion.matcher();
                 case Step.Lifecycle ignored -> null;
                 case Step.StreamLifecycle ignored -> null;
+                case Step.Composed ignored -> null;
                 case Step.Cdc ignored -> null;
             };
             if (matcher instanceof Matcher.Count count) {

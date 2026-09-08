@@ -13,6 +13,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
@@ -98,7 +99,7 @@ class ABuiltPipelineRunsAcrossMembersTest {
     void everyRowFromBothMembersReachesTheSinkThroughAStatelessStep() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 List.of(Step.inline("keep_even",
                         FromClause.list(FromRef.literal("orders_src")),
                         new TransformBody.Filter("row.id % 2 == 0"), null, null)),
@@ -135,7 +136,7 @@ class ABuiltPipelineRunsAcrossMembersTest {
     void everyRowFromBothMembersReachesTheSinkThroughAUnion() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("a_src", "b_src"),
+                List.of(SourceRef.bare("a_src"), SourceRef.bare("b_src")),
                 List.of(Step.inline("u",
                         FromClause.list(FromRef.literal("a_src"), FromRef.literal("b_src")),
                         new TransformBody.Union(), null, null)),

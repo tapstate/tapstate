@@ -7,6 +7,8 @@ import com.hazelcast.jet.core.Watermark;
 import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
@@ -224,18 +226,26 @@ final class StoreBackedDagSource implements DagSource {
      * leaves an ordinary pipeline's stop untouched by any of this.
      */
     @Override
-    public Set<String> stateNamespacesOf(String pipelineId) {
+    public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
         // Read off the wiring alone, so a stop still names them when the sources behind the query have
         // gone undiscoverable. Asked first for that reason: what follows resolves source models.
         Set<String> namespaces = new LinkedHashSet<>(PipelineDagBuilder.joinStateNamespaces(pipeline));
-        if (!PipelineDagBuilder.hasNest(pipeline)) {
-            return namespaces;
+        if (PipelineDagBuilder.hasNest(pipeline)) {
+            Map<String, NestTable> byAlias =
+                    nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+            namespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
+            namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
         }
-        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
-        namespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
-        namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
-        return namespaces;
+        if (namespaces.isEmpty()) {
+            // Nothing kept, rather than a holding that names nowhere: a surface renders the labels it is
+            // handed, and one over an empty holding would tell a reader state is being cleared that this
+            // pipeline never had.
+            return List.of();
+        }
+        // The label comes from the declaration rather than being written out here, so what a stop calls
+        // this and what a stop drops are one string rather than two that agree today.
+        return List.of(PipelineStateInventory.OPERATOR_STATE.in(namespaces));
     }
 
     private record SourceVertex(
@@ -280,7 +290,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline) {
         Map<String, SourceVertex> vertices = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
             SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
             for (String table : resolution.tables()) {
@@ -522,7 +532,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private Map<String, String> chainIdByTable(PipelineResource pipeline) {
         Map<String, String> chainIdByTable = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
             SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
             for (String table : resolution.tables()) {

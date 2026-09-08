@@ -34,6 +34,6 @@ final class SrsProjection {
      */
     static Envelope toEnvelope(SrsItem item, String src, SourceOrder order) {
         return new Envelope(item.op(), item.ts(), src, item.before(), item.after(), null,
-                Map.of(src, new ChainPosition(order, item.srcPos().token())));
+                Map.of(src, new ChainPosition(order, item.srcPos() == null ? null : item.srcPos().token())));
     }
 }

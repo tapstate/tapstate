@@ -33,8 +33,8 @@ final class IdleDagSource implements DagSource {
 
     /** The stand-in keeps no state, so a pipeline running it has no namespace to be let go of. */
     @Override
-    public Set<String> stateNamespacesOf(String pipelineId) {
-        return Set.of();
+    public java.util.List<io.tapstate.core.lifecycle.PipelineStateHolding> stateHeldBy(String pipelineId) {
+        return java.util.List.of();
     }
 
     /** Emits nothing and never signals completion, so the job it runs stays RUNNING until acted on. */

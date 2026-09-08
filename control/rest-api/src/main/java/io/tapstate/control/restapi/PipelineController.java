@@ -4,6 +4,7 @@ import io.tapstate.control.core.PipelineLifecycleService;
 import io.tapstate.core.lifecycle.DesiredState;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -17,6 +18,10 @@ import org.springframework.web.bind.annotation.RestController;
  * real caller rather than a placeholder.
  * There is deliberately no {@code rewind} verb: a re-dig is the explicit two-step stop then start, composed
  * by the caller.
+ *
+ * <p>Stop is the one verb here that takes a body, and the one that refuses without it. It is also the only
+ * one that can destroy something a caller may have wanted: reading the absent answer as either yes or no
+ * would make the same request mean two different outcomes to two callers, and only one of them finds out.
  */
 @RestController
 class PipelineController {
@@ -35,8 +40,10 @@ class PipelineController {
 
     @Verb("pipeline.stop")
     @PostMapping("/pipelines/{id}:stop")
-    DesiredState stop(@PathVariable("id") String id) {
-        return lifecycle.stop(AuthenticatedCaller.subject(), id);
+    DesiredState stop(@PathVariable("id") String id,
+            @RequestBody(required = false) PipelineStopRequest request) {
+        return lifecycle.stop(
+                AuthenticatedCaller.subject(), id, PipelineStopRequest.purgeStateOf(request, id));
     }
 
     @Verb("pipeline.pause")

@@ -329,7 +329,7 @@ class ConvergenceDriverTest {
         }
 
         @Override
-        public void stop(String pipelineId) {
+        public void stop(String pipelineId, boolean purgeState) {
         }
 
         @Override

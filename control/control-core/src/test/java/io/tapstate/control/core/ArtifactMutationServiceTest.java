@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeResource;
@@ -666,7 +667,7 @@ class ArtifactMutationServiceTest {
     }
 
     private static PipelineResource pipelineReading(String id, String sourceId) {
-        return new PipelineResource(id, null, List.of(sourceId), null, null, null, null, null);
+        return new PipelineResource(id, null, List.of(SourceRef.bare(sourceId)), null, null, null, null, null);
     }
 
     private static TransformResource transform(String id) {
@@ -906,7 +907,8 @@ class ArtifactMutationServiceTest {
 
         void seed(String miningChainId, ConsumerOffset... consumers) {
             chains.put(miningChainId,
-                    new SrsMeta(miningChainId, "srcpos-1", List.of(consumers), null, List.of(), null));
+                    new SrsMeta(miningChainId, new ChainPosition(new SourceOrder(1L, 1L), "srcpos-1"),
+                            List.of(consumers), null, List.of(), null));
         }
 
         /** Arms one chain to refuse a detach, standing in for a chain whose store is momentarily down. */
@@ -940,6 +942,13 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
+        public void dropChain(String miningChainId) {
+            // Removing a whole chain is a stop's act, not a removal's: what this double stands in for
+            // never reaches it, so it refuses rather than quietly answering.
+            throw new UnsupportedOperationException("chain removal is not exercised by this double");
+        }
+
+        @Override
         public void detachConsumer(String miningChainId, String pipelineId) {
             // Fail before mutating, so an armed chain keeps the departing consumer's cursor — the residue
             // the report is about has to really be there for the assertions to witness anything.
@@ -948,8 +957,11 @@ class ArtifactMutationServiceTest {
             List<ConsumerOffset> kept = chain.consumerOffsets().stream()
                     .filter(offset -> !offset.pipelineId().equals(pipelineId))
                     .toList();
-            chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceReadOffset(), kept,
-                    chain.cdcStartPosition(), chain.schemaHistory(), chain.retention()));
+            // Everything but the consumers is carried across; the six-argument constructor would
+            // default the snapshot-complete tables and both generations away, which a detach does not do.
+            chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceRead(), kept,
+                    chain.cdcStartPosition(), chain.schemaHistory(), chain.retention(),
+                    chain.epoch(), chain.snapshotEpoch()));
         }
 
         @Override
@@ -958,7 +970,13 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            // No test on this double writes a position back; a call here is a wiring mistake, not a case.
+            throw new UnsupportedOperationException("rewindSourceReadOffset");
+        }
+
+        @Override
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             throw new UnsupportedOperationException("the delete path never advances a chain");
         }
 
@@ -983,7 +1001,7 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             throw new UnsupportedOperationException("the delete path never advances a chain");
         }
 

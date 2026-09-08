@@ -15,6 +15,7 @@ import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -223,7 +224,7 @@ class SourceApiTest {
                 HttpStatus.BAD_REQUEST, "control.malformed-request");
 
         context.getBean(InMemoryArtifactStore.class).save(
-                new PipelineResource("pipeline", null, List.of("orders"), null, null, null, null, null));
+                new PipelineResource("pipeline", null, List.of(SourceRef.bare("orders")), null, null, null, null, null));
         assertError(request("writer").delete().uri("/api/sources/orders")
                         .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag()),
                 HttpStatus.CONFLICT, "source.in-use");

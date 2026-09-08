@@ -5,6 +5,7 @@ import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -57,6 +58,18 @@ class StoreConfiguration {
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
     SrsMetaStore srsMetaStore(StorePort storePort) {
         return storePort.meta();
+    }
+
+    /**
+     * The durable change log the assembly root puts behind every change ring, so a change that entered a
+     * ring outlives the process that read it. Gated with the store, and the gate is what it means: a run
+     * without one keeps changes in the member alone, and a restart has nothing to replay from -- which is
+     * the state this log exists to end.
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    SrsLogStore srsLogStore(StorePort storePort) {
+        return storePort.srsLog();
     }
 
     /**

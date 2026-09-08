@@ -15,6 +15,7 @@ import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.map.IMap;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
@@ -183,7 +184,7 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
         PipelineResource pipeline = new PipelineResource(PIPELINE, null,
-                List.of("orders", "lines", "products"), List.of(step), null,
+                List.of(SourceRef.bare("orders"), SourceRef.bare("lines"), SourceRef.bare("products")), List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
                 null, null);

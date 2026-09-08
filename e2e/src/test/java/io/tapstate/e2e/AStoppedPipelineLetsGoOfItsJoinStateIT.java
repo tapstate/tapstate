@@ -129,7 +129,9 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
             awaitHeld(state, DIMENSION_NAMESPACE, "the dimension mirror to hold the customers");
             awaitHeld(state, INDEX_NAMESPACE, "the reverse index to hold a bucket per customer");
 
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.STOP);
+            // Asked to clear. A stop that was asked to keep leaves all of this standing, which is the
+            // point of the flag; what is under test here is that clearing reaches the join at all.
+            control.stop(PIPELINE_ID, true);
             Await.until(
                     PIPELINE_ID + " to reach " + PipelineState.STOPPED,
                     () -> control.state(PIPELINE_ID).filter(PipelineState.STOPPED::equals).isPresent(),

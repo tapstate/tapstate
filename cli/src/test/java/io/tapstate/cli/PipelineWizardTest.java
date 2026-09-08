@@ -56,7 +56,7 @@ class PipelineWizardTest {
         // src_a and tgt_b already exist as kind:source files -> both refs are menu choices
         ScriptedPrompter p = new ScriptedPrompter("p1", "src_a", "(done)", "sync", "tgt_b");
         PipelineResource pipe = new PipelineWizard(p, List.of("src_a", "tgt_b")).run();
-        assertThat(pipe.sources()).containsExactly("src_a");
+        assertThat(pipe.sourceIds()).containsExactly("src_a");
         assertThat(yaml(pipe)).isEqualTo(
                 """
                 version: tapstate/v1
@@ -79,7 +79,7 @@ class PipelineWizardTest {
         // existing sources present, but the user picks "(other)" and types an id not in the list
         ScriptedPrompter p = new ScriptedPrompter("p1", "(other)", "src_new", "(done)", "sync", "tgt_b");
         PipelineResource pipe = new PipelineWizard(p, List.of("tgt_b")).run();
-        assertThat(pipe.sources()).containsExactly("src_new");
+        assertThat(pipe.sourceIds()).containsExactly("src_new");
     }
 
     @Test
@@ -623,6 +623,6 @@ class PipelineWizardTest {
         // a pipeline must name a source; a blank answer (no workspace sources to choose) is re-asked
         ScriptedPrompter p = new ScriptedPrompter("p1", "", "src_real", "(done)", "sync", "tgt_b");
         PipelineResource pipe = new PipelineWizard(p, List.of()).run();
-        assertThat(pipe.sources()).containsExactly("src_real");
+        assertThat(pipe.sourceIds()).containsExactly("src_real");
     }
 }

@@ -36,10 +36,12 @@ import tools.jackson.databind.DeserializationFeature;
 @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, ArtifactController.class, ConnectionController.class,
         ConnectorController.class, DataBrowserController.class, DataBrowserStreamConfiguration.class,
         PipelineController.class, PipelineObservationController.class, PipelineLogsController.class,
+        PipelinePositionController.class,
         PipelineStreamConfiguration.class, ClusterController.class, HealthController.class,
         VersionController.class, AuthController.class, IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,
         SourceDraftController.class,
+        DerivedSchemaController.class,
         ApiExceptionHandler.class})
 public class ControlHttpFace {
 

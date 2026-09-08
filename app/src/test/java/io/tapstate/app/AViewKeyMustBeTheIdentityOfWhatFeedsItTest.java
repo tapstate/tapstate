@@ -8,6 +8,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -73,7 +74,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal("orders"), TableRef.literal("invoices")), null, null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("src"), "id", null, null),
                 null, settings(), null));
 
@@ -94,7 +95,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         artifacts.save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "mysql",
                 Map.of("host", "the-users-own-warehouse"), SourceMode.CDC,
                 List.of(TableRef.literal("facts")), null, null, null));
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null, null),
                 null, settings(), null));
 
@@ -121,7 +122,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal("orders")), null, null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
                 null, settings(), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
@@ -144,7 +145,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal("orders")), null, null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
                 null, settings(), null));
 
@@ -189,7 +190,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         aliases.put("i", FromRef.literal("order_items"));
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src_orders", "src_items"),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src_orders", true), SourceRef.spec("src_items", true)),
                 List.of(step),
                 new ViewBlock.Inline("order_state", FromRef.literal(STEP), viewKey, null, null),
                 null, settings(), null));

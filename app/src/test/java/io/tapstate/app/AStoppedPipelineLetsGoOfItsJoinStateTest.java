@@ -9,6 +9,7 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
@@ -16,8 +17,10 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -87,7 +90,7 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
     void namesEveryNamespaceTheJoinKeepsStateIn() {
         InMemoryStorePort store = seeded(JOIN_PIPELINE);
 
-        Set<String> namespaces = new StoreBackedDagSource(store).stateNamespacesOf(PIPELINE);
+        Set<String> namespaces = namespacesHeldBy(store);
 
         assertThat(namespaces).containsExactlyInAnyOrder(FACT_NAMESPACE, DIM_NAMESPACE, INDEX_NAMESPACE,
                 FACT_ALIAS_DIM_NAMESPACE, FACT_ALIAS_INDEX_NAMESPACE);
@@ -105,7 +108,7 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
         InMemoryStorePort store = seeded(JOIN_PIPELINE);
         seedState(store, FACT_NAMESPACE, DIM_NAMESPACE, INDEX_NAMESPACE, OTHER_PIPELINE_NAMESPACE);
 
-        actuator(store).stop(PIPELINE);
+        actuator(store).stop(PIPELINE, true);
 
         assertThat(store.keyedState().load(FACT_NAMESPACE, "k")).isEmpty();
         assertThat(store.keyedState().load(DIM_NAMESPACE, "k")).isEmpty();
@@ -136,7 +139,7 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
         // pipeline is in, and the run already up goes on keeping state where it was built to keep it.
         seeded(store, PIPELINE_WITHOUT_JOIN);
 
-        actuator.stop(PIPELINE);
+        actuator.stop(PIPELINE, true);
 
         assertThat(store.keyedState().load(FACT_NAMESPACE, "k"))
                 .describedAs("what the run kept is dropped by the names it ran under, not the ones it ends under")
@@ -149,7 +152,7 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
     void aPipelineThatJoinsNothingHasNoJoinNamespaceToBeLetGoOf() {
         InMemoryStorePort store = seeded(PIPELINE_WITHOUT_JOIN);
 
-        assertThat(new StoreBackedDagSource(store).stateNamespacesOf(PIPELINE))
+        assertThat(namespacesHeldBy(store))
                 .describedAs("a stop of an ordinary pipeline drops nothing, and notes nothing to drop later")
                 .isEmpty();
     }
@@ -218,6 +221,17 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
               from: widen
               sync: [ { id: sync_1, source: orders_dest } ]
             """;
+
+    /**
+     * Every namespace this pipeline's holdings name, flattened. A stop clears by namespace, so what is
+     * asserted here is the union rather than which holding each one arrived under.
+     */
+    private static Set<String> namespacesHeldBy(InMemoryStorePort store) {
+        return new StoreBackedDagSource(store).stateHeldBy(PIPELINE).stream()
+                .map(PipelineStateHolding::namespaces)
+                .flatMap(Set::stream)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
 
     /** The actuator as production composes it, over a capture coordinator that does nothing. */
     private EngineLifecycleActuator actuator(InMemoryStorePort store) {

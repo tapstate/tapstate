@@ -16,6 +16,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -74,7 +75,7 @@ class PipelineDagBuilderNestTest {
     private static DAG buildWith(TransformBody.Nest body, String... aliasToSource) {
         Step step = nestStep("doc", body, aliasToSource);
         PipelineResource pipeline = new PipelineResource("p", null,
-                List.of("customers", "policies", "claims", "profiles"),
+                List.of(SourceRef.bare("customers"), SourceRef.bare("policies"), SourceRef.bare("claims"), SourceRef.bare("profiles")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
@@ -154,7 +155,7 @@ class PipelineDagBuilderNestTest {
         Step step = nestStep("doc", tree(),
                 "customer", "customers", "policy", "policies", "claim", "claims", "profile", "profiles");
         PipelineResource pipeline = new PipelineResource("p", null,
-                List.of("customers", "policies", "claims", "profiles"),
+                List.of(SourceRef.bare("customers"), SourceRef.bare("policies"), SourceRef.bare("claims"), SourceRef.bare("profiles")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
