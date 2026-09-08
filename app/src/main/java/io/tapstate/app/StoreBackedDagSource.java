@@ -4,6 +4,7 @@ import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.core.common.TapstateException;
@@ -222,17 +223,37 @@ final class StoreBackedDagSource implements DagSource {
      */
     @Override
     public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
-        PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
-        if (!PipelineDagBuilder.hasNest(pipeline)) {
-            return List.of();
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        List<PipelineStateHolding> holdings = new ArrayList<>();
+        if (PipelineDagBuilder.hasNest(pipeline)) {
+            Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+            Set<String> namespaces =
+                    new LinkedHashSet<>(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
+            namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
+            holdings.add(PipelineStateInventory.OPERATOR_STATE.in(namespaces));
         }
-        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
-        Set<String> namespaces =
-                new LinkedHashSet<>(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
-        namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
-        // The label comes from the declaration rather than being written out here, so what a stop calls
-        // this and what a stop drops are one string rather than two that agree today.
-        return List.of(PipelineStateInventory.OPERATOR_STATE.in(namespaces));
+        holdings.add(PipelineStateInventory.CONNECTOR_STATE.in(connectorStateNamespaces(pipeline)));
+        return List.copyOf(holdings);
+    }
+
+    /**
+     * The exact PDK state namespaces the assembled pipeline can open: its capture sources and every sink
+     * the DAG builds. The PDK owns the namespace spelling, while this layer owns which pipeline nodes the
+     * runtime can open; combining the two keeps a stop's inventory identical to the runtime's identities.
+     */
+    private static Set<String> connectorStateNamespaces(PipelineResource pipeline) {
+        Set<String> namespaces = new LinkedHashSet<>();
+        pipeline.sources().forEach(source -> namespaces.add(
+                ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), source.id()))));
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            namespaces.add(ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), view.id())));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            serve.sync().forEach(sync -> namespaces.add(
+                    ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), syncNodeId(sync)))));
+        }
+        return namespaces;
     }
 
     private record SourceVertex(

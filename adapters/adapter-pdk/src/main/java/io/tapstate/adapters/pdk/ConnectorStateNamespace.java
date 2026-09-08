@@ -17,7 +17,7 @@ import io.tapstate.core.model.PipelineNode;
  * The guarantee is the pipeline id's, not the node id's — a scheme relying on both would be resting on
  * something nothing states.
  */
-final class ConnectorStateNamespace {
+public final class ConnectorStateNamespace {
 
     private static final String PREFIX = "pdk.state.";
 
@@ -38,7 +38,7 @@ final class ConnectorStateNamespace {
     }
 
     /** The namespace {@code node}'s connector keeps its own notes in, or null for a drive naming no node. */
-    static String of(PipelineNode node) {
+    public static String of(PipelineNode node) {
         return node == null ? null : PREFIX + node.pipelineId() + "." + node.nodeId();
     }
 }

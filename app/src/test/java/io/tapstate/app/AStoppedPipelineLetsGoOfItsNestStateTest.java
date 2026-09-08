@@ -30,6 +30,7 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.runtime.engine.Engine;
@@ -90,6 +91,16 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     /** A namespace belonging to some other pipeline, which no stop of this one may touch. */
     private static final String OTHER_PIPELINE_NAMESPACE = "nest.other_pipe.some_step.$root";
 
+    private static final String SOURCE_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + "." + PARENT_SOURCE;
+    private static final String CHILD_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + "." + CHILD_SOURCE;
+    private static final String GRANDCHILD_CONNECTOR_NAMESPACE =
+            "pdk.state." + PIPELINE + "." + GRANDCHILD_SOURCE;
+    private static final String SINK_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + ".sync_1";
+    private static final String VIEW_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + ".orders_view";
+    private static final String OTHER_PIPELINE_CONNECTOR_NAMESPACE = "pdk.state.other_pipe." + PARENT_SOURCE;
+    private static final String UNOPENED_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + ".removed_node";
+    private static final String GLOBAL_CONNECTOR_NAMESPACE = "pdk.global-state";
+
     private HazelcastInstance member;
 
     @BeforeEach
@@ -115,7 +126,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
-    @DisplayName("the namespaces a stop drops are every vertex's state and parking area, plus where the shape was written down")
+    @DisplayName("the namespaces a stop drops are every runtime component's state")
     void namesEveryNamespaceTheTreeKeepsStateIn() {
         InMemoryStorePort store = seedStore();
 
@@ -130,7 +141,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         // will ever send again. A stop that dropped everything else and left those behind would keep them
         // under a name no run afterwards looks at.
         assertThat(namespaces).containsExactlyInAnyOrder(ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE,
-                ROOT_NAMESPACE + ".parking", ITEMS_NAMESPACE + ".parking");
+                ROOT_NAMESPACE + ".parking", ITEMS_NAMESPACE + ".parking", SOURCE_CONNECTOR_NAMESPACE,
+                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE);
     }
 
     @Test
@@ -154,13 +166,21 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
-    void aPipelineThatNestsNothingHasNoNamespaceToBeLetGoOf() {
+    void aPipelineThatNestsNothingStillNamesItsConnectorState() {
         InMemoryStorePort store = seedStore();
         store.artifacts().save(pipelineWithoutNest());
 
-        assertThat(new StoreBackedDagSource(store).stateHeldBy(PIPELINE))
-                .describedAs("a stop of an ordinary pipeline drops nothing, and notes nothing to drop later")
-                .isEmpty();
+        assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE);
+    }
+
+    @Test
+    void aViewSinkIsNamedAlongsideTheCaptureConnectorThatFeedsIt() {
+        InMemoryStorePort store = seedStore();
+        store.artifacts().save(pipelineWithView());
+
+        assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE);
     }
 
     @Test
@@ -216,6 +236,45 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
                 .describedAs("and still readable from where a run reads it, across that start")
                 .isEqualTo("held");
         assertThat(member.getMap(ITEMS_NAMESPACE).get("k")).isEqualTo("held");
+    }
+
+    @Test
+    @DisplayName("purging a pipeline clears its exact connector state and keeps every other connector state")
+    void purgingClearsOnlyTheStoppedPipelinesConnectorState() {
+        InMemoryStorePort store = seedStore();
+        seedState(store, SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE,
+                OTHER_PIPELINE_CONNECTOR_NAMESPACE, UNOPENED_CONNECTOR_NAMESPACE, GLOBAL_CONNECTOR_NAMESPACE);
+
+        actuator(store).stop(PIPELINE, true);
+
+        assertThat(store.keyedState().load(SOURCE_CONNECTOR_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(SINK_CONNECTOR_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(OTHER_PIPELINE_CONNECTOR_NAMESPACE, "k"))
+                .describedAs("a stop reaches no connector state owned by another pipeline")
+                .isPresent();
+        assertThat(store.keyedState().load(UNOPENED_CONNECTOR_NAMESPACE, "k"))
+                .describedAs("a stop drops the runtime's exact nodes rather than a namespace prefix")
+                .isPresent();
+        assertThat(store.keyedState().load(GLOBAL_CONNECTOR_NAMESPACE, "k"))
+                .describedAs("the deployment-wide connector map belongs to no pipeline")
+                .isPresent();
+    }
+
+    @Test
+    @DisplayName("keeping state on stop leaves connector-state bytes unchanged")
+    void stoppingWithoutPurgeLeavesConnectorStateBytesUnchanged() {
+        InMemoryStorePort store = seedStore();
+        byte[] sourceBytes = new byte[] {0, 1, 2, 3};
+        byte[] sinkBytes = new byte[] {4, 5, 6, 7};
+        store.keyedState().save(SOURCE_CONNECTOR_NAMESPACE, "cursor", sourceBytes);
+        store.keyedState().save(SINK_CONNECTOR_NAMESPACE, "checkpoint", sinkBytes);
+
+        actuator(store).stop(PIPELINE, false);
+
+        assertThat(store.keyedState().load(SOURCE_CONNECTOR_NAMESPACE, "cursor"))
+                .hasValueSatisfying(bytes -> assertThat(bytes).containsExactly(sourceBytes));
+        assertThat(store.keyedState().load(SINK_CONNECTOR_NAMESPACE, "checkpoint"))
+                .hasValueSatisfying(bytes -> assertThat(bytes).containsExactly(sinkBytes));
     }
 
     /**
@@ -288,22 +347,24 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
-    @DisplayName("a pipeline that nests nothing writes no record of keeping state, and notes no drop")
-    void anOrdinaryPipelineIsUntouchedByAnyOfThis() {
+    @DisplayName("a pipeline that nests nothing records connector state and drops its record after purge")
+    void aPipelineWithoutNestsRecordsConnectorState() {
         InMemoryStorePort store = seedStore();
         store.artifacts().save(pipelineWithoutNest());
         EngineLifecycleActuator actuator = actuator(store);
 
         actuator.start(PIPELINE);
+
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))
+                .hasValueSatisfying(bytes -> assertThat(new String(bytes, StandardCharsets.UTF_8))
+                        .contains(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE));
         actuator.stop(PIPELINE, true);
 
-        // Recording "this run keeps state in nowhere" would put a record where a pipeline with no state has
-        // none to describe, and every later reader would have to tell that from a run that kept something.
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))
-                .describedAs("a pipeline with no nest in it leaves nothing written down")
+                .describedAs("purging drops the record of the connector namespaces it cleared")
                 .isEmpty();
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "namespaces"))
-                .describedAs("and so notes no drop for a later start to finish")
+                .describedAs("and leaves no pending drop behind")
                 .isEmpty();
     }
 
@@ -555,6 +616,12 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true)), List.of(), null,
                 new ServeBlock.Inline(null, FromRef.literal(PARENT_SOURCE),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
+    }
+
+    private static PipelineResource pipelineWithView() {
+        return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true)), List.of(),
+                new ViewBlock.Inline("orders_view", FromRef.literal(PARENT_SOURCE), "id", null, null), null,
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 
