@@ -16,6 +16,8 @@ import java.util.OptionalInt;
 /** Pure local/remote projection for one workbench refresh. */
 final class WorkbenchProjection {
 
+    static final List<String> VISIBLE_KINDS = List.of("source", "pipeline");
+
     private WorkbenchProjection() {
     }
 
@@ -56,19 +58,23 @@ final class WorkbenchProjection {
                     .remote.add(projectRemote(artifact));
         }
 
-        List<WorkbenchArtifactRow> rows = merged.values().stream()
+        List<WorkbenchArtifactRow> mergedRows = merged.values().stream()
                 .map(row -> row.freeze(remoteState instanceof WorkbenchRemoteState.Available))
                 .sorted(rowOrder())
                 .toList();
-        WorkbenchWorkspaceSnapshot workspace = new WorkbenchWorkspaceSnapshot(remoteState, rows);
-        WorkbenchResourceListSnapshot sources = resourceList("source", remoteState, rows);
-        WorkbenchResourceListSnapshot pipelines = resourceList("pipeline", remoteState, rows);
+        List<WorkbenchArtifactRow> workspaceRows = mergedRows.stream()
+                .filter(row -> VISIBLE_KINDS.contains(row.key().kind()))
+                .filter(row -> !row.local().isEmpty())
+                .toList();
+        WorkbenchWorkspaceSnapshot workspace = new WorkbenchWorkspaceSnapshot(remoteState, workspaceRows);
+        WorkbenchResourceListSnapshot sources = resourceList("source", remoteState, mergedRows);
+        WorkbenchResourceListSnapshot pipelines = resourceList("pipeline", remoteState, mergedRows);
 
         return new WorkbenchSnapshot(
                 contextGeneration,
                 requestSequence,
                 session,
-                overview(rows, remoteState instanceof WorkbenchRemoteState.Available, remoteCopy),
+                overview(workspaceRows, remoteState instanceof WorkbenchRemoteState.Available, remoteCopy),
                 workspace,
                 sources,
                 pipelines);
@@ -138,21 +144,17 @@ final class WorkbenchProjection {
         return new WorkbenchResourceListSnapshot(
                 kind,
                 remoteState,
-                rows.stream().filter(row -> row.key().kind().equals(kind)).toList());
+                rows.stream()
+                        .filter(row -> row.key().kind().equals(kind))
+                        .filter(row -> !row.remote().isEmpty())
+                        .toList());
     }
 
     private static WorkbenchOverviewSnapshot overview(
             List<WorkbenchArtifactRow> rows,
             boolean remoteAvailable,
             List<RemoteArtifact> remoteArtifacts) {
-        List<String> orderedKinds = new ArrayList<>(WorkspaceScan.KINDS);
-        rows.stream()
-                .map(row -> row.key().kind())
-                .filter(kind -> !WorkspaceScan.KINDS.contains(kind))
-                .distinct()
-                .sorted()
-                .forEach(orderedKinds::add);
-        List<WorkbenchKindCount> kinds = orderedKinds.stream()
+        List<WorkbenchKindCount> kinds = VISIBLE_KINDS.stream()
                 .map(kind -> new WorkbenchKindCount(
                         kind,
                         count(rows, kind, true),

@@ -1,0 +1,14 @@
+$accent: #4FACBC;
+
+#base       { color: #D4D4D4; background: #1E1E1E; }
+#accent     { color: $accent; }
+#accent-bg  { color: black; background: $accent; text-style: bold; }
+#hint-key   { color: black; background: $accent; text-style: bold; }
+#title      { color: $accent; text-style: bold; }
+#muted      { color: #8A9494; }
+#selection  { color: white; background: #285A63; text-style: bold; }
+#success    { color: #4EC9B0; }
+#warning    { color: #DCDCAA; }
+#error      { color: #F48771; }
+#info       { color: #8CCFD8; }
+#label      { color: #D7C986; }

@@ -37,8 +37,8 @@ class WorkbenchProjectionTest {
                         new RemoteArtifact("equal", "source", equalCanonical),
                         new RemoteArtifact("drifted", "source", driftedCanonical + " ")));
 
-        assertThat(row(snapshot, "source", "equal").alignment()).isEqualTo(WorkbenchAlignment.IN_SYNC);
-        assertThat(row(snapshot, "source", "drifted").alignment()).isEqualTo(WorkbenchAlignment.DRIFTED);
+        assertThat(workspaceRow(snapshot, "source", "equal").alignment()).isEqualTo(WorkbenchAlignment.IN_SYNC);
+        assertThat(workspaceRow(snapshot, "source", "drifted").alignment()).isEqualTo(WorkbenchAlignment.DRIFTED);
     }
 
     @Test
@@ -59,7 +59,7 @@ class WorkbenchProjectionTest {
                 new WorkbenchRemoteState.Available(1),
                 List.of(new RemoteArtifact("secured", "source", canonical(local.resource()))));
 
-        assertThat(row(snapshot, "source", "secured").alignment()).isEqualTo(WorkbenchAlignment.IN_SYNC);
+        assertThat(workspaceRow(snapshot, "source", "secured").alignment()).isEqualTo(WorkbenchAlignment.IN_SYNC);
         assertThat(snapshot.toString()).doesNotContain(secret);
         assertThat(retainedStrings(snapshot)).noneMatch(value -> value.contains(secret));
     }
@@ -76,9 +76,9 @@ class WorkbenchProjectionTest {
                         new RemoteArtifact("unreadable", "source", "ignored", false),
                         new RemoteArtifact("null-canonical", "source", null, true)));
 
-        assertThat(row(snapshot, "source", "local").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
-        assertThat(row(snapshot, "source", "unreadable").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
-        assertThat(row(snapshot, "source", "null-canonical").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
+        assertThat(workspaceRow(snapshot, "source", "local").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
+        assertThat(serverRow(snapshot.sources(), "unreadable").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
+        assertThat(serverRow(snapshot.sources(), "null-canonical").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
     }
 
     @Test
@@ -97,10 +97,10 @@ class WorkbenchProjectionTest {
                         new RemoteArtifact("misplaced", "source", "anything"),
                         new RemoteArtifact("duplicate", "source", "anything")));
 
-        assertThat(row(snapshot, "source", "broken").alignment()).isEqualTo(WorkbenchAlignment.INVALID_LOCAL);
-        assertThat(row(snapshot, "source", "misplaced").alignment()).isEqualTo(WorkbenchAlignment.INVALID_LOCAL);
-        assertThat(row(snapshot, "source", "duplicate").alignment()).isEqualTo(WorkbenchAlignment.INVALID_LOCAL);
-        assertThat(row(snapshot, "source", "duplicate").local()).hasSize(2);
+        assertThat(workspaceRow(snapshot, "source", "broken").alignment()).isEqualTo(WorkbenchAlignment.INVALID_LOCAL);
+        assertThat(workspaceRow(snapshot, "source", "misplaced").alignment()).isEqualTo(WorkbenchAlignment.INVALID_LOCAL);
+        assertThat(workspaceRow(snapshot, "source", "duplicate").alignment()).isEqualTo(WorkbenchAlignment.INVALID_LOCAL);
+        assertThat(workspaceRow(snapshot, "source", "duplicate").local()).hasSize(2);
     }
 
     @Test
@@ -115,7 +115,7 @@ class WorkbenchProjectionTest {
                         new RemoteArtifact("orders", "pipeline", canonical),
                         new RemoteArtifact("orders", "pipeline", canonical)));
 
-        WorkbenchArtifactRow row = row(snapshot, "pipeline", "orders");
+        WorkbenchArtifactRow row = workspaceRow(snapshot, "pipeline", "orders");
         assertThat(row.alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
         assertThat(row.remote()).hasSize(2);
     }
@@ -129,8 +129,8 @@ class WorkbenchProjectionTest {
                 new WorkbenchRemoteState.Available(1),
                 List.of(new RemoteArtifact("shared", "pipeline", canonical(pipeline("shared")))));
 
-        assertThat(row(snapshot, "source", "shared").alignment()).isEqualTo(WorkbenchAlignment.LOCAL_ONLY);
-        assertThat(row(snapshot, "pipeline", "shared").alignment()).isEqualTo(WorkbenchAlignment.REMOTE_ONLY);
+        assertThat(workspaceRow(snapshot, "source", "shared").alignment()).isEqualTo(WorkbenchAlignment.LOCAL_ONLY);
+        assertThat(serverRow(snapshot.pipelines(), "shared").alignment()).isEqualTo(WorkbenchAlignment.REMOTE_ONLY);
     }
 
     @Test
@@ -145,7 +145,7 @@ class WorkbenchProjectionTest {
             WorkbenchSnapshot snapshot = project(List.of(local), unavailable, List.of());
 
             assertThat(snapshot.workspace().remoteState()).isEqualTo(unavailable);
-            assertThat(row(snapshot, "source", "local").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
+            assertThat(workspaceRow(snapshot, "source", "local").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
         }
     }
 
@@ -163,7 +163,7 @@ class WorkbenchProjectionTest {
         assertThat(snapshot.workspace().remoteState()).isEqualTo(
                 new WorkbenchRemoteState.Diagnostic(
                         ProjectionError.LOAD_FAILED, Map.of("operation", "list")));
-        assertThat(row(snapshot, "source", "local").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
+        assertThat(workspaceRow(snapshot, "source", "local").alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
         assertThatThrownBy(() -> diagnostic.arguments().put("operation", "changed"))
                 .isInstanceOf(UnsupportedOperationException.class);
     }
@@ -177,12 +177,12 @@ class WorkbenchProjectionTest {
                 new WorkbenchRemoteState.Available(1),
                 List.of(new RemoteArtifact("remote", "pipeline", canonical(pipeline("remote")))));
 
-        assertThat(row(snapshot, "source", "local").alignment()).isEqualTo(WorkbenchAlignment.LOCAL_ONLY);
-        assertThat(row(snapshot, "pipeline", "remote").alignment()).isEqualTo(WorkbenchAlignment.REMOTE_ONLY);
+        assertThat(workspaceRow(snapshot, "source", "local").alignment()).isEqualTo(WorkbenchAlignment.LOCAL_ONLY);
+        assertThat(serverRow(snapshot.pipelines(), "remote").alignment()).isEqualTo(WorkbenchAlignment.REMOTE_ONLY);
     }
 
     @Test
-    void ordersRowsByStructuralKindThenIdentityAndDerivesTabsAndCountsFromThem() {
+    void scopesWorkspaceServerTabsAndOverviewToTheirOwnedResourceSets() {
         List<WorkspaceScan.Artifact> local = List.of(
                 artifact("transform", "z.tap.yml", transform("z")),
                 artifact("source", "z.tap.yml", source("z")),
@@ -193,17 +193,16 @@ class WorkbenchProjectionTest {
 
         assertThat(snapshot.workspace().rows())
                 .extracting(row -> row.key().kind() + "/" + row.key().id())
-                .containsExactly("source/a", "source/z", "pipeline/a", "transform/z");
-        assertThat(snapshot.sources().rows()).containsExactly(
-                row(snapshot, "source", "a"), row(snapshot, "source", "z"));
-        assertThat(snapshot.pipelines().rows()).containsExactly(row(snapshot, "pipeline", "a"));
+                .containsExactly("source/a", "source/z", "pipeline/a");
+        assertThat(snapshot.sources().rows()).isEmpty();
+        assertThat(snapshot.pipelines().rows()).isEmpty();
         assertThat(snapshot.overview().kinds())
                 .extracting(WorkbenchKindCount::kind)
-                .containsExactlyElementsOf(WorkspaceScan.KINDS);
+                .containsExactly("source", "pipeline");
         assertThat(snapshot.overview().kinds().get(0).localCount()).isEqualTo(2);
         assertThat(snapshot.overview().kinds().get(1).localCount()).isEqualTo(1);
         assertThat(snapshot.overview().alignment()).isEqualTo(
-                new WorkbenchAlignmentCounts(4, 0, 0, 0, 0, 0));
+                new WorkbenchAlignmentCounts(3, 0, 0, 0, 0, 0));
     }
 
     @Test
@@ -217,16 +216,17 @@ class WorkbenchProjectionTest {
         local.clear();
         remote.clear();
 
-        assertThat(snapshot.workspace().rows()).hasSize(2);
+        assertThat(snapshot.workspace().rows()).hasSize(1);
+        assertThat(snapshot.pipelines().rows()).hasSize(1);
         assertThatThrownBy(() -> snapshot.workspace().rows().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> snapshot.sources().rows().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> snapshot.overview().kinds().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(() -> row(snapshot, "source", "local").local().clear())
+        assertThatThrownBy(() -> workspaceRow(snapshot, "source", "local").local().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(() -> row(snapshot, "pipeline", "remote").remote().clear())
+        assertThatThrownBy(() -> serverRow(snapshot.pipelines(), "remote").remote().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
     }
 
@@ -275,7 +275,7 @@ class WorkbenchProjectionTest {
     }
 
     @Test
-    void countsUnknownKindsAfterKnownKindsUsingRemoteArtifactSemantics() {
+    void excludesUnsupportedKindsAndRemoteOnlyRowsFromOverviewAndWorkspace() {
         List<RemoteArtifact> remote = List.of(
                 new RemoteArtifact("dup", "beta", "one"),
                 new RemoteArtifact("x", "alpha", "alpha"),
@@ -287,19 +287,14 @@ class WorkbenchProjectionTest {
 
         assertThat(snapshot.overview().kinds())
                 .extracting(WorkbenchKindCount::kind)
-                .containsExactly("source", "pipeline", "transform", "view", "serve", "alpha", "beta");
-        assertThat(snapshot.overview().kinds().get(5).remoteCount()).hasValue(1);
-        assertThat(snapshot.overview().kinds().get(6).remoteCount()).hasValue(3);
+                .containsExactly("source", "pipeline");
         assertThat(snapshot.overview().kinds().stream()
                 .map(WorkbenchKindCount::remoteCount)
                 .mapToInt(count -> count.orElseThrow())
-                .sum()).isEqualTo(remote.size());
-        assertThat(snapshot.workspace().rows())
-                .extracting(row -> row.key().kind() + "/" + row.key().id())
-                .containsExactly("alpha/x", "beta/dup", "beta/y");
-        assertThat(row(snapshot, "beta", "dup").remote()).hasSize(2);
+                .sum()).isZero();
+        assertThat(snapshot.workspace().rows()).isEmpty();
         assertThat(snapshot.overview().alignment())
-                .isEqualTo(new WorkbenchAlignmentCounts(0, 2, 0, 0, 0, 1));
+                .isEqualTo(new WorkbenchAlignmentCounts(0, 0, 0, 0, 0, 0));
         assertThat(snapshot.sources().rows()).isEmpty();
         assertThat(snapshot.pipelines().rows()).isEmpty();
     }
@@ -364,9 +359,16 @@ class WorkbenchProjectionTest {
         return new CanonicalWriter().write(resource);
     }
 
-    private static WorkbenchArtifactRow row(WorkbenchSnapshot snapshot, String kind, String id) {
+    private static WorkbenchArtifactRow workspaceRow(WorkbenchSnapshot snapshot, String kind, String id) {
         return snapshot.workspace().rows().stream()
                 .filter(candidate -> candidate.key().equals(new WorkbenchArtifactKey(kind, id)))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    private static WorkbenchArtifactRow serverRow(WorkbenchResourceListSnapshot snapshot, String id) {
+        return snapshot.rows().stream()
+                .filter(candidate -> candidate.key().id().equals(id))
                 .findFirst()
                 .orElseThrow();
     }

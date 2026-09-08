@@ -10,6 +10,7 @@ record WorkbenchState(
         WorkbenchTab selectedTab,
         Optional<WorkbenchSnapshot> expectedSnapshot,
         Optional<WorkbenchSnapshot> snapshot,
+        Optional<WorkbenchOverlayState> overlay,
         WorkbenchTableState workspaceTable,
         WorkbenchTableState sourcesTable,
         WorkbenchTableState pipelinesTable) {
@@ -18,6 +19,7 @@ record WorkbenchState(
         Objects.requireNonNull(selectedTab, "selectedTab");
         Objects.requireNonNull(expectedSnapshot, "expectedSnapshot");
         Objects.requireNonNull(snapshot, "snapshot");
+        Objects.requireNonNull(overlay, "overlay");
         Objects.requireNonNull(workspaceTable, "workspaceTable");
         Objects.requireNonNull(sourcesTable, "sourcesTable");
         Objects.requireNonNull(pipelinesTable, "pipelinesTable");
@@ -26,6 +28,7 @@ record WorkbenchState(
     static WorkbenchState initial() {
         return new WorkbenchState(
                 WorkbenchTab.OVERVIEW,
+                Optional.empty(),
                 Optional.empty(),
                 Optional.empty(),
                 WorkbenchTableState.empty(),
@@ -59,6 +62,29 @@ record WorkbenchState(
         return tab == selectedTab ? this : copy(tab, workspaceTable, sourcesTable, pipelinesTable);
     }
 
+    WorkbenchState withOverlay(WorkbenchOverlayState nextOverlay) {
+        Objects.requireNonNull(nextOverlay, "nextOverlay");
+        return new WorkbenchState(
+                selectedTab,
+                expectedSnapshot,
+                snapshot,
+                Optional.of(nextOverlay),
+                workspaceTable,
+                sourcesTable,
+                pipelinesTable);
+    }
+
+    WorkbenchState closeOverlay() {
+        return overlay.isEmpty() ? this : new WorkbenchState(
+                selectedTab,
+                expectedSnapshot,
+                snapshot,
+                Optional.empty(),
+                workspaceTable,
+                sourcesTable,
+                pipelinesTable);
+    }
+
     WorkbenchState selectRow(WorkbenchTab tab, int index, int visibleRows) {
         Objects.requireNonNull(tab, "tab");
         requireVisibleRows(visibleRows);
@@ -86,6 +112,7 @@ record WorkbenchState(
                 selectedTab,
                 Optional.of(expected),
                 contextChanged ? Optional.empty() : snapshot,
+                overlay,
                 contextChanged ? WorkbenchTableState.empty() : workspaceTable,
                 contextChanged ? WorkbenchTableState.empty() : sourcesTable,
                 contextChanged ? WorkbenchTableState.empty() : pipelinesTable);
@@ -107,6 +134,7 @@ record WorkbenchState(
                 selectedTab,
                 expectedSnapshot,
                 Optional.of(published),
+                overlay,
                 workspaceTable.clamp(published.workspace().rows().size()),
                 sourcesTable.clamp(published.sources().rows().size()),
                 pipelinesTable.clamp(published.pipelines().rows().size()));
@@ -126,7 +154,7 @@ record WorkbenchState(
             WorkbenchTableState workspace,
             WorkbenchTableState sources,
             WorkbenchTableState pipelines) {
-        return new WorkbenchState(tab, expectedSnapshot, snapshot, workspace, sources, pipelines);
+        return new WorkbenchState(tab, expectedSnapshot, snapshot, overlay, workspace, sources, pipelines);
     }
 
     private WorkbenchTableState table(WorkbenchTab tab) {
@@ -164,12 +192,6 @@ record WorkbenchState(
         if (key.isChar('4')) {
             return WorkbenchTab.PIPELINES;
         }
-        if (key.isLeft()) {
-            return selectedTab.previous();
-        }
-        if (key.isRight()) {
-            return selectedTab.next();
-        }
         if (key.isCancel()) {
             return WorkbenchTab.OVERVIEW;
         }
@@ -204,8 +226,6 @@ record WorkbenchState(
         SOURCES('3', "Sources", "No source snapshot is loaded yet."),
         PIPELINES('4', "Pipelines", "No pipeline snapshot is loaded yet.");
 
-        private static final WorkbenchTab[] TABS = values();
-
         private final char shortcut;
         private final String label;
         private final String emptyMessage;
@@ -236,13 +256,6 @@ record WorkbenchState(
             return this != OVERVIEW;
         }
 
-        WorkbenchTab previous() {
-            return TABS[(ordinal() + TABS.length - 1) % TABS.length];
-        }
-
-        WorkbenchTab next() {
-            return TABS[(ordinal() + 1) % TABS.length];
-        }
     }
 }
 

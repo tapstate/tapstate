@@ -4,9 +4,11 @@ import dev.tamboui.buffer.Buffer;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.terminal.Frame;
 import dev.tamboui.tui.event.Event;
+import dev.tamboui.tui.event.KeyCode;
 import dev.tamboui.tui.event.KeyEvent;
 import dev.tamboui.tui.event.MouseButton;
 import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.tui.event.PasteEvent;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
@@ -121,7 +123,7 @@ class WorkbenchRefreshIntegrationTest {
     }
 
     @Test
-    void rendererHitMapDrivesTabAndRowSelection() {
+    void rendererHitMapDrivesTabSelection() {
         ImmediateScheduler scheduler = new ImmediateScheduler();
         WorkbenchRuntime runtime = new WorkbenchRuntime(
                 WorkbenchState.initial(), scheduler, () -> true, event -> {
@@ -135,9 +137,93 @@ class WorkbenchRefreshIntegrationTest {
         assertThat(session.handleEvent(MouseEvent.press(MouseButton.LEFT, 14, 5), null)).isTrue();
         assertThat(runtime.state().selectedTab()).isEqualTo(WorkbenchState.WorkbenchTab.WORKSPACE);
 
-        session.render(Frame.forTesting(Buffer.empty(new Rect(0, 0, 88, 24))));
-        assertThat(session.handleEvent(MouseEvent.press(MouseButton.LEFT, 1, 10), null)).isTrue();
-        assertThat(runtime.state().workspaceTable().selectedIndex()).isEqualTo(1);
+    }
+
+    @Test
+    void overlayOwnsInputUntilItIsClosed() {
+        ImmediateScheduler scheduler = new ImmediateScheduler();
+        WorkbenchRuntime runtime = new WorkbenchRuntime(
+                WorkbenchState.initial(), scheduler, () -> true, event -> {
+                });
+        Workbench.Session session = new Workbench.Session(runtime);
+
+        assertThat(session.handleEvent(KeyEvent.ofChar('0'), null)).isTrue();
+        assertThat(runtime.state().overlay()).contains(new WorkbenchOverlayState.More(0));
+        assertThat(session.handleEvent(KeyEvent.ofChar('2'), null)).isTrue();
+        assertThat(runtime.state().selectedTab()).isEqualTo(WorkbenchState.WorkbenchTab.OVERVIEW);
+
+        assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ESCAPE), null)).isTrue();
+        assertThat(runtime.state().overlay()).isEmpty();
+        assertThat(session.handleEvent(KeyEvent.ofChar('2'), null)).isTrue();
+        assertThat(runtime.state().selectedTab()).isEqualTo(WorkbenchState.WorkbenchTab.WORKSPACE);
+    }
+
+    @Test
+    void signedOutSessionLogsInWithoutExposingOrRetainingThePassword() throws Exception {
+        RecordingScheduler scheduler = new RecordingScheduler();
+        WorkbenchSnapshot signedOut = signedOutSnapshot(0, 1);
+        WorkbenchRuntime runtime = new WorkbenchRuntime(
+                WorkbenchState.initial().expectSnapshot(signedOut).acceptSnapshot(signedOut),
+                scheduler,
+                () -> true,
+                event -> {
+                });
+        AtomicReference<String> receivedPassword = new AtomicReference<>();
+        AtomicReference<SecretBuffer> submittedBuffer = new AtomicReference<>();
+        CountDownLatch loginCalled = new CountDownLatch(1);
+        WorkbenchActionGateway gateway = new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return List.of(new ContextOption("dev", true));
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                return new ContextResult.Ready(name, false);
+            }
+
+            @Override
+            public LoginResult login(String username, SecretBuffer password) {
+                submittedBuffer.set(password);
+                receivedPassword.set(password.consume(value -> value));
+                loginCalled.countDown();
+                return new LoginResult.SignedIn(username);
+            }
+        };
+
+        try (Workbench.Session session = new Workbench.Session(
+                runtime,
+                (generation, sequence, token) -> snapshot(generation, sequence, "orders"),
+                gateway)) {
+            assertThat(session.handleEvent(KeyEvent.ofChar('c'), null)).isTrue();
+            for (char character : "alice".toCharArray()) {
+                assertThat(session.handleEvent(KeyEvent.ofChar(character), null)).isTrue();
+            }
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            assertThat(session.handleEvent(new PasteEvent("p@ssword"), null)).isTrue();
+
+            Buffer buffer = Buffer.empty(new Rect(0, 0, 88, 24));
+            session.render(Frame.forTesting(buffer));
+            assertThat(textOf(buffer)).contains("Username: alice", "Password: ********");
+            assertThat(textOf(buffer)).doesNotContain("p@ssword");
+            assertThat(runtime.state().toString()).doesNotContain("p@ssword");
+
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            await(loginCalled);
+            scheduler.awaitNext().run();
+
+            assertThat(receivedPassword).hasValue("p@ssword");
+            assertThat(submittedBuffer.get().cleared()).isTrue();
+            assertThat(runtime.state().overlay()).isEmpty();
+            assertThat(runtime.state().expectedSnapshot())
+                    .map(WorkbenchSnapshot::identity)
+                    .contains(new WorkbenchSnapshot.Identity(1, 1));
+
+            scheduler.awaitNext().run();
+            assertThat(runtime.state().snapshot())
+                    .map(WorkbenchSnapshot::identity)
+                    .contains(new WorkbenchSnapshot.Identity(1, 1));
+        }
     }
 
     @Test
@@ -199,7 +285,7 @@ class WorkbenchRefreshIntegrationTest {
                 assertThat(row.remote()).isEmpty();
                 assertThat(row.alignment()).isEqualTo(WorkbenchAlignment.UNKNOWN);
             });
-            assertThat(accepted.pipelines().rows()).hasSize(1);
+            assertThat(accepted.pipelines().rows()).isEmpty();
             assertThat(accepted.toString()).doesNotContain("secret refresh failure");
         }
     }
@@ -323,7 +409,7 @@ class WorkbenchRefreshIntegrationTest {
                         Path.of("pipeline/orders.tap.yml"), Optional.of("pipeline"), true, false, true)),
                 List.of(new WorkbenchRemoteArtifact(true, true)),
                 WorkbenchAlignment.IN_SYNC);
-        List<WorkbenchKindCount> kinds = WorkspaceScan.KINDS.stream()
+        List<WorkbenchKindCount> kinds = WorkbenchProjection.VISIBLE_KINDS.stream()
                 .map(kind -> new WorkbenchKindCount(
                         kind,
                         kind.equals("pipeline") ? 1 : 0,
@@ -340,6 +426,27 @@ class WorkbenchRefreshIntegrationTest {
                         "source", new WorkbenchRemoteState.Available(1), List.of()),
                 new WorkbenchResourceListSnapshot(
                         "pipeline", new WorkbenchRemoteState.Available(1), List.of(row)));
+    }
+
+    private static WorkbenchSnapshot signedOutSnapshot(long generation, long sequence) {
+        WorkbenchSessionSnapshot session = new WorkbenchSessionSnapshot(
+                Path.of("/workspace"),
+                Optional.of("dev"),
+                Optional.of(ResolvedContext.Source.EXPLICIT),
+                WorkbenchConnection.CONNECTED,
+                WorkbenchAuthentication.SIGNED_OUT,
+                Optional.empty(),
+                Optional.of(URI.create("https://tapstate.example")),
+                "tapstate test");
+        WorkbenchRemoteState remote = new WorkbenchRemoteState.SignedOut();
+        return new WorkbenchSnapshot(
+                generation,
+                sequence,
+                session,
+                WorkbenchOverviewSnapshot.empty(),
+                new WorkbenchWorkspaceSnapshot(remote, List.of()),
+                new WorkbenchResourceListSnapshot("source", remote, List.of()),
+                new WorkbenchResourceListSnapshot("pipeline", remote, List.of()));
     }
 
     private static void await(CountDownLatch latch) throws InterruptedException {

@@ -14,6 +14,7 @@ final class WorkbenchRuntime {
             "Workbench state reduction requires the render owner thread";
 
     private final WorkbenchReducer<WorkbenchState> reducer;
+    private final LatestOnlyMailbox.Scheduler scheduler;
     private final BooleanSupplier ownerThread;
     private final Consumer<Event> dispatch;
     private final LatestOnlyMailbox<WorkbenchEvent.SnapshotPublished> mailbox;
@@ -26,9 +27,10 @@ final class WorkbenchRuntime {
             Consumer<Event> dispatch) {
         this.state = Objects.requireNonNull(initialState, "initialState");
         this.reducer = WorkbenchReducer.workbench();
+        this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         this.ownerThread = Objects.requireNonNull(ownerThread, "ownerThread");
         this.dispatch = Objects.requireNonNull(dispatch, "dispatch");
-        this.mailbox = new LatestOnlyMailbox<>(scheduler, this::reduce);
+        this.mailbox = new LatestOnlyMailbox<>(this.scheduler, this::reduce);
     }
 
     WorkbenchState state() {
@@ -53,6 +55,10 @@ final class WorkbenchRuntime {
         }
         state = next;
         return true;
+    }
+
+    void runLater(Runnable callback) {
+        scheduler.runLater(callback);
     }
 
     private void reduce(WorkbenchEvent event) {

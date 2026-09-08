@@ -98,6 +98,10 @@
     </dependency>
     <dependency>
       <groupId>dev.tamboui</groupId>
+      <artifactId>tamboui-css</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.tamboui</groupId>
       <artifactId>tamboui-jline3-backend</artifactId>
     </dependency>
 
@@ -193,6 +197,7 @@
                     <include>org.jline:*</include>
                     <!-- the pinned full-screen runner and the only permitted terminal backend -->
                     <include>dev.tamboui:tamboui-tui</include>
+                    <include>dev.tamboui:tamboui-css</include>
                     <include>dev.tamboui:tamboui-jline3-backend</include>
                     <!-- test scope never ships -->
                     <include>*:*:*:*:test</include>
@@ -285,6 +290,7 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
                 <buildArg>-H:IncludeResources=schema/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=messages/.*\.yml</buildArg>
                 <buildArg>-H:IncludeResources=dev/tamboui/tui/bindings/.*\.properties</buildArg>
+                <buildArg>-H:IncludeResources=tui/themes/.*\.tcss</buildArg>
               </buildArgs>
               <metadataRepository>
                 <enabled>true</enabled>

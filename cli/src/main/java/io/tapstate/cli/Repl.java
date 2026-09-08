@@ -32,6 +32,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -252,6 +253,105 @@ final class Repl {
     /** The structured, silent read boundary used by the full-screen workbench. */
     WorkbenchDataSource workbenchDataSource() {
         return this::loadWorkbenchSnapshot;
+    }
+
+    /** The typed context and authentication boundary used by the full-screen workbench. */
+    WorkbenchActionGateway workbenchActionGateway() {
+        return new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return workbenchContextOptions();
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                return selectWorkbenchContext(name);
+            }
+
+            @Override
+            public LoginResult login(String username, SecretBuffer password) {
+                return loginFromWorkbench(username, password);
+            }
+        };
+    }
+
+    private synchronized List<WorkbenchActionGateway.ContextOption> workbenchContextOptions() {
+        if (contextManager == null) {
+            return List.of();
+        }
+        try {
+            return contextManager.suggestions().stream()
+                    .map(choice -> new WorkbenchActionGateway.ContextOption(
+                            choice.name(), choice.suggested()))
+                    .toList();
+        } catch (RuntimeException unavailable) {
+            return List.of();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.ContextResult selectWorkbenchContext(String name) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+        try {
+            ContextManager.ContextChoice choice = contextManager.suggestions().stream()
+                    .filter(candidate -> candidate.name().equals(name))
+                    .findFirst()
+                    .orElse(null);
+            if (choice == null) {
+                return new WorkbenchActionGateway.ContextResult.Unavailable();
+            }
+            ResolvedContext.Named selected = new ResolvedContext.Named(
+                    choice.name(), choice.definition(), ResolvedContext.Source.EXPLICIT);
+            contextManager.choose(name);
+            session.disconnect();
+            namedContext = selected;
+            WorkbenchRemoteState failure = prepareWorkbenchContext(
+                    selected, new RefreshRequest.CancellationToken());
+            if (failure instanceof WorkbenchRemoteState.Offline) {
+                return new WorkbenchActionGateway.ContextResult.Offline(name);
+            }
+            if (failure != null) {
+                return new WorkbenchActionGateway.ContextResult.Unavailable();
+            }
+            return new WorkbenchActionGateway.ContextResult.Ready(name, session.isAuthenticated());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.LoginResult loginFromWorkbench(
+            String username, SecretBuffer password) {
+        Objects.requireNonNull(password, "password");
+        if (authService == null || namedContext == null || machineToken != null) {
+            password.close();
+            return new WorkbenchActionGateway.LoginResult.Unavailable();
+        }
+        try {
+            return password.consume(secret -> switch (authService.login(
+                    namedContext, username, secret, true)) {
+                case AuthService.LoginResult.Success success -> {
+                    AuthService.ActiveSession active = success.session();
+                    session.connect(namedContext.definition().seeds(), active.seed(), null);
+                    session.authenticate(
+                            active.accessToken(),
+                            active.record().principal(),
+                            null,
+                            namedContext.definition().seeds());
+                    yield new WorkbenchActionGateway.LoginResult.SignedIn(
+                            active.record().principal());
+                }
+                case AuthService.LoginResult.Rejected rejected ->
+                        new WorkbenchActionGateway.LoginResult.Rejected(rejected.code());
+                case AuthService.LoginResult.Unreachable ignored ->
+                        new WorkbenchActionGateway.LoginResult.Unreachable();
+            });
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.LoginResult.Unavailable();
+        }
     }
 
     private WorkbenchSnapshot loadWorkbenchSnapshot(

@@ -183,7 +183,7 @@ record WorkbenchOverviewSnapshot(
 
     static WorkbenchOverviewSnapshot empty() {
         return new WorkbenchOverviewSnapshot(
-                WorkspaceScan.KINDS.stream()
+                WorkbenchProjection.VISIBLE_KINDS.stream()
                         .map(kind -> new WorkbenchKindCount(kind, 0, OptionalInt.empty()))
                         .toList(),
                 new WorkbenchAlignmentCounts(0, 0, 0, 0, 0, 0));

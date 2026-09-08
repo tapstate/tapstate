@@ -75,11 +75,11 @@ class WorkbenchRendererTest {
                 .contains("Auth: signed in")
                 .contains("Principal: alice")
                 .contains("Endpoint: https://tapstate.example:9443")
-                .contains("1 Overview | 2 Workspace | 3 Sources | 4 Pipelines")
-                .contains("Kinds")
+                .contains("1 Overview | 2 Workspace [2] | 3 Sources [1] | 4 Pipelines [0] | 0 More")
+                .contains("Resources")
                 .contains("source", "pipeline", "in sync 1", "local only 1")
                 .contains("Remote artifacts: 2")
-                .contains("1-4 tabs  Left/Right switch  r refresh  q quit")
+                .contains("1-4 views  c context  0 more  r refresh  q quit")
                 .doesNotContain(secret, "/admin", "F1", "F2", "command palette", "Up/Down select");
         assertThat(rendered.layout().tooSmall()).isFalse();
         assertThat(rendered.layout().wide()).isFalse();
@@ -114,10 +114,11 @@ class WorkbenchRendererTest {
         WorkbenchSnapshot snapshot = snapshot(new WorkbenchRemoteState.Available(2), rows);
 
         assertThat(render(100, 28, accepted(snapshot)).text())
-                .contains("Kinds", "source", "pipeline", "view", "drifted 1")
+                .contains("Resources", "source", "pipeline", "drifted 1")
                 .doesNotContain("customer-source", "billing-pipeline", "operations-view");
         assertThat(render(100, 28, accepted(snapshot).select(WorkbenchState.WorkbenchTab.WORKSPACE)).text())
-                .contains("customer-source", "billing-pipeline", "operations-view");
+                .contains("customer-source", "billing-pipeline")
+                .doesNotContain("operations-view");
         assertThat(render(100, 28, accepted(snapshot).select(WorkbenchState.WorkbenchTab.SOURCES)).text())
                 .contains("customer-source")
                 .doesNotContain("billing-pipeline", "operations-view");
@@ -127,11 +128,10 @@ class WorkbenchRendererTest {
     }
 
     @Test
-    void overviewCompactsExcessKindsWithoutOverwritingReservedRows() {
-        List<WorkbenchKindCount> kinds = IntStream.range(0, 16)
-                .mapToObj(index -> new WorkbenchKindCount(
-                        "kind-%02d".formatted(index), index, OptionalInt.of(index + 1)))
-                .toList();
+    void overviewKeepsAlignmentSummaryAboveReservedNotificationRows() {
+        List<WorkbenchKindCount> kinds = List.of(
+                new WorkbenchKindCount("source", 7, OptionalInt.of(8)),
+                new WorkbenchKindCount("pipeline", 2, OptionalInt.of(3)));
         WorkbenchAlignmentCounts alignment = new WorkbenchAlignmentCounts(1, 2, 3, 4, 5, 6);
         WorkbenchRemoteState remote = new WorkbenchRemoteState.Available(16);
         WorkbenchSnapshot snapshot = new WorkbenchSnapshot(
@@ -145,17 +145,15 @@ class WorkbenchRendererTest {
 
         Rendered rendered = render(88, 24, accepted(snapshot));
 
-        assertThat(lineOf(rendered.buffer(), 18)).contains("+7 kinds not shown");
         assertThat(lineOf(rendered.buffer(), 19))
                 .contains("Alignment: local only 1 | remote only 2 | in sync 3");
         assertThat(lineOf(rendered.buffer(), 20))
                 .contains("drifted 4 | invalid local 5 | unknown 6");
         assertThat(lineOf(rendered.buffer(), 22)).contains("Remote artifacts: 16");
         assertThat(lineOf(rendered.buffer(), 23))
-                .contains("1-4 tabs  Left/Right switch  r refresh  q quit");
+                .contains("1-4 views  c context  0 more  r refresh  q quit");
         assertThat(rendered.text())
-                .contains("kind-00", "kind-08")
-                .doesNotContain("kind-09", "kind-15");
+                .contains("source", "local 7", "remote 8", "pipeline", "local 2", "remote 3");
     }
 
     @Test
@@ -170,8 +168,7 @@ class WorkbenchRendererTest {
 
         assertThat(rendered.text())
                 .contains("source", "local", "local only", "source/local.tap.yml", "-")
-                .contains("pipeline", "remote", "remote only", "remote")
-                .contains("view", "broken", "invalid local", "view/broken.tap.yml");
+                .doesNotContain("remote only", "view/broken.tap.yml", "broken");
     }
 
     @Test
@@ -202,15 +199,16 @@ class WorkbenchRendererTest {
     void nonEmptyTableTabShowsSelectionShortcut() {
         WorkbenchSnapshot snapshot = snapshot(
                 new WorkbenchRemoteState.Available(0),
-                List.of(row("source", "orders", WorkbenchAlignment.LOCAL_ONLY,
-                        "source/orders.tap.yml", false)));
+                List.of(row("source", "orders", WorkbenchAlignment.IN_SYNC,
+                        "source/orders.tap.yml", true)));
 
         Rendered rendered = render(88, 24, accepted(snapshot)
                 .select(WorkbenchState.WorkbenchTab.SOURCES));
 
         assertThat(rendered.text())
                 .contains("Up/Down select")
-                .contains("1-4 tabs", "Left/Right switch", "r refresh", "q quit");
+                .contains("1-4 views", "c context", "0 more", "r refresh", "q quit")
+                .doesNotContain("Left/Right switch");
     }
 
     @Test
@@ -259,7 +257,7 @@ class WorkbenchRendererTest {
                 .orElseThrow();
         assertThat(layout.rowAt(selected.area().x(), selected.area().y())).contains(selected);
         assertThat(rendered.buffer().get(selected.area().x(), selected.area().y()).style().effectiveModifiers())
-                .contains(Modifier.REVERSED);
+                .contains(Modifier.BOLD);
         assertThat(state.workspaceTable().scrollOffset()).isEqualTo(21);
     }
 
@@ -287,8 +285,37 @@ class WorkbenchRendererTest {
         assertThat(layout.rowAt(row.area().x(), row.area().y())).contains(row);
         assertThat(layout.rowAt(row.area().right(), row.area().y())).isEmpty();
         assertThat(layout.rowAt(row.area().x(), row.area().y() - 1)).isEmpty();
+        WorkbenchRenderer.ActionHit context = layout.actionHits().stream()
+                .filter(hit -> hit.launcher() == WorkbenchRenderer.Launcher.CONTEXT)
+                .findFirst()
+                .orElseThrow();
+        WorkbenchRenderer.ActionHit more = layout.actionHits().stream()
+                .filter(hit -> hit.launcher() == WorkbenchRenderer.Launcher.MORE)
+                .findFirst()
+                .orElseThrow();
+        assertThat(layout.actionAt(context.area().x(), context.area().y()))
+                .contains(WorkbenchRenderer.Launcher.CONTEXT);
+        assertThat(layout.actionAt(more.area().x(), more.area().y()))
+                .contains(WorkbenchRenderer.Launcher.MORE);
         assertThat(layout.tabHits()).isUnmodifiable();
         assertThat(layout.rowHits()).isUnmodifiable();
+        assertThat(layout.actionHits()).isUnmodifiable();
+        assertThat(rendered.text()).contains("0 More");
+    }
+
+    @Test
+    void moreOverlayRendersAboveTheViewWithClickableEntries() {
+        WorkbenchState state = accepted(snapshot(new WorkbenchRemoteState.Available(0), List.of()))
+                .withOverlay(new WorkbenchOverlayState.More(0));
+
+        Rendered rendered = render(100, 24, state);
+
+        assertThat(rendered.text()).contains("More", "Context & Auth", "Help");
+        assertThat(rendered.layout().overlayHits()).hasSize(2).isUnmodifiable();
+        for (WorkbenchRenderer.OverlayHit hit : rendered.layout().overlayHits()) {
+            assertThat(rendered.layout().overlayIndexAt(hit.area().x(), hit.area().y()))
+                    .hasValue(hit.index());
+        }
     }
 
     @Test
@@ -368,7 +395,7 @@ class WorkbenchRendererTest {
 
         assertThat(rendered.text())
                 .contains(emptyMessage, "Remote workspace is empty")
-                .contains("1-4 tabs", "Left/Right switch", "r refresh", "q quit")
+                .contains("1-4 views", "c context", "0 more", "r refresh", "q quit")
                 .doesNotContain("Up/Down select");
         assertThat(rendered.layout().rowHits()).isEmpty();
     }
@@ -395,7 +422,7 @@ class WorkbenchRendererTest {
         assertThat(hit.area().width()).isEqualTo(rendered.buffer().width());
         assertThat(hit.area().right()).isEqualTo(rendered.buffer().width());
         assertThat(rendered.buffer().get(rightmost, hit.area().y()).style().effectiveModifiers())
-                .contains(Modifier.REVERSED);
+                .contains(Modifier.BOLD);
         assertThat(rendered.layout().rowAt(rightmost, hit.area().y())).contains(hit);
         assertThat(rendered.layout().rowAt(rightmost + 1, hit.area().y())).isEmpty();
     }
@@ -413,31 +440,37 @@ class WorkbenchRendererTest {
             WorkbenchSessionSnapshot session,
             WorkbenchRemoteState remoteState,
             List<WorkbenchArtifactRow> rows) {
+        List<WorkbenchArtifactRow> workspace = rows.stream()
+                .filter(row -> WorkbenchProjection.VISIBLE_KINDS.contains(row.key().kind()))
+                .filter(row -> !row.local().isEmpty())
+                .toList();
         List<WorkbenchArtifactRow> sources = rows.stream()
-                .filter(row -> row.key().kind().equals("source"))
+                .filter(row -> row.key().kind().equals("source") && !row.remote().isEmpty())
                 .toList();
         List<WorkbenchArtifactRow> pipelines = rows.stream()
-                .filter(row -> row.key().kind().equals("pipeline"))
+                .filter(row -> row.key().kind().equals("pipeline") && !row.remote().isEmpty())
                 .toList();
-        WorkbenchOverviewSnapshot overview = overview(rows, remoteState);
+        WorkbenchOverviewSnapshot overview = overview(workspace, remoteState, rows);
         return new WorkbenchSnapshot(
                 1,
                 1,
                 session,
                 overview,
-                new WorkbenchWorkspaceSnapshot(remoteState, rows),
+                new WorkbenchWorkspaceSnapshot(remoteState, workspace),
                 new WorkbenchResourceListSnapshot("source", remoteState, sources),
                 new WorkbenchResourceListSnapshot("pipeline", remoteState, pipelines));
     }
 
     private static WorkbenchOverviewSnapshot overview(
-            List<WorkbenchArtifactRow> rows, WorkbenchRemoteState remoteState) {
+            List<WorkbenchArtifactRow> workspace,
+            WorkbenchRemoteState remoteState,
+            List<WorkbenchArtifactRow> allRows) {
         List<WorkbenchKindCount> kinds = new ArrayList<>();
-        for (String kind : WorkspaceScan.KINDS) {
-            int local = (int) rows.stream()
+        for (String kind : WorkbenchProjection.VISIBLE_KINDS) {
+            int local = (int) workspace.stream()
                     .filter(row -> row.key().kind().equals(kind) && !row.local().isEmpty())
                     .count();
-            int remote = (int) rows.stream()
+            int remote = (int) allRows.stream()
                     .filter(row -> row.key().kind().equals(kind) && !row.remote().isEmpty())
                     .count();
             kinds.add(new WorkbenchKindCount(
@@ -448,12 +481,12 @@ class WorkbenchRendererTest {
                             : OptionalInt.empty()));
         }
         return new WorkbenchOverviewSnapshot(kinds, new WorkbenchAlignmentCounts(
-                count(rows, WorkbenchAlignment.LOCAL_ONLY),
-                count(rows, WorkbenchAlignment.REMOTE_ONLY),
-                count(rows, WorkbenchAlignment.IN_SYNC),
-                count(rows, WorkbenchAlignment.DRIFTED),
-                count(rows, WorkbenchAlignment.INVALID_LOCAL),
-                count(rows, WorkbenchAlignment.UNKNOWN)));
+                count(workspace, WorkbenchAlignment.LOCAL_ONLY),
+                count(workspace, WorkbenchAlignment.REMOTE_ONLY),
+                count(workspace, WorkbenchAlignment.IN_SYNC),
+                count(workspace, WorkbenchAlignment.DRIFTED),
+                count(workspace, WorkbenchAlignment.INVALID_LOCAL),
+                count(workspace, WorkbenchAlignment.UNKNOWN)));
     }
 
     private static int count(List<WorkbenchArtifactRow> rows, WorkbenchAlignment alignment) {

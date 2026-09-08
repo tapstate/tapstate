@@ -6,13 +6,14 @@ import dev.tamboui.tui.TuiRunner;
 import dev.tamboui.tui.event.Event;
 import dev.tamboui.tui.event.KeyEvent;
 import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.tui.event.PasteEvent;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalInt;
 
 /**
@@ -40,7 +41,8 @@ final class Workbench {
             terminal = null;
             TuiRunner runner = createRunner(backend);
             try {
-                Session workbench = new Session(runner, session.workbenchDataSource());
+                Session workbench = new Session(
+                        runner, session.workbenchDataSource(), session.workbenchActionGateway());
                 try {
                     runner.runLater(workbench::refresh);
                     runner.run(workbench::handleEvent, workbench::render);
@@ -146,34 +148,59 @@ final class Workbench {
     static final class Session implements AutoCloseable {
         private final WorkbenchRuntime runtime;
         private final WorkbenchDataSource dataSource;
+        private final WorkbenchActionGateway actionGateway;
         private final RefreshCoordinator refreshCoordinator;
+        private final WorkbenchActionCoordinator actionCoordinator;
         private volatile WorkbenchSnapshot lastSuccessfulSnapshot;
         private WorkbenchRenderer.RenderLayout layout = WorkbenchRenderer.RenderLayout.forTooSmallFrame();
 
-        private Session(TuiRunner runner, WorkbenchDataSource dataSource) {
+        private Session(
+                TuiRunner runner,
+                WorkbenchDataSource dataSource,
+                WorkbenchActionGateway actionGateway) {
             this(new WorkbenchRuntime(
                             WorkbenchState.initial(),
                             runner::runLater,
                             runner::isRenderThread,
                             runner::dispatch),
-                    dataSource);
+                    dataSource,
+                    actionGateway);
         }
 
         Session(WorkbenchRuntime runtime) {
             this.runtime = Objects.requireNonNull(runtime, "runtime");
             this.dataSource = null;
+            this.actionGateway = null;
             this.refreshCoordinator = null;
+            this.actionCoordinator = null;
         }
 
         Session(WorkbenchRuntime runtime, WorkbenchDataSource dataSource) {
+            this(runtime, dataSource, null);
+        }
+
+        Session(
+                WorkbenchRuntime runtime,
+                WorkbenchDataSource dataSource,
+                WorkbenchActionGateway actionGateway) {
             this.runtime = Objects.requireNonNull(runtime, "runtime");
             this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
+            this.actionGateway = actionGateway;
             this.refreshCoordinator = new RefreshCoordinator(this::publishRefreshResult);
+            this.actionCoordinator = actionGateway == null ? null : new WorkbenchActionCoordinator(runtime);
         }
 
         boolean handleEvent(Event event, TuiRunner runner) {
             if (event == WorkbenchRedrawEvent.INSTANCE) {
                 return true;
+            }
+            if (runtime.state().overlay().isPresent()) {
+                if (event instanceof KeyEvent key && key.isCtrlC()) {
+                    clearOverlaySecret();
+                    runner.quit();
+                    return true;
+                }
+                return handleOverlayEvent(event);
             }
             if (event instanceof KeyEvent key) {
                 if (key.isCharIgnoreCase('q') || key.isCtrlC()) {
@@ -184,9 +211,24 @@ final class Workbench {
                     refresh();
                     return true;
                 }
+                if (key.isCharIgnoreCase('c')) {
+                    return openContextEntry();
+                }
+                if (key.isChar('0')) {
+                    return runtime.updateState(state -> state.withOverlay(
+                            new WorkbenchOverlayState.More(0)));
+                }
                 return runtime.updateState(state -> state.reduce(key, visibleRows()));
             }
             if (event instanceof MouseEvent mouse && mouse.isClick()) {
+                var action = layout.actionAt(mouse.x(), mouse.y());
+                if (action.isPresent()) {
+                    return switch (action.orElseThrow()) {
+                        case CONTEXT -> openContextEntry();
+                        case MORE -> runtime.updateState(state -> state.withOverlay(
+                                new WorkbenchOverlayState.More(0)));
+                    };
+                }
                 var clickedTab = layout.tabAt(mouse.x(), mouse.y());
                 if (clickedTab.isPresent()) {
                     return runtime.updateState(state -> state.select(clickedTab.orElseThrow()));
@@ -199,6 +241,252 @@ final class Workbench {
                 }
             }
             return false;
+        }
+
+        private boolean handleOverlayEvent(Event event) {
+            WorkbenchOverlayState overlay = runtime.state().overlay().orElseThrow();
+            if (event instanceof PasteEvent paste) {
+                return handleOverlayPaste(overlay, paste.text());
+            }
+            if (event instanceof MouseEvent mouse && mouse.isClick()) {
+                OptionalInt clicked = layout.overlayIndexAt(mouse.x(), mouse.y());
+                if (clicked.isEmpty()) {
+                    return true;
+                }
+                int index = clicked.orElseThrow();
+                return switch (overlay) {
+                    case WorkbenchOverlayState.More ignored -> runtime.updateState(state ->
+                            state.withOverlay(new WorkbenchOverlayState.More(Math.clamp(index, 0, 1))));
+                    case WorkbenchOverlayState.ContextPicker picker -> runtime.updateState(state ->
+                            state.withOverlay(picker.select(index)));
+                    case WorkbenchOverlayState.Login ignored -> true;
+                    case WorkbenchOverlayState.Help ignored -> true;
+                };
+            }
+            if (!(event instanceof KeyEvent key)) {
+                return true;
+            }
+            if (key.isCancel()) {
+                clearOverlaySecret();
+                runtime.updateState(WorkbenchState::closeOverlay);
+                return true;
+            }
+            return switch (overlay) {
+                case WorkbenchOverlayState.More more -> handleMoreKey(more, key);
+                case WorkbenchOverlayState.ContextPicker picker -> handleContextKey(picker, key);
+                case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
+                case WorkbenchOverlayState.Help ignored -> true;
+            };
+        }
+
+        private boolean handleMoreKey(WorkbenchOverlayState.More more, KeyEvent key) {
+            if (key.isUp() || key.isDown()) {
+                int selected = key.isUp() ? Math.max(0, more.selectedIndex() - 1)
+                        : Math.min(1, more.selectedIndex() + 1);
+                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.More(selected)));
+                return true;
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                if (more.selectedIndex() == 0) {
+                    return openContextEntry();
+                }
+                runtime.updateState(state -> state.withOverlay(WorkbenchOverlayState.Help.INSTANCE));
+                return true;
+            }
+            return true;
+        }
+
+        private boolean handleContextKey(WorkbenchOverlayState.ContextPicker picker, KeyEvent key) {
+            if (picker.pending()) {
+                return true;
+            }
+            if (key.isUp() || key.isDown()) {
+                int selected = picker.selectedIndex() + (key.isUp() ? -1 : 1);
+                runtime.updateState(state -> state.withOverlay(picker.select(selected)));
+                return true;
+            }
+            if ((key.isSelect() || key.isConfirm()) && picker.selectedIndex() >= 0) {
+                selectContext(picker);
+            }
+            return true;
+        }
+
+        private boolean handleLoginKey(WorkbenchOverlayState.Login login, KeyEvent key) {
+            if (login.pending()) {
+                return true;
+            }
+            if (key.isDeleteBackward()) {
+                if (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME) {
+                    String username = deleteLastCodePoint(login.username());
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                            login.contextName(), login.stage(), username, login.password(), false, Optional.empty())));
+                } else {
+                    login.password().deleteLast();
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                            login.contextName(), login.stage(), login.username(), login.password(), false, Optional.empty())));
+                }
+                return true;
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                if (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME) {
+                    if (!login.username().isBlank()) {
+                        runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                                login.contextName(), WorkbenchOverlayState.Login.Stage.PASSWORD,
+                                login.username(), login.password(), false, Optional.empty())));
+                    }
+                } else if (login.password().length() > 0) {
+                    submitLogin(login);
+                }
+                return true;
+            }
+            if (key.code() == dev.tamboui.tui.event.KeyCode.CHAR) {
+                return appendLoginText(login, key.string());
+            }
+            return true;
+        }
+
+        private boolean handleOverlayPaste(WorkbenchOverlayState overlay, String text) {
+            if (!(overlay instanceof WorkbenchOverlayState.Login login) || login.pending()) {
+                return true;
+            }
+            return appendLoginText(login, text);
+        }
+
+        private boolean appendLoginText(WorkbenchOverlayState.Login login, String text) {
+            if (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME) {
+                StringBuilder username = new StringBuilder(login.username());
+                text.codePoints()
+                        .filter(codePoint -> !Character.isISOControl(codePoint))
+                        .forEach(username::appendCodePoint);
+                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                        login.contextName(), login.stage(), username.toString(), login.password(),
+                        false, Optional.empty())));
+            } else {
+                login.password().append(text);
+                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                        login.contextName(), login.stage(), login.username(), login.password(),
+                        false, Optional.empty())));
+            }
+            return true;
+        }
+
+        private boolean openContextEntry() {
+            if (actionGateway == null) {
+                return false;
+            }
+            Optional<WorkbenchSessionSnapshot> session = runtime.state().snapshot()
+                    .map(WorkbenchSnapshot::session);
+            if (session.flatMap(WorkbenchSessionSnapshot::contextName).isPresent()
+                    && session.map(WorkbenchSessionSnapshot::authentication)
+                            .filter(WorkbenchAuthentication.SIGNED_OUT::equals)
+                            .isPresent()) {
+                String contextName = session.flatMap(WorkbenchSessionSnapshot::contextName).orElseThrow();
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                        contextName,
+                        WorkbenchOverlayState.Login.Stage.USERNAME,
+                        "",
+                        new SecretBuffer(),
+                        false,
+                        Optional.empty())));
+            }
+            List<WorkbenchActionGateway.ContextOption> contexts = actionGateway.contexts();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextPicker(
+                    contexts, contexts.isEmpty() ? -1 : 0, false, Optional.empty())));
+        }
+
+        private void selectContext(WorkbenchOverlayState.ContextPicker picker) {
+            if (actionCoordinator == null) {
+                return;
+            }
+            String contextName = picker.contexts().get(picker.selectedIndex()).name();
+            runtime.updateState(state -> state.withOverlay(picker.asPending()));
+            actionCoordinator.submit(
+                    () -> actionGateway.selectContext(contextName),
+                    this::completeContextSelection);
+        }
+
+        private void completeContextSelection(WorkbenchActionGateway.ContextResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.ContextResult.Ready ready -> {
+                    if (ready.signedIn()) {
+                        refreshAfterActivation();
+                    } else {
+                        runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                                ready.contextName(),
+                                WorkbenchOverlayState.Login.Stage.USERNAME,
+                                "",
+                                new SecretBuffer(),
+                                false,
+                                Optional.empty())));
+                    }
+                }
+                case WorkbenchActionGateway.ContextResult.Offline offline -> runtime.updateState(state ->
+                        state.withOverlay(contextMessage("Context is offline: " + offline.contextName())));
+                case WorkbenchActionGateway.ContextResult.Unavailable ignored -> runtime.updateState(state ->
+                        state.withOverlay(contextMessage("Context could not be selected")));
+            }
+        }
+
+        private WorkbenchOverlayState.ContextPicker contextMessage(String message) {
+            List<WorkbenchActionGateway.ContextOption> contexts = actionGateway.contexts();
+            return new WorkbenchOverlayState.ContextPicker(
+                    contexts, contexts.isEmpty() ? -1 : 0, false, Optional.of(message));
+        }
+
+        private void submitLogin(WorkbenchOverlayState.Login login) {
+            if (actionCoordinator == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    login.contextName(), login.stage(), login.username(), login.password(), true, Optional.empty())));
+            actionCoordinator.submit(
+                    () -> actionGateway.login(login.username(), login.password()),
+                    result -> completeLogin(login.contextName(), login.username(), result));
+        }
+
+        private void completeLogin(
+                String contextName,
+                String username,
+                WorkbenchActionGateway.LoginResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.LoginResult.SignedIn ignored -> refreshAfterActivation();
+                case WorkbenchActionGateway.LoginResult.Rejected rejected -> showLoginFailure(
+                        contextName, username, "Sign in rejected: " + rejected.code());
+                case WorkbenchActionGateway.LoginResult.Unreachable ignored -> showLoginFailure(
+                        contextName, username, "Server is unreachable");
+                case WorkbenchActionGateway.LoginResult.Unavailable ignored -> showLoginFailure(
+                        contextName, username, "Sign in is unavailable");
+            }
+        }
+
+        private void showLoginFailure(String contextName, String username, String message) {
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    contextName,
+                    WorkbenchOverlayState.Login.Stage.PASSWORD,
+                    username,
+                    new SecretBuffer(),
+                    false,
+                    Optional.of(message))));
+        }
+
+        private void refreshAfterActivation() {
+            runtime.updateState(WorkbenchState::closeOverlay);
+            refreshCoordinator.advanceContext();
+            refresh();
+        }
+
+        private void clearOverlaySecret() {
+            runtime.state().overlay()
+                    .filter(WorkbenchOverlayState.Login.class::isInstance)
+                    .map(WorkbenchOverlayState.Login.class::cast)
+                    .ifPresent(login -> login.password().close());
+        }
+
+        private static String deleteLastCodePoint(String value) {
+            if (value.isEmpty()) {
+                return value;
+            }
+            return value.substring(0, value.offsetByCodePoints(value.length(), -1));
         }
 
         void refresh() {
@@ -225,6 +513,10 @@ final class Workbench {
 
         @Override
         public void close() {
+            clearOverlaySecret();
+            if (actionCoordinator != null) {
+                actionCoordinator.close();
+            }
             if (refreshCoordinator != null) {
                 refreshCoordinator.close();
             }
@@ -279,8 +571,8 @@ final class Workbench {
                     session,
                     overview(rows, remoteState),
                     new WorkbenchWorkspaceSnapshot(remoteState, rows),
-                    resourceList("source", remoteState, rows),
-                    resourceList("pipeline", remoteState, rows));
+                    new WorkbenchResourceListSnapshot("source", remoteState, List.of()),
+                    new WorkbenchResourceListSnapshot("pipeline", remoteState, List.of()));
         }
 
         private static List<WorkbenchArtifactRow> localRows(
@@ -308,15 +600,8 @@ final class Workbench {
         private static WorkbenchOverviewSnapshot overview(
                 List<WorkbenchArtifactRow> rows,
                 WorkbenchRemoteState remoteState) {
-            List<String> kinds = new ArrayList<>(WorkspaceScan.KINDS);
-            rows.stream()
-                    .map(row -> row.key().kind())
-                    .filter(kind -> !WorkspaceScan.KINDS.contains(kind))
-                    .distinct()
-                    .sorted()
-                    .forEach(kinds::add);
             boolean remoteAvailable = remoteState instanceof WorkbenchRemoteState.Available;
-            List<WorkbenchKindCount> counts = kinds.stream()
+            List<WorkbenchKindCount> counts = WorkbenchProjection.VISIBLE_KINDS.stream()
                     .map(kind -> new WorkbenchKindCount(
                             kind,
                             (int) rows.stream()
@@ -337,16 +622,6 @@ final class Workbench {
                 List<WorkbenchArtifactRow> rows,
                 WorkbenchAlignment alignment) {
             return (int) rows.stream().filter(row -> row.alignment() == alignment).count();
-        }
-
-        private static WorkbenchResourceListSnapshot resourceList(
-                String kind,
-                WorkbenchRemoteState remoteState,
-                List<WorkbenchArtifactRow> rows) {
-            return new WorkbenchResourceListSnapshot(
-                    kind,
-                    remoteState,
-                    rows.stream().filter(row -> row.key().kind().equals(kind)).toList());
         }
 
         private int visibleRows() {

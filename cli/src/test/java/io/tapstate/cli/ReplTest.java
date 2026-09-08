@@ -4469,6 +4469,54 @@ class ReplTest {
     }
 
     @Test
+    void workbenchGatewaySelectsAContextAndUsesTheSharedPersistentLogin(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ContextConfigStore configStore = ContextConfigStore.underHome(home);
+        ContextManager manager = new ContextManager(configStore);
+        manager.create("dev", List.of(seed), true);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        client.loginOutcome = persistentLogin(
+                now, "urn:tapstate:cluster:test-cluster", "alice", "tss_workbench.session");
+        AuthFileStore authStore = AuthFileStore.underHome(home);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(
+                commandLine,
+                workspace,
+                client,
+                new ScriptedPrompter(),
+                name -> null,
+                new ContextResolver(configStore, name -> null),
+                null,
+                new AuthService(client, authStore, Clock.fixed(now, ZoneOffset.UTC)),
+                manager);
+        WorkbenchActionGateway gateway = repl.workbenchActionGateway();
+
+        assertThat(gateway.contexts()).containsExactly(new WorkbenchActionGateway.ContextOption("dev", false));
+        assertThat(gateway.selectContext("dev"))
+                .isEqualTo(new WorkbenchActionGateway.ContextResult.Ready("dev", false));
+        SecretBuffer password = new SecretBuffer();
+        password.append("pw");
+
+        assertThat(gateway.login("alice", password))
+                .isEqualTo(new WorkbenchActionGateway.LoginResult.SignedIn("alice"));
+        assertThat(password.cleared()).isTrue();
+        assertThat(repl.session().credential()).isEqualTo("jwt-alice");
+        assertThat(client.loginCalls)
+                .containsExactly("alice:pw@http://127.0.0.1:7900 persistent=true");
+        assertThat(authStore.load(
+                        manager.suggestions().getFirst().definition().authRef(),
+                        manager.suggestions().getFirst().definition().id()))
+                .isPresent();
+        assertThat(output.toString()).doesNotContain("pw");
+    }
+
+    @Test
     void ctxBuiltinCanChooseEditUnbindAndDeleteThroughTheSharedManager(@TempDir Path home)
             throws IOException {
         Path workspace = Files.createDirectory(home.resolve("orders"));

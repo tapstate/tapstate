@@ -386,7 +386,8 @@ class WorkbenchDataSourceTest {
 
         WorkbenchSnapshot snapshot = load(harness.repl());
 
-        assertThat(snapshot.workspace().rows()).hasSize(100);
+        assertThat(snapshot.workspace().rows()).isEmpty();
+        assertThat(snapshot.sources().rows()).hasSize(100);
         assertThat(client.calls("list")).isEqualTo(1);
         assertThat(client.calledMethods()).containsExactly("list");
     }
