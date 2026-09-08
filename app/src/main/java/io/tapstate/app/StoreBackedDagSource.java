@@ -209,26 +209,40 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * Where this pipeline's nests keep state: the namespace each compiled vertex holds its entries in,
-     * plus the one its shape was written down in. The record goes with the state it describes - kept
-     * behind, it would refuse the next start of a pipeline that has nothing left to abandon, naming paths
-     * that no longer address anything.
+     * Where this pipeline's operator state is kept - every namespace a stop has to let go of. Its nests
+     * keep one per compiled vertex plus the one their shape was written down in; its joins keep the
+     * mirrors and the reverse index each join step is wired for. The record goes with the state it
+     * describes - kept behind, it would refuse the next start of a pipeline that has nothing left to
+     * abandon, naming paths that no longer address anything.
+     *
+     * <p>Both kinds, because both are inherited by whatever is applied under this id next, and neither
+     * says anything while it happens. A join's mirrors are the sharper case: they hold each dimension row
+     * as it last was, so a rebuilt run widens fresh driving rows with values the source no longer holds -
+     * a target that disagrees with its source, at full row count, with every column plausible.
      *
      * <p>The tree is compiled again here rather than remembered from the build, for the same reason the
      * build compiles it rather than reading it back: the names come from the tree, so the tree is what is
-     * asked. A pipeline with no nest step keeps nothing and is named nothing, which is what leaves an
-     * ordinary pipeline's stop untouched by any of this.
+     * asked. A pipeline that neither nests nor joins keeps nothing and is named nothing, which is what
+     * leaves an ordinary pipeline's stop untouched by any of this.
      */
     @Override
     public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
-        if (!PipelineDagBuilder.hasNest(pipeline)) {
+        // Read off the wiring alone, so a stop still names them when the sources behind the query have
+        // gone undiscoverable. Asked first for that reason: what follows resolves source models.
+        Set<String> namespaces = new LinkedHashSet<>(PipelineDagBuilder.joinStateNamespaces(pipeline));
+        if (PipelineDagBuilder.hasNest(pipeline)) {
+            Map<String, NestTable> byAlias =
+                    nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+            namespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
+            namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
+        }
+        if (namespaces.isEmpty()) {
+            // Nothing kept, rather than a holding that names nowhere: a surface renders the labels it is
+            // handed, and one over an empty holding would tell a reader state is being cleared that this
+            // pipeline never had.
             return List.of();
         }
-        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
-        Set<String> namespaces =
-                new LinkedHashSet<>(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
-        namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
         // The label comes from the declaration rather than being written out here, so what a stop calls
         // this and what a stop drops are one string rather than two that agree today.
         return List.of(PipelineStateInventory.OPERATOR_STATE.in(namespaces));
