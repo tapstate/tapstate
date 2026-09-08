@@ -19,7 +19,9 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -162,6 +164,12 @@ class ReplTest {
          */
         final Map<String, LifecycleOutcome> lifecycleOutcomeByVerb = new HashMap<>();
         StatusOutcome statusOutcome = new StatusOutcome.Unreachable();
+        /**
+         * The states successive status reads answer, in order; the last one sticks. A single value
+         * cannot express what a pipeline being paused looks like -- it is running, then it is not --
+         * and a verb that waits for that transition is unaskable without it.
+         */
+        final Deque<StatusOutcome> statusOutcomes = new ArrayDeque<>();
         MetricsOutcome metricsOutcome = new MetricsOutcome.Unreachable();
         PositionOutcome positionOutcome = new PositionOutcome.Unreachable();
         SnapshotOutcome snapshotOutcome = new SnapshotOutcome.Unreachable();
@@ -400,7 +408,15 @@ class ReplTest {
         @Override
         public StatusOutcome status(URI baseUrl, String credential, String pipelineId) {
             statusCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
-            return healthy.contains(baseUrl) ? statusOutcome : new StatusOutcome.Unreachable();
+            if (!healthy.contains(baseUrl)) {
+                return new StatusOutcome.Unreachable();
+            }
+            if (statusOutcomes.isEmpty()) {
+                return statusOutcome;
+            }
+            // The last one sticks rather than draining: a wait polls an unknown number of times, and a
+            // queue that empties would answer the next poll with something nobody scripted.
+            return statusOutcomes.size() == 1 ? statusOutcomes.peek() : statusOutcomes.poll();
         }
 
         @Override
@@ -3621,7 +3637,9 @@ class ReplTest {
     @Test
     void restartOnARunningPipelineCyclesItAndCarriesOn() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
+        // Running when asked, paused once the pause has been carried out.
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
         Harness h = onlineSession(Path.of("tap-work"), client);
 
@@ -3635,9 +3653,58 @@ class ReplTest {
     }
 
     @Test
+    void restartDoesNotResumeUntilThePauseHasBeenCarriedOut() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        // Still running for two polls after the pause was accepted, then paused.
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // This is the case. A pipeline has one slot for its intent and the converge side samples it, so
+        // a resume written before the pause has been read leaves only itself -- asking for the state the
+        // pipeline is already in, which actuates nothing while every face reports success. The pipeline
+        // never stops, and nothing anywhere says so. What separates the two verbs is this wait, and the
+        // count of status reads is the only place from here that it is observable at all.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 pause pl1",
+                "jwt-tok@http://node1:7900 resume pl1");
+        assertThat(client.statusCalls)
+                .as("one read to learn it is running, then reads until the pause is what it actually is")
+                .hasSizeGreaterThan(2);
+    }
+
+    @Test
+    void restartThatNeverSeesThePauseCarriedOutResumesNothingAndSaysSo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        // It never reports paused, which is what a converge side that has stopped looks like.
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client,
+                Map.of("TAPSTATE_RESTART_PAUSE_TIMEOUT_MS", "0"));
+
+        h.repl().dispatch("restart pl1");
+
+        // Giving up without resuming is the answer, not a half-done one: the pipeline is on its way to
+        // paused and will stay there, which somebody can act on. A resume sent here would be the very
+        // write that erases the pause nobody has read yet.
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 pause pl1");
+        // The state it is in, not the one it is not: a pipeline that failed while pausing never
+        // reports paused either, and one message for both sends half of them to wait for nothing.
+        assertThat(h.sink().toString()).contains("it is still running");
+        assertThat(h.sink().toString()).contains("running restart again picks it up");
+    }
+
+    @Test
     void restartOnAPipelineWhoseDefinitionChangedNamesTheOptionThatWorks() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
         // The pause goes through; the resume is refused because the definition moved under the run.
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-old");
         client.lifecycleOutcomeByVerb.put("resume", new LifecycleOutcome.Rejected(
@@ -3655,7 +3722,8 @@ class ReplTest {
     @Test
     void restartLeftPausedByAnOrdinaryRefusalSaysTryingAgainWorks() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-old");
         client.lifecycleOutcomeByVerb.put("resume", new LifecycleOutcome.Rejected(
                 "lifecycle.illegal-transition", "Not paused."));

@@ -91,6 +91,18 @@ final class Repl {
     /** How often a wait wakes to notice the user interrupted it. */
     private static final Duration CANCEL_POLL = Duration.ofMillis(200);
 
+    /** How often a composed restart asks whether the pause it sent has been carried out. */
+    private static final Duration PAUSE_SETTLE_POLL = Duration.ofMillis(500);
+
+    /** How long it waits for that before it stops and says the pipeline is on its way to paused. */
+    private static final Duration PAUSE_SETTLE_BOUND = Duration.ofSeconds(30);
+
+    /**
+     * Overrides that bound, in milliseconds. A cluster whose converge interval has been widened needs a
+     * longer one, and a case exercising the giving-up path needs it not to take half a minute.
+     */
+    private static final String PAUSE_SETTLE_BOUND_ENV = "TAPSTATE_RESTART_PAUSE_TIMEOUT_MS";
+
     /**
      * The refusals a repeating background read rides out rather than dying on. Both mean the connector
      * was busy serving somebody else this second, which is the arrangement working: the interactive
@@ -1314,6 +1326,65 @@ final class Repl {
     }
 
     /**
+     * Waits for a pause to become the pipeline's actual state, and answers whether it did.
+     *
+     * <p>This is what makes the resume that follows a second instruction rather than one that erases the
+     * first. A pipeline has one slot for its intent and the converge side samples that slot rather than
+     * consuming a queue of them, so two verbs written inside one of its intervals leave only the second
+     * -- and the second here asks for the state the pipeline is already in, so the pass that finally
+     * looks actuates nothing and every face reports success. Nothing about that is visible from outside:
+     * the pipeline really is running, because it never stopped. Waiting until the pause is what the
+     * pipeline actually <em>is</em> separates the two verbs by more than the slot can lose.
+     *
+     * <p>The state read here is the actual one -- a read face serves what the converge side recorded,
+     * never the intent -- which is the whole reason this can be waited on at all.
+     *
+     * <p>A refusal ends the wait rather than being retried: it is an answer, and asking again produces
+     * the same one. An unreachable node is not, so it is polled through.
+     *
+     * @return the last state actually read, which the caller compares against paused; null when no read
+     *     ever produced one. Answering the state rather than a yes/no is what lets the caller say which
+     *     state the pipeline is in instead of only which one it is not.
+     */
+    private String awaitPaused(String id) {
+        // This wait owns its own interruption window, the way every streaming command owns one. The flag
+        // is sticky: a Ctrl-C that stopped a watch three commands ago is still set, and without this a
+        // restart would read somebody else's interruption as its own and give up before it had waited.
+        streamCancelled = false;
+        long deadline = System.nanoTime() + pauseSettleBound().toNanos();
+        String seen = null;
+        while (true) {
+            StatusOutcome outcome = withFailover(() ->
+                    controlPlane.status(session.landingNode(), session.credential(), id),
+                    o -> o instanceof StatusOutcome.Unreachable);
+            if (outcome instanceof StatusOutcome.Found found) {
+                seen = found.state();
+                if ("PAUSED".equalsIgnoreCase(seen)) {
+                    return seen;
+                }
+            }
+            if (outcome instanceof StatusOutcome.Rejected
+                    || System.nanoTime() - deadline >= 0
+                    || !sleepUnlessCancelled(PAUSE_SETTLE_POLL)) {
+                return seen;
+            }
+        }
+    }
+
+    /** How long {@link #awaitPaused} waits, the environment's answer if it gave a usable one. */
+    private Duration pauseSettleBound() {
+        String configured = env == null ? null : env.apply(PAUSE_SETTLE_BOUND_ENV);
+        if (configured == null || configured.isBlank()) {
+            return PAUSE_SETTLE_BOUND;
+        }
+        try {
+            return Duration.ofMillis(Long.parseLong(configured.trim()));
+        } catch (NumberFormatException notANumber) {
+            return PAUSE_SETTLE_BOUND;
+        }
+    }
+
+    /**
      * {@code stop <pipeline-id> [--keep-state] [-y]} -- the verb that clears, and the two words that
      * change how it is asked for.
      *
@@ -1406,8 +1477,11 @@ final class Repl {
      * the product has. There is no fifth verb behind this and no operation of its own: what a restart means
      * is a sequence, and a sequence is what a front end is for.
      *
-     * <p>Plain, it cycles the pipeline and lets it carry on from where it stopped -- a pause and a resume
-     * over a running one, a resume over a paused one. With {@code --rerun} it asks for the whole source
+     * <p>Plain, it cycles the pipeline and lets it carry on from where it stopped -- a pause, waited for,
+     * and then a resume over a running one; a resume over a paused one. The wait is not politeness: two
+     * lifecycle verbs written inside one converge interval leave only the second, and the second here
+     * asks for the state the pipeline is already in, so neither half happens and the terminal says it
+     * went fine. With {@code --rerun} it asks for the whole source
      * to be read again, which is a stop that clears followed by a start.
      *
      * <p>A pipeline with nothing to carry on from is started, and <em>told so</em>. The two outcomes are
@@ -1457,6 +1531,22 @@ final class Repl {
                 int paused = lifecycleOnline("pause", id, null);
                 if (paused != Cli.EXIT_OK) {
                     return paused;
+                }
+                String settled = awaitPaused(id);
+                if (!"PAUSED".equalsIgnoreCase(settled)) {
+                    // Nothing was resumed, and that is the point: the pipeline is on its way to paused
+                    // and will stay there, which is a state somebody can act on. Resuming from here
+                    // would write the second half of a pair whose first half nothing has read yet.
+                    //
+                    // The state it is actually in is named rather than the one it is not. A pipeline
+                    // that failed while pausing never reports paused either, and "it has not paused
+                    // yet" would send its owner to wait for something that is not coming.
+                    err.println("restart: " + id + " was asked to pause, but it is still "
+                            + (settled == null ? "not reporting a state" : settled.toLowerCase(Locale.ROOT))
+                            + ", so it has not been resumed; running restart again picks it up once it "
+                            + "has paused");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
                 }
                 LifecycleOutcome resumed = drive("resume", id, null);
                 if (resumed instanceof LifecycleOutcome.Rejected rejected
