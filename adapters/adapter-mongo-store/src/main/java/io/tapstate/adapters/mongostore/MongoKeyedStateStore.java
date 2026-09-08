@@ -1,7 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ErrorCategory;
-import com.mongodb.MongoWriteException;
+import com.mongodb.MongoException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReplaceOptions;
@@ -160,10 +160,11 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
             before = StoreIo.call(
                     () -> collection.findOneAndUpdate(byId(namespace, key), onInsert, asItWas));
         } catch (TapstateException e) {
-            if (!(e.getCause() instanceof MongoWriteException write)
-                    || write.getError().getCategory() != ErrorCategory.DUPLICATE_KEY) {
+            if (!(e.getCause() instanceof MongoException mongo)
+                    || ErrorCategory.fromErrorCode(mongo.getCode()) != ErrorCategory.DUPLICATE_KEY) {
                 throw e;
             }
+            // findAndModify reports duplicate keys as command failures, not write failures.
             // Lost the race: somebody else inserted between the check and the write. Their value is the
             // one that stands, and it is now readable.
             return load(namespace, key);

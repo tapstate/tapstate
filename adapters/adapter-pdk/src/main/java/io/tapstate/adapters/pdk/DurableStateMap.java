@@ -21,6 +21,11 @@ import java.util.Objects;
  * <p>Storing nothing under a key removes it -- the way a connector expires a checkpoint -- so a key that
  * holds nothing and a key that was never written are the same state, as they are in the map this
  * replaces.
+ *
+ * <p>Values are stored by value, not by reference. A read (including the incumbent returned by
+ * {@code putIfAbsent}) returns a detached snapshot with mutable lists, maps and byte arrays. Editing
+ * that snapshot changes no stored state until {@code put} is called with it. Reads always consult the
+ * store so another connector's writes are visible; no per-open object cache hides them.
  */
 final class DurableStateMap implements KVMap<Object> {
 

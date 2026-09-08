@@ -92,6 +92,23 @@ class WhatAConnectorPutsInItsStateComesBackAsTheSameTypeTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void decodedCollectionsCanBeEditedAtEveryDepth() {
+        Map<String, Object> back = (Map<String, Object>) roundTrip(
+                Map.of("topics", List.of(Map.of("name", "orders"))));
+        List<Object> topics = (List<Object>) back.get("topics");
+        Map<String, Object> topic = (Map<String, Object>) topics.getFirst();
+
+        topic.put("name", "invoices");
+        topics.add(Map.of("name", "customers"));
+        back.put("generation", 2L);
+
+        assertThat(back).isEqualTo(Map.of(
+                "topics", List.of(Map.of("name", "invoices"), Map.of("name", "customers")),
+                "generation", 2L));
+    }
+
+    @Test
     void aTypeOutsideTheSetIsRefusedRatherThanStringified() {
         // The closed set is the contract. Falling back to toString() would store something that reads
         // back as a String and looks plausible to whoever wrote a date or a BigDecimal.

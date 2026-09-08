@@ -58,7 +58,10 @@ final class ConnectorStateCodec {
         return bytes.toByteArray();
     }
 
-    /** The value {@code encoded} was made from, as the type it was written as. */
+    /**
+     * A detached value of the type that was written. Lists and maps, including nested ones, are mutable
+     * so callers can edit a decoded snapshot before explicitly writing it back.
+     */
     static Object decode(byte[] encoded) {
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(encoded))) {
             byte version = in.readByte();
@@ -138,7 +141,7 @@ final class ConnectorStateCodec {
                 for (int i = 0; i < size; i++) {
                     list.add(readValue(in));
                 }
-                yield List.copyOf(list);
+                yield list;
             }
             case MAP -> {
                 int size = readSize(in);

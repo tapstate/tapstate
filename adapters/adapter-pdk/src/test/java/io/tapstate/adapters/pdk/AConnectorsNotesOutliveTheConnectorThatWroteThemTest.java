@@ -3,6 +3,10 @@ package io.tapstate.adapters.pdk;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.spi.store.KeyedStateStore;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -41,6 +45,60 @@ class AConnectorsNotesOutliveTheConnectorThatWroteThemTest {
         Object back = map("pdk.state.p1.src_a").get("MYSQL_SCHEMA_HISTORY");
         assertThat(back).isInstanceOf(byte[].class);
         assertThat((byte[]) back).containsExactly(history);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void aListCanBeEditedAndExplicitlyWrittenBack() {
+        DurableStateMap notes = map("pdk.state.p1.src_a");
+        List<String> original = new ArrayList<>(List.of("orders"));
+        notes.put("tap_topic", original);
+        original.add("not-stored");
+        List<String> edited = (List<String>) notes.get("tap_topic");
+        assertThat(edited).containsExactly("orders");
+
+        edited.add("invoices");
+        // Reads are detached snapshots: neither an alias kept by put nor an edited read writes itself.
+        assertThat(notes.get("tap_topic")).isEqualTo(List.of("orders"));
+        notes.put("tap_topic", edited);
+
+        assertThat(map("pdk.state.p1.src_a").get("tap_topic"))
+                .isEqualTo(List.of("orders", "invoices"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void aMapCanBeEditedAndExplicitlyWrittenBack() {
+        DurableStateMap notes = map("pdk.state.p1.src_a");
+        Map<String, Object> original = new LinkedHashMap<>(Map.of("slot", "one"));
+        notes.put("checkpoint", original);
+        original.put("not-stored", true);
+        Map<String, Object> edited = (Map<String, Object>) notes.get("checkpoint");
+        assertThat(edited).containsOnlyKeys("slot");
+
+        edited.put("cp", 7L);
+        assertThat(notes.get("checkpoint")).isEqualTo(Map.of("slot", "one"));
+        notes.put("checkpoint", edited);
+
+        assertThat(map("pdk.state.p1.src_a").get("checkpoint"))
+                .isEqualTo(Map.of("slot", "one", "cp", 7L));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void aLosingClaimReturnsTheSameEditableSnapshotShapeAsGet() {
+        DurableStateMap notes = map("pdk.state.p1.src_a");
+        notes.put("checkpoint", Map.of("topics", List.of("orders")));
+
+        Map<String, Object> existing = (Map<String, Object>) notes.putIfAbsent(
+                "checkpoint", Map.of("topics", List.of("loser")));
+        ((List<String>) existing.get("topics")).add("invoices");
+        existing.put("cp", 7L);
+        assertThat(notes.get("checkpoint")).isEqualTo(Map.of("topics", List.of("orders")));
+        notes.put("checkpoint", existing);
+
+        assertThat(map("pdk.state.p1.src_a").get("checkpoint"))
+                .isEqualTo(Map.of("topics", List.of("orders", "invoices"), "cp", 7L));
     }
 
     @Test
