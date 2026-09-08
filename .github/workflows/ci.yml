@@ -61,17 +61,16 @@ jobs:
       # Only third-party dependencies are copied from the shared cache. This job's
       # install outputs live in its temporary repository and never enter that cache.
       - name: Seed an isolated dependency repository
-        run: |
-          mkdir -p "$RUNNER_TEMP/m2"
-          if [ -d "$HOME/.m2/repository" ]; then
-            rsync -a --exclude='/io/tapstate/' "$HOME/.m2/repository/" "$RUNNER_TEMP/m2/"
-          fi
+        run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Build the reactor without running tests
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
         run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+      - name: Preserve downloaded dependencies
+        if: always()
+        run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Validate and package this shard's evidence
         env:
           SHARD: ${{ matrix.shard }}
@@ -110,11 +109,7 @@ jobs:
           java-version: '21'
           cache: maven
       - name: Seed an isolated dependency repository
-        run: |
-          mkdir -p "$RUNNER_TEMP/m2"
-          if [ -d "$HOME/.m2/repository" ]; then
-            rsync -a --exclude='/io/tapstate/' "$HOME/.m2/repository/" "$RUNNER_TEMP/m2/"
-          fi
+        run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - uses: actions/download-artifact@v4
         with:
           name: ci-shard-plan
@@ -141,6 +136,9 @@ jobs:
         run: |
           mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -N jacoco:merge@jacoco-merge-reactor
           mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" jacoco:report@jacoco-report-reactor
+      - name: Preserve downloaded dependencies
+        if: always()
+        run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Diff coverage
         if: github.event_name == 'pull_request'
         continue-on-error: true
@@ -225,12 +223,13 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh
       - name: CI shard and aggregate cases
         run: |
           bash .github/scripts/ci-shard-smoke.sh
           bash .github/scripts/ci-aggregate-smoke.sh
           bash .github/scripts/ci-shape-smoke.sh
+          bash .github/scripts/ci-maven-cache-smoke.sh
       - name: CI timing cases
         run: bash .github/scripts/ci-timing-smoke.sh
       - name: refresh driver cases
