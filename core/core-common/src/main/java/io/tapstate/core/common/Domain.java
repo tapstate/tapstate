@@ -68,6 +68,8 @@ public enum Domain {
     ARTIFACT,
     // source-specific control operations: identity, optimistic concurrency and reference protection
     SOURCE,
+    // pipeline-specific control operations: identity, optimistic concurrency and editor metadata
+    PIPELINE,
     // local MCP presentation: sidecar input, connector-spec and upstream-response failures
     MCP,
     // runtime data plane: reading a source's snapshot / cdc into the replay store — diagnosable

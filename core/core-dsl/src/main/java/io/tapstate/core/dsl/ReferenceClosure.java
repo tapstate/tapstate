@@ -60,6 +60,13 @@ final class ReferenceClosure {
     }
 
     private void validatePipeline(PipelineResource p) {
+        // The visual editor creates a persisted blank draft before any Source has been chosen.
+        // It is intentionally not runnable yet; the next typed save must supply the full
+        // source + view/serve composition before the normal closure checks apply.
+        if (p.sources().isEmpty() && (p.transforms() == null || p.transforms().isEmpty())
+                && p.view() == null && p.serve() == null) {
+            return;
+        }
         // X17 minimal composition: source (model guarantees non-empty) + an output surface.
         if (p.view() == null && p.serve() == null) {
             throw new DslException(DslError.COMPOSITION, "", 0, 0, null,
@@ -99,7 +106,7 @@ final class ReferenceClosure {
 
         ServeBlock serve = p.serve();
         if (serve != null) {
-            resolveRef(serveFrom(serve), serveScope(stepIds, view), universe, "serve.from");
+            resolveFrom(serveFrom(serve), serveScope(stepIds, view), universe, "serve.from");
             validateServeSinks(serve);
             if (serve instanceof ServeBlock.Use u) {
                 resolveUse(u.use(), Kind.SERVE, "serve.use");
@@ -347,7 +354,7 @@ final class ReferenceClosure {
         };
     }
 
-    private static FromRef serveFrom(ServeBlock s) {
+    private static FromClause serveFrom(ServeBlock s) {
         return switch (s) {
             case ServeBlock.Inline i -> i.from();
             case ServeBlock.Use u -> u.from();

@@ -34,10 +34,17 @@ class ControlOperationsTest {
                         "connector.register",
                         "connector.list",
                         "connector.get",
+                        "connector.icon",
                         "data-browser.collections",
                         "data-browser.find",
                         "data-browser.stats",
                         "cluster.members",
+                        "pipeline.list",
+                        "pipeline.get",
+                        "pipeline.layout.get",
+                        "pipeline.layout.update",
+                        "pipeline.create",
+                        "pipeline.update",
                         "pipeline.start",
                         "pipeline.stop",
                         "pipeline.pause",
@@ -86,10 +93,11 @@ class ControlOperationsTest {
         // connector.register ingests a connector artifact into the distribution store, so it is a
         // state-mutating write.
         assertThat(registry.resolve("connector.register").scope()).isEqualTo(Scope.WRITE);
-        // connector.list reads the online catalog view (bundled snapshot union registered rows); it
-        // mutates nothing, so it is read.
+        // connector.list reads registered authoring candidates from the online catalog view; it mutates
+        // nothing, so it is read.
         assertThat(registry.resolve("connector.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.get").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("connector.icon").scope()).isEqualTo(Scope.READ);
         // the three data-browser verbs look at what a declared source's own database holds. They read
         // through to the connector and persist nothing at all — not even the result, unlike the two
         // connection probes — so they are read-scoped.
@@ -99,13 +107,16 @@ class ControlOperationsTest {
         // cluster.members reads live topology; it is authenticated like every registry operation, but
         // needs no write or admin privilege.
         assertThat(registry.resolve("cluster.members").scope()).isEqualTo(Scope.READ);
-        // the four pipeline lifecycle verbs write desired state, so they are write-scoped.
-        for (String id : List.of("pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
+        // The layout update replaces editor metadata, while the lifecycle verbs write desired state.
+        for (String id : List.of(
+                "pipeline.layout.update", "pipeline.create", "pipeline.update", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.WRITE);
         }
-        // the pipeline observation reads (status/metrics/snapshot store-backed, logs node-local) are all
+        // The static Pipeline projection, layout read, and observation reads are all
         // read faces; read-scoped, unaudited.
-        for (String id : List.of("pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs")) {
+        for (String id : List.of(
+                "pipeline.list", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
+                "pipeline.snapshot", "pipeline.logs")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
         for (String id : List.of("user.create", "user.passwd", "user.list", "token.create", "token.revoke", "token.list")) {
@@ -129,6 +140,8 @@ class ControlOperationsTest {
                         "pipeline.stop",
                         "pipeline.pause",
                         "pipeline.resume",
+                        "pipeline.update",
+                        "pipeline.create",
                         "user.create",
                         "user.passwd",
                         "token.create",
@@ -148,12 +161,17 @@ class ControlOperationsTest {
                 "connection.schema",
                 "connector.list",
                 "connector.get",
+                "connector.icon",
                 "data-browser.collections",
                 "data-browser.find",
                 "data-browser.stats",
                 "cluster.members",
                 "user.list",
                 "token.list",
+                "pipeline.list",
+                "pipeline.get",
+                "pipeline.layout.get",
+                "pipeline.layout.update",
                 "pipeline.status",
                 "pipeline.metrics",
                 "pipeline.snapshot",
@@ -167,7 +185,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(42);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(49);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }

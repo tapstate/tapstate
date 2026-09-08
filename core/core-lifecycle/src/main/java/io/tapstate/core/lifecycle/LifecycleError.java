@@ -34,6 +34,9 @@ public enum LifecycleError implements TapstateErrorCode {
      */
     PURGE_STATE_NOT_STATED("lifecycle.purge-state-not-stated", Set.of("pipeline")),
 
+    /** A persisted editor draft that does not yet have the source and output needed for a run. */
+    PIPELINE_NOT_RUNNABLE("lifecycle.pipeline-not-runnable", Set.of("pipeline")),
+
     /**
      * A lifecycle verb, or a status/metrics/snapshot read, named a pipeline that was never applied:
      * {@code pipeline} is the id the caller gave. Permanent -- unlike an applied pipeline with no
