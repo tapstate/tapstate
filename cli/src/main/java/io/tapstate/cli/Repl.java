@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -88,6 +89,9 @@ final class Repl {
 
     /** How often a wait wakes to notice the user interrupted it. */
     private static final Duration CANCEL_POLL = Duration.ofMillis(200);
+
+    private static final String WORKBENCH_REMOTE_REJECTED_CODE = "workbench.remote-rejected";
+    private static final String WORKBENCH_REMOTE_REJECTED_MESSAGE = "Request rejected";
 
     /**
      * The refusals a repeating background read rides out rather than dying on. Both mean the connector
@@ -243,6 +247,243 @@ final class Repl {
     /** The current session workspace. */
     Path workdir() {
         return workdir;
+    }
+
+    /** The structured, silent read boundary used by the full-screen workbench. */
+    WorkbenchDataSource workbenchDataSource() {
+        return this::loadWorkbenchSnapshot;
+    }
+
+    private WorkbenchSnapshot loadWorkbenchSnapshot(
+            long contextGeneration,
+            long requestSequence,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        cancellationToken.throwIfCancelled();
+        Path workspaceRoot = workdir;
+        List<WorkspaceScan.Artifact> localArtifacts = WorkspaceScan.of(workspaceRoot);
+        cancellationToken.throwIfCancelled();
+
+        WorkbenchContextSelection selection = resolveWorkbenchContext(workspaceRoot);
+        WorkbenchRemoteListing remote = loadWorkbenchRemote(selection, cancellationToken);
+        cancellationToken.throwIfCancelled();
+
+        return WorkbenchProjection.project(
+                contextGeneration,
+                requestSequence,
+                workbenchSession(workspaceRoot, selection.context()),
+                localArtifacts,
+                remote.state(),
+                remote.artifacts());
+    }
+
+    private WorkbenchContextSelection resolveWorkbenchContext(Path workspaceRoot) {
+        if (namedContext != null) {
+            return new WorkbenchContextSelection(Optional.of(namedContext), null);
+        }
+        if (session.isConnected() || contextResolver == null) {
+            return new WorkbenchContextSelection(Optional.empty(), null);
+        }
+        try {
+            Optional<ResolvedContext> resolved = contextResolver.resolve(null, explicitContext, workspaceRoot);
+            Optional<ResolvedContext.Named> named = resolved
+                    .filter(ResolvedContext.Named.class::isInstance)
+                    .map(ResolvedContext.Named.class::cast);
+            return new WorkbenchContextSelection(named, null);
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            return new WorkbenchContextSelection(
+                    Optional.empty(),
+                    new WorkbenchRemoteState.Diagnostic(failure.code(), Map.of()));
+        }
+    }
+
+    private WorkbenchRemoteListing loadWorkbenchRemote(
+            WorkbenchContextSelection selection,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        if (selection.diagnostic() != null) {
+            return new WorkbenchRemoteListing(selection.diagnostic(), List.of());
+        }
+        if (!session.isConnected() && selection.context().isPresent()) {
+            WorkbenchRemoteState preparationFailure = prepareWorkbenchContext(
+                    selection.context().orElseThrow(), cancellationToken);
+            if (preparationFailure != null) {
+                return new WorkbenchRemoteListing(preparationFailure, List.of());
+            }
+        }
+        if (!session.isConnected()) {
+            WorkbenchRemoteState state = selection.context().isPresent()
+                    ? new WorkbenchRemoteState.Offline()
+                    : new WorkbenchRemoteState.NotConfigured();
+            return new WorkbenchRemoteListing(state, List.of());
+        }
+        if (!session.isAuthenticated()) {
+            return new WorkbenchRemoteListing(new WorkbenchRemoteState.SignedOut(), List.of());
+        }
+
+        cancellationToken.throwIfCancelled();
+        URI failedLanding = session.landingNode();
+        ListOutcome outcome = controlPlane.list(failedLanding, session.credential(), null);
+        if (outcome instanceof ListOutcome.Unreachable) {
+            cancellationToken.throwIfCancelled();
+            if (silentWorkbenchFailover(failedLanding, cancellationToken)) {
+                cancellationToken.throwIfCancelled();
+                outcome = controlPlane.list(session.landingNode(), session.credential(), null);
+            }
+        }
+        cancellationToken.throwIfCancelled();
+        return switch (outcome) {
+            case ListOutcome.Listed listed -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Available(listed.artifacts().size()), listed.artifacts());
+            case ListOutcome.Rejected ignored -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Rejected(
+                            WORKBENCH_REMOTE_REJECTED_CODE,
+                            WORKBENCH_REMOTE_REJECTED_MESSAGE),
+                    List.of());
+            case ListOutcome.Unreachable ignored -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Offline(), List.of());
+        };
+    }
+
+    private WorkbenchRemoteState prepareWorkbenchContext(
+            ResolvedContext.Named context,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        cancellationToken.throwIfCancelled();
+        try {
+            if (machineToken != null) {
+                IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(context.definition(), null);
+                mutateWorkbenchSession(cancellationToken, () -> {
+                    session.connect(context.definition().seeds(), verified.seed(), null);
+                    session.authenticateMachine(machineToken, context.definition().seeds());
+                    namedContext = context;
+                });
+                return null;
+            }
+
+            if (authService != null) {
+                Optional<AuthService.ActiveSession> resumed = authService.resume(context);
+                cancellationToken.throwIfCancelled();
+                if (resumed.isPresent()) {
+                    AuthService.ActiveSession active = resumed.orElseThrow();
+                    mutateWorkbenchSession(cancellationToken, () -> {
+                        session.connect(context.definition().seeds(), active.seed(), null);
+                        session.authenticate(
+                                active.accessToken(),
+                                active.record().principal(),
+                                null,
+                                context.definition().seeds());
+                        namedContext = context;
+                    });
+                    return null;
+                }
+            }
+
+            IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(context.definition(), null);
+            mutateWorkbenchSession(cancellationToken, () -> {
+                session.connect(context.definition().seeds(), verified.seed(), null);
+                namedContext = context;
+            });
+            return null;
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            cancellationToken.throwIfCancelled();
+            if (isWorkbenchOffline(failure)) {
+                return new WorkbenchRemoteState.Offline();
+            }
+            return new WorkbenchRemoteState.Diagnostic(failure.code(), Map.of());
+        }
+    }
+
+    private static boolean isWorkbenchOffline(io.tapstate.core.common.TapstateException failure) {
+        return failure.code() == CliError.ISSUER_DISCOVERY_FAILED
+                || failure.code() == CliError.AUTH_SESSION_UNREACHABLE;
+    }
+
+    private boolean silentWorkbenchFailover(
+            URI failedLanding,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        if (!session.isConnected()) {
+            return false;
+        }
+        for (URI member : session.members()) {
+            cancellationToken.throwIfCancelled();
+            if (failedLanding.equals(member)) {
+                continue;
+            }
+            if (controlPlane.isHealthy(member)) {
+                mutateWorkbenchSession(cancellationToken, () -> session.reland(member));
+                return true;
+            }
+        }
+        mutateWorkbenchSession(cancellationToken, session::disconnect);
+        return false;
+    }
+
+    private static void mutateWorkbenchSession(
+            RefreshRequest.CancellationToken cancellationToken,
+            Runnable mutation) throws InterruptedException {
+        if (!cancellationToken.mutateIfActive(mutation)) {
+            cancellationToken.throwIfCancelled();
+        }
+    }
+
+    private WorkbenchSessionSnapshot workbenchSession(
+            Path workspaceRoot,
+            Optional<ResolvedContext.Named> selected) {
+        WorkbenchConnection connection = session.isConnected()
+                ? WorkbenchConnection.CONNECTED
+                : selected.isPresent() ? WorkbenchConnection.OFFLINE : WorkbenchConnection.NO_CONTEXT;
+        WorkbenchAuthentication authentication;
+        if (!session.isConnected()) {
+            authentication = WorkbenchAuthentication.NOT_APPLICABLE;
+        } else if (session.hasMachineCredential()) {
+            authentication = WorkbenchAuthentication.MACHINE;
+        } else if (session.isAuthenticated()) {
+            authentication = WorkbenchAuthentication.SIGNED_IN;
+        } else {
+            authentication = WorkbenchAuthentication.SIGNED_OUT;
+        }
+        return new WorkbenchSessionSnapshot(
+                workspaceRoot,
+                selected.map(ResolvedContext.Named::name),
+                selected.map(ResolvedContext.Named::source),
+                connection,
+                authentication,
+                Optional.ofNullable(session.principal()),
+                safeLandingNode(session.landingNode()),
+                session.versions());
+    }
+
+    private static Optional<URI> safeLandingNode(URI endpoint) {
+        if (endpoint == null || endpoint.getHost() == null) {
+            return Optional.empty();
+        }
+        String scheme = endpoint.getScheme();
+        if (!("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(new URI(
+                    scheme.toLowerCase(Locale.ROOT),
+                    null,
+                    endpoint.getHost().toLowerCase(Locale.ROOT),
+                    endpoint.getPort(),
+                    null,
+                    null,
+                    null));
+        } catch (URISyntaxException invalid) {
+            return Optional.empty();
+        }
+    }
+
+    private record WorkbenchContextSelection(
+            Optional<ResolvedContext.Named> context,
+            WorkbenchRemoteState.Diagnostic diagnostic) {
+    }
+
+    private record WorkbenchRemoteListing(
+            WorkbenchRemoteState state,
+            List<RemoteArtifact> artifacts) {
+        private WorkbenchRemoteListing {
+            artifacts = List.copyOf(artifacts);
+        }
     }
 
     /** The current connection state. */

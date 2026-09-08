@@ -1,8 +1,5 @@
 package io.tapstate.cli;
 
-import dev.tamboui.backend.jline3.JLineBackend;
-import dev.tamboui.layout.Rect;
-import dev.tamboui.style.Style;
 import dev.tamboui.terminal.Frame;
 import dev.tamboui.tui.TuiConfig;
 import dev.tamboui.tui.TuiRunner;
@@ -12,7 +9,11 @@ import dev.tamboui.tui.event.MouseEvent;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.OptionalInt;
 
 /**
  * The full-screen terminal owner for a bare CLI launch.
@@ -21,9 +22,6 @@ import java.util.Map;
  * this lifecycle and continue through Picocli's one-shot command path.
  */
 final class Workbench {
-
-    private static final int MIN_WIDTH = 88;
-    private static final int MIN_HEIGHT = 24;
 
     private Workbench() {
     }
@@ -38,12 +36,23 @@ final class Workbench {
                 Diagnostics.printText(session.errorOutput(), CliError.WORKBENCH_NEEDS_A_TERMINAL, Map.of());
                 return Cli.EXIT_DIAGNOSTIC;
             }
-            try (TuiRunner runner = createRunner(terminal)) {
-                terminal = null;
-                Session workbench = new Session();
-                runner.run(workbench::handleEvent, workbench::render);
-                return Cli.EXIT_OK;
+            WorkbenchTerminalBackend backend = new WorkbenchTerminalBackend(terminal);
+            terminal = null;
+            TuiRunner runner = createRunner(backend);
+            try {
+                Session workbench = new Session(runner, session.workbenchDataSource());
+                try {
+                    runner.runLater(workbench::refresh);
+                    runner.run(workbench::handleEvent, workbench::render);
+                } finally {
+                    workbench.close();
+                }
+            } catch (Exception | Error failure) {
+                closeAfterFailure(runner, backend, failure);
+                throw failure;
             }
+            closeRunner(runner, backend);
+            return Cli.EXIT_OK;
         } catch (Exception ignored) {
             closeQuietly(terminal);
             Diagnostics.printText(session.errorOutput(), CliError.WORKBENCH_UNAVAILABLE, Map.of());
@@ -56,78 +65,70 @@ final class Workbench {
      * terminal implementation when future optional integrations appear on the classpath.
      */
     private static TuiRunner createRunner(Terminal terminal) throws Exception {
-        return createRunner(new JLineBackend(terminal));
+        return createRunner(new WorkbenchTerminalBackend(terminal));
     }
 
-    private static TuiRunner createRunner(JLineBackend backend) throws Exception {
-        return TuiRunner.create(TuiConfig.builder()
+    static TuiRunner createRunner(WorkbenchTerminalBackend backend) throws Exception {
+        TuiRunner runner = null;
+        try {
+            runner = TuiRunner.create(runnerConfig(backend));
+            backend.quitOnEof(runner::quit);
+            backend.quitOnInterrupt(runner::quit);
+            return runner;
+        } catch (Exception | Error failure) {
+            closeAfterFailure(runner, backend, failure);
+            throw failure;
+        }
+    }
+
+    static TuiConfig runnerConfig(WorkbenchTerminalBackend backend) {
+        return TuiConfig.builder()
                 .backend(backend)
                 .mouseCapture(true)
                 .bracketedPaste(true)
-                .build());
+                .noTick()
+                .build();
+    }
+
+    static void closeRunner(TuiRunner runner, WorkbenchTerminalBackend backend) throws Exception {
+        try {
+            runner.close();
+        } catch (Exception | Error failure) {
+            closeAfterFailure(null, backend, failure);
+            throw failure;
+        }
+        backend.throwIfCleanupFailed();
+    }
+
+    private static void closeAfterFailure(
+            TuiRunner runner, WorkbenchTerminalBackend backend, Throwable failure) {
+        try {
+            if (runner == null) {
+                backend.close();
+                backend.throwIfCleanupFailed();
+            } else {
+                closeRunner(runner, backend);
+            }
+        } catch (Exception | Error cleanupFailure) {
+            addSuppressedOnce(failure, cleanupFailure);
+        }
+    }
+
+    private static void addSuppressedOnce(Throwable failure, Throwable cleanupFailure) {
+        if (cleanupFailure == failure) {
+            return;
+        }
+        for (Throwable suppressed : failure.getSuppressed()) {
+            if (suppressed == cleanupFailure) {
+                return;
+            }
+        }
+        failure.addSuppressed(cleanupFailure);
     }
 
     /** Renders from the runner-owned frame so resize changes take effect without a second terminal owner. */
     static void render(Frame frame) {
-        render(frame, WorkbenchState.initial());
-    }
-
-    private static TabBar render(Frame frame, WorkbenchState state) {
-        Rect area = frame.area();
-        if (area.width() < MIN_WIDTH || area.height() < MIN_HEIGHT) {
-            renderTooSmall(frame, area);
-            return null;
-        }
-        return renderShell(frame, area, state);
-    }
-
-    private static void renderTooSmall(Frame frame, Rect area) {
-        String title = "Terminal size too small:";
-        String actual = "Width = " + area.width() + "  Height = " + area.height();
-        String needed = "Needed for current config:";
-        String minimum = "Width = " + MIN_WIDTH + "  Height = " + MIN_HEIGHT;
-        int startY = area.y() + Math.max(0, (area.height() - 5) / 2);
-
-        writeCentered(frame, area, startY, title, Style.EMPTY.bold());
-        writeCentered(frame, area, startY + 1, actual, Style.EMPTY);
-        writeCentered(frame, area, startY + 3, needed, Style.EMPTY.bold());
-        writeCentered(frame, area, startY + 4, minimum, Style.EMPTY);
-    }
-
-    private static TabBar renderShell(Frame frame, Rect area, WorkbenchState state) {
-        frame.buffer().setString(area.x(), area.y(), "Tapstate workbench", Style.EMPTY.bold());
-        TabBar tabBar = renderTabs(frame, area, state.selectedTab());
-        renderActiveTab(frame, area, state.selectedTab());
-        frame.buffer().setString(area.x(), area.y() + area.height() - 1,
-                "1 overview  2 pipelines  3 sources  Left/Right switch  q quit", Style.EMPTY.dim());
-        return tabBar;
-    }
-
-    private static TabBar renderTabs(Frame frame, Rect area, WorkbenchState.WorkbenchTab selected) {
-        int x = area.x();
-        for (WorkbenchState.WorkbenchTab tab : WorkbenchState.WorkbenchTab.values()) {
-            String label = tab.displayLabel();
-            Style style = tab == selected ? Style.EMPTY.bold().reversed() : Style.EMPTY.dim();
-            frame.buffer().setString(x, area.y() + 1, label, style);
-            x += label.length();
-            if (tab != WorkbenchState.WorkbenchTab.SOURCES) {
-                frame.buffer().setString(x, area.y() + 1, " | ", Style.EMPTY.dim());
-                x += 3;
-            }
-        }
-        return new TabBar(area.x(), area.y() + 1);
-    }
-
-    private static void renderActiveTab(Frame frame, Rect area, WorkbenchState.WorkbenchTab selected) {
-        frame.buffer().setString(area.x(), area.y() + 3, selected.label(), Style.EMPTY.bold());
-        frame.buffer().setString(area.x(), area.y() + 5, selected.emptyMessage(), Style.EMPTY);
-        frame.buffer().setString(area.x(), area.y() + 7,
-                "Refresh, selection, and data views will be connected by the workbench runtime.", Style.EMPTY.dim());
-    }
-
-    private static void writeCentered(Frame frame, Rect area, int y, String text, Style style) {
-        int x = area.x() + Math.max(0, (area.width() - text.length()) / 2);
-        frame.buffer().setString(x, y, text, style);
+        WorkbenchRenderer.render(frame, WorkbenchState.initial());
     }
 
     private static void closeQuietly(Terminal terminal) {
@@ -141,66 +142,215 @@ final class Workbench {
         }
     }
 
-    /** The tab bar hit map from the most recently rendered frame. */
-    private record TabBar(int x, int y) {
+    /** The render-thread session for one runner lifecycle. */
+    static final class Session implements AutoCloseable {
+        private final WorkbenchRuntime runtime;
+        private final WorkbenchDataSource dataSource;
+        private final RefreshCoordinator refreshCoordinator;
+        private volatile WorkbenchSnapshot lastSuccessfulSnapshot;
+        private WorkbenchRenderer.RenderLayout layout = WorkbenchRenderer.RenderLayout.forTooSmallFrame();
 
-        private WorkbenchState.WorkbenchTab clickedTab(MouseEvent mouse) {
-            if (!mouse.isClick() || mouse.y() != y) {
-                return null;
-            }
-            int offset = mouse.x() - x;
-            if (offset < 0) {
-                return null;
-            }
-            for (WorkbenchState.WorkbenchTab tab : WorkbenchState.WorkbenchTab.values()) {
-                int labelWidth = tab.displayLabel().length();
-                if (offset < labelWidth) {
-                    return tab;
-                }
-                offset -= labelWidth;
-                if (tab != WorkbenchState.WorkbenchTab.SOURCES) {
-                    if (offset < 3) {
-                        return null;
-                    }
-                    offset -= 3;
-                }
-            }
-            return null;
+        private Session(TuiRunner runner, WorkbenchDataSource dataSource) {
+            this(new WorkbenchRuntime(
+                            WorkbenchState.initial(),
+                            runner::runLater,
+                            runner::isRenderThread,
+                            runner::dispatch),
+                    dataSource);
         }
-    }
 
-    /** The sole mutable holder for input-derived state during one runner lifecycle. */
-    private static final class Session {
-        private WorkbenchState state = WorkbenchState.initial();
-        private TabBar tabBar;
+        Session(WorkbenchRuntime runtime) {
+            this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.dataSource = null;
+            this.refreshCoordinator = null;
+        }
 
-        private boolean handleEvent(Event event, TuiRunner runner) {
+        Session(WorkbenchRuntime runtime, WorkbenchDataSource dataSource) {
+            this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
+            this.refreshCoordinator = new RefreshCoordinator(this::publishRefreshResult);
+        }
+
+        boolean handleEvent(Event event, TuiRunner runner) {
+            if (event == WorkbenchRedrawEvent.INSTANCE) {
+                return true;
+            }
             if (event instanceof KeyEvent key) {
                 if (key.isCharIgnoreCase('q') || key.isCtrlC()) {
                     runner.quit();
                     return true;
                 }
-                return updateState(state.reduce(key));
+                if (key.isCharIgnoreCase('r') && refreshCoordinator != null) {
+                    refresh();
+                    return true;
+                }
+                return runtime.updateState(state -> state.reduce(key, visibleRows()));
             }
-            if (event instanceof MouseEvent mouse && tabBar != null) {
-                WorkbenchState.WorkbenchTab clicked = tabBar.clickedTab(mouse);
-                if (clicked != null) {
-                    return updateState(state.select(clicked));
+            if (event instanceof MouseEvent mouse && mouse.isClick()) {
+                var clickedTab = layout.tabAt(mouse.x(), mouse.y());
+                if (clickedTab.isPresent()) {
+                    return runtime.updateState(state -> state.select(clickedTab.orElseThrow()));
+                }
+                var clickedRow = layout.rowAt(mouse.x(), mouse.y());
+                if (clickedRow.isPresent()) {
+                    WorkbenchRenderer.RowHit row = clickedRow.orElseThrow();
+                    return runtime.updateState(state -> state.selectRow(
+                            row.tab(), row.rowIndex(), visibleRows()));
                 }
             }
             return false;
         }
 
-        private boolean updateState(WorkbenchState next) {
-            if (next == state) {
-                return false;
+        void refresh() {
+            if (refreshCoordinator == null || dataSource == null) {
+                throw new IllegalStateException("This workbench session has no refresh data source");
             }
-            state = next;
-            return true;
+            RefreshRequest request = refreshCoordinator.refresh((generation, sequence, token) ->
+                    RefreshResult.success(dataSource.load(generation, sequence, token)));
+            runtime.expectSnapshot(new WorkbenchSnapshot(
+                    request.contextGeneration(), request.requestSequence()));
         }
 
-        private void render(Frame frame) {
-            tabBar = Workbench.render(frame, state);
+        void expectSnapshot(WorkbenchSnapshot snapshot) {
+            runtime.expectSnapshot(snapshot);
+        }
+
+        void publishSnapshot(WorkbenchSnapshot snapshot) {
+            runtime.publishSnapshot(snapshot);
+        }
+
+        void render(Frame frame) {
+            layout = WorkbenchRenderer.render(frame, runtime.state());
+        }
+
+        @Override
+        public void close() {
+            if (refreshCoordinator != null) {
+                refreshCoordinator.close();
+            }
+        }
+
+        void publishRefreshResult(RefreshResult result) {
+            WorkbenchSnapshot baseline = currentBaseline(result.contextGeneration());
+            WorkbenchSnapshot snapshot = switch (result.outcome()) {
+                case RefreshResult.Success success -> remember(success.snapshot());
+                case RefreshResult.Empty ignored -> unavailableSnapshot(
+                        result, emptyRemoteState(baseline), baseline);
+                case RefreshResult.Offline ignored -> unavailableSnapshot(
+                        result, new WorkbenchRemoteState.Offline(), baseline);
+                case RefreshResult.Diagnostic diagnostic -> unavailableSnapshot(
+                        result, new WorkbenchRemoteState.Diagnostic(
+                                diagnostic.code(), diagnostic.arguments()), baseline);
+            };
+            runtime.publishSnapshot(snapshot);
+        }
+
+        private WorkbenchSnapshot remember(WorkbenchSnapshot snapshot) {
+            lastSuccessfulSnapshot = snapshot;
+            return snapshot;
+        }
+
+        private WorkbenchSnapshot currentBaseline(long contextGeneration) {
+            WorkbenchSnapshot snapshot = lastSuccessfulSnapshot;
+            return snapshot != null && snapshot.contextGeneration() == contextGeneration
+                    ? snapshot
+                    : null;
+        }
+
+        private static WorkbenchRemoteState emptyRemoteState(WorkbenchSnapshot baseline) {
+            return baseline != null && baseline.session().connection() != WorkbenchConnection.NO_CONTEXT
+                    ? new WorkbenchRemoteState.Available(0)
+                    : new WorkbenchRemoteState.NotConfigured();
+        }
+
+        private static WorkbenchSnapshot unavailableSnapshot(
+                RefreshResult result,
+                WorkbenchRemoteState remoteState,
+                WorkbenchSnapshot baseline) {
+            WorkbenchSessionSnapshot session = baseline == null
+                    ? WorkbenchSessionSnapshot.empty()
+                    : baseline.session();
+            List<WorkbenchArtifactRow> rows = baseline == null
+                    ? List.of()
+                    : localRows(baseline.workspace().rows(), remoteState);
+            return new WorkbenchSnapshot(
+                    result.contextGeneration(),
+                    result.requestSequence(),
+                    session,
+                    overview(rows, remoteState),
+                    new WorkbenchWorkspaceSnapshot(remoteState, rows),
+                    resourceList("source", remoteState, rows),
+                    resourceList("pipeline", remoteState, rows));
+        }
+
+        private static List<WorkbenchArtifactRow> localRows(
+                List<WorkbenchArtifactRow> baselineRows,
+                WorkbenchRemoteState remoteState) {
+            boolean remoteAvailable = remoteState instanceof WorkbenchRemoteState.Available;
+            return baselineRows.stream()
+                    .filter(row -> !row.local().isEmpty())
+                    .map(row -> new WorkbenchArtifactRow(
+                            row.key(),
+                            row.local(),
+                            List.of(),
+                            invalidLocal(row)
+                                    ? WorkbenchAlignment.INVALID_LOCAL
+                                    : remoteAvailable
+                                            ? WorkbenchAlignment.LOCAL_ONLY
+                                            : WorkbenchAlignment.UNKNOWN))
+                    .toList();
+        }
+
+        private static boolean invalidLocal(WorkbenchArtifactRow row) {
+            return row.local().size() > 1 || row.local().stream().anyMatch(local -> !local.valid());
+        }
+
+        private static WorkbenchOverviewSnapshot overview(
+                List<WorkbenchArtifactRow> rows,
+                WorkbenchRemoteState remoteState) {
+            List<String> kinds = new ArrayList<>(WorkspaceScan.KINDS);
+            rows.stream()
+                    .map(row -> row.key().kind())
+                    .filter(kind -> !WorkspaceScan.KINDS.contains(kind))
+                    .distinct()
+                    .sorted()
+                    .forEach(kinds::add);
+            boolean remoteAvailable = remoteState instanceof WorkbenchRemoteState.Available;
+            List<WorkbenchKindCount> counts = kinds.stream()
+                    .map(kind -> new WorkbenchKindCount(
+                            kind,
+                            (int) rows.stream()
+                                    .filter(row -> row.key().kind().equals(kind))
+                                    .count(),
+                            remoteAvailable ? OptionalInt.of(0) : OptionalInt.empty()))
+                    .toList();
+            return new WorkbenchOverviewSnapshot(counts, new WorkbenchAlignmentCounts(
+                    count(rows, WorkbenchAlignment.LOCAL_ONLY),
+                    0,
+                    0,
+                    0,
+                    count(rows, WorkbenchAlignment.INVALID_LOCAL),
+                    count(rows, WorkbenchAlignment.UNKNOWN)));
+        }
+
+        private static int count(
+                List<WorkbenchArtifactRow> rows,
+                WorkbenchAlignment alignment) {
+            return (int) rows.stream().filter(row -> row.alignment() == alignment).count();
+        }
+
+        private static WorkbenchResourceListSnapshot resourceList(
+                String kind,
+                WorkbenchRemoteState remoteState,
+                List<WorkbenchArtifactRow> rows) {
+            return new WorkbenchResourceListSnapshot(
+                    kind,
+                    remoteState,
+                    rows.stream().filter(row -> row.key().kind().equals(kind)).toList());
+        }
+
+        private int visibleRows() {
+            return Math.max(1, layout.visibleRowCapacity());
         }
     }
 }

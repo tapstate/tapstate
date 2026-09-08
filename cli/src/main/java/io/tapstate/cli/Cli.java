@@ -497,6 +497,7 @@ public final class Cli implements Runnable {
                                   Supplier<Prompter> prompter, ContextResolver resolver,
                                   AuthService authService, Function<Repl, Integer> workbench) {
         Prompter oneShotPrompter = null;
+        PromptOwner launchPrompt = new PromptOwner(prompter);
         try {
             if (launch.hasConflictingTargets()) {
                 Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
@@ -523,7 +524,7 @@ public final class Cli implements Runnable {
             if (launch.connects()) {
                 int established = machineToken == null
                         ? repl.signIn(launch.connect(), launch.user(),
-                                () -> launch.resolvePassword(prompter), launch.isOneShot())
+                                () -> launch.resolvePassword(launchPrompt::get), launch.isOneShot())
                         : repl.connectForLaunch(launch.connect(), launch.isOneShot());
                 if (established != EXIT_OK) {
                     return established;
@@ -533,12 +534,52 @@ public final class Cli implements Runnable {
                 repl.dispatch(launch.command(), true);
                 return repl.lastExitCode();
             }
+            launchPrompt.close();
             return workbench.apply(repl);
         } finally {
+            launchPrompt.close();
             if (oneShotPrompter instanceof JLinePrompter jline) {
                 jline.close();
             }
             controlPlane.close();
+        }
+    }
+
+    /** Retains a lazily opened prompt owner until its terminal can be closed before workbench handoff. */
+    private static final class PromptOwner implements AutoCloseable {
+        private final Supplier<Prompter> factory;
+        private Prompter prompt;
+        private boolean closed;
+
+        private PromptOwner(Supplier<Prompter> factory) {
+            this.factory = factory;
+        }
+
+        private Prompter get() {
+            if (closed) {
+                throw new IllegalStateException("prompt owner is already closed");
+            }
+            if (prompt == null) {
+                prompt = factory.get();
+            }
+            return prompt;
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            if (prompt instanceof AutoCloseable closeable) {
+                try {
+                    closeable.close();
+                } catch (RuntimeException failure) {
+                    throw failure;
+                } catch (Exception failure) {
+                    throw new IllegalStateException("could not close prompt owner", failure);
+                }
+            }
         }
     }
 }

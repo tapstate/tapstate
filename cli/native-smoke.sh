@@ -43,11 +43,20 @@ green() { printf '\033[32m%s\033[0m\n' "$1"; }
 bold()  { printf '\033[1m%s\033[0m\n' "$1"; }
 # strip CSI escape sequences: a pty makes the binary emit colour, so matches must run on clean text
 strip_ansi() { sed $'s/\033\\[[0-9;]*[a-zA-Z]//g'; }
+# Match one complete marker line after normalizing the carriage returns emitted by a pty.
+marker_line_is() { printf '%s\n' "$1" | tr -d '\r' | grep -Fqx -- "$2"; }
 
-# Drive the native binary under a real pty (JLine needs a terminal): feed $1 to its stdin, run it with
-# the remaining args, capture all output into PTY_OUT and set PTY_RC=0 only on a clean child exit. A
-# child that wedges past the deadline is SIGKILLed and always reaped, so the suite never orphans a
-# 36MB process or hangs. PTY_RC, not just output greps, is what callers gate on.
+# Guard the exactly-once assertions themselves: a multi-digit count must never satisfy a count of 1.
+if marker_line_is $'__TAPSTATE_MARKER__10\r' '__TAPSTATE_MARKER__1' \
+   || ! marker_line_is $'noise\r\n__TAPSTATE_MARKER__1\r' '__TAPSTATE_MARKER__1'; then
+  red "native smoke marker matcher does not enforce complete lines"
+  exit 1
+fi
+
+# Drive an interactive one-shot command under a real pty: feed $1 to its stdin, run it with the
+# remaining args, capture all output into PTY_OUT and set PTY_RC=0 only on a clean child exit. A child
+# that wedges past the deadline is SIGKILLed and always reaped. PTY_RC, not just output greps, is what
+# callers gate on.
 pty_session() {
   local input="$1"; shift
   set +e
@@ -84,10 +93,8 @@ else:
                 timed_out = False
                 break
             out += chunk
-            # A REPL must enter terminal raw mode before TAB is written. Its banner is stable while
-            # the prompt contains terminal control sequences. The wizard can accept input as soon
-            # as it emits its first prompt bytes.
-            ready = (len(argv) == 1 and b"Tapstate CLI." in out) or (len(argv) > 1)
+            # Interactive one-shot commands can accept input after their first prompt bytes.
+            ready = len(argv) > 1
             if ready and not input_sent:
                 time.sleep(0.05)
                 try:
@@ -117,6 +124,123 @@ else:
         sys.stderr.write(f"could not write CLI input: {write_failed}\n")
     clean = (write_failed is None) and (not timed_out) and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
     sys.exit(0 if clean else 1)
+PY
+)
+  PTY_RC=$?
+  set -e
+}
+
+# Drive the bare full-screen workbench through one lifecycle action. The child starts with a real
+# controlling terminal, every action is bounded, and terminal flags plus alternate-screen/cursor
+# transitions are reported as markers for the shell assertions below.
+workbench_session() {
+  local action="$1"; shift
+  set +e
+  PTY_OUT=$(TAPSTATE_BIN="$BINARY" TAPSTATE_PTY_ACTION="$action" python3 - "$@" <<'PY'
+import fcntl, os, pty, select, signal, struct, sys, termios, time
+
+binary = os.environ["TAPSTATE_BIN"]
+action = os.environ["TAPSTATE_PTY_ACTION"]
+argv = [binary] + sys.argv[1:]
+
+pid, fd = pty.fork()
+if pid == 0:
+    try:
+        time.sleep(0.05)                  # let the parent capture cooked attributes before Java starts
+        if action == "login":
+            os.environ.pop("TAPSTATE_PASSWORD", None)
+        if os.environ.get("TERM", "") in ("", "dumb"):
+            os.environ["TERM"] = "xterm-256color"
+        os.execv(binary, argv)
+    except Exception:
+        os._exit(127)
+
+rows, columns = ((53, 83) if action == "resize" else (24, 88))
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+before = termios.tcgetattr(fd)
+out = bytearray()
+acted = False
+password_sent = False
+deadline = time.time() + 15
+timed_out = True
+
+while time.time() < deadline:
+    readable, _, _ = select.select([fd], [], [], 0.25)
+    if readable:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            timed_out = False
+            break
+        if not chunk:
+            timed_out = False
+            break
+        out += chunk
+
+    if action == "login" and not password_sent and b"Password:" in out:
+        os.write(fd, b"smoke-pw\n")
+        password_sent = True
+
+    screen_ready = b"Tapstate workbench" in out
+    if action == "resize":
+        if not acted and b"Terminal size too small:" in out:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
+            os.kill(pid, signal.SIGWINCH)
+            acted = True
+        elif acted and screen_ready:
+            os.write(fd, b"q")
+            action = "resize-finished"
+        continue
+    if acted or not screen_ready:
+        continue
+    if action == "normal" or action == "login":
+        os.write(fd, b"q")
+        acted = True
+    elif action == "eof":
+        os.write(fd, b"\x04")
+        acted = True
+    elif action == "sigint":
+        os.kill(pid, signal.SIGINT)
+        acted = True
+    elif action == "sigterm":
+        os.kill(pid, signal.SIGTERM)
+        acted = True
+
+if timed_out:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+_, status = os.waitpid(pid, 0)
+try:
+    after = termios.tcgetattr(fd)
+except termios.error:
+    after = None
+try:
+    os.close(fd)
+except OSError:
+    pass
+
+def normalized(attributes):
+    value = list(attributes)
+    value[3] &= ~getattr(termios, "PENDIN", 0)
+    value[4] = 0
+    value[5] = 0
+    return value
+
+exit_status = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
+restored = after is not None and normalized(before) == normalized(after)
+expected_exit = exit_status == 0 if action != "sigterm" else exit_status != 0
+leave_alt = out.count(b"\x1b[?1049l")
+show_cursor = out.count(b"\x1b[?25h")
+sys.stdout.write(out.decode("utf-8", "replace"))
+sys.stdout.write(f"\n__TAPSTATE_PTY_EXIT__{exit_status}\n")
+sys.stdout.write(f"__TAPSTATE_PTY_RESTORED__{int(restored)}\n")
+sys.stdout.write(f"__TAPSTATE_PTY_LEAVE_ALT__{leave_alt}\n")
+sys.stdout.write(f"__TAPSTATE_PTY_SHOW_CURSOR__{show_cursor}\n")
+sys.stdout.flush()
+sys.exit(0 if acted and not timed_out and restored and expected_exit else 1)
 PY
 )
   PTY_RC=$?
@@ -285,22 +409,19 @@ else
   bad "explain did not return a documented node; output: $EXPLAIN_OUT"
 fi
 
-# --- 5. REPL under a real pty (JLine interactive loop) ------------------------------------------
-bold "[5] REPL — interactive loop under a pty (JLine)"
-# printf -v (not $(...)) so the trailing newline that submits `exit` survives — command substitution
-# would strip it, leaving the REPL waiting for Enter until the deadline.
-printf -v repl_in 'help\nvalidate %s\nexit\n' "$VALID_DIR"
-pty_session "$repl_in"
-# match on ANSI-stripped text: anchor `valid:` so it cannot be satisfied by the `valid:` inside
-# `invalid:` (a rejected validate must not pass as a success), and require a clean child exit.
-REPL_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
+# --- 5. bare workbench under a real pty ----------------------------------------------------------
+bold "[5] workbench — normal quit under a pty"
+workbench_session normal
+WORKBENCH_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && printf '%s' "$REPL_CLEAN" | grep -q "Tapstate CLI" \
-   && printf '%s' "$REPL_CLEAN" | grep -qE '(^|[^[:alpha:]])valid:' \
-   && printf '%s' "$REPL_CLEAN" | grep -q "bye"; then
-  ok "REPL banner + successful validate + clean exit (rc 0) observed over a pty"
+   && printf '%s' "$WORKBENCH_CLEAN" | grep -q "Tapstate workbench" \
+   && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_EXIT__0' \
+   && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_RESTORED__1' \
+   && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_LEAVE_ALT__1' \
+   && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_SHOW_CURSOR__1'; then
+  ok "bare workbench rendered, quit normally, and restored its terminal exactly once"
 else
-  bad "REPL pty session failed (rc=$PTY_RC) or missing expected markers; output:"; echo "$PTY_OUT"
+  bad "bare workbench normal-quit lifecycle failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
 fi
 
 # --- 6. new wizard under a real pty (JLinePrompter interactive flow) ----------------------------
@@ -341,31 +462,30 @@ else
   bad "-o yaml did not render the expected block mapping; explain: $YAML_EXPLAIN | validate: $YAML_VALIDATE"
 fi
 
-# --- 8. Tab completion under a pty (the JLine completer reachable in the image) ------------------
-# Feed `va` + TAB so the verb completer resolves it to `validate`, then a valid corpus dir + Enter.
-# `va` on its own is not a verb (it draws an "Unmatched argument" usage error), so a `valid:` result
-# can only mean the native JLine completer fired and completed `va`→`validate`. This is the only
-# native exercise of completion; the JVM unit suite covers the candidate logic itself.
-bold "[8] Tab completion — verb completer under a pty (JLine)"
-printf -v comp_in 'va\t %s\nexit\n' "$VALID_DIR"
-pty_session "$comp_in"
-COMP_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
-if (( PTY_RC == 0 )) \
-   && printf '%s' "$COMP_CLEAN" | grep -qE '(^|[^[:alpha:]])valid:' \
-   && ! printf '%s' "$COMP_CLEAN" | grep -q 'Unmatched argument'; then
-  ok "Tab completed 'va'→'validate' and ran it over a pty (completer reachable in the image)"
-else
-  bad "Tab completion pty session failed (rc=$PTY_RC) or did not complete 'va'→'validate'; output:"; echo "$PTY_OUT"
-fi
+# --- 8. remaining workbench lifecycle exits and resize ------------------------------------------
+bold "[8] workbench — EOF, signals, and resize under a pty"
+for lifecycle_action in eof sigint sigterm resize; do
+  workbench_session "$lifecycle_action"
+  expected_exit=0
+  [[ "$lifecycle_action" == "sigterm" ]] && expected_exit=-15
+  if (( PTY_RC == 0 )) \
+     && marker_line_is "$PTY_OUT" "__TAPSTATE_PTY_EXIT__${expected_exit}" \
+     && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_RESTORED__1' \
+     && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_LEAVE_ALT__1' \
+     && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_SHOW_CURSOR__1' \
+     && { [[ "$lifecycle_action" != "resize" ]] \
+          || printf '%s' "$PTY_OUT" | strip_ansi | grep -q 'Tapstate workbench'; }; then
+    ok "workbench $lifecycle_action restored cooked mode, cursor, and alternate screen"
+  else
+    bad "workbench $lifecycle_action lifecycle failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
+  fi
+done
 
-# --- 9. online register under a pty (HttpClient POST + Bearer + JSON reachable in the image) -----
-# Sections 1-8 never open a socket. register / discover-schema were added after the CLI online path was
-# last proven native, and register in particular POSTs a base64 jar body and parses a JSON registration —
-# code a missing reflection/resource entry would break only in the image. Stand up a throwaway loopback
-# stub (healthz + login + register) and drive connect -> login -> register end to end, so the whole
-# authenticated online path runs through the native binary. A stack frame here is an AOT fault, not a
-# coded outcome. The stub double-forks and publishes its port + pid to files, so there is no sleep race.
-bold "[9] online register — connect + login + register under a pty (HTTP path reachable in the image)"
+# --- 9. authenticated bare workbench under a pty ------------------------------------------------
+# Stand up a throwaway loopback stub, let the launch password prompt finish, and then enter the
+# workbench. The PTY markers prove the prompt owner did not overlap or leak into full-screen ownership.
+# The stub double-forks and publishes its port + pid to files, so there is no sleep race.
+bold "[9] authenticated workbench — password prompt closes before full-screen ownership"
 STUB_DIR="$(mktemp -d)"
 trap 'if [[ -f "$STUB_DIR/pid" ]]; then kill "$(cat "$STUB_DIR/pid")" 2>/dev/null || true; fi; rm -rf "$STUB_DIR"' EXIT
 printf 'PK\003\004smoke-jar' > "$STUB_DIR/smoke.jar"   # any bytes; the stub does not inspect the jar
@@ -425,18 +545,20 @@ srv.serve_forever()
 PY
 python3 "$STUB_DIR/stub.py" "$STUB_DIR/port" "$STUB_DIR/pid" "$STUB_DIR/events"
 STUB_PORT="$(cat "$STUB_DIR/port" 2>/dev/null || true)"
-printf -v online_in 'connect 127.0.0.1:%s\nlogin admin\nsmoke-pw\nregister %s\nexit\n' "$STUB_PORT" "$STUB_DIR/smoke.jar"
-pty_session "$online_in"
+workbench_session login -c "127.0.0.1:$STUB_PORT" -u admin
 ONLINE_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && [[ -n "$STUB_PORT" ]] \
-   && printf '%s' "$ONLINE_CLEAN" | grep -q "connected to 127.0.0.1:$STUB_PORT" \
-   && printf '%s' "$ONLINE_CLEAN" | grep -q "logged in as admin" \
-   && printf '%s' "$ONLINE_CLEAN" | grep -qE 'registered[[:space:]]+smoke' \
+   && printf '%s' "$ONLINE_CLEAN" | grep -q "Password:" \
+   && printf '%s' "$ONLINE_CLEAN" | grep -q "Tapstate workbench" \
+   && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_EXIT__0' \
+   && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_RESTORED__1' \
+   && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_LEAVE_ALT__1' \
+   && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_SHOW_CURSOR__1' \
    && ! printf '%s' "$ONLINE_CLEAN" | grep -qE '\.java:[0-9]+\)'; then
-  ok "connect + login + register ran end to end through the native binary (no AOT fault)"
+  ok "password prompt closed before the authenticated workbench took and restored the terminal"
 else
-  bad "online register pty session failed (rc=$PTY_RC, port=${STUB_PORT:-none}); output:"; echo "$PTY_OUT"
+  bad "authenticated workbench lifecycle failed (rc=$PTY_RC, port=${STUB_PORT:-none}); output:"; echo "$PTY_OUT"
 fi
 
 bold "[10] one-line launch — -c / -u reach the server without a session"
