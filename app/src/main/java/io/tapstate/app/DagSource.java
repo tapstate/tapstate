@@ -30,7 +30,9 @@ interface DagSource {
     DAG dagFor(String pipelineId);
 
     /**
-     * The state namespaces {@code pipelineId} keeps its operator state in, empty where it keeps none.
+     * The state namespaces {@code pipelineId} keeps its operator state in, empty where it keeps none. Every
+     * mechanism that keeps some, not one of them: a pipeline that both nests and joins is answered with
+     * both sets, and one that only joins is still answered.
      *
      * <p>Deliberately not a defaulted method. An implementation that quietly answered "none" would leave
      * every namespace it owns unrecorded, and nothing about that announces itself: the pipeline stops, the
