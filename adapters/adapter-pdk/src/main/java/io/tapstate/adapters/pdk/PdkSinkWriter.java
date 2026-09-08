@@ -74,6 +74,11 @@ final class PdkSinkWriter implements SinkWriter {
         this.createIndex = createIndex;
     }
 
+    /** The connector this writer drives, and the state scope it was opened under. */
+    PdkConnector connector() {
+        return connector;
+    }
+
     @Override
     public CompletionStage<WriteResult> write(List<Envelope> records) {
         return CompletableFuture.supplyAsync(() -> deliver(records));

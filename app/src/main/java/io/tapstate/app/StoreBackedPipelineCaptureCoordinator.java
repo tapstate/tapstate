@@ -379,6 +379,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 ? settings.startFrom() : "latest";
         String retention = source.srs() != null ? source.srs().retention() : null;
         return new CaptureRunSpec(
+                // Unscoped on purpose. The run scopes its own config to the pipeline and source it names,
+                // so the node a connector files its notes under is worked out in one place rather than
+                // here as well.
                 resolution.config(),
                 readMode,
                 resolution.srsKey(),

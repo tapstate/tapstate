@@ -184,7 +184,7 @@ public final class SnapshotPhase {
      * capture was configured with, and a read that changed any of it would be reading somewhere else.
      */
     private static CaptureConfig readOf(CaptureConfig config, String table) {
-        return new CaptureConfig(config.connectorId(), config.settings(), List.of(table));
+        return new CaptureConfig(config.connectorId(), config.settings(), List.of(table), config.node());
     }
 
     /**

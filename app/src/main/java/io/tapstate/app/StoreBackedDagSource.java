@@ -4,6 +4,7 @@ import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.core.common.TapstateException;
@@ -11,6 +12,7 @@ import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
@@ -209,43 +211,54 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * Where this pipeline's operator state is kept - every namespace a stop has to let go of. Its nests
-     * keep one per compiled vertex plus the one their shape was written down in; its joins keep the
-     * mirrors and the reverse index each join step is wired for. The record goes with the state it
-     * describes - kept behind, it would refuse the next start of a pipeline that has nothing left to
-     * abandon, naming paths that no longer address anything.
-     *
-     * <p>Both kinds, because both are inherited by whatever is applied under this id next, and neither
-     * says anything while it happens. A join's mirrors are the sharper case: they hold each dimension row
-     * as it last was, so a rebuilt run widens fresh driving rows with values the source no longer holds -
-     * a target that disagrees with its source, at full row count, with every column plausible.
+     * Where this pipeline keeps state: the namespaces its compiled nest and join vertices hold entries
+     * in, the nest-shape record, and each PDK connector's exact node namespace. Operator records go with
+     * the state they describe - kept behind, they would make the next use of this pipeline id inherit
+     * rows and shapes the current sources no longer hold.
      *
      * <p>The tree is compiled again here rather than remembered from the build, for the same reason the
      * build compiles it rather than reading it back: the names come from the tree, so the tree is what is
-     * asked. A pipeline that neither nests nor joins keeps nothing and is named nothing, which is what
-     * leaves an ordinary pipeline's stop untouched by any of this.
+     * asked. A pipeline with no nest or join has no operator-state holding, but still names connector
+     * state for its capture sources and sinks because those connectors can keep notes between runs.
      */
     @Override
     public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
-        PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
-        // Read off the wiring alone, so a stop still names them when the sources behind the query have
-        // gone undiscoverable. Asked first for that reason: what follows resolves source models.
-        Set<String> namespaces = new LinkedHashSet<>(PipelineDagBuilder.joinStateNamespaces(pipeline));
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        List<PipelineStateHolding> holdings = new ArrayList<>();
+
+        // Read joins off the wiring before resolving source models. A stop must still name their mirrors
+        // and reverse indexes when the sources behind the query have gone undiscoverable.
+        Set<String> operatorNamespaces = new LinkedHashSet<>(PipelineDagBuilder.joinStateNamespaces(pipeline));
         if (PipelineDagBuilder.hasNest(pipeline)) {
-            Map<String, NestTable> byAlias =
-                    nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
-            namespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
-            namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
+            Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+            operatorNamespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
+            operatorNamespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
         }
-        if (namespaces.isEmpty()) {
-            // Nothing kept, rather than a holding that names nowhere: a surface renders the labels it is
-            // handed, and one over an empty holding would tell a reader state is being cleared that this
-            // pipeline never had.
-            return List.of();
+        if (!operatorNamespaces.isEmpty()) {
+            holdings.add(PipelineStateInventory.OPERATOR_STATE.in(operatorNamespaces));
         }
-        // The label comes from the declaration rather than being written out here, so what a stop calls
-        // this and what a stop drops are one string rather than two that agree today.
-        return List.of(PipelineStateInventory.OPERATOR_STATE.in(namespaces));
+        holdings.add(PipelineStateInventory.CONNECTOR_STATE.in(connectorStateNamespaces(pipeline)));
+        return List.copyOf(holdings);
+    }
+
+    /**
+     * The exact PDK state namespaces the assembled pipeline can open: its capture sources and every sink
+     * the DAG builds. The PDK owns the namespace spelling, while this layer owns which pipeline nodes the
+     * runtime can open; combining the two keeps a stop's inventory identical to the runtime's identities.
+     */
+    private static Set<String> connectorStateNamespaces(PipelineResource pipeline) {
+        Set<String> namespaces = new LinkedHashSet<>();
+        pipeline.sources().forEach(source -> namespaces.add(
+                ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), source.id()))));
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            namespaces.add(ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), view.id())));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            serve.sync().forEach(sync -> namespaces.add(
+                    ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), syncNodeId(sync)))));
+        }
+        return namespaces;
     }
 
     private record SourceVertex(
@@ -562,7 +575,7 @@ final class StoreBackedDagSource implements DagSource {
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes),
                 StoreBackedDagSource::transformPort,
-                element -> sinkWriter(element, targets, serveStreams),
+                element -> sinkWriter(pipeline, element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> viewSink(pipeline, view, targets, viewStreams, sourceKeysById),
@@ -623,7 +636,8 @@ final class StoreBackedDagSource implements DagSource {
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
         return sinkWriterBinder.bind(
-                store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable);
+                store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
+                new PipelineNode(pipeline.id(), inline.id()));
     }
 
     /**
@@ -1270,11 +1284,29 @@ final class StoreBackedDagSource implements DagSource {
      * that runs the sink.
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
-            SyncElement element, Map<String, TargetTable> targets, Set<String> serveStreams) {
+            PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
+            Set<String> serveStreams) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
         return sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
-                TargetModelResolver.renameAll(targets, serveStreams, element.rename()));
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename()),
+                new PipelineNode(pipeline.id(), syncNodeId(element)));
+    }
+
+    /**
+     * What names a serve.sync element as a node of its pipeline: its own id, which authoring generates
+     * for an element that declares none and holds unique across everything a pipeline names inside
+     * itself. That uniqueness is what makes it usable as a node id at all — the ids of two sinks of one
+     * pipeline have to differ or their connectors share one set of notes.
+     *
+     * <p>The fall back to the source written to is for an artifact that reached the store without going
+     * through authoring, where the id is still what the model says it is: optional. It names something
+     * rather than leaving the sink with no node at all. Two id-less elements writing to one target would
+     * name the same node, which is why authoring generating the ids is what this rests on rather than
+     * the fallback.
+     */
+    private static String syncNodeId(SyncElement element) {
+        return element.id() != null && !element.id().isBlank() ? element.id() : element.source();
     }
 
     /**
@@ -1388,13 +1420,13 @@ final class StoreBackedDagSource implements DagSource {
 
         SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                TargetTable target);
+                TargetTable target, PipelineNode node);
 
         default SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                Map<String, TargetTable> targets) {
+                Map<String, TargetTable> targets, PipelineNode node) {
             return bind(connectorId, settings, writeMode, ddl,
-                    targets.size() == 1 ? targets.values().iterator().next() : null);
+                    targets.size() == 1 ? targets.values().iterator().next() : null, node);
         }
     }
 
@@ -1403,15 +1435,15 @@ final class StoreBackedDagSource implements DagSource {
         @Override
         public SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                TargetTable target) {
-            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, target);
+                TargetTable target, PipelineNode node) {
+            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, target, node);
         }
 
         @Override
         public SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                Map<String, TargetTable> targets) {
-            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, targets);
+                Map<String, TargetTable> targets, PipelineNode node) {
+            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, targets, node);
         }
     }
 }

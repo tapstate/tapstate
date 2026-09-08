@@ -48,6 +48,11 @@ public final class PipelineStateInventory {
             "what its operators had assembled, and the changes they could not assemble",
             PipelineStateHolding.Scope.PIPELINE);
 
+    /** What each connector opened for this pipeline kept for a later drive. */
+    public static final PipelineStateHolding CONNECTOR_STATE = PipelineStateHolding.named(
+            "what its connectors had kept for a later drive",
+            PipelineStateHolding.Scope.PIPELINE);
+
     /**
      * How far the pipeline's read had got and been confirmed -- what a resume starts from, and the one
      * thing a user notices at once when a stop clears it: the next run reads its whole source again.
@@ -71,7 +76,7 @@ public final class PipelineStateInventory {
             PipelineStateHolding.Scope.CHAIN);
 
     private static final List<PipelineStateHolding> VOCABULARY =
-            List.of(OPERATOR_STATE, RESUME_POSITION, CHAIN_RECORD);
+            List.of(OPERATOR_STATE, CONNECTOR_STATE, RESUME_POSITION, CHAIN_RECORD);
 
     /**
      * Every kind of state this product records about a running pipeline. What a surface says without a
