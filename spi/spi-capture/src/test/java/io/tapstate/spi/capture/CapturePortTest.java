@@ -8,12 +8,17 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 /**
  * The capture port seen through a stub implementation: proves the contract is implementable and
  * usable, and pins the read-side boundary (snapshot yields {@code r}; cdc yields row/ddl mutations)
  * plus the close semantics the port documents (idempotent, may close before draining).
+ *
+ * <p>It also pins the position surface: a cdc stream is told where to begin, and a snapshot batch hands
+ * out the seam its change tail has to resume from. Both used to sit outside these signatures, which left
+ * the caller synthesizing a position the source had never reported.
  */
 class CapturePortTest {
 
@@ -58,11 +63,31 @@ class CapturePortTest {
     }
 
     @Test
+    void snapshotHandsOutTheSeamItsChangeTailResumesFrom() {
+        StubCapture capture = new StubCapture();
+
+        try (CaptureBatch batch = capture.snapshot(CONFIG)) {
+            // Sampled when the batch opened, before its first row was read: a change made while the
+            // snapshot runs falls after this and is re-delivered rather than missed.
+            assertThat(batch.seam()).contains(new SourcePosition("binlog.000042:1000"));
+        }
+    }
+
+    @Test
+    void aSourceWithNoChangeStreamReportsNoSeam() {
+        try (CaptureBatch batch = new SnapshotOnlyCapture().snapshot(CONFIG)) {
+            assertThat(batch.seam()).isEmpty();
+        }
+    }
+
+    @Test
     void cdcDeliversMutationEventsToTheListenerAndReturnsAClosableSubscription() {
         StubCapture capture = new StubCapture();
         List<Op> delivered = new ArrayList<>();
 
-        Subscription subscription = capture.cdc(CONFIG, event -> delivered.add(event.op()));
+        Subscription subscription =
+                capture.cdc(CONFIG, CaptureStart.present(),
+                        (events, position) -> events.forEach(event -> delivered.add(event.op())));
 
         assertThat(delivered).containsExactly(Op.INSERT, Op.UPDATE, Op.DELETE, Op.DDL);
 
@@ -70,6 +95,20 @@ class CapturePortTest {
         subscription.close();
         // idempotent: two close() calls stop the stream once
         assertThat(capture.lastSubscription.stopRuns).isEqualTo(1);
+    }
+
+    @Test
+    void cdcIsToldWhereToBeginAndTheTwoStartsReachThePortAsThemselves() {
+        StubCapture capture = new StubCapture();
+
+        capture.cdc(CONFIG, CaptureStart.resume(new SourcePosition("gtid:9-17")), (event, position) -> { });
+        assertThat(capture.lastStart).isEqualTo(CaptureStart.resume(new SourcePosition("gtid:9-17")));
+
+        capture.cdc(CONFIG, CaptureStart.present(), (event, position) -> { });
+        assertThat(capture.lastStart)
+                .as("beginning at the present is what the caller asked for, not what an omitted "
+                        + "position decayed into inside the port")
+                .isEqualTo(CaptureStart.present());
     }
 
     @Test
@@ -91,11 +130,36 @@ class CapturePortTest {
     @Test
     void captureListenerIsAFunctionalInterface() {
         List<Envelope> collected = new ArrayList<>();
-        CaptureListener listener = collected::add;
+        CaptureListener listener = (events, position) -> collected.addAll(events);
 
-        listener.onEvent(Envelope.insert(1L, "orders", Map.of("id", 1), null));
+        listener.onBatch(List.of(Envelope.insert(1L, "orders", Map.of("id", 1), null)), Optional.empty());
 
         assertThat(collected).hasSize(1);
+    }
+
+    /**
+     * The run the source read arrives whole, with the one position it named for that run. Both halves are
+     * the contract: the position stands for the whole run and means "everything up to here has been
+     * handed over", which is untrue of any prefix of it; and the grouping is the source\'s own, so
+     * splitting it here would destroy the only thing that lets a recipient pay a per-act cost once per
+     * batch instead of once per change.
+     */
+    @Test
+    void deliversTheRunWholeWithTheOnePositionTheSourceNamedForIt() {
+        StubCapture capture = new StubCapture();
+        List<List<Op>> runs = new ArrayList<>();
+        List<Optional<SourcePosition>> positions = new ArrayList<>();
+
+        capture.cdc(CONFIG, CaptureStart.present(), (events, position) -> {
+            runs.add(events.stream().map(Envelope::op).toList());
+            positions.add(position);
+        });
+
+        assertThat(runs)
+                .as("one call per run the source handed over -- four calls would mean the batch was taken "
+                        + "apart on the way here, and nothing downstream could put it back together")
+                .containsExactly(List.of(Op.INSERT, Op.UPDATE, Op.DELETE, Op.DDL));
+        assertThat(positions).containsExactly(Optional.of(new SourcePosition("binlog.000042:1400")));
     }
 
     private static final DiscoveredSchema SCHEMA =
@@ -106,21 +170,28 @@ class CapturePortTest {
 
         RecordingBatch lastBatch;
         RecordingSubscription lastSubscription;
+        CaptureStart lastStart;
 
         @Override
         public CaptureBatch snapshot(CaptureConfig config) {
             lastBatch = new RecordingBatch(List.of(
                     Envelope.read(1L, "orders", Map.of("id", 1), null),
-                    Envelope.read(2L, "orders", Map.of("id", 2), null)).iterator());
+                    Envelope.read(2L, "orders", Map.of("id", 2), null)).iterator(),
+                    Optional.of(new SourcePosition("binlog.000042:1000")));
             return lastBatch;
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
-            listener.onEvent(Envelope.insert(10L, "orders", Map.of("id", 1), null));
-            listener.onEvent(Envelope.update(11L, "orders", Map.of("id", 1), Map.of("id", 1, "n", 2), null));
-            listener.onEvent(Envelope.delete(12L, "orders", Map.of("id", 1), null));
-            listener.onEvent(Envelope.ddl(13L, "orders", Map.of("added", "n")));
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            lastStart = start;
+            // One batch: the source names where it had read to once the whole batch is handed over, so
+            // the position belongs to the batch and to no change inside it.
+            listener.onBatch(List.of(
+                            Envelope.insert(10L, "orders", Map.of("id", 1), null),
+                            Envelope.update(11L, "orders", Map.of("id", 1), Map.of("id", 1, "n", 2), null),
+                            Envelope.delete(12L, "orders", Map.of("id", 1), null),
+                            Envelope.ddl(13L, "orders", Map.of("added", "n"))),
+                    Optional.of(new SourcePosition("binlog.000042:1400")));
             lastSubscription = new RecordingSubscription();
             return lastSubscription;
         }
@@ -136,14 +207,41 @@ class CapturePortTest {
         }
     }
 
+    /** A source with no change stream at all: it reads rows and there is nothing to stitch a tail to. */
+    private static final class SnapshotOnlyCapture implements CapturePort {
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            return new RecordingBatch(
+                    List.of(Envelope.read(1L, "orders", Map.of("id", 1), null)).iterator(), Optional.empty());
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            throw new UnsupportedOperationException("this source has no change stream");
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            return new ConnectionReport(SCHEMA, List.of());
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            return SCHEMA;
+        }
+    }
+
     /** Models an idempotent close: the underlying source is released at most once. */
     private static final class RecordingBatch implements CaptureBatch {
         private final Iterator<Envelope> delegate;
+        private final Optional<SourcePosition> seam;
         boolean closed;
         int releaseRuns;
 
-        RecordingBatch(Iterator<Envelope> delegate) {
+        RecordingBatch(Iterator<Envelope> delegate, Optional<SourcePosition> seam) {
             this.delegate = delegate;
+            this.seam = seam;
         }
 
         @Override
@@ -154,6 +252,11 @@ class CapturePortTest {
         @Override
         public Envelope next() {
             return delegate.next();
+        }
+
+        @Override
+        public Optional<SourcePosition> seam() {
+            return seam;
         }
 
         @Override

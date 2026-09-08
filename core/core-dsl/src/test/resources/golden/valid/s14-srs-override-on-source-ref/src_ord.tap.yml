@@ -1,0 +1,13 @@
+version: tapstate/v1
+kind: source
+id: src_ord
+connector: mysql
+config:
+  host: 10.40.0.4
+  password: Ord_2026
+  username: cdc_user
+mode: cdc
+tables: [orders]
+srs:
+  retention: 7d
+  schema_evolution: track

@@ -33,6 +33,13 @@ final class Vocabulary {
     static final SortedSet<String> LIFECYCLE_STEPS =
             sorted(LifecycleVerb.values(), LifecycleVerb::id);
 
+    /**
+     * Steps written on their own that the product spells with more than one verb. Kept apart from
+     * {@link #LIFECYCLE_STEPS} because that set is the product's verb enum and has to stay it: a
+     * word here is one a person types, not one the control plane exposes.
+     */
+    static final SortedSet<String> COMPOSED_STEPS = sorted(ComposedVerb.values(), ComposedVerb::word);
+
     /** Steps that carry a body. */
     static final SortedSet<String> BODIED_STEPS = sorted(StepKeyword.values(), StepKeyword::word);
 

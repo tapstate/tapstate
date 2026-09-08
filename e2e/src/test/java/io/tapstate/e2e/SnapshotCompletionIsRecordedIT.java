@@ -48,6 +48,7 @@ class SnapshotCompletionIsRecordedIT {
     private static final String TABLE = "orders";
 
     private static final String SRS_META = "srs_meta";
+    private static final String CONSUMERS = "consumerOffsets";
     private static final String COMPLETED = "snapshotCompletedTables";
 
     @TempDir
@@ -96,15 +97,41 @@ class SnapshotCompletionIsRecordedIT {
 
             // The example's own awaits are what establish the snapshot actually drained: it settles on a
             // count of rows that only a snapshot read produces. Asserting the mark before that would be
-            // asserting it of a phase still running.
+            // asserting it of a phase still running -- but it is not enough on its own either, because the
+            // rows land at the target strictly before the mark does. See awaitMarkedTables.
             new E2eExecutor(binding, new FilePipelineLoader(workspace), TIMEOUT, POLL).execute(envelope);
 
-            assertThat(completedTables(storeUri))
+            assertThat(awaitMarkedTables(storeUri))
                     .as("the table the drained snapshot marks complete, read out of the chain record by a "
                             + "reader that is not the product; the product resolved this name from the "
                             + "applied source, and the example is what declares it is %s", TABLE)
                     .contains(TABLE);
         }
+    }
+
+    /**
+     * Waits for the chain record to carry a snapshot-completion mark at all, and answers with every mark
+     * it found. The wait is deliberately not the assertion: <em>which</em> table is named is what this
+     * case discriminates, so that stays with the caller -- a mark under the wrong name ends this wait and
+     * fails there, which is where the message explaining it lives.
+     *
+     * <p>Why a wait is needed when the example has already settled. The mark is not written by the
+     * snapshot phase; it is written when the sink acknowledges the rows, and an acknowledgement is reaped
+     * on a later pass of the processor than the write it settles. The example's awaits end as soon as the
+     * rows are readable at the target, which is strictly earlier, so a single read here races a write that
+     * has not happened yet. Measured: the same commit passed one CI run and failed the other on this
+     * assertion, reading an empty list.
+     */
+    private static List<String> awaitMarkedTables(String storeUri) {
+        List<String> marked = new ArrayList<>();
+        Await.until("a snapshot-completion mark in the chain record",
+                () -> {
+                    marked.clear();
+                    marked.addAll(completedTables(storeUri));
+                    return !marked.isEmpty();
+                },
+                marked::toString);
+        return marked;
     }
 
     /**
@@ -117,9 +144,23 @@ class SnapshotCompletionIsRecordedIT {
             String database = new com.mongodb.ConnectionString(storeUri).getDatabase();
             List<String> tables = new ArrayList<>();
             for (Document chain : client.getDatabase(database).getCollection(SRS_META).find()) {
-                Object marked = chain.get(COMPLETED);
-                if (marked instanceof List<?> entries) {
-                    entries.forEach(entry -> tables.add(String.valueOf(entry)));
+                // Completion is recorded against the pipeline that confirmed it, under its own consumer
+                // entry -- a chain-level list would answer every pipeline on the chain with the first
+                // one's answer. This gathers every consumer's, which is what "was it recorded at all"
+                // asks; which pipeline marked it is asserted where two of them exist.
+                Object consumers = chain.get(CONSUMERS);
+                if (!(consumers instanceof Document byPipeline)) {
+                    continue;
+                }
+                for (String pipelineId : byPipeline.keySet()) {
+                    Object consumer = byPipeline.get(pipelineId);
+                    if (!(consumer instanceof Document record)) {
+                        continue;
+                    }
+                    Object marked = record.get(COMPLETED);
+                    if (marked instanceof List<?> entries) {
+                        entries.forEach(entry -> tables.add(String.valueOf(entry)));
+                    }
                 }
             }
             return tables;

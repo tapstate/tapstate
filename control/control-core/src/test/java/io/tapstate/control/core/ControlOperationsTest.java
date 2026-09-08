@@ -45,6 +45,8 @@ class ControlOperationsTest {
                         "pipeline.metrics",
                         "pipeline.snapshot",
                         "pipeline.logs",
+                        "pipeline.position",
+                        "pipeline.set-position",
                         "pipeline.derived-schema",
                         "pipeline.accept-derived-schema",
                         "user.create",
@@ -162,7 +164,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(39);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(41);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
@@ -180,6 +182,8 @@ class ControlOperationsTest {
     void mcpFaceIsTheOnlineAuthoringClosurePlusTheReadFaceAndRestExposureRemainsEmpty() {
         // The read face joins on the same terms as everything else here — a mark on the registry entry.
         // The three are read-scoped, so a caller holding no write capability still gets all three.
+        // pause / resume are here for the stop's sake: with only the clearing verb open, the answer it
+        // demands is a question with one available answer, and the caller on this face is a model.
         assertThat(registry.exposedOn(Frontend.MCP))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
@@ -189,8 +193,11 @@ class ControlOperationsTest {
                         "connection.test", "connection.test-result",
                         "connection.discover-schema", "connection.schema",
                         "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-                        "pipeline.start", "pipeline.stop", "pipeline.status",
+                        "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+                        "pipeline.status",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
+                        // Neither half of the resume-point pair is here: where to resume from turns on
+                        // the source's retention window, which nothing on this face can see.
                         "data-browser.collections", "data-browser.find", "data-browser.stats");
         // Deliberately the widest ceiling, not the shipped one: REST carries no operation at any stage,
         // which is a stronger statement than "none has reached the stage we ship".

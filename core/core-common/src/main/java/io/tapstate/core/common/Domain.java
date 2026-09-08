@@ -72,7 +72,13 @@ public enum Domain {
     MCP,
     // runtime data plane: reading a source's snapshot / cdc into the replay store — diagnosable
     // capture-configuration faults such as an unparsable consumption start point (runtime)
-    CAPTURE;
+    CAPTURE,
+    // the recorded point a pipeline's read of a chain resumes from, read out and written back:
+    // diagnosable refusals of a write-back — one aimed at a chain the pipeline does not read, one that
+    // would move a chain still being read, one that changed a reading rather than the resume point, and
+    // one that asks for no move at all. Distinct from CAPTURE, which owns what goes wrong when a run
+    // consumes a start point, and from MONITOR, which reports a run without ever setting anything
+    POSITION;
 
 
     /**

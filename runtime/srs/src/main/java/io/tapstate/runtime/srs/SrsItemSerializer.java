@@ -32,7 +32,7 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
 
     @Override
     public void write(ObjectDataOutput out, SrsItem item) throws IOException {
-        out.writeString(item.srcPos().token());
+        out.writeString(item.srcPos() == null ? null : item.srcPos().token());
         out.writeString(item.op().symbol());
         out.writeLong(item.ts());
         writeRow(out, item.before());
@@ -42,7 +42,8 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
 
     @Override
     public SrsItem read(ObjectDataInput in) throws IOException {
-        SourcePosition srcPos = new SourcePosition(in.readString());
+        String token = in.readString();
+        SourcePosition srcPos = token == null ? null : new SourcePosition(token);
         Op op = Op.fromSymbol(in.readString());
         long ts = in.readLong();
         Map<String, Object> before = readRow(in);

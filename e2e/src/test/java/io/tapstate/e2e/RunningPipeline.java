@@ -77,7 +77,7 @@ final class RunningPipeline {
 
     /** Drives a stop and waits for the runtime to report it has reached rest. */
     void stopAndSettle() {
-        control.lifecycle(pipelineId, LifecycleVerb.STOP);
+        control.stop(pipelineId, true);
         Await.until(
                 pipelineId + " to reach " + PipelineState.STOPPED,
                 () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
