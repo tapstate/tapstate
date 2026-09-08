@@ -43,7 +43,18 @@ public enum IoError implements TapstateErrorCode {
      * newer grammar, or a document missing a field this version requires. {@code id} is the stored
      * document's id.
      */
-    DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id"));
+    DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id")),
+
+    /**
+     * A document a store operation had to write is larger than the store will accept. {@code id} is
+     * the document's id, or {@code unknown} where the failing call did not name one.
+     *
+     * <p>Distinct from {@link #STORE_UNAVAILABLE} because nothing is wrong with the store and
+     * retrying cannot help: what has to change is how much is being put in one document. The two were
+     * one code until a size failure was found reaching callers as "a store operation could not
+     * complete", which sends whoever reads it to check a store that is healthy.
+     */
+    DOCUMENT_TOO_LARGE("io.document-too-large", Set.of("id"));
 
     private final String code;
     private final Set<String> placeholders;

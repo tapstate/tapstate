@@ -91,9 +91,10 @@ class MongoDerivedSchemaStoreIT {
     }
 
     @Test
-    void oneStepsWriteDoesNotEatAnothersInTheSameDocument() {
-        // Both steps live in one document, so writing one is a read-modify-write over the other's
-        // history. Losing the neighbour would look exactly like a step that was never recorded.
+    void oneStepsWriteDoesNotEatAnothersHistory() {
+        // The two steps hold documents of their own, which is what the count pins: were they ever
+        // merged back into one, writing either would be a read-modify-write over the other's history,
+        // and losing the neighbour would look exactly like a step that was never recorded.
         withStore((store, collection) -> {
             store.record("wide", "widen", columns("id", "INT64 NOT NULL"), "sql-a", "src-v1", "calcite");
             store.record("wide", "enrich", columns("name", "STRING NULL"), "sql-b", "src-v1", "calcite");
@@ -102,7 +103,7 @@ class MongoDerivedSchemaStoreIT {
             assertThat(store.latest("wide", "enrich").orElseThrow().schema())
                     .containsExactly(Map.entry("name", "STRING NULL"));
             assertThat(store.latest("wide", "widen").orElseThrow().version()).isEqualTo(1L);
-            assertThat(collection.countDocuments()).isEqualTo(1);
+            assertThat(collection.countDocuments()).isEqualTo(2);
         });
     }
 
@@ -157,6 +158,109 @@ class MongoDerivedSchemaStoreIT {
                         assertThat(error.code().code()).isEqualTo("io.document-unreadable");
                         assertThat(error.args()).containsEntry("id", "wide");
                     });
+        });
+    }
+
+    /**
+     * A pipeline of ordinary size cannot record its steps' schemas, because every step it has shares one
+     * document and therefore one 16MB ceiling.
+     *
+     * <p>Five steps, each a 1000-column table recorded over forty shape changes, is roughly 3.7MB per
+     * step - comfortably storable on its own - and roughly 18MB once the five share a document. Measured
+     * 2026-09-08: the write fails partway through the fifth step, at the 170th record.
+     *
+     * <p><b>What fails is the write, so the failure is permanent.</b> The ceiling is not slowness: once
+     * the document is at the cap no further shape change can be recorded for any step of that pipeline,
+     * and a start that derives a new shape fails at this store every time it is tried. Nothing shrinks
+     * the document back.
+     *
+     * <p>This is red until the record is split so that a step's history is stored per
+     * {@code (pipelineId, stepId)} rather than per pipeline. It stays honest about what that split buys:
+     * each step here is well under the cap, so the split is what this case needs and nothing more. A
+     * single step whose own history passes 16MB is a different, still-open ceiling - the version history
+     * is append-only with no bound - and no case here claims otherwise.
+     */
+    @Test
+    void aPipelinesStepsDoNotShareOneDocumentCeiling() {
+        withStore((store, collection) -> {
+            for (int step = 0; step < 5; step++) {
+                for (int version = 0; version < 40; version++) {
+                    store.record("wide", "step_" + step, wideColumns(1000, version),
+                            "sql-v" + version, "src-v" + version, "calcite-1.40.0");
+                }
+            }
+
+            // The last step recorded is the one that proves the pipeline got all the way through; a
+            // partial write leaves the earlier steps readable, so reading step 0 would pass regardless.
+            assertThat(store.latest("wide", "step_4")).isPresent();
+        });
+    }
+
+    /** A table wide enough to be worth storing, with the column names an author actually writes. */
+    private static Map<String, String> wideColumns(int columns, int generation) {
+        Map<String, String> schema = new LinkedHashMap<>();
+        for (int i = 0; i < columns; i++) {
+            schema.put("customer_shipping_address_line_detail_" + i + "_g" + generation,
+                    "DECIMAL(18,4) NOT NULL");
+        }
+        return schema;
+    }
+
+    /** One stored version, in the shape a step's history holds. */
+    private static Document version(int number, String column, String type, String statement) {
+        return new Document("version", number)
+                .append("columns", List.of(new Document("name", column).append("type", type)))
+                .append("statement", statement)
+                .append("derivedFrom", "src-v1")
+                .append("derivedBy", "calcite");
+    }
+
+    /**
+     * A pipeline still held in the superseded one-document-per-pipeline shape keeps every version it
+     * had, both when it is read and when it is next written.
+     *
+     * <p>This history is the baseline a drift report is compared against, so it cannot be rebuilt by
+     * re-deriving: a re-derivation produces today's shape and knows nothing of the ones before it.
+     * Answering "never recorded" over such a pipeline would silently reset that baseline and report
+     * the next genuine change as the first one - which is why the move happens rather than a discard.
+     */
+    @Test
+    void aPipelineHeldInTheSupersededDocumentKeepsItsHistoryWhenNextWritten() {
+        withStore((store, collection) -> {
+            collection.insertOne(new Document("_id", "legacy").append("steps", List.of(
+                    new Document("step", "widen").append("versions", List.of(
+                            version(0, "id", "INT64 NOT NULL", "sql-a"),
+                            version(1, "id", "DECIMAL NOT NULL", "sql-b"))),
+                    new Document("step", "enrich").append("versions", List.of(
+                            version(0, "name", "STRING NULL", "sql-c"))))));
+
+            // Reading alone must already see it, before anything has moved it across.
+            assertThat(store.latest("legacy", "widen").orElseThrow().version()).isEqualTo(1L);
+
+            store.record("legacy", "widen", columns("id", "STRING NULL"), "sql-d", "src-v9", "calcite");
+
+            // Version 2, not version 0: the new shape continues the history rather than restarting it.
+            assertThat(store.latest("legacy", "widen").orElseThrow().version()).isEqualTo(2L);
+            // The step that was not written came across as well - moving only the step being recorded
+            // would strand the others the moment the old document was removed.
+            assertThat(store.latest("legacy", "enrich").orElseThrow().schema())
+                    .containsExactly(Map.entry("name", "STRING NULL"));
+            assertThat(collection.find(new Document("_id", "legacy")).first()).isNull();
+        });
+    }
+
+    @Test
+    void deletingAPipelineAlsoRemovesWhatItHeldInTheSupersededDocument() {
+        withStore((store, collection) -> {
+            collection.insertOne(new Document("_id", "legacy").append("steps", List.of(
+                    new Document("step", "widen").append("versions",
+                            List.of(version(0, "id", "INT64 NOT NULL", "sql-a"))))));
+
+            store.delete("legacy");
+
+            // The superseded document keys on the pipeline id itself, which is outside the range the
+            // split keys occupy; a drop that only swept that range would leave it behind for good.
+            assertThat(collection.countDocuments()).isZero();
         });
     }
 

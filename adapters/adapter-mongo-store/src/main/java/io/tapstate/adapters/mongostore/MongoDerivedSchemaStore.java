@@ -16,15 +16,24 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * The MongoDB side record of the columns a pipeline step works out for itself: one document per
- * pipeline, keyed by the pipeline id (as {@code _id}), carrying one entry per step and, within it, that
- * step's append-only version history.
+ * The MongoDB side record of the columns a pipeline step works out for itself: one document per step,
+ * keyed by {@code <pipelineId>.<stepId>} (as {@code _id}), carrying that step's append-only version
+ * history.
  *
- * <p><b>Why one document per pipeline and not one per step.</b> Both questions this store is asked are
- * then answered by the {@code _id} alone - reading one step's latest, and dropping everything a removed
- * pipeline recorded - so it needs no index beyond the one every collection already has. A document per
- * step would key on the pair, which leaves the drop querying a field the {@code _id} index cannot serve,
- * and this store has no way to create an index of its own.
+ * <p><b>Why a step per document, and why the key is compound.</b> A pipeline's steps used to share one
+ * document, which put a pipeline's entire recorded history - every step, every version, every column -
+ * under MongoDB's 16MB per-document limit. Measured 2026-09-08, five steps of a 1000-column table
+ * recorded over forty shape changes crossed it, at which point no further shape could be recorded for
+ * any step of that pipeline and nothing shrank the document back. Splitting per step is what removes
+ * that shared ceiling.
+ *
+ * <p>The key is compound rather than a plain step id because both questions this store is asked still
+ * have to be served by the {@code _id} index, this module having no way to create an index of its own:
+ * reading one step's latest is an exact {@code _id} lookup, and dropping everything a removed pipeline
+ * recorded is a range over the {@code _id} prefix {@code <pipelineId>.}. A pipeline id cannot itself
+ * contain a dot - the parser refuses one, the dot being the reserved addressing separator - so the
+ * first dot always separates the two halves and no two (pipeline, step) pairs can collide on one key.
+ * That invariant is load-bearing enough to be checked here rather than assumed.
  *
  * <p><b>Why steps and columns are arrays rather than sub-document keys.</b> A step id and a column name
  * are author-chosen text, and BSON field names cannot hold a dot. Keying by them would work until the
@@ -32,8 +41,8 @@ import java.util.Optional;
  * than anywhere a message could name the cause.
  *
  * <p><b>The read-modify-write is deliberate and its race is benign.</b> {@link #record} reads the
- * document to work out the next version, so two starts of one pipeline racing here could have one
- * overwrite the other. Both are deriving the same step from the same stored inputs, so they compute the
+ * step's document to work out the next version, so two starts of one pipeline racing here could have
+ * one overwrite the other. Both are deriving the same step from the same stored inputs, so they compute the
  * same schema; and a start that derived a <em>different</em> schema is refused before it reaches this
  * store, never recorded. What the race can lose is one provenance refresh, which the next start redoes.
  *
@@ -43,6 +52,13 @@ import java.util.Optional;
  * reconstructing.
  */
 public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
+
+    /**
+     * The one character that separates a pipeline id from a step id inside a key. A pipeline id cannot
+     * contain it, so the first occurrence always splits the two; a step id may (a source node's step id
+     * is {@code <sourceId>.<table>}), which is why the split is by first occurrence and not by last.
+     */
+    private static final char SEPARATOR = '.';
 
     private final MongoCollection<Document> collection;
 
@@ -54,7 +70,7 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
     public Optional<DerivedSchema> latest(String pipelineId, String stepId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(stepId, "stepId");
-        List<DerivedSchema> versions = versionsOf(read(pipelineId), pipelineId, stepId);
+        List<DerivedSchema> versions = stepVersions(pipelineId, stepId);
         return versions.isEmpty() ? Optional.empty() : Optional.of(versions.get(versions.size() - 1));
     }
 
@@ -64,8 +80,12 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(stepId, "stepId");
         Objects.requireNonNull(schema, "schema");
-        Document document = read(pipelineId);
-        List<DerivedSchema> versions = new ArrayList<>(versionsOf(document, pipelineId, stepId));
+        // A write is the moment a pipeline still stored in the superseded shape is moved over, so that
+        // the history it already has - which is the baseline every drift report is compared against - is
+        // carried rather than restarted. A re-derivation could rebuild the latest version but not the
+        // ones before it, and those are the record of what this step used to produce.
+        migrateLegacyDocument(pipelineId);
+        List<DerivedSchema> versions = new ArrayList<>(stepVersions(pipelineId, stepId));
         DerivedSchema last = versions.isEmpty() ? null : versions.get(versions.size() - 1);
         if (last != null && last.schema().equals(schema)) {
             // Same shape: the provenance is refreshed in place so the next difference stays attributable,
@@ -76,39 +96,82 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
             versions.add(new DerivedSchema(
                     last == null ? 0L : last.version() + 1, schema, statement, derivedFrom, derivedBy));
         }
-        StoreIo.run(() -> collection.replaceOne(
-                new Document("_id", pipelineId),
-                withStep(document, pipelineId, stepId, versions),
-                new ReplaceOptions().upsert(true)));
+        writeStep(pipelineId, stepId, versions);
     }
 
     @Override
     public void delete(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        // deleteOne on a missing _id removes nothing and reports so without failing, which is the no-op a
-        // pipeline that recorded nothing is meant to be.
+        // Every key this pipeline owns starts with "<pipelineId>." and none of another pipeline's does,
+        // so the half-open range from that prefix up to the next character serves the drop off the _id
+        // index. The pipeline's own id is deleted alongside it: that is where a record written before the
+        // split still lives, and leaving it would strand the one document this drop exists to remove.
+        String prefix = pipelineId + SEPARATOR;
+        Document ownedKeys = new Document("$gte", prefix).append("$lt", pipelineId + (char) (SEPARATOR + 1));
+        StoreIo.run(() -> collection.deleteMany(
+                new Document("$or", List.of(
+                        new Document("_id", ownedKeys),
+                        new Document("_id", pipelineId)))));
+    }
+
+    /**
+     * The key one step's document is stored under.
+     *
+     * <p>A pipeline id carrying the separator would make the key ambiguous - {@code ("a.b", "c")} and
+     * {@code ("a", "b.c")} would name one document and each would read the other's history. The parser
+     * refuses such an id, so reaching here with one is a defect in whatever built it rather than
+     * anything an author can cause, and it crashes bare rather than being reported as a store failure.
+     */
+    private static String key(String pipelineId, String stepId) {
+        if (pipelineId.indexOf(SEPARATOR) >= 0) {
+            throw new IllegalArgumentException(
+                    "pipelineId must not contain '" + SEPARATOR + "': " + pipelineId);
+        }
+        return pipelineId + SEPARATOR + stepId;
+    }
+
+    /** One step's version history, oldest first; empty where the step has none. */
+    private List<DerivedSchema> stepVersions(String pipelineId, String stepId) {
+        Document document = read(key(pipelineId, stepId));
+        if (document != null) {
+            return toVersions(document.get("versions"), pipelineId);
+        }
+        // Nothing under the split key: a pipeline written before the split still has this step inside its
+        // single document, and answering "never recorded" over it would silently reset the drift baseline
+        // rather than report a difference.
+        return versionsOf(read(pipelineId), pipelineId, stepId);
+    }
+
+    /**
+     * Rewrites a pipeline still held as one document into a document per step, then removes it. Does
+     * nothing for a pipeline already split, which is every pipeline after its first write.
+     */
+    private void migrateLegacyDocument(String pipelineId) {
+        Document legacy = read(pipelineId);
+        if (legacy == null) {
+            return;
+        }
+        for (Document step : stepsOf(legacy, pipelineId)) {
+            String stepId = requireString(step.get("step"), pipelineId);
+            writeStep(pipelineId, stepId, toVersions(step.get("versions"), pipelineId));
+        }
         StoreIo.run(() -> collection.deleteOne(new Document("_id", pipelineId)));
     }
 
-    private Document read(String pipelineId) {
-        return StoreIo.call(() -> collection.find(new Document("_id", pipelineId)).first());
-    }
-
-    /** The stored document with this step's history replaced; every other step is carried through. */
-    private static Document withStep(Document document, String pipelineId, String stepId,
-            List<DerivedSchema> versions) {
-        List<Document> steps = new ArrayList<>();
-        for (Document step : stepsOf(document, pipelineId)) {
-            if (!stepId.equals(requireString(step.get("step"), pipelineId))) {
-                steps.add(step);
-            }
-        }
+    private void writeStep(String pipelineId, String stepId, List<DerivedSchema> versions) {
         List<Document> stored = new ArrayList<>();
         for (DerivedSchema version : versions) {
             stored.add(toDocument(version));
         }
-        steps.add(new Document("step", stepId).append("versions", stored));
-        return new Document("_id", pipelineId).append("steps", steps);
+        String key = key(pipelineId, stepId);
+        StoreIo.run(key, () -> collection.replaceOne(
+                new Document("_id", key),
+                new Document("_id", key).append("versions", stored),
+                new ReplaceOptions().upsert(true)));
+    }
+
+    private Document read(String id) {
+        return StoreIo.call(() -> collection.find(new Document("_id", id)).first());
     }
 
     static Document toDocument(DerivedSchema version) {
@@ -122,7 +185,10 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
                 .append("derivedBy", version.derivedBy());
     }
 
-    /** The step entries of a stored document; empty for an absent document. */
+    /**
+     * The step entries of a document in the superseded one-per-pipeline shape; empty for an absent
+     * document. Read only where a pipeline written before the split is being served or moved over.
+     */
     private static List<Document> stepsOf(Document document, String pipelineId) {
         if (document == null) {
             return List.of();
@@ -144,7 +210,7 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
         return out;
     }
 
-    /** One step's version history, oldest first; empty where the pipeline or the step has none. */
+    /** One step's history out of a superseded one-per-pipeline document; empty where it has none. */
     private static List<DerivedSchema> versionsOf(Document document, String pipelineId, String stepId) {
         for (Document step : stepsOf(document, pipelineId)) {
             if (stepId.equals(requireString(step.get("step"), pipelineId))) {

@@ -300,6 +300,9 @@ io.store-unauthorized:
 io.document-unreadable:
   message: "A stored document with id '{id}' could not be read back."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."
+io.document-too-large:
+  message: "The record for '{id}' no longer fits in one stored document."
+  solution: "The store is healthy and retrying will not help. Reduce what is held under this one id."
 connector.not-official:
   message: "Runtime registration supports these connectors today: {official}. '{connector}' is not among them yet."
   solution: "Register one of the connectors listed above. The supported set grows as connectors complete certification, so an artifact refused here is not necessarily faulty."

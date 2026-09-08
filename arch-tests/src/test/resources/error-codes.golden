@@ -143,6 +143,7 @@ engine.frontier-order-not-encodable
 engine.frontier-pinned
 engine.job-failed
 engine.no-such-job
+io.document-too-large
 io.document-unreadable
 io.store-unauthorized
 io.store-unavailable

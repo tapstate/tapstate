@@ -14,15 +14,34 @@ import io.tapstate.spi.store.SourceTable;
 import org.bson.Document;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
- * The MongoDB discovered-schema store: stores the discovery envelope for a connection as one
- * structured document keyed by the connection's id — the connector id and discovery time it reports,
- * and the source model's tables (with their fields, primary key and indexes) as nested sub-documents.
+ * The MongoDB discovered-schema store: stores the discovery envelope for a connection as an envelope
+ * document keyed by the connection's id — the connector id and discovery time it reports — plus one
+ * document per table, keyed {@code <connectionId>.<generation>.<tableName>}, carrying that table's
+ * fields, primary key and indexes.
+ *
+ * <p><b>Why a table per document.</b> The whole envelope used to be one document, which put every
+ * table a connection has under MongoDB's 16MB per-document limit. Measured 2026-09-08 the ceiling
+ * falls at roughly 150,000 columns summed across the connection - 1500 tables of 120 columns does not
+ * fit - and a connection over it cannot be discovered at all, which makes it unusable rather than
+ * slow. Neither dimension has to be remarkable, so no author looking at their own tables would see it
+ * coming.
+ *
+ * <p><b>Why a generation, and why the envelope is written last.</b> A re-discovery has to become
+ * visible all at once: a reader that saw half of one discovery and half of the previous one would be
+ * told a table has columns it does not have, and would refuse or accept an expression on that basis.
+ * With the tables spread over many documents there is no single write that replaces them, so each
+ * discovery writes its tables under a fresh generation - invisible, because nothing points at them -
+ * and then names that generation in the envelope. That last step is a one-document write, so a reader
+ * sees the whole discovery or none of it. Superseded generations are swept afterwards; a run that
+ * dies before the sweep leaves documents nothing reads, and the next discovery removes them.
  *
  * <p>The envelope is a fixed shape of plain scalars and lists, so it is mapped field by field rather
  * than through a generic value normalization; on read the driver's {@code Document} / list values are
@@ -43,8 +62,17 @@ public final class MongoSchemaStore implements SchemaStore {
      */
     static final String MODEL_VERSION = "modelVersion";
 
-    /** The model this build writes and reads: source types resolved onto the tapstate namespace. */
-    static final int RESOLVED_TYPES = 1;
+    /**
+     * The model this build writes and reads: source types resolved onto the tapstate namespace, with
+     * the tables held as documents of their own rather than inline.
+     *
+     * <p>Bumped when the tables moved out of the envelope. A document written by the previous build
+     * carries its tables inline and names no generation, so reading it through the current path would
+     * find no tables and report an empty database - a wrong answer in the shape of a right one.
+     * Answering "not discovered" instead is the same migration this stamp already performed once: a
+     * re-discovery writes the current shape, and nothing here is data a re-discovery cannot rebuild.
+     */
+    static final int RESOLVED_TYPES = 2;
 
     private final MongoCollection<Document> collection;
 
@@ -52,15 +80,44 @@ public final class MongoSchemaStore implements SchemaStore {
         this.collection = Objects.requireNonNull(collection, "collection");
     }
 
+    /** The field naming which discovery a stored table belongs to; absent on the envelope itself. */
+    static final String GENERATION = "generation";
+
+    /**
+     * The one character separating the parts of a table key. A connection id cannot contain it, so the
+     * connection's own documents are exactly the keys in {@code [<id>., <id>/)} and no other
+     * connection's fall in that range. A table name may contain it and never needs splitting back out:
+     * the name is stored as a field of its own.
+     */
+    private static final char SEPARATOR = '.';
+
     @Override
     public void save(DiscoveredSourceModel discovered) {
         Objects.requireNonNull(discovered, "discovered");
-        // Upsert by the connection id (the document _id): the stored form is a full replacement, so a
-        // re-discovery of the same connection overwrites in place rather than accumulating documents.
+        String connectionId = discovered.connectionId();
+        String generation = UUID.randomUUID().toString();
+        List<Document> tables = new ArrayList<>();
+        List<SourceTable> model = discovered.model().tables();
+        for (int order = 0; order < model.size(); order++) {
+            SourceTable table = model.get(order);
+            tables.add(tableDocument(table)
+                    .append("_id", tableKey(connectionId, generation, table.name()))
+                    .append(GENERATION, generation)
+                    // Discovery order is part of what was stored and read back, so it is carried
+                    // explicitly: documents come back in key order, which is table-name order.
+                    .append("order", order));
+        }
+        if (!tables.isEmpty()) {
+            StoreIo.run(connectionId, () -> collection.insertMany(tables));
+        }
+        // The flip. Until this lands the tables above are unreachable, and after it the previous
+        // generation's are; being one document write, no reader can observe a mixture of the two.
         StoreIo.run(() -> collection.replaceOne(
-                new Document("_id", discovered.connectionId()),
-                toDocument(discovered),
+                new Document("_id", connectionId),
+                envelope(discovered, generation),
                 new ReplaceOptions().upsert(true)));
+        StoreIo.run(() -> collection.deleteMany(new Document("_id", ownedKeys(connectionId))
+                .append(GENERATION, new Document("$ne", generation))));
     }
 
     @Override
@@ -75,7 +132,50 @@ public final class MongoSchemaStore implements SchemaStore {
         if (document == null || !carriesResolvedTypes(document)) {
             return Optional.empty();
         }
-        return Optional.of(toDiscovered(document));
+        return Optional.of(toDiscovered(document, storedTables(connectionId, document)));
+    }
+
+    /**
+     * The stored table documents of a connection's current discovery, in the order they were
+     * discovered. An envelope carrying the current stamp but naming no generation is corrupt: the two
+     * are written together.
+     */
+    private List<Document> storedTables(String connectionId, Document envelope) {
+        String generation = envelope.getString(GENERATION);
+        if (generation == null) {
+            throw unreadable(connectionId);
+        }
+        List<Document> tables = new ArrayList<>();
+        StoreIo.run(() -> collection
+                .find(new Document("_id", ownedKeys(connectionId)).append(GENERATION, generation))
+                .forEach(tables::add));
+        tables.sort(Comparator.comparingInt(table -> order(table, connectionId)));
+        return tables;
+    }
+
+    /** Where a stored table sat in the discovery; an unreadable position is corruption, not zero. */
+    private static int order(Document table, String connectionId) {
+        if (!(table.get("order") instanceof Number number)) {
+            throw unreadable(connectionId);
+        }
+        return number.intValue();
+    }
+
+    /** The half-open {@code _id} range holding every table document a connection owns. */
+    private static Document ownedKeys(String connectionId) {
+        if (connectionId.indexOf(SEPARATOR) >= 0) {
+            // Such an id would make one connection's range overlap another's. The parser refuses one,
+            // so arriving here with it is a defect in whatever built it rather than an author's doing.
+            throw new IllegalArgumentException(
+                    "connectionId must not contain '" + SEPARATOR + "': " + connectionId);
+        }
+        return new Document("$gte", connectionId + SEPARATOR)
+                .append("$lt", connectionId + (char) (SEPARATOR + 1));
+    }
+
+    private static String tableKey(String connectionId, String generation, String tableName) {
+        ownedKeys(connectionId);
+        return connectionId + SEPARATOR + generation + SEPARATOR + tableName;
     }
 
     /**
@@ -89,22 +189,19 @@ public final class MongoSchemaStore implements SchemaStore {
     }
 
     /**
-     * Maps a discovery envelope to its stored document: the connection id as {@code _id}, the model
-     * version stamp, the connector id and discovery time as scalars, and the model's tables as a field.
+     * Maps a discovery to its envelope document: the connection id as {@code _id}, the model version
+     * stamp, the connector id and discovery time as scalars, and the generation whose table documents
+     * make up this discovery. The tables themselves are documents of their own.
      */
-    static Document toDocument(DiscoveredSourceModel discovered) {
-        List<Document> tables = new ArrayList<>();
-        for (SourceTable table : discovered.model().tables()) {
-            tables.add(tableDocument(table));
-        }
+    static Document envelope(DiscoveredSourceModel discovered, String generation) {
         return new Document("_id", discovered.connectionId())
                 .append(MODEL_VERSION, RESOLVED_TYPES)
                 .append("connectorId", discovered.connectorId())
                 .append("discoveredAt", discovered.discoveredAt())
-                .append("tables", tables);
+                .append(GENERATION, generation);
     }
 
-    private static Document tableDocument(SourceTable table) {
+    static Document tableDocument(SourceTable table) {
         List<Document> fields = new ArrayList<>();
         for (SourceField field : table.fields()) {
             // The document holds both type namespaces, so each key names the one it carries. The declared
@@ -147,16 +244,16 @@ public final class MongoSchemaStore implements SchemaStore {
         return TapstateType.UNKNOWN;
     }
 
-    /** Reconstructs a discovery envelope from its stored document, or fails coded when the shape is unreadable. */
-    static DiscoveredSourceModel toDiscovered(Document document) {
-        String id = document.getString("_id");
-        String connectorId = document.getString("connectorId");
+    /** Reconstructs a discovery from its envelope and its table documents, or fails coded when unreadable. */
+    static DiscoveredSourceModel toDiscovered(Document envelope, List<Document> storedTables) {
+        String id = envelope.getString("_id");
+        String connectorId = envelope.getString("connectorId");
         if (connectorId == null) {
             throw unreadable(id);
         }
-        long discoveredAt = discoveredAt(document, id);
+        long discoveredAt = discoveredAt(envelope, id);
         List<SourceTable> tables = new ArrayList<>();
-        for (Document table : documentList(document.get("tables"), id)) {
+        for (Document table : storedTables) {
             tables.add(toTable(table, id));
         }
         return new DiscoveredSourceModel(id, connectorId, discoveredAt, new SourceModel(tables));
