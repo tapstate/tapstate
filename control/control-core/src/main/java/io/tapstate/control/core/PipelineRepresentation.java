@@ -96,7 +96,10 @@ public final class PipelineRepresentation {
                     serve(input.serve()),
                     settings(input.settings()),
                     copyJson(input.experimental()));
-        } catch (IllegalArgumentException error) {
+        } catch (RuntimeException error) {
+            if (error instanceof TapstateException diagnostic) {
+                throw diagnostic;
+            }
             throw malformed(error.getMessage());
         }
     }
@@ -870,7 +873,8 @@ public final class PipelineRepresentation {
     }
 
     private static TapstateException malformed(String reason) {
-        return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", reason), null);
+        String detail = reason == null || reason.isBlank() ? "invalid pipeline payload" : reason;
+        return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", detail), null);
     }
 
     private static final class SetOf {
