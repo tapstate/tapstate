@@ -61,10 +61,12 @@ import java.util.concurrent.atomic.LongAdder;
  * </ul>
  *
  * <p><b>Two things sit outside the clock on purpose</b>, both large enough to bury the operator: rows
- * are built before the clock starts, and every scenario runs twice with the second reported, so what is
- * timed is compiled rather than interpreted. The large-bucket scenarios build theirs as they load them
- * instead of holding the whole corpus, which is the same thing - their clock covers one later edit, so
- * no generator can reach it either way.
+ * are built before the clock starts, and each single-arm scenario runs twice with the second reported.
+ * A comparison warms both arms, then brackets the carrier with heap samples and prints its local
+ * ratio. A second pass alone does not remove scheduling noise: raw rows remain raw observations,
+ * and repeating one scenario may still produce a wide spread on a busy machine. The large-bucket
+ * scenarios build theirs as they load them instead of holding the whole corpus, which is the same
+ * thing - their clock covers one later edit, so no generator can reach it either way.
  *
  * <p><b>What the cold layer here is.</b> A map in this heap, so a read through it is a hash lookup
  * rather than a network round trip. That makes the <em>trip counts</em> real and the <em>cold latency
@@ -158,8 +160,13 @@ class JoinBenchRun {
                 + System.getProperty(Knob.PARTITIONS, "271 (default)")
                 + " delivery=" + DELIVERY + " " + sizes);
         System.out.println(Result.header());
+        List<Arm> selected = arms(System.getProperty(Knob.ARMS, "carrier"));
         for (String name : scenarios(want)) {
-            for (Arm arm : arms(System.getProperty(Knob.ARMS, "carrier"))) {
+            if (selected.size() == 2) {
+                compare(name, tier, sizes);
+                continue;
+            }
+            for (Arm arm : selected) {
                 // Twice, reporting the second: the first is the interpreter, and reporting it would be
                 // measuring the JVM's warm-up rather than the operator.
                 run(name, tier, sizes, arm);
@@ -167,6 +174,43 @@ class JoinBenchRun {
                 System.out.flush();
             }
         }
+    }
+
+    /** Raw single-arm rows remain observations; a comparison gets a local control on both sides. */
+    private static void compare(String name, String tier, Sizes sizes) {
+        int warmups = "F1".equals(name) || "F2".equals(name) ? JoinBenchComparison.HEAP_WARMUPS : 1;
+        for (int i = 0; i < warmups; i++) {
+            run(name, tier, sizes, Arm.HEAP);
+        }
+        run(name, tier, sizes, Arm.CARRIER);
+        List<Result> controls = new ArrayList<>();
+        List<Result> carriers = new ArrayList<>();
+        var comparison = JoinBenchComparison.measure(() -> {
+            Result result = run(name, tier, sizes, Arm.HEAP);
+            controls.add(result);
+            return result.timing();
+        }, () -> {
+            Result result = run(name, tier, sizes, Arm.CARRIER);
+            carriers.add(result);
+            return result.timing();
+        }, JoinBenchComparison.CONTROL_SAMPLES);
+        Result carrier = carriers.getFirst();
+        for (Result control : controls) {
+            if (!control.workShape().equals(carrier.workShape())) {
+                throw new AssertionError("the control and carrier reached the state differently: "
+                        + control.workShape() + " / " + carrier.workShape());
+            }
+            if (control.timing().equals(comparison.before())
+                    || control.timing().equals(comparison.after())) {
+                System.out.println(control.row());
+            }
+        }
+        System.out.println(carrier.row());
+        System.out.printf(java.util.Locale.ROOT,
+                "# comparison %s/%s ratio=%.3f carrierMs=%.3f controlMs=%.3f%n",
+                name, tier, comparison.ratio(), carrier.nanos() / 1e6,
+                comparison.controlNanos() / 1e6);
+        System.out.flush();
     }
 
     private static List<Arm> arms(String want) {
@@ -217,7 +261,7 @@ class JoinBenchRun {
         rig.feed(facts);
         long nanos = System.nanoTime() - began;
 
-        return rig.result("F1", "1:1 narrow, dims then facts", nanos, sizes.dims());
+        return rig.result("F1", "1:1 narrow, dims then facts", began, nanos, sizes.dims());
     }
 
     /** The same, at a low fan-out and on the fifty-column row the throughput baseline was taken on. */
@@ -234,7 +278,7 @@ class JoinBenchRun {
         rig.feed(factRows);
         long nanos = System.nanoTime() - began;
 
-        return rig.result("F2", "1:" + sizes.fanout() + " wide, dims then facts", nanos, facts);
+        return rig.result("F2", "1:" + sizes.fanout() + " wide, dims then facts", began, nanos, facts);
     }
 
     // ---------------------------------------------------------------- incremental
@@ -357,7 +401,7 @@ class JoinBenchRun {
         rig.feed(work);
         long nanos = System.nanoTime() - began;
 
-        return rig.result("R1", "rebuild 1:" + sizes.fanout() + ", " + edits + " edits", nanos,
+        return rig.result("R1", "rebuild 1:" + sizes.fanout() + ", " + edits + " edits", began, nanos,
                 (long) edits * sizes.fanout());
     }
 
@@ -374,7 +418,7 @@ class JoinBenchRun {
         rig.feed(List.of(shape.dimensionRename(0)));
         long nanos = System.nanoTime() - began;
 
-        return rig.result("R2", "rebuild 1:" + sizes.wideFanout() + ", one edit", nanos,
+        return rig.result("R2", "rebuild 1:" + sizes.wideFanout() + ", one edit", began, nanos,
                 sizes.wideFanout());
     }
 
@@ -404,7 +448,7 @@ class JoinBenchRun {
         // Key 0 is one of the edited ones and carries its ordinary share as well as the large bucket.
         long rows = (long) edits * sizes.fanout() + sizes.wideFanout();
         return rig.result("R3", (edits - 1) + " x 1:" + sizes.fanout() + " + 1 x 1:"
-                + (sizes.wideFanout() + sizes.fanout()), nanos, rows);
+                + (sizes.wideFanout() + sizes.fanout()), began, nanos, rows);
     }
 
     /**
@@ -422,7 +466,7 @@ class JoinBenchRun {
         rig.feed(shape.dimensionReads(1));
         long nanos = System.nanoTime() - began;
 
-        return rig.result("R4", sizes.wideFanout() + " miss rows turn to matches", nanos,
+        return rig.result("R4", sizes.wideFanout() + " miss rows turn to matches", began, nanos,
                 sizes.wideFanout());
     }
 
@@ -463,7 +507,7 @@ class JoinBenchRun {
         }
 
         return rig.result("R5", sizes.batches() + " edits outside a 1:" + sizes.wideFanout()
-                + " projection; the paired arm rebuilt " + rebuilt, nanos, 0);
+                + " projection; the paired arm rebuilt " + rebuilt, began, nanos, 0);
     }
 
     // ---------------------------------------------------------------- the rig
@@ -618,16 +662,17 @@ class JoinBenchRun {
             settle();
             long[] each = new long[work.size()];
             long total = 0;
+            long firstBegan = System.nanoTime();
             for (int b = 0; b < work.size(); b++) {
                 long began = System.nanoTime();
                 feed(work.get(b));
                 each[b] = System.nanoTime() - began;
                 total += each[b];
             }
-            return result(name, note, total, expected).withBatches(each);
+            return result(name, note, firstBegan, total, expected).withBatches(each);
         }
 
-        private Result result(String name, String note, long nanos, long expected) {
+        private Result result(String name, String note, long began, long nanos, long expected) {
             long rows = emitted();
             if (rows != expected) {
                 throw new AssertionError(name + " emitted " + rows + " rows where the scenario is "
@@ -638,7 +683,7 @@ class JoinBenchRun {
             checkTierBit(name, resident, written);
             return new Result(name, tier, note, nanos, rows, cold.trips.sum(), cold.keys.sum(),
                     cold.breakdown(), resident, written, stores.batchReads, stores.singleReads,
-                    stores.keysRead, stores.writes);
+                    stores.keysRead, stores.writes, began + nanos / 2);
         }
 
         /**
@@ -1075,18 +1120,26 @@ class JoinBenchRun {
      */
     record Result(String scenario, String tier, String note, long nanos, long rows, long trips,
                   long coldKeys, String tripsWhere, long resident, long written,
-                  int batchReads, int singleReads, long keysRead, int writes, long[] batches) {
+                  int batchReads, int singleReads, long keysRead, int writes, long midpoint, long[] batches) {
 
         Result(String scenario, String tier, String note, long nanos, long rows, long trips,
                 long coldKeys, String tripsWhere, long resident, long written, int batchReads,
-                int singleReads, long keysRead, int writes) {
+                int singleReads, long keysRead, int writes, long midpoint) {
             this(scenario, tier, note, nanos, rows, trips, coldKeys, tripsWhere, resident, written,
-                    batchReads, singleReads, keysRead, writes, null);
+                    batchReads, singleReads, keysRead, writes, midpoint, null);
         }
 
         Result withBatches(long[] each) {
             return new Result(scenario, tier, note, nanos, rows, trips, coldKeys, tripsWhere, resident,
-                    written, batchReads, singleReads, keysRead, writes, each);
+                    written, batchReads, singleReads, keysRead, writes, midpoint, each);
+        }
+
+        String workShape() {
+            return batchReads + "/" + singleReads + "/" + keysRead + "/" + writes;
+        }
+
+        JoinBenchComparison.Timing timing() {
+            return new JoinBenchComparison.Timing(nanos, midpoint);
         }
 
         static String header() {

@@ -37,7 +37,8 @@ import static org.assertj.core.api.Assertions.fail;
  *       measured in the same JVM in the same run. Never as a wall clock: this repository has measured
  *       the same tree at 6.9 seconds in CI and over 60 seconds on a developer machine, so an absolute
  *       threshold is either slack enough to catch nothing or tight enough to redden on a busy runner.
- *       The ratio divides the machine out.
+ *       Controls immediately before and after each carrier sample track local changes in machine
+ *       cost. They cannot cancel a change that affects only one arm.
  * </ul>
  *
  * <p><b>The counts are the sharp half and the ratio is the blunt one, and it is worth knowing which is
@@ -129,7 +130,11 @@ class JoinPerformanceGateTest {
     private static final double MARGIN = 1.6;
 
     /**
-     * How many samples each arm takes, and why the two numbers differ by so much.
+     * Three carrier trials, each bracketed by eight heap samples on either side.
+     * The fastest control on each side removes brief disturbances; interpolation at the carrier's
+     * timed midpoint follows smooth local drift. The selected ratio keeps its own controls.
+     *
+     * <p>The sample counts were originally measured as follows.
      *
      * <p><b>They are set from the spread each arm was measured to have, not from a guess.</b> Over eight
      * samples in each of three separate JVMs, the carrier's smallest was 413, 391 and 391 milliseconds -
@@ -144,12 +149,12 @@ class JoinPerformanceGateTest {
      * saved where they are not.
      *
      * <p>Both are constants rather than properties. The recorded ratio is only a number about this
-     * pair, and a flag that changed either would leave the golden describing a measurement nobody is
-     * making any more, while still comparing against it.
+     * measurement, and a flag that changed either would leave the golden describing a measurement
+     * nobody is making any more, while still comparing against it.
      */
     private static final int CARRIER_SAMPLES = 3;
 
-    private static final int HEAP_SAMPLES = 8;
+    private static final int HEAP_SAMPLES = JoinBenchComparison.CONTROL_SAMPLES;
 
     /**
      * Heap samples run and thrown away before the timed ones start.
@@ -191,7 +196,7 @@ class JoinPerformanceGateTest {
      * leaving the old numbers would compare today's warm floor against yesterday's warm-up state,
      * which is the defect this removes.
      */
-    private static final int HEAP_WARMUPS = 200;
+    private static final int HEAP_WARMUPS = JoinBenchComparison.HEAP_WARMUPS;
 
     @Test
     void theOperatorStillReadsAndCostsWhatItIsRecordedTo() throws IOException {
@@ -202,7 +207,7 @@ class JoinPerformanceGateTest {
         Map<String, String> golden = readGolden();
         List<String> complaints = new ArrayList<>();
 
-        System.out.println("# joinperf carrierSamples=" + CARRIER_SAMPLES + " heapSamples="
+        System.out.println("# joinperf carrierSamples=" + CARRIER_SAMPLES + " heapSamplesPerSide="
                 + HEAP_SAMPLES + " " + SIZES);
         System.out.println(String.join("\t", "joinperf", "scenario", "tier", "batchReads",
                 "singleReads", "keysRead", "writes", "ratio", "carrierMs", "heapMs", "coldTrips",
@@ -234,56 +239,46 @@ class JoinPerformanceGateTest {
     // ---------------------------------------------------------------- measuring
 
     /**
-     * Runs one row.
-     *
-     * <p>The smallest of the samples is what a ratio is taken from rather than the mean. A sample can
-     * only be made slower by what else the machine was doing, never faster, so the least disturbed of
-     * them is the one closest to what the operator costs; averaging mixes in whatever else the runner
-     * had queued. The first sample is the interpreter's and is discarded by the same rule without
-     * having to be named.
+     * Take the smallest locally controlled ratio, keeping that carrier's counters and timing.
+     * Controls run before and after every carrier, including the untimed rows whose counts are
+     * asserted. Their timed midpoints exclude member setup and shutdown. Independent minima from
+     * two separate blocks would combine clocks from different machine conditions.
      */
     private static Measured measure(String scenario, String tier, List<String> complaints) {
         boolean timed = TIMED.contains(scenario);
-        long heapNanos = Long.MAX_VALUE;
-        long carrierNanos = Long.MAX_VALUE;
-        JoinBenchRun.Result carrier = null;
-        JoinBenchRun.Result heap = null;
+        List<JoinBenchRun.Result> observed = new ArrayList<>();
+        List<JoinBenchRun.Result> carriers = new ArrayList<>();
+        List<JoinBenchComparison> comparisons = new ArrayList<>();
 
         for (int i = 0; timed && i < HEAP_WARMUPS; i++) {
             JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.HEAP);
         }
-        for (int i = 0; i < (timed ? HEAP_SAMPLES : 1); i++) {
-            heap = JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.HEAP);
-            heapNanos = Math.min(heapNanos, heap.nanos());
-        }
         for (int i = 0; i < (timed ? CARRIER_SAMPLES : 1); i++) {
-            JoinBenchRun.Result each = JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.CARRIER);
-            carrierNanos = Math.min(carrierNanos, each.nanos());
-            if (carrier != null && !shape(carrier).equals(shape(each))) {
-                complaints.add(scenario + "/" + tier + ": two runs of the same scenario reached the "
-                        + "state differently - " + shape(carrier) + " then " + shape(each) + ". A "
-                        + "number that moves between runs cannot be recorded, and this gate records it");
+            comparisons.add(JoinBenchComparison.measure(() -> {
+                var heap = JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.HEAP);
+                observed.add(heap);
+                return heap.timing();
+            }, () -> {
+                var carrier = JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.CARRIER);
+                observed.add(carrier);
+                carriers.add(carrier);
+                return carrier.timing();
+            }, timed ? HEAP_SAMPLES : 1));
+        }
+
+        // Every sample must do the same work, including controls that were not selected. Otherwise
+        // a faster but incomplete arm could silently become the reference clock.
+        String expected = observed.getFirst().workShape();
+        for (JoinBenchRun.Result each : observed) {
+            if (!each.workShape().equals(expected)) {
+                complaints.add(scenario + "/" + tier + ": samples reached the state differently - "
+                        + expected + " then " + each.workShape() + ". The counts must be the operator's, "
+                        + "independent of the arm and of the sample's position");
             }
-            carrier = each;
         }
-
-        // The counts are meant to be the operator's own, so the two arms must agree on them. If they
-        // ever do not, the number is a property of the store and nothing recorded about it means what
-        // this gate says it means - which is worth a red of its own rather than a quietly weaker
-        // assertion. It is also the only thing here that would notice the heap arm having stopped
-        // running the same scenario as the carrier one.
-        if (!shape(heap).equals(shape(carrier))) {
-            complaints.add(scenario + "/" + tier + ": the two arms reach the state differently - heap "
-                    + shape(heap) + ", carrier " + shape(carrier) + ". The counts this gate holds are "
-                    + "supposed to be the operator's, and a store cannot be allowed to move them");
-        }
-        return new Measured(carrier, carrierNanos, heapNanos);
-    }
-
-    /** batchReads/singleReads/keysRead/writes - the whole of how one run reached its state. */
-    private static String shape(JoinBenchRun.Result result) {
-        return result.batchReads() + "/" + result.singleReads() + "/" + result.keysRead() + "/"
-                + result.writes();
+        JoinBenchComparison best = JoinBenchComparison.best(comparisons);
+        return new Measured(carriers.get(comparisons.indexOf(best)), best.carrier().nanos(),
+                best.controlNanos());
     }
 
     // ---------------------------------------------------------------- judging
@@ -297,10 +292,10 @@ class JoinPerformanceGateTest {
         }
         String[] want = recorded.split("\t");
         String wantShape = want[2] + "/" + want[3] + "/" + want[4] + "/" + want[5];
-        if (!wantShape.equals(shape(measured.carrier))) {
+        if (!wantShape.equals(measured.carrier.workShape())) {
             complaints.add(scenario + "/" + tier + ": the operator reaches its state differently now - "
                     + "recorded " + wantShape + " (batchReads/singleReads/keysRead/writes), measured "
-                    + shape(measured.carrier) + ". A rise in singleReads is the operator having gone "
+                    + measured.carrier.workShape() + ". A rise in singleReads is the operator having gone "
                     + "back to asking one key at a time; a rise in batchReads with the same keysRead is "
                     + "it asking in smaller pages; a rise in writes is it doing more work per row");
         }
@@ -359,10 +354,10 @@ class JoinPerformanceGateTest {
 
     // ---------------------------------------------------------------- what one row measured
 
-    private record Measured(JoinBenchRun.Result carrier, long carrierNanos, long heapNanos) {
+    private record Measured(JoinBenchRun.Result carrier, long carrierNanos, double heapNanos) {
 
         private double ratio() {
-            return carrierNanos / (double) heapNanos;
+            return carrierNanos / heapNanos;
         }
 
         private double carrierMs() {
