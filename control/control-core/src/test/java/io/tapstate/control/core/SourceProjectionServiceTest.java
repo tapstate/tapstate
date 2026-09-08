@@ -327,7 +327,8 @@ class SourceProjectionServiceTest {
     private static final class EmptySrsMetaStore implements SrsMetaStore {
         @Override public Optional<SrsMeta> read(String miningChainId) { return Optional.empty(); }
         @Override public void create(String miningChainId, String retention) { }
-        @Override public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) { }
+        @Override public void advanceSourceReadOffset(String miningChainId, ChainPosition sourceReadOffset) { }
+        @Override public void rewindSourceReadOffset(String miningChainId, String token) { }
         @Override public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) { }
         @Override public void advanceConsumerReadSeq(
                 String miningChainId, String pipelineId, String table, long lastReadSeq) { }
@@ -335,8 +336,9 @@ class SourceProjectionServiceTest {
         @Override public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) { }
         @Override public long openEpoch(String miningChainId) { return 0; }
         @Override public void appendSchemaVersion(String miningChainId, SchemaVersion version) { }
-        @Override public void markSnapshotComplete(String miningChainId, String table) { }
+        @Override public void markSnapshotComplete(String miningChainId, String pipelineId, String table) { }
         @Override public List<String> miningChainIdsWithConsumer(String pipelineId) { return List.of(); }
         @Override public void detachConsumer(String miningChainId, String pipelineId) { }
+        @Override public void dropChain(String miningChainId) { }
     }
 }

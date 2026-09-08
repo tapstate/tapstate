@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 
 import java.util.ArrayList;
@@ -64,7 +65,8 @@ public final class PipelineViewService {
 
     private List<PipelineSourceSummary> sourceSummaries(PipelineResource pipeline) {
         List<PipelineSourceSummary> summaries = new ArrayList<>(pipeline.sources().size());
-        for (String sourceId : pipeline.sources()) {
+        for (SourceRef sourceRef : pipeline.sources()) {
+            String sourceId = sourceRef.id();
             StoredResource stored = artifacts.getResource(sourceId)
                     .orElseThrow(() -> inconsistentSourceReference(pipeline.id(), sourceId));
             if (!(stored.resource() instanceof SourceResource source)) {

@@ -120,6 +120,18 @@ class ApplyServiceTest {
         assertThat(stored("orders_src")).contains("enabled: false");
     }
 
+    @Test
+    void typedReplaceAlsoRefusesToTurnTheReplayStoreOffWhileAReaderIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+        Resource replacement = new DslParser().parse(UNBUFFERED_SRC);
+
+        assertThatThrownBy(() -> guarded.replace(
+                "author", replacement, CanonicalHash.of(stored("orders_src"))))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
     /** A cdc source whose changes are buffered through the shared replay store. */
     private static final String BUFFERED_SRC = """
             version: tapstate/v1
@@ -127,7 +139,7 @@ class ApplyServiceTest {
             id: orders_src
             connector: mysql
             mode: cdc
-            config: { host: 10.30.0.5, username: writer, password: My_2026 }
+            config: { host: 10.30.0.5, database: orders, username: writer, password: My_2026 }
             tables: [orders]
             srs: { enabled: true }
             """;

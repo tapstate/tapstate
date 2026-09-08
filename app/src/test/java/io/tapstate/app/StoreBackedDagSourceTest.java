@@ -343,7 +343,7 @@ class StoreBackedDagSourceTest {
                 SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
-                "multi_subset", null, List.of("multi_src"), null, null,
+                "multi_subset", null, List.of(SourceRef.bare("multi_src")), null, null,
                 new ServeBlock.Inline(
                         "serve",
                         FromClause.list(

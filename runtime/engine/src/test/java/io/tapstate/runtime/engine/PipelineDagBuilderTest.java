@@ -62,7 +62,7 @@ class PipelineDagBuilderTest {
     void one_serve_sink_accepts_multiple_explicit_source_table_references() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("src"),
+                List.of(SourceRef.bare("src")),
                 null,
                 null,
                 new ServeBlock.Inline(

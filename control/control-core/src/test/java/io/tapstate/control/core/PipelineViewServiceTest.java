@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -156,7 +157,9 @@ class PipelineViewServiceTest {
     }
 
     private static PipelineResource pipeline(String id, List<String> sourceIds) {
-        return new PipelineResource(id, null, sourceIds, null, null, null, null, null);
+        return new PipelineResource(id, null,
+                sourceIds.stream().map(sourceId -> (SourceRef) SourceRef.bare(sourceId)).toList(),
+                null, null, null, null, null);
     }
 
     private static final class ReadOnlyArtifactStore implements ArtifactStore {

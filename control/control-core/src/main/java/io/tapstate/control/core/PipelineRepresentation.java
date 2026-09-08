@@ -22,6 +22,7 @@ import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Settings;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
@@ -58,7 +59,8 @@ public final class PipelineRepresentation {
         Objects.requireNonNull(pipeline, "pipeline");
         Objects.requireNonNull(contentHash, "contentHash");
         Objects.requireNonNull(sourceSummaries, "sourceSummaries");
-        if (!pipeline.sources().equals(sourceSummaries.stream().map(PipelineSourceSummary::id).toList())) {
+        if (!pipeline.sources().stream().map(SourceRef::id).toList()
+                .equals(sourceSummaries.stream().map(PipelineSourceSummary::id).toList())) {
             throw new IllegalArgumentException("source summaries must match declared pipeline source references");
         }
         return new PipelineView(
@@ -85,7 +87,9 @@ public final class PipelineRepresentation {
         return new PipelineResource(
                 input.id(),
                 input.metadata(),
-                copyStrings(input.sources(), "sources"),
+                copyStrings(input.sources(), "sources").stream()
+                        .map(id -> (SourceRef) SourceRef.bare(id))
+                        .toList(),
                 transforms(input.transforms()),
                 view(input.view()),
                 serve(input.serve()),

@@ -1,20 +1,35 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.DdlPolicy;
+import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.ErrorPolicy;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.Metadata;
+import io.tapstate.core.model.NestOrder;
+import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.PushElement;
+import io.tapstate.core.model.PushFormat;
+import io.tapstate.core.model.QueryElement;
+import io.tapstate.core.model.QueryType;
 import io.tapstate.core.model.ReadMode;
+import io.tapstate.core.model.RenameCase;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Settings;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
+import io.tapstate.core.model.Storage;
+import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
-import io.tapstate.core.model.RenameSpec;
-import io.tapstate.core.model.SyncElement;
-import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.ViewSchema;
+import io.tapstate.core.model.WriteMode;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -29,6 +44,220 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PipelineRepresentationTest {
 
     private final PipelineRepresentation representation = new PipelineRepresentation();
+
+    @Test
+    void mapsTheCompleteEditorPayloadToTheCanonicalPipelineModel() {
+        Map<String, Object> mapFields = new LinkedHashMap<>();
+        mapFields.put("removed", false);
+        mapFields.put("customer_id", "$id");
+        mapFields.put("total", "=price * quantity");
+        mapFields.put("region", Map.of("code", "EU", "priority", List.of(1, 2)));
+
+        Map<String, Object> nestRoot = Map.of(
+                "from", "orders",
+                "key", List.of("id"),
+                "mode", "upsert",
+                "track_key_changes", true,
+                "embed", List.of(Map.of(
+                        "from", "lines",
+                        "on", Map.of("order_id", "id"),
+                        "as", "array",
+                        "path", "lines",
+                        "array_key", List.of("line_id"),
+                        "ignore_updates", false,
+                        "track_key_changes", true,
+                        "embed", List.of(Map.of(
+                                "from", "products",
+                                "on", Map.of("sku", "sku"),
+                                "as", "object",
+                                "path", "product")))));
+
+        PipelineInput input = new PipelineInput(
+                "orders_sync",
+                new Metadata(Map.of("team", "analytics"), "Orders"),
+                List.of("mysql_orders", "postgres_customers"),
+                List.of(
+                        Map.of(
+                                "id", "shared_cleanup",
+                                "use", "cleanup",
+                                "from", "orders",
+                                "options", Map.of("strict", true)),
+                        Map.of(
+                                "id", "scripted",
+                                "type", "js",
+                                "from", List.of("shared_cleanup"),
+                                "body", Map.of("script", "return event;"),
+                                "experimental", Map.of("preview", true)),
+                        Map.of(
+                                "id", "projected",
+                                "type", "map",
+                                "from", Map.of("refs", List.of(Map.of("ref", "scripted"))),
+                                "fields", mapFields),
+                        Map.of(
+                                "id", "active",
+                                "type", "filter",
+                                "from", "/orders_.*/",
+                                "expr", "status == 'active'"),
+                        Map.of(
+                                "id", "combined",
+                                "type", "union",
+                                "from", List.of("active", Map.of("pattern", "archive_.*"))),
+                        Map.of(
+                                "id", "nested",
+                                "type", "nest",
+                                "from", Map.of("orders", "combined", "lines", "order_lines", "products", "products"),
+                                "primaryKey", "id",
+                                "order", "sub_first",
+                                "entriesInMemory", 250,
+                                "max_elements_per_document", 500,
+                                "root", nestRoot),
+                        Map.of(
+                                "id", "joined",
+                                "type", "join",
+                                "from", Map.of("orders", "nested", "customers", "customers"),
+                                "engine", "BUILTIN",
+                                "sql", "select * from orders join customers")),
+                Map.of(
+                        "from", Map.of("ref", "joined"),
+                        "primaryKey", "id",
+                        "storage", Map.of(
+                                "hot", Map.of("ttl", "15m"),
+                                "warm", Map.of("collection", "orders", "indexes", List.of("customer_id")),
+                                "cold", Map.of("partitionBy", List.of("region"))),
+                        "schema", Map.of("enforce", true, "evolution", "additive")),
+                Map.of(
+                        "from", List.of("view", "/backfill_.*/"),
+                        "sync", List.of(Map.of(
+                                "id", "warehouse",
+                                "source", "mongodb_target",
+                                "write_mode", "append",
+                                "rename", Map.of(
+                                        "map", Map.of("orders", "orders_v2"),
+                                        "case", "upper",
+                                        "prefix", "tap_",
+                                        "suffix", "_archive"),
+                                "ddl", "apply",
+                                "options", Map.of("ordered", true))),
+                        "query", List.of(
+                                Map.of("type", "rest", "backend", "warehouse"),
+                                Map.of("type", "MCP")),
+                        "push", List.of(
+                                Map.of(
+                                        "id", "events",
+                                        "source", "kafka_target",
+                                        "topic", "orders",
+                                        "format", "=event.after",
+                                        "options", Map.of("acks", "all")),
+                                Map.of(
+                                        "source", "audit_target",
+                                        "format", Map.of("id", "$order_id", "deleted", false)))),
+                Map.of(
+                        "errorPolicy", "dead_letter",
+                        "batch_size", 500,
+                        "parallelism", 4,
+                        "schedule", "0 2 * * *",
+                        "readMode", "CDC_ONLY",
+                        "start_from", "earliest"),
+                Map.of("preview", List.of("orders")));
+
+        PipelineResource model = representation.toModel(input, null);
+
+        assertThat(model.id()).isEqualTo("orders_sync");
+        assertThat(model.sources()).containsExactly(
+                SourceRef.bare("mysql_orders"), SourceRef.bare("postgres_customers"));
+        assertThat(model.transforms()).containsExactly(
+                Step.use("shared_cleanup", "cleanup", FromClause.list(FromRef.literal("orders")),
+                        Map.of("strict", true)),
+                Step.inline("scripted", FromClause.list(FromRef.literal("shared_cleanup")),
+                        new TransformBody.Js("return event;"), null, Map.of("preview", true)),
+                Step.inline("projected", FromClause.list(FromRef.literal("scripted")),
+                        new TransformBody.MapProjection(Map.of(
+                                "removed", FieldRule.drop(),
+                                "customer_id", FieldRule.rename("id"),
+                                "total", FieldRule.computed("price * quantity"),
+                                "region", FieldRule.literal(Map.of("code", "EU", "priority", List.of(1, 2))))),
+                        null, null),
+                Step.inline("active", FromClause.list(FromRef.regex("orders_.*")),
+                        new TransformBody.Filter("status == 'active'"), null, null),
+                Step.inline("combined", FromClause.list(FromRef.literal("active"), FromRef.regex("archive_.*")),
+                        new TransformBody.Union(), null, null),
+                Step.inline("nested", FromClause.aliases(Map.of(
+                                "orders", FromRef.literal("combined"),
+                                "lines", FromRef.literal("order_lines"),
+                                "products", FromRef.literal("products"))),
+                        new TransformBody.Nest(
+                                "id", NestOrder.SUB_FIRST, 250, 500,
+                                new NestRoot(
+                                        "orders", List.of("id"), "upsert", true,
+                                        List.of(new Embed(
+                                                "lines", Map.of("order_id", "id"), EmbedAs.ARRAY, "lines",
+                                                List.of("line_id"), false, true,
+                                                List.of(new Embed(
+                                                        "products", Map.of("sku", "sku"), EmbedAs.OBJECT,
+                                                        "product", null, null, null, null)))))),
+                        null, null),
+                Step.inline("joined", FromClause.aliases(Map.of(
+                                "orders", FromRef.literal("nested"),
+                                "customers", FromRef.literal("customers"))),
+                        new TransformBody.Join(JoinEngine.BUILTIN, "select * from orders join customers"),
+                        null, null));
+        assertThat(model.view()).isEqualTo(new ViewBlock.Inline(
+                "view",
+                FromRef.literal("joined"),
+                "id",
+                new Storage(
+                        new Storage.Hot("15m"),
+                        new Storage.Warm("orders", List.of("customer_id")),
+                        new Storage.Cold(List.of("region"))),
+                new ViewSchema(true, "additive")));
+        assertThat(model.serve()).isEqualTo(new ServeBlock.Inline(
+                "serve",
+                FromClause.list(FromRef.literal("view"), FromRef.regex("backfill_.*")),
+                List.of(new SyncElement(
+                        "warehouse",
+                        "mongodb_target",
+                        WriteMode.APPEND,
+                        new RenameSpec(
+                                Map.of("orders", "orders_v2"), RenameCase.UPPER, "tap_", "_archive"),
+                        DdlPolicy.APPLY,
+                        Map.of("ordered", true))),
+                List.of(new QueryElement(QueryType.REST, "warehouse"), new QueryElement(QueryType.MCP, null)),
+                List.of(
+                        new PushElement(
+                                "events", "kafka_target", "orders", PushFormat.cel("event.after"),
+                                Map.of("acks", "all")),
+                        new PushElement(
+                                null,
+                                "audit_target",
+                                null,
+                                PushFormat.fields(Map.of(
+                                        "id", FieldRule.rename("order_id"),
+                                        "deleted", FieldRule.drop())),
+                                null))));
+        assertThat(model.settings()).isEqualTo(new Settings(
+                ErrorPolicy.DEAD_LETTER, 500, 4, "0 2 * * *", ReadMode.CDC_ONLY, "earliest"));
+        assertThat(model.experimental()).isEqualTo(Map.of("preview", List.of("orders")));
+    }
+
+    @Test
+    void mapsReusableViewAndServeBlocksAndPreservesTheirDefaultIds() {
+        PipelineInput input = new PipelineInput(
+                "orders_sync",
+                null,
+                List.of("orders"),
+                null,
+                Map.of("use", "shared_view", "from", "/orders_.*/"),
+                Map.of("use", "shared_api", "from", "shared_view"),
+                null,
+                null);
+
+        PipelineResource model = representation.toModel(input, null);
+
+        assertThat(model.view()).isEqualTo(new ViewBlock.Use(
+                null, "shared_view", FromRef.regex("orders_.*")));
+        assertThat(model.serve()).isEqualTo(new ServeBlock.Use(
+                null, "shared_api", FromRef.literal("shared_view")));
+    }
 
     @Test
     void rejectsAliasMapsForServeFromBecauseCanonicalDslOnlyAcceptsAFlow() {
@@ -79,7 +308,7 @@ class PipelineRepresentationTest {
         PipelineResource pipeline = new PipelineResource(
                 "orders_sync",
                 null,
-                List.of("orders"),
+                refs("orders"),
                 null,
                 null,
                 null,
@@ -133,7 +362,7 @@ class PipelineRepresentationTest {
         PipelineResource pipeline = new PipelineResource(
                 "orders_sync",
                 null,
-                List.of("mysql_orders", "mysql_customers"),
+                refs("mysql_orders", "mysql_customers"),
                 List.of(
                         Step.inline(
                                 "active_orders",
@@ -181,7 +410,7 @@ class PipelineRepresentationTest {
         PipelineResource pipeline = new PipelineResource(
                 "orders_sync",
                 null,
-                List.of("mysql"),
+                refs("mysql"),
                 List.of(Step.inline(
                         "all_orders",
                         FromClause.list(FromRef.regex("orders_.*")),
@@ -210,7 +439,7 @@ class PipelineRepresentationTest {
         PipelineResource pipeline = new PipelineResource(
                 "mysql_to_mongodb",
                 null,
-                List.of("mysql_feynman"),
+                refs("mysql_feynman"),
                 null,
                 null,
                 new ServeBlock.Inline(
@@ -240,7 +469,7 @@ class PipelineRepresentationTest {
         PipelineResource pipeline = new PipelineResource(
                 "mysql_to_mongodb",
                 null,
-                List.of("mysql_feynman"),
+                refs("mysql_feynman"),
                 null,
                 null,
                 new ServeBlock.Inline(
@@ -278,7 +507,7 @@ class PipelineRepresentationTest {
         PipelineResource pipeline = new PipelineResource(
                 "mysql_to_mongodb",
                 null,
-                List.of("mysql_feynman"),
+                refs("mysql_feynman"),
                 null,
                 null,
                 new ServeBlock.Inline(
@@ -309,7 +538,7 @@ class PipelineRepresentationTest {
         PipelineResource pipeline = new PipelineResource(
                 "mysql_to_mongodb",
                 null,
-                List.of("mysql_feynman"),
+                refs("mysql_feynman"),
                 null,
                 new ViewBlock.Inline("players_view", FromRef.literal("Player"), null, null, null),
                 new ServeBlock.Inline(
@@ -341,7 +570,7 @@ class PipelineRepresentationTest {
         return new PipelineResource(
                 "orders_sync",
                 new Metadata(Map.of("team", "analytics"), "Orders to warehouse"),
-                sourceIds,
+                sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(),
                 List.of(Step.inline(
                         "active_orders",
                         FromClause.list(FromRef.literal("orders")),
@@ -360,5 +589,9 @@ class PipelineRepresentationTest {
         aliases.put("order", FromRef.literal("active_orders"));
         aliases.put("customer", FromRef.literal("customers"));
         return aliases;
+    }
+
+    private static List<SourceRef> refs(String... ids) {
+        return Arrays.stream(ids).map(id -> (SourceRef) SourceRef.bare(id)).toList();
     }
 }

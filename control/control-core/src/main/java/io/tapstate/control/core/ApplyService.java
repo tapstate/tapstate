@@ -333,6 +333,17 @@ public final class ApplyService {
         Objects.requireNonNull(resource, "resource");
         ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
+        if (live != null) {
+            List<Resource> stored = store.list();
+            if (prepared.resource() instanceof SourceResource replacement) {
+                live.refuseBufferingChangeWhileLive(
+                        storedSource(stored, replacement.id()), replacement, stored);
+            }
+            if (prepared.resource() instanceof PipelineResource replacement) {
+                live.refuseBufferingChangeWhileLive(
+                        storedPipeline(stored, replacement.id()), replacement);
+            }
+        }
         ArtifactWrite write = (switch (intent) {
             case CREATE_ONLY -> ArtifactWrite.createOnly(prepared.resource());
             case REPLACE_ONLY -> ArtifactWrite.replaceOnly(prepared.resource(), expectedContentHash);
@@ -431,7 +442,7 @@ public final class ApplyService {
         });
     }
 
-    /** The stored Source under {@code id}, or null when this apply is creating it. */
+    /** The stored Pipeline under {@code id}, or null when this apply is creating it. */
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {
         return stored.stream()
                 .filter(PipelineResource.class::isInstance)
@@ -448,6 +459,7 @@ public final class ApplyService {
                 .filter(source -> source.id().equals(id))
                 .findFirst()
                 .orElse(null);
+    }
 
     private enum ValidationScope {
         OFFLINE,
