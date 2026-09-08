@@ -80,7 +80,8 @@ class CliFaceProjectionGatesTest {
     private static final Set<String> DEFERRED_WITH_NO_VERB = Set.of(
             "connector.get",
             "cluster.members",
-            "source.create", "source.delete", "source.draft", "source.get", "source.list", "source.update",
+            "source.create", "source.delete", "source.draft", "source.get", "source.list", "source.schema",
+            "source.update",
             "user.create", "user.passwd", "user.list");
 
     @Test

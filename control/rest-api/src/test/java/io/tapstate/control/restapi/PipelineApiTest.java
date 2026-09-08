@@ -33,6 +33,7 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -612,6 +613,11 @@ class PipelineApiTest {
                     return Optional.empty();
                 }
             });
+        }
+
+        @Bean
+        SourceSchemaQueryService sourceSchemaQueryService(ArtifactStore store) {
+            return new SourceSchemaQueryService(store, new EmptySchemaStore());
         }
 
         @Bean
