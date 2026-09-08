@@ -1,0 +1,12 @@
+# Invalid: read_mode snapshot_only bounds the read of a cdc-capable source, so this pipeline has no
+# incremental tail for start_from to position a cursor into - mode-mismatch on
+# settings.start_from. The sibling case reaches the same refusal from a source that never had a tail to give; this
+# one has a source that does, and a read that declined it, which is the arm the mode token names.
+version: tapstate/v1
+kind: pipeline
+id: ledger_once
+source: src_ledger_sf
+settings: { read_mode: snapshot_only, start_from: earliest }
+serve:
+  from: ledger
+  sync: [ { id: dw, source: tgt_dw_sf, write_mode: upsert } ]

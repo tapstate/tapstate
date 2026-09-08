@@ -15,6 +15,7 @@ import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
@@ -702,9 +703,9 @@ class NestOperatorCostTest {
         others.forEach((alias, table) -> aliases.put(alias, FromRef.literal(table.name())));
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
-        List<String> sourceNames = new ArrayList<>();
-        sourceNames.add("orders");
-        others.values().forEach(table -> sourceNames.add(table.name()));
+        List<SourceRef> sourceNames = new ArrayList<>();
+        sourceNames.add(SourceRef.bare("orders"));
+        others.values().forEach(table -> sourceNames.add(SourceRef.bare(table.name())));
         PipelineResource resource = new PipelineResource(pipeline, null, sourceNames, List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),

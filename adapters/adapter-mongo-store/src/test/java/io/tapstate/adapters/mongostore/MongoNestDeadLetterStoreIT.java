@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.spi.store.NestDeadLetterRecord;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
@@ -158,6 +159,20 @@ class MongoNestDeadLetterStoreIT {
     private static NestDeadLetterRecord record(String element, long discardedAt) {
         return new NestDeadLetterRecord(NAMESPACE, element, "mysql-a", "1:42", 0L, discardedAt,
                 Map.of("id", 7));
+    }
+
+    @Test
+    void aDiscardedRowKeepsTheTypesItsColumnsWereDeclaredAs() {
+        withStore(store -> {
+            store.record(new NestDeadLetterRecord(NAMESPACE, "[\"policies\"]#[7]~i", "mongo-a", "1:42",
+                    180_000L, 9_000L,
+                    Map.of("_id", new ConvertedValue("650f1a2b3c4d5e6f70819200", "OBJECT_ID"))));
+
+            assertThat(store.read(NAMESPACE, 10).get(0).row())
+                    .as("this channel exists to be looked at later, and a row whose declared types were "
+                            + "dropped on the way in is not the row that was discarded")
+                    .containsEntry("_id", new ConvertedValue("650f1a2b3c4d5e6f70819200", "OBJECT_ID"));
+        });
     }
 
     private static void withStore(Consumer<MongoNestDeadLetterStore> test) {

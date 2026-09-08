@@ -55,15 +55,14 @@ import java.util.Set;
  */
 public final class ArtifactMutationService {
 
-    /** Actual states a pipeline is at rest in; any other means it is still executing. */
-    private static final Set<PipelineState> RESTING = Set.of(
-            PipelineState.NEW, PipelineState.STOPPED, PipelineState.COMPLETED, PipelineState.FAILED);
-
-    /** Desired states that will drive a pipeline back up, whatever it is doing right now. */
-    private static final Set<PipelineState> HEADED_UP = Set.of(
-            PipelineState.RUNNING, PipelineState.PAUSED);
-
     private final ArtifactStore store;
+    /**
+     * The one reading of "is this pipeline at rest". Held rather than re-derived so this refusal and
+     * every other guard that asks cannot drift apart -- they would only disagree in the states nobody
+     * checks by hand, which is where a wrong answer does its damage.
+     */
+    private final LivePipelines live;
+
     private final DesiredStore desired;
     private final StateStore state;
     private final ObservationStore observations;
@@ -90,6 +89,7 @@ public final class ArtifactMutationService {
         this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.follows = Objects.requireNonNull(follows, "follows");
+        this.live = new LivePipelines(this.desired, this.state);
     }
 
     /**
@@ -303,21 +303,19 @@ public final class ArtifactMutationService {
      * pass exactly the pipelines the refusal exists to catch.
      */
     private boolean isAtRest(String id) {
-        return isAtRest(actualStateOf(id), intentOf(id));
+        return live.isAtRest(id);
     }
 
     private static boolean isAtRest(PipelineState actual, PipelineState intent) {
-        return RESTING.contains(actual) && !HEADED_UP.contains(intent);
+        return LivePipelines.isAtRest(actual, intent);
     }
 
     private PipelineState actualStateOf(String id) {
-        return state.read(id)
-                .map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
-                .orElse(PipelineState.NEW);
+        return live.actualStateOf(id);
     }
 
     private PipelineState intentOf(String id) {
-        return desired.read(id).map(DesiredState::targetState).orElse(PipelineState.NEW);
+        return live.intentOf(id);
     }
 
     private static TapstateException error(ArtifactError code, Map<String, Object> args) {

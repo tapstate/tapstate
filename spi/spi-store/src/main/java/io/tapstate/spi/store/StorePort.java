@@ -49,6 +49,12 @@ public interface StorePort {
     SrsMetaStore meta();
 
     /**
+     * The SRS change log: every change that entered a chain's per-table ring, so the changes outlive the
+     * process that read them and a ring can be rebuilt where it left off.
+     */
+    SrsLogStore srsLog();
+
+    /**
      * The side record of the columns a pipeline step works out for itself, keyed by pipeline and step.
      * Kept beside the artifact rather than inside it: a derived value inside the canonical bytes would
      * make a pipeline nobody edited read as edited the moment the derivation changed.

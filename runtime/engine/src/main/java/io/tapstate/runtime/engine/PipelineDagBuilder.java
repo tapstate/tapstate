@@ -194,7 +194,7 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
         PipelineChains chains = frontier == null ? null : new PipelineChains();
 
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             List<String> sourceKeys = bindings.sourceKeys().apply(sourceId);
             if (sourceKeys == null || sourceKeys.isEmpty()) {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
@@ -341,7 +341,7 @@ public final class PipelineDagBuilder {
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
-                : ContiguousPrefix::new;
+                : () -> new ContiguousPrefix(axes);
         return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier);
     }
 

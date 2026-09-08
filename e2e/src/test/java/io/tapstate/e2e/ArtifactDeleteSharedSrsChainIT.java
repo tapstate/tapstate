@@ -115,7 +115,7 @@ class ArtifactDeleteSharedSrsChainIT {
 
             // The departing pipeline comes to rest first; the surviving one is left running throughout,
             // because what this case measures is whether it keeps going.
-            control.lifecycle(DEPARTING_ID, LifecycleVerb.STOP);
+            control.stop(DEPARTING_ID, true);
             Await.until(
                     DEPARTING_ID + " to reach " + PipelineState.STOPPED,
                     () -> control.state(DEPARTING_ID).filter(PipelineState.STOPPED::equals).isPresent(),

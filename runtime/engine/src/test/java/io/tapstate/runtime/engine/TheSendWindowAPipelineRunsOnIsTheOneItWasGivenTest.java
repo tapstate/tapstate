@@ -19,6 +19,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -175,7 +176,7 @@ class TheSendWindowAPipelineRunsOnIsTheOneItWasGivenTest {
         Step step = Step.inline("order_doc", FromClause.aliases(aliases), body(append), null, null);
 
         PipelineResource pipeline = new PipelineResource("p", null,
-                List.of("orders", "order_items"),
+                List.of(SourceRef.bare("orders"), SourceRef.bare("order_items")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("order_doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),

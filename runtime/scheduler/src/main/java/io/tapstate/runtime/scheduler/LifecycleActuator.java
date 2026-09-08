@@ -11,8 +11,8 @@ import java.util.Optional;
  *
  * <p>Each verb is named by the pipeline id alone: the actuator owns the mapping from a pipeline to its
  * job and, for a start, the topology that job runs. Start begins a fresh run; resume continues a
- * paused one; pause holds a running one; stop ends it. All four are the job side only — the
- * pipeline-private continuation the source store holds is cleared elsewhere.
+ * paused one; pause holds a running one; stop ends it. Stop alone takes a second argument, because it
+ * is the only verb that can also be asked to throw away what the pipeline has.
  */
 public interface LifecycleActuator {
 
@@ -25,8 +25,17 @@ public interface LifecycleActuator {
     /** Continues the pipeline's paused job, re-reading its start position from the store. */
     void resume(String pipelineId);
 
-    /** Ends the pipeline's job. */
-    void stop(String pipelineId);
+    /**
+     * Ends the pipeline's job, and clears what the pipeline has accumulated when {@code purgeState} says
+     * to. Clearing is what makes the next run read its whole source again; keeping is what lets it carry
+     * on, so the two are different outcomes rather than a tidiness setting.
+     *
+     * <p>{@code false} has to mean nothing is touched at all, not "cleared and then put back": the
+     * clearing is written down before it is carried out so that it survives a process dying mid-way, and
+     * a stop that wrote that down and then declined to act on it would have the next start finish the job
+     * on a pipeline whose owner asked for it to be left alone.
+     */
+    void stop(String pipelineId, boolean purgeState);
 
     /**
      * The failure of the pipeline's job if it died on its own, or empty while it runs, has no job, or

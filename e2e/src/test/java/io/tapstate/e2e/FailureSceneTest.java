@@ -174,6 +174,10 @@ class FailureSceneTest {
         }
 
         @Override
+        public void restart(String pipelineId, boolean rereadEverything) {
+        }
+
+        @Override
         public void cdc(TableAlias table, CdcOp op, long rows) {
         }
 

@@ -1,5 +1,6 @@
 package io.tapstate.core.model;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -17,10 +18,11 @@ public record PipelineResource(
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,
-        @Doc(value = "Ids of pre-created sources this pipeline reads from; at least one is required.",
+        @Doc(value = "The sources this pipeline reads from; at least one is required. Each is a bare "
+                + "source id, or an object carrying this pipeline's own srs switch for that source.",
                 required = true, key = "source")
         @YamlScalarOrList
-        List<String> sources,
+        List<SourceRef> sources,
         @Doc("Ordered transform steps applied to the source data.")
         List<Step> transforms,
         @Doc("View configuration that shapes the pipeline output into a queryable result.")
@@ -43,6 +45,18 @@ public record PipelineResource(
         transforms = transforms == null ? null : List.copyOf(transforms);
         experimental = experimental == null ? null
                 : Collections.unmodifiableMap(new LinkedHashMap<>(experimental));
+    }
+
+    /**
+     * The ids alone, in declaration order. Most callers only need to know which sources this
+     * pipeline reads; only the capture path needs the srs switch that rides along with them.
+     */
+    public List<String> sourceIds() {
+        List<String> ids = new ArrayList<>(sources.size());
+        for (SourceRef ref : sources) {
+            ids.add(ref.id());
+        }
+        return Collections.unmodifiableList(ids);
     }
 
     @Override

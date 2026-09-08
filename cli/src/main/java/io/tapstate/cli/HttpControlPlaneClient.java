@@ -34,6 +34,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The production {@link ControlPlaneClient}, backed by the JDK HTTP client (no third-party
@@ -871,11 +872,22 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
-    public LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb) {
+    public LifecycleOutcome lifecycle(
+            URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + ":" + verb, credential)
-                    .POST(HttpRequest.BodyPublishers.noBody())
-                    .build();
+            // Only a stop has anything to say in a body, and it is refused by the server without one.
+            // The other three send none at all rather than an empty object, which keeps them the
+            // requests they already were.
+            HttpRequest.BodyPublisher body = purgeState == null
+                    ? HttpRequest.BodyPublishers.noBody()
+                    : HttpRequest.BodyPublishers.ofString(
+                            "{\"purgeState\":" + purgeState + "}", StandardCharsets.UTF_8);
+            HttpRequest.Builder builder =
+                    authed(baseUrl, "/api/pipelines/" + pipelineId + ":" + verb, credential).POST(body);
+            if (purgeState != null) {
+                builder = builder.header("Content-Type", "application/json");
+            }
+            HttpRequest request = builder.build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -945,6 +957,71 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         } catch (IOException | RuntimeException e) {
             return new MetricsOutcome.Unreachable();
         }
+    }
+
+    @Override
+    public PositionOutcome position(URI baseUrl, String credential, String pipelineId) {
+        return positionCall(() -> authed(
+                baseUrl, "/api/pipelines/" + pipelineId + "/position", credential).GET().build());
+    }
+
+    @Override
+    public PositionOutcome setPosition(
+            URI baseUrl, String credential, String pipelineId, String document) {
+        return positionCall(() -> authed(baseUrl, "/api/pipelines/" + pipelineId + "/position", credential)
+                .header("Content-Type", "application/json")
+                .PUT(HttpRequest.BodyPublishers.ofString(document, StandardCharsets.UTF_8))
+                .build());
+    }
+
+    /**
+     * The read and the write-back differ only in the request they send: both answer with the same document
+     * and are refused in the same shapes, so one place decides what a body and a status code mean.
+     */
+    private PositionOutcome positionCall(Supplier<HttpRequest> request) {
+        try {
+            HttpResponse<String> response =
+                    send(request.get(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                PositionOutcome.Found found = positionFound(response.body());
+                return found == null ? new PositionOutcome.Unreachable() : found;
+            }
+            Rejection r = rejection(response.body(), "The server refused the request.");
+            return new PositionOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new PositionOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new PositionOutcome.Unreachable();
+        }
+    }
+
+    /**
+     * The document as it arrived, plus the little of it a sentence needs: for each chain, where it now
+     * resumes and which other pipelines read it. Null unless the body is a document with a chains array,
+     * so a 200 from something that is not this server reads as unreachable rather than as an empty answer.
+     */
+    private static PositionOutcome.Found positionFound(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> m) || !(m.get("chains") instanceof List<?> raw)) {
+            return null;
+        }
+        List<PositionOutcome.Chain> chains = new ArrayList<>();
+        for (Object entry : raw) {
+            if (entry instanceof Map<?, ?> chain && chain.get("chainId") instanceof String chainId) {
+                String token = chain.get("resumeFrom") instanceof Map<?, ?> from
+                        && from.get("token") instanceof String value ? value : null;
+                List<String> shared = new ArrayList<>();
+                if (chain.get("sharedWith") instanceof List<?> others) {
+                    for (Object other : others) {
+                        if (other instanceof String id) {
+                            shared.add(id);
+                        }
+                    }
+                }
+                chains.add(new PositionOutcome.Chain(chainId, token, List.copyOf(shared)));
+            }
+        }
+        return new PositionOutcome.Found(body, List.copyOf(chains));
     }
 
     @Override
