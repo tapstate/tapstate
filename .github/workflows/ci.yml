@@ -18,13 +18,24 @@ on:
     branches:
       - main
       - "ws/**"
+    # Release versions reset the previous-version new-code baseline.
+    tags:
+      - "v*"
   pull_request:
     branches:
       - main
 
+  workflow_dispatch:
+
+# Keep analyses serialized with manual pull-request analysis. Branch pushes can
+# cancel superseded builds; an analysis already in progress must finish.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && format('ci-{0}-{1}', github.workflow, github.ref) || format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') }}
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   shard-plan:
@@ -96,6 +107,12 @@ jobs:
   # This stable, non-matrix name is the required check. It admits the union,
   # including every shard's declared report and coverage files, before reporting green.
   build:
+    outputs:
+      sonar-required: ${{ env.SONAR_REQUIRED }}
+      sonar-enabled: ${{ steps.guard.outputs.run }}
+      sonar-outcome: ${{ steps.analyze.outcome }}
+    env:
+      SONAR_REQUIRED: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/')) }}
     needs: [shard-plan, test-shards]
     if: ${{ always() }}
     runs-on: ubuntu-latest
@@ -108,6 +125,48 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
+      - name: Check secret availability
+        id: guard
+        if: env.SONAR_REQUIRED == 'true'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SONAR_TOKEN:-}" ] && [ -n "${SONAR_HOST_URL:-}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
+          # From here the job ends green having analyzed nothing, and saying that quietly is the
+          # dangerous part: this is a required check, so the checks list shows the same tick here
+          # as on a run where the quality gate genuinely passed. Whoever reviews an outside
+          # contribution reads that tick as "quality measured" - and so do we, on our own repository,
+          # if the secrets are ever rotated away.
+          #
+          # Failing instead is not the repair. A fork's workflow run cannot be given repository
+          # secrets by any configuration, so a red here would mean no outside contribution can ever
+          # merge - the failure this workflow's fork guard exists to avoid. The fix is not to change
+          # the colour but to stop the colour from being the only thing said.
+          if [ "${IS_FORK_PR:-false}" = "true" ]; then
+            why="this pull request comes from a fork, and a fork's workflow run is never given repository secrets"
+          else
+            why="SONAR_TOKEN / SONAR_HOST_URL are not configured on this repository"
+          fi
+          echo "::notice title=SonarQube not evaluated::No analysis ran: ${why}. This check is green because it was skipped, not because the quality gate passed."
+          {
+            printf '## SonarQube: not evaluated\n\n'
+            printf 'No analysis ran on this commit, because %s.\n\n' "$why"
+            printf '**This check is green because it was skipped, not because the quality gate passed.**\n\n'
+            printf 'Neither code quality nor the new-code coverage condition was measured here. The\n'
+            printf 'diff-coverage summary on the CI workflow is what a run without secrets can still\n'
+            # Markdown backticks are literal.
+            # shellcheck disable=SC2016
+            printf 'produce; the quality gate itself is measured once the change reaches `main`.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Seed an isolated dependency repository
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - uses: actions/download-artifact@v4
@@ -132,10 +191,89 @@ jobs:
           jar="$(find control/mcp-server/target -maxdepth 1 -name 'mcp-server-*-boot.jar' -print -quit)"
           test -n "$jar"
           bash control/mcp-server/mcp-smoke.sh "$jar"
+      - name: Admit Sonar inputs
+        if: steps.guard.outputs.run == 'true'
+        run: .github/scripts/sonar-inputs.sh --root . --plan "$RUNNER_TEMP/shards.json" --artifacts "$RUNNER_TEMP/ci-artifacts" --restore .
       - name: Merge coverage from every declared shard
         run: |
           mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -N jacoco:merge@jacoco-merge-reactor
           mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" jacoco:report@jacoco-report-reactor
+      - name: Analyze admitted coverage
+        id: analyze
+        continue-on-error: true
+        if: steps.guard.outputs.run == 'true'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          set -euo pipefail
+          args=(
+            -Dsonar.projectKey=tapstate
+            -Dsonar.host.url="$SONAR_HOST_URL"
+            -Dsonar.login="$SONAR_TOKEN"
+            -Dsonar.qualitygate.wait=true
+          )
+          # On a release tag (e.g. v1.2.3) stamp the analysis with the release version (strip the
+          # leading v), so it creates a version event. With the "previous version" New Code
+          # definition, that resets the baseline; other builds keep the pom's default version.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            args+=("-Dsonar.projectVersion=${GITHUB_REF_NAME#v}")
+          fi
+          mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" sonar:sonar "${args[@]}"
+
+      # Best-effort PR decoration for Community Edition. Runs even when the analyze step failed
+      # (that is exactly the gate-red case worth commenting on); continue-on-error keeps a comment
+      # glitch from ever flipping a green job to red - the analyze step is the sole gate authority.
+      - name: Comment quality gate on PR
+        if: always() && steps.guard.outputs.run == 'true' && steps.analyze.outcome != 'skipped' && steps.analyze.outcome != '' && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          host="${SONAR_HOST_URL%/}"
+          dashboard="$host/dashboard?id=tapstate&pullRequest=${PR_NUMBER}"
+
+          # This instance has the Community Branch Plugin, so the PR is analyzed as a pull request
+          # whose new code is its diff against the base branch. Query the gate in that PR context,
+          # not the main branch (which would read empty). The analyze step already waited for the
+          # gate and concurrency serializes runs, so this status is this run's.
+          ps="$(curl -s -u "$SONAR_TOKEN:" "$host/api/qualitygates/project_status?projectKey=tapstate&pullRequest=${PR_NUMBER}" || true)"
+          status="$(printf '%s' "$ps" | jq -r '.projectStatus.status // "UNKNOWN"' 2>/dev/null || echo UNKNOWN)"
+          details="$(printf '%s' "$ps" | jq -r '.projectStatus.conditions[]? | select(.status=="ERROR") | "- `\(.metricKey)`: \(.actualValue) (fails \(.comparator) \(.errorThreshold))"' 2>/dev/null || true)"
+
+          case "$status" in
+            OK)    emoji="white_check_mark";   verdict="passed" ;;
+            ERROR) emoji="x";                  verdict="failed" ;;
+            # NONE = the gate could not be evaluated because there is no New Code to measure
+            # (the "Sonar way" conditions are all on new code; the first analysis, or one with
+            # no New Code baseline set on the server, has nothing to compare against). Not a failure.
+            NONE)  emoji="information_source"; verdict="not evaluated (no New Code baseline yet)" ;;
+            *)     emoji="warning";            verdict="unknown (see the workflow logs)" ;;
+          esac
+
+          {
+            printf '<!-- sonarqube-gate -->\n'
+            printf '### :%s: SonarQube quality gate: **%s**\n\n' "$emoji" "$verdict"
+            if [ -n "${details:-}" ]; then
+              printf 'Failing conditions:\n%s\n\n' "$details"
+            fi
+            printf '[Open the pull-request dashboard](%s)\n\n' "$dashboard"
+            printf '_Posted by CI from the SonarQube pull-request quality gate._\n'
+          } > comment.md
+
+          existing="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.body | contains("<!-- sonarqube-gate -->")) | .id' 2>/dev/null | head -n1 || true)"
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$(cat comment.md)" >/dev/null
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$(cat comment.md)" >/dev/null
+          fi
+          echo "Posted quality gate comment (status=${status})."
+
       - name: Preserve downloaded dependencies
         if: always()
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
@@ -159,6 +297,37 @@ jobs:
             **/target/site/jacoco/jacoco.xml
           if-no-files-found: error
           retention-days: 7
+
+  # A native check preserves fork-token behavior. The branch-push summary has a
+  # different name so ws pushes create no skipped or unevaluated sonarqube check.
+  sonarqube:
+    name: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && 'ci-summary' || 'sonarqube' }}
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report analysis outcome
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          SONAR_REQUIRED: ${{ needs.build.outputs.sonar-required }}
+          SONAR_ENABLED: ${{ needs.build.outputs.sonar-enabled }}
+          SONAR_OUTCOME: ${{ needs.build.outputs.sonar-outcome }}
+        run: |
+          set -euo pipefail
+          test "$BUILD_RESULT" = success
+          if [ "$SONAR_REQUIRED" = false ]; then
+            echo 'Build and shard admission passed.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          test "$SONAR_REQUIRED" = true
+          if [ "$SONAR_ENABLED" = false ]; then
+            echo '::notice title=SonarQube not evaluated::Repository secrets were unavailable. This check is green because analysis was skipped, not because the quality gate passed.'
+            printf '## SonarQube: not evaluated\n\nRepository secrets were unavailable (including fork pull requests). This check is green because analysis was skipped, not because the quality gate passed. See the build summary for the reason and diff coverage.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          test "$SONAR_ENABLED" = true
+          test "$SONAR_OUTCOME" = success
+          echo 'SonarQube analysis and quality gate passed.' >> "$GITHUB_STEP_SUMMARY"
 
   installer:
     # The install and quickstart scripts are shell, not Java: shellcheck them (ubuntu-latest ships
@@ -223,13 +392,15 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh
       - name: CI shard and aggregate cases
         run: |
           bash .github/scripts/ci-shard-smoke.sh
           bash .github/scripts/ci-aggregate-smoke.sh
           bash .github/scripts/ci-shape-smoke.sh
           bash .github/scripts/ci-maven-cache-smoke.sh
+          bash .github/scripts/sonar-inputs-smoke.sh
+          bash .github/scripts/sonar-workflow-smoke.sh
       - name: CI timing cases
         run: bash .github/scripts/ci-timing-smoke.sh
       - name: refresh driver cases

@@ -42,7 +42,12 @@ def check(workflows, contexts):
     assert 'ci-shard.sh run' in shards and 'ci-aggregate.sh pack' in shards
     assert 'install' in shards and '-DskipTests' in shards and 'RUNNER_TEMP/m2' in shards
     assert 'if-no-files-found: error' in shards, 'missing shard artifact must fail'
-    names = set()
+    sonar = ci.get('sonarqube', '')
+    sonar_name = "    name: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && 'ci-summary' || 'sonarqube' }}"
+    assert sonar_name in sonar.splitlines(), 'sonarqube must keep its exact name on analysis events'
+    assert not re.search(r'^\s+matrix:', sonar, re.M), 'sonarqube must not be a matrix'
+    assert 'needs: build' in sonar and 'always()' in sonar, 'sonarqube must report failed builds'
+    names = {'sonarqube'}
     for text in workflows.values():
         for key, body in jobs(text).items():
             # A matrix or custom display name no longer provides the unqualified job id.
@@ -63,6 +68,7 @@ for original, replacement in [
     ('  build:', '  build-renamed:'),
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),
+    ("&& 'ci-summary' || 'sonarqube'", "&& 'ci-summary' || 'sonar-renamed'"),
 ]:
     assert original in workflows['ci.yml'], f'mutation target absent: {original}'
     mutated = {**workflows, 'ci.yml': workflows['ci.yml'].replace(original, replacement, 1)}
@@ -71,5 +77,5 @@ for original, replacement in [
     except AssertionError:
         continue
     raise AssertionError(f'workflow mutation escaped: {replacement}')
-print('ci-shape smoke: workflow contracts and 3 mutations passed')
+print('ci-shape smoke: workflow contracts and 4 mutations passed')
 PY
