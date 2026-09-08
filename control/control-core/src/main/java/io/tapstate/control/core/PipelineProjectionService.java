@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactMutation;
 
 import java.util.Map;
 import java.util.Objects;
@@ -32,7 +33,7 @@ public final class PipelineProjectionService {
         Objects.requireNonNull(input, "input");
         PipelineResource pipeline = representation.toModel(input, null);
         ArtifactWriteResult result = apply.create(principal, pipeline, ControlOperations.PIPELINE_CREATE);
-        throwForWriteRefusal(result.write());
+        throwForWriteRefusal(pipeline.id(), result.write());
         return views.get(pipeline.id());
     }
 
@@ -49,7 +50,7 @@ public final class PipelineProjectionService {
         PipelineResource replacement = representation.toModel(input, pipeline(stored.resource()));
         ArtifactWriteResult result = apply.replace(
                 principal, replacement, expectedContentHash, ControlOperations.PIPELINE_UPDATE);
-        throwForWriteRefusal(result.write());
+        throwForWriteRefusal(id, result.write());
         return views.get(id);
     }
 
@@ -60,9 +61,13 @@ public final class PipelineProjectionService {
         throw new IllegalStateException("Pipeline projection received a non-Pipeline resource");
     }
 
-    private static void throwForWriteRefusal(ArtifactBatchWrite outcome) {
+    static void throwForWriteRefusal(String targetId, ArtifactBatchWrite outcome) {
         if (outcome.appliedSuccessfully()) {
             return;
+        }
+        if (outcome.refusal() == ArtifactMutation.VERSION_CONFLICT && !targetId.equals(outcome.refusedId())) {
+            throw new TapstateException(
+                    ArtifactError.VERSION_CONFLICT, Map.of("id", outcome.refusedId()), null);
         }
         PipelineError code = switch (outcome.refusal()) {
             case ALREADY_EXISTS -> PipelineError.ALREADY_EXISTS;
@@ -70,7 +75,7 @@ public final class PipelineProjectionService {
             case VERSION_CONFLICT -> PipelineError.VERSION_CONFLICT;
             default -> throw new IllegalStateException("unexpected Pipeline write outcome: " + outcome.refusal());
         };
-        throw error(code, Map.of("id", outcome.refusedId()));
+        throw error(code, Map.of("id", targetId));
     }
 
     private static void requireMatchingId(String pathId, String bodyId) {

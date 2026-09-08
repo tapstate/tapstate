@@ -50,7 +50,7 @@ public final class SourceProjectionService {
         Objects.requireNonNull(input, "input");
         SourceResource source = representation.toModel(input, null);
         ArtifactWriteResult result = apply.create(principal, source, ControlOperations.SOURCE_CREATE);
-        throwForWriteRefusal(result.write());
+        throwForWriteRefusal(source.id(), result.write());
         return representation.toView(source(result.artifact().resource()), result.artifact().contentHash());
     }
 
@@ -63,7 +63,7 @@ public final class SourceProjectionService {
         SourceResource replacement = representation.toModel(input, source(requireSource(id).resource()));
         ArtifactWriteResult result = apply.replace(
                 principal, replacement, expectedContentHash, ControlOperations.SOURCE_UPDATE);
-        throwForWriteRefusal(result.write());
+        throwForWriteRefusal(id, result.write());
         return representation.toView(source(result.artifact().resource()), result.artifact().contentHash());
     }
 
@@ -96,9 +96,13 @@ public final class SourceProjectionService {
         throw new IllegalStateException("Source projection received a non-Source resource");
     }
 
-    private static void throwForWriteRefusal(ArtifactBatchWrite outcome) {
+    static void throwForWriteRefusal(String targetId, ArtifactBatchWrite outcome) {
         if (outcome.appliedSuccessfully()) {
             return;
+        }
+        if (outcome.refusal() == ArtifactMutation.VERSION_CONFLICT && !targetId.equals(outcome.refusedId())) {
+            throw new TapstateException(
+                    ArtifactError.VERSION_CONFLICT, Map.of("id", outcome.refusedId()), null);
         }
         SourceError code = switch (outcome.refusal()) {
             case ALREADY_EXISTS -> SourceError.ALREADY_EXISTS;
@@ -106,7 +110,7 @@ public final class SourceProjectionService {
             case VERSION_CONFLICT -> SourceError.VERSION_CONFLICT;
             default -> throw new IllegalStateException("unexpected Source write outcome: " + outcome.refusal());
         };
-        throw error(code, Map.of("id", outcome.refusedId()));
+        throw error(code, Map.of("id", targetId));
     }
 
     private static TapstateException sourceError(TapstateException error) {
