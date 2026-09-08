@@ -13,6 +13,8 @@ import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.SourceColumn;
 import io.tapstate.core.sql.SourceTable;
 import io.tapstate.core.sql.SqlFrontEnd;
+import io.tapstate.spi.sink.TargetField;
+import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.core.common.TapstateType;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -458,6 +460,30 @@ class NodeColumnsTest {
         assertThatThrownBy(() -> NodeColumns.of(nest("orders", List.of("o_id")), inputs, null))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("orders");
+    }
+
+    @Test
+    @DisplayName("a nest orders its columns exactly as the assembled target model does")
+    void aNestOrdersItsColumnsAsTheAssembledTargetModelDoes() {
+        // The two answers have to stay one answer. The assembled model is still what the sink is
+        // handed today, so until that path reads this one there are two orderings of the same columns
+        // in the tree, and nothing but this compares them.
+        //
+        // Names and order only: the assembled model carries the target store's own type token for a
+        // column while this carries the shared type and its nullability, so the types are not the
+        // same statement about the column and comparing them would assert a coincidence.
+        List<String> key = List.of("o_id", "o_region");
+        TargetTable model = new TargetTable("orders", List.of(
+                new TargetField("o_total", "decimal", false),
+                new TargetField("o_id", "bigint", false),
+                new TargetField("o_region", "text", false)));
+        Map<String, NodeColumns> inputs = Map.of("orders",
+                known("o_total", "DECIMAL NULL", "o_id", "INT64 NOT NULL", "o_region", "STRING NULL"));
+
+        Map<String, String> columns = NodeColumns.of(nest("orders", key), inputs, null).columns();
+
+        assertThat(columns.keySet()).containsExactlyElementsOf(
+                TargetModelResolver.keyedOn(model, key).fields().stream().map(TargetField::name).toList());
     }
 
     // ---- join ----
