@@ -14,6 +14,7 @@ import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
@@ -21,6 +22,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Settings;
@@ -91,14 +93,14 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     /** A namespace belonging to some other pipeline, which no stop of this one may touch. */
     private static final String OTHER_PIPELINE_NAMESPACE = "nest.other_pipe.some_step.$root";
 
-    private static final String SOURCE_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + "." + PARENT_SOURCE;
-    private static final String CHILD_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + "." + CHILD_SOURCE;
+    private static final String SOURCE_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, PARENT_SOURCE);
+    private static final String CHILD_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, CHILD_SOURCE);
     private static final String GRANDCHILD_CONNECTOR_NAMESPACE =
-            "pdk.state." + PIPELINE + "." + GRANDCHILD_SOURCE;
-    private static final String SINK_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + ".sync_1";
-    private static final String VIEW_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + ".orders_view";
-    private static final String OTHER_PIPELINE_CONNECTOR_NAMESPACE = "pdk.state.other_pipe." + PARENT_SOURCE;
-    private static final String UNOPENED_CONNECTOR_NAMESPACE = "pdk.state." + PIPELINE + ".removed_node";
+            connectorNamespace(PIPELINE, GRANDCHILD_SOURCE);
+    private static final String SINK_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "sync_1");
+    private static final String VIEW_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "orders_view");
+    private static final String OTHER_PIPELINE_CONNECTOR_NAMESPACE = connectorNamespace("other_pipe", PARENT_SOURCE);
+    private static final String UNOPENED_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "removed_node");
     private static final String GLOBAL_CONNECTOR_NAMESPACE = "pdk.global-state";
 
     private HazelcastInstance member;
@@ -638,5 +640,9 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         Set<String> namespaces = new java.util.LinkedHashSet<>();
         held.forEach(holding -> namespaces.addAll(holding.namespaces()));
         return namespaces;
+    }
+
+    private static String connectorNamespace(String pipelineId, String nodeId) {
+        return ConnectorStateNamespace.of(new PipelineNode(pipelineId, nodeId));
     }
 }

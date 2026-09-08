@@ -211,15 +211,15 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * Where this pipeline's nests keep state: the namespace each compiled vertex holds its entries in,
-     * plus the one its shape was written down in. The record goes with the state it describes - kept
-     * behind, it would refuse the next start of a pipeline that has nothing left to abandon, naming paths
-     * that no longer address anything.
+     * Where this pipeline keeps state: the namespaces each compiled nest vertex holds entries in, plus
+     * the record of the nest shape and each PDK connector's exact node namespace. The shape record goes
+     * with the state it describes - kept behind, it would refuse the next start of a pipeline that has
+     * nothing left to abandon, naming paths that no longer address anything.
      *
      * <p>The tree is compiled again here rather than remembered from the build, for the same reason the
      * build compiles it rather than reading it back: the names come from the tree, so the tree is what is
-     * asked. A pipeline with no nest step keeps nothing and is named nothing, which is what leaves an
-     * ordinary pipeline's stop untouched by any of this.
+     * asked. A pipeline with no nest step has no operator-state holding, but still names connector state
+     * for its capture sources and sinks because those connectors can keep notes between runs.
      */
     @Override
     public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
