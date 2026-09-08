@@ -15,7 +15,8 @@ import java.util.Optional;
 import org.bson.Document;
 import org.bson.types.Binary;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /**
  * A real change-capture connector mints an identity for itself on its first run and keeps it in the state
@@ -27,9 +28,8 @@ import org.junit.jupiter.api.Test;
  * <p>This is the half of that story a single branch can hold: the identity itself. It asserts the state
  * map is durable in the way the connector needs -- the identity is there after the first run, and the run
  * that comes back after the process is replaced is running under <em>the same one</em> rather than a fresh
- * one. Whether a matching identity is then enough for the stream to resume is a question for a build that
- * has a recorded position to resume from; that machinery is not on this branch, which is also why this
- * case cannot be written as a resume.
+ * one. The separate restart witness proves that the matching identity and recorded position restart the
+ * stream without rereading its table; this one locks the connector-owned identity the resume depends on.
  *
  * <p>Read out of the store rather than off any product surface, and compared byte for byte: what is being
  * asserted is that the second run did not mint, and only the value itself says that.
@@ -46,9 +46,6 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
     private static final String DATABASE = "identity_restart_db";
     private static final String PIPELINE_ID = "identity_across_restart";
     private static final String SOURCE_ID = "src_mysql";
-
-    /** Where a connector's own notes are filed, derived from the pipeline node that opened it. */
-    private static final String NAMESPACE = "pdk.state." + PIPELINE_ID + "." + SOURCE_ID;
 
     /** The note the MySQL connector mints on a first run and looks for on every later one. */
     private static final String SERVER_NAME = "SERVER_NAME";
@@ -67,18 +64,22 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
         RealConnectorGate.require("mysql", "mongodb");
     }
 
-    @Test
-    void theRunThatComesBackIsTheOneThatMintedTheIdentityNotANewOne() throws Exception {
-        Map<String, Object> mysql = SharedMySql.settings(DATABASE);
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void theRunThatComesBackIsTheOneThatMintedTheIdentityNotANewOne(Tiers tier) throws Exception {
+        String suffix = tier.name().toLowerCase(java.util.Locale.ROOT);
+        String pipelineId = PIPELINE_ID + "_" + suffix;
+        String namespace = "pdk.state." + pipelineId + "." + SOURCE_ID;
+        Map<String, Object> mysql = SharedMySql.settings(DATABASE + "_" + suffix);
         seedOneRow(mysql);
 
-        String storeUri = SharedMongo.replicaSetUrl("identity_restart_store");
-        String targetUri = SharedMongo.replicaSetUrl("identity_restart_target");
+        String storeUri = SharedMongo.replicaSetUrl("identity_restart_store_" + suffix);
+        String targetUri = SharedMongo.replicaSetUrl("identity_restart_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
         byte[] minted;
         try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle first = Tiers.IN_PROCESS.launch(storeUri)) {
+            try (ServerHandle first = tier.launch(storeUri)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 control.bootstrapAndLogin("e2e", "e2e-password");
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
@@ -87,10 +88,10 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 Map<String, String> resources = new LinkedHashMap<>();
                 resources.put("src_mysql.tap.yml", sourceYaml(mysql));
                 resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
-                resources.put("pipeline.tap.yml", pipelineYaml());
+                resources.put("pipeline.tap.yml", pipelineYaml(pipelineId));
                 control.apply(resources);
                 control.discoverSchema(SOURCE_ID, "mysql", mysql);
-                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                control.lifecycle(pipelineId, LifecycleVerb.START);
 
                 awaitCustomer(mongo, target, SEEDED, "the snapshot to reach the target");
                 // Carrying changes, so the connector is past its snapshot and into the drive that mints
@@ -99,13 +100,14 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 awaitCustomer(mongo, target, BEFORE_THE_RESTART, "a change made before the restart");
 
                 Await.until("the connector to have filed the identity it minted",
-                        () -> note(storeUri, SERVER_NAME).isPresent(),
-                        () -> "nothing under " + NAMESPACE);
-                minted = note(storeUri, SERVER_NAME).orElseThrow();
+                        () -> note(storeUri, namespace, SERVER_NAME).isPresent(),
+                        () -> "nothing under " + namespace);
+                minted = note(storeUri, namespace, SERVER_NAME).orElseThrow();
             }
 
-            // The process is gone. The store it wrote, the source database and the target are not.
-            try (ServerHandle second = Tiers.IN_PROCESS.launch(storeUri)) {
+            // The server is gone; on the real-process tier its whole JVM is gone. The store it wrote, the
+            // source database and the target are not.
+            try (ServerHandle second = tier.launch(storeUri)) {
                 ControlPlane control = new ControlPlane(second.baseUrl());
                 control.login("e2e", "e2e-password");
 
@@ -114,10 +116,10 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 update(mysql, AFTER_THE_RESTART);
                 awaitCustomer(mongo, target, AFTER_THE_RESTART, "a change made after the restart");
 
-                assertThat(note(storeUri, SERVER_NAME))
+                assertThat(note(storeUri, namespace, SERVER_NAME))
                         .as("the identity after a run that came back and is carrying changes")
                         .isPresent();
-                assertThat(note(storeUri, SERVER_NAME).orElseThrow())
+                assertThat(note(storeUri, namespace, SERVER_NAME).orElseThrow())
                         .as("the run that came back is running under the identity the first one minted, "
                                 + "not one of its own: a fresh identity is what leaves a recorded position "
                                 + "filed under a name nothing looks it up by")
@@ -127,9 +129,9 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
     }
 
     /** One of the connector's own notes, read straight out of the store as the bytes it was written as. */
-    private static Optional<byte[]> note(String storeUri, String key) {
+    private static Optional<byte[]> note(String storeUri, String namespace, String key) {
         try (MongoClient client = MongoClients.create(storeUri)) {
-            Document id = new Document("ns", NAMESPACE).append("k", key);
+            Document id = new Document("ns", namespace).append("k", key);
             Document found = client.getDatabase(STATE_DATABASE)
                     .getCollection(STATE_COLLECTION)
                     .find(new Document("_id", id))
@@ -194,7 +196,7 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 .formatted(targetUri);
     }
 
-    private static String pipelineYaml() {
+    private static String pipelineYaml(String pipelineId) {
         return """
                 version: tapstate/v1
                 kind: pipeline
@@ -208,6 +210,6 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                   sync:
                     - source: tgt_mongo
                 """
-                .formatted(PIPELINE_ID);
+                .formatted(pipelineId);
     }
 }
