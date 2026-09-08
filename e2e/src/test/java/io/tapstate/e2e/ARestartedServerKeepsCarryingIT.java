@@ -78,9 +78,10 @@ class ARestartedServerKeepsCarryingIT {
             assertThat(control.state(running.pipelineId()))
                     .as("the pipeline the restarted server adopted from the store it read")
                     .contains(PipelineState.RUNNING);
-            assertThat(running.rowsAtTarget())
-                    .as("the target before anything new is laid down - the wait below has to be earned")
-                    .isEqualTo(carriedBeforeTheRestart);
+            awaitExactly(
+                    running,
+                    carriedBeforeTheRestart,
+                    "the target to be restored before anything new is laid down");
 
             running.insertAtSource(1);
             awaitAtLeast(running, carriedBeforeTheRestart + 1, "a change made after the restart");
@@ -91,5 +92,10 @@ class ARestartedServerKeepsCarryingIT {
     private static long awaitAtLeast(RunningPipeline running, long rows, String what) {
         Await.until(what, () -> running.rowsAtTarget() >= rows, () -> running.rowsAtTarget() + " rows");
         return running.rowsAtTarget();
+    }
+
+    /** Waits for the restarted target to hold exactly the rows the first server had carried. */
+    private static void awaitExactly(RunningPipeline running, long rows, String what) {
+        Await.until(what, () -> running.rowsAtTarget() == rows, () -> running.rowsAtTarget() + " rows");
     }
 }
