@@ -132,6 +132,22 @@ final class JoinSchemaDrift {
     }
 
     /**
+     * The type half of a declared type, read back. It sits beside the renderer for the reason the
+     * renderer is single: a reader written somewhere else drifts from the writer eventually, and the
+     * shape that takes is a recorded column read back as a type it was never written as - which is a
+     * computed column judged in an environment that does not match the one it will run in.
+     *
+     * <p><b>An unreadable string bare-crashes rather than answering UNKNOWN.</b> Everything this reads
+     * was written by the renderer above, so a string it cannot read means a second writer exists
+     * somewhere - and that is the defect itself. Answering UNKNOWN would file it away as a column
+     * whose type merely failed to resolve, which is an ordinary state nobody investigates.
+     */
+    static TapstateType typeOf(String declaredType) {
+        int space = declaredType.indexOf(' ');
+        return TapstateType.valueOf(space < 0 ? declaredType : declaredType.substring(0, space));
+    }
+
+    /**
      * The refusal, attributed. The two codes carry the same difference because the difference is the
      * same; what differs is who has to act on it, and that is what the code says.
      */

@@ -252,4 +252,31 @@ class JoinSchemaDriftTest {
         assertThat(recorded.version()).isZero();
         assertThat(recorded.derivedFrom()).isNotEqualTo(provenanceBefore);
     }
+    /**
+     * The renderer and the reader are one pair, so every type survives the trip out and back. Driven
+     * off the enum rather than a written-out list: a type added tomorrow joins this case on its own,
+     * and a reader that stopped covering one would otherwise be found by whoever first fed a recorded
+     * column of that type back into an expression check - which is a long way from here.
+     */
+    @Test
+    @DisplayName("every declared type reads back as the type it was written from")
+    void everyDeclaredTypeReadsBackAsItself() {
+        for (TapstateType type : TapstateType.values()) {
+            assertThat(JoinSchemaDrift.typeOf(JoinSchemaDrift.declaredType(type, true)))
+                    .as("nullable %s", type)
+                    .isEqualTo(type);
+            assertThat(JoinSchemaDrift.typeOf(JoinSchemaDrift.declaredType(type, false)))
+                    .as("non-null %s", type)
+                    .isEqualTo(type);
+        }
+    }
+
+    @Test
+    @DisplayName("a declared type nothing here wrote crashes bare rather than reading as unresolved")
+    void aDeclaredTypeFromNowhereCrashesBare() {
+        // Answering UNKNOWN would file a second writer's output away as a column whose type merely
+        // failed to resolve - an ordinary state nobody investigates - instead of as the defect it is.
+        assertThatThrownBy(() -> JoinSchemaDrift.typeOf("VARCHAR(20) NULL"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }

@@ -21,7 +21,7 @@ public sealed interface ViewBlock {
                   String primaryKey,
                   @Doc("Storage backend used to persist this view.")
                   Storage storage,
-                  @Doc("Field layout of the records held by this view.")
+                  @Doc("Schema policy for this view: whether its shape is enforced and how it may evolve.")
                   ViewSchema schema) implements ViewBlock {
         public Inline {
             Objects.requireNonNull(id, "id");

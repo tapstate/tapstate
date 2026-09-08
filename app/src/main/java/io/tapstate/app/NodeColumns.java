@@ -1,5 +1,8 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.RowExpressions;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.PushFormat;
 import io.tapstate.core.model.ServeBlock;
@@ -8,8 +11,10 @@ import io.tapstate.core.model.ViewBlock;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * What one node of a pipeline works its own output columns out to be, or the reason nobody can say.
@@ -84,17 +89,28 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
     }
 
     /**
-     * What a transform step produces. Six kinds, and the switch is exhaustive over all of them: a
-     * seventh cannot be added to the grammar without this stopping the build.
+     * What a transform step produces, given what reaches it. Six kinds, and the switch is exhaustive
+     * over all of them: a seventh cannot be added to the grammar without this stopping the build.
+     *
+     * <p><b>A script is the one kind that cannot be answered for, and the answer is final rather than
+     * pending.</b> Its columns are whatever the script writes on the row while it runs, and its types
+     * are not merely hard but undefined - one JS number type means the same script can put a whole
+     * number on one row and a fractional one on the next. Analysing the source would answer
+     * confidently and sometimes wrongly, which is the one failure this model must not have; asking the
+     * author to declare the shape moves the guess rather than removing it, since nothing would hold a
+     * row to the declaration. <b>A script also sees events that carry no row at all</b> - it is the
+     * only step handed schema changes - so for part of what it sees the question does not even apply,
+     * and nothing here may work a row's shape out from one of those.
      */
-    static NodeColumns of(TransformBody body) {
+    static NodeColumns of(TransformBody body, NodeColumns upstream) {
         return switch (body) {
             case TransformBody.Js ignored ->
                     unknown("js: a script settles its own columns while it runs, not before");
-            case TransformBody.MapProjection ignored ->
-                    unknown("map: the projection's field rules are not read here yet");
-            case TransformBody.Filter ignored ->
-                    unknown("filter: the upstream columns it passes through are not read here yet");
+            case TransformBody.MapProjection projection -> project(projection.fields(), upstream);
+            // A predicate decides which rows travel on, never which columns they carry. Handing the
+            // upstream answer back unchanged is the whole of it - including when that answer is an
+            // unknown, which then keeps naming the step that actually went dark.
+            case TransformBody.Filter ignored -> upstream;
             case TransformBody.Union ignored ->
                     unknown("union: the several upstreams it merges are not read here yet");
             case TransformBody.Nest ignored ->
@@ -109,22 +125,33 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
      * is a choice of its own - the envelope - rather than a node that is not there, so it is a case here
      * and not a guard above.
      */
-    static NodeColumns of(PushElement element) {
+    static NodeColumns of(PushElement element, NodeColumns upstream) {
         return switch (element.format()) {
-            case null ->
-                    unknown("serve.push envelope: the envelope's own shape is not written down here yet");
-            case PushFormat.Cel ignored ->
-                    unknown("serve.push cel: the expression's result type is not read here yet");
-            case PushFormat.Fields ignored ->
-                    unknown("serve.push fields: the per-field rules are not read here yet");
+            // The envelope wraps the row in metadata rather than reshaping it, so the row travels on
+            // with the columns it arrived with. The wrapper's own names are not among them: they
+            // describe the change, and this records what the change is to.
+            case null -> upstream;
+            // One expression produces the entire body, so what it yields is a single value and not a
+            // set of named columns - a map literal included, since CEL types a map by its value type
+            // and never by its keys. The type it does yield is named because that is the whole of what
+            // can be said, and a reader who wants the columns has to look at the expression.
+            case PushFormat.Cel cel -> upstream.known()
+                    ? unknown("serve.push cel: the body is one expression producing "
+                            + RowExpressions.typedValueType(cel.expr(), typesOf(upstream))
+                            + ", which names no columns of its own")
+                    : upstream;
+            case PushFormat.Fields fields -> project(fields.fields(), upstream);
         };
     }
 
-    /** What a view stores. */
-    static NodeColumns of(ViewBlock view) {
+    /**
+     * What a view stores: the rows it is given, so the columns it is given. A view carries a schema
+     * policy of its own - whether the shape is held to and how it may move - but a policy says what
+     * happens to a shape rather than what the shape is, so nothing there is read here.
+     */
+    static NodeColumns of(ViewBlock view, NodeColumns upstream) {
         return switch (view) {
-            case ViewBlock.Inline ignored ->
-                    unknown("view: the columns it holds are not read here yet");
+            case ViewBlock.Inline ignored -> upstream;
             case ViewBlock.Use use -> throw notExpanded("view", use.use());
         };
     }
@@ -140,6 +167,79 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
             case ServeBlock.Inline inline -> inline.push() == null ? List.of() : inline.push();
             case ServeBlock.Use use -> throw notExpanded("serve", use.use());
         };
+    }
+
+    /**
+     * The projection both the map step and the per-field push format are: the declared rules in
+     * declared order, then every upstream column no rule already spoke for, in the order it arrived.
+     * <b>This mirrors what the projection actually does to a row, rule for rule</b> - a rename takes
+     * the source column's type and consumes it, a drop removes it, a literal and a computed value add
+     * one, an output name wins over a same-named column arriving from upstream, and a rename whose
+     * source is not there produces nothing rather than an empty column. The two have to agree: this is
+     * the shape a target table is later built to, and a row that does not fit it fails at the write.
+     *
+     * <p>An unknown upstream comes straight back out. Re-wording it here would replace the name of the
+     * step that went dark with the name of a step that merely could not see past it, and the first is
+     * the one worth having by the time anybody reads a pipeline's model.
+     */
+    private static NodeColumns project(Map<String, FieldRule> rules, NodeColumns upstream) {
+        if (!upstream.known()) {
+            return upstream;
+        }
+        Map<String, TapstateType> upstreamTypes = typesOf(upstream);
+        Map<String, String> out = new LinkedHashMap<>();
+        Set<String> consumed = new LinkedHashSet<>();
+        Set<String> dropped = new LinkedHashSet<>();
+        rules.forEach((output, rule) -> {
+            switch (rule) {
+                case FieldRule.Rename rename -> {
+                    consumed.add(rename.sourceField());
+                    String renamed = upstream.columns().get(rename.sourceField());
+                    if (renamed != null) {
+                        out.put(output, renamed);
+                    }
+                }
+                case FieldRule.Drop ignored -> dropped.add(output);
+                // A literal is the one column here that is known not to be absent: it is the same
+                // written-down value on every row.
+                case FieldRule.Literal literal ->
+                        out.put(output, JoinSchemaDrift.declaredType(literalType(literal.value()), false));
+                // Nullable, always: an expression over a column that may be absent may itself yield
+                // nothing, and no part of the expression language says otherwise.
+                case FieldRule.Computed computed -> out.put(output, JoinSchemaDrift.declaredType(
+                        RowExpressions.typedValueType(computed.celExpr(), upstreamTypes), true));
+            }
+        });
+        upstream.columns().forEach((name, type) -> {
+            if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
+                out.put(name, type);
+            }
+        });
+        return known(out);
+    }
+
+    /**
+     * What a written-down value is. A literal is written in the pipeline's own text, so its type is
+     * whatever the text parsed to and nothing else is consulted; a shape the parser produces that is
+     * not one of these is unknown rather than the closest of them, for the same reason a computed
+     * value outside the expression language's own types is.
+     */
+    private static TapstateType literalType(Object value) {
+        return switch (value) {
+            case Boolean ignored -> TapstateType.BOOLEAN;
+            case String ignored -> TapstateType.STRING;
+            case Integer ignored -> TapstateType.INT64;
+            case Long ignored -> TapstateType.INT64;
+            case Double ignored -> TapstateType.DOUBLE;
+            default -> TapstateType.UNKNOWN;
+        };
+    }
+
+    /** The upstream columns as the expression checker wants them: the type alone, without the null. */
+    private static Map<String, TapstateType> typesOf(NodeColumns upstream) {
+        Map<String, TapstateType> types = new LinkedHashMap<>();
+        upstream.columns().forEach((name, declared) -> types.put(name, JoinSchemaDrift.typeOf(declared)));
+        return types;
     }
 
     /**
