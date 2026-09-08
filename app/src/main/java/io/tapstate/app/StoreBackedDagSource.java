@@ -40,6 +40,7 @@ import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceIndex;
+import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StorePort;
@@ -82,6 +83,7 @@ final class StoreBackedDagSource implements DagSource {
     private final NestSettings nestSettings;
     private final StoreReachability storeReachability;
     private final JoinSchemaDrift joinSchemaDrift;
+    private final SourceSchemaCopy sourceSchemaCopy;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -153,6 +155,7 @@ final class StoreBackedDagSource implements DagSource {
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
         this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
+        this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
     }
 
     @Override
@@ -162,6 +165,10 @@ final class StoreBackedDagSource implements DagSource {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
+        // The pipeline takes its own copy of what discovery found for each table it reads, before anything
+        // downstream is worked out from it. Reading the discovery directly instead would let a
+        // re-discovery change the shape of this run's input while the run is already using it.
+        copySourceSchemas(pipelineId, sourceVertices);
         Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
         Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
         Set<String> stepIds = stepIds(pipeline);
@@ -232,6 +239,29 @@ final class StoreBackedDagSource implements DagSource {
 
     private record SourceVertex(
             String pipelineId, String sourceId, String table, SourceCaptureResolution resolution) {
+    }
+
+    /**
+     * Records this pipeline's own copy of each source table it reads. One vertex is one selected table, so
+     * a source reading several tables leaves one copy per table rather than one for the source - the same
+     * reason the chain binding is keyed per vertex, and the reason the id carries the table.
+     *
+     * <p>A table nothing has discovered is skipped rather than recorded empty. Authoring against an
+     * undiscovered source is allowed, and a start that actually needs the model refuses by name before it
+     * binds anything.
+     */
+    private void copySourceSchemas(String pipelineId, Map<String, SourceVertex> sourceVertices) {
+        for (SourceVertex vertex : sourceVertices.values()) {
+            SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
+            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            sourceSchemaCopy.copy(pipelineId, vertex.sourceId(), vertex.table(),
+                    discovered == null ? null : discoveredTable(discovered, vertex.table()));
+        }
+    }
+
+    /** The named table in a discovered model, or null when the model does not carry it. */
+    private static SourceTable discoveredTable(SourceModel model, String table) {
+        return model.tables().stream().filter(t -> t.name().equals(table)).findFirst().orElse(null);
     }
 
     /**

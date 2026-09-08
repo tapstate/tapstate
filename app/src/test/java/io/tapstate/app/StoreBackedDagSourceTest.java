@@ -7,6 +7,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
@@ -31,9 +32,11 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
+import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -77,6 +80,37 @@ class StoreBackedDagSourceTest {
         assertThat(edges(dag)).containsExactlyInAnyOrder(
                 edge("orders_src", "keep_even"),
                 edge("keep_even", "serve.sync_1"));
+    }
+
+    @Test
+    void building_the_dag_copies_each_read_source_table_into_the_pipelines_own_record() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of("orders_src"),
+                List.of(filter("keep_even", "row.id % 2 == 0", FromRef.literal("orders_src"))),
+                null,
+                serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(store.derivedSchemas.latest("p", "orders_src.orders"))
+                .get()
+                .extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+        // Filed under the qualified id, never under the vertex name. This source selects one table, so
+        // the graph names its vertex "orders_src" - the assertion above proves the copy does not follow
+        // that name, which would go missing the day a second table is selected and read as never
+        // recorded rather than as a change.
+        assertThat(store.derivedSchemas.latest("p", "orders_src")).isEmpty();
     }
 
     @Test

@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.OutputField;
 import io.tapstate.core.sql.SourceColumn;
@@ -117,7 +118,17 @@ final class JoinSchemaDrift {
 
     /** How one derived column's type is written down, on every side that writes one down. */
     static String declaredType(OutputField field) {
-        return field.type() + (field.nullable() ? " NULL" : " NOT NULL");
+        return declaredType(field.type(), field.nullable());
+    }
+
+    /**
+     * The same rendering for a column that is not a join output - a source node copying a discovered
+     * column, say. It is an overload rather than a second renderer on purpose: two renderings of the
+     * same column drift apart eventually, and the shape that takes is a recorded schema that no longer
+     * equals the one the next start computes, which reads as a difference nobody made.
+     */
+    static String declaredType(TapstateType type, boolean nullable) {
+        return type + (nullable ? " NULL" : " NOT NULL");
     }
 
     /**
