@@ -35,6 +35,9 @@ interface DagSource {
      * What {@code pipelineId}'s topology keeps state in — for each component that keeps any, what to call
      * it, whose it is, and the namespaces it is kept under. Empty where the pipeline keeps none.
      *
+     * <p>Every component that keeps some, not one of them: a pipeline that both nests and joins is
+     * answered with both sets, and one that only joins is still answered.
+     *
      * <p>Deliberately not a defaulted method. An implementation that quietly answered "none" would leave
      * every namespace it owns unrecorded, and nothing about that announces itself: the pipeline stops, the
      * state stays, and the next run reads it as its own.

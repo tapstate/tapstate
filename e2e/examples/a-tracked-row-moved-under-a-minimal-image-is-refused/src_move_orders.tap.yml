@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: src_move_orders
+connector: postgres
+config: { host: ${SRC_HOST}, port: ${SRC_PORT}, database: ${SRC_DATABASE}, schema: public, user: ${SRC_USERNAME}, password: ${SRC_PASSWORD} }
+mode: cdc
+tables: [ move_orders ]

@@ -37,7 +37,13 @@ public final class PipelineStateInventory {
     public static final String NEXT_RUN_HAS_NO_POSITION =
             "The run after this one has no position to carry on from.";
 
-    /** What a nest assembled, the shape it assembled under, and the changes it could not assemble. */
+    /**
+     * What the pipeline's operators had built up: what a nest assembled, the shape it assembled under
+     * and the changes it could not assemble, together with the row images and reverse index a join
+     * keeps. One holding rather than one per component, because the label speaks of the operators
+     * rather than of any one of them - which is what lets the next component that keeps state be
+     * spoken about by naming its namespaces and nothing else.
+     */
     public static final PipelineStateHolding OPERATOR_STATE = PipelineStateHolding.named(
             "what its operators had assembled, and the changes they could not assemble",
             PipelineStateHolding.Scope.PIPELINE);

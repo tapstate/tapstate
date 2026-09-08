@@ -397,6 +397,25 @@ final class ControlPlane {
         expect(send(authed("/api/connections:discover-schema", body)), 200, "discover the model of " + resourceId);
     }
 
+    /** The table names a Source exposes from its latest discovery, in discovery order. */
+    List<String> sourceSchemaTables(String sourceId) {
+        return schemaTables("/api/sources/" + urlSegment(sourceId) + "/schema", "Source " + sourceId);
+    }
+
+    /** Every table the latest connection-level discovery found, in discovery order. */
+    List<String> connectionSchemaTables(String connectionId) {
+        return schemaTables(
+                "/api/connections/" + urlSegment(connectionId) + "/schema", "connection " + connectionId);
+    }
+
+    private List<String> schemaTables(String path, String subject) {
+        HttpResponse<String> response = send(authedGet(path));
+        expect(response, 200, "read the schema of " + subject);
+        return entriesOf(response.body(), "tables").stream()
+                .map(table -> String.valueOf(table.get("name")))
+                .toList();
+    }
+
     /**
      * Drives a connection test and returns the report body verbatim. The verb probes the connection
      * for real - it inits the connector, discovers, and reads a small sample - so it exercises paths

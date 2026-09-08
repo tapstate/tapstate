@@ -211,27 +211,32 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * Where this pipeline keeps state: the namespaces each compiled nest vertex holds entries in, plus
-     * the record of the nest shape and each PDK connector's exact node namespace. The shape record goes
-     * with the state it describes - kept behind, it would refuse the next start of a pipeline that has
-     * nothing left to abandon, naming paths that no longer address anything.
+     * Where this pipeline keeps state: the namespaces its compiled nest and join vertices hold entries
+     * in, the nest-shape record, and each PDK connector's exact node namespace. Operator records go with
+     * the state they describe - kept behind, they would make the next use of this pipeline id inherit
+     * rows and shapes the current sources no longer hold.
      *
      * <p>The tree is compiled again here rather than remembered from the build, for the same reason the
      * build compiles it rather than reading it back: the names come from the tree, so the tree is what is
-     * asked. A pipeline with no nest step has no operator-state holding, but still names connector state
-     * for its capture sources and sinks because those connectors can keep notes between runs.
+     * asked. A pipeline with no nest or join has no operator-state holding, but still names connector
+     * state for its capture sources and sinks because those connectors can keep notes between runs.
      */
     @Override
     public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         List<PipelineStateHolding> holdings = new ArrayList<>();
+
+        // Read joins off the wiring before resolving source models. A stop must still name their mirrors
+        // and reverse indexes when the sources behind the query have gone undiscoverable.
+        Set<String> operatorNamespaces = new LinkedHashSet<>(PipelineDagBuilder.joinStateNamespaces(pipeline));
         if (PipelineDagBuilder.hasNest(pipeline)) {
             Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
-            Set<String> namespaces =
-                    new LinkedHashSet<>(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
-            namespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
-            holdings.add(PipelineStateInventory.OPERATOR_STATE.in(namespaces));
+            operatorNamespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
+            operatorNamespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
+        }
+        if (!operatorNamespaces.isEmpty()) {
+            holdings.add(PipelineStateInventory.OPERATOR_STATE.in(operatorNamespaces));
         }
         holdings.add(PipelineStateInventory.CONNECTOR_STATE.in(connectorStateNamespaces(pipeline)));
         return List.copyOf(holdings);

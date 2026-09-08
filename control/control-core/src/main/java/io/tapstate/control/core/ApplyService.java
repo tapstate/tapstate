@@ -13,7 +13,6 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
-import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
@@ -28,8 +27,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
  * The resource-type-agnostic apply pipeline. {@link #plan} is the front half — validate -> canonical
@@ -362,7 +359,7 @@ public final class ApplyService {
                     .filter(discovered -> discovered.connectorId().equals(source.connector()))
                     .ifPresent(discovered -> {
                         List<DiscoveredTable> tables = new ArrayList<>();
-                        for (SourceTable table : selectedTables(source, discovered.model().tables())) {
+                        for (SourceTable table : SourceTableScope.select(source, discovered.model().tables())) {
                             Map<String, TapstateType> columns = new LinkedHashMap<>();
                             for (SourceField field : table.fields()) {
                                 columns.put(field.name(), field.type());
@@ -380,52 +377,6 @@ public final class ApplyService {
                     });
         }
         return bySource;
-    }
-
-    /**
-     * The discovered tables {@code source} reads. Discovery runs per connection, so the stored model
-     * carries every table the connection can see - including the ones this source's selector leaves
-     * out. Those are not this source's to answer for, and the wiring can point an expression at a table
-     * only through the source that selects it.
-     *
-     * <p>A selector matching nothing in the model narrows nothing — the names cannot be lined up (the
-     * connector may report qualified names, or the model may predate the selector), so no table is
-     * ruled out. Where the wiring names the table it reads, this changes no verdict: a name absent
-     * from the model is filtered out downstream either way. Where it cannot — a regex {@code from:},
-     * which only a connection can resolve — it is what keeps the whole model in play; narrowing to
-     * the empty set there would leave every column absent, and an absent column stays untyped and
-     * passes, so the gate would quietly stop refusing anything at all for that source. A pattern that
-     * will not compile matches nothing on its own rather than failing the apply.
-     */
-    private static List<SourceTable> selectedTables(SourceResource source, List<SourceTable> discovered) {
-        List<TableRef> selectors = source.tables();
-        if (selectors == null || selectors.isEmpty()) {
-            return discovered;      // no selector: the source reads whatever the connection holds
-        }
-        List<SourceTable> selected = new ArrayList<>();
-        for (SourceTable table : discovered) {
-            if (selectors.stream().anyMatch(selector -> selects(selector, table.name()))) {
-                selected.add(table);
-            }
-        }
-        return selected.isEmpty() ? discovered : selected;
-    }
-
-    /** Whether one {@code tables} entry selects the named discovered table. */
-    private static boolean selects(TableRef selector, String table) {
-        return switch (selector) {
-            case TableRef.Literal literal -> literal.name().equals(table);
-            case TableRef.Spec spec -> spec.name().equals(table);
-            case TableRef.Regex regex -> matches(regex.pattern(), table);
-        };
-    }
-
-    private static boolean matches(String pattern, String table) {
-        try {
-            return Pattern.matches(pattern, table);
-        } catch (PatternSyntaxException e) {
-            return false;
-        }
     }
 
     /** Classifies one prepared artifact without mutating the store. */

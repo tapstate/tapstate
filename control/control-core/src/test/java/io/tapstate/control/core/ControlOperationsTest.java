@@ -24,6 +24,7 @@ class ControlOperationsTest {
                         "source.draft",
                         "source.list",
                         "source.get",
+                        "source.schema",
                         "source.update",
                         "source.delete",
                         "connection.test",
@@ -70,6 +71,7 @@ class ControlOperationsTest {
         assertThat(registry.resolve("source.draft").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.get").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("source.schema").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.update").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("source.delete").scope()).isEqualTo(Scope.WRITE);
         // connection.test persists its result for later query, so it is a state-mutating write.
@@ -141,6 +143,7 @@ class ControlOperationsTest {
                 "source.draft",
                 "source.list",
                 "source.get",
+                "source.schema",
                 "connection.test-result",
                 "connection.schema",
                 "connector.list",
@@ -164,7 +167,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(41);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(42);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }

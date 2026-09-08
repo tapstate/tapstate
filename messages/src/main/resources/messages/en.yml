@@ -598,8 +598,8 @@ nest.state-served-from-cold-layer:
   message: "Nest namespace {namespace} served {backfills} of {accesses} state reads from storage rather than memory ({share}), {millis} each; {entries} of {stored} entries are in memory ({resident})."
   solution: "Raise this pipeline's in-memory entry budget so more of its working set stays resident, or accept the round trips if the throughput they allow is enough."
 nest.key-change-tracking-requires-before-image:
-  message: "Stream {alias} tracks structural key changes, but source table {table} provides no before image."
-  solution: "Configure the source to emit full row images, or turn key tracking off for that stream."
+  message: "Stream {alias} tracks structural key changes, but the row an update of source table {table} replaces does not carry {columns}."
+  solution: "Configure that source to send whole row images rather than minimal ones - on MySQL that is binlog_row_image=FULL, on PostgreSQL a full replica identity on the table - or turn key tracking off for that stream. A minimal image sends the columns identifying the row and nothing else, so the earlier row arrives without the one this compares and reads as a row that used to hang under nothing."
 nest.state-far-exceeds-memory-budget:
   message: "Nest level {embedPath} of pipeline {pipeline} is estimated to hold {estimatedEntries} entries, {multiple} times the {budget} it keeps in memory, so nearly every read of its state would come from storage."
   solution: "Raise this pipeline's entries_in_memory so more of that level stays resident, or accept the round trips if the throughput they allow is enough."

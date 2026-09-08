@@ -44,6 +44,7 @@ import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
+import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.TokenSecrets;
@@ -434,6 +435,11 @@ class ControlPlaneConfiguration {
     @Bean
     SchemaQueryService schemaQueryService(SchemaStore schemaStore) {
         return new SchemaQueryService(schemaStore);
+    }
+
+    @Bean
+    SourceSchemaQueryService sourceSchemaQueryService(ArtifactStore artifactStore, SchemaStore schemaStore) {
+        return new SourceSchemaQueryService(artifactStore, schemaStore);
     }
 
     // The read face over a declared source's own database. Unlike the two connection probes, the browser
