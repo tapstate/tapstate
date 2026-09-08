@@ -13,10 +13,12 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * Lets go of the state a pipeline's nests kept, in the two places it is kept: the maps holding it on the
- * member, and the store behind them holding what those maps wrote through. Both, because either alone
- * leaves the state readable - dropping only the store leaves the live map answering from memory, and
- * destroying only the map leaves the next run's first read pulling it all back off disk.
+ * Lets go of the operator state a pipeline's runs kept - a nest's and a join's alike, since both are named
+ * the same way and neither is a cache - in the two places it is kept: the maps holding it on the member,
+ * and the store behind them holding what those maps wrote through. Both, because either alone leaves the
+ * state readable - dropping only the store leaves the live map answering from memory and writing its
+ * entries straight back through as they are asked for, and destroying only the map leaves the next run's
+ * first read pulling it all back off disk.
  *
  * <p>A drop is written down before it is done and forgotten only once it is finished, so that a process
  * that dies halfway through one leaves behind a note saying so rather than a pipeline half let go of. The

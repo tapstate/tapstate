@@ -78,17 +78,90 @@ class AStreamThatTracksKeyChangesNeedsToSeeWhatTheRowWasTest {
     }
 
     /**
-     * The alias is what the author wrote and the table is what a DBA has to go and reconfigure. Naming only
-     * one of them leaves whoever reads the failure to guess the other.
+     * The alias is what the author wrote, the table is what a DBA has to go and reconfigure, and the
+     * columns are what that reconfiguration has to make the source send. Naming only the first two leaves
+     * whoever reads the failure looking for a row image that is, from where they stand, already there.
      */
     @Test
-    void theFailureNamesBothWhatWasWrittenAndWhatHasToBeReconfigured() throws Exception {
+    void theFailureNamesWhatWasWrittenWhatToReconfigureAndWhichColumnsAreMissing() throws Exception {
         ResolverProcessor policies = resolver(CLAIMS_TRACKED);
 
         assertThatThrownBy(() -> feed(policies, CLAIMS, claimUpdateWithNoBefore(1, "k1", "p1")))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).args())
-                .isEqualTo(Map.of("alias", "claim", "table", "claims"));
+                .describedAs("no earlier row at all means every compared column is missing, and the "
+                        + "failure lists them rather than saying the row is absent - one sentence for "
+                        + "the three states a source can be in")
+                .isEqualTo(Map.of("alias", "claim", "table", "claims",
+                        "columns", "claim_id, policy_id"));
+    }
+
+    @Test
+    void anEarlierRowCarryingNoTrackedKeyColumnIsRefused() throws Exception {
+        ResolverProcessor policies = resolver(CLAIMS_TRACKED);
+
+        assertThatThrownBy(() -> feed(policies, CLAIMS, claimUpdateWithMinimalBefore(1, "k1", "p1")))
+                .describedAs("a minimal row image sends the columns that identify the row and nothing "
+                        + "else, so the image is there and the column the tracking is about is not. "
+                        + "Read as an earlier row it says the claim used to hang under no policy at "
+                        + "all, so what goes out is a detach addressed to nothing and an attach to the "
+                        + "new parent - the element ends up under both, with the switch on and nothing "
+                        + "reported")
+                .isInstanceOf(TapstateException.class)
+                .extracting(thrown -> ((TapstateException) thrown).code().code())
+                .isEqualTo("nest.key-change-tracking-requires-before-image");
+    }
+
+    /**
+     * Nothing of the refused change is applied - not sent on, not written down.
+     *
+     * <p>This is what says a run that meets this has no divergent document to put right, and it is worth
+     * a case of its own because the alternative is not visible from the failure. A guard placed after the
+     * first read of the event would fail the job just as loudly while leaving half a move behind, and that
+     * half sits behind an ack: the restart replays from after it, so nothing puts it back. Every earlier
+     * event either carried these columns and was followed correctly, or would have been refused here in
+     * its turn - so what an operator has to do about the data is nothing.
+     */
+    @Test
+    void theRefusalLeavesNothingOfThatChangeApplied() throws Exception {
+        NestVertex vertex = NestTopology.compile("p", "doc", POLICIES_TRACKED, tables())
+                .vertexAt(List.of("policies"));
+        HeapNestStore<ResolverState> store = new HeapNestStore<>();
+        ResolverProcessor processor = new ResolverProcessor(vertex, store, UNUSED);
+        TestOutbox outbox = new TestOutbox(256);
+        processor.init(outbox, new TestProcessorContext());
+
+        TestInbox inbox = new TestInbox();
+        inbox.queue().add(policyUpdateWithMinimalBefore(1, "P1", "c2"));
+        assertThatThrownBy(() -> processor.process(OWN_ROWS, inbox))
+                .isInstanceOf(TapstateException.class);
+
+        List<Object> routed = new ArrayList<>();
+        outbox.drainQueueAndReset(0, routed, false);
+        assertThat(routed)
+                .describedAs("no half of the move went out - neither the attach to the new parent nor a "
+                        + "detach addressed to whatever the missing column read as")
+                .isEmpty();
+        assertThat(store.count())
+                .describedAs("and nothing was filed for it either")
+                .isZero();
+    }
+
+    /**
+     * The column saying which element it is counts too, and is the half a reader would not think to ask
+     * for. What is placed and what is taken out of the old place are the same element, and the ref for
+     * each is built off its own row - so an earlier row that says which parent it left and not which
+     * element it was takes a different element out of that parent than the one that moved.
+     */
+    @Test
+    void anEarlierRowWithoutTheColumnSayingWhichElementItIsIsRefused() throws Exception {
+        ResolverProcessor policies = resolver(CLAIMS_TRACKED);
+
+        assertThatThrownBy(() -> feed(policies, CLAIMS, Envelope.update(1, "claim",
+                row("policy_id", "p0"), row("claim_id", "k1", "policy_id", "p1"), null).withOrder(at(1))))
+                .isInstanceOf(TapstateException.class)
+                .extracting(thrown -> ((TapstateException) thrown).args())
+                .isEqualTo(Map.of("alias", "claim", "table", "claims", "columns", "claim_id"));
     }
 
     /** The vertex's own rows are a stream like any other, and the switch on that embed covers them. */
@@ -264,6 +337,15 @@ class AStreamThatTracksKeyChangesNeedsToSeeWhatTheRowWasTest {
                 row("claim_id", claimId, "policy_id", policyId), null).withOrder(at(seq));
     }
 
+    /**
+     * What a minimal row image sends as the row an update replaces: the columns identifying the row, and
+     * nothing else. The image is present; the column the tracking is about is not.
+     */
+    private static Envelope claimUpdateWithMinimalBefore(long seq, String claimId, String policyId) {
+        return Envelope.update(seq, "claim", row("claim_id", claimId),
+                row("claim_id", claimId, "policy_id", policyId), null).withOrder(at(seq));
+    }
+
     private static Envelope claimInsert(long seq, String claimId, String policyId) {
         return Envelope.insert(seq, "claim", row("claim_id", claimId, "policy_id", policyId), null)
                 .withOrder(at(seq));
@@ -272,6 +354,16 @@ class AStreamThatTracksKeyChangesNeedsToSeeWhatTheRowWasTest {
     private static Envelope claimDelete(long seq, String claimId, String policyId) {
         return Envelope.delete(seq, "claim", row("claim_id", claimId, "policy_id", policyId), null)
                 .withOrder(at(seq));
+    }
+
+    /**
+     * A policy that really moved to another customer, with the earlier row a minimal image sends: the
+     * column identifying the policy, and not the one it is keyed to its customer by.
+     */
+    private static Envelope policyUpdateWithMinimalBefore(long seq, String policyId, String customerId) {
+        return Envelope.update(seq, "policy", row("policy_id", policyId),
+                row("policy_id", policyId, "customer_id", customerId,
+                        "policy_no", "PN-" + policyId), null).withOrder(at(seq));
     }
 
     private static Envelope policyUpdateWithNoBefore(long seq, String policyId, String customerId) {

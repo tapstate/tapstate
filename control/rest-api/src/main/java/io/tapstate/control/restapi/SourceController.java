@@ -1,8 +1,10 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AuditedSourceService;
+import io.tapstate.control.core.SchemaReport;
 import io.tapstate.control.core.SourceDraft;
 import io.tapstate.control.core.SourceError;
+import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SourceView;
 import io.tapstate.core.common.TapstateException;
 import org.springframework.http.HttpHeaders;
@@ -28,9 +30,11 @@ class SourceController {
     private static final String QUOTED_HASH = "\"[0-9a-f]{64}\"";
 
     private final AuditedSourceService sources;
+    private final SourceSchemaQueryService schemas;
 
-    SourceController(AuditedSourceService sources) {
+    SourceController(AuditedSourceService sources, SourceSchemaQueryService schemas) {
         this.sources = Objects.requireNonNull(sources, "sources");
+        this.schemas = Objects.requireNonNull(schemas, "schemas");
     }
 
     @Verb("source.create")
@@ -53,6 +57,12 @@ class SourceController {
     ResponseEntity<SourceView> get(@PathVariable("id") String id) {
         SourceView view = sources.get(id);
         return ResponseEntity.ok().eTag(view.contentHash()).body(view);
+    }
+
+    @Verb("source.schema")
+    @GetMapping("/sources/{id}/schema")
+    ResponseEntity<SchemaReport> schema(@PathVariable("id") String id) {
+        return ResponseEntity.of(schemas.find(id));
     }
 
     @Verb("source.update")

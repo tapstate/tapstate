@@ -11,8 +11,8 @@ import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.dsl.WriteKeyRules;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
-import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
@@ -27,8 +27,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
  * The resource-type-agnostic apply pipeline. {@link #plan} is the front half — validate -> canonical
@@ -37,8 +35,9 @@ import java.util.regex.PatternSyntaxException;
  * the catalog), judges the batch's row expressions against the columns of the tables its sources were
  * discovered to hold, then emits each resource's canonical form and content hash. It writes nothing. It reads the
  * schema store — an observation of what discovery found, never the config truth layer, which apply is
- * the one writer of — and reads the artifact store only for a draft that carries a precondition, to
- * judge that precondition against the stored version.
+ * the one writer of — and reads the artifact store for a draft that carries a precondition, to
+ * judge that precondition against the stored version, and for a pipeline, to read back the srs
+ * switches it has already recorded so that an unedited file re-applies as a no-op.
  * {@link #apply} runs a plan and then upserts each artifact into the store by its id, skipping the
  * write when the stored artifact's content hash is unchanged (a no-op).
  *
@@ -77,12 +76,26 @@ public final class ApplyService {
     private final SchemaStore schemas;
     private final PlanAdvisories advisories;
     private final SchemaDerivation derivation;
+
+    /**
+     * The reading of which pipelines are up, or null when the caller supplied none -- see the same field
+     * on the Source service. Apply is the path most edits actually arrive on, so a guard that covered
+     * only the other one would be a guard in name.
+     */
+    private final LivePipelines live;
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories, SchemaDerivation derivation) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, null);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live) {
+        this.live = live;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -133,12 +146,74 @@ public final class ApplyService {
         RowExpressionTypeRules.validate(resources, discovered);
         WriteKeyRules.validate(resources, discovered);
         List<Resource> validated = List.copyOf(workspace.resources());
+        Map<String, SourceResource> batchSources = new LinkedHashMap<>();
+        for (Resource resource : validated) {
+            if (resource instanceof SourceResource source) {
+                batchSources.put(source.id(), source);
+            }
+        }
         List<PreparedArtifact> prepared = new ArrayList<>();
         for (Resource resource : validated) {
-            String canonicalForm = writer.write(resource);
-            prepared.add(new PreparedArtifact(resource, canonicalForm, CanonicalHash.of(canonicalForm)));
+            Resource recorded = resource instanceof PipelineResource pipeline
+                    ? withOwnSrsSwitches(pipeline, batchSources) : resource;
+            String canonicalForm = writer.write(recorded);
+            prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(canonicalForm)));
         }
         return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions);
+    }
+
+    /**
+     * Records this pipeline's own srs switch for each source it reads. A switch the author wrote wins;
+     * failing that, the value this pipeline already recorded for that source is kept; failing that,
+     * the reference is new and the source's own switch is taken once -- here, and never again.
+     *
+     * <p>Why it is per pipeline at all: the switch decides whether a source is read through the shared
+     * replay store, and editing it on the source moved every pipeline reading that source at once -- a
+     * consent none of them could give individually. Recorded here, moving one pipeline is an edit to
+     * that one pipeline.
+     *
+     * <p>"First" is judged per source, not per pipeline: a source added to an existing pipeline has no
+     * recorded value, so it takes that source's, while the references beside it keep theirs.
+     *
+     * <p>This runs before the canonical form is written, and therefore before the content hash. After
+     * it, a draft that omits the switch would hash differently from the stored artifact that carries
+     * one, so every apply of an unedited file would read as a change: rewrite without the switch,
+     * materialize again, one revision per apply on a file nobody touched.
+     */
+    private PipelineResource withOwnSrsSwitches(
+            PipelineResource pipeline, Map<String, SourceResource> batchSources) {
+        Map<String, Boolean> alreadyRecorded = new LinkedHashMap<>();
+        if (store.get(pipeline.id()).orElse(null) instanceof PipelineResource stored) {
+            for (SourceRef ref : stored.sources()) {
+                if (ref instanceof SourceRef.Spec spec) {
+                    alreadyRecorded.put(spec.id(), spec.srs());
+                }
+            }
+        }
+        List<SourceRef> refs = new ArrayList<>();
+        boolean anyRecorded = false;
+        for (SourceRef ref : pipeline.sources()) {
+            if (ref instanceof SourceRef.Spec) {
+                refs.add(ref);
+                anyRecorded = true;
+                continue;
+            }
+            Boolean own = alreadyRecorded.get(ref.id());
+            if (own == null) {
+                // The source is read from the batch alone, because the batch is the closure: a pipeline
+                // referencing a source that is not in it is refused before this runs. A reference left
+                // bare here therefore cannot happen; if that closure rule is ever widened, the capture
+                // side names the pipeline and the source rather than guessing a value.
+                SourceResource declaring = batchSources.get(ref.id());
+                own = declaring == null ? null : declaring.srsEnabled();
+            }
+            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own));
+            anyRecorded |= own != null;
+        }
+        return anyRecorded
+                ? new PipelineResource(pipeline.id(), pipeline.metadata(), refs, pipeline.transforms(),
+                        pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental())
+                : pipeline;
     }
 
     /** Validates and plans a batch while performing no store or audit write. */
@@ -181,9 +256,19 @@ public final class ApplyService {
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
         Map<String, String> enforced = new LinkedHashMap<>();
+        // Read once for the refusal below, and only when there is a reading to judge against.
+        List<Resource> stored = live == null ? List.of() : store.list();
         for (PreparedArtifact prepared : plan.artifacts()) {
             ArtifactOutcome outcome = outcome(prepared);
             if (outcome.change() != ArtifactOutcome.Change.UNCHANGED) {
+                if (live != null && prepared.resource() instanceof SourceResource replacement) {
+                    live.refuseBufferingChangeWhileLive(
+                            storedSource(stored, replacement.id()), replacement, stored);
+                }
+                if (live != null && prepared.resource() instanceof PipelineResource replacement) {
+                    live.refuseBufferingChangeWhileLive(
+                            storedPipeline(stored, replacement.id()), replacement);
+                }
                 toWrite.add(prepared.resource());
                 // The declared version travels with the record, so a version-checked edit is
                 // distinguishable in the audit trail from a blind overwrite of the same id. A draft that
@@ -225,6 +310,25 @@ public final class ApplyService {
             }
         }
         return result;
+    }
+
+    /** The stored Source under {@code id}, or null when this apply is creating it. */
+    private static PipelineResource storedPipeline(List<Resource> stored, String id) {
+        return stored.stream()
+                .filter(PipelineResource.class::isInstance)
+                .map(PipelineResource.class::cast)
+                .filter(pipeline -> pipeline.id().equals(id))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static SourceResource storedSource(List<Resource> stored, String id) {
+        return stored.stream()
+                .filter(SourceResource.class::isInstance)
+                .map(SourceResource.class::cast)
+                .filter(source -> source.id().equals(id))
+                .findFirst()
+                .orElse(null);
     }
 
     /**
@@ -270,7 +374,7 @@ public final class ApplyService {
                     .filter(discovered -> discovered.connectorId().equals(source.connector()))
                     .ifPresent(discovered -> {
                         List<DiscoveredTable> tables = new ArrayList<>();
-                        for (SourceTable table : selectedTables(source, discovered.model().tables())) {
+                        for (SourceTable table : SourceTableScope.select(source, discovered.model().tables())) {
                             Map<String, TapstateType> columns = new LinkedHashMap<>();
                             for (SourceField field : table.fields()) {
                                 columns.put(field.name(), field.type());
@@ -288,52 +392,6 @@ public final class ApplyService {
                     });
         }
         return bySource;
-    }
-
-    /**
-     * The discovered tables {@code source} reads. Discovery runs per connection, so the stored model
-     * carries every table the connection can see - including the ones this source's selector leaves
-     * out. Those are not this source's to answer for, and the wiring can point an expression at a table
-     * only through the source that selects it.
-     *
-     * <p>A selector matching nothing in the model narrows nothing — the names cannot be lined up (the
-     * connector may report qualified names, or the model may predate the selector), so no table is
-     * ruled out. Where the wiring names the table it reads, this changes no verdict: a name absent
-     * from the model is filtered out downstream either way. Where it cannot — a regex {@code from:},
-     * which only a connection can resolve — it is what keeps the whole model in play; narrowing to
-     * the empty set there would leave every column absent, and an absent column stays untyped and
-     * passes, so the gate would quietly stop refusing anything at all for that source. A pattern that
-     * will not compile matches nothing on its own rather than failing the apply.
-     */
-    private static List<SourceTable> selectedTables(SourceResource source, List<SourceTable> discovered) {
-        List<TableRef> selectors = source.tables();
-        if (selectors == null || selectors.isEmpty()) {
-            return discovered;      // no selector: the source reads whatever the connection holds
-        }
-        List<SourceTable> selected = new ArrayList<>();
-        for (SourceTable table : discovered) {
-            if (selectors.stream().anyMatch(selector -> selects(selector, table.name()))) {
-                selected.add(table);
-            }
-        }
-        return selected.isEmpty() ? discovered : selected;
-    }
-
-    /** Whether one {@code tables} entry selects the named discovered table. */
-    private static boolean selects(TableRef selector, String table) {
-        return switch (selector) {
-            case TableRef.Literal literal -> literal.name().equals(table);
-            case TableRef.Spec spec -> spec.name().equals(table);
-            case TableRef.Regex regex -> matches(regex.pattern(), table);
-        };
-    }
-
-    private static boolean matches(String pattern, String table) {
-        try {
-            return Pattern.matches(pattern, table);
-        } catch (PatternSyntaxException e) {
-            return false;
-        }
     }
 
     /** Classifies one prepared artifact without mutating the store. */

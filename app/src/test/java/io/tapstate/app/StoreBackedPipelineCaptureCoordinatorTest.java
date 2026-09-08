@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
 
+import io.tapstate.core.model.PipelineNode;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.ReadMode;
@@ -24,6 +26,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.StorePort;
 import java.util.List;
@@ -50,7 +53,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest");
 
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                "pipe-1", settings, source, SourceCaptureResolution.of(source));
+                "pipe-1", settings, source, SourceCaptureResolution.of(source), true);
 
         assertThat(spec.pipelineId()).isEqualTo("pipe-1");
         assertThat(spec.sourceId()).isEqualTo("orders_src");
@@ -58,41 +61,231 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(spec.config().streams()).containsExactly("orders");
         assertThat(spec.readMode()).isEqualTo(ReadMode.CDC_ONLY);
         assertThat(spec.srsKey()).isNull();
-        assertThat(spec.srsEnabled()).as("srs defaults on when the source declares no srs block").isTrue();
+        assertThat(spec.srsEnabled()).as("the switch this pipeline recorded is carried through").isTrue();
         assertThat(spec.startFrom()).isEqualTo(io.tapstate.runtime.srs.StartFrom.earliest());
         assertThat(spec.schemaVer()).isZero();
     }
 
+    /**
+     * The config a run is driven with names the node it is driven for. This is the only place both halves
+     * exist: a source resolves without knowing any pipeline, and a pipeline is what starts each of its
+     * sources — so a spec that carried the pair beside the config while the config itself named nothing
+     * would leave the connector, which is handed only the config, with nowhere to keep what it records
+     * for itself. The two ids on the spec are not the witness for this; the one on the config is.
+     */
     @Test
-    void theL1MockWatermarkIsMonotonicAndItsOrderIsNumericNotLexical() {
+    void theConfigTheRunIsDrivenWithNamesTheNodeItIsDrivenFor() {
+        SourceResource source = cdcSource("orders_src", "orders", null);
+
+        CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, source, SourceCaptureResolution.of(source), true);
+
+        assertThat(spec.config().node()).isEqualTo(new PipelineNode("pipe-1", "orders_src"));
+    }
+
+    /**
+     * Two pipelines reading one database still mine it once. The node is what separates their notes, and
+     * the chain is what merges their reading — deriving one from the other in either direction breaks the
+     * half that was not being thought about, and neither break shows up in the rows.
+     */
+    @Test
+    void twoPipelinesReadingOneSourceKeepSeparateNodesAndStillShareOneChain() {
+        SourceResource source = cdcSource("orders_src", "orders", null);
+
+        CaptureRunSpec one = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, source, SourceCaptureResolution.of(source), true);
+        CaptureRunSpec other = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-2", null, source, SourceCaptureResolution.of(source), true);
+
+        assertThat(one.config().node()).isNotEqualTo(other.config().node());
+        assertThat(MiningChainId.of(one.config()))
+                .as("the chain both pipelines mine is the source's, not either pipeline's")
+                .isEqualTo(MiningChainId.of(other.config()));
+    }
+
+    /**
+     * The run spec carries no position of any kind, and that absence is the point.
+     *
+     * <p>A seam and a per-change position are the source's own, learned from it as the read happens. When
+     * this layer supplied them instead, both were invented here: a fixed seam token, and a generator that
+     * began again at its first value on every run. The second is what silently rewound the durable offset
+     * — a restarted run's invented positions start over while its ring generation rises, so every ordering
+     * check reads the rewind as an advance.
+     *
+     * <p>Asserted structurally, over the record's components, so that putting either back is a red test
+     * rather than a thing a reader has to notice.
+     */
+    @Test
+    void carriesNoPositionOfItsOwnBecausePositionsAreTheSourcesToState() {
         SourceResource source = cdcSource("orders_src", "orders", null);
         Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest");
 
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                "pipe-1", settings, source, SourceCaptureResolution.of(source));
+                "pipe-1", settings, source, SourceCaptureResolution.of(source), true);
 
-        // The mock watermark is a monotonic source-position generator. What ranks the tokens it hands out
-        // is not carried here at all: the order is the ring's own, assigned on append, so the spec has
-        // nothing to say about it - and nothing that could disagree with what the sink ranks by.
-        assertThat(spec.watermark().get()).isEqualTo(new SourcePosition("w1"));
-        assertThat(spec.watermark().get()).isEqualTo(new SourcePosition("w2"));
-        assertThat(spec.cdcStart()).isNotNull();
+        assertThat(spec.getClass().getRecordComponents())
+                .extracting(java.lang.reflect.RecordComponent::getType)
+                .as("no component of the run spec is a source position, nor a supplier of one")
+                .doesNotContain(SourcePosition.class, java.util.function.Supplier.class);
     }
 
     @Test
-    void aSourceWithSrsDisabledDerivesTheDirectTailAndAnExplicitKeyIsCarried() {
+    void aPipelineWhoseSwitchIsOffDerivesTheDirectTailAndAnExplicitKeyIsStillCarried() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null,
                 new Srs("shared-key", null, null, null, false), null);
 
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                "pipe-1", null, source, SourceCaptureResolution.of(source));
+                "pipe-1", null, source, SourceCaptureResolution.of(source), false);
 
-        assertThat(spec.srsEnabled()).as("srs.enabled:false is honoured").isFalse();
-        assertThat(spec.srsKey()).isEqualTo("shared-key");
+        assertThat(spec.srsEnabled()).as("the off switch is honoured").isFalse();
+        assertThat(spec.srsKey()).as("the key is the chain's identity, not the switch, so it is carried either way")
+                .isEqualTo("shared-key");
         assertThat(spec.readMode()).as("null settings default the read mode").isEqualTo(ReadMode.SNAPSHOT_AND_CDC);
-        assertThat(spec.startFrom()).as("null settings default the start position to earliest")
+        assertThat(spec.startFrom()).as("null settings default the start position to latest")
+                .isEqualTo(io.tapstate.runtime.srs.StartFrom.latest());
+    }
+
+    /**
+     * A pipeline that names no start position begins where its published contract says it does.
+     *
+     * <p>The setting documents its own default as {@code latest} and the canonical form encodes that same
+     * reading by dropping an explicit {@code latest}, so a run that filled in {@code earliest} instead told
+     * an author one thing and did the opposite: "only what is written from now on" against "replay every
+     * change still retained". Nothing read the filled-in value until a tail that reads its source directly
+     * began resolving it, at which point the disagreement became a first run that re-reads the whole
+     * retention window.
+     *
+     * <p>The third case is what makes the other two mean anything: an implementation that answers
+     * {@code latest} to everything satisfies both defaults and still throws away what an author wrote.
+     */
+    @Test
+    void aPipelineThatNamesNoStartPositionBeginsWhereItsContractSaysItDoes() {
+        SourceResource source = cdcSource("orders_src", "orders", null);
+
+        CaptureRunSpec noSettings = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, source, SourceCaptureResolution.of(source), true);
+        CaptureRunSpec settingsWithoutOne = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", new Settings(null, null, null, null, ReadMode.CDC_ONLY, null),
+                source, SourceCaptureResolution.of(source), true);
+        CaptureRunSpec authorAskedForEarliest = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"),
+                source, SourceCaptureResolution.of(source), true);
+
+        assertThat(noSettings.startFrom()).as("no settings at all")
+                .isEqualTo(io.tapstate.runtime.srs.StartFrom.latest());
+        assertThat(settingsWithoutOne.startFrom()).as("settings that name every other field but this one")
+                .isEqualTo(io.tapstate.runtime.srs.StartFrom.latest());
+        assertThat(authorAskedForEarliest.startFrom()).as("what the author wrote still wins")
                 .isEqualTo(io.tapstate.runtime.srs.StartFrom.earliest());
+    }
+
+    /**
+     * A hand-written source position is refused whether or not this pipeline buffers, rather than passed
+     * through to the connector.
+     *
+     * <p>Handing one through was the drafted behaviour for the unbuffered path, and there is no channel for
+     * it: a recorded position is the connector own offset object serialized, not text a person writes, and
+     * the plugin interface offers no way to build an offset from a string. It could not be documented
+     * either -- the offset type differs per connector and per connector configuration, so no shape could be
+     * named for an author to write. Asking for an exact position is served instead by reading one back and
+     * writing it again, which refuses out loud when it cannot be honoured; a start setting yields silently
+     * to an already-recorded position, so the same ask would have gone unanswered with nothing said.
+     *
+     * <p>Both paths are asserted because only their conjunction discriminates: an implementation that
+     * forwards the value once buffering is off stays green on the buffered case, which is the half a
+     * single-case test would have picked.
+     */
+    @Test
+    void aHandWrittenSourcePositionIsRefusedOnBothPathsRatherThanPassedThrough() {
+        String binlogCoordinate = """
+                {"file":"mysql-bin.000003","pos":154}""";
+        Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, binlogCoordinate);
+        SourceResource buffered = cdcSource("orders_src", "orders", null);
+        SourceResource direct = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null,
+                new Srs(null, null, null, null, false), null);
+
+        assertThat(buffered.srsEnabled()).as("the two sources really do take different paths").isTrue();
+        assertThat(direct.srsEnabled()).isFalse();
+
+        for (boolean srsEnabled : List.of(true, false)) {
+            SourceResource source = srsEnabled ? buffered : direct;
+            // The description goes on the call, not after it: a .as() chained onto the returned assertion
+            // never reaches the "no throwable was raised" failure, which is precisely the failure this
+            // case exists to produce -- and without it the report cannot say which of the two paths broke.
+            assertThatThrownBy(() -> StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                            "pipe-1", settings, source, SourceCaptureResolution.of(source), srsEnabled),
+                    "srs enabled: %s", srsEnabled)
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(e -> {
+                        TapstateException refused = (TapstateException) e;
+                        assertThat(refused.code().code()).isEqualTo("capture.start-from-unparsable");
+                        assertThat(refused.args()).containsEntry("value", binlogCoordinate);
+                    });
+        }
+    }
+
+
+    /**
+     * The whole point of moving the switch: the source says buffered, this pipeline recorded direct, and
+     * the run it derives is direct. Reading the source here -- even as a fallback -- puts back the
+     * coupling where editing one source re-routed every pipeline reading it.
+     */
+    @Test
+    void thePipelinesOwnSwitchDecidesEvenWhereTheSourceDisagrees() {
+        SourceResource buffered = cdcSource("orders_src", "orders", null);
+        assertThat(buffered.srsEnabled()).as("the source itself says buffered").isTrue();
+
+        CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, buffered, SourceCaptureResolution.of(buffered), false);
+
+        assertThat(spec.srsEnabled())
+                .as("the pipeline recorded off, so it reads direct however the source is configured")
+                .isFalse();
+    }
+
+    /** And the mirror, so neither direction is satisfied by an implementation that answers a constant. */
+    @Test
+    void thePipelinesOwnSwitchDecidesInTheOtherDirectionToo() {
+        SourceResource direct = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null,
+                new Srs(null, null, null, null, false), null);
+        assertThat(direct.srsEnabled()).as("the source itself says direct").isFalse();
+
+        CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
+                "pipe-1", null, direct, SourceCaptureResolution.of(direct), true);
+
+        assertThat(spec.srsEnabled()).isTrue();
+    }
+
+    /**
+     * A stored pipeline carries a recorded switch on every reference -- apply puts one there. One that
+     * does not has never been through apply, so starting it is refused loudly rather than run on a guess.
+     *
+     * <p>Guessing is the failure worth preventing: the pipeline would come up, report healthy, and read
+     * through the other path, which is the same silent shape this line exists to close. The refusal names
+     * both halves, so a reader is told which reference is missing it rather than that something is.
+     */
+    @Test
+    void aReferenceWithNoRecordedSwitchIsRefusedRatherThanRunOnAGuess() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src")), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"),
+                        List.of(new SyncElement("sync_1", "orders_src", null, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        CaptureStarter starter = (spec, passthrough) -> {
+            throw new AssertionError("capture must not start: no switch was ever recorded");
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer());
+
+        assertThatThrownBy(() -> coordinator.startCapture("p"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("'p'")
+                .hasMessageContaining("'orders_src'");
     }
 
     // ---- handle lifecycle ------------------------------------------------------------------------
@@ -127,11 +320,67 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(coordinator.isActive("p")).as("start retains a live handle for the pipeline").isTrue();
         assertThat(srsCoordinator.isProvisioned(chainId)).isTrue();
 
-        coordinator.stopCapture("p");
+        coordinator.stopCapture("p", true);
 
         assertThat(subscriptionClosed).as("stop closes the capture subscription, stopping the daemon").isTrue();
         assertThat(srsCoordinator.isProvisioned(chainId)).as("stop tears the source chain down").isFalse();
         assertThat(coordinator.isActive("p")).as("stop drops the handle").isFalse();
+    }
+
+    @Test
+    void aStopAskedToKeepLeavesTheCursorExactlyWhereItIs() {
+        CursorFixture fixture = new CursorFixture();
+        fixture.coordinator.startCapture("p");
+        fixture.leaveACursorFor("p");
+
+        fixture.coordinator.stopCapture("p", false);
+
+        // Its pair above is what makes this an assertion. Both stops close the run and give the chain
+        // back; only the record says which one was asked to throw the position away, and that position
+        // is the entire thing a later resume reads.
+        assertThat(fixture.consumersOnTheChain()).containsExactly("p");
+    }
+
+    /** One pipeline over one source, with a durable cursor on the chain it reads. */
+    private static final class CursorFixture {
+
+        private final InMemoryStorePort store;
+        private final SrsCoordinator srsCoordinator;
+        private final StoreBackedPipelineCaptureCoordinator coordinator;
+        private final SourceResource source = cdcSource("orders_src", "orders", null);
+
+        CursorFixture() {
+            InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+            artifacts.save(source);
+            artifacts.save(pipeline("p", "orders_src"));
+            store = new InMemoryStorePort(artifacts);
+            srsCoordinator = new SrsCoordinator(store.meta());
+            coordinator = new StoreBackedPipelineCaptureCoordinator(
+                    store, this::start, srsCoordinator, new SnapshotBuffer());
+        }
+
+        private CaptureRun start(CaptureRunSpec spec, java.util.function.Consumer<Envelope> passthrough) {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
+            }), new CaptureHealth());
+        }
+
+        /** Writes the durable cursor a run leaves behind, which is what a purge has to take away. */
+        void leaveACursorFor(String pipelineId) {
+            store.meta().upsertConsumerOffset(chainId(), new ConsumerOffset(pipelineId, Map.of(), null));
+        }
+
+        List<String> consumersOnTheChain() {
+            return store.meta().read(chainId()).orElseThrow().consumerOffsets().stream()
+                    .map(ConsumerOffset::pipelineId)
+                    .toList();
+        }
+
+        private String chainId() {
+            return MiningChainId.resolve(SourceCaptureResolution.of(source).config(), null).value();
+        }
     }
 
     @Test
@@ -261,7 +510,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("src_a", "orders", null));
         artifacts.save(cdcSource("src_b", "orders", null));
-        artifacts.save(new PipelineResource("p", null, List.of("src_a", "src_b"), null, null,
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("src_a"),
                         List.of(new SyncElement("sync_1", "src_a", null, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
@@ -304,7 +553,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 new SrsCoordinator(new InMemorySrsMetaStore()),
                 new SnapshotBuffer());
 
-        coordinator.stopCapture("never-started");
+        coordinator.stopCapture("never-started", true);
 
         assertThat(coordinator.isActive("never-started")).isFalse();
     }
@@ -425,7 +674,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         artifacts.save(cdcSource("src_b", "customers", null));
         artifacts.save(new SourceResource("src_c", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, null, null, null, null));
-        artifacts.save(new PipelineResource("p", null, List.of("src_a", "src_b", "src_c"), null, null,
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true), SourceRef.spec("src_c", true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("src_a"),
                         List.of(new SyncElement("sync_1", "src_a", null, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
@@ -459,6 +708,140 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 firstSpec.get().config(), firstSpec.get().srsKey()))).isFalse();
     }
 
+    /**
+     * What a resume has to know is whether the load reached the target, and this is the face that answers it.
+     *
+     * <p>The read side cannot: a bounded read drains in one blocking pass before the job carrying its rows is
+     * submitted, so every table's read has returned before anyone can hold the pipeline, while almost none of
+     * what it read has been written. This case puts the two in exactly that state -- every table present on
+     * the read face, not one of them confirmed on the record -- because that is the state a hold lands in, and
+     * an implementation reading the wrong one of the two answers "delivered" throughout it.
+     */
+    @Test
+    void aLoadIsDeliveredOnlyOnceTheRecordShowsEveryTableWrittenNotOnceItsReadReturned() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        AtomicReference<MiningChainId> chain = new AtomicReference<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            chain.set(chainId);
+            return new CaptureRun(Optional.of(chainId), false, 2L, Map.of("orders", 1L, "customers", 1L),
+                    Optional.empty(), Optional.of(() -> {
+                    }), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                new StoreBackedPipelineCaptureCoordinator(store, starter, srsCoordinator, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        // Both reads have returned -- the read face has an entry for every table ...
+        assertThat(coordinator.snapshotProgress("p")).containsOnlyKeys("orders", "customers");
+        // ... and the target has confirmed none of it, which is where a hold part way through a load lands.
+        assertThat(coordinator.loadDelivered("p")).as("read but not written is not delivered").isFalse();
+
+        store.meta().markSnapshotComplete(chain.get().value(), "p", "orders");
+        assertThat(coordinator.loadDelivered("p")).as("one table of two is not the load").isFalse();
+
+        store.meta().markSnapshotComplete(chain.get().value(), "p", "customers");
+        assertThat(coordinator.loadDelivered("p")).as("every table confirmed").isTrue();
+    }
+
+    /**
+     * Another pipeline finishing the same table says nothing about this one: the mark is written against the
+     * pipeline because each writes to a target of its own. Read at the chain level, a pipeline new to the
+     * chain would inherit the first one's answer and be resumed over a load it never did.
+     */
+    @Test
+    void aTableAnotherPipelineFinishedIsNotThisPipelinesLoad() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        AtomicReference<MiningChainId> chain = new AtomicReference<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            chain.set(chainId);
+            return new CaptureRun(Optional.of(chainId), false, 1L, Map.of("orders", 1L),
+                    Optional.empty(), Optional.of(() -> {
+                    }), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                new StoreBackedPipelineCaptureCoordinator(store, starter, srsCoordinator, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        store.meta().markSnapshotComplete(chain.get().value(), "another-pipeline", "orders");
+
+        assertThat(coordinator.loadDelivered("p")).isFalse();
+    }
+
+    /**
+     * A read mode with no load has nothing that could be undelivered, and neither has a pipeline this
+     * coordinator is running nothing for. Both answer true, which is what keeps a resume on the engine-only
+     * path everywhere the question does not arise -- the overwhelming majority of them.
+     */
+    @Test
+    void aPipelineWithNoLoadAndOneThatIsNotRunningBothReportDelivered() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src")); // pipeline() defaults to ReadMode.CDC_ONLY
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
+            }), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                new StoreBackedPipelineCaptureCoordinator(store, starter, srsCoordinator, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.loadDelivered("p")).as("cdc_only runs no load").isTrue();
+        assertThat(coordinator.loadDelivered("never-started")).as("nothing running has no load").isTrue();
+    }
+
+    /**
+     * A stop takes the question away with the run. What is kept here is which tables to ask about and on
+     * which chain -- both belong to the run being torn down, and a stopped pipeline that kept them would
+     * answer for a run that is over.
+     */
+    @Test
+    void aStoppedPipelineReportsDeliveredRatherThanAnsweringForTheRunItNoLongerHas() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 1L, Map.of("orders", 1L),
+                    Optional.empty(), Optional.of(() -> {
+                    }), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                new StoreBackedPipelineCaptureCoordinator(store, starter, srsCoordinator, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        assertThat(coordinator.loadDelivered("p")).isFalse();
+
+        coordinator.stopCapture("p", false);
+
+        assertThat(coordinator.loadDelivered("p")).isTrue();
+    }
+
     // ---- fixtures --------------------------------------------------------------------------------
 
     private static SourceResource cdcSource(String id, String table, String srsKey) {
@@ -472,14 +855,14 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     private static PipelineResource pipelineWithReadMode(String id, String sourceId, ReadMode readMode) {
-        return new PipelineResource(id, null, List.of(sourceId), null, null,
+        return new PipelineResource(id, null, List.of(SourceRef.spec(sourceId, true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal(sourceId),
                         List.of(new SyncElement("sync_1", sourceId, null, null, null, null)), null, null),
                 new Settings(null, null, null, null, readMode, "earliest"), null);
     }
 
     private static PipelineResource twoSourcePipeline(String id, String sourceA, String sourceB) {
-        return new PipelineResource(id, null, List.of(sourceA, sourceB), null, null,
+        return new PipelineResource(id, null, List.of(SourceRef.spec(sourceA, true), SourceRef.spec(sourceB, true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal(sourceA),
                         List.of(new SyncElement("sync_1", sourceA, null, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);

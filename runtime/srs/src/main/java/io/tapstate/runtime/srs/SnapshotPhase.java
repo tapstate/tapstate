@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.CaptureBatch;
@@ -10,7 +11,9 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Consumer;
 
 /**
@@ -26,65 +29,172 @@ public final class SnapshotPhase {
 
     /**
      * Runs the snapshot phase over the chain's selected {@code tables}: records the cdc-start position for
-     * the chain, drains the bounded snapshot read straight to {@code sink} with every row stamped with the
-     * generation this snapshot belongs to, then marks each of those tables' snapshot complete. Returns the
-     * number of events passed through.
+     * the chain, then reads each table it still owes with a bounded read of its own, straight to
+     * {@code sink} with every row stamped with the generation this snapshot belongs to. Returns how many
+     * events it passed through, and the seam the tail that follows it has to join at.
+     *
+     * <p>A table at a time, and only the tables still owed. Which those are is read from this pipeline's
+     * own record on the chain: a table is owed until this pipeline's sink is recorded as having written
+     * it. Another pipeline on the same chain having finished it says nothing -- it wrote to its target,
+     * not to this one. That is a different question from
+     * whether it was read, and only the first is safe to skip on -- a table read and never written, skipped
+     * on the way back, leaves every one of its rows that has not changed since absent from the target for
+     * good, because the tail only replays what changed after the seam.
+     *
+     * <p>Nothing here marks a table written. That mark is the sink's to make, when its frontier confirms
+     * that table's rows; a reader that also made it would be a second voice on the one question this phase
+     * cannot answer, and the two would disagree in the direction that loses rows.
      *
      * <p>The rows are ordered even though they have no position in the change stream: they carry the
      * reserved snapshot sequence, which places all of them before every change of the same generation, so
      * a change can never be overwritten by the snapshot value of the row it changed.
      *
-     * <p>Which generation they carry is {@code ringEpoch} for a snapshot that is starting, but the one
-     * already recorded for a snapshot that is resuming — see {@link #pinnedEpoch}.
+     * <p>A snapshot that is starting takes {@code ringEpoch} and the seam its own batch sampled; one that
+     * is resuming takes the generation and the seam already recorded, as a pair — see
+     * {@link #resumedSnapshot}.
      *
-     * <p>The two marks bracket the drain and answer different questions. The cdc-start position — the
-     * source log position sampled at snapshot start — is recorded before the batch drains, so the cdc tail
-     * that follows resumes from before the snapshot and the idempotent sink absorbs the overlap; no change
-     * made while the snapshot runs is missed. Its presence therefore means the snapshot has <em>started</em>.
-     * The completion mark is written only after the drain returns, so its presence means the table has been
-     * read to exhaustion. A drain that fails partway marks nothing: an aborted snapshot is not a completed
-     * one, and a reader treating a partial drain as exhausted would conclude rows are absent from the source
-     * that were merely never read. Events are passed through one by one, never buffered in the change ring,
-     * and the batch is always closed.
+     * <p>The cdc-start position is the one thing this phase writes. It — the
+     * seam this snapshot began at, sampled at the source before its first row — is settled before the
+     * first table drains, so the cdc tail that follows resumes from before the snapshot and the idempotent
+     * sink absorbs the overlap; no change made while the snapshot runs is missed. It goes into the record
+     * when this run is resuming what is written there, or when nothing is; a run whose load is its own on
+     * a chain that already carries somebody else's seam keeps its seam to itself and hands it back
+     * instead, because one chain records one seam while every pipeline on it loads separately. A batch that reports no
+     * seam stops the run with a code rather than letting the caller pick a start of its own.
+     * Its presence therefore means the snapshot has <em>started</em>.
+     * A read that fails partway stops the run there: the tables after it are not read, and none of them --
+     * nor the one that failed -- is recorded as anything. Events are passed through one by one, never
+     * buffered in the change ring, and every batch is always closed.
+     *
+     * <p>One seam covers the whole round, taken from the first read of it and never replaced. Each bounded
+     * read samples a seam of its own, later than the one before, and letting a later table's seam move
+     * where the tail begins would leave the span between the two covered by nothing: the tables already
+     * read were read before it, and the tail starts after it, so a row deleted in between is in neither and
+     * stays in the target for good — nothing thrown, nothing logged.
      *
      * <p>Seeding the chain's meta record is a separate lifecycle step; recording the cdc-start position on
      * an unseeded chain is a caller ordering error surfaced by the store.
      */
-    public static long run(
+    public static Outcome run(
             CapturePort port,
             CaptureConfig config,
             String miningChainId,
+            String pipelineId,
             List<String> tables,
-            SourcePosition cdcStart,
             long ringEpoch,
             SrsMetaStore meta,
             Consumer<Envelope> sink) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(tables, "tables");
-        Objects.requireNonNull(cdcStart, "cdcStart");
         Objects.requireNonNull(meta, "meta");
         Objects.requireNonNull(sink, "sink");
         if (tables.isEmpty()) {
             throw new IllegalArgumentException("a snapshot over a chain must name the tables it reads");
         }
 
-        long epoch = pinnedEpoch(meta, miningChainId, tables, ringEpoch);
+        Optional<SrsMeta> record = meta.read(miningChainId);
+        List<String> owed = stillOwed(record, pipelineId, tables);
+        Optional<SrsMeta> resumed = resumedSnapshot(record, pipelineId, owed);
+        long epoch = resumed.map(SrsMeta::snapshotEpoch).orElse(ringEpoch);
         SourceOrder order = SourceOrder.snapshotRow(epoch);
-        meta.setCdcStart(miningChainId, cdcStart.token(), epoch);
-        long count = drain(port, config, row -> sink.accept(row.withOrder(order)));
-        // One drain reads every selected table to exhaustion, so each of them is marked - marking only the
-        // first would leave the rest looking un-drained and pin a later re-mine to this run's generation.
-        for (String table : tables) {
-            meta.markSnapshotComplete(miningChainId, table);
+        // A resume reuses the pair it read back. Both halves come from the same record and the same
+        // question, so one of them moving on its own is the state that has no meaning: rows pinned to a
+        // generation whose seam is somewhere else.
+        String resumedStart = resumed.map(SrsMeta::cdcStartPosition).orElse(null);
+        // Whoever recorded the chain's seam keeps it. A run that is not resuming that snapshot has a seam
+        // of its own and needs no room in the record for it: the tail it starts is told where to join by
+        // the return value, in the same run that sampled it. Overwriting would move where a resuming
+        // pipeline's tail begins forward over a span nothing else covers -- the same loss, aimed at
+        // whoever was here first.
+        boolean chainCarriesASeam = record.map(SrsMeta::cdcStartPosition).isPresent();
+        String tailSeam = null;
+        long count = 0;
+        for (String table : owed) {
+            try (CaptureBatch batch = port.snapshot(readOf(config, table))) {
+                // The seam comes from the batch, which sampled it at the source before reading its first
+                // row. A source that reports none leaves the tail nothing to join to, and the run stops
+                // here rather than proceeding: a snapshot whose tail then begins wherever it likes drops
+                // every change made while the snapshot ran, with nothing thrown and nothing logged.
+                SourcePosition seam = batch.seam().orElseThrow(() -> new TapstateException(
+                        CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
+                if (tailSeam == null) {
+                    tailSeam = resumedStart != null ? resumedStart : seam.token();
+                    // A resume writes back the pair it read, unchanged. A run that recorded nothing here
+                    // writes its own. The one case left out is the one this guards: a run whose load is its
+                    // own on a chain that already carries somebody else's seam. Writing there would move
+                    // where the other pipeline's tail begins forward over a span nothing covers.
+                    if (resumedStart != null || !chainCarriesASeam) {
+                        meta.setCdcStart(miningChainId, tailSeam, epoch);
+                    }
+                }
+                while (batch.hasNext()) {
+                    sink.accept(batch.next().withOrder(order));
+                    count++;
+                }
+            }
         }
-        return count;
+        return new Outcome(count, tailSeam);
     }
 
     /**
-     * The generation this snapshot's rows are pinned to: the one already recorded when this run is
-     * resuming a snapshot that never drained, and {@code ringEpoch} otherwise.
+     * What one run of the phase produced: how many rows it passed through, and the seam the tail that
+     * follows it has to join at -- null when the run read nothing, because a run that owes no table
+     * samples no seam and starts no snapshot the tail has to cover.
+     *
+     * <p>The seam is handed back rather than left to be read off the chain's record, and that is the whole
+     * point of it being here. One chain carries one recorded seam while every pipeline on it runs a load
+     * of its own, so the record cannot answer "where did <em>this</em> run's load begin" -- it answers
+     * with whichever pipeline's load reached it first. A pipeline new to a chain that took that answer
+     * would start its tail wherever the chain was created, which for a chain older than the source's log
+     * window is a start no source will serve.
+     */
+    public record Outcome(long rows, String tailSeam) {
+    }
+
+    /**
+     * The selected tables this run still owes a read: the ones this pipeline's own record does not show as
+     * written. A table is owed until this pipeline's sink has confirmed it, however far its read got --
+     * reading is not writing, and the only one of the two that is safe to skip a table on is the second.
+     *
+     * <p>This is also what a hold has to be resumed against, which is why it is not private. The rows a
+     * load has read but not delivered live nowhere durable, so the tables this reports are exactly the
+     * ones a rebuild would read again -- one reckoning for both questions, because two of them would
+     * eventually disagree and the disagreement is silent either way round.
+     *
+     * <p>Read against the pipeline and not the chain. A chain is keyed by the source connection and
+     * excludes the table subset, so pipelines reading one database share a chain by construction while
+     * writing to targets of their own -- and a chain-level reading hands a pipeline new to the chain the
+     * answer another pipeline produced. It then owes nothing, enters no snapshot phase at all, and its
+     * target keeps none of the rows that were there before it started, with the run healthy and nothing
+     * logged.
+     */
+    public static List<String> stillOwed(
+            Optional<SrsMeta> record, String pipelineId, List<String> tables) {
+        List<String> written =
+                record.map(stored -> stored.snapshotCompletedTables(pipelineId)).orElse(List.of());
+        return tables.stream().filter(table -> !written.contains(table)).toList();
+    }
+
+    /**
+     * The bounded read that covers {@code table} alone, on the connection the whole capture runs on. The
+     * selection is the only thing that narrows: everything a connector needs to open the source is what the
+     * capture was configured with, and a read that changed any of it would be reading somewhere else.
+     */
+    private static CaptureConfig readOf(CaptureConfig config, String table) {
+        return new CaptureConfig(config.connectorId(), config.settings(), List.of(table), config.node());
+    }
+
+    /**
+     * The recorded snapshot this run is resuming, or empty when whatever runs now is a snapshot of its own.
+     *
+     * <p>A resuming run reuses two things and reuses them together: the generation its rows are pinned to,
+     * and the seam its tail joins at. One call wrote them and one act is described by them — the seam says
+     * where the changes this snapshot does not cover begin, the generation says where its rows sit against
+     * those changes — so a run that took one from the record and one from itself would be describing an act
+     * that never happened.
      *
      * <p>A snapshot outlives the ring it started under. Every restart rebuilds the ring and opens a new
      * generation, and a higher generation wins every comparison — so a rerun whose rows took the generation
@@ -93,19 +203,47 @@ public final class SnapshotPhase {
      * generation makes that reversal impossible rather than unlikely: the rerun's rows sit below every
      * change of their own generation and below every generation after it.
      *
-     * <p>Resuming is "a seam was recorded and some selected table has not drained". A run whose tables are
-     * all marked drained means whatever runs now is a new snapshot — a re-mine — and a new baseline of truth
-     * is entitled to beat what came before, so it takes the current generation. One table of the selection
-     * still un-drained keeps the whole run pinned: the rows of its drained siblings are re-read by the same
-     * drain, and letting those take the running generation is exactly the silent roll-back this pins against.
+     * <p>Keeping the seam closes the matching hole on the tail's side. The rerun's batch samples a seam of
+     * its own, later than the recorded one, and taking that would move where the tail begins forward over
+     * the span between the two. Nothing else covers that span: the rerun re-reads the rows that are there
+     * now, so a row deleted since the recorded seam is in neither the re-read nor a tail that starts after
+     * the delete, and it stays in the target for good — nothing thrown, nothing logged. Starting at the
+     * recorded seam replays the span instead, which the idempotent sink absorbs.
+     *
+     * <p>Resuming is "this pipeline recorded a seam here, and some selected table is still owed" — all
+     * three, and the first of them is what keeps one pipeline's snapshot from being read as another's. A
+     * run that owes none
+     * means whatever runs now is a new snapshot — a re-mine — and a new baseline of truth is entitled to
+     * beat what came before, so it takes the current generation and the seam it sampled itself; reusing the
+     * recorded seam there would replay everything since that run on every re-mine, for ever.
      */
-    private static long pinnedEpoch(
-            SrsMetaStore meta, String miningChainId, List<String> tables, long ringEpoch) {
-        return meta.read(miningChainId)
-                .filter(record -> record.snapshotEpoch() != 0L)
-                .filter(record -> !record.snapshotCompletedTables().containsAll(tables))
-                .map(SrsMeta::snapshotEpoch)
-                .orElse(ringEpoch);
+    private static Optional<SrsMeta> resumedSnapshot(
+            Optional<SrsMeta> record, String pipelineId, List<String> owed) {
+        return record
+                .filter(stored -> stored.snapshotEpoch() != 0L)
+                .filter(stored -> !owed.isEmpty())
+                .filter(stored -> hasBeenOnThisChainBefore(stored, pipelineId));
+    }
+
+    /**
+     * Whether {@code pipelineId} has a record of its own on the chain -- the reading of "has this pipeline
+     * run here before", and so of whether a recorded snapshot is one it started.
+     *
+     * <p>A chain is keyed by the source connection and excludes the table subset, so pipelines reading one
+     * database share a chain by construction while each loads a target of its own. The seam and the
+     * generation written on the chain therefore belong to whichever pipeline recorded them, and a pipeline
+     * new to the chain that read them as its own would resume a load it never began: its rows would be
+     * pinned to a generation from before it existed, and its tail told to start where that other load
+     * began -- a point the source may no longer retain, which is a join that cannot be served at all.
+     *
+     * <p>A pipeline's record appears when its sink first acks, so "no record" is also "nothing of this
+     * pipeline's has reached its target". That is what makes sampling a fresh seam safe here: the loss a
+     * recorded seam is kept against is a row that was delivered and then deleted at the source before the
+     * new seam, and a pipeline with nothing delivered has no such row.
+     */
+    private static boolean hasBeenOnThisChainBefore(SrsMeta record, String pipelineId) {
+        return record.consumerOffsets().stream()
+                .anyMatch(consumer -> consumer.pipelineId().equals(pipelineId));
     }
 
     /**

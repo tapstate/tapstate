@@ -288,21 +288,19 @@ class ApplyServiceRowExpressionTypeTest {
     }
 
     /**
-     * Where the wiring cannot name the table — a regex {@code from:}, which only a connection can
-     * resolve — the whole selected model is in play, and a selector that lines up with nothing must
-     * not narrow that to the empty set. Every column would then be absent, an absent column passes,
-     * and the gate would quietly stop refusing anything at all for that source.
+     * A Source exposes only its selected tables. When a stale discovery no longer carries any of
+     * them, a dynamic {@code from:} cannot reach tables outside that declared scope merely because
+     * they are still present in the connection-level model.
      */
     @Test
-    @DisplayName("an unresolvable from: still judges against the model when the selector lines up with none of it")
-    void anUnresolvableReferenceKeepsTheModelInPlay() {
+    @DisplayName("an unresolvable from: excludes every table outside the Source selection")
+    void anUnresolvableReferenceExcludesTablesOutsideTheSourceSelection() {
         discovered("src_orders", table("legacy_orders", "amount", TapstateType.DECIMAL));
 
-        DslException thrown = catchThrowableOfType(DslException.class,
-                () -> service.apply("tester", batch(source("[ orders ]"), "/.*/", "after.amount * 2 > 0")));
-
-        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
-        assertThat(thrown.args()).containsEntry("table", "legacy_orders");
+        assertThatCode(() -> service.apply(
+                "tester", batch(source("[ orders ]"), "/.*/", "after.amount * 2 > 0")))
+                .doesNotThrowAnyException();
+        assertThat(artifacts.get("orders_out")).isPresent();
     }
 
     @Test

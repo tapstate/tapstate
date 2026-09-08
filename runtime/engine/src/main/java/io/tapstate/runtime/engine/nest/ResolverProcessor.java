@@ -452,7 +452,7 @@ public final class ResolverProcessor extends AbstractProcessor {
             return;
         }
         Envelope event = (Envelope) item;
-        NestKeys.requireBeforeImageWhereKeysAreTracked(edge, event);
+        NestKeys.requireBeforeImageWhereKeysAreTracked(edge, event, comparedOn(edge));
         Map<String, Object> row = NestKeys.rowOf(event);
         if (edge.pathId().equals(vertex.pathId())) {
             if (edge.carriesDepartures()) {
@@ -582,6 +582,30 @@ public final class ResolverProcessor extends AbstractProcessor {
      * value any more; left there they wait for an answer that can never come and hold the frontier below
      * them for as long as the job runs.
      */
+    /**
+     * The columns this vertex reads off the row an update replaces, for the edge it arrived on - which is
+     * what a source tracking key changes on that edge has to send, and all it has to send.
+     *
+     * <p>Its own rows are read on both halves of what this vertex does with them: the key it is filed
+     * under, which says whether the row took its children somewhere else, and the key it hangs from, which
+     * says whether the row itself moved. Both are read for one event, so both are required for it. A row
+     * arriving from beneath is only ever compared on the key naming its parent.
+     */
+    private List<String> comparedOn(NestInbound edge) {
+        // Which element of its level a row is arrives on every path here: what is placed and what is being
+        // taken out of the old place are the same element, and both refs are built off their own row.
+        // A set, because these overlap on a table identified by what it hangs from, and naming a column
+        // twice in the failure would read as two different columns being absent.
+        Set<String> compared = new LinkedHashSet<>(edge.elementKey());
+        if (!edge.pathId().equals(vertex.pathId())) {
+            compared.addAll(edge.keyFields());
+            return List.copyOf(compared);
+        }
+        compared.addAll(vertex.partitionKey());
+        compared.addAll(vertex.parentKeyFields());
+        return List.copyOf(compared);
+    }
+
     private void vacate(NestInbound edge, Envelope event, Map<String, Object> row,
             Map<Object, ResolverState> touched) {
         Map<String, Object> was = NestKeys.replacedRow(edge, event);

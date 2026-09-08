@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.AssemblyIdentity;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
@@ -34,6 +35,18 @@ public final class ArtifactQueryService {
     public Optional<StoredArtifact> get(String id) {
         Objects.requireNonNull(id, "id");
         return store.get(id).map(this::view);
+    }
+
+    /**
+     * What the stored artifact's run would be assembled from, or empty when none is stored.
+     *
+     * <p>Read here rather than derived from {@link #get}: the reading needs the resource, and the view
+     * a read returns has already been flattened to text. Both readings come off the same writer, which
+     * is what keeps "what changed" and "what it hashes to" from drifting apart.
+     */
+    public Optional<String> assemblyIdentityOf(String id) {
+        Objects.requireNonNull(id, "id");
+        return store.get(id).map(AssemblyIdentity::of);
     }
 
     /** Lists every stored artifact, retaining rows whose stored body is unreadable. */

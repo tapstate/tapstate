@@ -195,7 +195,37 @@ public enum ConnectorError implements TapstateErrorCode {
      * connector id; {@code timeout} is how long it was given. The instance it ran on is closed rather
      * than reused, because the abandoned read is still inside it.
      */
-    READ_TIMEOUT("connector.read-timeout", Set.of("connector", "timeout"));
+    READ_TIMEOUT("connector.read-timeout", Set.of("connector", "timeout")),
+
+    /**
+     * A connector asked to keep a value whose type this build has no encoding for. Refused where it is
+     * written rather than coerced: a value stringified on the way in reads back as text and passes for
+     * what was stored, and the connector that wrote a number finds one only when it casts.
+     */
+    STATE_VALUE_UNSUPPORTED("connector.state-value-unsupported", Set.of("type")),
+
+    /**
+     * A stored connector note cannot be read back - a format or a tag from a later build, or bytes that
+     * end early. Reported rather than treated as absent, because absent is what a connector reads as
+     * "this is my first run", and acting on that quietly discards whatever it had recorded.
+     */
+    STATE_UNREADABLE("connector.state-unreadable", Set.of("detail")),
+
+    /**
+     * A connector's own stream position could not be written down, so this source has no position to
+     * record and nothing a later run could resume from. {@code connector} is the connector id;
+     * {@code detail} is why the position could not be rendered. Reporting no position instead would
+     * claim the source has nowhere to resume from, which is a different and untrue statement.
+     */
+    POSITION_UNRENDERABLE("connector.position-unrenderable", Set.of("connector", "detail")),
+
+    /**
+     * A recorded position could not be read back into something this connector accepts — most often its
+     * position type has changed shape since the position was written. {@code connector} is the connector
+     * id; {@code detail} is why it could not be read. Refusing is deliberate: starting from the present
+     * instead would silently drop every change made since the position was recorded.
+     */
+    POSITION_UNREADABLE("connector.position-unreadable", Set.of("connector", "detail"));
 
     private final String code;
     private final Set<String> placeholders;

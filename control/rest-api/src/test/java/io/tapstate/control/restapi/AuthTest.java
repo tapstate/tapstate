@@ -35,6 +35,7 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -59,6 +60,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.spi.store.SessionRecord;
 import io.tapstate.spi.store.SessionStore;
 import io.tapstate.core.model.PipelineResource;
@@ -718,6 +720,8 @@ class AuthTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
+            PipelinePositionTestConfiguration.class,
+            DerivedSchemaTestConfiguration.class,
             AuditedSourceServiceTestConfiguration.class})
     static class TestApp {
 
@@ -919,6 +923,11 @@ class AuthTest {
             });
         }
 
+        @Bean
+        SourceSchemaQueryService sourceSchemaQueryService(InMemoryArtifactStore store) {
+            return new SourceSchemaQueryService(store, new EmptySchemaStore());
+        }
+
         // The three data-browser controller methods are bundled too, so their service must be present for
         // the context to stand up; this suite exercises the auth matrix, not the reads, so every probe is
         // inert (their behaviour is proven in DataBrowserApiTest).
@@ -984,7 +993,9 @@ class AuthTest {
         @Bean
         PipelineLifecycleService pipelineLifecycleService(
                 ArtifactQueryService artifacts, DesiredStore desired, AuditGate auditGate) {
-            return new PipelineLifecycleService(artifacts, desired, auditGate);
+            // Nothing converges in this bundle, so the pipeline has no fencing epoch to read.
+            return new PipelineLifecycleService(
+                    artifacts, desired, auditGate, pipelineId -> java.util.Optional.empty());
         }
 
         @Bean
@@ -1296,7 +1307,7 @@ class AuthTest {
 
             @Override
             public Optional<Resource> get(String id) {
-                return Optional.of(new PipelineResource(id, null, List.of("src_x"), null, null, null, null, null));
+                return Optional.of(new PipelineResource(id, null, List.of(SourceRef.bare("src_x")), null, null, null, null, null));
             }
 
             @Override

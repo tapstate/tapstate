@@ -27,7 +27,7 @@ class McpToolCatalogTest {
 
     private static final List<String> WRITE_TOOLS = List.of(
             "artifact_apply", "artifact_delete", "connection_test", "connection_discover_schema",
-            "pipeline_start", "pipeline_stop");
+            "pipeline_start", "pipeline_stop", "pipeline_pause", "pipeline_resume");
 
     /**
      * The read that supplies the removal's precondition has to be reachable without write access.
@@ -93,9 +93,29 @@ class McpToolCatalogTest {
     }
 
     @Test
-    void allowWriteAddsExactlyTheSixWriteTools() {
+    void allowWriteAddsExactlyTheEightWriteTools() {
         assertThat(McpToolCatalog.operations(true).stream().map(McpToolCatalog::toolName))
                 .containsExactlyInAnyOrderElementsOf(concat(READ_TOOLS, WRITE_TOOLS));
+    }
+
+    /**
+     * There has to be a way to make a Pipeline stop moving that does not clear it. Without one, the only
+     * "stop" a model can reach is the verb that drops the Pipeline's position and everything it
+     * assembled -- and a caller that has to pick something is going to pick the thing that is there.
+     * The required answer on the stop is a real question only while a second door exists.
+     */
+    @Test
+    void thereIsAWayToHoldAPipelineThatClearsNothing() {
+        assertThat(McpToolCatalog.operations(true).stream().map(McpToolCatalog::toolName))
+                .contains("pipeline_pause", "pipeline_resume");
+        // Write access, like every other verb that changes a Pipeline: holding one is not a read.
+        assertThat(McpToolCatalog.operations(false).stream().map(McpToolCatalog::toolName))
+                .doesNotContain("pipeline_pause", "pipeline_resume");
+        // The description is what a model reads before choosing, and choosing between these two and the
+        // stop is the whole point of opening them -- so it has to say that this one keeps everything.
+        assertThat(ControlOperations.PIPELINE_PAUSE.description())
+                .contains("Nothing is cleared")
+                .contains("carries on");
     }
 
     /**

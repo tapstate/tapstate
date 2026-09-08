@@ -207,11 +207,17 @@ public enum NestError implements TapstateErrorCode {
             Severity.WARNING),
 
     /**
-     * Running: a stream tracks structural key changes but its source does not provide a before image, so
-     * a key change cannot be told from an ordinary update and the document would silently diverge.
+     * Running: a stream tracks structural key changes but the row an update replaces does not carry the
+     * columns the tracking compares, so a key change cannot be told from an ordinary update and the
+     * document would silently diverge.
+     *
+     * <p><b>{@code columns} names what is missing, and it is the only useful half of the answer under a
+     * minimal row image.</b> That image sends the columns identifying the row and nothing else, so the
+     * earlier row is present and the compared column is not - an operator told only the stream and the
+     * table would go looking for a row image that is, from where they stand, already there.
      */
     KEY_CHANGE_TRACKING_REQUIRES_BEFORE_IMAGE(
-            "nest.key-change-tracking-requires-before-image", Set.of("alias", "table")),
+            "nest.key-change-tracking-requires-before-image", Set.of("alias", "table", "columns")),
 
     /**
      * Running: the rows of a stream are recorded against the row they point at, but its source sends an

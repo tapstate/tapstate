@@ -12,6 +12,7 @@ import io.tapstate.adapters.pdk.PdkSchemaDiscoverer;
 import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
@@ -33,7 +34,9 @@ import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
 import io.tapstate.control.core.PipelineLogQueryService;
+import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
@@ -42,6 +45,7 @@ import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
+import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.TokenSecrets;
@@ -67,6 +71,7 @@ import io.tapstate.runtime.probe.DelegatingSchemaDiscoveryProbe;
 import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.DataBrowser;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -229,7 +234,7 @@ class ControlPlaneConfiguration {
     ApplyService applyService(
             ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
             SchemaStore schemaStore, @Nullable NestSettings nestSettings,
-            SchemaDerivation derivation) {
+            SchemaDerivation derivation, LivePipelines livePipelines) {
         // The online apply validates against the live catalog view (the bundled snapshot union the
         // connectors registered so far), so a connector registered at runtime is honoured without a restart.
         // It also reads the schema store, which is what lets it judge a row expression against the columns
@@ -247,12 +252,21 @@ class ControlPlaneConfiguration {
         // moved under a pipeline nobody edited leaves that pipeline's content hash byte-identical, so
         // the write is skipped in exactly the case the model most needs refreshing.
         return new ApplyService(connectorCatalogView::merged, artifactStore, auditGate, schemaStore,
-                new NestSizingAdvisories(settings.entriesHeldInMemory()), derivation);
+                new NestSizingAdvisories(settings.entriesHeldInMemory()), derivation, livePipelines);
     }
 
     @Bean
     ArtifactQueryService artifactQueryService(ArtifactStore artifactStore) {
         return new ArtifactQueryService(artifactStore);
+    }
+
+    /**
+     * The one reading of which pipelines are up, shared by every guard that refuses a change to what a
+     * live pipeline is running on. Assembled here so the refusals cannot be wired to different readings.
+     */
+    @Bean
+    LivePipelines livePipelines(StorePort storePort) {
+        return new LivePipelines(storePort.desired(), storePort.state());
     }
 
     @Bean
@@ -428,6 +442,11 @@ class ControlPlaneConfiguration {
         return new SchemaQueryService(schemaStore);
     }
 
+    @Bean
+    SourceSchemaQueryService sourceSchemaQueryService(ArtifactStore artifactStore, SchemaStore schemaStore) {
+        return new SourceSchemaQueryService(artifactStore, schemaStore);
+    }
+
     // The read face over a declared source's own database. Unlike the two connection probes, the browser
     // holds live state between calls — a pool of initialized connector instances — so the assembly root
     // owns its shutdown; the three probes share that one browser rather than holding one each, which is
@@ -473,13 +492,31 @@ class ControlPlaneConfiguration {
     @Bean
     PipelineLifecycleService pipelineLifecycleService(
             ArtifactQueryService artifactQueryService, StorePort storePort, AuditGate auditGate) {
-        return new PipelineLifecycleService(artifactQueryService, storePort.desired(), auditGate);
+        return new PipelineLifecycleService(artifactQueryService, storePort.desired(), auditGate,
+                pipelineId -> storePort.state().read(pipelineId).map(CheckpointDoc::epoch));
     }
 
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
             ArtifactQueryService artifactQueryService, StorePort storePort) {
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations());
+    }
+
+    /**
+     * Which chains a pipeline reads — the one part of the resume-point face that has to be resolved
+     * here, because a chain's identity comes from the connector config, the selected tables and the srs
+     * key, and this is where the sides that fill and read a chain both derive it.
+     */
+    @Bean
+    PipelineChains pipelineChains(StorePort storePort) {
+        return new StoreBackedPipelineChains(storePort);
+    }
+
+    @Bean
+    PipelinePositionService pipelinePositionService(PipelineChains pipelineChains, StorePort storePort,
+            LivePipelines livePipelines, AuditGate auditGate) {
+        return new PipelinePositionService(
+                pipelineChains, storePort.meta(), storePort.artifacts(), livePipelines, auditGate);
     }
 
     // ---- the node-local log tail: the sink, the appender that feeds it, and the read face over it ----
@@ -525,13 +562,14 @@ class ControlPlaneConfiguration {
     @Bean
     SourceService sourceService(
             ConnectorCatalogView connectorCatalogView, ArtifactStore artifactStore,
-            SourceRepresentation representation, ObjectProvider<DataBrowserFollows> follows) {
+            SourceRepresentation representation, ObjectProvider<DataBrowserFollows> follows,
+            LivePipelines livePipelines) {
         // Resolved through a provider rather than injected directly: the streaming face is
         // servlet-only, and a control plane assembled without one still deletes sources -- it
         // simply has no follows to stop. Asked for at call time so it cannot depend on which
         // configuration Spring happens to process first.
         return new SourceService(connectorCatalogView::merged, artifactStore, representation,
-                follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+                follows.getIfAvailable(() -> DataBrowserFollows.NONE), livePipelines);
     }
 
     @Bean

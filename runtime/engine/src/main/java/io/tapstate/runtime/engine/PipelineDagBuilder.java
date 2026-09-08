@@ -15,6 +15,7 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.runtime.engine.join.JoinDag;
+import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.NestDag;
 import io.tapstate.runtime.engine.nest.NestFrontier;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -77,6 +78,46 @@ public final class PipelineDagBuilder {
             TransformBody.Nest nest = nestOf(step);
             if (nest != null) {
                 namespaces.addAll(NestTopology.compile(pipeline.id(), step.id(), nest, tables).stateNamespaces());
+            }
+        }
+        return namespaces;
+    }
+
+    /**
+     * Every namespace this pipeline's joins keep state in, empty for a pipeline that has none: the mirror of
+     * the driving rows, and a mirror and a reverse index for each source the step is wired to.
+     *
+     * <p>Named here rather than left out because the state is not a cache. The mirrors hold each dimension
+     * row as it last was, so a run inheriting them widens fresh driving rows with values the source no
+     * longer holds - and nothing reports that. The job runs, the row count is right, every row is present,
+     * and each column reads as plausible.
+     *
+     * <p><b>Every source the step declares, rather than only the ones a run writes to.</b> Which of them is
+     * driven from is the query's answer, not the wiring's, so telling them apart would mean deriving the
+     * plan - which needs each source's discovered model and refuses without it. A takedown must not depend
+     * on the query still compiling or on a model still being there: what it cannot name it strands for
+     * good, because the store has no way to list what it holds. Naming one that was never written costs a
+     * drop that finds nothing, which is the direction this can afford to be wrong in.
+     *
+     * <p>Which steps are joins is decided by {@link #joinOf}, the same way the build decides it, for the
+     * reason {@link #nestStateNamespaces} gives: two walks that judged it differently would drop the
+     * namespaces of one set of steps while a run wrote to another's.
+     */
+    public static Set<String> joinStateNamespaces(PipelineResource pipeline) {
+        if (pipeline.transforms() == null) {
+            return Set.of();
+        }
+        Set<String> namespaces = new LinkedHashSet<>();
+        for (Step step : pipeline.transforms()) {
+            if (joinOf(step) == null) {
+                continue;
+            }
+            namespaces.add(JoinMaps.factMirror(pipeline.id(), step.id()));
+            // A join's from: is an alias map by construction - the step model refuses any other shape for
+            // one - so this is an invariant rather than a case, and a violation crashes bare.
+            for (String alias : ((FromClause.Aliases) step.from()).aliases().keySet()) {
+                namespaces.add(JoinMaps.dimensionMirror(pipeline.id(), step.id(), alias));
+                namespaces.add(JoinMaps.reverseIndex(pipeline.id(), step.id(), alias));
             }
         }
         return namespaces;
@@ -194,7 +235,7 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
         PipelineChains chains = frontier == null ? null : new PipelineChains();
 
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             List<String> sourceKeys = bindings.sourceKeys().apply(sourceId);
             if (sourceKeys == null || sourceKeys.isEmpty()) {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
@@ -341,7 +382,7 @@ public final class PipelineDagBuilder {
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
-                : ContiguousPrefix::new;
+                : () -> new ContiguousPrefix(axes);
         return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier);
     }
 

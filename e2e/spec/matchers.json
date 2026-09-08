@@ -45,6 +45,14 @@
       "description": "A lifecycle verb, driven on the pipeline. Written on its own."
     },
     {
+      "word": "restart",
+      "description": "A word the terminal offers, driven on the pipeline. It expands into the product's own verbs; the vocabulary follows what a person types."
+    },
+    {
+      "word": "restart --rerun",
+      "description": "A word the terminal offers, driven on the pipeline. It expands into the product's own verbs; the vocabulary follows what a person types."
+    },
+    {
       "word": "assert",
       "description": "Checks a matcher once, now."
     },

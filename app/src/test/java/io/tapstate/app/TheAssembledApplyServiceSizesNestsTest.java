@@ -3,6 +3,7 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.ArtifactDraft;
 import io.tapstate.control.core.ArtifactValidationResult;
 import io.tapstate.control.core.AuditGate;
@@ -93,13 +94,17 @@ class TheAssembledApplyServiceSizesNestsTest {
     private ApplyService assembled(NestSettings settings) {
         ConnectorCatalogView catalog = new ConnectorCatalogView(
                 TapstateCatalog.load(), new NoRegisteredConnectors(), specStore(), registry());
+        // A real lifecycle reading rather than none, so this stays a test of the assembly as it is
+        // built: nothing here is running, so the refusal it carries never fires and sizing is what is
+        // measured.
         return new ControlPlaneConfiguration().applyService(
                 new InMemoryArtifactStore(), catalog,
                 new AuditGate(record -> { }, FIXED_CLOCK), schemas, settings,
                 // This test is about the sizing advisory, and a derivation would need a whole store port
                 // behind it to answer at all. Named rather than defaulted, so an assembly that derives
                 // nothing says so.
-                SchemaDerivation.none());
+                SchemaDerivation.none(),
+                new LivePipelines(new InMemoryDesiredStore(), new InMemoryStateStore()));
     }
 
     /** One customer table of {@code rows} rows, plus the two the tree also reads. */

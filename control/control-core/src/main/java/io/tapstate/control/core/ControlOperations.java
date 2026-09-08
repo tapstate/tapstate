@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.PipelineStateInventory;
+
 import java.util.List;
 import java.util.Map;
 
@@ -77,6 +79,9 @@ public final class ControlOperations {
     public static final Operation SOURCE_GET = new Operation(
             "source.get", Scope.READ, false, ControlApiSchema.ref("source.get"),
             "Get one Source with secret-redacted config and configured-secret field names.", CLI_ONLY);
+    public static final Operation SOURCE_SCHEMA = new Operation(
+            "source.schema", Scope.READ, false, null,
+            "Read a Source's latest discovered schema, limited to the tables that Source declares.", CLI_ONLY);
     public static final Operation SOURCE_UPDATE = new Operation(
             "source.update", Scope.WRITE, true, null,
             "Replace one Source through the Server control API.", CLI_ONLY);
@@ -162,11 +167,26 @@ public final class ControlOperations {
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
+    // The description is rendered from the same declarations a stop works through, both outcomes of
+            // them. Written out by hand it would describe whatever was true when somebody last edited it,
+            // and a description that has fallen behind reads exactly like one that is complete.
     public static final Operation PIPELINE_STOP = mcp(
             "pipeline.stop", Scope.WRITE, true,
-            "Set a Pipeline's desired state to stopped.");
-    public static final Operation PIPELINE_PAUSE = new Operation("pipeline.pause", Scope.WRITE, true, null, CLI_ONLY);
-    public static final Operation PIPELINE_RESUME = new Operation("pipeline.resume", Scope.WRITE, true, null, CLI_ONLY);
+            "Set a Pipeline's desired state to stopped. purgeState is required and has no default: it "
+                    + "says what becomes of what the Pipeline accumulated. "
+                    + PipelineStateInventory.describeBothOutcomes());
+    // Open on the same face as the stop above, and for its sake. Behind a stop that clears, these are
+    // the way to make a Pipeline stop moving without losing anything -- and the caller on that face is a
+    // model, which will reach for whatever verb is there. Leaving only the clearing one open turns the
+    // answer it demands into a formality that is always yes.
+    public static final Operation PIPELINE_PAUSE = mcp(
+            "pipeline.pause", Scope.WRITE, true,
+            "Hold a Pipeline where it is. Nothing is cleared: its position and everything it assembled "
+                    + "stay, and a resume carries on from there. This is how to make a Pipeline stop "
+                    + "moving without losing what it has.");
+    public static final Operation PIPELINE_RESUME = mcp(
+            "pipeline.resume", Scope.WRITE, true,
+            "Carry a paused Pipeline on from the position it was holding, reading nothing again.");
 
     // pipeline observation reads: the four read faces. status/metrics/snapshot are store-backed over the
     // per-pipeline observation doc (status = lifecycle state, metrics = open stat map, snapshot = per-table
@@ -184,6 +204,21 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LOGS = mcp(
             "pipeline.logs", Scope.READ, false,
             "Read the bounded, secret-redacted log tail for a Pipeline.");
+
+    // Where a pipeline resumes from, read and written back. The read mutates nothing; the write moves
+    // durable state that outlives every run on the chain -- shared with any other pipeline reading it --
+    // so it is write-scoped and audited like the lifecycle verbs.
+    //
+    // Both stay off the model-facing surface, unlike the lifecycle writes beside them. Choosing where to
+    // resume from turns on whether a position is still inside the source's retention window, which
+    // nothing on this side can check and the store cannot answer. With the write not there, the read's
+    // own reason to be there mostly goes with it: the two things it adds over the metrics face -- who
+    // else reads the chain, and when the position was recorded -- are what you look at before editing.
+    // Where a pipeline stands is on that face already.
+    public static final Operation PIPELINE_POSITION = new Operation(
+            "pipeline.position", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_SET_POSITION = new Operation(
+            "pipeline.set-position", Scope.WRITE, true, null, CLI_ONLY);
 
     // The columns a step works out for itself, and the one act that moves what they are held to. A
     // start is refused when a step's derived columns no longer match the ones it was recorded
@@ -216,6 +251,7 @@ public final class ControlOperations {
             SOURCE_DRAFT,
             SOURCE_LIST,
             SOURCE_GET,
+            SOURCE_SCHEMA,
             SOURCE_UPDATE,
             SOURCE_DELETE,
             CONNECTION_TEST,
@@ -237,6 +273,8 @@ public final class ControlOperations {
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
+            PIPELINE_POSITION,
+            PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,
             PIPELINE_ACCEPT_DERIVED_SCHEMA,
             USER_CREATE,

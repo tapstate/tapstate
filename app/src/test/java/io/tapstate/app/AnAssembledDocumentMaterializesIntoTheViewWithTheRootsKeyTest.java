@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.model.PipelineNode;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.function.SupplierEx;
@@ -8,6 +10,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -115,13 +118,13 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
 
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
-                    WriteMode writeMode, DdlPolicy ddl, TargetTable target) {
+                    WriteMode writeMode, DdlPolicy ddl, TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;
             }
 
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
-                    WriteMode writeMode, DdlPolicy ddl, Map<String, TargetTable> targets) {
+                    WriteMode writeMode, DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node) {
                 bound.set(targets);
                 return (SupplierEx<SinkWriter>) () -> null;
             }
@@ -162,7 +165,7 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
         Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
 
         // A view and no serve block: declaring the view is the whole instruction to materialize.
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
                 List.of(step),
                 new ViewBlock.Inline(VIEW, FromRef.literal(STEP), "id", null, null),
                 null,

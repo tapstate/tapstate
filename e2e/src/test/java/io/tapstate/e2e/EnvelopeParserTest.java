@@ -235,9 +235,24 @@ class EnvelopeParserTest {
 
     @Test
     void rejectsAnUnknownStepVerb() {
-        assertThatThrownBy(() -> EnvelopeParser.parse(minimal("steps:\n  - restart\n")))
+        // `rewind` rather than any other invented word: the step record says in as many words that
+        // there is deliberately no rewind step, because re-snapshotting is stop then start. A word
+        // the design has ruled out is one this case can keep. It used to be `restart`, which the
+        // harness now accepts -- and that it was the natural choice here is the whole reason the
+        // word had to be added.
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal("steps:\n  - rewind\n")))
                 .isInstanceOf(EnvelopeException.class)
-                .hasMessageContaining("restart");
+                .hasMessageContaining("rewind");
+    }
+
+    @Test
+    void acceptsTheWordsTheTerminalComposes() {
+        // The other side of the case above, and the reason it had to change: both forms parse, and
+        // they differ only in the answer their stop carries.
+        assertThat(EnvelopeParser.parse(minimal("steps:\n  - restart\n")).steps())
+                .containsExactly(new Step.Composed(ComposedVerb.RESTART));
+        assertThat(EnvelopeParser.parse(minimal("steps:\n  - restart --rerun\n")).steps())
+                .containsExactly(new Step.Composed(ComposedVerb.RESTART_RERUN));
     }
 
     @Test

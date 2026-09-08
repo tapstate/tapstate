@@ -6,6 +6,7 @@ import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.QueryElement;
 import io.tapstate.core.model.QueryType;
@@ -54,7 +55,7 @@ class CanonicalOutputWellFormednessTest {
     void nestPipelineOutputParsesBackLosslessly() {
         // The gnarliest shape: alias maps, full nest tree with the `on` key (a YAML 1.1
         // boolean literal!), quoted expression, flow sequences.
-        PipelineResource p = new PipelineResource("customer_360", null, List.of("src_ins"),
+        PipelineResource p = new PipelineResource("customer_360", null, List.of(SourceRef.bare("src_ins")),
                 List.of(Step.inline("clean", FromClause.list(FromRef.literal("CUSTOMERS")),
                                 new TransformBody.MapProjection(fields()), null, null),
                         Step.inline("c360",

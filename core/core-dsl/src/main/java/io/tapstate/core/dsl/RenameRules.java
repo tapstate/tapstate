@@ -113,7 +113,7 @@ final class RenameRules {
      */
     private static Set<String> declaredTables(PipelineResource pipeline, Map<String, SourceResource> sources) {
         Set<String> tables = new LinkedHashSet<>();
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = sources.get(sourceId);
             if (source == null || source.tables() == null) {
                 return Set.of();

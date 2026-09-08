@@ -7,6 +7,7 @@ import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Workspace;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.SinkWriter;
@@ -303,14 +304,14 @@ class JoinOutputTargetTest {
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                    TargetTable target) {
+                    TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;
             }
 
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-                    Map<String, TargetTable> targets) {
+                    Map<String, TargetTable> targets, PipelineNode node) {
                 into.put(connectorId, targets);
                 return (SupplierEx<SinkWriter>) () -> null;
             }

@@ -84,7 +84,8 @@ class ApiExceptionHandler {
             case "control.bootstrap-closed" -> HttpStatus.CONFLICT;
             case "source.id-mismatch" -> HttpStatus.BAD_REQUEST;
             case "source.not-found" -> HttpStatus.NOT_FOUND;
-            case "source.already-exists", "source.in-use" -> HttpStatus.CONFLICT;
+            case "source.already-exists", "source.in-use", "source.srs-change-while-running" ->
+                    HttpStatus.CONFLICT;
             case "source.version-conflict" -> HttpStatus.PRECONDITION_FAILED;
             case "source.precondition-required" -> HttpStatus.PRECONDITION_REQUIRED;
             // The artifact refusals, mirroring the source.* mapping above because they mean the same things
@@ -108,6 +109,9 @@ class ApiExceptionHandler {
             // from the current state, or a start/resume at a stale revision, is a 409 state conflict.
             case "lifecycle.unknown-pipeline" -> HttpStatus.NOT_FOUND;
             case "lifecycle.illegal-transition", "lifecycle.incompatible-revision" -> HttpStatus.CONFLICT;
+            // The request did not say something it has to say, which is the caller's to fix by sending
+            // it -- not a conflict with the pipeline's state, which is what the two above are.
+            case "lifecycle.purge-state-not-stated" -> HttpStatus.BAD_REQUEST;
             // A status / metrics / snapshot read of a pipeline that has published no observation is a 404: the
             // observation resource does not exist yet, like a get of an unknown artifact.
             case "monitor.no-observation" -> HttpStatus.NOT_FOUND;
@@ -125,6 +129,15 @@ class ApiExceptionHandler {
             // served in any order at all and is refused rather than answered in one nobody applied.
             case "data-browser.invalid-limit", "data-browser.connector-not-browsable",
                  "data-browser.unorderable-field" ->
+                    HttpStatus.BAD_REQUEST;
+            // A write-back refused because something on the chain is still up is a conflict with the state
+            // those pipelines are in, not with the request: the same document lands once they are down.
+            case "position.write-back-while-live" -> HttpStatus.CONFLICT;
+            // The other three are judgements on the document as written -- a chain this pipeline does not
+            // read, a reading sent back changed, and a request that asks for no move at all. Each is the
+            // caller's to fix by sending a different document, and left to the default each would come
+            // back as a 500 blaming the server for it.
+            case "position.chain-not-read", "position.field-not-editable", "position.nothing-to-write" ->
                     HttpStatus.BAD_REQUEST;
             default -> switch (domainOf(code.code())) {
                 case "dsl" -> HttpStatus.BAD_REQUEST;
