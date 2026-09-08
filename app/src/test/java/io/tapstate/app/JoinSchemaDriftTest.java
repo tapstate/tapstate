@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.model.JoinEngine;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.SourceColumn;
 import io.tapstate.core.sql.SourceTable;
@@ -42,6 +44,11 @@ class JoinSchemaDriftTest {
                         new SourceColumn("c_name", TapstateType.STRING, false))));
     }
 
+    /** The step itself, which is what the check is handed - its text is one thing the step carries. */
+    private static TransformBody.Join join(String sql) {
+        return new TransformBody.Join(JoinEngine.BUILTIN, sql);
+    }
+
     private static JoinPlan plan(String sql, List<SourceTable> tables) {
         return SqlFrontEnd.derive(sql, tables);
     }
@@ -54,7 +61,7 @@ class JoinSchemaDriftTest {
     void aFirstStartRecordsAndPasses() {
         List<SourceTable> tables = tables(TapstateType.DECIMAL);
 
-        assertThatCode(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, tables), tables))
+        assertThatCode(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables))
                 .doesNotThrowAnyException();
 
         DerivedSchema recorded = records.latest("flow", "widen").orElseThrow();
@@ -66,9 +73,9 @@ class JoinSchemaDriftTest {
     @DisplayName("an unchanged join starts again and spends no new version")
     void anUnchangedJoinPasses() {
         List<SourceTable> tables = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, tables), tables);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables);
 
-        assertThatCode(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, tables), tables))
+        assertThatCode(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables))
                 .doesNotThrowAnyException();
 
         assertThat(records.latest("flow", "widen").orElseThrow().version()).isZero();
@@ -78,10 +85,10 @@ class JoinSchemaDriftTest {
     @DisplayName("a source column changing the output type is refused, attributed to the sources")
     void aChangedSourceColumnIsRefusedAndAttributedToTheSources() {
         List<SourceTable> before = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, before), before);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, before), before);
         List<SourceTable> after = tables(TapstateType.DOUBLE);
 
-        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, after), after))
+        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, after), after))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code().code())
                             .isEqualTo("actuation.join-output-schema-source-changed");
@@ -101,17 +108,17 @@ class JoinSchemaDriftTest {
     @DisplayName("a refused start records nothing, so the next one still sees the difference")
     void aRefusedStartRecordsNothing() {
         List<SourceTable> before = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, before), before);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, before), before);
         List<SourceTable> after = tables(TapstateType.DOUBLE);
 
-        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, after), after))
+        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, after), after))
                 .isInstanceOf(TapstateException.class);
 
         // Absorbing the new shape here would make the difference undetectable by the time anyone
         // looked: the start would refuse once and then run on the new shape forever after.
         assertThat(records.latest("flow", "widen").orElseThrow().schema())
                 .containsEntry("o_total", "DECIMAL NOT NULL");
-        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, after), after))
+        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, after), after))
                 .isInstanceOf(TapstateException.class);
     }
 
@@ -122,12 +129,12 @@ class JoinSchemaDriftTest {
         // It is set up by recording a different answer under the provenance today's inputs really do
         // hash to - which is exactly the state a release that changed the derivation would leave.
         List<SourceTable> tables = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, tables), tables);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables);
         DerivedSchema asRecorded = records.latest("flow", "widen").orElseThrow();
         records.record("flow", "widen", Map.of("o_id", "INT64 NOT NULL"), asRecorded.statement(),
                 asRecorded.derivedFrom(), "join-derivation/0+calcite/1.39.0");
 
-        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, tables), tables))
+        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code().code())
                             .isEqualTo("actuation.join-output-schema-engine-changed");
@@ -144,13 +151,13 @@ class JoinSchemaDriftTest {
     @DisplayName("an edited query producing different columns is not drift")
     void anEditedQueryPassesAndIsRecorded() {
         List<SourceTable> tables = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, tables), tables);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables);
         String edited = "SELECT o.o_id, c.c_name AS customer_name"
                 + " FROM orders o LEFT JOIN customers c ON o.o_cust_id = c.c_id";
 
         // The author asked for the new shape. Refusing here would put a ceremony in front of every
         // ordinary edit, which is how a check gets turned off.
-        assertThatCode(() -> drift.checkAndRecord("flow", "widen", edited, plan(edited, tables), tables))
+        assertThatCode(() -> drift.checkAndRecord("flow", "widen", join(edited), plan(edited, tables), tables))
                 .doesNotThrowAnyException();
 
         DerivedSchema recorded = records.latest("flow", "widen").orElseThrow();
@@ -162,12 +169,12 @@ class JoinSchemaDriftTest {
     @DisplayName("a column disappearing and one appearing are reported apart")
     void addedAndRemovedColumnsAreReportedApart() {
         List<SourceTable> tables = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, tables), tables);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables);
         DerivedSchema asRecorded = records.latest("flow", "widen").orElseThrow();
         records.record("flow", "widen", Map.of("o_id", "INT64 NOT NULL", "gone", "STRING NULL"),
                 asRecorded.statement(), "some-other-source-fingerprint", asRecorded.derivedBy());
 
-        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, tables), tables))
+        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.args()).containsEntry("added", "o_total, customer_name");
                     assertThat(error.args()).containsEntry("removed", "gone");
@@ -182,14 +189,14 @@ class JoinSchemaDriftTest {
         // it strands a pipeline on a version, and in this release there is no second route: pinning the
         // old shape by casting in the SELECT is not available, the SQL subset refuses CAST outright.
         List<SourceTable> before = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, before), before);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, before), before);
         List<SourceTable> after = tables(TapstateType.DOUBLE);
-        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, after), after))
+        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, after), after))
                 .isInstanceOf(TapstateException.class);
 
-        drift.record("flow", "widen", SQL, plan(SQL, after), after);
+        drift.record("flow", "widen", join(SQL), plan(SQL, after), after);
 
-        assertThatCode(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, after), after))
+        assertThatCode(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, after), after))
                 .doesNotThrowAnyException();
         assertThat(records.latest("flow", "widen").orElseThrow().schema())
                 .containsEntry("o_total", "DOUBLE NOT NULL");
@@ -202,10 +209,10 @@ class JoinSchemaDriftTest {
         // overwrote in place would leave a history claiming the shape never moved, which is the one
         // thing this record is kept for.
         List<SourceTable> before = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, before), before);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, before), before);
         List<SourceTable> after = tables(TapstateType.DOUBLE);
 
-        drift.record("flow", "widen", SQL, plan(SQL, after), after);
+        drift.record("flow", "widen", join(SQL), plan(SQL, after), after);
 
         assertThat(records.latest("flow", "widen").orElseThrow().version()).isEqualTo(1L);
     }
@@ -214,11 +221,11 @@ class JoinSchemaDriftTest {
     @DisplayName("two joins of one pipeline are held apart")
     void twoStepsAreHeldApart() {
         List<SourceTable> before = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, before), before);
-        drift.checkAndRecord("flow", "enrich", SQL, plan(SQL, before), before);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, before), before);
+        drift.checkAndRecord("flow", "enrich", join(SQL), plan(SQL, before), before);
         List<SourceTable> after = tables(TapstateType.DOUBLE);
 
-        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", SQL, plan(SQL, after), after))
+        assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, after), after))
                 .isInstanceOf(TapstateException.class);
 
         // The other step's record is its own and is untouched by the refusal next door.
@@ -233,7 +240,7 @@ class JoinSchemaDriftTest {
         // this query happens to read. Narrowing it to the read set would make the fingerprint depend on
         // the query, and the two inputs then stop being separable - which is the whole mechanism.
         List<SourceTable> before = tables(TapstateType.DECIMAL);
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, before), before);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, before), before);
         String provenanceBefore = records.latest("flow", "widen").orElseThrow().derivedFrom();
         List<SourceTable> withAnExtraColumn = List.of(
                 new SourceTable("orders", List.of(
@@ -243,7 +250,7 @@ class JoinSchemaDriftTest {
                         new SourceColumn("o_note", TapstateType.STRING, true))),
                 before.get(1));
 
-        drift.checkAndRecord("flow", "widen", SQL, plan(SQL, withAnExtraColumn), withAnExtraColumn);
+        drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, withAnExtraColumn), withAnExtraColumn);
 
         // The output did not move, so nothing is refused and no version is spent - but the provenance
         // is now today's. Left stale, the next genuine difference would be attributed to the sources

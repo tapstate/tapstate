@@ -8,7 +8,10 @@ import io.tapstate.core.model.PushFormat;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.core.sql.OutputField;
 
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -57,11 +60,13 @@ import java.util.Set;
  * the same column would drift from that one eventually, and the shape that takes is a recorded schema
  * that no longer equals the one the next start computes, which reads as a difference nobody made.
  *
- * <p><b>Every answer here is worked out from one upstream model</b> - the one that reaches the node
- * being asked about. Which model that is, where several streams reach one step, is a question this
- * does not answer and deliberately does not take a shape for: merging several upstreams is its own
- * ruling, and a different one for a merge, for a nested document and for a joined table. A parameter
- * shaped for it before a single arm reads one would be a guess at three answers at once.
+ * <p><b>A node is handed its inputs by name, and what each kind does with them differs.</b> Most read
+ * whatever reaches them as one model - several streams merge into it, and a single stream is that
+ * merge's degenerate case. A nest reads exactly one of them, the stream its own root names, which is
+ * why the inputs arrive keyed by the name that node's wiring calls them by rather than in an order
+ * somebody would have to know. A join reads none of them: its columns come from its compiled query,
+ * which is the one other thing handed in here, and it is the only node whose answer does not follow
+ * from what reaches it.
  *
  * @param columns       the node's output columns, name to declared type, in output order; empty when
  *                      nothing can be said
@@ -95,8 +100,9 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
     }
 
     /**
-     * What a transform step produces, given what reaches it. Six kinds, and the switch is exhaustive
-     * over all of them: a seventh cannot be added to the grammar without this stopping the build.
+     * What a transform step produces, given what reaches it and, where it has one, what it compiled to.
+     * Six kinds, and the switch is exhaustive over all of them: a seventh cannot be added to the
+     * grammar without this stopping the build.
      *
      * <p><b>A script is the one kind that cannot be answered for, and the answer is final rather than
      * pending.</b> Its columns are whatever the script writes on the row while it runs, and its types
@@ -108,22 +114,144 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
      * only step handed schema changes - so for part of what it sees the question does not even apply,
      * and nothing here may work a row's shape out from one of those.
      */
-    static NodeColumns of(TransformBody body, NodeColumns upstream) {
+    static NodeColumns of(TransformBody body, Map<String, NodeColumns> inputs, JoinPlan compiledJoin) {
         return switch (body) {
             case TransformBody.Js ignored ->
                     unknown("js: a script settles its own columns while it runs, not before");
-            case TransformBody.MapProjection projection -> project(projection.fields(), upstream);
-            // A predicate decides which rows travel on, never which columns they carry. Handing the
-            // upstream answer back unchanged is the whole of it - including when that answer is an
-            // unknown, which then keeps naming the step that actually went dark.
-            case TransformBody.Filter ignored -> upstream;
-            case TransformBody.Union ignored ->
-                    unknown("union: the several upstreams it merges are not read here yet");
-            case TransformBody.Nest ignored ->
-                    unknown("nest: the tree of embedded streams is not read here yet");
-            case TransformBody.Join ignored ->
-                    unknown("join: the compiled query's output fields are not read here yet");
+            case TransformBody.MapProjection projection ->
+                    project(projection.fields(), merged(inputs.values()));
+            // A predicate decides which rows travel on, never which columns they carry. Handing what
+            // reached it back unchanged is the whole of it - including when that answer is an unknown,
+            // which then keeps naming the step that actually went dark.
+            case TransformBody.Filter ignored -> merged(inputs.values());
+            // The merge itself, and nothing besides. It computes what the arm above does, and is
+            // written out separately all the same: the two coincide only because a predicate happens
+            // not to touch a column, so folding them together would make a later change to one of
+            // them silently a change to the other.
+            case TransformBody.Union ignored -> merged(inputs.values());
+            case TransformBody.Nest nest -> rootOf(nest, inputs);
+            case TransformBody.Join ignored -> published(compiledJoin);
         };
+    }
+
+    /**
+     * The one model that reaches a node where several streams do: every column any input carries, and
+     * each column only as certain as the least certain input carrying it.
+     *
+     * <p><b>The union of the field sets, never the intersection.</b> A merge forwards each row as it
+     * arrives - nothing strips a column off a row because a sibling stream has no such column - so the
+     * intersection describes a row that is never produced, and it is short in the one direction this
+     * model must not err in: a column missing here is a column the target table is never built with,
+     * and every value in it is then dropped at the write with nothing reporting it.
+     *
+     * <p><b>Certainty only ever goes down.</b> A column absent from any one input is nullable whatever
+     * the inputs carrying it said, because a row from an input without it carries nothing there. A
+     * column the inputs disagree about the type of is UNKNOWN rather than the first answer or the
+     * wider one: they disagree, and either choice states a type that is wrong for the other's rows.
+     *
+     * <p>An unknown input carries the whole merge, unreworded. The columns of a merge one of whose
+     * inputs nobody can describe are not knowable either, and the name worth keeping is the node that
+     * actually went dark rather than the one that merely could not see past it.
+     */
+    static NodeColumns merged(Collection<NodeColumns> inputs) {
+        if (inputs.isEmpty()) {
+            throw new IllegalStateException("a node was worked out with no input at all; every node "
+                    + "reads at least one stream, so this is a caller that wired none");
+        }
+        for (NodeColumns input : inputs) {
+            if (!input.known()) {
+                return input;
+            }
+        }
+        if (inputs.size() == 1) {
+            return inputs.iterator().next();
+        }
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, Integer> carriedBy = new LinkedHashMap<>();
+        for (NodeColumns input : inputs) {
+            input.columns().forEach((name, declared) -> {
+                carriedBy.merge(name, 1, Integer::sum);
+                String already = seen.get(name);
+                seen.put(name, already == null ? declared : reconciled(already, declared));
+            });
+        }
+        Map<String, String> out = new LinkedHashMap<>();
+        seen.forEach((name, declared) -> out.put(name, carriedBy.get(name) == inputs.size()
+                ? declared
+                : JoinSchemaDrift.declaredType(JoinSchemaDrift.typeOf(declared), true)));
+        return known(out);
+    }
+
+    /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
+    private static String reconciled(String seen, String declared) {
+        TapstateType type = JoinSchemaDrift.typeOf(seen) == JoinSchemaDrift.typeOf(declared)
+                ? JoinSchemaDrift.typeOf(seen)
+                : TapstateType.UNKNOWN;
+        return JoinSchemaDrift.declaredType(type,
+                JoinSchemaDrift.nullableOf(seen) || JoinSchemaDrift.nullableOf(declared));
+    }
+
+    /**
+     * What a nest publishes: the columns of the stream its root names, that root's upsert key leading.
+     * <b>The embedded children contribute none of their own</b> - their rows sit inside the documents
+     * rather than beside them, so a column of theirs here would be a target column no write ever
+     * fills. That is what the assembled model already said; this is the same answer, moved to where
+     * every other node's is worked out rather than a second one beside it.
+     *
+     * <p>A key naming a column the root does not carry is left out rather than invented. It travels on
+     * one column short, which the sink reports against the table it is writing, where conjuring the
+     * column would instead describe a table the connector cannot create.
+     *
+     * <p><b>Which columns those are survives only as their order.</b> This vocabulary is column name to
+     * declared type and has nowhere to say "and this one is the key" - said out loud because an order
+     * that happens to lead with a key reads like a model that carries one.
+     *
+     * <p>A root that is not among the inputs is a caller that has not resolved the nest's wiring rather
+     * than anything an author wrote, so it crashes bare: an unknown would file it away as a stream
+     * that merely could not be described, which is an ordinary state nobody investigates.
+     */
+    private static NodeColumns rootOf(TransformBody.Nest nest, Map<String, NodeColumns> inputs) {
+        String alias = nest.root().from();
+        NodeColumns root = inputs.get(alias);
+        if (root == null) {
+            throw new IllegalStateException("nest root '" + alias + "' is not among the inputs "
+                    + inputs.keySet() + "; the root's own stream has to be resolved before a nest's"
+                    + " columns are worked out");
+        }
+        if (!root.known()) {
+            return root;
+        }
+        Map<String, String> out = new LinkedHashMap<>();
+        for (String column : nest.root().key() == null ? List.<String>of() : nest.root().key()) {
+            String declared = root.columns().get(column);
+            if (declared != null) {
+                out.put(column, declared);
+            }
+        }
+        root.columns().forEach(out::putIfAbsent);
+        return known(out);
+    }
+
+    /**
+     * What a join publishes: the flat row its compiled query produces, in the order it publishes it,
+     * each column rendered the way every other derived column is.
+     *
+     * <p><b>This is the one node whose answer does not follow from what reaches it.</b> A join's
+     * columns come from its SELECT and from what its sources say they hold, which is what compiling
+     * the query works out; the streams themselves say nothing about the shape of the widened row. So
+     * the inputs go unread here, and arriving with nothing compiled is a caller that has not compiled
+     * the step - a defect on this side, hence bare.
+     */
+    private static NodeColumns published(JoinPlan compiledJoin) {
+        if (compiledJoin == null) {
+            throw new IllegalStateException("a join was worked out with no compiled query; its columns"
+                    + " come from its SELECT, so the step has to be compiled before it is asked");
+        }
+        Map<String, String> columns = new LinkedHashMap<>();
+        for (OutputField field : compiledJoin.outputFields()) {
+            columns.put(field.name(), JoinSchemaDrift.declaredType(field));
+        }
+        return known(columns);
     }
 
     /**

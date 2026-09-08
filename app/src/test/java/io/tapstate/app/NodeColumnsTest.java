@@ -9,6 +9,11 @@ import io.tapstate.core.model.PushFormat;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.core.sql.SourceColumn;
+import io.tapstate.core.sql.SourceTable;
+import io.tapstate.core.sql.SqlFrontEnd;
+import io.tapstate.core.common.TapstateType;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -41,29 +46,39 @@ class NodeColumnsTest {
     @Test
     @DisplayName("every kind of transform reaches an arm of its own")
     void everyKindOfTransformReachesAnArmOfItsOwn() {
-        NodeColumns upstream = upstream();
+        // One set of inputs the six kinds all answer over, chosen so that each arm's answer differs
+        // from the others': the root the nest names carries a column the sibling stream does not, and
+        // the projection renames one of them.
+        Map<String, NodeColumns> inputs = new LinkedHashMap<>();
+        inputs.put("orders", known("o_id", "INT64 NOT NULL", "o_total", "DECIMAL NULL"));
+        inputs.put("lines", known("l_id", "INT64 NOT NULL"));
 
-        // The two a single-input step answers for. A filter's answer is the upstream itself, so what
-        // makes it an answer rather than a silence is that it is known at all.
-        assertThat(NodeColumns.of(map(rules("area", FieldRule.rename("region"))), upstream).known())
-                .isTrue();
-        assertThat(NodeColumns.of(new TransformBody.Filter("after.qty > 1"), upstream).known()).isTrue();
-
-        List<TransformBody> unanswered = List.of(
+        Set<NodeColumns> answers = new LinkedHashSet<>();
+        for (TransformBody body : List.of(
                 new TransformBody.Js("emit(record)"),
+                map(rules("amount", FieldRule.rename("o_total"))),
+                new TransformBody.Filter("after.o_id > 1"),
                 new TransformBody.Union(),
-                new TransformBody.Nest("id", null, new NestRoot("orders", null, null, null, null)),
-                new TransformBody.Join(JoinEngine.BUILTIN, "select 1"));
-        Set<String> reasons = new LinkedHashSet<>();
-        for (TransformBody body : unanswered) {
-            NodeColumns answer = NodeColumns.of(body, upstream);
-            assertThat(answer.known()).isFalse();
-            assertThat(answer.unknownBecause()).startsWith(body.type() + ":");
-            reasons.add(answer.unknownBecause());
+                nest("orders", List.of("o_total")),
+                new TransformBody.Join(JoinEngine.BUILTIN, JOIN_SQL))) {
+            answers.add(NodeColumns.of(body, inputs, joinPlan()));
         }
-        // One arm per kind, not one arm shared by four: a single answer covering the lot would read as
-        // four answers here unless the reasons are counted.
-        assertThat(reasons).hasSameSizeAs(unanswered);
+
+        // Five, not six, and the missing one is on purpose: a predicate and a merge are one function
+        // on columns, asserted as such in its own case. Every other pair of arms answers differently,
+        // so folding any of them into another - or into a catch-all - drops this count.
+        assertThat(answers).hasSize(5);
+        assertThat(NodeColumns.of(new TransformBody.Filter("after.o_id > 1"), inputs, null))
+                .isEqualTo(NodeColumns.of(new TransformBody.Union(), inputs, null));
+    }
+
+    @Test
+    @DisplayName("a script is the one kind that answers with a reason instead of columns")
+    void aScriptAnswersWithAReasonInsteadOfColumns() {
+        NodeColumns answer = NodeColumns.of(new TransformBody.Js("emit(record)"), one(upstream()), null);
+
+        assertThat(answer.known()).isFalse();
+        assertThat(answer.unknownBecause()).startsWith("js:");
     }
 
     @Test
@@ -100,7 +115,7 @@ class NodeColumnsTest {
     @Test
     @DisplayName("a predicate decides which rows travel on, never which columns they carry")
     void aFilterHandsTheColumnsOnUntouched() {
-        NodeColumns answer = NodeColumns.of(new TransformBody.Filter("after.qty > 1"), upstream());
+        NodeColumns answer = NodeColumns.of(new TransformBody.Filter("after.qty > 1"), one(upstream()), null);
 
         assertThat(answer.columns()).containsExactlyEntriesOf(upstream().columns());
     }
@@ -112,7 +127,7 @@ class NodeColumnsTest {
         rules.put("tag", FieldRule.literal("eu"));
         rules.put("area", FieldRule.rename("region"));
 
-        NodeColumns answer = NodeColumns.of(map(rules), upstream());
+        NodeColumns answer = NodeColumns.of(map(rules), one(upstream()), null);
 
         // Declared order is the output order, and a rename consumes the column it took - so 'region'
         // is not also passed through under its old name. What is left arrives in the order it arrived.
@@ -124,7 +139,7 @@ class NodeColumnsTest {
     @DisplayName("a rename whose source is not there produces nothing, not an empty column")
     void aRenameOfAnAbsentColumnProducesNothing() {
         NodeColumns answer =
-                NodeColumns.of(map(rules("copy", FieldRule.rename("no_such_column"))), upstream());
+                NodeColumns.of(map(rules("copy", FieldRule.rename("no_such_column"))), one(upstream()), null);
 
         // The projection itself produces no output for a source it cannot find, so a column here would
         // be one the rows never carry - and a target table built with it would take a column that is
@@ -140,7 +155,7 @@ class NodeColumnsTest {
         rules.put("qty", FieldRule.drop());
         rules.put("region", FieldRule.literal(7));
 
-        NodeColumns answer = NodeColumns.of(map(rules), upstream());
+        NodeColumns answer = NodeColumns.of(map(rules), one(upstream()), null);
 
         assertThat(answer.columns()).doesNotContainKey("qty");
         // The upstream 'region' is a string; the rule that produced one of the same name wins, exactly
@@ -159,7 +174,7 @@ class NodeColumnsTest {
         rules.put("ratio", FieldRule.literal(1.5d));
         rules.put("odd", FieldRule.literal(List.of("a")));
 
-        Map<String, String> columns = NodeColumns.of(map(rules), upstream()).columns();
+        Map<String, String> columns = NodeColumns.of(map(rules), one(upstream()), null).columns();
 
         // NOT NULL because a literal is the same written-down value on every row - the only column
         // here nothing can make absent.
@@ -180,7 +195,7 @@ class NodeColumnsTest {
         rules.put("joined", FieldRule.computed("after.region + '!'"));
         rules.put("stamped", FieldRule.computed("now()"));
 
-        Map<String, String> columns = NodeColumns.of(map(rules), upstream()).columns();
+        Map<String, String> columns = NodeColumns.of(map(rules), one(upstream()), null).columns();
 
         // A bare column read is the assertion that carries the weight: it is the only one here whose
         // answer differs depending on whether the upstream types reached the expression at all. The
@@ -205,7 +220,7 @@ class NodeColumnsTest {
         rules.put("qty", FieldRule.drop());
         rules.put("total", FieldRule.computed("after.id * 2"));
 
-        NodeColumns viaMap = NodeColumns.of(map(rules), upstream());
+        NodeColumns viaMap = NodeColumns.of(map(rules), one(upstream()), null);
         NodeColumns viaPush = NodeColumns.of(push(PushFormat.fields(rules)), upstream());
 
         // The two share one rule vocabulary in the grammar, so an answer computed twice would be two
@@ -217,14 +232,14 @@ class NodeColumnsTest {
     @Test
     @DisplayName("an unknown is handed on as it was written, naming the step that actually went dark")
     void anUnknownIsHandedOnUnreworded() {
-        NodeColumns dark = NodeColumns.of(new TransformBody.Js("emit(record)"), upstream());
+        NodeColumns dark = NodeColumns.of(new TransformBody.Js("emit(record)"), one(upstream()), null);
         ViewBlock.Inline view = new ViewBlock.Inline("v", FromRef.literal("orders"), "id", null, null);
         Map<String, FieldRule> rules = rules("tag", FieldRule.literal("eu"));
 
         // Every step below a dark one could say only that it cannot see past it, and a chain of those
         // buries the one fact worth having: which step stopped being able to answer.
-        assertThat(NodeColumns.of(new TransformBody.Filter("true"), dark)).isEqualTo(dark);
-        assertThat(NodeColumns.of(map(rules), dark)).isEqualTo(dark);
+        assertThat(NodeColumns.of(new TransformBody.Filter("true"), one(dark), null)).isEqualTo(dark);
+        assertThat(NodeColumns.of(map(rules), one(dark), null)).isEqualTo(dark);
         assertThat(NodeColumns.of(view, dark)).isEqualTo(dark);
         assertThat(NodeColumns.of(push(null), dark)).isEqualTo(dark);
         assertThat(NodeColumns.of(push(PushFormat.cel("1")), dark)).isEqualTo(dark);
@@ -300,6 +315,236 @@ class NodeColumnsTest {
     }
 
     /** Three columns in a fixed order, spanning a type arithmetic reaches and one it does not. */
+    // ---- several streams reaching one node ----
+
+    @Test
+    @DisplayName("a merge publishes every column any input carries, never only the ones they share")
+    void aMergePublishesEveryColumnAnyInputCarries() {
+        // Nothing strips a column off a row because a sibling stream has no such column, so the
+        // intersection would describe a row that is never produced - and describe it one column short,
+        // which is the direction whose values are dropped at the write with nothing reporting it.
+        NodeColumns left = known("id", "INT64 NOT NULL", "qty", "INT64 NULL");
+        NodeColumns right = known("id", "INT64 NOT NULL", "region", "STRING NULL");
+
+        NodeColumns answer = NodeColumns.of(new TransformBody.Union(), inputs(left, right), null);
+
+        assertThat(answer.columns()).containsOnlyKeys("id", "qty", "region");
+    }
+
+    @Test
+    @DisplayName("a column only one input carries comes back nullable, whatever that input said")
+    void aColumnOnlyOneInputCarriesComesBackNullable() {
+        // The load-bearing half of the merge: a row arriving from the input without it carries nothing
+        // there, so NOT NULL would be a promise the other stream breaks on its first row.
+        NodeColumns left = known("id", "INT64 NOT NULL", "qty", "INT64 NOT NULL");
+        NodeColumns right = known("id", "INT64 NOT NULL");
+
+        Map<String, String> columns = NodeColumns.of(
+                new TransformBody.Union(), inputs(left, right), null).columns();
+
+        assertThat(columns).containsEntry("qty", "INT64 NULL").containsEntry("id", "INT64 NOT NULL");
+    }
+
+    @Test
+    @DisplayName("inputs that disagree about a column's type publish it as UNKNOWN")
+    void inputsThatDisagreeAboutATypePublishUnknown() {
+        // Picking either answer states a type that is wrong for the other input's rows, and the two
+        // are equally wrong - so the column is the one thing this vocabulary has for "nobody can say".
+        NodeColumns left = known("code", "INT64 NOT NULL");
+        NodeColumns right = known("code", "STRING NOT NULL");
+
+        Map<String, String> columns = NodeColumns.of(
+                new TransformBody.Union(), inputs(left, right), null).columns();
+
+        assertThat(columns).containsEntry("code", "UNKNOWN NOT NULL");
+    }
+
+    @Test
+    @DisplayName("a merge keeps the order it first met each column in")
+    void aMergeKeepsTheOrderItFirstMetEachColumnIn() {
+        NodeColumns left = known("id", "INT64 NOT NULL", "qty", "INT64 NULL");
+        NodeColumns right = known("region", "STRING NULL", "id", "INT64 NOT NULL");
+
+        Map<String, String> columns = NodeColumns.of(
+                new TransformBody.Union(), inputs(left, right), null).columns();
+
+        assertThat(columns.keySet()).containsExactly("id", "qty", "region");
+    }
+
+    @Test
+    @DisplayName("one input nobody can describe carries the whole merge, unreworded")
+    void oneDarkInputCarriesTheWholeMerge() {
+        NodeColumns dark = NodeColumns.of(new TransformBody.Js("emit(record)"), one(upstream()), null);
+
+        NodeColumns answer = NodeColumns.of(
+                new TransformBody.Union(), inputs(upstream(), dark), null);
+
+        assertThat(answer).isEqualTo(dark);
+    }
+
+    @Test
+    @DisplayName("a predicate and a merge answer the same thing over the same inputs")
+    void aPredicateAndAMergeAnswerTheSameThing() {
+        // They are one function on columns, because a predicate happens not to touch any. Written as
+        // two arms all the same: a later change to what one of them does must not become a change to
+        // the other by having been folded into it.
+        Map<String, NodeColumns> inputs = inputs(
+                known("id", "INT64 NOT NULL"), known("region", "STRING NULL"));
+
+        assertThat(NodeColumns.of(new TransformBody.Filter("after.id > 1"), inputs, null))
+                .isEqualTo(NodeColumns.of(new TransformBody.Union(), inputs, null));
+    }
+
+    @Test
+    @DisplayName("a projection over several inputs projects what they merged to")
+    void aProjectionOverSeveralInputsProjectsTheMerge() {
+        // The rename takes the merged column's type, nullability included - so a column one input does
+        // not carry arrives under its new name still admitting the rows that carry nothing there.
+        NodeColumns left = known("id", "INT64 NOT NULL", "qty", "INT64 NOT NULL");
+        NodeColumns right = known("id", "INT64 NOT NULL");
+
+        Map<String, String> columns = NodeColumns.of(
+                map(rules("amount", FieldRule.rename("qty"))), inputs(left, right), null).columns();
+
+        assertThat(columns).containsEntry("amount", "INT64 NULL");
+    }
+
+    @Test
+    @DisplayName("a node reached with no input at all crashes bare")
+    void aNodeWithNoInputCrashesBare() {
+        // Every node reads at least one stream, so this is a caller that wired none - a defect on this
+        // side, which an unknown would file away as a stream that merely could not be described.
+        assertThatThrownBy(() -> NodeColumns.of(new TransformBody.Union(), Map.of(), null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("no input");
+    }
+
+    // ---- nest ----
+
+    @Test
+    @DisplayName("a nest publishes its root stream's columns, the root's key leading")
+    void aNestPublishesItsRootsColumnsKeyLeading() {
+        Map<String, NodeColumns> inputs = new LinkedHashMap<>();
+        inputs.put("orders", known("o_total", "DECIMAL NULL", "o_id", "INT64 NOT NULL"));
+        inputs.put("lines", known("l_id", "INT64 NOT NULL", "l_qty", "INT64 NULL"));
+
+        Map<String, String> columns = NodeColumns.of(nest("orders", List.of("o_id")), inputs, null)
+                .columns();
+
+        // The embedded stream contributes nothing: its rows sit inside the documents rather than
+        // beside them, so a column of theirs appearing here would be a target table column no write
+        // ever fills.
+        assertThat(columns.keySet()).containsExactly("o_id", "o_total");
+    }
+
+    @Test
+    @DisplayName("a nest key naming a column the root does not carry is left out, not invented")
+    void aNestKeyNamingAnAbsentColumnIsLeftOut() {
+        Map<String, NodeColumns> inputs = new LinkedHashMap<>();
+        inputs.put("orders", known("o_id", "INT64 NOT NULL"));
+
+        Map<String, String> columns =
+                NodeColumns.of(nest("orders", List.of("o_id", "no_such_column")), inputs, null)
+                        .columns();
+
+        assertThat(columns.keySet()).containsExactly("o_id");
+    }
+
+    @Test
+    @DisplayName("a nest whose root is not among the inputs crashes bare")
+    void aNestWhoseRootIsNotAmongTheInputsCrashesBare() {
+        Map<String, NodeColumns> inputs = Map.of("lines", known("l_id", "INT64 NOT NULL"));
+
+        assertThatThrownBy(() -> NodeColumns.of(nest("orders", List.of("o_id")), inputs, null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("orders");
+    }
+
+    // ---- join ----
+
+    @Test
+    @DisplayName("a join publishes the row its compiled query produces, in that order")
+    void aJoinPublishesItsCompiledQuerysRow() {
+        Map<String, String> columns = NodeColumns.of(
+                new TransformBody.Join(JoinEngine.BUILTIN, JOIN_SQL), Map.of(), joinPlan()).columns();
+
+        assertThat(columns.keySet()).containsExactly("o_id", "o_total", "customer_name");
+        // The fact table's own column keeps what the source declared for it; the outer-joined
+        // dimension's cannot, because a fact row that matches nothing publishes no value there.
+        assertThat(columns).containsEntry("o_id", "INT64 NOT NULL");
+        assertThat(columns.get("customer_name")).endsWith(" NULL").doesNotContain("NOT NULL");
+    }
+
+    @Test
+    @DisplayName("the join answer is the one the drift record is written from, column for column")
+    void theJoinAnswerIsTheOneTheDriftRecordIsWrittenFrom() {
+        // The whole of what makes moving this derivation a refactor rather than a change: the record a
+        // start is held to has to be byte-identical to what this now computes, or the first start after
+        // the move refuses over a difference nobody made.
+        InMemoryDerivedSchemaStore records = new InMemoryDerivedSchemaStore();
+        new JoinSchemaDrift(records).checkAndRecord(
+                "flow", "widen", new TransformBody.Join(JoinEngine.BUILTIN, JOIN_SQL), joinPlan(),
+                JOIN_TABLES);
+
+        Map<String, String> columns = NodeColumns.of(
+                new TransformBody.Join(JoinEngine.BUILTIN, JOIN_SQL), Map.of(), joinPlan()).columns();
+
+        assertThat(columns).isEqualTo(records.latest("flow", "widen").orElseThrow().schema());
+    }
+
+    @Test
+    @DisplayName("a join reached with nothing compiled crashes bare")
+    void aJoinWithNothingCompiledCrashesBare() {
+        assertThatThrownBy(() -> NodeColumns.of(
+                new TransformBody.Join(JoinEngine.BUILTIN, JOIN_SQL), Map.of(), null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("compiled");
+    }
+
+    /** Several streams reaching one step, in the order they are given. */
+    private static Map<String, NodeColumns> inputs(NodeColumns... streams) {
+        Map<String, NodeColumns> byName = new LinkedHashMap<>();
+        for (int i = 0; i < streams.length; i++) {
+            byName.put("in" + i, streams[i]);
+        }
+        return byName;
+    }
+
+    /** A known answer written out as name, declared type, name, declared type. */
+    private static NodeColumns known(String... nameThenType) {
+        Map<String, String> columns = new LinkedHashMap<>();
+        for (int i = 0; i < nameThenType.length; i += 2) {
+            columns.put(nameThenType[i], nameThenType[i + 1]);
+        }
+        return NodeColumns.known(columns);
+    }
+
+    private static TransformBody.Nest nest(String rootAlias, List<String> key) {
+        return new TransformBody.Nest(null, null, new NestRoot(rootAlias, key, null, null, null));
+    }
+
+    private static final String JOIN_SQL =
+            "SELECT o.o_id, o.o_total, c.c_name AS customer_name"
+                    + " FROM orders o LEFT JOIN customers c ON o.o_cust_id = c.c_id";
+
+    private static final List<SourceTable> JOIN_TABLES = List.of(
+            new SourceTable("orders", List.of(
+                    new SourceColumn("o_id", TapstateType.INT64, false),
+                    new SourceColumn("o_cust_id", TapstateType.INT64, true),
+                    new SourceColumn("o_total", TapstateType.DECIMAL, false))),
+            new SourceTable("customers", List.of(
+                    new SourceColumn("c_id", TapstateType.INT64, false),
+                    new SourceColumn("c_name", TapstateType.STRING, false))));
+
+    private static JoinPlan joinPlan() {
+        return SqlFrontEnd.derive(JOIN_SQL, JOIN_TABLES);
+    }
+
+    /** One stream reaching a step, under whatever name its wiring calls it by. */
+    private static Map<String, NodeColumns> one(NodeColumns upstream) {
+        return Map.of("in", upstream);
+    }
+
     private static NodeColumns upstream() {
         Map<String, String> columns = new LinkedHashMap<>();
         columns.put("id", "INT64 NOT NULL");

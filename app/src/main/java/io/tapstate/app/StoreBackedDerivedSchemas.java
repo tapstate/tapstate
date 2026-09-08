@@ -108,7 +108,7 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
                     // would eventually do.
                     JoinSchemaDrift accepting = new JoinSchemaDrift(storePort.derivedSchemas());
                     joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> accepting.record(
-                            pipelineId, stepId, compiled.sql(), compiled.plan(), compiled.tables()));
+                            pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
                     return null;
                 });
     }

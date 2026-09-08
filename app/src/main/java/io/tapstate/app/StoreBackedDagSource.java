@@ -190,7 +190,7 @@ final class StoreBackedDagSource implements DagSource {
         // - and every write of that row succeeds, which is why the difference has to be caught here or
         // not at all.
         compiledJoins.forEach((stepId, compiled) -> joinSchemaDrift.checkAndRecord(
-                pipelineId, stepId, compiled.sql(), compiled.plan(), compiled.tables()));
+                pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
         // What this run will be holding on to, written down now that every step's shape is recorded and
         // the gate above has let the start through. Nothing re-reads a derived schema once the job is
         // submitted, so without this note a reader asking what the running pipeline produces answers
@@ -1131,7 +1131,7 @@ final class StoreBackedDagSource implements DagSource {
             throw new TapstateException(ActuationError.JOIN_SOURCE_KEY_MISSING,
                     Map.of("step", step.id(), "table", driving), null);
         }
-        return new CompiledJoin(plan, key, Map.copyOf(tableByName), join.sql(), derivedFrom);
+        return new CompiledJoin(plan, key, Map.copyOf(tableByName), join, derivedFrom);
     }
 
     /** The columns of one table, in the shared type vocabulary the plan is derived against. */
@@ -1161,8 +1161,13 @@ final class StoreBackedDagSource implements DagSource {
      * for, while an untouched query producing new columns is the world having moved under it.
      */
     record CompiledJoin(io.tapstate.core.sql.JoinPlan plan, List<String> factKeyColumns,
-            Map<String, String> tableByName, String sql,
+            Map<String, String> tableByName, TransformBody.Join body,
             List<io.tapstate.core.sql.SourceTable> tables) {
+
+        /** What the author wrote, which is what a change of statement is fingerprinted from. */
+        String sql() {
+            return body.sql();
+        }
 
         /** The real table the join is driven from, under its own name rather than the SQL's alias. */
         String factTable() {
