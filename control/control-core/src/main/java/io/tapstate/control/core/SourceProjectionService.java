@@ -49,7 +49,7 @@ public final class SourceProjectionService {
     public SourceView create(String principal, SourceInput input) {
         Objects.requireNonNull(input, "input");
         SourceResource source = representation.toModel(input, null);
-        ArtifactWriteResult result = apply.create(principal, source);
+        ArtifactWriteResult result = apply.create(principal, source, ControlOperations.SOURCE_CREATE);
         throwForWriteRefusal(result.write());
         return representation.toView(source(result.artifact().resource()), result.artifact().contentHash());
     }
@@ -61,7 +61,8 @@ public final class SourceProjectionService {
         requireMatchingId(id, input.id());
         requirePrecondition(id, expectedContentHash);
         SourceResource replacement = representation.toModel(input, source(requireSource(id).resource()));
-        ArtifactWriteResult result = apply.replace(principal, replacement, expectedContentHash);
+        ArtifactWriteResult result = apply.replace(
+                principal, replacement, expectedContentHash, ControlOperations.SOURCE_UPDATE);
         throwForWriteRefusal(result.write());
         return representation.toView(source(result.artifact().resource()), result.artifact().contentHash());
     }

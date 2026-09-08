@@ -67,10 +67,10 @@ public final class PipelineRepresentation {
                 pipeline.id(),
                 pipeline.metadata(),
                 sourceSummaries,
-                pipeline.transforms(),
-                pipeline.view(),
-                pipeline.serve(),
-                pipeline.settings(),
+                transformViews(pipeline.transforms()),
+                viewValue(pipeline.view()),
+                serveValue(pipeline.serve()),
+                settingsValue(pipeline.settings()),
                 pipeline.experimental(),
                 dagProjection.project(pipeline, sourceSummaries),
                 contentHash,
@@ -84,17 +84,36 @@ public final class PipelineRepresentation {
         if (input.sources() == null) {
             throw malformed("sources must be provided");
         }
-        return new PipelineResource(
-                input.id(),
-                input.metadata(),
-                copyStrings(input.sources(), "sources").stream()
-                        .map(id -> (SourceRef) SourceRef.bare(id))
-                        .toList(),
-                transforms(input.transforms()),
-                view(input.view()),
-                serve(input.serve()),
-                settings(input.settings()),
-                copyJson(input.experimental()));
+        try {
+            return new PipelineResource(
+                    input.id(),
+                    input.metadata(),
+                    sourceIds(input.sources()).stream()
+                            .map(id -> (SourceRef) SourceRef.bare(id))
+                            .toList(),
+                    transforms(input.transforms()),
+                    view(input.view()),
+                    serve(input.serve()),
+                    settings(input.settings()),
+                    copyJson(input.experimental()));
+        } catch (IllegalArgumentException error) {
+            throw malformed(error.getMessage());
+        }
+    }
+
+    private static List<String> sourceIds(List<Object> values) {
+        List<String> ids = new ArrayList<>(values.size());
+        for (int index = 0; index < values.size(); index++) {
+            Object value = values.get(index);
+            if (value instanceof PipelineSourceSummary summary) {
+                ids.add(summary.id());
+            } else if (value instanceof Map<?, ?>) {
+                ids.add(requiredText(object(value, "sources[" + index + "]"), "id", "sources[" + index + "]"));
+            } else {
+                ids.add(requiredString(value, "sources[" + index + "]"));
+            }
+        }
+        return List.copyOf(ids);
     }
 
     private static List<Step> transforms(List<Map<String, Object>> values) {
@@ -127,10 +146,38 @@ public final class PipelineRepresentation {
         if (use != null) {
             return Step.use(id, use, from, options);
         }
-        String type = text(step.get("type"), path + ".type");
+        String type = transformType(step.get("type"), body, path);
         TransformBody transform = body(type, payload, path);
         return Step.inline(id, from, transform, options,
                 copyJson(objectOrNull(step.get("experimental"), path + ".experimental")));
+    }
+
+    private static String transformType(Object raw, Map<String, Object> body, String path) {
+        if (raw != null) {
+            return text(raw, path + ".type");
+        }
+        if (body == null) {
+            throw malformed(path + ".type is required");
+        }
+        if (body.containsKey("script")) {
+            return "js";
+        }
+        if (body.containsKey("fields")) {
+            return "map";
+        }
+        if (body.containsKey("expr")) {
+            return "filter";
+        }
+        if (body.containsKey("root")) {
+            return "nest";
+        }
+        if (body.containsKey("sql") || body.containsKey("engine")) {
+            return "join";
+        }
+        if (body.isEmpty()) {
+            return "union";
+        }
+        throw malformed(path + ".type is required");
     }
 
     private static TransformBody body(String type, Map<String, Object> payload, String path) {
@@ -164,6 +211,21 @@ public final class PipelineRepresentation {
                 result.put(entry.getKey(), FieldRule.rename(string.substring(1)));
             } else if (value instanceof String string && string.startsWith("=")) {
                 result.put(entry.getKey(), FieldRule.computed(string.substring(1)));
+            } else if (value instanceof Map<?, ?> map) {
+                Map<String, Object> typed = object(map, path + "." + entry.getKey());
+                if (typed.isEmpty()) {
+                    result.put(entry.getKey(), FieldRule.drop());
+                } else if (typed.size() == 1 && typed.containsKey("sourceField")) {
+                    result.put(entry.getKey(), FieldRule.rename(
+                            requiredString(typed.get("sourceField"), path + "." + entry.getKey())));
+                } else if (typed.size() == 1 && typed.containsKey("celExpr")) {
+                    result.put(entry.getKey(), FieldRule.computed(
+                            requiredString(typed.get("celExpr"), path + "." + entry.getKey())));
+                } else if (typed.size() == 1 && typed.containsKey("value")) {
+                    result.put(entry.getKey(), FieldRule.literal(copyJsonValue(typed.get("value"))));
+                } else {
+                    result.put(entry.getKey(), FieldRule.literal(copyJsonValue(value)));
+                }
             } else if (value != null) {
                 result.put(entry.getKey(), FieldRule.literal(copyJsonValue(value)));
             } else {
@@ -171,6 +233,257 @@ public final class PipelineRepresentation {
             }
         }
         return Collections.unmodifiableMap(result);
+    }
+
+    private static List<Map<String, Object>> transformViews(List<Step> steps) {
+        if (steps == null) {
+            return null;
+        }
+        return steps.stream().map(PipelineRepresentation::transformView).toList();
+    }
+
+    private static Map<String, Object> transformView(Step step) {
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("id", step.id());
+        value.put("from", fromValue(step.from()));
+        if (step instanceof Step.Use use) {
+            value.put("use", use.use());
+        } else if (step instanceof Step.Inline inline) {
+            value.put("type", inline.body().type());
+            value.putAll(bodyValue(inline.body()));
+            value.put("experimental", copyJson(inline.experimental()));
+        }
+        value.put("options", copyJson(step.options()));
+        return Collections.unmodifiableMap(value);
+    }
+
+    private static Map<String, Object> bodyValue(TransformBody body) {
+        Map<String, Object> value = new LinkedHashMap<>();
+        switch (body) {
+            case TransformBody.Js js -> value.put("script", js.script());
+            case TransformBody.MapProjection map -> value.put("fields", fieldRuleValues(map.fields()));
+            case TransformBody.Filter filter -> value.put("expr", filter.expr());
+            case TransformBody.Union ignored -> {
+            }
+            case TransformBody.Nest nest -> {
+                value.put("primaryKey", nest.primaryKey());
+                value.put("order", nest.order() == null ? null : nest.order().name());
+                value.put("entriesInMemory", nest.entriesInMemory());
+                value.put("maxElementsPerDocument", nest.maxElementsPerDocument());
+                value.put("root", nestRootValue(nest.root()));
+            }
+            case TransformBody.Join join -> {
+                value.put("engine", join.engine().name());
+                value.put("sql", join.sql());
+            }
+        }
+        return value;
+    }
+
+    private static Map<String, Object> nestRootValue(NestRoot root) {
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("from", root.from());
+        value.put("key", root.key());
+        value.put("mode", root.mode());
+        value.put("trackKeyChanges", root.trackKeyChanges());
+        value.put("embed", embedValues(root.embed()));
+        return Collections.unmodifiableMap(value);
+    }
+
+    private static List<Map<String, Object>> embedValues(List<Embed> embeds) {
+        if (embeds == null) {
+            return null;
+        }
+        return embeds.stream().map(embed -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("from", embed.from());
+            value.put("on", embed.on());
+            value.put("as", embed.as() == null ? null : embed.as().name());
+            value.put("path", embed.path());
+            value.put("arrayKey", embed.arrayKey());
+            value.put("ignoreUpdates", embed.ignoreUpdates());
+            value.put("trackKeyChanges", embed.trackKeyChanges());
+            value.put("embed", embedValues(embed.embed()));
+            return Collections.unmodifiableMap(value);
+        }).toList();
+    }
+
+    private static Map<String, Object> fieldRuleValues(Map<String, FieldRule> rules) {
+        Map<String, Object> values = new LinkedHashMap<>();
+        for (Map.Entry<String, FieldRule> entry : rules.entrySet()) {
+            values.put(entry.getKey(), switch (entry.getValue()) {
+                case FieldRule.Drop ignored -> false;
+                case FieldRule.Rename rename -> "$" + rename.sourceField();
+                case FieldRule.Computed computed -> "=" + computed.celExpr();
+                case FieldRule.Literal literal -> copyJsonValue(literal.value());
+            });
+        }
+        return Collections.unmodifiableMap(values);
+    }
+
+    private static Object fromValue(FromClause from) {
+        return switch (from) {
+            case FromClause.Flow flow -> flow.refs().stream().map(PipelineRepresentation::fromRefValue).toList();
+            case FromClause.Aliases aliases -> {
+                Map<String, Object> values = new LinkedHashMap<>();
+                aliases.aliases().forEach((alias, ref) -> values.put(alias, fromRefValue(ref)));
+                yield Collections.unmodifiableMap(values);
+            }
+        };
+    }
+
+    private static String fromRefValue(FromRef ref) {
+        return switch (ref) {
+            case FromRef.Literal literal -> literal.ref();
+            case FromRef.Regex regex -> "/" + regex.pattern() + "/";
+        };
+    }
+
+    private static Map<String, Object> viewValue(ViewBlock view) {
+        if (view == null) {
+            return null;
+        }
+        Map<String, Object> value = new LinkedHashMap<>();
+        if (view instanceof ViewBlock.Use use) {
+            value.put("id", use.id());
+            value.put("from", fromRefValue(use.from()));
+            value.put("use", use.use());
+        } else if (view instanceof ViewBlock.Inline inline) {
+            value.put("id", inline.id());
+            value.put("from", fromRefValue(inline.from()));
+            value.put("primaryKey", inline.primaryKey());
+            value.put("storage", storageValue(inline.storage()));
+            value.put("schema", viewSchemaValue(inline.schema()));
+        }
+        return Collections.unmodifiableMap(value);
+    }
+
+    private static Map<String, Object> storageValue(Storage storage) {
+        if (storage == null) {
+            return null;
+        }
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("hot", storage.hot() == null ? null : Map.of("ttl", storage.hot().ttl()));
+        if (storage.warm() == null) {
+            value.put("warm", null);
+        } else {
+            Map<String, Object> warm = new LinkedHashMap<>();
+            warm.put("collection", storage.warm().collection());
+            warm.put("indexes", storage.warm().indexes());
+            value.put("warm", Collections.unmodifiableMap(warm));
+        }
+        if (storage.cold() == null) {
+            value.put("cold", null);
+        } else {
+            value.put("cold", Collections.singletonMap("partitionBy", storage.cold().partitionBy()));
+        }
+        return Collections.unmodifiableMap(value);
+    }
+
+    private static Map<String, Object> viewSchemaValue(ViewSchema schema) {
+        if (schema == null) {
+            return null;
+        }
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("enforce", schema.enforce());
+        value.put("evolution", schema.evolution());
+        return Collections.unmodifiableMap(value);
+    }
+
+    private static Map<String, Object> serveValue(ServeBlock serve) {
+        if (serve == null) {
+            return null;
+        }
+        Map<String, Object> value = new LinkedHashMap<>();
+        if (serve instanceof ServeBlock.Use use) {
+            value.put("id", use.id());
+            value.put("from", fromValue(use.from()));
+            value.put("use", use.use());
+        } else if (serve instanceof ServeBlock.Inline inline) {
+            value.put("id", inline.id());
+            value.put("from", fromValue(inline.from()));
+            value.put("sync", syncValues(inline.sync()));
+            value.put("query", queryValues(inline.query()));
+            value.put("push", pushValues(inline.push()));
+        }
+        return Collections.unmodifiableMap(value);
+    }
+
+    private static List<Map<String, Object>> syncValues(List<SyncElement> elements) {
+        if (elements == null) {
+            return null;
+        }
+        return elements.stream().map(element -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("id", element.id());
+            value.put("source", element.source());
+            value.put("writeMode", element.writeMode() == null ? null : element.writeMode().name());
+            value.put("rename", renameValue(element.rename()));
+            value.put("ddl", element.ddl() == null ? null : element.ddl().name());
+            value.put("options", copyJson(element.options()));
+            return Collections.unmodifiableMap(value);
+        }).toList();
+    }
+
+    private static Map<String, Object> renameValue(RenameSpec rename) {
+        if (rename == null) {
+            return null;
+        }
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("map", rename.map());
+        value.put("case", rename.caseMode() == null ? null : rename.caseMode().name());
+        value.put("prefix", rename.prefix());
+        value.put("suffix", rename.suffix());
+        return Collections.unmodifiableMap(value);
+    }
+
+    private static List<Map<String, Object>> queryValues(List<QueryElement> elements) {
+        if (elements == null) {
+            return null;
+        }
+        return elements.stream().map(element -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("type", element.type().name());
+            value.put("backend", element.backend());
+            return Collections.unmodifiableMap(value);
+        }).toList();
+    }
+
+    private static List<Map<String, Object>> pushValues(List<PushElement> elements) {
+        if (elements == null) {
+            return null;
+        }
+        return elements.stream().map(element -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("id", element.id());
+            value.put("source", element.source());
+            value.put("topic", element.topic());
+            value.put("format", pushFormatValue(element.format()));
+            value.put("options", copyJson(element.options()));
+            return Collections.unmodifiableMap(value);
+        }).toList();
+    }
+
+    private static Object pushFormatValue(PushFormat format) {
+        return switch (format) {
+            case null -> null;
+            case PushFormat.Cel cel -> "=" + cel.expr();
+            case PushFormat.Fields fields -> fieldRuleValues(fields.fields());
+        };
+    }
+
+    private static Map<String, Object> settingsValue(Settings settings) {
+        if (settings == null) {
+            return null;
+        }
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("errorPolicy", settings.errorPolicy() == null ? null : settings.errorPolicy().name());
+        value.put("batchSize", settings.batchSize());
+        value.put("parallelism", settings.parallelism());
+        value.put("schedule", settings.schedule());
+        value.put("readMode", settings.readMode() == null ? null : settings.readMode().name());
+        value.put("startFrom", settings.startFrom());
+        return Collections.unmodifiableMap(value);
     }
 
     private static NestRoot nestRoot(Map<String, Object> value, String path) {
@@ -529,14 +842,6 @@ public final class PipelineRepresentation {
             }
         }
         throw malformed(path + " has unsupported value " + text);
-    }
-
-    private static List<String> copyStrings(List<String> values, String path) {
-        List<String> result = new ArrayList<>(values.size());
-        for (int index = 0; index < values.size(); index++) {
-            result.add(requiredString(values.get(index), path + "[" + index + "]"));
-        }
-        return List.copyOf(result);
     }
 
     private static Map<String, Object> copyJson(Map<String, Object> value) {

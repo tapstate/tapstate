@@ -219,8 +219,8 @@ class ConnectorApiTest {
     void servesAnIconFromTheRegisteredConnectorArtifact() {
         context.getBean(SeedableConnectorCatalogStore.class).upsert(CatalogEntryReader.read(ORDERS_ROW));
         SeedableConnectorRegistry registry = context.getBean(SeedableConnectorRegistry.class);
-        registry.register("orders", "artifact-hash");
-        registry.withArtifact("artifact-hash", jarWith("icons/orders.png", new byte[] {1, 2, 3}));
+        registry.register("orders", "artifact-icon-authenticated");
+        registry.withArtifact("artifact-icon-authenticated", jarWith("icons/orders.png", new byte[] {1, 2, 3}));
 
         ResponseEntity<byte[]> response = client().get().uri("/api/connectors/orders/icon")
                 .header("Authorization", "Bearer " + token(Scope.READ))
@@ -252,8 +252,8 @@ class ConnectorApiTest {
     void servesARegisteredIconThroughTheAnonymousImageRoute() {
         context.getBean(SeedableConnectorCatalogStore.class).upsert(CatalogEntryReader.read(ORDERS_ROW));
         SeedableConnectorRegistry registry = context.getBean(SeedableConnectorRegistry.class);
-        registry.register("orders", "artifact-hash");
-        registry.withArtifact("artifact-hash", jarWith("icons/orders.png", new byte[] {7, 8, 9}));
+        registry.register("orders", "artifact-icon-anonymous");
+        registry.withArtifact("artifact-icon-anonymous", jarWith("icons/orders.png", new byte[] {7, 8, 9}));
 
         ResponseEntity<byte[]> response = client().get().uri("/connector-icons/orders")
                 .retrieve().toEntity(byte[].class);
@@ -275,8 +275,8 @@ class ConnectorApiTest {
     void returnsNotFoundWhenTheRegisteredArtifactDoesNotContainTheDeclaredIcon() {
         context.getBean(SeedableConnectorCatalogStore.class).upsert(CatalogEntryReader.read(ORDERS_ROW));
         SeedableConnectorRegistry registry = context.getBean(SeedableConnectorRegistry.class);
-        registry.register("orders", "artifact-hash");
-        registry.withArtifact("artifact-hash", jarWith("icons/other.png", new byte[] {1, 2, 3}));
+        registry.register("orders", "artifact-icon-missing");
+        registry.withArtifact("artifact-icon-missing", jarWith("icons/other.png", new byte[] {1, 2, 3}));
 
         HttpStatusCode status = client().get().uri("/api/connectors/orders/icon")
                 .header("Authorization", "Bearer " + token(Scope.READ))

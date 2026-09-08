@@ -31,7 +31,7 @@ public final class PipelineProjectionService {
     public PipelineView create(String principal, PipelineInput input) {
         Objects.requireNonNull(input, "input");
         PipelineResource pipeline = representation.toModel(input, null);
-        ArtifactWriteResult result = apply.create(principal, pipeline);
+        ArtifactWriteResult result = apply.create(principal, pipeline, ControlOperations.PIPELINE_CREATE);
         throwForWriteRefusal(result.write());
         return views.get(pipeline.id());
     }
@@ -47,7 +47,8 @@ public final class PipelineProjectionService {
                 .filter(candidate -> candidate.resource() instanceof PipelineResource)
                 .orElseThrow(() -> error(PipelineError.NOT_FOUND, Map.of("id", id)));
         PipelineResource replacement = representation.toModel(input, pipeline(stored.resource()));
-        ArtifactWriteResult result = apply.replace(principal, replacement, expectedContentHash);
+        ArtifactWriteResult result = apply.replace(
+                principal, replacement, expectedContentHash, ControlOperations.PIPELINE_UPDATE);
         throwForWriteRefusal(result.write());
         return views.get(id);
     }

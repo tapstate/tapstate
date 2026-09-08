@@ -4,6 +4,8 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -31,11 +33,20 @@ public final class ConnectorCatalogView {
 
     private static final String BUNDLED = "bundled";
     private static final String REGISTERED = "registered";
+    private static final int MAX_CACHED_ICONS = 128;
+    private static final int MAX_ICON_BYTES = 1024 * 1024;
 
     private final TapstateCatalog bundled;
     private final ConnectorCatalogStore store;
     private final ConnectorSpecStore specStore;
     private final ConnectorRegistry registry;
+    private final Map<IconCacheKey, Optional<ConnectorIcon>> icons = Collections.synchronizedMap(
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<IconCacheKey, Optional<ConnectorIcon>> eldest) {
+                    return size() > MAX_CACHED_ICONS;
+                }
+            });
 
     public ConnectorCatalogView(
             TapstateCatalog bundled, ConnectorCatalogStore store, ConnectorSpecStore specStore,
@@ -82,8 +93,17 @@ public final class ConnectorCatalogView {
         if (registrations.size() != 1) {
             return Optional.empty();
         }
-        return registry.artifact(registrations.get(0).contentHash())
-                .flatMap(artifact -> iconFrom(artifact, icon));
+        IconCacheKey key = new IconCacheKey(registrations.get(0).contentHash(), icon);
+        synchronized (icons) {
+            Optional<ConnectorIcon> cached = icons.get(key);
+            if (cached != null) {
+                return cached;
+            }
+            Optional<ConnectorIcon> loaded = registry.artifact(key.contentHash())
+                    .flatMap(artifact -> iconFrom(artifact, key.declaredPath()));
+            icons.put(key, loaded);
+            return loaded;
+        }
     }
 
     private static Optional<ConnectorIcon> iconFrom(byte[] artifact, String declaredPath) {
@@ -92,13 +112,19 @@ public final class ConnectorCatalogView {
             JarEntry entry;
             while ((entry = jar.getNextJarEntry()) != null) {
                 if (!entry.isDirectory() && entry.getName().equals(path)) {
-                    return Optional.of(new ConnectorIcon(jar.readAllBytes(), mediaType(path)));
+                    byte[] bytes = jar.readNBytes(MAX_ICON_BYTES + 1);
+                    return bytes.length > MAX_ICON_BYTES
+                            ? Optional.empty()
+                            : Optional.of(new ConnectorIcon(bytes, mediaType(path)));
                 }
             }
             return Optional.empty();
         } catch (IOException ignored) {
             return Optional.empty();
         }
+    }
+
+    private record IconCacheKey(String contentHash, String declaredPath) {
     }
 
     private static String mediaType(String path) {

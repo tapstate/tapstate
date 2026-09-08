@@ -95,7 +95,7 @@ class PipelineViewServiceTest {
     }
 
     @Test
-    void rejectsMissingOrWrongKindSourceReferencesInsteadOfDroppingThem() {
+    void marksMissingOrWrongKindSourceReferencesAsUnresolved() {
         ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
         store.seed(pipeline("missing", List.of("absent")));
         store.seed(pipeline("wrong_kind", List.of("not_a_source")));
@@ -103,14 +103,27 @@ class PipelineViewServiceTest {
         PipelineViewService pipelines = new PipelineViewService(
                 new ArtifactQueryService(store), new PipelineRepresentation());
 
-        assertThatThrownBy(() -> pipelines.find("missing"))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("absent")
-                .hasMessageContaining("Source");
-        assertThatThrownBy(() -> pipelines.find("wrong_kind"))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("not_a_source")
-                .hasMessageContaining("Source");
+        assertThat(pipelines.find("missing").orElseThrow().sources())
+                .containsExactly(PipelineSourceSummary.unresolved("absent"));
+        assertThat(pipelines.find("wrong_kind").orElseThrow().sources())
+                .containsExactly(PipelineSourceSummary.unresolved("not_a_source"));
+    }
+
+    @Test
+    void listKeepsHealthyPipelinesVisibleWhenAnotherPipelineHasADanglingSource() {
+        ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
+        store.seed(source("orders", "Orders", "mysql"));
+        store.seed(pipeline("healthy", List.of("orders")));
+        store.seed(pipeline("broken", List.of("missing")));
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(store), new PipelineRepresentation());
+
+        List<PipelineView> listed = pipelines.list();
+
+        assertThat(listed).extracting(PipelineView::id).containsExactly("broken", "healthy");
+        assertThat(listed.getFirst().sources()).containsExactly(PipelineSourceSummary.unresolved("missing"));
+        assertThat(listed.get(1).sources()).containsExactly(
+                new PipelineSourceSummary("orders", new Metadata(Map.of("team", "sales"), "Orders"), "mysql"));
     }
 
     @Test

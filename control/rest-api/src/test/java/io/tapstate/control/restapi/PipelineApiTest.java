@@ -485,7 +485,41 @@ class PipelineApiTest {
                 .isNotEqualTo(etag);
         assertThat(((Map<?, ?>) replaced.getBody().get("settings")).get("readMode")).isEqualTo("CDC_ONLY");
         assertThat(context.getBean(RecordingAuditStore.class).records)
-                .anySatisfy(record -> assertThat(record.operationId()).isEqualTo("artifact.apply"));
+                .anySatisfy(record -> assertThat(record.operationId()).isEqualTo("pipeline.update"));
+    }
+
+    @Test
+    void getBodyRoundTripsThroughPutForInlineTransformsAndFieldRules() {
+        context.getBean(FakeArtifactStore.class).seed("""
+                version: tapstate/v1
+                kind: pipeline
+                id: roundtrip
+                source: src_x
+                transforms:
+                  - id: projected
+                    type: map
+                    from: /.*/
+                    fields: { old: false, renamed: $old, computed: =1 + 1 }
+                serve: { from: projected }
+                """);
+        ResponseEntity<Map> current = client().get().uri("/api/pipelines/roundtrip")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+
+        ResponseEntity<Map> replaced = client().put().uri("/api/pipelines/roundtrip")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .header(HttpHeaders.IF_MATCH, current.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(current.getBody())
+                .retrieve().toEntity(Map.class);
+
+        assertThat(replaced.getStatusCode()).isEqualTo(HttpStatus.OK);
+        Map<?, ?> transform = (Map<?, ?>) ((List<?>) replaced.getBody().get("transforms")).getFirst();
+        assertThat(transform.get("type")).isEqualTo("map");
+        Map<?, ?> fields = (Map<?, ?>) transform.get("fields");
+        assertThat(fields.get("old")).isEqualTo(false);
+        assertThat(fields.get("renamed")).isEqualTo("$old");
+        assertThat(fields.get("computed")).isEqualTo("=1 + 1");
     }
 
     @Test
@@ -1055,6 +1089,19 @@ class PipelineApiTest {
         @Override
         public void saveAll(List<Resource> artifacts) {
             artifacts.forEach(r -> byId.put(r.id(), r));
+        }
+
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+            for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
+                Resource current = byId.get(expected.getKey());
+                if (current == null
+                        || !CanonicalHash.of(new CanonicalWriter().write(current)).equals(expected.getValue())) {
+                    return Optional.of(expected.getKey());
+                }
+            }
+            saveAll(artifacts);
+            return Optional.empty();
         }
 
         @Override

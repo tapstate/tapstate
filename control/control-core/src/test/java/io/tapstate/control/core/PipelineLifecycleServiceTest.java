@@ -88,6 +88,25 @@ class PipelineLifecycleServiceTest {
     }
 
     @Test
+    void aBlankEditorDraftCannotBeStarted() {
+        artifacts.save("""
+                version: tapstate/v1
+                kind: pipeline
+                id: blank
+                source: []
+                """);
+
+        TapstateException thrown = catchThrowableOfType(
+                TapstateException.class, () -> service.start("alice", "blank"));
+
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code().code()).isEqualTo("lifecycle.pipeline-not-runnable");
+        assertThat(thrown.args()).containsEntry("pipeline", "blank");
+        assertThat(desired.read("blank")).isEmpty();
+        assertThat(audit.records).isEmpty();
+    }
+
+    @Test
     void resumeAtAStaleRevisionIsRefusedWithTheRequestedAndLatest() {
         artifacts.save(PIPELINE_V1);
         service.start("alice", "pl1"); // desired RUNNING at v1

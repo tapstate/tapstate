@@ -8,6 +8,7 @@ import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.common.TapstateException;
@@ -994,6 +995,45 @@ class ApplyServiceTest {
         assertThat(result.write().refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
         assertThat(store.get("ora2my_ods")).isEmpty();
         assertThat(stored("src_ora")).isEqualTo(canonicalOf(SRC_ORA.replace("10.20.0.15", "10.20.0.16")));
+    }
+
+    @Test
+    void offlinePlanningIgnoresStoredArtifactsOutsideTheSubmittedClosure() {
+        store.landDirectly(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: stale_pipeline
+                source: missing_source
+                serve: { from: /.*/ }
+                """));
+
+        ApplyPlan plan = service.plan(List.of(draft(TGT_MY)));
+
+        assertThat(plan.artifacts()).extracting(PreparedArtifact::id).containsExactly("tgt_my");
+        assertThat(plan.workspacePreconditions()).isEmpty();
+    }
+
+    @Test
+    void typedCreateDoesNotConflictWithAnUnrelatedArtifactEdit() {
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        Resource unrelated = new DslParser().parse(PIPELINE.replace("ora2my_ods", "unrelated_pipeline"));
+        store.landDirectly(unrelated);
+        Resource unrelatedEdit = new DslParser().parse(
+                PIPELINE.replace("ora2my_ods", "unrelated_pipeline")
+                        .replace("snapshot_and_cdc", "cdc_only"));
+        store.concurrentWriter = () -> store.landDirectly(unrelatedEdit);
+        SourceResource created = (SourceResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: new_source
+                connector: mysql
+                config: { host: localhost, database: inventory, username: reader }
+                """);
+
+        ArtifactWriteResult result = service.create("bob", created);
+
+        assertThat(result.write().appliedSuccessfully()).isTrue();
+        assertThat(store.get("new_source")).contains(created);
     }
 
     @Test

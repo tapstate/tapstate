@@ -159,6 +159,38 @@ class ArtifactStoreTest {
         assertThat(store.storedCanonical("orders")).isEqualTo(WRITER.write(original));
     }
 
+    @Test
+    void defaultWriteAllRefusesAConditionalWriteWhoseReadGuardsCannotBeHonored() {
+        LegacySingleWriteStore store = new LegacySingleWriteStore();
+        Resource original = source("localhost");
+        store.seed(original);
+
+        assertThatThrownBy(() -> store.writeAll(List.of(
+                ArtifactWrite.createOnly(source("customers", "replica"))
+                        .guardedBy(Map.of("orders", hash(original))))))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("read preconditions");
+        assertThat(store.get("customers")).isEmpty();
+    }
+
+    @Test
+    void defaultConditionalBatchCarriesReadGuardsBesideReplaceConditions() {
+        ConditionalBatchStore store = new ConditionalBatchStore();
+        Resource original = source("localhost");
+        Resource dependency = source("customers", "localhost");
+        store.seed(original);
+        store.seed(dependency);
+
+        ArtifactBatchWrite outcome = store.writeAll(List.of(
+                ArtifactWrite.replaceOnly(source("replica"), hash(original))
+                        .guardedBy(Map.of("customers", "0".repeat(64))),
+                ArtifactWrite.upsert(source("new_source", "localhost"))));
+
+        assertThat(outcome.refusedId()).isEqualTo("customers");
+        assertThat(store.storedCanonical("orders")).isEqualTo(WRITER.write(original));
+        assertThat(store.get("new_source")).isEmpty();
+    }
+
     private static Resource source(String host) {
         return source("orders", host);
     }

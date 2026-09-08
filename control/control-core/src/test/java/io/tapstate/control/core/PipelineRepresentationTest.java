@@ -237,6 +237,24 @@ class PipelineRepresentationTest {
         assertThat(model.settings()).isEqualTo(new Settings(
                 ErrorPolicy.DEAD_LETTER, 500, 4, "0 2 * * *", ReadMode.CDC_ONLY, "earliest"));
         assertThat(model.experimental()).isEqualTo(Map.of("preview", List.of("orders")));
+
+        PipelineView projected = representation.toView(
+                model,
+                "d".repeat(64),
+                List.of(
+                        new PipelineSourceSummary("mysql_orders", null, "mysql"),
+                        new PipelineSourceSummary("postgres_customers", null, "postgres")));
+        PipelineResource roundTripped = representation.toModel(new PipelineInput(
+                projected.id(),
+                projected.metadata(),
+                new ArrayList<Object>(projected.sources()),
+                projected.transforms(),
+                projected.view(),
+                projected.serve(),
+                projected.settings(),
+                projected.experimental()), model);
+
+        assertThat(roundTripped).isEqualTo(model);
     }
 
     @Test
@@ -273,6 +291,24 @@ class PipelineRepresentationTest {
     }
 
     @Test
+    void translatesModelInvariantFailuresIntoTheCodedMalformedRequest() {
+        PipelineInput input = new PipelineInput(
+                "invalid", null, List.of(),
+                List.of(Map.of(
+                        "id", "nested",
+                        "type", "nest",
+                        "from", List.of("orders"),
+                        "root", Map.of("from", "orders"))),
+                null, null, null, null);
+
+        assertThatThrownBy(() -> representation.toModel(input, null))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(error.args()).containsKey("reason");
+                });
+    }
+
+    @Test
     void mapsTheStaticPipelineArtifactAndItsReferencedSourceSummaries() {
         PipelineResource pipeline = pipeline(List.of("orders", "customers"));
 
@@ -292,10 +328,21 @@ class PipelineRepresentationTest {
                         "orders", new Metadata(Map.of("team", "sales"), "Orders"), "mysql"),
                 new PipelineSourceSummary(
                         "customers", new Metadata(Map.of(), "Customers"), "postgres"));
-        assertThat(view.transforms()).containsExactlyElementsOf(pipeline.transforms());
-        assertThat(view.view()).isEqualTo(pipeline.view());
-        assertThat(view.serve()).isEqualTo(pipeline.serve());
-        assertThat(view.settings()).isEqualTo(pipeline.settings());
+        assertThat(view.transforms()).singleElement().satisfies(step -> {
+            assertThat(step).containsEntry("id", "active_orders");
+            assertThat(step).containsEntry("type", "filter");
+            assertThat(step).containsEntry("expr", "status == 'active'");
+        });
+        PipelineResource roundTripped = representation.toModel(new PipelineInput(
+                view.id(),
+                view.metadata(),
+                new ArrayList<Object>(view.sources()),
+                view.transforms(),
+                view.view(),
+                view.serve(),
+                view.settings(),
+                view.experimental()), pipeline);
+        assertThat(roundTripped).isEqualTo(pipeline);
         assertThat(view.experimental()).isEqualTo(Map.of("preview", List.of("orders")));
         assertThat(view.contentHash()).isEqualTo("a".repeat(64));
     }

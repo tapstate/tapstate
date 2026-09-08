@@ -26,7 +26,6 @@ import io.tapstate.spi.store.SourceTable;
 
 import java.util.ArrayList;
 import java.util.ArrayDeque;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -159,16 +158,15 @@ public final class ApplyService {
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
         List<Resource> storedResources = store.list();
         List<Resource> candidate = new ArrayList<>();
-        Map<String, String> workspacePreconditions = new LinkedHashMap<>();
         for (Resource stored : storedResources) {
             if (!submittedIds.contains(stored.id())) {
                 candidate.add(stored);
-                workspacePreconditions.put(stored.id(), storedHash(stored));
             }
         }
         candidate.addAll(submitted);
         TapstateCatalog liveCatalog = catalog.get();
-        Workspace workspace = Workspace.of(candidate, liveCatalog);
+        List<Resource> validationResources = validationResources(candidate, submitted, validationScope);
+        Workspace workspace = Workspace.of(validationResources, liveCatalog);
         if (validationScope == ValidationScope.ONLINE_SOURCE) {
             for (Resource resource : submitted) {
                 if (resource instanceof SourceResource source) {
@@ -178,11 +176,16 @@ public final class ApplyService {
         }
         // Read once and handed to both: the gate judges the batch against it, then the advisory pass
         // advises on the same reading rather than paying a second round trip for a possibly different one.
-        List<Resource> semanticValidation = semanticValidationResources(candidate, submitted, validationScope);
-        Map<String, List<DiscoveredTable>> discovered = discoveredTables(semanticValidation);
-        RowExpressionTypeRules.validate(semanticValidation, discovered);
-        WriteKeyRules.validate(semanticValidation, discovered);
+        Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources);
+        RowExpressionTypeRules.validate(validationResources, discovered);
+        WriteKeyRules.validate(validationResources, discovered);
         List<Resource> validated = List.copyOf(workspace.resources());
+        Map<String, String> workspacePreconditions = new LinkedHashMap<>();
+        for (Resource resource : validated) {
+            if (!submittedIds.contains(resource.id())) {
+                workspacePreconditions.put(resource.id(), storedHash(resource));
+            }
+        }
         Map<String, Resource> validatedById = new LinkedHashMap<>();
         Map<String, SourceResource> batchSources = new LinkedHashMap<>();
         for (Resource resource : validated) {
@@ -265,72 +268,73 @@ public final class ApplyService {
      * reachable through references to the submitted source (including inline serve sinks and
      * reusable serve definitions); all non-pipeline resources remain available for wiring lookup.
      */
-    private static List<Resource> semanticValidationResources(
+    private static List<Resource> validationResources(
             List<Resource> candidate, List<Resource> submitted, ValidationScope scope) {
-        if (scope != ValidationScope.ONLINE_SOURCE) {
-            return candidate;
+        if (scope == ValidationScope.OFFLINE) {
+            return List.copyOf(submitted);
         }
         Set<String> submittedSourceIds = new LinkedHashSet<>();
-        Set<String> submittedPipelineIds = new LinkedHashSet<>();
+        Set<String> selectedIds = new LinkedHashSet<>();
         for (Resource resource : submitted) {
+            selectedIds.add(resource.id());
             if (resource instanceof SourceResource) {
                 submittedSourceIds.add(resource.id());
-            } else if (resource instanceof PipelineResource) {
-                submittedPipelineIds.add(resource.id());
             }
-        }
-        // A typed Pipeline write must be judged against its own discovered sources, but it must not
-        // re-run schema-dependent gates for every unrelated stored Pipeline. A stale keyless table in
-        // another pipeline would otherwise make creating an empty draft impossible (and would report
-        // an error for the wrong request). Non-pipeline resources remain available to resolve the
-        // submitted pipeline's source/serve definitions.
-        if (!submittedPipelineIds.isEmpty()) {
-            return candidate.stream()
-                    .filter(resource -> !(resource instanceof PipelineResource)
-                            || submittedPipelineIds.contains(resource.id()))
-                    .toList();
-        }
-        if (submittedSourceIds.isEmpty()) {
-            return candidate;
         }
 
         ReferenceGraph graph = ReferenceGraph.of(candidate);
-        Set<String> impacted = new HashSet<>();
         ArrayDeque<String> pending = new ArrayDeque<>(submittedSourceIds);
         while (!pending.isEmpty()) {
             String id = pending.removeFirst();
-            if (!impacted.add(id)) {
-                continue;
-            }
             for (ReferenceGraph.Edge referrer : graph.referencedBy(id)) {
-                pending.addLast(referrer.id());
+                if (selectedIds.add(referrer.id())) {
+                    pending.addLast(referrer.id());
+                }
             }
         }
 
-        List<Resource> selected = new ArrayList<>();
-        for (Resource resource : candidate) {
-            if (!(resource instanceof PipelineResource) || impacted.contains(resource.id())) {
-                selected.add(resource);
+        pending.addAll(selectedIds);
+        while (!pending.isEmpty()) {
+            String id = pending.removeFirst();
+            for (ReferenceGraph.Edge dependency : graph.references(id)) {
+                if (selectedIds.add(dependency.id())) {
+                    pending.addLast(dependency.id());
+                }
             }
         }
-        return selected;
+        return candidate.stream().filter(resource -> selectedIds.contains(resource.id())).toList();
     }
 
     /** Applies one typed resource only while its id is absent. */
     public ArtifactWriteResult create(String principal, Resource resource) {
-        return writeTyped(principal, resource, ArtifactWrite.Intent.CREATE_ONLY, null);
+        return create(principal, resource, ControlOperations.ARTIFACT_APPLY);
+    }
+
+    ArtifactWriteResult create(String principal, Resource resource, Operation operation) {
+        return writeTyped(principal, resource, ArtifactWrite.Intent.CREATE_ONLY, null, operation);
     }
 
     /** Applies one typed resource only while its stored canonical hash equals {@code expectedContentHash}. */
     public ArtifactWriteResult replace(String principal, Resource resource, String expectedContentHash) {
         Objects.requireNonNull(expectedContentHash, "expectedContentHash");
-        return writeTyped(principal, resource, ArtifactWrite.Intent.REPLACE_ONLY, expectedContentHash);
+        return replace(principal, resource, expectedContentHash, ControlOperations.ARTIFACT_APPLY);
+    }
+
+    ArtifactWriteResult replace(
+            String principal, Resource resource, String expectedContentHash, Operation operation) {
+        Objects.requireNonNull(expectedContentHash, "expectedContentHash");
+        return writeTyped(principal, resource, ArtifactWrite.Intent.REPLACE_ONLY, expectedContentHash, operation);
     }
 
     private ArtifactWriteResult writeTyped(
-            String principal, Resource resource, ArtifactWrite.Intent intent, String expectedContentHash) {
+            String principal,
+            Resource resource,
+            ArtifactWrite.Intent intent,
+            String expectedContentHash,
+            Operation operation) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(resource, "resource");
+        Objects.requireNonNull(operation, "operation");
         ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
         if (live != null) {
@@ -350,7 +354,7 @@ public final class ApplyService {
             case UPSERT -> throw new IllegalArgumentException("typed writes must be conditional");
         }).guardedBy(plan.workspacePreconditions());
         ArtifactBatchWrite outcome = auditGate.dispatchAll(
-                ControlOperations.ARTIFACT_APPLY,
+                operation,
                 List.of(new AuditContext(principal, prepared.id(), expectedContentHash)),
                 () -> store.writeAll(List.of(write)));
         return new ArtifactWriteResult(prepared, outcome);

@@ -1,11 +1,6 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.model.Metadata;
-import io.tapstate.core.model.ServeBlock;
-import io.tapstate.core.model.Settings;
-import io.tapstate.core.model.Step;
-import io.tapstate.core.model.ViewBlock;
-
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -15,10 +10,10 @@ public record PipelineView(
         String id,
         Metadata metadata,
         List<PipelineSourceSummary> sources,
-        List<Step> transforms,
-        ViewBlock view,
-        ServeBlock serve,
-        Settings settings,
+        List<Map<String, Object>> transforms,
+        Map<String, Object> view,
+        Map<String, Object> serve,
+        Map<String, Object> settings,
         Map<String, Object> experimental,
         PipelineDag dag,
         String contentHash,

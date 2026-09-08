@@ -67,10 +67,10 @@ public final class PipelineViewService {
         List<PipelineSourceSummary> summaries = new ArrayList<>(pipeline.sources().size());
         for (SourceRef sourceRef : pipeline.sources()) {
             String sourceId = sourceRef.id();
-            StoredResource stored = artifacts.getResource(sourceId)
-                    .orElseThrow(() -> inconsistentSourceReference(pipeline.id(), sourceId));
-            if (!(stored.resource() instanceof SourceResource source)) {
-                throw inconsistentSourceReference(pipeline.id(), sourceId);
+            StoredResource stored = artifacts.getResource(sourceId).orElse(null);
+            if (stored == null || !(stored.resource() instanceof SourceResource source)) {
+                summaries.add(PipelineSourceSummary.unresolved(sourceId));
+                continue;
             }
             summaries.add(new PipelineSourceSummary(source.id(), source.metadata(), source.connector()));
         }
@@ -84,8 +84,4 @@ public final class PipelineViewService {
         throw new IllegalStateException("Pipeline projection received a non-Pipeline resource");
     }
 
-    private static IllegalStateException inconsistentSourceReference(String pipelineId, String sourceId) {
-        return new IllegalStateException(
-                "Pipeline " + pipelineId + " references " + sourceId + " as a Source, but it does not resolve");
-    }
 }

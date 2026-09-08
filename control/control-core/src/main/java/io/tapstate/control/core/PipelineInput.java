@@ -9,12 +9,27 @@ import java.util.Map;
 public record PipelineInput(
         String id,
         Metadata metadata,
-        List<String> sources,
+        List<Object> sources,
         List<Map<String, Object>> transforms,
         Map<String, Object> view,
         Map<String, Object> serve,
         Map<String, Object> settings,
-        Map<String, Object> experimental) {
+        Map<String, Object> experimental,
+        PipelineDag dag,
+        String contentHash,
+        PipelineStatus status) {
+
+    public PipelineInput(
+            String id,
+            Metadata metadata,
+            List<Object> sources,
+            List<Map<String, Object>> transforms,
+            Map<String, Object> view,
+            Map<String, Object> serve,
+            Map<String, Object> settings,
+            Map<String, Object> experimental) {
+        this(id, metadata, sources, transforms, view, serve, settings, experimental, null, null, null);
+    }
 
     public PipelineInput {
         sources = sources == null ? null : List.copyOf(sources);

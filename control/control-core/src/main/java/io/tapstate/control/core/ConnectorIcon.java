@@ -30,6 +30,6 @@ public record ConnectorIcon(byte[] bytes, String mediaType) {
 
     @Override
     public String toString() {
-        return "ConnectorIcon[bytes=" + Arrays.toString(bytes) + ", mediaType=" + mediaType + "]";
+        return "ConnectorIcon[bytes=" + bytes.length + " bytes, mediaType=" + mediaType + "]";
     }
 }

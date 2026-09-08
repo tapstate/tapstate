@@ -206,13 +206,52 @@ class ConnectorCatalogViewTest {
     }
 
     @Test
+    void repeatedIconReadsReuseTheExtractionForAnImmutableArtifactHash() {
+        InMemoryConnectorCatalogStore store = new InMemoryConnectorCatalogStore();
+        store.upsert(CatalogEntryReader.read(ACME_ROW));
+        byte[] artifact = jarWith("icons/acme.png", new byte[] {4, 5, 6});
+        int[] artifactReads = {0};
+        ConnectorRegistry registry = new ConnectorRegistry() {
+            @Override
+            public RegistrationOutcome register(
+                    String id, String pdkApiVersion, RegistrationSource source, byte[] bytes) {
+                throw new UnsupportedOperationException("the icon read never registers");
+            }
+
+            @Override
+            public List<ConnectorRegistration> list() {
+                return List.of(new ConnectorRegistration(
+                        "acme", "jar-hash", "1.0.0", RegistrationSource.REGISTER));
+            }
+
+            @Override
+            public Optional<byte[]> artifact(String hash) {
+                artifactReads[0]++;
+                return Optional.of(artifact.clone());
+            }
+
+            @Override
+            public boolean hasArtifact(String hash) {
+                return true;
+            }
+        };
+        ConnectorCatalogView view = new ConnectorCatalogView(
+                BUNDLED, store, new InMemoryConnectorSpecStore(), registry);
+
+        assertThat(view.icon("acme")).isPresent();
+        assertThat(view.icon("acme")).isPresent();
+
+        assertThat(artifactReads[0]).isEqualTo(1);
+    }
+
+    @Test
     void iconIsAValueOverItsImageBytes() {
         ConnectorIcon icon = new ConnectorIcon(new byte[] {4, 5, 6}, "image/png");
 
         assertThat(icon).isEqualTo(new ConnectorIcon(new byte[] {4, 5, 6}, "image/png"));
         assertThat(icon.hashCode())
                 .isEqualTo(new ConnectorIcon(new byte[] {4, 5, 6}, "image/png").hashCode());
-        assertThat(icon).hasToString("ConnectorIcon[bytes=[4, 5, 6], mediaType=image/png]");
+        assertThat(icon).hasToString("ConnectorIcon[bytes=3 bytes, mediaType=image/png]");
     }
 
     @Test

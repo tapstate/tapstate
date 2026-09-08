@@ -47,8 +47,32 @@ public interface ArtifactStore {
             return refused.map(id -> ArtifactBatchWrite.refused(id, ArtifactMutation.VERSION_CONFLICT))
                     .orElseGet(ArtifactBatchWrite::applied);
         }
+        if (writes.stream().noneMatch(write -> write.intent() == ArtifactWrite.Intent.CREATE_ONLY)
+                && (writes.size() > 1 || writes.stream().anyMatch(write -> !write.readPreconditions().isEmpty()))) {
+            Map<String, String> preconditions = new java.util.LinkedHashMap<>();
+            for (ArtifactWrite write : writes) {
+                if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
+                    preconditions.put(write.resource().id(), write.expectedContentHash());
+                }
+                for (Map.Entry<String, String> precondition : write.readPreconditions().entrySet()) {
+                    String previous = preconditions.putIfAbsent(precondition.getKey(), precondition.getValue());
+                    if (previous != null && !previous.equals(precondition.getValue())) {
+                        throw new IllegalArgumentException("one batch cannot require two versions of "
+                                + precondition.getKey());
+                    }
+                }
+            }
+            Optional<String> refused = saveAll(
+                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions);
+            return refused.map(id -> ArtifactBatchWrite.refused(id, ArtifactMutation.VERSION_CONFLICT))
+                    .orElseGet(ArtifactBatchWrite::applied);
+        }
         if (writes.size() == 1) {
             ArtifactWrite write = writes.getFirst();
+            if (!write.readPreconditions().isEmpty()) {
+                throw new UnsupportedOperationException(
+                        "atomic conditional artifact writes with read preconditions are not implemented");
+            }
             ArtifactMutation outcome = switch (write.intent()) {
                 case CREATE_ONLY -> create(write.resource());
                 case REPLACE_ONLY -> replace(write.resource().id(), write.expectedContentHash(), write.resource());
@@ -60,18 +84,6 @@ public interface ArtifactStore {
                         ArtifactBatchWrite.refused(write.resource().id(), outcome);
                 case DELETED -> throw new IllegalStateException("artifact write cannot report deletion");
             };
-        }
-        if (writes.stream().noneMatch(write -> write.intent() == ArtifactWrite.Intent.CREATE_ONLY)) {
-            Map<String, String> preconditions = new java.util.LinkedHashMap<>();
-            for (ArtifactWrite write : writes) {
-                if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
-                    preconditions.put(write.resource().id(), write.expectedContentHash());
-                }
-            }
-            Optional<String> refused = saveAll(
-                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions);
-            return refused.map(id -> ArtifactBatchWrite.refused(id, ArtifactMutation.VERSION_CONFLICT))
-                    .orElseGet(ArtifactBatchWrite::applied);
         }
         throw new UnsupportedOperationException("atomic mixed artifact writes are not implemented");
     }
