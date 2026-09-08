@@ -95,14 +95,8 @@ public final class ConnectorCatalogView {
         }
         IconCacheKey key = new IconCacheKey(registrations.get(0).contentHash(), icon);
         synchronized (icons) {
-            Optional<ConnectorIcon> cached = icons.get(key);
-            if (cached != null) {
-                return cached;
-            }
-            Optional<ConnectorIcon> loaded = registry.artifact(key.contentHash())
-                    .flatMap(artifact -> iconFrom(artifact, key.declaredPath()));
-            icons.put(key, loaded);
-            return loaded;
+            return icons.computeIfAbsent(key, cacheKey -> registry.artifact(cacheKey.contentHash())
+                    .flatMap(artifact -> iconFrom(artifact, cacheKey.declaredPath())));
         }
     }
 
