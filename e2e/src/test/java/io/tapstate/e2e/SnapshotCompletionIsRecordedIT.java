@@ -97,15 +97,41 @@ class SnapshotCompletionIsRecordedIT {
 
             // The example's own awaits are what establish the snapshot actually drained: it settles on a
             // count of rows that only a snapshot read produces. Asserting the mark before that would be
-            // asserting it of a phase still running.
+            // asserting it of a phase still running -- but it is not enough on its own either, because the
+            // rows land at the target strictly before the mark does. See awaitMarkedTables.
             new E2eExecutor(binding, new FilePipelineLoader(workspace), TIMEOUT, POLL).execute(envelope);
 
-            assertThat(completedTables(storeUri))
+            assertThat(awaitMarkedTables(storeUri))
                     .as("the table the drained snapshot marks complete, read out of the chain record by a "
                             + "reader that is not the product; the product resolved this name from the "
                             + "applied source, and the example is what declares it is %s", TABLE)
                     .contains(TABLE);
         }
+    }
+
+    /**
+     * Waits for the chain record to carry a snapshot-completion mark at all, and answers with every mark
+     * it found. The wait is deliberately not the assertion: <em>which</em> table is named is what this
+     * case discriminates, so that stays with the caller -- a mark under the wrong name ends this wait and
+     * fails there, which is where the message explaining it lives.
+     *
+     * <p>Why a wait is needed when the example has already settled. The mark is not written by the
+     * snapshot phase; it is written when the sink acknowledges the rows, and an acknowledgement is reaped
+     * on a later pass of the processor than the write it settles. The example's awaits end as soon as the
+     * rows are readable at the target, which is strictly earlier, so a single read here races a write that
+     * has not happened yet. Measured: the same commit passed one CI run and failed the other on this
+     * assertion, reading an empty list.
+     */
+    private static List<String> awaitMarkedTables(String storeUri) {
+        List<String> marked = new ArrayList<>();
+        Await.until("a snapshot-completion mark in the chain record",
+                () -> {
+                    marked.clear();
+                    marked.addAll(completedTables(storeUri));
+                    return !marked.isEmpty();
+                },
+                marked::toString);
+        return marked;
     }
 
     /**
