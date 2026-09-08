@@ -34,6 +34,7 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -919,6 +920,11 @@ class AuthTest {
                     return Optional.empty();
                 }
             });
+        }
+
+        @Bean
+        SourceSchemaQueryService sourceSchemaQueryService(InMemoryArtifactStore store) {
+            return new SourceSchemaQueryService(store, new EmptySchemaStore());
         }
 
         // The three data-browser controller methods are bundled too, so their service must be present for

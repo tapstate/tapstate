@@ -9,6 +9,7 @@ import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.Scope;
+import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SourceService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
@@ -24,6 +25,11 @@ import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
+import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
 import org.junit.jupiter.api.AfterAll;
@@ -83,7 +89,28 @@ class SourceApiTest {
     @BeforeEach
     void reset() {
         context.getBean(InMemoryArtifactStore.class).clear();
+        context.getBean(InMemorySchemaStore.class).clear();
         context.getBean(RecordingAuditStore.class).reset();
+    }
+
+    @Test
+    void sourceSchemaContainsOnlyTablesTheSourceSelects() throws Exception {
+        create("orders", "before");
+        context.getBean(InMemorySchemaStore.class).save(new DiscoveredSourceModel(
+                "orders", "mysql", 1_700_000_000_000L, new SourceModel(List.of(
+                        new SourceTable("orders", List.of(new SourceField("id", "bigint")), List.of("id"), List.of()),
+                        new SourceTable("payments", List.of(new SourceField("id", "varchar")), List.of("id"), List.of()),
+                        new SourceTable("audit_log", List.of(new SourceField("id", "bigint")), List.of("id"), List.of()),
+                        new SourceTable("customers", List.of(new SourceField("id", "bigint")), List.of("id"), List.of())))));
+
+        ResponseEntity<String> response = request("reader").get().uri("/api/sources/orders/schema")
+                .retrieve().toEntity(String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode body = JSON.readTree(response.getBody());
+        assertThat(body.path("connectionId").asText()).isEqualTo("orders");
+        assertThat(body.path("tables")).extracting(table -> table.path("name").asText())
+                .containsExactly("orders", "audit_log", "customers");
     }
 
     @Test
@@ -382,6 +409,10 @@ class SourceApiTest {
             ApiExceptionHandler.class})
     static class TestApp {
         @Bean InMemoryArtifactStore artifactStore() { return new InMemoryArtifactStore(); }
+        @Bean InMemorySchemaStore schemaStore() { return new InMemorySchemaStore(); }
+        @Bean SourceSchemaQueryService sourceSchemaQueryService(ArtifactStore artifacts, SchemaStore schemas) {
+            return new SourceSchemaQueryService(artifacts, schemas);
+        }
         @Bean RecordingAuditStore auditStore() { return new RecordingAuditStore(); }
         @Bean Clock clock() { return Clock.fixed(Instant.parse("2026-07-13T00:00:00Z"), ZoneOffset.UTC); }
         @Bean AuditedSourceService auditedSourceService(SourceService source, AuditStore audits, Clock clock) {
@@ -456,6 +487,24 @@ class SourceApiTest {
         public synchronized List<Resource> list() { return new ArrayList<>(byId.values()); }
         private static String hash(Resource resource) {
             return CanonicalHash.of(new CanonicalWriter().write(resource));
+        }
+    }
+
+    private static final class InMemorySchemaStore implements SchemaStore {
+        private final Map<String, DiscoveredSourceModel> byId = new LinkedHashMap<>();
+
+        synchronized void clear() {
+            byId.clear();
+        }
+
+        @Override
+        public synchronized void save(DiscoveredSourceModel discovered) {
+            byId.put(discovered.connectionId(), discovered);
+        }
+
+        @Override
+        public synchronized Optional<DiscoveredSourceModel> get(String connectionId) {
+            return Optional.ofNullable(byId.get(connectionId));
         }
     }
 }

@@ -127,6 +127,30 @@ class DslReferenceClosureTest {
     }
 
     @Test
+    @DisplayName("a pipeline cannot reference a table outside its Source selection")
+    void selectedSourceRejectsAnUnselectedTableReference() {
+        String source = source("src_orders", "mysql", "orders");
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: src_orders
+                transforms:
+                  - { id: f, from: [payments], type: filter, expr: "op != 'd'" }
+                serve:
+                  from: f
+                  sync: [ { id: s, source: src_orders } ]
+                """;
+
+        Throwable thrown = catchThrowable(() -> batch(source, pipeline));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        DslException error = (DslException) thrown;
+        assertThat(error.code()).isEqualTo(DslError.MISSING_REFERENCE);
+        assertThat(error.path()).isEqualTo("transforms[0].from");
+    }
+
+    @Test
     @DisplayName("a <source_id>.<table> prefix resolves the otherwise-ambiguous bare name")
     void qualifiedPrefixDisambiguates() {
         // Same collision as invalid/s08, but the from-token carries the disambiguating prefix
