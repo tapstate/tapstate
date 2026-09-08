@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -15,6 +16,9 @@ import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
+
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -197,6 +201,56 @@ class MongoSchemaStoreIT {
             assertThat(store.get("orders-db").orElseThrow().model().tables())
                     .extracting(SourceTable::name).containsExactly("zulu", "alpha");
         });
+    }
+
+    /**
+     * A discovery that fails partway through leaves the previous one intact and readable, rather than
+     * a model holding none of the tables it should.
+     *
+     * <p>This is what the write ordering inside a save buys, and it is invisible to every other case
+     * here: with the envelope written last, a failure before it lands means the new generation is
+     * never named and the previous discovery is still the current one. Written the other way round,
+     * the envelope names a generation whose tables never arrived, and the connection reads back as a
+     * database with no tables at all - a wrong answer in the shape of a right one, and the shape a
+     * reader would act on.
+     *
+     * <p>The failure is injected at the table write rather than simulated by a crash, so the case is
+     * deterministic and needs no second thread.
+     */
+    @Test
+    void aDiscoveryThatFailsPartWayThroughLeavesThePreviousOneReadable() {
+        withStore((store, collection) -> {
+            store.save(new DiscoveredSourceModel("orders-db", "mysql", 1L, ordersModel()));
+
+            MongoCollection<Document> failingTableWrites = failing(collection, "insertMany");
+            assertThatThrownBy(() -> new MongoSchemaStore(failingTableWrites).save(
+                    new DiscoveredSourceModel("orders-db", "mysql", 2L, new SourceModel(List.of(
+                            new SourceTable("shipments", List.of(), List.of(), List.of()))))))
+                    .isInstanceOf(RuntimeException.class);
+
+            DiscoveredSourceModel read = store.get("orders-db").orElseThrow();
+            assertThat(read.discoveredAt()).isEqualTo(1L);
+            assertThat(read.model().tables()).extracting(SourceTable::name)
+                    .containsExactly("orders", "customers");
+        });
+    }
+
+    /** The collection, with one named method failing the way a lost connection would. */
+    @SuppressWarnings("unchecked")
+    private static MongoCollection<Document> failing(MongoCollection<Document> delegate, String method) {
+        return (MongoCollection<Document>) Proxy.newProxyInstance(
+                MongoCollection.class.getClassLoader(),
+                new Class<?>[] {MongoCollection.class},
+                (proxy, invoked, args) -> {
+                    if (invoked.getName().equals(method)) {
+                        throw new MongoException("injected failure");
+                    }
+                    try {
+                        return invoked.invoke(delegate, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
     private interface StoreTest {
