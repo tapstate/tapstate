@@ -277,6 +277,26 @@ class DerivedSchemaReportTest {
     }
 
     @Test
+    @DisplayName("a re-copy is refused while a job is producing, now that a target is built from the copy")
+    void aRecopyIsRefusedWhileAJobIsProducing() {
+        // The copy has a reader below it: the table a sink creates is built from what the pipeline
+        // publishes, worked forward from this copy. Moving it under a running job therefore moves what
+        // that job was assembled from - the record would describe one shape while the job produces
+        // another, and everything read off the record afterwards describes a pipeline that is not the
+        // one running. Same refusal accepting has, and for the same reason.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        store.desired().save(new DesiredState("wide", PipelineState.RUNNING, "revision"));
+
+        assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).derive("wide"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).isEqualTo("actuation.schema-sync-while-running");
+                    assertThat(error.args()).containsEntry("state", "NEW")
+                            .containsEntry("desired", "RUNNING");
+                });
+    }
+
+    @Test
     @DisplayName("an apply re-copies the physical model without holding any step to what it recorded")
     void anApplyRecopiesThePhysicalModelWithoutHoldingAnyStepToIt() {
         // What apply triggers, and what it must not: the copy follows the source, and the difference the

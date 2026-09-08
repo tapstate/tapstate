@@ -116,16 +116,18 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
     @Override
     public void derive(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        // The copy, and nothing gated. What holds a join to the columns it was recorded producing is the
-        // start's business: refusing here would refuse a whole batch of unrelated resources over one
-        // pipeline whose source widened a column, which is not something the author applying can act on.
+        // Refused while a job is carrying the pipeline, exactly as accepting is - and it was not, until
+        // the copy gained a reader below it. The table a sink creates is now built from what the
+        // pipeline publishes, worked forward from this copy, so moving the copy under a running job
+        // moves what that job was assembled from: the record would say the pipeline produces one shape
+        // while the job produces another, and every reader of the record afterwards describes a
+        // pipeline that is not the one running.
         //
-        // Nor is this refused while a job is carrying the pipeline, where accepting is. The two are not
-        // the same act: this moves a source node's copy, which nothing running was assembled from - a
-        // join recompiles its columns from the discovery itself - so the record and the job going on
-        // still agree afterwards. That holds only while the copy has no reader below it. The day a step
-        // works its own columns out from the copy rather than from the discovery, this call starts
-        // moving what a run was assembled from, and it needs the same refusal accepting has.
+        // Nothing else is gated. What holds a join to the columns it was recorded producing is the
+        // start's business: refusing that here would refuse a whole batch of unrelated resources over
+        // one pipeline whose source widened a column, which is not something the author applying can
+        // act on.
+        refuseWhileAJobIsProducing(pipelineId);
         joins.copySourceSchemas(pipelineId);
     }
 

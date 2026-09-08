@@ -215,6 +215,14 @@ final class StoreBackedDagSource implements DagSource {
                 ? streamsReaching(pipeline, view.from(), sourceKeyByTable, sourceKeysById,
                         sourceVertices, stepIds)
                 : Set.of();
+        // Each stream a sink receives, narrowed to what the pipeline actually publishes on it rather
+        // than to what its source table holds. Only the serve terminal is narrowed here: a view
+        // composes its own descriptor around the key it names, and a stream reaching both terminals
+        // would otherwise be answered twice with nothing saying which answer the map holds.
+        if (pipeline.serve() instanceof ServeBlock.Inline serving && !serveStreams.isEmpty()) {
+            targets.putAll(publishedTargets(pipelineId, pipeline, serving.from(), serveStreams,
+                    bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
+        }
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
         FrontierBinding frontier = frontierBinding(sourceVertices);
         return PipelineDagBuilder.build(
@@ -445,6 +453,129 @@ final class StoreBackedDagSource implements DagSource {
                     : new TargetTable(root.name(), List.of()));
         }
         return assembled;
+    }
+
+    /**
+     * The targets a serve block's sinks are built from: each stream as the pipeline publishes it, not as
+     * its source table holds it.
+     *
+     * <p><b>A target is created to the shape the rows arriving at it actually have.</b> Built from the
+     * source table instead, it carries a column for every column the table has - including the ones a
+     * step between them stopped forwarding - and nothing reports that: every row still arrives, every
+     * write still succeeds, and the column simply sits empty in a table somebody later reads as data.
+     * The columns and their order come from the pipeline's own copy of the source model, worked forward
+     * through each step the stream passes, which is what makes this the copy's first reader.
+     *
+     * <p>A stream nobody can describe is left as it was. An unknown is not a claim that the rows are
+     * shapeless - it is the absence of one - and narrowing a target to it would remove every column
+     * from a table whose rows still carry them.
+     */
+    private Map<String, TargetTable> publishedTargets(
+            String pipelineId, PipelineResource pipeline, FromRef from, Set<String> streams,
+            Map<String, TargetTable> bySourceTable, Map<String, SourceVertex> sourceVertices,
+            Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
+            Set<String> stepIds) {
+        Map<String, TargetTable> published = new LinkedHashMap<>();
+        for (String stream : streams) {
+            TargetTable base = bySourceTable.get(stream);
+            if (base == null) {
+                continue;
+            }
+            NodeColumns produced = streamColumnsAt(pipelineId, pipeline, from, stream, sourceVertices,
+                    sourceKeyByTable, sourceKeysById, stepIds, new HashSet<>());
+            if (produced != null && produced.known()) {
+                published.put(stream, publishedAs(base, produced));
+            }
+        }
+        return published;
+    }
+
+    /**
+     * What one source table's rows carry where a terminal reference reads them, or null when that
+     * stream does not reach it as itself.
+     *
+     * <p><b>Worked out per stream rather than per node.</b> A step that merges several streams has one
+     * model, but the sink resolves a target by the table a row came from - and a merge forwards each
+     * row as it arrives rather than reshaping it to the merged model - so the shape that matters here
+     * is what this one table's rows look like at that point, which is the merged model's answer only
+     * when the merge has one input.
+     *
+     * <p>A nest and a join publish a stream of their own under the step id, so a source table's stream
+     * does not travel past one as itself; those two are registered separately from their compiled
+     * output and are not reached from here.
+     */
+    private NodeColumns streamColumnsAt(
+            String pipelineId, PipelineResource pipeline, FromRef from, String stream,
+            Map<String, SourceVertex> sourceVertices, Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById, Set<String> stepIds, Set<String> visiting) {
+        ViewBlock.Inline view = inlineViewNamed(pipeline, from);
+        if (view != null) {
+            NodeColumns upstream = streamColumnsAt(pipelineId, pipeline, view.from(), stream,
+                    sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting);
+            return upstream == null ? null : NodeColumns.of(view, upstream);
+        }
+        for (String key : upstreams(from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
+            SourceVertex vertex = sourceVertices.get(key);
+            if (vertex != null) {
+                if (vertex.table().equals(stream)) {
+                    return copiedColumns(pipelineId, vertex);
+                }
+                continue;
+            }
+            if (!(stepOf(pipeline, key) instanceof Step.Inline inline)
+                    || inline.body() instanceof TransformBody.Nest
+                    || inline.body() instanceof TransformBody.Join
+                    || !visiting.add(key)) {
+                continue;
+            }
+            for (FromRef upstreamRef : refsOf(inline.from())) {
+                NodeColumns upstream = streamColumnsAt(pipelineId, pipeline, upstreamRef, stream,
+                        sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting);
+                if (upstream != null) {
+                    return NodeColumns.of(inline.body(), Map.of("in", upstream), null);
+                }
+            }
+        }
+        return null;
+    }
+
+    /** This pipeline's own copy of one source table's model, as a node's columns. */
+    private NodeColumns copiedColumns(String pipelineId, SourceVertex vertex) {
+        return storePort.derivedSchemas()
+                .latest(pipelineId, SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()))
+                .map(recorded -> NodeColumns.known(recorded.schema()))
+                .orElse(null);
+    }
+
+    /**
+     * One published stream's target: the columns the pipeline produces, in that order, each carrying
+     * what the source declared for it and nothing where the source has no such column.
+     *
+     * <p><b>The type stays the source's own spelling.</b> A projection changes which columns travel,
+     * not what a column is; writing the shared type there instead would hand the connector a word its
+     * own DDL does not have. A column the source never had - a written-down value, a computed one -
+     * carries no type at all and is inferred by the connector, the way a join's computed columns and a
+     * view's unresolved ones already are.
+     *
+     * <p>The key is whatever of the table's own key still travels, key columns leading, because that
+     * is the order the sink matches an upsert in. A projection that drops a key column publishes rows
+     * with nothing to match on; that reaches the sink as a key one column short and is reported there,
+     * against the table being written, rather than being invented back here.
+     */
+    private static TargetTable publishedAs(TargetTable base, NodeColumns produced) {
+        Map<String, TargetField> declared = new LinkedHashMap<>();
+        base.fields().forEach(field -> declared.put(field.name(), field));
+        List<TargetField> fields = new ArrayList<>(produced.columns().size());
+        List<String> key = new ArrayList<>();
+        for (String column : produced.columns().keySet()) {
+            TargetField carried = declared.get(column);
+            fields.add(new TargetField(column, carried == null ? null : carried.type(), false));
+            if (carried != null && carried.primaryKey()) {
+                key.add(column);
+            }
+        }
+        return TargetModelResolver.keyedOn(
+                new TargetTable(base.name(), fields, base.indexes()), key);
     }
 
     /**

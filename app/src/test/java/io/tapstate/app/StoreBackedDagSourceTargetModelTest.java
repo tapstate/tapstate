@@ -106,6 +106,29 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
+    void a_column_a_projection_drops_is_not_in_the_target_the_sink_is_built_from() {
+        // A target is created to the shape the pipeline actually produces, not to the shape of the
+        // table it started from. A projection that drops a column is the plainest case of the two
+        // differing, and building from the source table instead creates a column no write ever fills -
+        // which no count, state or code reports, because every row still arrives and is written.
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("amount", io.tapstate.core.model.FieldRule.drop()));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable(
+                "orders",
+                List.of(new SourceField("id", "INT"), new SourceField("amount", "DECIMAL")),
+                List.of("id"),
+                List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        // The type is still the one the source declared for the column: what a projection changes is
+        // which columns travel, and a target built to a type nobody discovered is a different change.
+        assertThat(bound).containsExactly(new TargetTable("orders", List.of(
+                new TargetField("id", "INT", true))));
+    }
+
+    @Test
     void refuses_a_sync_start_when_the_source_schema_was_never_discovered() {
         InMemoryStorePort store = seededPipeline();
 
@@ -356,6 +379,27 @@ class StoreBackedDagSourceTargetModelTest {
             bound.add(node);
             return (SupplierEx<SinkWriter>) () -> null;
         };
+    }
+
+    /** The single-source pipeline above with one projection step between the source and the sink. */
+    private static InMemoryStorePort seededProjectingPipeline(
+            Map<String, io.tapstate.core.model.FieldRule> rules) {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+        store.artifacts().save(new SourceResource("orders_dest", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null, null));
+        store.artifacts().save(new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("project", FromClause.list(FromRef.literal("orders_src")),
+                        new TransformBody.MapProjection(new LinkedHashMap<>(rules)), null, null)),
+                null,
+                new ServeBlock.Inline(null, FromRef.literal("project"),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)),
+                        null, null),
+                null, null));
+        OpenRingGenerations.forSources(store, "orders_src");
+        return store;
     }
 
     private static InMemoryStorePort seededPipeline() {
