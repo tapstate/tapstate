@@ -116,6 +116,59 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void every_read_table_gets_its_own_copy_matching_its_own_physical_table() {
+        // Two sources and three tables between them. The case above reads one table of one source, so
+        // it holds for a build that copies whatever it happens to reach first; what a pipeline needs is
+        // one copy per table it reads, each matching that table rather than a neighbour of the same
+        // shape. A copy missing here is a source node with no recorded shape at all, which reads as a
+        // table nobody has discovered - an ordinary state, investigated on the source side.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("shop_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")),
+                null, null, null));
+        store.artifacts().save(cdcSource("events_src", "events"));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource(
+                "three", null,
+                List.of(SourceRef.spec("shop_src", true), SourceRef.spec("events_src", true)),
+                List.of(Step.inline("all", FromClause.list(
+                                FromRef.literal("shop_src.orders"),
+                                FromRef.literal("shop_src.customers"),
+                                FromRef.literal("events_src.events")),
+                        new TransformBody.Union(), null, null)),
+                null,
+                serve(FromRef.literal("all"), sync("sync_1", "dest")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("shop_src", "mysql", 1L, new SourceModel(List.of(
+                new SourceTable("orders", List.of(new SourceField("o_id", "bigint", TapstateType.INT64)),
+                        List.of("o_id"), List.of()),
+                new SourceTable("customers", List.of(
+                        new SourceField("c_id", "bigint", TapstateType.INT64),
+                        new SourceField("c_name", "varchar", TapstateType.STRING)),
+                        List.of("c_id"), List.of())))));
+        store.schemas.save(new DiscoveredSourceModel("events_src", "mysql", 1L, new SourceModel(List.of(
+                new SourceTable("events", List.of(
+                        new SourceField("e_id", "bigint", TapstateType.INT64),
+                        new SourceField("kind", "varchar", TapstateType.STRING)),
+                        List.of("e_id"), List.of())))));
+        OpenRingGenerations.forSources(store, "shop_src", "events_src");
+
+        new StoreBackedDagSource(store).dagFor("three");
+
+        // Each copy carries its own table's columns. Written out per table rather than as three
+        // non-empty checks: three copies that all hold the same table would satisfy a count.
+        assertThat(store.derivedSchemas.latest("three", "shop_src.orders"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("o_id", "INT64 NULL"));
+        assertThat(store.derivedSchemas.latest("three", "shop_src.customers"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("c_id", "INT64 NULL", "c_name", "STRING NULL"));
+        assertThat(store.derivedSchemas.latest("three", "events_src.events"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("e_id", "INT64 NULL", "kind", "STRING NULL"));
+    }
+
+    @Test
     void a_view_declared_by_reference_materializes_like_an_inline_one() {
         // The wizard writes this form whenever an author reuses an existing view, so it is not a
         // grammar curiosity: the reference must reach the builder already expanded.
