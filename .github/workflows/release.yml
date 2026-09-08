@@ -494,7 +494,7 @@ jobs:
               exit 1
             fi
             echo "waiting for the real-connector lane..."
-            sleep 60
+            sleep 20
           done
 
       # 8. And so is the join performance lane, for the same reason and read the same way. It is the
@@ -516,7 +516,7 @@ jobs:
               exit 1
             fi
             echo "waiting for the join performance lane..."
-            sleep 60
+            sleep 20
           done
 
       # 4. Every pull request in this release's range answered its documentation impact, and the ones

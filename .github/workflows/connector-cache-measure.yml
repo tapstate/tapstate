@@ -1,0 +1,39 @@
+# Temporary runner probe for snapshot cache provenance; removed after validation.
+name: Connector cache probe
+on:
+  push:
+    branches: [ws/ci-turnaround]
+    paths:
+      - .github/workflows/connector-cache-measure.yml
+      - .github/scripts/connector-cache.sh
+      - .github/scripts/connector-cache-smoke.sh
+permissions:
+  contents: read
+jobs:
+  connector-cache-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Connector JDK compatible with its pinned Lombok
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Seed isolated connector dependencies
+        run: |
+          mkdir -p "$HOME/.m2/repository" "$RUNNER_TEMP/connector-m2"
+          rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$HOME/.m2/repository/" "$RUNNER_TEMP/connector-m2/"
+      - name: Resolve current upstream source and snapshot artifacts
+        id: inputs
+        run: |
+          git clone --depth 1 https://github.com/tapdata/tapdata-connectors.git "$RUNNER_TEMP/connector-source"
+          .github/scripts/connector-cache.sh prepare --checkout "$RUNNER_TEMP/connector-source" --repo-local "$RUNNER_TEMP/connector-m2" --output "$RUNNER_TEMP/connector-inputs.json"
+          echo "key=$(.github/scripts/connector-cache.sh key --manifest "$RUNNER_TEMP/connector-inputs.json")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-inputs-probe
+          path: ${{ runner.temp }}/connector-inputs.json
+          if-no-files-found: error
+          retention-days: 7
