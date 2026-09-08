@@ -93,7 +93,7 @@ python3 - <<'PY'
 import json
 import os
 import subprocess
-base = ['bash', os.environ['TIMING_GATE'], 'ci.yml', '--repo', 'example/project', '--runs', '2', '--event', 'push',
+base = [os.environ['TIMING_GATE'], 'ci.yml', '--repo', 'example/project', '--runs', '2', '--event', 'push',
         '--branch', 'main', '--job', 'build', '--modules', '--json']
 passed = 0
 def call(case='ok', argv=None):
