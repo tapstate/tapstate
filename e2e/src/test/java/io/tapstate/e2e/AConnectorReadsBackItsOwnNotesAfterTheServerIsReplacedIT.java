@@ -61,10 +61,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * empty, so a run handed an empty one still leaves a value behind - present, well-formed, and different.
  * Asserting presence alone would pass against exactly the defect this is about; the bytes are compared.
  *
- * <p>What this deliberately does not do is stop the pipeline before replacing the server. Whether a stop
- * leaves a connector's notes alone is a proposition of its own, about what a stop is allowed to clear,
- * and it is witnessed where that cleanup is declared. Here the pipeline is left running and the server
- * underneath it is taken away.
+ * <p>The pipeline is stopped with state kept before the replacement. That makes the lifecycle boundary
+ * literal: the first run writes its note, the stop preserves it, and the explicit start after the next
+ * server opens it. Clearing state instead would be a different request and would correctly leave the
+ * connector with nothing to read.
  *
  * <p>Runs on the harness's own connector, so it needs Docker for the store and nothing else - no real
  * database, and therefore no gate that skips it outside a nightly run.
@@ -132,12 +132,16 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
                     () -> note(storeUri, namespace).isPresent(),
                     () -> "nothing under " + namespace);
             minted = note(storeUri, namespace).orElseThrow();
+
+            control.stop(pipelineId, false);
+            awaitStopped(control, pipelineId);
         }
 
-        // The server is gone. On the real-process tier so is the JVM that ran it; the store is not.
+        // The stopped server is gone. On the real-process tier so is the JVM that ran it; the store is not.
         try (ServerHandle second = tier.launch(storeUri)) {
             ControlPlane control = new ControlPlane(second.baseUrl());
             control.login("e2e", "e2e-password");
+            control.lifecycle(pipelineId, LifecycleVerb.START);
             awaitRunning(control, pipelineId);
 
             long rowsBefore = files.count(target, TABLE);
@@ -179,6 +183,13 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
         Await.until(
                 pipelineId + " to reach " + PipelineState.RUNNING,
                 () -> control.state(pipelineId).filter(PipelineState.RUNNING::equals).isPresent(),
+                () -> String.valueOf(control.state(pipelineId)));
+    }
+
+    private static void awaitStopped(ControlPlane control, String pipelineId) {
+        Await.until(
+                pipelineId + " to reach " + PipelineState.STOPPED,
+                () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
                 () -> String.valueOf(control.state(pipelineId)));
     }
 
