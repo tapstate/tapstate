@@ -302,6 +302,42 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void a_view_records_a_model_of_its_own_although_it_is_not_a_step() {
+        // A view is a block beside the steps rather than one of them, so a walk written as "every
+        // transform step" reaches every node but this one - and a node nobody asks about produces no
+        // error when its model is missing. It stores the rows it is handed, so what it stores is what
+        // reached it, and a reader asking what this pipeline keeps in the managed store is asking here.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
+        Map<String, FieldRule> dropRegion = new LinkedHashMap<>();
+        dropRegion.put("region", FieldRule.drop());
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
+                        new TransformBody.MapProjection(dropRegion), null, null)),
+                new ViewBlock.Inline("order_state", FromRef.literal("trimmed"), "id", null, null),
+                null, null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("region", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        // The step above it drops a column, so the view's own columns are not the source's. Asserted
+        // that way rather than as "the view has a record": a walk that filed what reached the pipeline
+        // under the view's id would satisfy the weaker reading while describing rows it never stores.
+        assertThat(store.derivedSchemas.latest("p", "order_state"))
+                .get()
+                .extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+    }
+
+    @Test
     void a_connector_reporting_a_failed_check_is_what_unreachable_means() {
         // The test above hands in a refusal already formed, so it proves the build asks and propagates --
         // not that a real probe turns a connector's FAILED verdict into this code. Drive the real probe

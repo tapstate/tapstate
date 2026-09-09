@@ -1,6 +1,5 @@
 package io.tapstate.app;
 
-import io.tapstate.core.model.TransformBody;
 import io.tapstate.spi.store.ContentHash;
 import io.tapstate.spi.store.DerivedSchemaStore;
 
@@ -13,6 +12,10 @@ import java.util.Objects;
 /**
  * Files what one transform step works its own columns out to be, beside the pipeline that step belongs
  * to.
+ *
+ * <p><b>A node here is whatever the author wrote that reshapes a row</b> - a transform step's body,
+ * or the view block beside them. They are recorded through one class because they are one question,
+ * and the record has one shape whichever node answered it.
  *
  * <p><b>Every node, not only the ones that read and the ones that join.</b> A source node's shape is
  * filed by the copy and a join step's by the drift check, which between them cover two of the node
@@ -45,18 +48,18 @@ final class StepSchemaRecord {
      * its own columns while it runs is an ordinary pipeline, and the answer is what keeps a caller from
      * pinning a step with no history to pin into.
      */
-    boolean record(String pipelineId, String stepId, NodeColumns derived,
-            Map<String, NodeColumns> inputs, TransformBody body) {
+    boolean record(String pipelineId, String nodeId, NodeColumns derived,
+            Map<String, NodeColumns> inputs, Object authored) {
         if (!derived.known()) {
             return false;
         }
-        records.record(pipelineId, stepId, derived.columns(), fingerprintOf(body),
+        records.record(pipelineId, nodeId, derived.columns(), fingerprintOf(authored),
                 fingerprintOf(inputs), DERIVED_BY);
         return true;
     }
 
     /**
-     * A fingerprint of what the author wrote: this step's own body, and nothing else of the pipeline.
+     * A fingerprint of what the author wrote: this node's own text, and nothing else of the pipeline.
      * Keyed on the step alone deliberately - hashing the whole artifact instead would make an edit to
      * one step read as an edit to every other, which is the confusion the two provenance fingerprints
      * exist to prevent.
@@ -68,8 +71,8 @@ final class StepSchemaRecord {
      * exist yet: such a check reads a moved statement as "the author edited this", so the first
      * assembly after a rename would let one genuine difference through as an ordinary edit.
      */
-    private static String fingerprintOf(TransformBody body) {
-        return ContentHash.of(String.valueOf(body).getBytes(StandardCharsets.UTF_8));
+    private static String fingerprintOf(Object authored) {
+        return ContentHash.of(String.valueOf(authored).getBytes(StandardCharsets.UTF_8));
     }
 
     /**

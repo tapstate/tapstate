@@ -204,7 +204,7 @@ final class StoreBackedDagSource implements DagSource {
         // this a pipeline records what it reads and what it joins, and nothing for the steps in
         // between - so a reader asking what it produces at one of those cannot tell a step whose model
         // was never derived from a step that could not be described.
-        derivedSteps.addAll(recordStepSchemas(pipelineId, pipeline,
+        derivedSteps.addAll(recordStepSchemas(pipelineId,
                 deriveSteps(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds,
                         compiledJoins, vertex -> copiedColumns(pipelineId, vertex))));
         pinWhatThisRunHolds(pipelineId, derivedSteps);
@@ -589,7 +589,7 @@ final class StoreBackedDagSource implements DagSource {
         // the inputs below and so are not recorded again here.
         compiledJoins.forEach((stepId, compiled) ->
                 derived.put(stepId, NodeColumns.of(compiled.body(), Map.of(), compiled.plan())));
-        Map<String, Map<String, NodeColumns>> reaching = new LinkedHashMap<>();
+        Map<String, Recordable> recordable = new LinkedHashMap<>();
         boolean progressed = true;
         while (progressed) {
             progressed = false;
@@ -597,17 +597,30 @@ final class StoreBackedDagSource implements DagSource {
                 if (derived.containsKey(step.id())) {
                     continue;
                 }
-                Map<String, NodeColumns> inputs = inputsOf(step, sourceVertices,
+                Map<String, NodeColumns> inputs = inputsOf(refsOf(step.from()), sourceVertices,
                         sourceKeyByTable, sourceKeysById, stepIds, derived, sourceColumns);
-                if (inputs == null) {
+                if (inputs == null
+                        || (step.body() instanceof TransformBody.Nest nest
+                                && !inputs.containsKey(nest.root().from()))) {
                     continue;
                 }
                 derived.put(step.id(), NodeColumns.of(step.body(), inputs, null));
-                reaching.put(step.id(), inputs);
+                recordable.put(step.id(), new Recordable(inputs, step.body()));
                 progressed = true;
             }
         }
-        return new StepDerivations(derived, reaching);
+        // The view is a block beside the steps rather than one of them, so the loop above never
+        // reaches it - and it stores the rows it is handed, which is a model of its own. Worked out
+        // after the loop because every step it could read from has settled by then.
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            Map<String, NodeColumns> inputs = inputsOf(List.of(view.from()), sourceVertices,
+                    sourceKeyByTable, sourceKeysById, stepIds, derived, sourceColumns);
+            if (inputs != null) {
+                derived.put(view.id(), NodeColumns.of(view, NodeColumns.merged(inputs.values())));
+                recordable.put(view.id(), new Recordable(inputs, view));
+            }
+        }
+        return new StepDerivations(derived, recordable);
     }
 
     /**
@@ -638,6 +651,9 @@ final class StoreBackedDagSource implements DagSource {
                 nodes.put(step.id(), columns);
             }
         }
+        if (pipeline.view() instanceof ViewBlock.Inline view && steps.get(view.id()) != null) {
+            nodes.put(view.id(), steps.get(view.id()));
+        }
         return nodes;
     }
 
@@ -655,23 +671,25 @@ final class StoreBackedDagSource implements DagSource {
         return table == null ? null : NodeColumns.known(SourceSchemaCopy.columnsOf(table));
     }
 
-    /** What every step of a pipeline derives, and what reached each of the ones this walk worked out. */
+    /** What every node of a pipeline derives, and how the ones this walk worked out were reached. */
     private record StepDerivations(
-            Map<String, NodeColumns> columns, Map<String, Map<String, NodeColumns>> reaching) {
+            Map<String, NodeColumns> columns, Map<String, Recordable> recordable) {
+    }
+
+    /** One node's derivation as the record needs it: what reached it, and what the author wrote. */
+    private record Recordable(Map<String, NodeColumns> inputs, Object authored) {
     }
 
     /**
      * Records what the walk above worked out, answering the step ids that got a record. Separate from
      * the walk because the read face runs the same walk and must write nothing.
      */
-    private List<String> recordStepSchemas(
-            String pipelineId, PipelineResource pipeline, StepDerivations derived) {
+    private List<String> recordStepSchemas(String pipelineId, StepDerivations derived) {
         List<String> recorded = new ArrayList<>();
-        derived.reaching().forEach((stepId, inputs) -> {
-            if (stepOf(pipeline, stepId) instanceof Step.Inline inline
-                    && stepSchemaRecord.record(pipelineId, stepId,
-                            derived.columns().get(stepId), inputs, inline.body())) {
-                recorded.add(stepId);
+        derived.recordable().forEach((nodeId, node) -> {
+            if (stepSchemaRecord.record(pipelineId, nodeId, derived.columns().get(nodeId),
+                    node.inputs(), node.authored())) {
+                recorded.add(nodeId);
             }
         });
         return recorded;
@@ -691,12 +709,12 @@ final class StoreBackedDagSource implements DagSource {
      * refuse an assembly that otherwise builds.
      */
     private Map<String, NodeColumns> inputsOf(
-            Step.Inline step, Map<String, SourceVertex> sourceVertices,
+            List<FromRef> refs, Map<String, SourceVertex> sourceVertices,
             Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
             Set<String> stepIds, Map<String, NodeColumns> derived,
             Function<SourceVertex, NodeColumns> sourceColumns) {
         Map<String, NodeColumns> inputs = new LinkedHashMap<>();
-        for (FromRef ref : refsOf(step.from())) {
+        for (FromRef ref : refs) {
             List<NodeColumns> reached = new ArrayList<>();
             for (String key : upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
                 SourceVertex vertex = sourceVertices.get(key);
@@ -711,12 +729,7 @@ final class StoreBackedDagSource implements DagSource {
             }
             inputs.put(referenceOf(ref), NodeColumns.merged(reached));
         }
-        if (inputs.isEmpty()
-                || (step.body() instanceof TransformBody.Nest nest
-                        && !inputs.containsKey(nest.root().from()))) {
-            return null;
-        }
-        return inputs;
+        return inputs.isEmpty() ? null : inputs;
     }
 
     /** The text a reference was written as, which is the name a nest's root is declared under. */
