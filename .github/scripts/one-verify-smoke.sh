@@ -5,6 +5,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 python3 - "$here" <<'PY'
 from pathlib import Path
 import subprocess
+import os
 import sys
 import tempfile
 
@@ -25,6 +26,10 @@ jobs:
 
 cases = [
     ('one full call', {'one.yml': workflow()}, True, ['one.yml:test']),
+    ('two workflows with Bash time', {'one.yml': workflow(), 'two.yml': workflow('time mvn -B verify')}, False, ['one.yml:test', 'two.yml:test']),
+    ('two workflows with portable Bash time', {'one.yml': workflow(), 'two.yml': workflow('time -p mvn -B verify')}, False, ['found 2']),
+    ('two workflows with external time', {'one.yml': workflow(), 'two.yml': workflow('/usr/bin/time -p mvn -B verify')}, False, ['found 2']),
+    ('one timed call', {'one.yml': workflow('time mvn -B verify')}, True, ['found 1']),
     ('two workflows', {'one.yml': workflow(), 'two.yml': workflow()}, False, ['one.yml:test', 'two.yml:test']),
     ('two calls in one step', {'one.yml': workflow('mvn verify; mvn -B verify')}, False, ['found 2']),
     ('two jobs', {'one.yml': workflow() + '  other:\n    steps:\n      - run: mvn verify\n'}, False, ['one.yml:test', 'one.yml:other']),
@@ -56,6 +61,22 @@ cases = [
     ('flow steps fail closed', {'one.yml': workflow(), 'two.yml': 'on: push\njobs:\n  duplicate:\n    steps: [{run: mvn verify}]\n'}, False, ['unsupported']),
     ('module working directory is not a full suite', {'one.yml': workflow(extra='      - run: mvn verify\n        working-directory: e2e\n')}, True, ['found 1']),
 ]
+# Prove that the wrapper fixture executes a second suite using a harmless recorder.
+# This is an independent shell observation, not a prediction from the gate parser.
+with tempfile.TemporaryDirectory() as temporary:
+    directory = Path(temporary)
+    recorder = directory / 'mvn'
+    recorder.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$CALL_RECORD"\n')
+    recorder.chmod(0o755)
+    record = directory / 'calls'
+    environment = dict(os.environ, PATH=str(directory) + os.pathsep + os.environ['PATH'], CALL_RECORD=str(record))
+    for wrapper in ('time', 'time -p', '/usr/bin/time -p'):
+        record.write_text('')
+        run = subprocess.run(['bash', '-c', 'mvn -B verify\n' + wrapper + ' mvn -B verify'], env=environment, capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert record.read_text().splitlines() == ['-B verify', '-B verify'], wrapper
+    print('time recorder: 3 wrappers each executed exactly 2 Maven calls', flush=True)
+
 with tempfile.TemporaryDirectory() as temporary:
     directory = Path(temporary)
     for name, files, success, messages in cases:

@@ -162,6 +162,23 @@ def full_suite(arguments):
     if not arguments:
         return False
     executable = Path(arguments[0]).name
+    if executable == 'time':
+        # Bash time and the external time utility execute their following command.
+        # Handle the common options explicitly; unknown options must not conceal it.
+        arguments = arguments[1:]
+        while arguments and arguments[0].startswith('-'):
+            option = arguments.pop(0)
+            if option == '--':
+                break
+            if option in ('-p', '-v', '-a', '-q', '--portability', '--verbose', '--append', '--quiet'):
+                continue
+            if option in ('-f', '-o', '--format', '--output') and arguments:
+                arguments.pop(0)
+                continue
+            if option.startswith(('--format=', '--output=')):
+                continue
+            raise ValueError('unsupported time option: ' + option)
+        return full_suite(arguments)
     if executable in ('bash', 'sh') and len(arguments) > 1:
         arguments = arguments[1:]
         executable = Path(arguments[0]).name
