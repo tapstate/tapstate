@@ -73,9 +73,16 @@ final class RecipeRun {
             case "sample" -> DemoCmd.bundledFiles().stream()
                     .map(file -> new Output(file, file.path().substring(0, file.path().indexOf('/')), null))
                     .toList();
-            case "blank" -> BlankRecipe.bundledFiles().stream()
-                    .map(file -> new Output(file, file.path().substring(0, file.path().indexOf('/')), null))
-                    .toList();
+            case "blank" -> {
+                List<Output> blank = new ArrayList<>(BlankRecipe.bundledFiles().stream()
+                        .map(file -> new Output(file, file.path().substring(0, file.path().indexOf('/')), null))
+                        .toList());
+                WorkspaceWrite.File gitignore = new WorkspaceFiles(root).gitignoreEnv();
+                if (gitignore != null) {
+                    blank.add(new Output(gitignore, "gitignore", null));
+                }
+                yield blank;
+            }
             case "mirrored-table" -> {
                 TapstateCatalog catalog = TapstateCatalog.load();
                 MirroredTableRecipe.Answers answers = prompter != null

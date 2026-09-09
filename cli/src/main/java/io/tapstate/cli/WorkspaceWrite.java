@@ -5,9 +5,11 @@ import io.tapstate.core.common.TapstateException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Writes a set of files into a workspace - every one of them, or none.
@@ -98,6 +100,8 @@ final class WorkspaceWrite {
             Touched target = touched.get(i);
             try {
                 Files.writeString(target.path(), files.get(i).content());
+                done.add(target);
+                restrictSecrets(target.path());
             } catch (IOException cannotWrite) {
                 // All or none, kept as a promise rather than as an intention. What this invocation
                 // wrote is taken back, so a reader is left with the workspace they had - which for the
@@ -107,9 +111,22 @@ final class WorkspaceWrite {
                 undo(done);
                 throw notWritable(target.path(), cannotWrite);
             }
-            done.add(target);
         }
         return done.stream().map(t -> new Written(t.path(), t.existing() != null)).toList();
+    }
+
+    /** Restricts files that hold credentials when the filesystem supports POSIX permissions. */
+    private static void restrictSecrets(Path target) throws IOException {
+        if (!target.getFileName().toString().equals(WorkspaceFiles.ENV)) {
+            return;
+        }
+        try {
+            Files.setPosixFilePermissions(target, Set.of(
+                    PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE));
+        } catch (UnsupportedOperationException unsupported) {
+            // A non-POSIX filesystem cannot express owner-only permissions.
+        }
     }
 
     /** A target this invocation is about to write, and what it held first - {@code null} if nothing. */

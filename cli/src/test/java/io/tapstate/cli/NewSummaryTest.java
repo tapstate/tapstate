@@ -63,7 +63,7 @@ class NewSummaryTest {
     }
 
     @Test
-    void blankListsItsTwoSkeletonsAndSaysToFillThem(@TempDir Path home, @TempDir Path parent) {
+    void blankListsItsSkeletonsAndTheSecretIgnoreRule(@TempDir Path home, @TempDir Path parent) {
         Path ws = parent.resolve("fresh");
 
         NewRecipeTest.Run r = NewRecipeTest.run(home, new ScriptedPrompter(), "new", "blank", "--yes", "-w", ws.toString());
@@ -75,6 +75,7 @@ class NewSummaryTest {
                         + """
                           source/example_source.tap.yml  source example_source: mysql, cdc
                           pipeline/example_pipeline.tap.yml  pipeline example_pipeline: 1 source, view
+                          .gitignore  keeps .env out of version control
                           (skeletons — replace the placeholder values, then run tapstate validate)
                         """
                         + ENDING);

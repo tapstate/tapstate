@@ -48,17 +48,17 @@ final class DotEnv {
             return values;
         }
         for (String raw : Files.readAllLines(file)) {
-            String line = raw.strip();
-            if (line.isEmpty() || line.startsWith("#")) {
+            String trimmed = raw.strip();
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
                 continue;
             }
-            int eq = line.indexOf('=');
+            int eq = raw.indexOf('=');
             if (eq <= 0) {
                 continue;
             }
-            String name = line.substring(0, eq).strip();
+            String name = raw.substring(0, eq).strip();
             if (!name.isEmpty()) {
-                values.put(name, line.substring(eq + 1));
+                values.put(name, raw.substring(eq + 1));
             }
         }
         return values;
