@@ -48,7 +48,7 @@ public final class MigrationRunner {
      * changesets and this runner -- shared types belong in the package above.
      */
     private static final List<ChangeSet> CHANGE_SETS =
-            List.of(new V1BaselineIndexes(), new V2StructuredArtifacts());
+            List.of(new V1BaselineIndexes(), new V2StructuredArtifacts(), new V3RecordedSrsSwitches());
 
     /**
      * The highest version this build knows. A store above it is one this build must not open: it was
