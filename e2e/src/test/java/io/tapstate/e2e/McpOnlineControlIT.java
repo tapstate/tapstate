@@ -133,7 +133,8 @@ class McpOnlineControlIT {
                     ConnectorJars.bytesFor(E2eConnectorJar.BROWSABLE_CONNECTOR_ID));
             control.apply(Map.of(
                     "src.tap.yml", sourceYaml("src_browse", data),
-                    "v_declared.tap.yml", declaringViewYaml()));
+                    "v_declared.tap.yml", declaringViewYaml(),
+                    "pipeline.tap.yml", pipelineYaml()));
 
             Process process = startMcp(server.baseUrl(), control.mintToken("read"), stderr);
             try (Writer input = new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8);
@@ -163,7 +164,31 @@ class McpOnlineControlIT {
                         .containsExactly(
                                 "data_browser_collections", "data_browser_find", "data_browser_stats");
 
-                Map<String, Map<String, Object>> listed = collectionsByName(input, output, 3, "src_browse");
+                send(input, """
+                        {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                          "name":"source_list","arguments":{}}}
+                        """);
+                Map<?, ?> sourceList = (Map<?, ?>) receive(output).get("result");
+                assertThat(sourceList.get("isError")).as("listing Sources through MCP").isEqualTo(false);
+                List<?> sources = (List<?>) ((Map<?, ?>) sourceList.get("structuredContent")).get("items");
+                assertThat(sources.stream()
+                        .map(source -> String.valueOf(((Map<?, ?>) source).get("id"))))
+                        .as("the Source list returned by the existing server list API")
+                        .contains("src_browse");
+
+                send(input, """
+                        {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+                          "name":"pipeline_list","arguments":{}}}
+                        """);
+                Map<?, ?> pipelineList = (Map<?, ?>) receive(output).get("result");
+                assertThat(pipelineList.get("isError")).as("listing Pipelines through MCP").isEqualTo(false);
+                List<?> pipelines = (List<?>) ((Map<?, ?>) pipelineList.get("structuredContent")).get("items");
+                assertThat(pipelines.stream()
+                        .map(pipeline -> String.valueOf(((Map<?, ?>) pipeline).get("id"))))
+                        .as("the Pipeline list returned by the existing server list API")
+                        .contains("pipeline_browse");
+
+                Map<String, Map<String, Object>> listed = collectionsByName(input, output, 5, "src_browse");
                 assertThat(listed).containsKeys(DECLARED, BY_HAND);
 
                 // What a workspace said about a collection reaches the agent...
@@ -189,7 +214,7 @@ class McpOnlineControlIT {
                 // or not answering at all. The two seeded collections carry different columns on purpose:
                 // a read wired to the other one comes back with `note` and fails on the last assertion
                 // rather than passing on a row that merely looks plausible.
-                send(input, findCall(4, "src_browse", DECLARED));
+                send(input, findCall(6, "src_browse", DECLARED));
                 Map<?, ?> found = (Map<?, ?>) receive(output).get("result");
                 assertThat(found.get("isError"))
                         .as("reading the collection the listing named, in the same session")
@@ -206,7 +231,7 @@ class McpOnlineControlIT {
 
                 // Applied after the tools were listed, and read without listing them again.
                 control.apply(Map.of("src_later.tap.yml", sourceYaml("src_later", later)));
-                assertThat(collectionsByName(input, output, 5, "src_later"))
+                assertThat(collectionsByName(input, output, 7, "src_later"))
                         .as("a source applied mid-session, read by a client that has not re-listed")
                         .containsKey("arrivals");
 
@@ -214,11 +239,11 @@ class McpOnlineControlIT {
                 // answer. The first source is asked again in the same breath, so "it disappeared" is
                 // distinguishable from "the session broke".
                 control.deleteSource("src_later");
-                send(input, call(6, "src_later"));
+                send(input, call(8, "src_later"));
                 assertThat(((Map<?, ?>) receive(output).get("result")).get("isError"))
                         .as("reading a source that has been deleted, in a session that never restarted")
                         .isEqualTo(true);
-                assertThat(collectionsByName(input, output, 7, "src_browse"))
+                assertThat(collectionsByName(input, output, 9, "src_browse"))
                         .as("the source that was not deleted, asked right afterwards")
                         .containsKeys(DECLARED, BY_HAND);
             } finally {
@@ -291,6 +316,20 @@ class McpOnlineControlIT {
                 primary_key: id
                 storage: { warm: { collection: %s } }
                 """.formatted(DESCRIBED_AS, DECLARED);
+    }
+
+    private static String pipelineYaml() {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: pipeline_browse
+                source: src_browse
+                settings: { read_mode: snapshot }
+                view:
+                  id: v_pipeline
+                  from: %s
+                  primary_key: id
+                """.formatted(DECLARED);
     }
 
     private static HttpServer server(ExchangeHandler handler) throws IOException {

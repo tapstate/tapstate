@@ -49,6 +49,7 @@ final class McpOperationExecutor {
                 case "system.version" -> get("/version");
                 case "connector.list" -> get("/api/connectors");
                 case "connector.get" -> get("/api/connectors/" + segment(required(args, "id")));
+                case "source.list" -> get("/api/sources");
                 case "source.draft" -> sourceDraft(args);
                 case "connection.test" -> connectionWrite(args, "/api/connections:test");
                 case "connection.test-result" -> get(
@@ -62,6 +63,7 @@ final class McpOperationExecutor {
                 case "artifact.apply" -> post("/api/artifacts:apply", args, RequestBudget.HEAVY);
                 case "artifact.get" -> get("/api/artifacts/" + segment(required(args, "id")));
                 case "artifact.delete" -> artifactDelete(args);
+                case "pipeline.list" -> get("/api/pipelines");
                 case "pipeline.start" -> pipelineAction(args, "start");
                 case "pipeline.stop" -> pipelineStop(args);
                 case "pipeline.pause" -> pipelineAction(args, "pause");

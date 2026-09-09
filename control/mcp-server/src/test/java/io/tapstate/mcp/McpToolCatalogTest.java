@@ -20,9 +20,9 @@ class McpToolCatalogTest {
     private static final List<String> READ_TOOLS = List.of(
             "system_version",
             "connector_list", "connector_get",
-            "source_draft",
+            "source_draft", "source_list",
             "connection_test_result", "connection_schema", "artifact_validate", "artifact_get",
-            "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
+            "pipeline_list", "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
             "data_browser_collections", "data_browser_find", "data_browser_stats");
 
     private static final List<String> WRITE_TOOLS = List.of(
@@ -41,7 +41,7 @@ class McpToolCatalogTest {
     }
 
     @Test
-    void defaultSurfaceContainsExactlyTheFifteenReadTools() {
+    void defaultSurfaceContainsExactlyTheSeventeenReadTools() {
         assertThat(McpToolCatalog.operations(false).stream().map(McpToolCatalog::toolName))
                 .containsExactlyInAnyOrderElementsOf(READ_TOOLS);
     }

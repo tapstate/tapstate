@@ -60,6 +60,7 @@ class McpOperationExecutorTest {
                     Map.entry(ControlOperations.SYSTEM_VERSION, Map.of()),
                     Map.entry(ControlOperations.CONNECTOR_LIST, Map.of()),
                     Map.entry(ControlOperations.CONNECTOR_GET, Map.of("id", "mysql")),
+                    Map.entry(ControlOperations.SOURCE_LIST, Map.of()),
                     Map.entry(ControlOperations.SOURCE_DRAFT, Map.of(
                             "id", "orders", "connector", "mysql", "config", Map.of("host", "db"))),
                     Map.entry(ControlOperations.CONNECTION_TEST, connection),
@@ -71,6 +72,7 @@ class McpOperationExecutorTest {
                     Map.entry(ControlOperations.ARTIFACT_GET, Map.of("id", "orders")),
                     Map.entry(ControlOperations.ARTIFACT_DELETE,
                             Map.of("id", "orders", "expectedContentHash", "a".repeat(64))),
+                    Map.entry(ControlOperations.PIPELINE_LIST, Map.of()),
                     Map.entry(ControlOperations.PIPELINE_START, pipeline),
                     Map.entry(ControlOperations.PIPELINE_STOP, stop),
                     Map.entry(ControlOperations.PIPELINE_PAUSE, pipeline),
@@ -102,11 +104,11 @@ class McpOperationExecutorTest {
                     // At the root, not under /api: the version answer is the anonymous endpoint the
                     // CLI also reads while connecting, and a second one would be a second truth.
                     "/version",
-                    "/api/connectors", "/api/connectors/mysql", "/api/connections:test",
+                    "/api/connectors", "/api/connectors/mysql", "/api/sources", "/api/connections:test",
                     "/api/sources:draft",
                     "/api/connections/orders/test-result", "/api/connections:discover-schema",
                     "/api/connections/orders/schema", "/api/artifacts:validate", "/api/artifacts:apply",
-                    "/api/artifacts/orders",
+                    "/api/artifacts/orders", "/api/pipelines",
                     "/api/pipelines/orders:start", "/api/pipelines/orders:stop",
                     "/api/pipelines/orders:pause", "/api/pipelines/orders:resume",
                     "/api/pipelines/orders/status", "/api/pipelines/orders/metrics",
