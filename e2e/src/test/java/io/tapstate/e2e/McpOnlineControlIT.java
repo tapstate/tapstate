@@ -166,7 +166,7 @@ class McpOnlineControlIT {
 
                 send(input, """
                         {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-                          "name":"source_list","arguments":{}}}
+                          "name":"source_list","arguments":{"limit":1,"offset":0}}}
                         """);
                 Map<?, ?> sourceList = (Map<?, ?>) receive(output).get("result");
                 assertThat(sourceList.get("isError")).as("listing Sources through MCP").isEqualTo(false);
@@ -174,11 +174,13 @@ class McpOnlineControlIT {
                 assertThat(sources.stream()
                         .map(source -> String.valueOf(((Map<?, ?>) source).get("id"))))
                         .as("the Source list returned by the existing server list API")
-                        .contains("src_browse");
+                        .containsExactly("src_browse");
+                assertThat(((Map<?, ?>) sources.getFirst()).keySet().stream().map(String::valueOf).toList())
+                        .containsExactlyInAnyOrder("id", "metadata", "connector");
 
                 send(input, """
                         {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
-                          "name":"pipeline_list","arguments":{}}}
+                          "name":"pipeline_list","arguments":{"limit":1,"offset":0}}}
                         """);
                 Map<?, ?> pipelineList = (Map<?, ?>) receive(output).get("result");
                 assertThat(pipelineList.get("isError")).as("listing Pipelines through MCP").isEqualTo(false);
@@ -186,7 +188,7 @@ class McpOnlineControlIT {
                 assertThat(pipelines.stream()
                         .map(pipeline -> String.valueOf(((Map<?, ?>) pipeline).get("id"))))
                         .as("the Pipeline list returned by the existing server list API")
-                        .contains("pipeline_browse");
+                        .containsExactly("pipeline_browse");
 
                 Map<String, Map<String, Object>> listed = collectionsByName(input, output, 5, "src_browse");
                 assertThat(listed).containsKeys(DECLARED, BY_HAND);
@@ -231,7 +233,18 @@ class McpOnlineControlIT {
 
                 // Applied after the tools were listed, and read without listing them again.
                 control.apply(Map.of("src_later.tap.yml", sourceYaml("src_later", later)));
-                assertThat(collectionsByName(input, output, 7, "src_later"))
+                send(input, """
+                        {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+                          "name":"source_list","arguments":{"limit":1,"offset":1}}}
+                        """);
+                Map<?, ?> laterSourceList = (Map<?, ?>) receive(output).get("result");
+                assertThat(laterSourceList.get("isError")).as("reading the second Source page").isEqualTo(false);
+                List<?> laterSources = (List<?>) ((Map<?, ?>) laterSourceList.get("structuredContent")).get("items");
+                assertThat(laterSources.stream()
+                        .map(source -> String.valueOf(((Map<?, ?>) source).get("id"))))
+                        .as("the Source page after the first Source")
+                        .containsExactly("src_later");
+                assertThat(collectionsByName(input, output, 8, "src_later"))
                         .as("a source applied mid-session, read by a client that has not re-listed")
                         .containsKey("arrivals");
 
@@ -239,11 +252,11 @@ class McpOnlineControlIT {
                 // answer. The first source is asked again in the same breath, so "it disappeared" is
                 // distinguishable from "the session broke".
                 control.deleteSource("src_later");
-                send(input, call(8, "src_later"));
+                send(input, call(9, "src_later"));
                 assertThat(((Map<?, ?>) receive(output).get("result")).get("isError"))
                         .as("reading a source that has been deleted, in a session that never restarted")
                         .isEqualTo(true);
-                assertThat(collectionsByName(input, output, 9, "src_browse"))
+                assertThat(collectionsByName(input, output, 10, "src_browse"))
                         .as("the source that was not deleted, asked right afterwards")
                         .containsKeys(DECLARED, BY_HAND);
             } finally {

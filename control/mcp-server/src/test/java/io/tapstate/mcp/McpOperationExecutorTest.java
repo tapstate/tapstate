@@ -40,6 +40,9 @@ class McpOperationExecutorTest {
                          "config":[],
                          "spec":{"contentHash":"abc123","text":"{}","unavailable":null}}
                         """);
+            } else if (exchange.getRequestURI().toString().equals("/api/sources?limit=50&offset=0")
+                    || exchange.getRequestURI().toString().equals("/api/pipelines?limit=50&offset=0")) {
+                answer(exchange, 200, "{\"items\":[]}");
             } else {
                 answer(exchange, 200, "{}");
             }
@@ -104,11 +107,12 @@ class McpOperationExecutorTest {
                     // At the root, not under /api: the version answer is the anonymous endpoint the
                     // CLI also reads while connecting, and a second one would be a second truth.
                     "/version",
-                    "/api/connectors", "/api/connectors/mysql", "/api/sources", "/api/connections:test",
+                    "/api/connectors", "/api/connectors/mysql", "/api/sources?limit=50&offset=0",
+                    "/api/connections:test",
                     "/api/sources:draft",
                     "/api/connections/orders/test-result", "/api/connections:discover-schema",
                     "/api/connections/orders/schema", "/api/artifacts:validate", "/api/artifacts:apply",
-                    "/api/artifacts/orders", "/api/pipelines",
+                    "/api/artifacts/orders", "/api/pipelines?limit=50&offset=0",
                     "/api/pipelines/orders:start", "/api/pipelines/orders:stop",
                     "/api/pipelines/orders:pause", "/api/pipelines/orders:resume",
                     "/api/pipelines/orders/status", "/api/pipelines/orders/metrics",
@@ -116,6 +120,61 @@ class McpOperationExecutorTest {
                     "/api/sources/views/collections",
                     "/api/sources/views/collections/order_state/stats",
                     "/api/sources/views/collections/order_state:find");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sourceListOmitsAllConfigurationBeforeReturningToTheModel() throws Exception {
+        AtomicReference<String> path = new AtomicReference<>();
+        HttpServer server = server(exchange -> {
+            path.set(exchange.getRequestURI().toString());
+            answer(exchange, 200, """
+                    {"items":[{"id":"orders","metadata":{"labels":{"team":"sales"},
+                    "description":"Orders"},"connector":"mongodb",
+                    "config":{"uri":"mongodb://app:s3cr3t@db.internal/orders"},
+                    "configuredSecrets":["password"],"mode":"snapshot","tables":[]}]}
+                    """);
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.SOURCE_LIST,
+                    Map.of("limit", 2, "offset", 1));
+
+            assertThat(result.error()).isFalse();
+            assertThat(path.get()).isEqualTo("/api/sources?limit=2&offset=1");
+            Map<?, ?> item = (Map<?, ?>) ((List<?>) result.body().get("items")).getFirst();
+            assertThat(item.keySet().stream().map(String::valueOf).toList())
+                    .containsExactlyInAnyOrder("id", "metadata", "connector");
+            assertThat(item.get("id")).isEqualTo("orders");
+            assertThat(item.get("connector")).isEqualTo("mongodb");
+            assertThat(JsonWriter.write(result.body()))
+                    .doesNotContain("s3cr3t", "config", "configuredSecrets", "uri");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listToolsSendABoundedPageToTheServer() throws Exception {
+        List<String> paths = new ArrayList<>();
+        HttpServer server = server(exchange -> {
+            paths.add(exchange.getRequestURI().toString());
+            answer(exchange, 200, "{\"items\":[]}");
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            assertThat(executor.execute(ControlOperations.SOURCE_LIST, Map.of()).error()).isFalse();
+            assertThat(executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("limit", 999, "offset", 3)).error()).isFalse();
+
+            assertThat(paths).containsExactly(
+                    "/api/sources?limit=50&offset=0", "/api/pipelines?limit=200&offset=3");
         } finally {
             server.stop(0);
         }

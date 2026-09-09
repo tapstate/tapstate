@@ -93,6 +93,30 @@ class McpToolCatalogTest {
     }
 
     @Test
+    void listToolsDeclareBoundedPagesAndAConfigurationFreeSourceSummary() {
+        Map<?, ?> sourceRequest = ControlApiSchema.resolve(ControlOperations.SOURCE_LIST.schema().params());
+        Map<?, ?> sourceProperties = (Map<?, ?>) sourceRequest.get("properties");
+        assertThat(sourceProperties.keySet().stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("limit", "offset");
+        assertThat(((Map<?, ?>) sourceProperties.get("limit")).get("minimum")).isEqualTo(1);
+        assertThat(((Map<?, ?>) sourceProperties.get("limit")).get("maximum")).isEqualTo(200);
+        assertThat(((Map<?, ?>) sourceProperties.get("offset")).get("minimum")).isEqualTo(0);
+
+        Map<?, ?> sourceResult = ControlApiSchema.resolve(ControlOperations.SOURCE_LIST.schema().result());
+        Map<?, ?> sourceItem = (Map<?, ?>) ((Map<?, ?>) sourceResult.get("properties"))
+                .get("items");
+        sourceItem = (Map<?, ?>) sourceItem.get("items");
+        assertThat(((List<?>) sourceItem.get("required")).stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("id", "connector");
+        assertThat(((Map<?, ?>) sourceItem.get("properties")).keySet().stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("id", "metadata", "connector");
+        assertThat(ControlOperations.SOURCE_LIST.description())
+                .contains("omitted").contains("limit").contains("offset");
+        assertThat(ControlOperations.PIPELINE_LIST.description())
+                .contains("limit").contains("offset").contains("status");
+    }
+
+    @Test
     void allowWriteAddsExactlyTheEightWriteTools() {
         assertThat(McpToolCatalog.operations(true).stream().map(McpToolCatalog::toolName))
                 .containsExactlyInAnyOrderElementsOf(concat(READ_TOOLS, WRITE_TOOLS));

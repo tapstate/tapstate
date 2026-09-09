@@ -87,6 +87,26 @@ public final class ControlApiSchema {
         Map<String, Object> empty = object(List.of(), Map.of(), false);
         Map<String, Object> opaque = object(List.of(), Map.of(), true);
         Map<String, Object> id = string("Tapstate resource identifier");
+        Map<String, Object> listRequest = object(
+                List.of(),
+                Map.of(
+                        "limit", integer(1, ListBounds.MAX_LIMIT,
+                                "Maximum number of items to return. Defaults to " + ListBounds.DEFAULT_LIMIT),
+                        "offset", integer(0, Integer.MAX_VALUE,
+                                "Number of matching items to skip before returning the page")),
+                false);
+        Map<String, Object> sourceMetadata = object(List.of(), Map.of(
+                "labels", Map.of("type", "object", "additionalProperties", Map.of("type", "string")),
+                "description", string("Free-text Source description")), false);
+        Map<String, Object> sourceSummary = object(
+                List.of("id", "connector"),
+                Map.of(
+                        "id", id,
+                        "metadata", sourceMetadata,
+                        "connector", string("Registered connector id")),
+                false);
+        Map<String, Object> sourceListResult = object(
+                List.of("items"), Map.of("items", array(sourceSummary)), false);
 
         // Open rather than closed: the two reserved fields of the version answer are empty until what
         // fills them lands, and a document that typed them would have to describe an absent value.
@@ -96,7 +116,7 @@ public final class ControlApiSchema {
                 true));
         pair(defs, "ConnectorList", empty, opaque);
         pair(defs, "ConnectorGet", object(List.of("id"), Map.of("id", id), false), opaque);
-        pair(defs, "SourceList", empty, opaque);
+        pair(defs, "SourceList", listRequest, sourceListResult);
         pair(defs, "SourceGet", object(List.of("id"), Map.of("id", id), false), opaque);
 
         Map<String, Object> sourceProperties = new LinkedHashMap<>();
@@ -187,7 +207,7 @@ public final class ControlApiSchema {
         pair(defs, "ArtifactGet", object(List.of("id"), Map.of("id", id), false), artifactResult);
 
         Map<String, Object> pipelineId = object(List.of("id"), Map.of("id", id), false);
-        pair(defs, "PipelineList", empty, opaque);
+        pair(defs, "PipelineList", listRequest, opaque);
         pair(defs, "PipelineStart", pipelineId, opaque);
         Map<String, Object> stopRequest = object(
                 List.of("id", "purgeState"),

@@ -75,7 +75,9 @@ public final class ControlOperations {
                     + " This does not create an artifact or audit record.");
     public static final Operation SOURCE_LIST = new Operation(
             "source.list", Scope.READ, false, ControlApiSchema.ref("source.list"),
-            "List Sources with secret-redacted config and configured-secret field names.", CLI_AND_MCP);
+            "List a bounded page of Sources by id, connector, and display metadata. Configuration is "
+                    + "intentionally omitted, including secret and non-secret fields. Use limit (1-200) "
+                    + "and offset to page.", CLI_AND_MCP);
     public static final Operation SOURCE_GET = new Operation(
             "source.get", Scope.READ, false, ControlApiSchema.ref("source.get"),
             "Get one Source with secret-redacted config and configured-secret field names.", CLI_ONLY);
@@ -172,7 +174,8 @@ public final class ControlOperations {
     // is stop then start composed at the surface.
     public static final Operation PIPELINE_LIST = new Operation(
             "pipeline.list", Scope.READ, false, ControlApiSchema.ref("pipeline.list"),
-            "List static Pipeline artifacts with resolved Source summaries.", CLI_AND_MCP);
+            "List a bounded page of Pipeline artifacts with resolved Source summaries and live status. "
+                    + "Use limit (1-200) and offset to page; each item can include its DAG and transforms.", CLI_AND_MCP);
     public static final Operation PIPELINE_GET = new Operation(
             "pipeline.get", Scope.READ, false, null,
             "Get one static Pipeline artifact with resolved Source summaries.", CLI_ONLY);
