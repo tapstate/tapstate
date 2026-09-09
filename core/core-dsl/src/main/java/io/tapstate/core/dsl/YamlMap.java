@@ -23,15 +23,17 @@ import java.util.Set;
 final class YamlMap {
 
     private final String path;                                  // "" at the document root
+    private final Node self;                                    // the mapping this view reads
     private final Map<String, Node> values = new LinkedHashMap<>();
     private final Map<String, Node> keyNodes = new LinkedHashMap<>();
 
-    private YamlMap(String path) {
+    private YamlMap(String path, Node self) {
         this.path = path;
+        this.self = self;
     }
 
     static YamlMap of(MappingNode node, String path) {
-        YamlMap m = new YamlMap(path);
+        YamlMap m = new YamlMap(path, node);
         for (NodeTuple tuple : node.getValue()) {
             String key = ((ScalarNode) tuple.getKeyNode()).getValue();
             m.values.put(key, tuple.getValueNode());
@@ -70,6 +72,28 @@ final class YamlMap {
                     Map.of("value", nodeTypeName(n), "expected", "a scalar"));
         }
         return sc.getValue();
+    }
+
+    /**
+     * As {@link #string}, for a key the schema requires: an absent one is refused rather than
+     * handed on as a null.
+     */
+    String requireString(String key) {
+        return require(key, string(key));
+    }
+
+    /**
+     * Returns {@code value} as read from {@code key}, or refuses when the key the schema requires
+     * was left out. Leaving one out is a property of the document, so it comes back located like
+     * every other malformed artifact -- passing the null on reaches a model record that null-checks
+     * it, and the author is handed a NullPointerException naming an internal component instead.
+     */
+    <T> T require(String key, T value) {
+        if (value == null) {
+            throw error(DslError.COMPOSITION, childPath(key), self,
+                    Map.of("detail", "required field '" + key + "' is missing"));
+        }
+        return value;
     }
 
     /** Free-form typed value (scalar / list / map) per the Tapstate dialect; null if absent. */
