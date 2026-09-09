@@ -29,7 +29,7 @@ class WorkbenchRendererTest {
                 .contains("Width = 83  Height = 53")
                 .contains("Needed for current config:")
                 .contains("Width = 88  Height = 24")
-                .doesNotContain("Tapstate workbench", "Overview", "q quit");
+                .doesNotContain("TapState", "Overview", "q quit");
         assertThat(rendered.layout().tooSmall()).isTrue();
         assertThat(rendered.layout().visibleRowCapacity()).isZero();
         assertThat(rendered.layout().tabAt(0, 0)).isEmpty();
@@ -43,7 +43,7 @@ class WorkbenchRendererTest {
         assertThat(rendered.text())
                 .contains("Width = 88  Height = 23")
                 .contains("Width = 88  Height = 24")
-                .doesNotContain("Tapstate workbench");
+                .doesNotContain("TapState");
         assertThat(rendered.layout().tooSmall()).isTrue();
     }
 
@@ -68,22 +68,55 @@ class WorkbenchRendererTest {
         Rendered rendered = render(88, 24, accepted(snapshot));
 
         assertThat(rendered.text())
-                .contains("Tapstate workbench")
-                .contains("Workspace: /work/catalog")
-                .contains("Context: dev (explicit)")
-                .contains("Connection: connected")
-                .contains("Auth: signed in")
-                .contains("Principal: alice")
-                .contains("Endpoint: https://tapstate.example:9443")
-                .contains("1 Overview | 2 Workspace [2] | 3 Sources [1] | 4 Pipelines [0] | 0 More")
+                .contains("TapState", "ctx: dev", "connected", "auth: alice", "workspace: /work/catalog")
+                .contains("1 Overview", "2 Workspace", "3 Sources", "4 Pipelines", "0 More")
                 .contains("Resources")
                 .contains("source", "pipeline", "in sync 1", "local only 1")
                 .contains("Remote artifacts: 2")
-                .contains("1-4 views  c context  0 more  r refresh  q quit")
-                .doesNotContain(secret, "/admin", "F1", "F2", "command palette", "Up/Down select");
+                .contains("1-4 views  c context  a auth  0 more  r refresh  q quit")
+                .doesNotContain(secret, "/admin", "explicit", "F1", "F2", "command palette",
+                        "Up/Down select", "[2]", "[1]", "[0]");
         assertThat(rendered.layout().tooSmall()).isFalse();
         assertThat(rendered.layout().wide()).isFalse();
         assertThat(rendered.layout().visibleRowCapacity()).isPositive();
+    }
+
+    @Test
+    void frameUsesCamelHeaderTabStatisticsEmojiAndBorderedContentGeometry() {
+        WorkbenchSessionSnapshot session = new WorkbenchSessionSnapshot(
+                Path.of("/work/catalog"),
+                Optional.of("dev"),
+                Optional.of(ResolvedContext.Source.EXPLICIT),
+                WorkbenchConnection.CONNECTED,
+                WorkbenchAuthentication.SIGNED_IN,
+                Optional.of("alice"),
+                Optional.of(URI.create("https://tapstate.example:9443")),
+                "v0.4.4");
+        WorkbenchSnapshot snapshot = snapshot(
+                session,
+                new WorkbenchRemoteState.Available(2),
+                List.of(row("source", "orders", WorkbenchAlignment.IN_SYNC, "source/orders.tap.yml", true),
+                        row("pipeline", "daily", WorkbenchAlignment.LOCAL_ONLY, "pipeline/daily.tap.yml", false)));
+
+        Rendered rendered = render(100, 24, accepted(snapshot));
+
+        String header = lineOf(rendered.buffer(), 0);
+        assertThat(header)
+                .contains("TapState", "ctx: dev", "connected", "workspace: /work/catalog", "auth: alice");
+        assertThat(header.indexOf("ctx: dev")).isLessThan(header.indexOf("connected"));
+        assertThat(header.indexOf("connected")).isLessThan(header.indexOf("workspace: /work/catalog"));
+        assertThat(header.indexOf("workspace: /work/catalog")).isLessThan(header.indexOf("auth: alice"));
+        assertThat(lineOf(rendered.buffer(), 1)).contains("(2)", "(1)", "(0)");
+        assertThat(lineOf(rendered.buffer(), 2))
+                .contains("🌊", "1 Overview", "📁", "2 Workspace", "🔌", "3 Sources",
+                        "🔀", "4 Pipelines", "📂", "0 More ▾")
+                .doesNotContain("[2]", "[1]", "[0]");
+        assertThat(lineOf(rendered.buffer(), 3)).startsWith("╭").contains(" Overview ");
+        assertThat(lineOf(rendered.buffer(), 22)).startsWith("╰");
+        assertThat(lineOf(rendered.buffer(), 23)).contains("c context", "a auth", "q quit");
+        assertThat(rendered.layout().actionHits())
+                .extracting(hit -> hit.launcher().name())
+                .contains("CONTEXT", "AUTH", "MORE");
     }
 
     @Test
@@ -145,13 +178,14 @@ class WorkbenchRendererTest {
 
         Rendered rendered = render(88, 24, accepted(snapshot));
 
-        assertThat(lineOf(rendered.buffer(), 19))
+        assertThat(lineOf(rendered.buffer(), 18))
                 .contains("Alignment: local only 1 | remote only 2 | in sync 3");
-        assertThat(lineOf(rendered.buffer(), 20))
+        assertThat(lineOf(rendered.buffer(), 19))
                 .contains("drifted 4 | invalid local 5 | unknown 6");
-        assertThat(lineOf(rendered.buffer(), 22)).contains("Remote artifacts: 16");
+        assertThat(lineOf(rendered.buffer(), 21)).contains("Remote artifacts: 16");
+        assertThat(lineOf(rendered.buffer(), 22)).startsWith("╰");
         assertThat(lineOf(rendered.buffer(), 23))
-                .contains("1-4 views  c context  0 more  r refresh  q quit");
+                .contains("1-4 views  c context  a auth  0 more  r refresh  q quit");
         assertThat(rendered.text())
                 .contains("source", "local 7", "remote 8", "pipeline", "local 2", "remote 3");
     }
@@ -310,8 +344,8 @@ class WorkbenchRendererTest {
 
         Rendered rendered = render(100, 24, state);
 
-        assertThat(rendered.text()).contains("More", "Context & Auth", "Help");
-        assertThat(rendered.layout().overlayHits()).hasSize(2).isUnmodifiable();
+        assertThat(rendered.text()).contains("More", "Context", "Authentication", "Help");
+        assertThat(rendered.layout().overlayHits()).hasSize(3).isUnmodifiable();
         for (WorkbenchRenderer.OverlayHit hit : rendered.layout().overlayHits()) {
             assertThat(rendered.layout().overlayIndexAt(hit.area().x(), hit.area().y()))
                     .hasValue(hit.index());
@@ -338,7 +372,7 @@ class WorkbenchRendererTest {
 
         for (int width : List.of(88, 156, 157)) {
             Rendered rendered = render(width, 24, state);
-            String renderedRow = lineOf(rendered.buffer(), 9);
+            String renderedRow = lineOf(rendered.buffer(), 5);
             assertThat(renderedRow)
                     .contains("pipeline", "pipeline-")
                     .doesNotContain(longId, longPath, "artifact.tap.yml");
@@ -353,9 +387,9 @@ class WorkbenchRendererTest {
         assertThat(CharWidth.of(arabicSymbol)).isEqualTo(1);
         assertThat(CharWidth.of(hangulLeadingConsonant)).isEqualTo(1);
 
-        assertUnicodeColumnBoundary("a".repeat(24) + arabicSymbol + "X", arabicSymbol);
+        assertUnicodeColumnBoundary("a".repeat(23) + arabicSymbol + "X", arabicSymbol);
         assertUnicodeColumnBoundary(
-                "a".repeat(24) + hangulLeadingConsonant + "X", hangulLeadingConsonant);
+                "a".repeat(23) + hangulLeadingConsonant + "X", hangulLeadingConsonant);
     }
 
     @Test
@@ -408,9 +442,9 @@ class WorkbenchRendererTest {
                 .select(WorkbenchState.WorkbenchTab.WORKSPACE));
 
         int symbolX = 33;
-        assertThat(rendered.buffer().get(symbolX, 9).symbol()).isEqualTo(boundarySymbol);
-        assertThat(rendered.buffer().get(34, 9).symbol()).isEqualTo(" ");
-        assertThat(lineOf(rendered.buffer(), 9)).doesNotContain("X");
+        assertThat(rendered.buffer().get(symbolX, 5).symbol()).isEqualTo(boundarySymbol);
+        assertThat(rendered.buffer().get(34, 5).symbol()).isEqualTo(" ");
+        assertThat(lineOf(rendered.buffer(), 5)).doesNotContain("X");
         assertOccupiedToRightEdge(rendered);
     }
 
@@ -418,13 +452,13 @@ class WorkbenchRendererTest {
         WorkbenchRenderer.RowHit hit = rendered.layout().rowHits().getFirst();
         int rightmost = rendered.buffer().width() - 1;
 
-        assertThat(hit.area().x()).isZero();
-        assertThat(hit.area().width()).isEqualTo(rendered.buffer().width());
-        assertThat(hit.area().right()).isEqualTo(rendered.buffer().width());
-        assertThat(rendered.buffer().get(rightmost, hit.area().y()).style().effectiveModifiers())
+        assertThat(hit.area().x()).isEqualTo(1);
+        assertThat(hit.area().width()).isEqualTo(rendered.buffer().width() - 2);
+        assertThat(hit.area().right()).isEqualTo(rendered.buffer().width() - 1);
+        assertThat(rendered.buffer().get(rightmost - 1, hit.area().y()).style().effectiveModifiers())
                 .contains(Modifier.BOLD);
-        assertThat(rendered.layout().rowAt(rightmost, hit.area().y())).contains(hit);
-        assertThat(rendered.layout().rowAt(rightmost + 1, hit.area().y())).isEmpty();
+        assertThat(rendered.layout().rowAt(rightmost - 1, hit.area().y())).contains(hit);
+        assertThat(rendered.layout().rowAt(rightmost, hit.area().y())).isEmpty();
     }
 
     private static WorkbenchState accepted(WorkbenchSnapshot snapshot) {

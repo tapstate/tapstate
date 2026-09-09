@@ -39,7 +39,7 @@ class WorkbenchTest {
                 .contains("Width = 83  Height = 53")
                 .contains("Needed for current config:")
                 .contains("Width = 88  Height = 24")
-                .doesNotContain("Tapstate workbench");
+                .doesNotContain("TapState");
     }
 
     @Test
@@ -51,7 +51,7 @@ class WorkbenchTest {
         assertThat(textOf(buffer))
                 .contains("Width = 88  Height = 23")
                 .contains("Width = 88  Height = 24")
-                .doesNotContain("Tapstate workbench");
+                .doesNotContain("TapState");
     }
 
     @Test
@@ -64,7 +64,7 @@ class WorkbenchTest {
 
         assertThat(textOf(tooSmall)).contains("Terminal size too small:");
         assertThat(textOf(recovered))
-                .contains("Tapstate workbench")
+                .contains("TapState")
                 .doesNotContain("Terminal size too small:");
     }
 

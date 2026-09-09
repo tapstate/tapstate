@@ -8,12 +8,13 @@ import java.util.Optional;
 sealed interface WorkbenchOverlayState
         permits WorkbenchOverlayState.More,
                 WorkbenchOverlayState.ContextPicker,
+                WorkbenchOverlayState.ContextCreate,
                 WorkbenchOverlayState.Login,
                 WorkbenchOverlayState.Help {
 
     record More(int selectedIndex) implements WorkbenchOverlayState {
         public More {
-            if (selectedIndex < 0 || selectedIndex > 1) {
+            if (selectedIndex < 0 || selectedIndex > 2) {
                 throw new IllegalArgumentException("More selection is outside the menu");
             }
         }
@@ -27,16 +28,16 @@ sealed interface WorkbenchOverlayState
         public ContextPicker {
             contexts = List.copyOf(contexts);
             Objects.requireNonNull(message, "message");
-            if (contexts.isEmpty() ? selectedIndex != -1 : selectedIndex < 0 || selectedIndex >= contexts.size()) {
+            if (selectedIndex < 0 || selectedIndex > contexts.size()) {
                 throw new IllegalArgumentException("Context selection is outside the menu");
             }
         }
 
         ContextPicker select(int index) {
-            if (pending || contexts.isEmpty()) {
+            if (pending) {
                 return this;
             }
-            int selected = Math.clamp(index, 0, contexts.size() - 1);
+            int selected = Math.clamp(index, 0, contexts.size());
             return selected == selectedIndex ? this : new ContextPicker(contexts, selected, false, message);
         }
 
@@ -45,9 +46,31 @@ sealed interface WorkbenchOverlayState
         }
     }
 
+    record ContextCreate(
+            Stage stage,
+            String name,
+            String server,
+            boolean verifyTls,
+            boolean pending,
+            Optional<String> message) implements WorkbenchOverlayState {
+        public ContextCreate {
+            Objects.requireNonNull(stage, "stage");
+            Objects.requireNonNull(name, "name");
+            Objects.requireNonNull(server, "server");
+            Objects.requireNonNull(message, "message");
+        }
+
+        enum Stage {
+            NAME,
+            SERVER,
+            VERIFY_TLS
+        }
+    }
+
     record Login(
             String contextName,
             Stage stage,
+            String server,
             String username,
             SecretBuffer password,
             boolean pending,
@@ -55,12 +78,14 @@ sealed interface WorkbenchOverlayState
         public Login {
             Objects.requireNonNull(contextName, "contextName");
             Objects.requireNonNull(stage, "stage");
+            Objects.requireNonNull(server, "server");
             Objects.requireNonNull(username, "username");
             Objects.requireNonNull(password, "password");
             Objects.requireNonNull(message, "message");
         }
 
         enum Stage {
+            SERVER,
             USERNAME,
             PASSWORD
         }

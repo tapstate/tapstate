@@ -134,7 +134,7 @@ class WorkbenchRefreshIntegrationTest {
         runtime.publishSnapshot(snapshot);
 
         session.render(Frame.forTesting(Buffer.empty(new Rect(0, 0, 88, 24))));
-        assertThat(session.handleEvent(MouseEvent.press(MouseButton.LEFT, 14, 5), null)).isTrue();
+        assertThat(session.handleEvent(MouseEvent.press(MouseButton.LEFT, 18, 2), null)).isTrue();
         assertThat(runtime.state().selectedTab()).isEqualTo(WorkbenchState.WorkbenchTab.WORKSPACE);
 
     }
@@ -156,6 +156,66 @@ class WorkbenchRefreshIntegrationTest {
         assertThat(runtime.state().overlay()).isEmpty();
         assertThat(session.handleEvent(KeyEvent.ofChar('2'), null)).isTrue();
         assertThat(runtime.state().selectedTab()).isEqualTo(WorkbenchState.WorkbenchTab.WORKSPACE);
+    }
+
+    @Test
+    void contextSelectionAndAuthenticationAreIndependentEntries() throws Exception {
+        RecordingScheduler scheduler = new RecordingScheduler();
+        WorkbenchRuntime runtime = new WorkbenchRuntime(
+                WorkbenchState.initial(), scheduler, () -> true, event -> {
+                });
+        AtomicInteger selectedContexts = new AtomicInteger();
+        AtomicInteger loginCalls = new AtomicInteger();
+        CountDownLatch contextSelected = new CountDownLatch(1);
+        WorkbenchActionGateway gateway = new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return List.of(new ContextOption("dev", true));
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                selectedContexts.incrementAndGet();
+                contextSelected.countDown();
+                return new ContextResult.Ready(name, false);
+            }
+
+            @Override
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public LoginResult login(LoginRequest request, SecretBuffer password) {
+                loginCalls.incrementAndGet();
+                password.close();
+                return new LoginResult.SignedIn(request.username());
+            }
+        };
+
+        try (Workbench.Session session = new Workbench.Session(
+                runtime,
+                (generation, sequence, token) -> signedOutSnapshot(generation, sequence),
+                gateway)) {
+            WorkbenchSnapshot initial = signedOutSnapshot(0, 1);
+            session.expectSnapshot(initial);
+            session.publishSnapshot(initial);
+            scheduler.awaitNext().run();
+
+            assertThat(session.handleEvent(KeyEvent.ofChar('c'), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay ->
+                    assertThat(overlay).isInstanceOf(WorkbenchOverlayState.ContextPicker.class));
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            await(contextSelected);
+            scheduler.awaitNext().run();
+            assertThat(loginCalls).hasValue(0);
+            assertThat(runtime.state().overlay()).isEmpty();
+
+            scheduler.awaitNext().run();
+            assertThat(session.handleEvent(KeyEvent.ofChar('a'), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay ->
+                    assertThat(overlay).isInstanceOf(WorkbenchOverlayState.Login.class));
+        }
     }
 
     @Test
@@ -183,11 +243,16 @@ class WorkbenchRefreshIntegrationTest {
             }
 
             @Override
-            public LoginResult login(String username, SecretBuffer password) {
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public LoginResult login(LoginRequest request, SecretBuffer password) {
                 submittedBuffer.set(password);
                 receivedPassword.set(password.consume(value -> value));
                 loginCalled.countDown();
-                return new LoginResult.SignedIn(username);
+                return new LoginResult.SignedIn(request.username());
             }
         };
 
@@ -195,7 +260,7 @@ class WorkbenchRefreshIntegrationTest {
                 runtime,
                 (generation, sequence, token) -> snapshot(generation, sequence, "orders"),
                 gateway)) {
-            assertThat(session.handleEvent(KeyEvent.ofChar('c'), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofChar('a'), null)).isTrue();
             for (char character : "alice".toCharArray()) {
                 assertThat(session.handleEvent(KeyEvent.ofChar(character), null)).isTrue();
             }
@@ -223,6 +288,146 @@ class WorkbenchRefreshIntegrationTest {
             assertThat(runtime.state().snapshot())
                     .map(WorkbenchSnapshot::identity)
                     .contains(new WorkbenchSnapshot.Identity(1, 1));
+        }
+    }
+
+    @Test
+    void contextPickerCreatesAndActivatesAContextWithoutStartingLogin() throws Exception {
+        RecordingScheduler scheduler = new RecordingScheduler();
+        WorkbenchRuntime runtime = new WorkbenchRuntime(
+                WorkbenchState.initial(), scheduler, () -> true, event -> {
+                });
+        AtomicReference<String> createdName = new AtomicReference<>();
+        AtomicReference<URI> createdServer = new AtomicReference<>();
+        AtomicReference<Boolean> createdVerifyTls = new AtomicReference<>();
+        AtomicInteger loginCalls = new AtomicInteger();
+        CountDownLatch contextCreated = new CountDownLatch(1);
+        WorkbenchActionGateway gateway = new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return List.of();
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                createdName.set(name);
+                createdServer.set(server);
+                createdVerifyTls.set(verifyTls);
+                contextCreated.countDown();
+                return new ContextResult.Ready(name, false);
+            }
+
+            @Override
+            public LoginResult login(LoginRequest request, SecretBuffer password) {
+                loginCalls.incrementAndGet();
+                password.close();
+                return new LoginResult.Unavailable();
+            }
+        };
+
+        try (Workbench.Session session = new Workbench.Session(
+                runtime,
+                (generation, sequence, token) -> signedOutSnapshot(generation, sequence),
+                gateway)) {
+            assertThat(session.handleEvent(KeyEvent.ofChar('c'), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay -> {
+                assertThat(overlay).isInstanceOf(WorkbenchOverlayState.ContextPicker.class);
+                assertThat(((WorkbenchOverlayState.ContextPicker) overlay).selectedIndex()).isZero();
+            });
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay ->
+                    assertThat(overlay).isInstanceOf(WorkbenchOverlayState.ContextCreate.class));
+            assertThat(session.handleEvent(new PasteEvent("dev"), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            assertThat(session.handleEvent(new PasteEvent("http://127.0.0.1:7900"), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+
+            await(contextCreated);
+            scheduler.awaitNext().run();
+
+            assertThat(createdName).hasValue("dev");
+            assertThat(createdServer).hasValue(URI.create("http://127.0.0.1:7900"));
+            assertThat(createdVerifyTls).hasValue(true);
+            assertThat(loginCalls).hasValue(0);
+            assertThat(runtime.state().overlay()).isEmpty();
+
+            scheduler.awaitNext().run();
+            assertThat(runtime.state().snapshot())
+                    .map(WorkbenchSnapshot::identity)
+                    .contains(new WorkbenchSnapshot.Identity(1, 1));
+        }
+    }
+
+    @Test
+    void authenticationCanTargetATemporaryServerWithoutCreatingAContext() throws Exception {
+        RecordingScheduler scheduler = new RecordingScheduler();
+        WorkbenchSnapshot disconnected = disconnectedSnapshot(0, 1);
+        WorkbenchRuntime runtime = new WorkbenchRuntime(
+                WorkbenchState.initial().expectSnapshot(disconnected).acceptSnapshot(disconnected),
+                scheduler,
+                () -> true,
+                event -> {
+                });
+        AtomicReference<WorkbenchActionGateway.LoginRequest> request = new AtomicReference<>();
+        CountDownLatch loginCalled = new CountDownLatch(1);
+        WorkbenchActionGateway gateway = new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return List.of();
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public LoginResult login(LoginRequest submitted, SecretBuffer password) {
+                request.set(submitted);
+                password.close();
+                loginCalled.countDown();
+                return new LoginResult.SignedIn(submitted.username());
+            }
+        };
+
+        try (Workbench.Session session = new Workbench.Session(
+                runtime,
+                (generation, sequence, token) -> snapshot(generation, sequence, "orders"),
+                gateway)) {
+            assertThat(session.handleEvent(KeyEvent.ofChar('a'), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay -> {
+                assertThat(overlay).isInstanceOf(WorkbenchOverlayState.Login.class);
+                assertThat(((WorkbenchOverlayState.Login) overlay).stage())
+                        .isEqualTo(WorkbenchOverlayState.Login.Stage.SERVER);
+            });
+            Buffer buffer = Buffer.empty(new Rect(0, 0, 88, 24));
+            session.render(Frame.forTesting(buffer));
+            assertThat(textOf(buffer))
+                    .contains("Sign in to temporary server", "Server:", "Username:", "Password:");
+            assertThat(session.handleEvent(new PasteEvent("http://127.0.0.1:7900"), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            assertThat(session.handleEvent(new PasteEvent("alice"), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            assertThat(session.handleEvent(new PasteEvent("pw"), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+
+            await(loginCalled);
+            scheduler.awaitNext().run();
+
+            assertThat(request.get().server()).contains(URI.create("http://127.0.0.1:7900"));
+            assertThat(request.get().username()).isEqualTo("alice");
+            assertThat(runtime.state().overlay()).isEmpty();
         }
     }
 
@@ -443,6 +648,18 @@ class WorkbenchRefreshIntegrationTest {
                 generation,
                 sequence,
                 session,
+                WorkbenchOverviewSnapshot.empty(),
+                new WorkbenchWorkspaceSnapshot(remote, List.of()),
+                new WorkbenchResourceListSnapshot("source", remote, List.of()),
+                new WorkbenchResourceListSnapshot("pipeline", remote, List.of()));
+    }
+
+    private static WorkbenchSnapshot disconnectedSnapshot(long generation, long sequence) {
+        WorkbenchRemoteState remote = new WorkbenchRemoteState.NotConfigured();
+        return new WorkbenchSnapshot(
+                generation,
+                sequence,
+                WorkbenchSessionSnapshot.empty(),
                 WorkbenchOverviewSnapshot.empty(),
                 new WorkbenchWorkspaceSnapshot(remote, List.of()),
                 new WorkbenchResourceListSnapshot("source", remote, List.of()),

@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -4503,7 +4504,8 @@ class ReplTest {
         SecretBuffer password = new SecretBuffer();
         password.append("pw");
 
-        assertThat(gateway.login("alice", password))
+        assertThat(gateway.login(
+                new WorkbenchActionGateway.LoginRequest(Optional.empty(), "alice"), password))
                 .isEqualTo(new WorkbenchActionGateway.LoginResult.SignedIn("alice"));
         assertThat(password.cleared()).isTrue();
         assertThat(repl.session().credential()).isEqualTo("jwt-alice");
@@ -4514,6 +4516,80 @@ class ReplTest {
                         manager.suggestions().getFirst().definition().id()))
                 .isPresent();
         assertThat(output.toString()).doesNotContain("pw");
+    }
+
+    @Test
+    void workbenchGatewayCreatesAContextThroughTheSharedManager(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+        ContextManager manager = new ContextManager(store);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        CommandLine commandLine = Cli.newCommandLine();
+        commandLine.setOut(new PrintWriter(new StringWriter()));
+        commandLine.setErr(new PrintWriter(new StringWriter()));
+        Repl repl = new Repl(
+                commandLine,
+                workspace,
+                client,
+                new ScriptedPrompter(),
+                name -> null,
+                new ContextResolver(store, name -> null),
+                null,
+                null,
+                manager);
+
+        assertThat(repl.workbenchActionGateway().createContext("dev", seed, true))
+                .isEqualTo(new WorkbenchActionGateway.ContextResult.Ready("dev", false));
+
+        assertThat(store.load().contexts()).containsOnlyKeys("dev");
+        assertThat(store.load().contexts().get("dev").seeds()).containsExactly(seed);
+        assertThat(store.load().lastContext()).isEqualTo("dev");
+        assertThat(repl.session().isConnected()).isTrue();
+        assertThat(repl.session().isAuthenticated()).isFalse();
+    }
+
+    @Test
+    void workbenchGatewayLogsIntoATemporaryConnectionWithoutCreatingAContext() {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.loginOutcome = new LoginOutcome.Success("jwt-alice");
+        Harness harness = harness(Path.of("tap-work"), client);
+        assertThat(harness.repl().connectForLaunch(seed.toString(), true)).isZero();
+        SecretBuffer password = new SecretBuffer();
+        password.append("pw");
+
+        assertThat(harness.repl().workbenchActionGateway().login(
+                new WorkbenchActionGateway.LoginRequest(Optional.empty(), "alice"), password))
+                .isEqualTo(new WorkbenchActionGateway.LoginResult.SignedIn("alice"));
+
+        assertThat(password.cleared()).isTrue();
+        assertThat(harness.repl().session().credential()).isEqualTo("jwt-alice");
+        assertThat(client.loginCalls)
+                .containsExactly("alice:pw@http://127.0.0.1:7900");
+        assertThat(harness.sink().toString()).doesNotContain("pw");
+    }
+
+    @Test
+    void workbenchGatewayConnectsAndLogsIntoATemporaryServerInOneTypedAction() {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.loginOutcome = new LoginOutcome.Success("jwt-alice");
+        Harness harness = harness(Path.of("tap-work"), client);
+        SecretBuffer password = new SecretBuffer();
+        password.append("pw");
+
+        assertThat(harness.repl().workbenchActionGateway().login(
+                new WorkbenchActionGateway.LoginRequest(Optional.of(seed), "alice"), password))
+                .isEqualTo(new WorkbenchActionGateway.LoginResult.SignedIn("alice"));
+
+        assertThat(password.cleared()).isTrue();
+        assertThat(harness.repl().session().landingNode()).isEqualTo(seed);
+        assertThat(harness.repl().session().credential()).isEqualTo("jwt-alice");
+        assertThat(client.loginCalls)
+                .containsExactly("alice:pw@http://127.0.0.1:7900");
+        assertThat(harness.sink().toString()).doesNotContain("pw", "connected to");
     }
 
     @Test

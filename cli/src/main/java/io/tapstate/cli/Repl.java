@@ -269,8 +269,13 @@ final class Repl {
             }
 
             @Override
-            public LoginResult login(String username, SecretBuffer password) {
-                return loginFromWorkbench(username, password);
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                return createWorkbenchContext(name, server, verifyTls);
+            }
+
+            @Override
+            public LoginResult login(LoginRequest request, SecretBuffer password) {
+                return loginFromWorkbench(request, password);
             }
         };
     }
@@ -323,16 +328,59 @@ final class Repl {
         }
     }
 
+    private synchronized WorkbenchActionGateway.ContextResult createWorkbenchContext(
+            String name, URI server, boolean verifyTls) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+        try {
+            contextManager.create(name, List.of(server), verifyTls);
+            return selectWorkbenchContext(name);
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+    }
+
     private synchronized WorkbenchActionGateway.LoginResult loginFromWorkbench(
-            String username, SecretBuffer password) {
+            WorkbenchActionGateway.LoginRequest request, SecretBuffer password) {
+        Objects.requireNonNull(request, "request");
         Objects.requireNonNull(password, "password");
-        if (authService == null || namedContext == null || machineToken != null) {
+        if (machineToken != null) {
             password.close();
             return new WorkbenchActionGateway.LoginResult.Unavailable();
         }
         try {
+            if (request.server().isPresent()) {
+                URI server = request.server().orElseThrow();
+                if (!controlPlane.isHealthy(server)) {
+                    return new WorkbenchActionGateway.LoginResult.Unreachable();
+                }
+                namedContext = null;
+                session.disconnect();
+                session.connect(List.of(server), server, controlPlane.serverVersion(server));
+            }
+            if (!session.isConnected()) {
+                return new WorkbenchActionGateway.LoginResult.Unavailable();
+            }
+            if (namedContext == null || authService == null) {
+                IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(session.seeds(), null);
+                return password.consume(secret -> switch (verified.withCredential(
+                        secret, (node, credential) -> controlPlane.login(
+                                node, request.username(), credential))) {
+                    case LoginOutcome.Success success -> {
+                        session.reland(verified.seed());
+                        session.authenticate(
+                                success.token(), request.username(), null, session.seeds());
+                        yield new WorkbenchActionGateway.LoginResult.SignedIn(request.username());
+                    }
+                    case LoginOutcome.Rejected rejected ->
+                            new WorkbenchActionGateway.LoginResult.Rejected(rejected.code());
+                    case LoginOutcome.Unreachable ignored ->
+                            new WorkbenchActionGateway.LoginResult.Unreachable();
+                });
+            }
             return password.consume(secret -> switch (authService.login(
-                    namedContext, username, secret, true)) {
+                    namedContext, request.username(), secret, true)) {
                 case AuthService.LoginResult.Success success -> {
                     AuthService.ActiveSession active = success.session();
                     session.connect(namedContext.definition().seeds(), active.seed(), null);
@@ -351,6 +399,8 @@ final class Repl {
             });
         } catch (RuntimeException unavailable) {
             return new WorkbenchActionGateway.LoginResult.Unavailable();
+        } finally {
+            password.close();
         }
     }
 

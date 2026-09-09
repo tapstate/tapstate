@@ -5,8 +5,13 @@ import dev.tamboui.layout.Rect;
 import dev.tamboui.style.Style;
 import dev.tamboui.terminal.Frame;
 import dev.tamboui.text.CharWidth;
+import dev.tamboui.text.Line;
+import dev.tamboui.text.Span;
+import dev.tamboui.widgets.block.Block;
+import dev.tamboui.widgets.block.BorderType;
+import dev.tamboui.widgets.block.Borders;
+import dev.tamboui.widgets.block.Title;
 
-import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -21,10 +26,10 @@ final class WorkbenchRenderer {
     private static final int MIN_WIDTH = 88;
     private static final int MIN_HEIGHT = 24;
     private static final int WIDE_WIDTH = 157;
-    private static final int TABS_Y = 5;
-    private static final int CONTENT_TITLE_Y = 7;
-    private static final int TABLE_HEADER_Y = 8;
-    private static final int TABLE_ROWS_Y = 9;
+    private static final int HEADER_Y = 0;
+    private static final int TAB_BADGES_Y = 1;
+    private static final int TAB_LABELS_Y = 2;
+    private static final int CONTENT_Y = 3;
     private static final WorkbenchTheme DEFAULT_THEME = WorkbenchTheme.dark();
 
     private WorkbenchRenderer() {
@@ -46,18 +51,18 @@ final class WorkbenchRenderer {
         }
 
         boolean wide = area.width() >= WIDE_WIDTH;
-        int notificationY = area.bottom() - 2;
         int footerY = area.bottom() - 1;
-        int visibleRows = Math.max(1, notificationY - (area.y() + TABLE_ROWS_Y));
         HeaderLayout header = renderHeaderAndTabs(frame, area, state, wide, theme);
-        List<RowHit> rowHits = renderContent(frame, area, state, wide, visibleRows, theme);
-        write(frame, area.x(), notificationY, notification(state), notificationStyle(state, theme), area);
+        Rect contentArea = new Rect(
+                area.x(), area.y() + CONTENT_Y, area.width(), footerY - (area.y() + CONTENT_Y));
+        ContentLayout content = renderContent(frame, contentArea, state, wide, theme);
         write(frame, area.x(), footerY, footer(state), theme.muted(), area);
         List<OverlayHit> overlayHits = state.overlay()
                 .map(overlay -> renderOverlay(frame, area, overlay, theme))
                 .orElseGet(List::of);
         return new RenderLayout(
-                false, wide, visibleRows, header.tabHits(), rowHits, header.actionHits(), overlayHits);
+                false, wide, content.visibleRows(), header.tabHits(), content.rowHits(),
+                header.actionHits(), overlayHits);
     }
 
     private static void renderTooSmall(Frame frame, Rect area, WorkbenchTheme theme) {
@@ -77,52 +82,67 @@ final class WorkbenchRenderer {
         WorkbenchSessionSnapshot session = state.snapshot()
                 .map(WorkbenchSnapshot::session)
                 .orElseGet(WorkbenchSessionSnapshot::empty);
-        String title = session.versions().isBlank()
-                ? "Tapstate workbench"
-                : "Tapstate workbench  " + session.versions();
-        write(frame, area.x(), area.y(), title, theme.title(), area);
-        write(frame, area.x(), area.y() + 1,
-                "Workspace: " + displayPath(session.workspaceRoot()), theme.base(), area);
-        String contextLine = "Context: " + displayContext(session)
-                        + separator(wide) + "Connection: " + words(session.connection())
-                        + separator(wide) + "Auth: " + words(session.authentication());
-        int contextWidth = write(frame, area.x(), area.y() + 2, contextLine, theme.info(), area);
-        write(frame, area.x(), area.y() + 3,
-                "Principal: " + session.principal().orElse("-")
-                        + separator(wide) + "Endpoint: " + session.landingNode().map(URI::toString).orElse("-"),
-                theme.base(), area);
-
         int x = area.x();
         List<TabHit> hits = new ArrayList<>();
         List<ActionHit> actions = new ArrayList<>();
+        x += write(frame, x, area.y() + HEADER_Y, " TapState", theme.title(), area);
+        x += write(frame, x, area.y() + HEADER_Y, "  ", theme.base(), area);
+        int contextX = x;
+        int contextWidth = write(frame, x, area.y() + HEADER_Y,
+                "ctx: " + session.contextName().orElse("-"), theme.info(), area);
+        x += contextWidth;
         if (contextWidth > 0) {
             actions.add(new ActionHit(
                     Launcher.CONTEXT,
-                    new Rect(area.x(), area.y() + 2, contextWidth, 1)));
+                    new Rect(contextX, area.y() + HEADER_Y, contextWidth, 1)));
         }
+        x += write(frame, x, area.y() + HEADER_Y,
+                "  " + connectionMarker(session.connection()) + " " + words(session.connection()),
+                connectionStyle(session.connection(), theme), area);
+        x += write(frame, x, area.y() + HEADER_Y,
+                "  workspace: " + displayPath(session.workspaceRoot()), theme.base(), area);
+        x += write(frame, x, area.y() + HEADER_Y, "  ", theme.base(), area);
+        int authX = x;
+        int authWidth = write(frame, x, area.y() + HEADER_Y,
+                "auth: " + displayAuthentication(session), authenticationStyle(session.authentication(), theme), area);
+        x += authWidth;
+        if (authWidth > 0) {
+            actions.add(new ActionHit(
+                    Launcher.AUTH,
+                    new Rect(authX, area.y() + HEADER_Y, authWidth, 1)));
+        }
+        if (!session.versions().isBlank()) {
+            write(frame, x, area.y() + HEADER_Y, "  " + session.versions(), theme.success(), area);
+        }
+
+        String divider = wide ? " | " : "|";
+        x = area.x();
         WorkbenchState.WorkbenchTab[] tabs = WorkbenchState.WorkbenchTab.values();
         for (int index = 0; index < tabs.length; index++) {
             WorkbenchState.WorkbenchTab tab = tabs[index];
-            String label = tabLabel(state, tab);
+            String label = tabLabel(tab);
+            String badge = tabBadge(state, tab);
+            if (!badge.isEmpty()) {
+                int badgeX = x + Math.max(0, (displayWidth(label) - displayWidth(badge)) / 2);
+                write(frame, badgeX, area.y() + TAB_BADGES_Y, badge, theme.info(), area);
+            }
             Style style = tab == state.selectedTab()
                     ? theme.accentBackground()
                     : theme.muted();
-            int width = write(frame, x, area.y() + TABS_Y, label, style, area);
+            int width = write(frame, x, area.y() + TAB_LABELS_Y, label, style, area);
             if (width > 0) {
-                hits.add(new TabHit(tab, new Rect(x, area.y() + TABS_Y, width, 1)));
+                hits.add(new TabHit(tab, new Rect(x, area.y() + TAB_LABELS_Y, width, 1)));
             }
             x += width;
-            if (index + 1 < tabs.length) {
-                x += write(frame, x, area.y() + TABS_Y, " | ", theme.muted(), area);
-            }
+            x += write(frame, x, area.y() + TAB_LABELS_Y, divider, theme.muted(), area);
         }
-        int separatorWidth = write(frame, x, area.y() + TABS_Y, " | ", theme.muted(), area);
-        int moreX = x + separatorWidth;
-        int moreWidth = write(frame, moreX, area.y() + TABS_Y, "0 More", theme.accent(), area);
+        int moreX = x;
+        String moreLabel = "📂  0 More ▾";
+        int moreWidth = write(frame, moreX, area.y() + TAB_LABELS_Y, moreLabel, theme.accent(), area);
         if (moreWidth > 0) {
             actions.add(new ActionHit(
                     Launcher.MORE,
-                    new Rect(moreX, area.y() + TABS_Y, moreWidth, 1)));
+                    new Rect(moreX, area.y() + TAB_LABELS_Y, moreWidth, 1)));
         }
         return new HeaderLayout(List.copyOf(hits), List.copyOf(actions));
     }
@@ -133,8 +153,9 @@ final class WorkbenchRenderer {
         int contentRows = switch (overlay) {
             case WorkbenchOverlayState.More ignored -> 3;
             case WorkbenchOverlayState.ContextPicker picker ->
-                    Math.max(3, Math.min(10, picker.contexts().size()) + 2);
-            case WorkbenchOverlayState.Login ignored -> 6;
+                    Math.max(4, Math.min(10, picker.contexts().size()) + 3);
+            case WorkbenchOverlayState.ContextCreate ignored -> 8;
+            case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
             case WorkbenchOverlayState.Help ignored -> 6;
         };
         int height = contentRows + 2;
@@ -154,6 +175,8 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.More more -> renderMore(frame, area, box, more, theme);
             case WorkbenchOverlayState.ContextPicker picker ->
                     renderContexts(frame, area, box, picker, theme);
+            case WorkbenchOverlayState.ContextCreate create ->
+                    renderContextCreate(frame, area, box, create, theme);
             case WorkbenchOverlayState.Login login -> renderLogin(frame, area, box, login, theme);
             case WorkbenchOverlayState.Help ignored -> renderHelp(frame, area, box, theme);
         };
@@ -162,7 +185,7 @@ final class WorkbenchRenderer {
     private static List<OverlayHit> renderMore(
             Frame frame, Rect area, Rect box, WorkbenchOverlayState.More more, WorkbenchTheme theme) {
         write(frame, box.x() + 2, box.y() + 1, "More", theme.title(), area);
-        List<String> entries = List.of("Context & Auth", "Help");
+        List<String> entries = List.of("Context", "Authentication", "Help");
         List<OverlayHit> hits = new ArrayList<>();
         for (int index = 0; index < entries.size(); index++) {
             String line = (index == more.selectedIndex() ? "> " : "  ") + entries.get(index);
@@ -181,11 +204,6 @@ final class WorkbenchRenderer {
             WorkbenchOverlayState.ContextPicker picker,
             WorkbenchTheme theme) {
         write(frame, box.x() + 2, box.y() + 1, "Choose context", theme.title(), area);
-        if (picker.contexts().isEmpty()) {
-            write(frame, box.x() + 2, box.y() + 2,
-                    "No saved contexts. Use tapstate context create first.", theme.warning(), area);
-            return List.of();
-        }
         List<OverlayHit> hits = new ArrayList<>();
         int visible = Math.min(10, picker.contexts().size());
         for (int index = 0; index < visible; index++) {
@@ -197,78 +215,156 @@ final class WorkbenchRenderer {
                     index == picker.selectedIndex() ? theme.selection() : theme.base(), area);
             hits.add(new OverlayHit(index, new Rect(box.x() + 2, rowY, width, 1)));
         }
+        int createIndex = picker.contexts().size();
+        int createY = box.y() + 2 + visible;
+        String createLine = (createIndex == picker.selectedIndex() ? "> " : "  ") + "+ New Context";
+        int createWidth = write(frame, box.x() + 2, createY, createLine,
+                createIndex == picker.selectedIndex() ? theme.selection() : theme.accent(), area);
+        hits.add(new OverlayHit(createIndex, new Rect(box.x() + 2, createY, createWidth, 1)));
         picker.message().ifPresent(message -> write(
                 frame, box.x() + 2, box.y() + box.height() - 2, message,
                 picker.pending() ? theme.info() : theme.warning(), area));
         return List.copyOf(hits);
     }
 
+    private static List<OverlayHit> renderContextCreate(
+            Frame frame,
+            Rect area,
+            Rect box,
+            WorkbenchOverlayState.ContextCreate create,
+            WorkbenchTheme theme) {
+        write(frame, box.x() + 2, box.y() + 1, "New Context", theme.title(), area);
+        write(frame, box.x() + 2, box.y() + 2,
+                marker(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.NAME)
+                        + "Name: " + create.name(),
+                fieldStyle(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.NAME, theme), area);
+        write(frame, box.x() + 2, box.y() + 3,
+                marker(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.SERVER)
+                        + "Server: " + create.server(),
+                fieldStyle(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.SERVER, theme), area);
+        write(frame, box.x() + 2, box.y() + 4,
+                marker(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS)
+                        + "Verify TLS: " + (create.verifyTls() ? "Yes" : "No"),
+                fieldStyle(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS, theme), area);
+        String hint = create.pending()
+                ? "Creating context..."
+                : create.stage() == WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS
+                        ? "Y/N or Space toggle  Enter create  Esc cancel"
+                        : "Enter next  Esc cancel";
+        write(frame, box.x() + 2, box.y() + 6, hint, theme.muted(), area);
+        create.message().ifPresent(message -> write(
+                frame, box.x() + 2, box.y() + 7, message, theme.error(), area));
+        return List.of();
+    }
+
+    private static String marker(
+            WorkbenchOverlayState.ContextCreate.Stage actual,
+            WorkbenchOverlayState.ContextCreate.Stage expected) {
+        return actual == expected ? "> " : "  ";
+    }
+
+    private static Style fieldStyle(
+            WorkbenchOverlayState.ContextCreate.Stage actual,
+            WorkbenchOverlayState.ContextCreate.Stage expected,
+            WorkbenchTheme theme) {
+        return actual == expected ? theme.selection() : theme.base();
+    }
+
     private static List<OverlayHit> renderLogin(
             Frame frame, Rect area, Rect box, WorkbenchOverlayState.Login login, WorkbenchTheme theme) {
         write(frame, box.x() + 2, box.y() + 1,
                 "Sign in to " + login.contextName(), theme.title(), area);
-        write(frame, box.x() + 2, box.y() + 2,
+        boolean transientLogin = transientLogin(login);
+        int usernameY = box.y() + (transientLogin ? 3 : 2);
+        int passwordY = usernameY + 1;
+        int hintY = passwordY + 1;
+        int messageY = hintY + 1;
+        if (transientLogin) {
+            write(frame, box.x() + 2, box.y() + 2,
+                    (login.stage() == WorkbenchOverlayState.Login.Stage.SERVER ? "> " : "  ")
+                            + "Server: " + login.server(),
+                    login.stage() == WorkbenchOverlayState.Login.Stage.SERVER
+                            ? theme.selection() : theme.base(), area);
+        }
+        write(frame, box.x() + 2, usernameY,
                 (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME ? "> " : "  ")
                         + "Username: " + login.username(),
                 login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME
                         ? theme.selection() : theme.base(), area);
-        write(frame, box.x() + 2, box.y() + 3,
+        write(frame, box.x() + 2, passwordY,
                 (login.stage() == WorkbenchOverlayState.Login.Stage.PASSWORD ? "> " : "  ")
                         + "Password: " + login.password().mask(),
                 login.stage() == WorkbenchOverlayState.Login.Stage.PASSWORD
                         ? theme.selection() : theme.base(), area);
         String hint = login.pending()
                 ? "Signing in..."
-                : login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME
+                : login.stage() != WorkbenchOverlayState.Login.Stage.PASSWORD
                         ? "Enter next  Esc cancel"
                         : "Enter sign in  Esc cancel";
-        write(frame, box.x() + 2, box.y() + 4, hint, theme.muted(), area);
+        write(frame, box.x() + 2, hintY, hint, theme.muted(), area);
         login.message().ifPresent(message -> write(
-                frame, box.x() + 2, box.y() + 5, message, theme.error(), area));
+                frame, box.x() + 2, messageY, message, theme.error(), area));
         return List.of();
+    }
+
+    private static boolean transientLogin(WorkbenchOverlayState.Login login) {
+        return login.stage() == WorkbenchOverlayState.Login.Stage.SERVER || !login.server().isBlank();
     }
 
     private static List<OverlayHit> renderHelp(
             Frame frame, Rect area, Rect box, WorkbenchTheme theme) {
         write(frame, box.x() + 2, box.y() + 1, "Help", theme.title(), area);
         write(frame, box.x() + 2, box.y() + 2, "1-4 switch views", theme.base(), area);
-        write(frame, box.x() + 2, box.y() + 3, "c choose context or sign in", theme.base(), area);
+        write(frame, box.x() + 2, box.y() + 3, "c context   a authentication", theme.base(), area);
         write(frame, box.x() + 2, box.y() + 4,
                 "r refresh   q quit   Esc close", theme.base(), area);
         return List.of();
     }
 
-    private static List<RowHit> renderContent(
+    private static ContentLayout renderContent(
             Frame frame,
             Rect area,
             WorkbenchState state,
             boolean wide,
-            int visibleRows,
             WorkbenchTheme theme) {
-        write(frame, area.x(), area.y() + CONTENT_TITLE_Y,
-                state.selectedTab().label(), theme.title(), area);
+        Block block = Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(theme.accent())
+                .title(Title.from(Line.from(Span.styled(
+                        " " + state.selectedTab().label() + " ", theme.title()))))
+                .build();
+        frame.renderWidget(block, area);
+        Rect inner = block.inner(area);
+        int visibleRows = Math.max(1, inner.height() - 2);
         if (state.snapshot().isEmpty()) {
-            write(frame, area.x(), area.y() + TABLE_ROWS_Y,
-                    state.selectedTab().emptyMessage(), theme.base(), area);
-            return List.of();
+            write(frame, inner.x(), inner.y(), state.selectedTab().emptyMessage(), theme.base(), inner);
+            write(frame, inner.x(), inner.bottom() - 1,
+                    notification(state), notificationStyle(state, theme), inner);
+            return new ContentLayout(List.of(), visibleRows);
         }
 
         WorkbenchSnapshot snapshot = state.snapshot().orElseThrow();
+        List<RowHit> rowHits;
         if (state.selectedTab() == WorkbenchState.WorkbenchTab.OVERVIEW) {
-            renderOverview(frame, area, snapshot.overview(), theme);
-            return List.of();
+            renderOverview(frame, inner, snapshot.overview(), theme);
+            rowHits = List.of();
+        } else {
+            List<WorkbenchArtifactRow> rows = rows(snapshot, state.selectedTab());
+            WorkbenchTableState table = table(state, state.selectedTab());
+            rowHits = renderTable(
+                    frame, inner, state.selectedTab(), rows, table, wide, visibleRows, theme);
         }
-        List<WorkbenchArtifactRow> rows = rows(snapshot, state.selectedTab());
-        WorkbenchTableState table = table(state, state.selectedTab());
-        return renderTable(frame, area, state.selectedTab(), rows, table, wide, visibleRows, theme);
+        write(frame, inner.x(), inner.bottom() - 1,
+                notification(state), notificationStyle(state, theme), inner);
+        return new ContentLayout(rowHits, visibleRows);
     }
 
     private static void renderOverview(
             Frame frame, Rect area, WorkbenchOverviewSnapshot overview, WorkbenchTheme theme) {
-        write(frame, area.x(), area.y() + TABLE_HEADER_Y,
-                "Resources", theme.label().bold(), area);
-        int rowsY = area.y() + TABLE_ROWS_Y;
-        int summaryY = area.bottom() - 5;
+        write(frame, area.x(), area.y(), "Resources", theme.label().bold(), area);
+        int rowsY = area.y() + 1;
+        int summaryY = area.bottom() - 4;
         int kindCapacity = Math.max(1, summaryY - rowsY);
         boolean overflow = overview.kinds().size() > kindCapacity;
         int visibleKinds = Math.min(
@@ -312,11 +408,11 @@ final class WorkbenchRenderer {
             int visibleRows,
             WorkbenchTheme theme) {
         Columns columns = Columns.forWidth(area.width(), wide);
-        write(frame, area.x(), area.y() + TABLE_HEADER_Y,
+        write(frame, area.x(), area.y(),
                 columns.format("KIND", "IDENTIFIER", "ALIGNMENT", "LOCAL", "REMOTE"),
                 theme.label().bold(), area);
         if (rows.isEmpty()) {
-            write(frame, area.x(), area.y() + TABLE_ROWS_Y,
+            write(frame, area.x(), area.y() + 1,
                     emptyRowsMessage(tab), theme.base(), area);
             return List.of();
         }
@@ -340,7 +436,7 @@ final class WorkbenchRenderer {
                     words(row.alignment()),
                     localMarker(row),
                     remoteMarker(row));
-            int y = area.y() + TABLE_ROWS_Y + index - scroll;
+            int y = area.y() + 1 + index - scroll;
             Style style = index == selected ? theme.selection() : theme.base();
             int width = write(frame, area.x(), y, line, style, area);
             if (width > 0) {
@@ -383,16 +479,25 @@ final class WorkbenchRenderer {
                 && state.snapshot()
                         .map(snapshot -> !rows(snapshot, state.selectedTab()).isEmpty())
                         .orElse(false);
-        return "1-4 views  c context  0 more"
+        return "1-4 views  c context  a auth  0 more"
                 + (hasSelectableRows ? "  Up/Down select" : "")
                 + "  r refresh  q quit";
     }
 
-    private static String tabLabel(WorkbenchState state, WorkbenchState.WorkbenchTab tab) {
+    private static String tabLabel(WorkbenchState.WorkbenchTab tab) {
+        return switch (tab) {
+            case OVERVIEW -> "🌊  1 Overview";
+            case WORKSPACE -> "📁  2 Workspace";
+            case SOURCES -> "🔌  3 Sources";
+            case PIPELINES -> "🔀  4 Pipelines";
+        };
+    }
+
+    private static String tabBadge(WorkbenchState state, WorkbenchState.WorkbenchTab tab) {
         if (tab == WorkbenchState.WorkbenchTab.OVERVIEW) {
-            return tab.displayLabel();
+            return "";
         }
-        String badge = state.snapshot().map(snapshot -> switch (tab) {
+        String count = state.snapshot().map(snapshot -> switch (tab) {
             case OVERVIEW -> "";
             case WORKSPACE -> Integer.toString(snapshot.workspace().rows().size());
             case SOURCES -> snapshot.sources().remoteState() instanceof WorkbenchRemoteState.Available
@@ -402,7 +507,7 @@ final class WorkbenchRenderer {
                     ? Integer.toString(snapshot.pipelines().rows().size())
                     : "?";
         }).orElse("?");
-        return tab.displayLabel() + " [" + badge + ']';
+        return "(" + count + ")";
     }
 
     private static Style notificationStyle(WorkbenchState state, WorkbenchTheme theme) {
@@ -476,12 +581,25 @@ final class WorkbenchRenderer {
         };
     }
 
-    private static String displayContext(WorkbenchSessionSnapshot session) {
-        if (session.contextName().isEmpty()) {
-            return "-";
-        }
-        String source = session.contextSource().map(WorkbenchRenderer::words).orElse("unknown");
-        return session.contextName().orElseThrow() + " (" + source + ')';
+    private static String connectionMarker(WorkbenchConnection connection) {
+        return connection == WorkbenchConnection.CONNECTED ? "●" : "○";
+    }
+
+    private static Style connectionStyle(WorkbenchConnection connection, WorkbenchTheme theme) {
+        return connection == WorkbenchConnection.CONNECTED ? theme.success() : theme.warning();
+    }
+
+    private static String displayAuthentication(WorkbenchSessionSnapshot session) {
+        return session.principal().orElseGet(() -> words(session.authentication()));
+    }
+
+    private static Style authenticationStyle(
+            WorkbenchAuthentication authentication, WorkbenchTheme theme) {
+        return switch (authentication) {
+            case SIGNED_IN, MACHINE -> theme.success();
+            case SIGNED_OUT -> theme.warning();
+            case NOT_APPLICABLE -> theme.muted();
+        };
     }
 
     private static String displayPath(Path path) {
@@ -495,10 +613,6 @@ final class WorkbenchRenderer {
             return fileName == null ? "-" : fileName.toString();
         }
         return normalized.toString();
-    }
-
-    private static String separator(boolean wide) {
-        return wide ? " | " : "  ";
     }
 
     private static String words(Enum<?> value) {
@@ -623,6 +737,7 @@ final class WorkbenchRenderer {
 
     enum Launcher {
         CONTEXT,
+        AUTH,
         MORE
     }
 
@@ -643,6 +758,12 @@ final class WorkbenchRenderer {
     }
 
     private record HeaderLayout(List<TabHit> tabHits, List<ActionHit> actionHits) {
+    }
+
+    private record ContentLayout(List<RowHit> rowHits, int visibleRows) {
+        private ContentLayout {
+            rowHits = List.copyOf(rowHits);
+        }
     }
 
     private record Columns(

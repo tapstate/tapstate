@@ -1,7 +1,9 @@
 package io.tapstate.cli;
 
+import java.net.URI;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /** Typed activation boundary used by the workbench without routing through command text. */
 interface WorkbenchActionGateway {
@@ -10,11 +12,20 @@ interface WorkbenchActionGateway {
 
     ContextResult selectContext(String name);
 
-    LoginResult login(String username, SecretBuffer password);
+    ContextResult createContext(String name, URI server, boolean verifyTls);
+
+    LoginResult login(LoginRequest request, SecretBuffer password);
 
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
             Objects.requireNonNull(name, "name");
+        }
+    }
+
+    record LoginRequest(Optional<URI> server, String username) {
+        public LoginRequest {
+            Objects.requireNonNull(server, "server");
+            Objects.requireNonNull(username, "username");
         }
     }
 

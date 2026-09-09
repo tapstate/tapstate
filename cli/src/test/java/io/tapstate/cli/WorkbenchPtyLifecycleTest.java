@@ -24,7 +24,7 @@ class WorkbenchPtyLifecycleTest {
             assertThat(count(pty.transcript(), ENTER_ALTERNATE_SCREEN)).isEqualTo(1);
 
             pty.resize(88, 24);
-            pty.awaitText("Tapstate workbench", SCREEN_TIMEOUT);
+            pty.awaitText("TapState", SCREEN_TIMEOUT);
 
             assertThat(pty.jvmPid()).isEqualTo(originalJvm);
             assertThat(count(pty.transcript(), ENTER_ALTERNATE_SCREEN)).isEqualTo(1);
