@@ -171,6 +171,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: upgrade-failure-scenes
-          path: e2e/target/failure-scenes/
+          # The upgraded server's own log, as well as any scene a witness wrote. Everything this lane
+          # can fail on reaches maven as "the row never arrived", which names no cause at all: the
+          # refusal that stopped the pipeline is only ever in the server's log, and that log is in a
+          # temporary directory the run throws away. Read once with nothing here, this lane costs a
+          # local reproduction to learn anything from.
+          path: |
+            e2e/target/failure-scenes/
+            /tmp/tapstate-e2e-server*/server.out
           if-no-files-found: ignore
           retention-days: 7
