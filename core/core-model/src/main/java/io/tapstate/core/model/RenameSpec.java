@@ -5,7 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Sink-side table rename (ADR-0016 §8, X4): explicit per-table map (highest priority)
+ * Sink-side table rename (§8, X4): explicit per-table map (highest priority)
  * plus bulk rules; application order = case first, then literal prefix/suffix.
  */
 @Doc("Sink-side table rename rules: an explicit per-table name map plus bulk case and prefix/suffix transforms.")

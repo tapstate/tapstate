@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * One {@code serve.sync} element — table-model write to an external store (ADR-0016 §8).
+ * One {@code serve.sync} element — table-model write to an external store (§8).
  * {@code source} references a {@code kind: source} connection supplier (X18); the element
  * never carries connector/config. An id is only required when referenced by
  * {@code query[].backend} (validate-layer rule).

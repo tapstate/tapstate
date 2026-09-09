@@ -7,6 +7,7 @@ import io.tapstate.spi.store.ObservationStore;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The pipeline observation read side: the three store-backed read faces — status / metrics / snapshot —
@@ -40,6 +41,13 @@ public final class PipelineObservationQueryService {
     public PipelineStatus status(String pipelineId) {
         Observation observation = require(pipelineId);
         return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure());
+    }
+
+    /** Returns the latest status when an observation exists, without turning an unobserved pipeline into an error. */
+    public Optional<PipelineStatus> findStatus(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return observations.read(pipelineId)
+                .map(observation -> new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure()));
     }
 
     /** The pipeline's open map of run statistics plus its per-table source positions. */

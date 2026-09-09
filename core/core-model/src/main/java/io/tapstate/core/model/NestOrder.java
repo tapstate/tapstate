@@ -1,6 +1,6 @@
 package io.tapstate.core.model;
 
-/** Nest event-processing order (ADR-0016 §5.1). */
+/** Nest event-processing order (§5.1). */
 @Doc("Order in which a nest transform processes main and sub-table change events.")
 public enum NestOrder {
     @Doc("Process the main-table event before its related sub-table events.")

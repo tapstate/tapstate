@@ -3,7 +3,7 @@ package io.tapstate.core.model;
 import java.util.Objects;
 
 /**
- * One {@code serve.query} element (ADR-0016 §8). No {@code backend} = parallel egress
+ * One {@code serve.query} element (§8). No {@code backend} = parallel egress
  * from the view store (A); {@code backend: <sync-id>} = API on sink (B).
  */
 @Doc("One query exposed by a serve resource, either parallel egress from the view store or an API served on a sink.")

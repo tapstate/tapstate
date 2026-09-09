@@ -17,7 +17,7 @@ import java.util.stream.Collectors;
 
 /**
  * Connector capability-matrix validation (plan poc1 C3) — the offline tier that consults the
- * connector catalog (ADR-0019 §3.3: structural + in-batch reference + capability matrix over
+ * connector catalog (structural + in-batch reference + capability matrix over
  * bundled ∪ cache). The catalog is the build-time projection of each connector's own spec, so the
  * connector's legal modes and config schema are looked up per connector — nothing here hard-codes
  * connector knowledge.
@@ -25,7 +25,7 @@ import java.util.stream.Collectors;
  * <p>Scope is the offline projection:
  * <ul>
  *   <li>a connector absent from the catalog is skipped — its registration is authoritative only on
- *       the server (ADR-0019 §3.3), so offline cannot reject an unknown connector;</li>
+ *       the server, so offline cannot reject an unknown connector;</li>
  *   <li>mode × connector legality: a source's {@code mode}, when present, must be one of the
  *       connector's declared modes (a write-target supplier has no {@code mode} and is skipped);</li>
  *   <li>config field type / enum: each <em>provided</em> config value is checked against the

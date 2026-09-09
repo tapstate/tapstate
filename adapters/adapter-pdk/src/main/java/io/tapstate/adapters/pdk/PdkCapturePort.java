@@ -18,6 +18,8 @@ import io.tapdata.entity.event.TapBaseEvent;
 import io.tapdata.entity.event.TapEvent;
 import io.tapdata.entity.event.control.ControlEvent;
 import io.tapdata.entity.schema.TapTable;
+import io.tapdata.entity.utils.InstanceFactory;
+import io.tapdata.entity.utils.JsonParser;
 import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVReadOnlyMap;
@@ -387,7 +389,9 @@ public final class PdkCapturePort implements CapturePort {
                     }
                     listener.onBatch(decoded, position(connector, offset));
                 });
-                stream.streamRead(connector.context(), config.streams(), startOffset, BATCH_SIZE, consumer);
+                Object readerOffset = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
+                        connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
+                stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
                 return null;
             });
         } catch (Throwable t) {

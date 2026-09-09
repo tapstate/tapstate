@@ -8,7 +8,7 @@ import java.util.Objects;
 
 /**
  * {@code kind: source} — independent collection/mining resource owning connection config
- * and (for CDC) the SRS (ADR-0016 §3/§4). Dual role (X18): when referenced purely as a
+ * and (for CDC) the SRS (§3/§4). Dual role (X18): when referenced purely as a
  * connection supplier by sync/push elements, {@code mode}/{@code tables} may be absent;
  * conditional requiredness is a validate-layer rule.
  */
