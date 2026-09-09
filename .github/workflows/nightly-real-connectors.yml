@@ -107,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [shard-1, shard-2, shard-3, shard-4]
+        shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]
     env:
       SHARD: ${{ matrix.shard }}
     steps:
@@ -154,6 +154,7 @@ jobs:
             e2e/target/failure-scenes/
             e2e/target/failsafe-reports/
             e2e/target/witness-ledger.txt
+            e2e/target/witness-ledgers/
           if-no-files-found: ignore
           retention-days: 7
 
@@ -188,5 +189,6 @@ jobs:
           path: |
             e2e/target/failsafe-reports/
             e2e/target/witness-ledger.txt
+            e2e/target/witness-ledgers/
           if-no-files-found: error
           retention-days: 7

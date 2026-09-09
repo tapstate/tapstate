@@ -21,7 +21,7 @@ def check(text):
     assert 'SHARD_RESULT: ${{ needs.connector-witnesses.result }}' in aggregate
     assert 'run: test "$SHARD_RESULT" = success' in aggregate
     assert 'run: .github/scripts/witness-gate.sh' in aggregate
-    assert 'shard: [shard-1, shard-2, shard-3, shard-4]' in witness and 'fail-fast: false' in witness
+    assert 'shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]' in witness and 'fail-fast: false' in witness
     assert 'needs: [connector-plan, connector-jars]' in witness
     assert '-DskipTests install' in witness and '-Dmaven.repo.local="$RUNNER_TEMP/m2"' in witness
     assert 'connector-witnesses.sh run --plan' in witness and 'connector-witnesses.sh pack --plan' in witness
@@ -48,7 +48,7 @@ for before,after in [
     ('  real-connectors:', '  real-connectors-renamed:'),
     ('    if: always()', '    if: success()'),
     ('connector-witnesses.sh verify --plan','true # connector-witnesses.sh verify --plan'),
-    ('shard: [shard-1, shard-2, shard-3, shard-4]','shard: [shard-1, shard-2, shard-3]'),
+    ('shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]','shard: [shard-1, shard-2, shard-3]'),
     ('connector-cache.sh verify','connector-cache.sh key'),
     ('path: ${{ runner.temp }}/connector-m2/io/tapdata', 'path: ~/.m2/repository'),
     ('pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-', 'pdk-inputs-${{ runner.os }}-')]:

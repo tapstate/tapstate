@@ -5,7 +5,6 @@ from collections import Counter
 import fnmatch
 import hashlib
 import importlib.util
-import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,13 +21,30 @@ spec.loader.exec_module(shards)
 # This is the only pattern list. Duration hints never determine membership.
 SELECTOR = 'PublishedExamplesIT,RealMysqlToMongo*IT,Nest*IT,DataBrowser*IT,Watch*IT,AnObjectIdReadsBackTheSameThroughBothFacesIT,SinkValueRoundTripIT'
 LEDGER = Path('e2e/target/witness-ledger.txt')
+TIERS = ('IN_PROCESS', 'REAL_PROCESS')
+LEDGERS = Path('e2e/target/witness-ledgers')
+MARKER = 'tapstate.published-case='
 
 
 def inventory(root):
     patterns = SELECTOR.split(',')
-    return [test for test in shards.discover(root)
-            if test['module'] == 'e2e' and test['kind'] == 'it'
-            and any(fnmatch.fnmatchcase(test['class'].rsplit('.', 1)[-1], pattern) for pattern in patterns)]
+    result = []
+    for test in shards.discover(root):
+        if test['module'] != 'e2e' or test['kind'] != 'it' or not any(
+                fnmatch.fnmatchcase(test['class'].rsplit('.', 1)[-1], p) for p in patterns):
+            continue
+        if test['class'].endswith('.PublishedExamplesIT'):
+            examples = sorted((root / 'e2e/examples').rglob('*.e2e.yml'))
+            shards.require(examples, 'no published example specifications discovered')
+            for example in examples:
+                result.append(dict(test, example=example.relative_to(root / 'e2e').as_posix()))
+        else:
+            result.append(test)
+    return result
+
+
+def expected_cases(tests):
+    return Counter(t['example'] + ' on ' + tier for t in tests if 'example' in t for tier in TIERS)
 
 
 def engine(command, args, *extra):
@@ -37,6 +53,7 @@ def engine(command, args, *extra):
 
 def strict_reports(root, selected):
     counts = Counter()
+    identities = Counter()
     for report in (root / 'e2e/target/failsafe-reports').glob('TEST-*.xml'):
         suite = ET.parse(report).getroot()
         name = suite.get('name', '').split('$', 1)[0]
@@ -45,8 +62,23 @@ def strict_reports(root, selected):
         cases = suite.findall('testcase')
         shards.require(int(suite.get('tests', '0')) == len(cases), 'witness testcase count differs: ' + name)
         counts[name] += len(cases)
+        if name.endswith('.PublishedExamplesIT'):
+            for case in cases:
+                markers = [line[len(MARKER):] for output in case.findall('system-out')
+                           for line in (output.text or '').splitlines() if line.startswith(MARKER)]
+                shards.require(len(markers) == 1, 'Published testcase needs exactly one execution identity')
+                identities[markers[0]] += 1
     for test in selected['tests']:
         shards.require(counts[test['class']] > 0, 'real witness executed no tests: ' + test['class'])
+    shards.require(identities == expected_cases(selected['tests']), 'Published testcase identities differ from assignment')
+    return identities
+
+
+def shard_ledger(path, tests):
+    shards.require(path.is_file() and not path.is_symlink(), 'missing witness ledger')
+    actual = Counter(path.read_text().splitlines())
+    shards.require(actual == expected_cases(tests), 'witness ledger differs from assignment')
+    return actual
 
 
 def ledger_check(root, path):
@@ -91,43 +123,62 @@ def main():
             source = Path(tmp) / 'inventory.json'
             shards.write(source, inventory(args.root))
             extra = ['--durations', args.durations] if args.durations else []
-            engine('plan', args, '--inventory', source, '--count', '4', '--output', args.output, *extra)
+            engine('plan', args, '--inventory', source, '--count', '10', '--output', args.output, *extra)
         return
     plan = shards.load_plan(args, args.root)
     shards.require(plan['selection'] == 'inventory' and plan['cohort_hash'] == shards.cohort(inventory(args.root)),
                    'connector pattern cohort differs from plan')
-    shards.require(len(plan['shards']) == 4, 'connector lane requires four shards')
-    sweep = [s for s in plan['shards'] if any(t['class'].endswith('.PublishedExamplesIT') for t in s['tests'])]
-    shards.require(len(sweep) == 1, 'example sweep must occur in exactly one shard')
+    shards.require(len(plan['shards']) == 10, 'connector lane requires ten shards')
     if args.command == 'run':
         (args.root / LEDGER).unlink(missing_ok=True)
+        shutil.rmtree(args.root / LEDGERS, ignore_errors=True)
         engine('run', args, '--plan', args.plan, '--shard', args.shard, '--repo-local', args.repo_local)
     elif args.command == 'pack':
         selected = shards.selected(plan, args.shard)
         strict_reports(args.root, selected)
-        if selected == sweep[0]:
-            ledger_check(args.root, args.root / LEDGER)
+        paths = list((args.root / LEDGERS).glob('*'))
+        has_examples = bool(expected_cases(selected['tests']))
+        shards.require(not (args.root / LEDGER).exists(), 'unexpected legacy ledger in a connector shard')
+        shards.require(len(paths) == int(has_examples), 'unexpected sweep JVM ledger set')
+        if has_examples:
+            shard_ledger(paths[0], selected['tests'])
         engine('pack', args, '--plan', args.plan, '--shard', args.shard, '--output', args.output)
-        if selected == sweep[0]:
+        if has_examples:
             path = Path(args.output) / 'witness-ledger.txt'
-            shutil.copyfile(args.root / LEDGER, path)
+            shutil.copyfile(paths[0], path)
             shards.write(Path(args.output) / 'ledger.json', dict(source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
                          shard_id=args.shard, sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
     else:
+        all_cases = Counter()
+        all_ledgers = Counter()
         for selected in plan['shards']:
             directory = args.artifacts / selected['id']
-            allowed = {'files', 'manifest.json'} | ({'witness-ledger.txt', 'ledger.json'} if selected == sweep[0] else set())
-            shards.require(directory.is_dir() and {p.name for p in directory.iterdir()} == allowed,
+            has_examples = bool(expected_cases(selected['tests']))
+            allowed = {'files', 'manifest.json'} | ({'witness-ledger.txt', 'ledger.json'} if has_examples else set())
+            shards.require(directory.is_dir() and not directory.is_symlink()
+                           and {p.name for p in directory.iterdir()} == allowed,
                            'connector shard evidence differs: ' + selected['id'])
-            strict_reports(directory / 'files', selected)
-        directory = args.artifacts / sweep[0]['id']
-        ledger = directory / 'witness-ledger.txt'
-        shards.require(shards.read(directory / 'ledger.json') == dict(source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
-                       shard_id=sweep[0]['id'], sha256=hashlib.sha256(ledger.read_bytes()).hexdigest()), 'ledger identity differs')
-        ledger_check(args.root, ledger)
-        engine('verify', args, '--plan', args.plan, '--artifacts', args.artifacts, '--restore', args.restore)
-        (args.restore / LEDGER).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(ledger, args.restore / LEDGER)
+            all_cases.update(strict_reports(directory / 'files', selected))
+            if has_examples:
+                ledger = directory / 'witness-ledger.txt'
+                all_ledgers.update(shard_ledger(ledger, selected['tests']))
+                shards.require(shards.read(directory / 'ledger.json') == dict(source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
+                               shard_id=selected['id'], sha256=hashlib.sha256(ledger.read_bytes()).hexdigest()), 'ledger identity differs')
+        expected = expected_cases(inventory(args.root))
+        shards.require(all_cases == expected and all_ledgers == expected, 'global Published case or ledger multiset differs')
+        # The existing release gate still consumes its original manifest vocabulary.
+        # Keep every occurrence through translation; no set conversion can hide a duplicate.
+        legacy = []
+        for identity in all_ledgers.elements():
+            example, tier = identity.rsplit(' on ', 1)
+            legacy.append(Path(example).parent.name + ' on ' + tier)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / 'witness-ledger.txt'
+            ledger.write_text(''.join(line + '\n' for line in sorted(legacy)))
+            ledger_check(args.root, ledger)
+            engine('verify', args, '--plan', args.plan, '--artifacts', args.artifacts, '--restore', args.restore)
+            (args.restore / LEDGER).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ledger, args.restore / LEDGER)
 
 
 if __name__ == '__main__':

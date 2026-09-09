@@ -123,7 +123,8 @@ class PublishedExamplesIT {
     }
 
     static Stream<Arguments> everyPublishedExampleOnEveryTier() {
-        return Examples.specifications().stream()
+        return PublishedExampleSelection.select(Examples.specifications(),
+                        System.getProperty(PublishedExampleSelection.PROPERTY)).stream()
                 .flatMap(specification -> Stream.of(Tiers.values())
                         .map(tier -> Arguments.of(specification, tier)));
     }
@@ -131,6 +132,7 @@ class PublishedExamplesIT {
     @ParameterizedTest(name = "{0} on {1}")
     @MethodSource("everyPublishedExampleOnEveryTier")
     void thePublishedExampleRuns(Path specification, Tiers tier) {
+        PublishedExampleSelection.reportIdentity(specification, tier);
         Path workspace = specification.getParent();
         Envelope envelope = EnvelopeParser.parse(Examples.read(specification));
 
@@ -180,7 +182,7 @@ class PublishedExamplesIT {
         // Last line on purpose: the ledger vouches only for a run that held every assertion above,
         // including the independent read. The release gate reads absence from it, so nothing may be
         // recorded on a path that can be reached without the assertions.
-        WitnessLedger.record(workspace.getFileName().toString(), tier);
+        WitnessLedger.record(specification, tier);
     }
 
     /**

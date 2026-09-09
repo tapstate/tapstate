@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Source discovery, longest-first balancing, and fail-closed shard artifact admission."""
 import argparse
+import copy
 from collections import Counter
 import fnmatch
 import hashlib
@@ -29,6 +30,10 @@ def write(path, value):
 
 
 def key(test):
+    return class_key(test) + ((test['example'],) if 'example' in test else ())
+
+
+def class_key(test):
     return test['module'], test['kind'], test['class']
 
 
@@ -103,7 +108,9 @@ def balance(tests, count, hints):
     bins = [[] for _ in range(count)]
     totals = [0.0] * count
     def duration(test):
-        value = hints.get(test['module'] + '/' + test['class'], hints.get(test['class'], 1.0))
+        identity = test['class'] + ('#' + test['example'] if 'example' in test else '')
+        # New source-discovered units join automatically with a one-second fallback weight.
+        value = hints.get(test['module'] + '/' + identity, hints.get(identity, 1.0))
         require(isinstance(value, (float, int)) and value >= 0, 'invalid duration hint')
         return float(value)
     for test in sorted(tests, key=lambda t: (-duration(t), key(t))):
@@ -135,7 +142,7 @@ def make_plan(args, root):
                 shards=[dict(id=name, tests=ts, estimated_seconds=round(total, 3), required_exec=execs(ts))
                         for name, ts, total in groups])
     write(args.output, plan)
-    print('planned ' + str(len(tests)) + ' source-selected classes across ' + str(len(groups)) + ' shards')
+    print('planned ' + str(len(tests)) + ' source-selected units across ' + str(len(groups)) + ' shards')
 
 
 def load_plan(args, root):
@@ -148,7 +155,14 @@ def load_plan(args, root):
     if plan['selection'] == 'default-reactor':
         require(cohort(discover(root)) == plan['cohort_hash'], 'source-selected cohort differs from plan')
     else:
-        require(set(key(t) for t in tests) <= set(key(t) for t in discover(root)), 'inventory contains unselected source classes')
+        require(set(class_key(t) for t in tests) <= set(class_key(t) for t in discover(root)), 'inventory contains unselected source classes')
+        for test in tests:
+            if 'example' in test:
+                example = safe_path(test['example'])
+                require(test['class'].endswith('.PublishedExamplesIT') and test['module'] == 'e2e'
+                        and test['kind'] == 'it' and example.parts[0] == 'examples'
+                        and example.name.endswith('.e2e.yml') and (root / 'e2e' / example).is_file(),
+                        'invalid example scheduling unit')
     ids = [s['id'] for s in plan['shards']]
     require(len(set(ids)) == len(ids), 'duplicate shard ID')
     for shard in plan['shards']:
@@ -185,6 +199,10 @@ def run_shard(args, root, plan):
     # Selectors span several modules. Exact admission below catches any missing class;
     # Maven must permit the modules in which a selector has no local match.
     command += ['-Dsurefire.failIfNoSpecifiedTests=false', '-Dfailsafe.failIfNoSpecifiedTests=false']
+    examples = [t['example'] for t in shard['tests'] if 'example' in t]
+    if examples:
+        command += ['-Dtapstate.e2e.published-examples=' + ','.join(examples),
+                    '-DforkCount=1', '-DreuseForks=true', '-Djunit.jupiter.execution.parallel.enabled=false']
     subprocess.run(command, cwd=root, check=True)
 
 
@@ -223,7 +241,7 @@ def reports(root, shard):
                 statistics['skipped'] += skipped
                 statistics['zero_case_classes'] += int(count == 0)
                 paths.append(path)
-    expected = {key(t) for t in shard['tests']}
+    expected = {class_key(t) for t in shard['tests']}
     require(actual == expected, 'report class set differs: missing=' + str(sorted(expected - actual)) + ' extra=' + str(sorted(actual - expected)))
     for test in shard['tests']:
         compiled = root / test['module'] / 'target/test-classes' / (test['class'].replace('.', '/') + '.class')
@@ -254,7 +272,7 @@ def pack(args, root, plan):
                                         statistics=statistics, report_classes=report_classes,
                                         files={p.relative_to(files).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                                                for p in sorted(files.rglob('*')) if p.is_file()}))
-    print('packed ' + shard['id'] + ': ' + str(len(shard['tests'])) + ' source-selected classes')
+    print('packed ' + shard['id'] + ': ' + str(len(shard['tests'])) + ' source-selected units')
 
 
 def verify(args, root, plan):
@@ -292,6 +310,7 @@ def verify(args, root, plan):
         admitted.append((shard, files))
     # Nothing reaches the restored tree until all shards passed admission.
     destination = Path(args.restore)
+    shared_reports = {}
     for shard, files in admitted:
         for path in sorted(files.rglob('*')):
             require(not path.is_symlink(), 'symlink artifact: ' + str(path))
@@ -300,10 +319,28 @@ def verify(args, root, plan):
             relative = path.relative_to(files)
             if relative.as_posix() in shard['required_exec']:
                 relative = Path('target/ci-shards') / shard['id'] / relative
+            if path.name.startswith('TEST-') and any('example' in t and path.name == 'TEST-' + t['class'] + '.xml' for t in shard['tests']):
+                shared_reports.setdefault(relative, []).append(path)
+                relative = Path('target/ci-shards') / shard['id'] / relative
             target = destination / safe_path(relative.as_posix())
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, target)
-    print('admitted ' + str(len(plan['expected'])) + ' source-selected classes exactly once across ' + str(len(admitted)) + ' shards')
+    for relative, paths in shared_reports.items():
+        suites = [ET.parse(path).getroot() for path in paths]
+        merged = copy.deepcopy(suites[0])
+        for node in list(merged):
+            if node.tag != 'properties':
+                merged.remove(node)
+        for suite in suites:
+            for case in suite.findall('testcase'):
+                merged.append(copy.deepcopy(case))
+        for attr in ['tests', 'failures', 'errors', 'skipped']:
+            merged.set(attr, str(sum(int(s.get(attr, '0')) for s in suites)))
+        merged.set('time', str(sum(float(s.get('time', '0')) for s in suites)))
+        target = destination / safe_path(relative.as_posix())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        ET.ElementTree(merged).write(target, encoding='utf-8', xml_declaration=True)
+    print('admitted ' + str(len(plan['expected'])) + ' source-selected units exactly once across ' + str(len(admitted)) + ' shards')
 
 
 def main():
