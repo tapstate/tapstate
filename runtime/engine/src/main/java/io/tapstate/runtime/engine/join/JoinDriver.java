@@ -357,6 +357,11 @@ public final class JoinDriver {
             forget(previousKey, previous);
             previous = null;
         }
+        // Publish the row before its index entries. A dimension processor can walk a new entry
+        // immediately; if the mirror still looks empty, it removes that entry as stale and later
+        // dimension changes never reach the fact again.
+        dropPrimed(key);
+        stores.putFact(key, after);
         for (Dimension dimension : dimensions) {
             String was = previous == null ? null : dimensionKeyIn(previous, dimension);
             String now = dimensionKeyIn(after, dimension);
@@ -373,8 +378,6 @@ public final class JoinDriver {
                 stores.indexAdd(dimension.source(), now, key);
             }
         }
-        dropPrimed(key);
-        stores.putFact(key, after);
         queueRow(after, event.ts(), false);
     }
 
@@ -654,7 +657,7 @@ public final class JoinDriver {
      * that never existed being removed is a no-op at an idempotent sink, while a row that did exist and
      * is not removed stays for ever.
      */
-    private Envelope rowEvent(Map<String, Object> factRow, long ts, boolean removed) {
+    Envelope rowEvent(Map<String, Object> factRow, long ts, boolean removed) {
         Map<String, Map<String, Object>> sources = new HashMap<>();
         sources.put(factSource, factRow);
         for (Dimension dimension : dimensions) {

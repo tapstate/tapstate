@@ -305,11 +305,10 @@ class PipelineDagBuilderTest {
 
     /**
      * The positive control for the case below: with the binding supplied, the join is drawn rather than
-     * refused - one vertex, and one edge per source its plan reads, each arriving on its own ordinal so
-     * the vertex can tell which side a change came from.
+     * refused. Source changes keep their own ordinals, and final projection meets at the output key.
      */
     @Test
-    void join_step_draws_one_vertex_and_one_edge_per_source() {
+    void join_step_routes_final_projection_by_the_fact_key() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
                 List.of(SourceRef.bare("orders_src"), SourceRef.bare("customers_src")),
@@ -324,11 +323,27 @@ class PipelineDagBuilderTest {
                 FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()));
 
         assertThat(vertexNames(dag))
-                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "serve.sync_1");
+                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1");
         assertThat(edges(dag)).contains(
                 edge("orders_src", "j", 0, 0),
                 edge("customers_src", "j", 0, 1),
-                edge("j", "serve.sync_1", 0, 0));
+                edge("j", "j:project", 0, 0),
+                edge("j:project", "serve.sync_1", 0, 0));
+        Edge projection = dag.getInboundEdges("j:project").getFirst();
+        assertThat(projection.isDistributed()).isTrue();
+        assertThat(projection.getPartitioner()).isNotNull();
+        @SuppressWarnings("unchecked")
+        com.hazelcast.jet.core.Partitioner<Object> partitioner =
+                (com.hazelcast.jet.core.Partitioner<Object>) projection.getPartitioner();
+        java.util.concurrent.atomic.AtomicReference<Object> routed = new java.util.concurrent.atomic.AtomicReference<>();
+        partitioner.init(key -> {
+            routed.set(key);
+            return 0;
+        });
+        partitioner.getPartition(Envelope.insert(1, "j", Map.of("id", 10L, "customer", "new"), null), 17);
+        assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
+        partitioner.getPartition(Envelope.delete(1, "j", Map.of("id", 10L, "customer", "old"), null), 17);
+        assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
     }
 
     /**
