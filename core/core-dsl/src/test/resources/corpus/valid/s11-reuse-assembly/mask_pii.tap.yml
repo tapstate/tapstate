@@ -1,4 +1,4 @@
-# ADR-0016 §14.11 — reusable definition bodies + pure-reference assembly (X19).
+# §14.11 — reusable definition bodies + pure-reference assembly (X19).
 # Definition body = pure logic, from: is forbidden (wiring belongs to the pipeline).
 version: tapstate/v1
 kind: transform

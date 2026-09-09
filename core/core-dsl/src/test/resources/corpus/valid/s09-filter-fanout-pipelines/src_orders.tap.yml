@@ -1,4 +1,4 @@
-# ADR-0016 §14.9 — conditional fan-out, v1 form: N pipelines x filter over one shared
+# §14.9 — conditional fan-out, v1 form: N pipelines x filter over one shared
 # source (router left v1, X14). Single SRS mining chain, no duplicate source reads.
 version: tapstate/v1
 kind: source

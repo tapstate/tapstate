@@ -1,5 +1,5 @@
 # Invalid: the step is named 'orders', which is also a table in src_a — a bare from: [orders]
-# could no longer tell the step's output apart from the source table (ADR-0016 §5, no shadowing).
+# could no longer tell the step's output apart from the source table (§5, no shadowing).
 # Rename the step (e.g. live_orders) and the batch is valid.
 version: tapstate/v1
 kind: pipeline

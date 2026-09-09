@@ -1,7 +1,7 @@
 package io.tapstate.core.model;
 
 /**
- * Error policy (ADR-0016 §1, X7): override chain = step explicit > settings task-level >
+ * Error policy (§1, X7): override chain = step explicit > settings task-level >
  * system default fail. DLQ physical landing is open (F10).
  */
 @Doc("How the pipeline handles a record that fails processing.")

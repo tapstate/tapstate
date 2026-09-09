@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * One {@code serve.push} element — event-stream egress, no table model (ADR-0016 §8,
+ * One {@code serve.push} element — event-stream egress, no table model (§8,
  * X11): {@code {id?, source, topic?, format?, options?}}; the connector category derives
  * from the referenced source, never a {@code type} field.
  */

@@ -20,6 +20,75 @@ import java.util.Optional;
 public interface ArtifactStore {
 
     /**
+     * Atomically applies every requested resource write while evaluating each write's condition in the
+     * same store operation. A refused condition leaves the entire batch unchanged and identifies the
+     * resource and condition outcome that refused it.
+     *
+     * <p>Adapters should override this for mixed batches. The default keeps existing single-write
+     * implementations useful while refusing a mixed conditional batch it cannot make atomic.
+     */
+    default ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
+        if (writes.isEmpty()) {
+            return ArtifactBatchWrite.applied();
+        }
+        if (writes.stream().allMatch(write -> write.intent() == ArtifactWrite.Intent.UPSERT)) {
+            Map<String, String> preconditions = new java.util.LinkedHashMap<>();
+            for (ArtifactWrite write : writes) {
+                for (Map.Entry<String, String> precondition : write.readPreconditions().entrySet()) {
+                    String previous = preconditions.putIfAbsent(precondition.getKey(), precondition.getValue());
+                    if (previous != null && !previous.equals(precondition.getValue())) {
+                        throw new IllegalArgumentException("one batch cannot require two versions of "
+                                + precondition.getKey());
+                    }
+                }
+            }
+            Optional<String> refused = saveAll(
+                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions);
+            return refused.map(id -> ArtifactBatchWrite.refused(id, ArtifactMutation.VERSION_CONFLICT))
+                    .orElseGet(ArtifactBatchWrite::applied);
+        }
+        if (writes.stream().noneMatch(write -> write.intent() == ArtifactWrite.Intent.CREATE_ONLY)
+                && (writes.size() > 1 || writes.stream().anyMatch(write -> !write.readPreconditions().isEmpty()))) {
+            Map<String, String> preconditions = new java.util.LinkedHashMap<>();
+            for (ArtifactWrite write : writes) {
+                if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
+                    preconditions.put(write.resource().id(), write.expectedContentHash());
+                }
+                for (Map.Entry<String, String> precondition : write.readPreconditions().entrySet()) {
+                    String previous = preconditions.putIfAbsent(precondition.getKey(), precondition.getValue());
+                    if (previous != null && !previous.equals(precondition.getValue())) {
+                        throw new IllegalArgumentException("one batch cannot require two versions of "
+                                + precondition.getKey());
+                    }
+                }
+            }
+            Optional<String> refused = saveAll(
+                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions);
+            return refused.map(id -> ArtifactBatchWrite.refused(id, ArtifactMutation.VERSION_CONFLICT))
+                    .orElseGet(ArtifactBatchWrite::applied);
+        }
+        if (writes.size() == 1) {
+            ArtifactWrite write = writes.getFirst();
+            if (!write.readPreconditions().isEmpty()) {
+                throw new UnsupportedOperationException(
+                        "atomic conditional artifact writes with read preconditions are not implemented");
+            }
+            ArtifactMutation outcome = switch (write.intent()) {
+                case CREATE_ONLY -> create(write.resource());
+                case REPLACE_ONLY -> replace(write.resource().id(), write.expectedContentHash(), write.resource());
+                case UPSERT -> throw new IllegalStateException("upsert batch must have been handled above");
+            };
+            return switch (outcome) {
+                case CREATED, REPLACED -> ArtifactBatchWrite.applied();
+                case NOT_FOUND, ALREADY_EXISTS, VERSION_CONFLICT ->
+                        ArtifactBatchWrite.refused(write.resource().id(), outcome);
+                case DELETED -> throw new IllegalStateException("artifact write cannot report deletion");
+            };
+        }
+        throw new UnsupportedOperationException("atomic mixed artifact writes are not implemented");
+    }
+
+    /**
      * Atomically inserts {@code artifact} by its top-level id. The artifact is stored only when that
      * id is absent; an existing artifact is left unchanged and returns {@link
      * ArtifactMutation#ALREADY_EXISTS}.
