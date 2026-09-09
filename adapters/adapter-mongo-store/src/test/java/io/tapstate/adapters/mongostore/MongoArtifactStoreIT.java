@@ -23,6 +23,8 @@ import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -155,20 +157,19 @@ class MongoArtifactStoreIT {
             assertThat(store.create(source)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
             assertThat(store.replace("orders", oldHash, changed)).isEqualTo(ArtifactMutation.REPLACED);
 
-            String canonicalAfterReplace = collection.find(new Document("_id", "orders"))
-                    .first().getString("canonical");
+            Map<String, Object> canonicalAfterReplace = storedBody(collection, "orders");
             assertThat(store.replace("orders", oldHash, changedAgain))
                     .isEqualTo(ArtifactMutation.VERSION_CONFLICT);
-            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
+            assertThat(storedBody(collection, "orders"))
                     .isEqualTo(canonicalAfterReplace);
 
             assertThatThrownBy(() -> store.replace("orders", newHash, differentId))
                     .isInstanceOf(IllegalArgumentException.class);
-            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
+            assertThat(storedBody(collection, "orders"))
                     .isEqualTo(canonicalAfterReplace);
 
             assertThat(store.delete("orders", oldHash)).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
-            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
+            assertThat(storedBody(collection, "orders"))
                     .isEqualTo(canonicalAfterReplace);
 
             assertThat(store.delete("orders", newHash)).isEqualTo(ArtifactMutation.DELETED);
@@ -211,13 +212,12 @@ class MongoArtifactStoreIT {
             String hash = collection.find(new Document("_id", "orders")).first().getString("contentHash");
             assertThat(store.writeAll(List.of(ArtifactWrite.replaceOnly(changed, hash))))
                     .isEqualTo(ArtifactBatchWrite.applied());
-            String canonicalAfterReplace = collection.find(new Document("_id", "orders"))
-                    .first().getString("canonical");
+            Map<String, Object> canonicalAfterReplace = storedBody(collection, "orders");
 
             ArtifactBatchWrite staleOutcome = store.writeAll(List.of(ArtifactWrite.replaceOnly(stale, hash)));
             assertThat(staleOutcome.refusedId()).isEqualTo("orders");
             assertThat(staleOutcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
-            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
+            assertThat(storedBody(collection, "orders"))
                     .isEqualTo(canonicalAfterReplace);
         });
     }
@@ -238,8 +238,8 @@ class MongoArtifactStoreIT {
             assertThat(outcome.refusedId()).isEqualTo("orders");
             assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
             assertThat(collection.find(new Document("_id", "orders_sync")).first()).isNull();
-            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
-                    .isEqualTo(WRITER.write(changedSource));
+            assertThat(storedBody(collection, "orders"))
+                    .isEqualTo(bodyOf(changedSource));
         });
     }
 
@@ -282,11 +282,11 @@ class MongoArtifactStoreIT {
                             assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
                         });
 
-                String expectedCanonical = alphaOutcome.appliedSuccessfully()
-                        ? WRITER.write(alphaReplacement)
-                        : WRITER.write(betaReplacement);
-                assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
-                        .isEqualTo(expectedCanonical);
+                Map<String, Object> expectedBody = alphaOutcome.appliedSuccessfully()
+                        ? bodyOf(alphaReplacement)
+                        : bodyOf(betaReplacement);
+                assertThat(storedBody(collection, "orders"))
+                        .isEqualTo(expectedBody);
             } catch (Exception error) {
                 throw new AssertionError("concurrent replace test failed", error);
             }
@@ -313,7 +313,7 @@ class MongoArtifactStoreIT {
             Resource edited = PARSER.parse(ORDERS.replace("localhost", "replica"));
 
             assertThat(store.saveAll(List.of(edited), Map.of("orders", declared))).isEmpty();
-            String afterEdit = collection.find(new Document("_id", "orders")).first().getString("canonical");
+            Map<String, Object> afterEdit = storedBody(collection, "orders");
 
             // The version the caller declared has moved on. The batch must write none of itself — the
             // valid sibling included, since the comparison happens inside the same transaction as the
@@ -322,7 +322,7 @@ class MongoArtifactStoreIT {
                     List.of(PARSER.parse(ORDERS.replace("localhost", "stale-writer")), PARSER.parse(ORDERS_SYNC)),
                     Map.of("orders", declared)))
                     .contains("orders");
-            assertThat(collection.find(new Document("_id", "orders")).first().getString("canonical"))
+            assertThat(storedBody(collection, "orders"))
                     .isEqualTo(afterEdit);
             assertThat(collection.find(new Document("_id", "orders_sync")).first())
                     .as("the refused batch opened a transaction and committed none of it")
@@ -475,6 +475,56 @@ class MongoArtifactStoreIT {
 
     private interface StoreTest {
         void run(MongoArtifactStore store, MongoCollection<Document> collection);
+    }
+
+    /**
+     * What the store actually holds for {@code id} -- the structured body, not a rendering of it.
+     *
+     * <p>The non-null assertion is the point of routing every read through here. This document is
+     * written under one field and read under another exactly once, when the shape changes; a read of
+     * a field that is gone answers null, and two of those compare equal, so a whole set of these
+     * assertions passes while checking nothing.
+     */
+    private static Map<String, Object> storedBody(MongoCollection<Document> collection, String id) {
+        Document document = collection.find(new Document("_id", id)).first();
+        assertThat(document)
+                .as("no artifact document stored under '%s'", id)
+                .isNotNull();
+        Document body = document.get("body", Document.class);
+        assertThat(body)
+                .as("the artifact document for '%s' carries no structured body", id)
+                .isNotNull();
+        return plain(body);
+    }
+
+    /** The body {@code resource} is stored as, to compare against {@link #storedBody}. */
+    private static Map<String, Object> bodyOf(Resource resource) {
+        return plain(WRITER.tree(resource));
+    }
+
+    /**
+     * The same map with every nested map flattened to one type. A body goes to the driver as plain
+     * maps and comes back as {@code Document}s, and {@code Document.equals} answers false to anything
+     * that is not a {@code Document} -- so two bodies that print identically compare unequal.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> plain(Map<String, ?> map) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        map.forEach((key, value) -> out.put(key, value instanceof Map<?, ?> nested
+                ? plain((Map<String, ?>) nested)
+                : value instanceof List<?> list ? plainList(list) : value));
+        return out;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Object> plainList(List<?> list) {
+        List<Object> out = new ArrayList<>(list.size());
+        for (Object value : list) {
+            out.add(value instanceof Map<?, ?> nested
+                    ? plain((Map<String, ?>) nested)
+                    : value instanceof List<?> inner ? plainList(inner) : value);
+        }
+        return out;
     }
 
     /** Runs a test body against a fresh artifact store over a clean collection on the real replica-set. */

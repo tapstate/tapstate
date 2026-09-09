@@ -108,7 +108,7 @@ public final class DslParser {
     private static final Set<String> VIEW_SCHEMA_KEYS = Set.of("enforce", "evolution");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
-    private static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
+    static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
     static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "options");
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");

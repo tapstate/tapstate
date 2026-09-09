@@ -692,11 +692,14 @@ class PipelineApiTest {
                   ddl: apply
             """;
 
+    // Read by the pipelines below, so it has to say how it is read. The write target under it
+    // deliberately does not: only a source a pipeline reads is asked for a mode.
     private static final String SOURCE_X = """
             version: tapstate/v1
             kind: source
             id: src_x
             connector: mysql
+            mode: cdc
             """;
 
     private static final String SOURCE_TARGET = """

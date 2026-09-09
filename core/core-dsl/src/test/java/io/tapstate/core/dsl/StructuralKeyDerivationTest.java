@@ -11,6 +11,7 @@ import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.Settings;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.Step;
@@ -123,6 +124,7 @@ class StructuralKeyDerivationTest {
         assertWhitelist(DslParser.PUSH_KEYS, PushElement.class, Set.of("options"));
         assertWhitelist(DslParser.STEP_BASE_KEYS, Step.Inline.class, Set.of("type", "options"));
         assertWhitelist(DslParser.STEP_USE_KEYS, Step.Use.class, Set.of("options"));
+        assertWhitelist(DslParser.SOURCE_REF_KEYS, SourceRef.Spec.class, Set.of());
     }
 
     private static Set<String> union(Set<String> a, Set<String> b) {
@@ -283,7 +285,8 @@ class StructuralKeyDerivationTest {
     /** The whitelists the tests above re-derive from a record. */
     private static final Set<String> DERIVED = Set.of(
             "SOURCE_KEYS", "PIPELINE_KEYS", "TRANSFORM_DEF_KEYS", "METADATA_KEYS", "SRS_KEYS",
-            "TABLE_SPEC_KEYS", "SYNC_KEYS", "PUSH_KEYS", "STEP_BASE_KEYS", "STEP_USE_KEYS");
+            "TABLE_SPEC_KEYS", "SYNC_KEYS", "PUSH_KEYS", "STEP_BASE_KEYS", "STEP_USE_KEYS",
+            "SOURCE_REF_KEYS");
 
     /** The required-key sets, re-derived above from their record's {@code @Doc(required = true)}. */
     private static final Set<String> REQUIRED_DERIVED = Set.of(
