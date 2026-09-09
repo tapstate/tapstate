@@ -82,7 +82,7 @@ public final class JoinDag {
         Vertex projection = dag.newVertex(nodeId + ":project", ProcessorMetaSupplier.of(new JoinVertexSupplier(
                 plan, pipelineId, nodeId, factKeyColumns, Map.of(), stores, true)));
         dag.edge(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection)
-                .partitioned(keyOf(JoinProjection.outputKeyColumns(plan, factKeyColumns))).distributed());
+                .partitioned(item -> ((JoinUpdate) item).factKey()).distributed());
         return projection;
     }
 

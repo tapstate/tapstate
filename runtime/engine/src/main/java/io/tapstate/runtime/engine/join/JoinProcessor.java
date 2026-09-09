@@ -78,7 +78,7 @@ public final class JoinProcessor extends AbstractProcessor {
             driver.absorb(changes);
             taken = true;
         }
-        if (driver.drain(this::tryEmit)) {
+        if (driver.drainUpdates(this::tryEmit)) {
             inbox.clear();
             taken = false;
         }
@@ -91,7 +91,7 @@ public final class JoinProcessor extends AbstractProcessor {
      */
     @Override
     public boolean tryProcess() {
-        return driver.drain(this::tryEmit);
+        return driver.drainUpdates(this::tryEmit);
     }
 
     /**
@@ -100,6 +100,6 @@ public final class JoinProcessor extends AbstractProcessor {
      */
     @Override
     public boolean complete() {
-        return driver.drain(this::tryEmit);
+        return driver.drainUpdates(this::tryEmit);
     }
 }

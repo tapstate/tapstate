@@ -18,10 +18,11 @@ class JoinProjectionProcessorTest {
     void backpressureDoesNotRepeatOrLoseABatchedProjection() throws Exception {
         CountingJoinStores stores = new CountingJoinStores(4);
         stores.putDimensionRow("c", JoinKey.of(List.of(1L)).name(), Map.of("id", 1L, "name", "Ada"));
-        List<Envelope> arrivals = new ArrayList<>();
+        List<JoinUpdate> arrivals = new ArrayList<>();
         for (long id = 10; id < 13; id++) {
             stores.putFact(JoinKey.of(List.of(id)).name(), Map.of("id", id, "customer_id", 1L));
-            arrivals.add(Envelope.insert(1, "joined", Map.of("order_id", id), null));
+            arrivals.add(new JoinUpdate(JoinKey.of(List.of(id)).name(),
+                    Envelope.insert(1, "joined", Map.of("order_id", id), null)));
         }
         JoinProjectionProcessor processor = new JoinProjectionProcessor(
                 new JoinProjection(JoinProjectionTest.plan(), List.of("id"), "joined", stores));

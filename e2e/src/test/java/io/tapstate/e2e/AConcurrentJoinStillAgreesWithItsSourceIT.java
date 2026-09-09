@@ -7,6 +7,7 @@ import io.tapstate.runtime.engine.join.JoinExecutor;
 import io.tapstate.runtime.engine.join.JoinProjection;
 import io.tapstate.runtime.engine.join.JoinSink;
 import io.tapstate.runtime.engine.join.JoinStores;
+import io.tapstate.runtime.engine.join.JoinUpdate;
 import io.tapstate.runtime.engine.join.MapJoinStores;
 import io.tapstate.runtime.engine.join.SourceChange;
 import io.tapstate.testsupport.RequiresDocker;
@@ -73,7 +74,7 @@ class AConcurrentJoinStillAgreesWithItsSourceIT {
                 carrier[0].holdFacts = true;
                 answer.upsert("orders", Map.of("id", 10, "customer_id", 1, "payment_id", 100));
                 assertThat(carrier[0].delayed).singleElement()
-                        .satisfies(event -> assertThat(event.after()).containsEntry("payment_method", null));
+                        .satisfies(event -> assertThat(event.event().after()).containsEntry("payment_method", null));
 
                 answer.upsert("payments", Map.of("id", 100, "channel", "card"));
                 answer.upsert("customers", Map.of("id", 1, "name", "adelaide"));
@@ -101,7 +102,7 @@ class AConcurrentJoinStillAgreesWithItsSourceIT {
         private final List<String> keys;
         private final String stream;
         private final InterleavedStores stores = new InterleavedStores();
-        private final List<Envelope> delayed = new ArrayList<>();
+        private final List<JoinUpdate> delayed = new ArrayList<>();
         private JoinDriver facts;
         private JoinDriver dimensions;
         private JoinProjection projection;
@@ -127,7 +128,9 @@ class AConcurrentJoinStillAgreesWithItsSourceIT {
             this.sink = sink;
             for (SourceChange change : changes) {
                 boolean fact = change.source().equals(factSource);
-                boolean drained = (fact ? facts : dimensions).apply(List.of(change), event -> {
+                JoinDriver driver = fact ? facts : dimensions;
+                driver.absorb(List.of(change));
+                boolean drained = driver.drainUpdates(event -> {
                     if (fact && holdFacts) {
                         delayed.add(event);
                     } else {
@@ -140,7 +143,7 @@ class AConcurrentJoinStillAgreesWithItsSourceIT {
             return true;
         }
 
-        private void publish(List<Envelope> events) {
+        private void publish(List<JoinUpdate> events) {
             for (Envelope event : projection.refresh(events)) {
                 assertThat(sink.offer(event)).isTrue();
             }

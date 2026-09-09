@@ -340,9 +340,13 @@ class PipelineDagBuilderTest {
             routed.set(key);
             return 0;
         });
-        partitioner.getPartition(Envelope.insert(1, "j", Map.of("id", 10L, "customer", "new"), null), 17);
+        partitioner.getPartition(new io.tapstate.runtime.engine.join.JoinUpdate(
+                io.tapstate.core.sql.JoinKey.of(List.of(10L)).name(),
+                Envelope.insert(1, "j", Map.of("customer", "new"), null)), 17);
         assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
-        partitioner.getPartition(Envelope.delete(1, "j", Map.of("id", 10L, "customer", "old"), null), 17);
+        partitioner.getPartition(new io.tapstate.runtime.engine.join.JoinUpdate(
+                io.tapstate.core.sql.JoinKey.of(List.of(10L)).name(),
+                Envelope.delete(1, "j", Map.of("customer", "old"), null)), 17);
         assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
     }
 

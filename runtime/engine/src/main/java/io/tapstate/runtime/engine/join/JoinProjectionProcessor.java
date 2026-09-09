@@ -22,9 +22,9 @@ final class JoinProjectionProcessor extends AbstractProcessor {
     @Override
     public void process(int ordinal, Inbox inbox) {
         if (!taken) {
-            List<Envelope> arrivals = new ArrayList<>(inbox.size());
+            List<JoinUpdate> arrivals = new ArrayList<>(inbox.size());
             for (Object item : inbox) {
-                arrivals.add((Envelope) item);
+                arrivals.add((JoinUpdate) item);
             }
             pending.addAll(projection.refresh(arrivals));
             taken = true;

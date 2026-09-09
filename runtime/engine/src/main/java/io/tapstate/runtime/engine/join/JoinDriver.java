@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /**
  * The incremental half of a join: what one change to one source means for the flat rows already
@@ -481,10 +482,15 @@ public final class JoinDriver {
      * @return whether nothing is left to send
      */
     public boolean drain(JoinSink sink) {
+        return drainUpdates(update -> sink.offer(update.event()));
+    }
+
+    /** Carries the fact identity to final projection without adding a column to the user's row. */
+    public boolean drainUpdates(Predicate<JoinUpdate> sink) {
         while (!pending.isEmpty()) {
             Work work = pending.peek();
             if (work instanceof Row row) {
-                if (!sink.offer(row.event())) {
+                if (!sink.test(row.update())) {
                     return false;
                 }
                 pending.poll();
@@ -504,7 +510,7 @@ public final class JoinDriver {
      * Returns false when the sink refused, having written down where to carry on from - the page and
      * the position within it, so nothing is sent twice and nothing is skipped.
      */
-    private boolean advance(Recompute recompute, JoinSink sink) {
+    private boolean advance(Recompute recompute, Predicate<JoinUpdate> sink) {
         Dimension dimension = recompute.dimension();
         String source = dimension.source();
         String dimensionKey = recompute.dimensionKey();
@@ -569,7 +575,7 @@ public final class JoinDriver {
      * never primed.
      */
     private boolean emit(Recompute recompute, Dimension dimension,
-            Map<String, Map<String, Object>> rows, Set<String> asked, JoinSink sink) {
+            Map<String, Map<String, Object>> rows, Set<String> asked, Predicate<JoinUpdate> sink) {
         List<String> factKeys =
                 stores.indexPage(dimension.source(), recompute.dimensionKey(), recompute.page());
         List<String> stale = new ArrayList<>();
@@ -609,7 +615,7 @@ public final class JoinDriver {
                 // idempotent sink, against a row that otherwise stays for ever.
                 event = rowEvent(factRow, recompute.ts(), true);
             }
-            if (!sink.offer(event)) {
+            if (!sink.test(new JoinUpdate(factKey, event))) {
                 // Nothing has been removed yet, so the entries found stale on this pass are simply
                 // found again on the next one. Removing them mid-walk would move the positions the
                 // bookmark below is written in.
@@ -647,7 +653,7 @@ public final class JoinDriver {
         }
         Envelope event = rowEvent(factRow, ts, removed);
         if (event != null) {
-            pending.add(new Row(event));
+            pending.add(new Row(new JoinUpdate(factKeyOf(factRow), event)));
         }
     }
 
@@ -797,7 +803,7 @@ public final class JoinDriver {
     }
 
     /** One published row waiting for the sink to take it. */
-    private record Row(Envelope event) implements Work {
+    private record Row(JoinUpdate update) implements Work {
     }
 
     /**
