@@ -222,6 +222,9 @@ def reports(root, shard):
                 suite = ET.parse(path).getroot()
                 require(suite.tag == 'testsuite', 'invalid JUnit report: ' + str(path))
                 name = suite.get('name', '')
+                # Restoration uses filenames as keys, so their identity must match the admitted suite.
+                # This includes nested suites: the full name, including '$', owns its own report.
+                require(path.name == 'TEST-' + name + '.xml', 'report filename differs from suite identity: ' + str(path))
                 require(name and (module, kind, name) not in seen, 'duplicate or unnamed test report: ' + name)
                 seen.add((module, kind, name))
                 require(int(suite.get('failures', '0')) == 0 and int(suite.get('errors', '0')) == 0

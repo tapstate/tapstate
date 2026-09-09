@@ -5,6 +5,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 export SHARD_GATE="$here/ci-shard.sh" AGGREGATE_GATE="$here/ci-aggregate.sh"
 python3 - <<'PY'
 import hashlib, json, os, pathlib, shutil, subprocess, tempfile
+from collections import Counter
+import xml.etree.ElementTree as ET
 with tempfile.TemporaryDirectory() as tmp:
     root=pathlib.Path(tmp); artifacts=root/'artifacts'
     def put(path,text):
@@ -27,7 +29,7 @@ with tempfile.TemporaryDirectory() as tmp:
             put(test['module']+'/target/test-classes/'+name.replace('.', '/')+'.class','test-bytecode')
             report=f'<testsuite name="{name}" tests="{count}" failures="0" errors="0" skipped="0"><testcase classname="{name}" name="ok"/></testsuite>' if count=='1' else f'<testsuite name="{name}" tests="0" failures="0" errors="0" skipped="0"/>'
             put(test['module']+'/target/'+phase+'-reports/TEST-'+name+'.xml',report)
-            if name.endswith('EngineTest'):
+            if name.endswith(('EngineTest', 'OneIT', 'TwoIT')):
                 put(test['module']+'/target/'+phase+'-reports/TEST-'+name+'$Nested.xml',f'<testsuite name="{name}$Nested" tests="1" failures="0" errors="0"><testcase classname="{name}$Nested" name="nested"/></testsuite>')
         for path in shard['required_exec']: put(path,'execution-data')
         subprocess.run([os.environ['AGGREGATE_GATE'],'pack','--root',tmp,'--plan',str(root/'plan.json'),'--shard',shard['id'],'--output',str(artifacts/shard['id'])],check=True)
@@ -38,11 +40,24 @@ with tempfile.TemporaryDirectory() as tmp:
                 m=json.loads(manifest.read_text()); files=manifest.parent/'files'
                 m['files']={p.relative_to(files).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in files.rglob('*') if p.is_file()}
                 manifest.write_text(json.dumps(m))
+        shutil.rmtree(root/'restored',ignore_errors=True)
         result=subprocess.run([os.environ['AGGREGATE_GATE'],'verify','--root',tmp,'--plan',str(root/'plan.json'),'--artifacts',str(artifacts),'--restore',str(root/'restored')],capture_output=True,text=True)
         assert (result.returncode==0)==expect, result.stdout+result.stderr
+        if not expect: assert not (root/'restored').exists()
     verify(); assert (root/'restored/target/ci-shards/rest/e2e/target/jacoco.exec').is_file()
+    def case_counts(paths):
+        return Counter((ET.parse(p).getroot().get('name'),c.get('classname'),c.get('name'))
+                       for p in paths for c in ET.parse(p).getroot().findall('testcase'))
+    assert case_counts(artifacts.rglob('TEST-*.xml'))==case_counts((root/'restored').rglob('TEST-*.xml'))
+    assert len(list((root/'restored').rglob('TEST-*.xml')))==8
     backup=root/'backup'; shutil.copytree(artifacts,backup)
     def reset(): shutil.rmtree(artifacts); shutil.copytree(backup,artifacts)
+    # Distinct ordinary and nested suites cannot silently collide in the restored namespace.
+    for pattern in ['TEST-sample.*IT.xml', 'TEST-sample.*IT$Nested.xml']:
+        for p in artifacts.rglob(pattern): p.rename(p.with_name('TEST-shared.xml'))
+        verify(False, rehash=True); reset()
+    p=next(artifacts.rglob('TEST-sample.EngineTest$Nested.xml')); p.rename(p.with_name('TEST-renamed.xml'))
+    verify(False, rehash=True); reset()
     shutil.rmtree(artifacts/'e2e-2'); verify(False); reset()
     manifest=artifacts/'rest/manifest.json'; m=json.loads(manifest.read_text()); m['source_sha']='wrong'; manifest.write_text(json.dumps(m)); verify(False); reset()
     (artifacts/'rest/files/e2e/target/jacoco.exec').unlink(); verify(False); reset()
@@ -58,5 +73,5 @@ with tempfile.TemporaryDirectory() as tmp:
     (alien/'TEST-extra.xml').write_text('<testsuite name="sample.ExtraTest" tests="1" errors="0" failures="0"/>'); verify(False, rehash=True); reset()
     # A test added after planning invalidates the source-selected cohort.
     put('core/src/test/java/sample/NewTest.java','package sample; class NewTest {}'); verify(False)
-print('ci-aggregate smoke: 14 admission cases passed')
+print('ci-aggregate smoke: 17 admission cases passed')
 PY

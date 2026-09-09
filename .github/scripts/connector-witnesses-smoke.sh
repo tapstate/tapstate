@@ -57,7 +57,10 @@ with tempfile.TemporaryDirectory() as tmp:
             suite=ET.parse(report).getroot(); suite.append(copy.deepcopy(suite.find('testcase'))); suite.set('tests',str(len(suite.findall('testcase'))))
             report.write_text(ET.tostring(suite,encoding='unicode')); pack(shard,False); report.write_text(saved_report)
         pack(shard)
-    def verify(ok=True): call('verify','--plan',root/'plan.json','--artifacts',artifacts,'--restore',root/'restored',ok=ok)
+    def verify(ok=True):
+        shutil.rmtree(root/'restored',ignore_errors=True)
+        call('verify','--plan',root/'plan.json','--artifacts',artifacts,'--restore',root/'restored',ok=ok)
+        if not ok: assert not (root/'restored').exists()
     verify()
     assert Counter((root/'restored/e2e/target/witness-ledger.txt').read_text().splitlines())==Counter((root/'e2e/witness-manifest.txt').read_text().splitlines())
     merged=ET.parse(root/'restored/e2e/target/failsafe-reports/TEST-sample.PublishedExamplesIT.xml').getroot()
@@ -93,6 +96,9 @@ with tempfile.TemporaryDirectory() as tmp:
         if mutation=='duplicate-marker': case.find('system-out').text*=2
         if mutation=='wrong-example': case.find('system-out').text='tapstate.published-case=examples/unknown/case.e2e.yml on IN_PROCESS\n'
         suite.set('tests',str(len(suite.findall('testcase')))); p.write_text(ET.tostring(suite,encoding='unicode')); rehash(); verify(False); reset()
+    # A valid suite identity under an arbitrary filename must fail before it can bypass merge routing.
+    for p in artifacts.rglob('TEST-*Published*.xml'): p.rename(p.with_name('TEST-renamed.xml'))
+    rehash(); verify(False); reset()
     # Simulate same-name XML copied over its sibling before admission.
     reports=list(artifacts.rglob('TEST-*Published*.xml')); shutil.copyfile(reports[0],reports[1]); rehash(); verify(False); reset()
     for mutation in ['missing','empty','duplicate','omitted','residual']:
@@ -118,5 +124,5 @@ with tempfile.TemporaryDirectory() as tmp:
     selected=next(s for s in plan['shards'] if s['id']==sweep[0])
     assert Counter(selection.split(','))==Counter(t['example'] for t in selected['tests'] if 'example' in t)
     assert '-DforkCount=1' in args and '-DreuseForks=true' in args and '-Djunit.jupiter.execution.parallel.enabled=false' in args
-print('connector-witnesses smoke: example scheduling, XML preservation and 26 adverse admission/run scenario types passed')
+print('connector-witnesses smoke: example scheduling, XML preservation and 27 adverse admission/run scenario types passed')
 PY
