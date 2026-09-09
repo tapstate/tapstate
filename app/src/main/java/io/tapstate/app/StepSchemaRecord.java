@@ -27,6 +27,15 @@ import java.util.Objects;
  * record, and the next comparison takes it as the baseline - so the first describable derivation would
  * report every column as newly appeared, an alarm produced here and shaped exactly like a step that
  * moved. The same reading the source copy takes of a table nothing has discovered.
+ *
+ * <p><b>A node that cannot answer carries the shape that reached it, and says so.</b> A script settles
+ * its own columns while it runs, so nothing can work out what it emits - and left at that, the record
+ * stops at the script and stops for everything below it, because each step below derives from an
+ * unknown and is unknown itself. One script would blank the rest of the pipeline's model, which is a
+ * worse answer than an assumption stated out loud. So the shape that reached it is carried on, and the
+ * row is written down as carried rather than derived: the columns below a script rest on something the
+ * script can break, and a reader has to be able to see the row where that entered. Nothing compares
+ * this field, so naming it costs nothing and hiding it would cost the next reader the whole chain.
  */
 final class StepSchemaRecord {
 
@@ -35,6 +44,13 @@ final class StepSchemaRecord {
      * "did the derivation change" is answered by the columns moving while its inputs did not.
      */
     private static final String DERIVED_BY = "step-derivation-1";
+
+    /**
+     * What a row worked out by nobody says instead. Its own word rather than a flag on the derivation's,
+     * because the two are different claims: one says these are the columns this node produces, the other
+     * says these are the columns that reached it and nothing here knows what it does to them.
+     */
+    private static final String CARRIED_THROUGH = "carried-through-1";
 
     private final DerivedSchemaStore records;
 
@@ -49,12 +65,12 @@ final class StepSchemaRecord {
      * pinning a step with no history to pin into.
      */
     boolean record(String pipelineId, String nodeId, NodeColumns derived,
-            Map<String, NodeColumns> inputs, Object authored) {
+            Map<String, NodeColumns> inputs, Object authored, boolean carried) {
         if (!derived.known()) {
             return false;
         }
         records.record(pipelineId, nodeId, derived.columns(), fingerprintOf(authored),
-                fingerprintOf(inputs), DERIVED_BY);
+                fingerprintOf(inputs), carried ? CARRIED_THROUGH : DERIVED_BY);
         return true;
     }
 

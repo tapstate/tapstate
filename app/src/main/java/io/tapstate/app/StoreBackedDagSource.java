@@ -604,8 +604,13 @@ final class StoreBackedDagSource implements DagSource {
                                 && !inputs.containsKey(nest.root().from()))) {
                     continue;
                 }
-                derived.put(step.id(), NodeColumns.of(step.body(), inputs, null));
-                recordable.put(step.id(), new Recordable(inputs, step.body()));
+                NodeColumns columns = NodeColumns.of(step.body(), inputs, null);
+                // A node that cannot say what it emits carries what reached it, so the chain of models
+                // does not stop here and take everything below it with it. Only where the answer is
+                // unknown: a node that did work its columns out keeps them.
+                boolean carried = !columns.known();
+                derived.put(step.id(), carried ? NodeColumns.merged(inputs.values()) : columns);
+                recordable.put(step.id(), new Recordable(inputs, step.body(), carried));
                 progressed = true;
             }
         }
@@ -617,7 +622,7 @@ final class StoreBackedDagSource implements DagSource {
                     sourceKeyByTable, sourceKeysById, stepIds, derived, sourceColumns);
             if (inputs != null) {
                 derived.put(view.id(), NodeColumns.of(view, NodeColumns.merged(inputs.values())));
-                recordable.put(view.id(), new Recordable(inputs, view));
+                recordable.put(view.id(), new Recordable(inputs, view, false));
             }
         }
         return new StepDerivations(derived, recordable);
@@ -676,8 +681,11 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, NodeColumns> columns, Map<String, Recordable> recordable) {
     }
 
-    /** One node's derivation as the record needs it: what reached it, and what the author wrote. */
-    private record Recordable(Map<String, NodeColumns> inputs, Object authored) {
+    /**
+     * One node's derivation as the record needs it: what reached it, what the author wrote, and whether
+     * the columns are what this node produces or only what reached it.
+     */
+    private record Recordable(Map<String, NodeColumns> inputs, Object authored, boolean carried) {
     }
 
     /**
@@ -688,7 +696,7 @@ final class StoreBackedDagSource implements DagSource {
         List<String> recorded = new ArrayList<>();
         derived.recordable().forEach((nodeId, node) -> {
             if (stepSchemaRecord.record(pipelineId, nodeId, derived.columns().get(nodeId),
-                    node.inputs(), node.authored())) {
+                    node.inputs(), node.authored(), node.carried())) {
                 recorded.add(nodeId);
             }
         });

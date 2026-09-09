@@ -302,6 +302,56 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void a_script_carries_the_chain_on_at_the_shape_that_reached_it() {
+        // A script settles its own columns while it runs, so nothing can derive what it emits. Left at
+        // that, the record stops at the script and stops for everything below it too - the step after
+        // it derives from an unknown and is unknown itself - so one script blanks the rest of the
+        // pipeline's model. It carries the shape that reached it instead, and says in the record that
+        // this is what it did: the columns below a script rest on an assumption the script can break,
+        // and a reader has to be able to see which row that assumption entered at.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        Map<String, FieldRule> dropRegion = new LinkedHashMap<>();
+        dropRegion.put("region", FieldRule.drop());
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("scripted", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.Js("emit(record)"), null, null),
+                        Step.inline("trimmed", FromClause.list(FromRef.literal("scripted")),
+                                new TransformBody.MapProjection(dropRegion), null, null)),
+                null,
+                serve(FromRef.literal("trimmed"), sync("sync_1", "orders_dest")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("region", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(store.derivedSchemas.latest("p", "scripted"))
+                .get()
+                .extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL", "region", "STRING NULL"));
+        // Named as carried rather than derived. Without this the row is indistinguishable from a step
+        // that actually works its columns out, and the assumption it rests on disappears.
+        assertThat(store.derivedSchemas.latest("p", "scripted"))
+                .get()
+                .extracting(DerivedSchema::derivedBy)
+                .isEqualTo("carried-through-1");
+        // The step below it is the point of carrying at all: it derives, and it derives from the
+        // carried shape rather than from an unknown.
+        assertThat(store.derivedSchemas.latest("p", "trimmed"))
+                .get()
+                .extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+    }
+
+    @Test
     void a_view_records_a_model_of_its_own_although_it_is_not_a_step() {
         // A view is a block beside the steps rather than one of them, so a walk written as "every
         // transform step" reaches every node but this one - and a node nobody asks about produces no
