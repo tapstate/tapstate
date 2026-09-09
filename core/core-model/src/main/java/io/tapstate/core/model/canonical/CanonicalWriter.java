@@ -110,13 +110,26 @@ public final class CanonicalWriter {
             case Byte b -> b.intValue();
             case Short s -> s.intValue();
             case Float f -> f.doubleValue();
-            case BigDecimal d -> d.doubleValue();
-            // No 64-bit integer holds it, and neither does any store this tree is written to. Storing a
-            // different number instead is the one outcome worth refusing: the canonical text has never
-            // read such a value back either, so nothing is being taken away that worked before.
+            // The two wide types below are refused rather than narrowed, and reaching either is an
+            // invariant violation rather than an authoring mistake: a number no store can hold is
+            // refused where it is admitted -- the JSON face against the list of types it accepts, the
+            // parser against the widths a whole number may take -- both of which name the field and the
+            // position the caller wrote. What is left here is the case those two missed, and a crash is
+            // the only honest answer to it. Storing a different number than the one configured is the
+            // outcome worth refusing: it reads back as a value somebody chose.
+            case BigDecimal d -> exactly(d);
             case BigInteger i -> i.longValueExact();
             case null, default -> value;
         };
+    }
+
+    /** The decimal as a double, refusing one that would not survive the narrowing. */
+    private static double exactly(BigDecimal value) {
+        double narrowed = value.doubleValue();
+        if (BigDecimal.valueOf(narrowed).compareTo(value) != 0) {
+            throw new ArithmeticException("BigDecimal " + value + " does not fit in a double");
+        }
+        return narrowed;
     }
 
     // ---- top-level resources ------------------------------------------------------

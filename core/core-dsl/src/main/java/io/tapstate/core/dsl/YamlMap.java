@@ -198,7 +198,7 @@ final class YamlMap {
                 return Boolean.valueOf(v);
             }
             if (Tag.INT.equals(tag)) {
-                return parseInt(v);
+                return parseInt(v, sc);
             }
             if (Tag.FLOAT.equals(tag)) {
                 return Double.valueOf(v);
@@ -222,7 +222,15 @@ final class YamlMap {
         return null;
     }
 
-    private static Object parseInt(String raw) {
+    /**
+     * A whole number as the narrowest of int / long that holds it.
+     *
+     * <p>One wider than a long is refused here, coded and located. No store this value can reach holds
+     * an integer wider than 64 bits, so admitting it only moves the refusal to a layer that has no field
+     * name and no line to report it against -- which is where it used to land, as an unchecked crash out
+     * of the writer that turns the model into text.
+     */
+    private static Object parseInt(String raw, ScalarNode node) {
         boolean negative = raw.startsWith("-");
         String s = (raw.startsWith("+") || raw.startsWith("-")) ? raw.substring(1) : raw;
         int radix = 10;
@@ -238,8 +246,13 @@ final class YamlMap {
         }
         try {
             return Integer.valueOf(s, radix);
-        } catch (NumberFormatException overflow) {
-            return Long.valueOf(s, radix);
+        } catch (NumberFormatException widerThanAnInt) {
+            try {
+                return Long.valueOf(s, radix);
+            } catch (NumberFormatException widerThanAnyStore) {
+                throw error(DslError.ILLEGAL_VALUE, "", node,
+                        Map.of("value", raw, "expected", "a whole number that fits in 64 bits"));
+            }
         }
     }
 

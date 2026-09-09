@@ -306,6 +306,26 @@ class SourceApiTest {
     }
 
     @Test
+    void sourceCreateRejectsAConfigNumberNoStoreCanHoldInsteadOfCrashingOnTheWayToOne() {
+        // The accepted-types list admits any JSON integer, and past 64 bits there is no store to put one
+        // in. It used to be taken here and met further in by the writer that turns the model into text --
+        // which has no field, no document and no code to answer with, so the caller got a component name
+        // and a 500 about a value they had written themselves.
+        //
+        // Only the integer is driven from here. The other unstorable width is a decimal that is not the
+        // same decimal once it is a double, and this face cannot deliver one: nothing configures Jackson
+        // to bind a JSON float as BigDecimal, so it arrives already narrowed to a double. Refusing it is
+        // kept where a value that has not been through a face is written, and is a guard rather than a
+        // path -- asserting it here would assert something no request can reach.
+        String body = sourceJson("wide", "bad").replace("\"port\":3306", "\"port\":99999999999999999999");
+        assertThat(body).contains("99999999999999999999");
+
+        assertError(request("writer").post().uri("/api/sources")
+                        .contentType(MediaType.APPLICATION_JSON).body(body),
+                HttpStatus.BAD_REQUEST, "control.malformed-request");
+    }
+
+    @Test
     void sourceCreateRejectsMissingLiveConnectorConfigBeforePersisting() {
         String missingDatabase = sourceJson("missing-config", "bad")
                 .replace("\"database\":\"orders\",", "");

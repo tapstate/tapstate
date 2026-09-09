@@ -282,6 +282,47 @@ class DslParserTest {
     }
 
     @Test
+    void rejectsAConfigIntegerNoStoreCanHoldWithACodeRatherThanACrash() {
+        // A whole number wider than 64 bits is refused where it is written, naming the value and the
+        // line. Admitting it only moves the failure to the writer that turns the model into text, which
+        // has no field and no position to report it against and crashed unchecked on the way to a store
+        // that could not have held it either.
+        String yaml = """
+                version: tapstate/v1
+                kind: source
+                id: x
+                connector: mysql
+                config:
+                  huge: 99999999999999999999
+                """;
+
+        Throwable t = catchThrowable(() -> parser.parse(yaml));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.code()).isEqualTo(DslError.ILLEGAL_VALUE);
+        assertThat(ex.args()).containsEntry("value", "99999999999999999999");
+        assertThat(ex.line()).as("the author is told where they wrote it").isEqualTo(6);
+    }
+
+    @Test
+    void stillAcceptsTheWidestWholeNumberAStoreCanHold() {
+        // The refusal above is about what no store holds, not about "large": the boundary value is a
+        // number this product stores every day, and moving the gate onto it would be a new refusal.
+        String yaml = """
+                version: tapstate/v1
+                kind: source
+                id: x
+                connector: mysql
+                config:
+                  big: 9223372036854775807
+                """;
+
+        assertThat(((SourceResource) parser.parse(yaml)).config())
+                .containsEntry("big", Long.MAX_VALUE);
+    }
+
+    @Test
     void bindsAStoredDocumentWithoutParsingAnyText() {
         // What a document store hands back: plain maps and already-typed scalars, no text anywhere.
         // The port stays an int through the binding, which is the half a text round trip cannot show --
