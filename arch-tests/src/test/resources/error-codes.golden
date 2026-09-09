@@ -163,6 +163,7 @@ lifecycle.purge-state-not-stated
 lifecycle.unknown-pipeline
 mcp.connector-spec-unavailable
 mcp.environment-missing
+mcp.invalid-server-response
 mcp.server-rejected
 migration.changeset-failed
 migration.data-newer-than-binary
