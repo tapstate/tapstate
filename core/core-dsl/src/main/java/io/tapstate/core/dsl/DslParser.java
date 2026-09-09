@@ -145,9 +145,9 @@ public final class DslParser {
         Map<String, Object> options = m.freeMap("options");
         rejectRelocatedReadOptions(m, options);
         return new SourceResource(
-                idOf(m),
+                m.require("id", idOf(m)),
                 metadata(m),
-                m.string("connector"),
+                m.requireString("connector"),
                 m.freeMap("config"),
                 mode(m, "mode"),
                 tables(m.seq("tables")),
@@ -185,7 +185,7 @@ public final class DslParser {
                 // not the event envelope. Its type environment is the source schema, unknown
                 // offline — so its compile / type-check is deferred to the engine, unlike the
                 // envelope-rooted expressions (filter node / map / push) checked at parse time.
-                refs.add(TableRef.spec(ts.string("name"), ts.string("filter"),
+                refs.add(TableRef.spec(ts.requireString("name"), ts.string("filter"),
                         scalarList(ts.seq("pk"), "tables.pk"), ts.freeMap("options")));
             }
         }
@@ -213,7 +213,7 @@ public final class DslParser {
         String beforeServe = view != null ? viewId(view) : lastTransform;
         ServeBlock serve = serve(m, beforeServe);
         return new PipelineResource(
-                idOf(m), metadata(m), sources(m), transforms, view, serve, settings(m),
+                m.require("id", idOf(m)), metadata(m), sources(m), transforms, view, serve, settings(m),
                 m.freeMap("experimental"));
     }
 
@@ -241,7 +241,9 @@ public final class DslParser {
         // An object written without the switch says exactly what a bare id says, so it normalizes
         // to one: keeping both spellings of one state would let the same pipeline canonicalize two
         // ways, and the materialization rule reads "has a switch" off this distinction.
-        return srs == null ? SourceRef.bare(ref.string("id")) : SourceRef.spec(ref.string("id"), srs);
+        return srs == null
+                ? SourceRef.bare(ref.requireString("id"))
+                : SourceRef.spec(ref.requireString("id"), srs);
     }
 
     // ---- transforms ---------------------------------------------------------------
@@ -306,10 +308,11 @@ public final class DslParser {
 
     private TransformBody body(String type, YamlMap s) {
         return switch (type) {
-            case "js" -> new TransformBody.Js(s.string("script"));
-            case "map" -> new TransformBody.MapProjection(fieldRules(s.mapping("fields")));
+            case "js" -> new TransformBody.Js(s.requireString("script"));
+            case "map" -> new TransformBody.MapProjection(
+                    fieldRules(s.require("fields", s.mapping("fields"))));
             case "filter" -> {
-                String expr = s.string("expr");
+                String expr = s.requireString("expr");
                 checkPredicate(s, "expr", expr);
                 yield new TransformBody.Filter(expr);
             }
@@ -319,10 +322,11 @@ public final class DslParser {
                     enumByYaml(NestOrder.values(), NestOrder::yaml, s, "order"),
                     positiveIntValue(s, "entries_in_memory"),
                     positiveIntValue(s, "max_elements_per_document"),
-                    nestRoot(s.mapping("root")));
+                    nestRoot(s.require("root", s.mapping("root"))));
             case "join" -> {
-                JoinEngine engine = enumByYaml(JoinEngine.values(), JoinEngine::yaml, s, "engine");
-                String sql = s.string("sql");
+                JoinEngine engine =
+                        s.require("engine", enumByYaml(JoinEngine.values(), JoinEngine::yaml, s, "engine"));
+                String sql = s.requireString("sql");
                 checkJoinSql(s, sql);
                 yield new TransformBody.Join(engine, sql);
             }
@@ -361,7 +365,7 @@ public final class DslParser {
     private NestRoot nestRoot(YamlMap r) {
         r.requireOnly(NEST_ROOT_KEYS);
         return new NestRoot(
-                r.string("from"),
+                r.requireString("from"),
                 scalarList(r.seq("key"), "key"),
                 r.string("mode"),
                 boolValue(r, "trackKeyChanges"),
@@ -377,10 +381,10 @@ public final class DslParser {
             YamlMap e = YamlMap.requireMapping(n, "embed");
             e.requireOnly(EMBED_KEYS);
             out.add(new Embed(
-                    e.string("from"),
-                    stringMap(e, "on"),
-                    enumByYaml(EmbedAs.values(), EmbedAs::yaml, e, "as"),
-                    e.string("path"),
+                    e.requireString("from"),
+                    e.require("on", stringMap(e, "on")),
+                    e.require("as", enumByYaml(EmbedAs.values(), EmbedAs::yaml, e, "as")),
+                    e.requireString("path"),
                     scalarList(e.seq("key"), "key"),
                     scalarList(e.seq("arrayKey"), "arrayKey"),
                     boolValue(e, "ignoreUpdates"),
@@ -424,13 +428,13 @@ public final class DslParser {
         if (st.has("hot")) {
             YamlMap h = st.mapping("hot");
             h.requireOnly(HOT_KEYS);
-            hot = new Storage.Hot(h.string("ttl"));
+            hot = new Storage.Hot(h.requireString("ttl"));
         }
         Storage.Warm warm = null;
         if (st.has("warm")) {
             YamlMap w = st.mapping("warm");
             w.requireOnly(WARM_KEYS);
-            warm = new Storage.Warm(w.string("collection"), scalarList(w.seq("indexes"), "indexes"));
+            warm = new Storage.Warm(w.requireString("collection"), scalarList(w.seq("indexes"), "indexes"));
         }
         Storage.Cold cold = null;
         if (st.has("cold")) {
@@ -483,7 +487,7 @@ public final class DslParser {
             String id = s.string("id");
             out.add(new SyncElement(
                     id != null ? id : "sync_" + (i + 1),     // anonymous sync element -> sync_<N> (2026-06-15)
-                    s.string("source"),
+                    s.requireString("source"),
                     enumByYaml(WriteMode.values(), WriteMode::yaml, s, "write_mode"),
                     rename(s.mapping("rename")),
                     enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
@@ -513,7 +517,9 @@ public final class DslParser {
         for (Node n : items) {
             YamlMap q = YamlMap.requireMapping(n, pathPrefix + "query[" + i++ + "]");
             q.requireOnly(QUERY_KEYS);
-            out.add(new QueryElement(enumByYaml(QueryType.values(), QueryType::yaml, q, "type"), q.string("backend")));
+            out.add(new QueryElement(
+                    q.require("type", enumByYaml(QueryType.values(), QueryType::yaml, q, "type")),
+                    q.string("backend")));
         }
         return out;
     }
@@ -529,7 +535,7 @@ public final class DslParser {
             String id = p.string("id");
             out.add(new PushElement(
                     id != null ? id : "push_" + (i + 1),     // anonymous push element -> push_<N> (2026-06-15)
-                    p.string("source"), p.string("topic"),
+                    p.requireString("source"), p.string("topic"),
                     pushFormat(p), p.freeMap("options")));
         }
         return out;
@@ -587,7 +593,7 @@ public final class DslParser {
         allowed.addAll(payloadKeys(type));
         m.requireOnly(allowed);
         return new TransformResource(
-                idOf(m), metadata(m), body(type, m), m.freeMap("options"), m.freeMap("experimental"));
+                m.require("id", idOf(m)), metadata(m), body(type, m), m.freeMap("options"), m.freeMap("experimental"));
     }
 
     /** A reusable MDM sink definition (§7, X19): where/how to materialize, no wiring. */
@@ -595,7 +601,7 @@ public final class DslParser {
         forbidFrom(m);
         m.requireOnly(VIEW_DEF_KEYS);
         return new ViewResource(
-                idOf(m), metadata(m), m.string("primary_key"),
+                m.require("id", idOf(m)), metadata(m), m.string("primary_key"),
                 storage(m.mapping("storage")), viewSchema(m.mapping("schema")), m.freeMap("experimental"));
     }
 
@@ -604,7 +610,7 @@ public final class DslParser {
         forbidFrom(m);
         m.requireOnly(SERVE_DEF_KEYS);
         return new ServeResource(
-                idOf(m), metadata(m),
+                m.require("id", idOf(m)), metadata(m),
                 syncList(m.seq("sync"), ""), queryList(m.seq("query"), ""), pushList(m.seq("push"), ""),
                 m.freeMap("experimental"));
     }
