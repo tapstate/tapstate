@@ -80,8 +80,7 @@ class PipelineRepresentationTest {
                         Map.of(
                                 "id", "shared_cleanup",
                                 "use", "cleanup",
-                                "from", "orders",
-                                "options", Map.of("strict", true)),
+                                "from", "orders"),
                         Map.of(
                                 "id", "scripted",
                                 "type", "js",
@@ -136,8 +135,7 @@ class PipelineRepresentationTest {
                                         "case", "upper",
                                         "prefix", "tap_",
                                         "suffix", "_archive"),
-                                "ddl", "apply",
-                                "options", Map.of("ordered", true))),
+                                "ddl", "apply")),
                         "query", List.of(
                                 Map.of("type", "rest", "backend", "warehouse"),
                                 Map.of("type", "MCP")),
@@ -146,8 +144,7 @@ class PipelineRepresentationTest {
                                         "id", "events",
                                         "source", "kafka_target",
                                         "topic", "orders",
-                                        "format", "=event.after",
-                                        "options", Map.of("acks", "all")),
+                                        "format", "=event.after"),
                                 Map.of(
                                         "source", "audit_target",
                                         "format", Map.of("id", "$order_id", "deleted", false)))),

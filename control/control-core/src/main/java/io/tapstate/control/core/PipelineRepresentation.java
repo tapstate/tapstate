@@ -132,6 +132,7 @@ public final class PipelineRepresentation {
 
     private static Step transform(Map<String, Object> value, String path) {
         Map<String, Object> step = object(value, path);
+        requireNoOptions(step, path);
         String id = text(step.get("id"), path + ".id");
         Map<String, Object> body = objectOrNull(step.get("body"), path + ".body");
         Map<String, Object> payload = new LinkedHashMap<>();
@@ -560,6 +561,7 @@ public final class PipelineRepresentation {
         List<SyncElement> result = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
             Map<String, Object> value = object(values.get(index), path + "[" + index + "]");
+            requireNoOptions(value, path + "[" + index + "]");
             result.add(new SyncElement(
                     textOrNull(value.get("id"), path + ".id"),
                     requiredText(value, "source", path),
@@ -594,6 +596,7 @@ public final class PipelineRepresentation {
         List<PushElement> result = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
             Map<String, Object> value = object(values.get(index), path + "[" + index + "]");
+            requireNoOptions(value, path + "[" + index + "]");
             result.add(new PushElement(
                     textOrNull(value.get("id"), path + ".id"),
                     requiredText(value, "source", path),
@@ -866,12 +869,33 @@ public final class PipelineRepresentation {
         requiredString(value, path);
     }
 
+    /**
+     * Options are the engine's own configuration and its vocabulary is empty today, so the model has
+     * nowhere to put one. Refusing here rather than dropping it silently: a request that carries an
+     * option and loses it on the way in reads as accepted and configures nothing. The source face
+     * refuses the same key, and so does the authoring grammar; this face used to be the one that
+     * took it and said nothing.
+     */
+    private static void requireNoOptions(Map<String, Object> value, String path) {
+        Object options = value.get("options");
+        if (options == null || (options instanceof Map<?, ?> map && map.isEmpty())) {
+            return;
+        }
+        throw malformed(path + ".options carries no engine option today; remove the field");
+    }
+
     private static TapstateException malformed(String reason) {
         String detail = reason == null || reason.isBlank() ? "invalid pipeline payload" : reason;
         return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", detail), null);
     }
 
     private static final class SetOf {
+        /**
+         * The keys a step carries in its own right. Everything else on a step is transform payload,
+         * so a key dropped from here is not removed - it is re-read as payload. "options" stays for
+         * that reason: the refusal above lets an empty one through, and without this entry that
+         * empty map would arrive in the transform body.
+         */
         private static final java.util.Set<String> STEP_META = java.util.Set.of(
                 "id", "from", "type", "use", "options", "experimental", "body");
 
