@@ -1,31 +1,32 @@
 # DSL corpus — acceptance baseline for the core-dsl pipeline (plan poc1 B1)
 
-This corpus materializes every scenario of [ADR-0016](../../../../../../docs/adr/0016-dsl-grammar.md)
-§14 (14.1–14.11, X19 included) as loadable `.tap.yml` workspaces. It is the acceptance
-baseline for B2–B5: parse, validate, CEL checking, and canonical round-trip are all
-asserted against these files. Grammar branches the corpus does not exercise are not
-implemented defensively (plan risk R3, corpus-first).
+This corpus materializes every §14 grammar scenario (14.1–14.11, X19 included) as
+loadable `.tap.yml` workspaces. It is the acceptance baseline for B2–B5: parse, validate,
+CEL checking, and canonical round-trip are all asserted against these files. Grammar
+branches the corpus does not exercise are not implemented defensively (plan risk R3,
+corpus-first).
 
 Authoring rules:
 
 - **Only defined syntax.** Every file uses §1–§13 grammar exactly as decided; no invented
-  fields, no speculative sugar. When the grammar changes, the ADR changes first.
+  fields, no speculative sugar. The grammar is decided first; the corpus follows.
 - One file per resource, named `<top-level id>.tap.yml`, single YAML document.
-- Comments are English and cite the deciding ADR section / X-decision.
+- Comments are English and state the rule a file exercises — the grammar section or X-decision,
+  never an identifier for a document this repository does not carry.
 - `CorpusSmokeTest` guards this structural contract (well-formedness, layout, rule
   vocabulary). It does **not** check DSL semantics — that is the validate engine's job.
 
-## valid/ — one workspace directory per ADR-0016 §14 scenario
+## valid/ — one workspace directory per §14 scenario
 
 Each directory is an independently loadable workspace batch: every referenced id resolves
-inside the directory (offline closure = the batch, ADR-0021 §3). Ids may repeat across
+inside the directory (offline closure = the batch). Ids may repeat across
 directories — uniqueness is per batch.
 
 `s01`–`s11` are the original §14 scenarios; `s12`–`s13` are read_mode-amendment additions
 (§11.8) exercising grammar that amendment introduced — `read_mode: snapshot_only` bounding a
 cdc read, and `srs.enabled: false`.
 
-| Directory | ADR | Scenario | Notable grammar surface |
+| Directory | Section | Scenario | Notable grammar surface |
 |---|---|---|---|
 | `s01-mirror-rename-ddl` | §14.1 | Oracle → MySQL whole-source mirror | `serve.from: /.*/`, `sync[].rename` (map+case+prefix), `ddl: apply`, `auto_create_table` |
 | `s02-modeling-nest-rest` | §14.2 | Oracle → SRS → nest → view → REST | `srs` tuning, `map`, `nest` full tree (2-level embed), view tiers, `query: rest` |
@@ -34,7 +35,7 @@ cdc read, and `srs.enabled: false`.
 | `s05-cdc-to-kafka-push` | §14.5 | MySQL CDC → Kafka | `push` element (no `type`), `topic`, `settings.read_mode: cdc_only` |
 | `s06-api-poll-mongo` | §14.6 | GitHub API polling → MongoDB | `mode: api`, `poll_interval`/`cursor`, `tables[].pk`, whole-source regex |
 | `s07-csv-batch-import` | §14.7 | CSV batch import + cleanse | `mode: file`, literal-only `tables`, map computed value (`"=CEL"`) |
-| `s08-dual-source-join` | §14.8 | Cross-database dual-source join | `source:` id list, `join` (duckdb SQL + aggregation), view-only output |
+| `s08-dual-source-join` | §14.8 | Cross-database dual-source join | `source:` id list, `join` (SQL inside the supported subset), view-only output |
 | `s09-filter-fanout-pipelines` | §14.9 | Conditional fan-out, v1 form | N pipelines × `filter` over one shared source (router is out of v1, X14) |
 | `s10-ddl-evolution-chain` | §14.10 | DDL / schema evolution five-hop chain | `include_ddl`, `srs.schema_evolution: track`, map passthrough, `view.schema`, sink `ddl: apply` |
 | `s11-reuse-assembly` | §14.11 | Definition bodies + pure-reference assembly | `kind: transform/view/serve` definitions, string = `use:` sugar, natural-order wiring (X19) |
@@ -48,7 +49,6 @@ Each case is the smallest batch that exhibits exactly one violation, plus an
 
 ```yaml
 rule: <vocabulary key>   # machine-checked against the list below
-adr:  "<deciding ADR section>"
 path: <field path of the violation>
 note: "<one-line human explanation>"
 ```
@@ -91,8 +91,8 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `g01-id-contains-dot` | illegal-value | id containing the reserved `.` separator |
 | `g02-duplicate-top-level-id` | duplicate-id | same top-level id in two files of one batch |
 | `g03-duplicate-pipeline-internal-id` | duplicate-id | two transforms steps in one pipeline share an id (internal namespace, 2026-06-15) |
-| `g04-step-id-shadows-table` | duplicate-id | step id equals a literal table name in the source (no shadowing, ADR-0016 §5) |
-| `g05-step-id-shadows-source` | duplicate-id | step id equals a referenced source id (no shadowing, ADR-0016 §5) |
+| `g04-step-id-shadows-table` | duplicate-id | step id equals a literal table name in the source (no shadowing, §5) |
+| `g05-step-id-shadows-source` | duplicate-id | step id equals a referenced source id (no shadowing, §5) |
 | `g06-cel-unknown-envelope-field` | illegal-expression | filter references `afterr`, a typo of the `after` envelope field (CEL type-check) |
 | `g07-cel-map-syntax-error` | illegal-expression | map computed value `"=after.region +"` is not well-formed CEL (CEL parse) |
 | `g08-cel-push-object-format` | illegal-expression | push object-form computed field `"=after.region +"` is not well-formed CEL (distinct `format.<field>` path) |
@@ -101,9 +101,10 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `g11-config-enum-violation` | invalid-config-value | `mysql.deploymentMode` set to `cluster`, outside the declared enum |
 | `g12-snapshot-only-on-stream` | mode-mismatch | `settings.read_mode: snapshot_only` over a pure stream source (no one-shot read) |
 | `g13-start-from-without-tail` | mode-mismatch | `settings.start_from` on a bounded read (api source, no incremental tail) |
-| `g14-source-without-connector` | missing-field | source with no `connector:`, the field nothing else implies |
-| `g15-read-source-without-mode` | mode-required-for-read | source read by a pipeline with no `mode:`; the write target in the same batch correctly has none |
-| `g16-view-without-primary-key` | missing-field | inline view with no `primary_key:`, the field its sink indexes uniquely |
+| `g14-start-from-on-snapshot-only-cdc` | mode-mismatch | `settings.start_from` on a cdc source read `snapshot_only` (the read_mode removed the tail, so the reported mode is the read_mode) |
+| `g15-source-without-connector` | missing-field | source with no `connector:`, the field nothing else implies |
+| `g16-read-source-without-mode` | mode-required-for-read | source read by a pipeline with no `mode:`; the write target in the same batch correctly has none |
+| `g17-view-without-primary-key` | missing-field | inline view with no `primary_key:`, the field its sink indexes uniquely |
 
 Connector-dimension variants (capability matrix, config field checks) are validated against the
 bundled catalog by plan task C3. The catalog's mode signal is trusted only where it is reliable —

@@ -14,7 +14,9 @@ import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -29,6 +31,13 @@ import java.util.concurrent.CompletionException;
  * <p>Backpressure is by refusal: when the in-flight bound is reached the processor stops draining its
  * inbox, so Jet holds the upstream back until an outstanding write settles and frees a slot. A batch's
  * events are handed to the writer and never touched again, honouring the writer's ownership window.
+ *
+ * <p><b>Not everything that arrives is a record.</b> A vertex upstream may also send word that a chain got
+ * past changes it has nothing to deliver for — absorbed where they arrived, with no record coming for them
+ * ever. Those are never offered to the writer, but they take part in the frontier, and they take part
+ * <em>with the batch they arrived in</em> rather than on arrival: a position may only be acked once every
+ * record carrying a lower one has landed, and settling with the batch is what makes that true here without
+ * anything having to work out what is still outstanding.
  *
  * <p>The vertex runs at total parallelism one and, by default, keeps a single write in flight: one
  * {@code serve.sync} is one external target, and applying one batch to completion before the next is
@@ -56,6 +65,19 @@ public final class SinkProcessor extends AbstractProcessor {
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
+    // Bounds that arrived while writes were still in flight, held until they settle, one per axis. A bound
+    // proves what is still coming, never what is durable: every event it covers has been taken in by the
+    // time it arrives, but the ones sitting in an unsettled batch are not written yet. Handing it to the
+    // frontier then would let one settled batch of a fan-out stand for the whole of what its change
+    // produced.
+    //
+    // One slot per axis rather than one in total, because a bound names the chain it is for: one chain's
+    // promise is not a newer version of another's, and a single slot lets whichever arrives second
+    // overwrite the first. The overwritten chain then waits for a strictly higher position of its own to
+    // settle, which on a chain that has gone quiet never comes -- so the position it was holding stays
+    // open for the life of the run, and on a snapshot that is a table nothing records as loaded and every
+    // resume reads again in full.
+    private final Map<Byte, Watermark> heldBounds = new LinkedHashMap<>();
     private boolean closed;
 
     // Resolved at init from the running job, so a failed write can be recorded against this pipeline's id
@@ -101,33 +123,44 @@ public final class SinkProcessor extends AbstractProcessor {
     /**
      * A meta-supplier for a sink vertex that drives the writer the factory opens. The factory (not a
      * prebuilt writer) is what the DAG carries, so the writer is opened on the member that runs the
-     * vertex. The vertex is pinned to total parallelism one.
+     * vertex. The vertex is pinned to total parallelism one, on the member that owns {@code vertexName}.
+     *
+     * <p>Naming the member is half of a pair, and the other half is not optional: every edge into this
+     * vertex must be {@code distributed().allToOne(vertexName)}. Pinned says there is one processor;
+     * reachable says the items get to it. A member with no processor of this vertex answers input with an
+     * {@code IllegalStateException} the moment the first event lands, which on one member never happens -
+     * the only processor there is the local one - so nothing short of a real cluster tells the two apart.
      */
-    public static ProcessorMetaSupplier metaSupplier(SupplierEx<? extends SinkWriter> writerFactory) {
+    public static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory) {
+        Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         SupplierEx<Processor> supplier =
                 () -> new SinkProcessor(writerFactory.get(), DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE);
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
     /**
      * A meta-supplier for a sink vertex that also advances a durable sink-ack watermark. The ack is carried
      * as a {@link SinkAckFactory}, not a prebuilt {@link SinkAck}: the durable store it writes is not
      * serializable, so only the factory travels on the DAG and the store is resolved on the member that runs
-     * the vertex. The vertex is pinned to total parallelism one and keeps a single write in flight, the
+     * the vertex. The vertex is pinned to total parallelism one - on the member that owns {@code vertexName},
+     * which every edge into it must route to with {@code allToOne} - and keeps a single write in flight, the
      * order-preserving contract every shape of frontier below it depends on.
      *
      * <p>{@code frontierFactory} settles which shape that is, and it is settled here rather than run-time:
      * how far a sink may say a chain has landed depends on whether what reaches it is one chain in order or
      * an assembly of several, and that is a property of the graph that was compiled, not of any event.
      */
-    static ProcessorMetaSupplier metaSupplier(SupplierEx<? extends SinkWriter> writerFactory,
+    static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory) {
+        Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         Objects.requireNonNull(sinkAckFactory, "sinkAckFactory");
         Objects.requireNonNull(frontierFactory, "frontierFactory");
         return ProcessorMetaSupplier.forceTotalParallelismOne(
-                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory));
+                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory), vertexName);
     }
 
     /**
@@ -148,11 +181,25 @@ public final class SinkProcessor extends AbstractProcessor {
         reapSettled();
         while (!inbox.isEmpty() && inFlight.size() < maxInFlight) {
             List<Envelope> batch = new ArrayList<>();
-            while (batch.size() < maxBatchSize && !inbox.isEmpty()) {
-                batch.add((Envelope) inbox.poll());
+            List<ChainEntry> absorbed = new ArrayList<>();
+            int taken = 0;
+            while (taken < maxBatchSize && !inbox.isEmpty()) {
+                Object item = inbox.poll();
+                taken++;
+                // Word that a chain got past some changes with nothing to deliver for them. It is not a
+                // record and is never offered to the writer, but it settles with this batch rather than on
+                // arrival: it may only be acked once every record before it has landed, and riding the
+                // batch is what makes that true without anything here having to work it out.
+                if (item instanceof SettledPositions settled) {
+                    settled.positions().forEach(
+                            (chain, position) -> absorbed.add(new ChainEntry(chain, position)));
+                    continue;
+                }
+                batch.add((Envelope) item);
             }
-            inFlight.add(new InFlightBatch(
-                    writer.write(batch).toCompletableFuture(), positionsOf(batch)));
+            List<ChainEntry> positions = new ArrayList<>(positionsOf(batch));
+            positions.addAll(absorbed);
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions));
         }
         // A saturated in-flight set leaves the rest of the inbox unread; Jet backpressures upstream
         // until reapSettled frees a slot on a later call.
@@ -192,10 +239,32 @@ public final class SinkProcessor extends AbstractProcessor {
     @Override
     public boolean tryProcessWatermark(Watermark watermark) {
         if (frontier != null) {
-            frontier.bound(watermark, sinkAck);
+            // The newest bound on an axis subsumes any older one held for that axis, so only the newest of
+            // each is kept. Across axes nothing subsumes anything.
+            heldBounds.put(watermark.key(), watermark);
+            releaseHeldBounds();
             reportTrailing();
         }
         return true;
+    }
+
+    /**
+     * Hands every held bound to the frontier once nothing is in flight. That is the moment every event they
+     * cover is durable: the engine delivers a bound only after the events beneath it, and this processor
+     * takes those straight from the inbox into batches, so once no batch is in flight none of them is
+     * unwritten.
+     *
+     * <p>All of them, not the newest: they are bounds on different chains, and a chain whose bound was
+     * dropped here has no second one coming while it stays quiet.
+     */
+    private void releaseHeldBounds() {
+        if (heldBounds.isEmpty() || !inFlight.isEmpty()) {
+            return;
+        }
+        for (Watermark bound : heldBounds.values()) {
+            frontier.bound(bound, sinkAck);
+        }
+        heldBounds.clear();
     }
 
     /**
@@ -242,6 +311,7 @@ public final class SinkProcessor extends AbstractProcessor {
             return true;
         });
         if (frontier != null) {
+            releaseHeldBounds();
             reportTrailing();
         }
     }
@@ -261,6 +331,18 @@ public final class SinkProcessor extends AbstractProcessor {
     /** What this batch contributes to the frontier, empty when no frontier is tracked. */
     private List<ChainEntry> positionsOf(List<Envelope> batch) {
         return frontier == null ? List.of() : frontier.positions(batch);
+    }
+
+    /**
+     * The write that settles this batch, or an already-settled one where the batch holds no record. A drain
+     * of nothing but words about chains has nothing to deliver, and handing the writer an empty list would
+     * put an empty call on an external target on every one of them - on a pointed-at stream nobody names,
+     * that is every drain of it.
+     */
+    private CompletableFuture<WriteResult> settlementOf(List<Envelope> batch) {
+        return batch.isEmpty()
+                ? CompletableFuture.completedFuture(new WriteResult(0))
+                : writer.write(batch).toCompletableFuture();
     }
 
     /**

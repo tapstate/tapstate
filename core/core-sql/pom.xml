@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.tapstate</groupId>
+    <artifactId>core</artifactId>
+    <version>${revision}</version>
+  </parent>
+
+  <artifactId>core-sql</artifactId>
+  <name>Tapstate :: Core :: SQL</name>
+  <description>SQL parse / validate / output-type derivation for join declarations; produces a carrier-agnostic plan and never executes anything</description>
+
+  <dependencies>
+    <!-- compile scope: the shared column-type vocabulary. A derived output field is reported in
+         it rather than in the SQL engine's own type names, which is what keeps the produced plan
+         carrier-agnostic. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-common</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
+    <!-- Calcite at compile scope: parser + validator + type derivation, never execution. Its 25
+         declared dependencies are excluded wholesale and the four that are actually reachable
+         from this path are declared below, so what lands on the classpath is stated in this file
+         rather than inherited. Among the excluded: a runtime Java compiler (janino), a JDBC
+         connection pool (commons-dbcp2) and a geospatial stack (jts / proj4j). -->
+    <dependency>
+      <groupId>org.apache.calcite</groupId>
+      <artifactId>calcite-core</artifactId>
+      <exclusions>
+        <exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.calcite</groupId>
+      <artifactId>calcite-linq4j</artifactId>
+      <exclusions>
+        <exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion>
+      </exclusions>
+    </dependency>
+    <!-- reached from Frameworks' static initializer (its Driver extends avatica's
+         UnregisteredDriver), not from anything this module writes -->
+    <dependency>
+      <groupId>org.apache.calcite.avatica</groupId>
+      <artifactId>avatica-core</artifactId>
+      <exclusions>
+        <exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion>
+      </exclusions>
+    </dependency>
+    <!-- reached from the validator's static initializer (TimeFrames builds its unit conversions
+         with BigFraction), not from anything this module writes -->
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-math3</artifactId>
+    </dependency>
+    <!-- Calcite logs through slf4j; without the API on the classpath its classes fail to link -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <!-- Guava is not an independent grant: Calcite's own schema and type APIs take and return
+         Guava collections, so the parse/validate path cannot link without it. Nothing this module
+         writes names a Guava type, which is why the fine-grained ring rule does not grant it. -->
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Core-ring allowlist grant (R1): the SQL front end's closure is permitted at compile
+           scope in core-sql ONLY. Appends to the parent core ring's enforce-core-ring-whitelist
+           rule (core/pom.xml); every other core module still bans these. Five artifacts, named
+           one by one on purpose: a Calcite upgrade that reintroduces one of the excluded
+           dependencies trips this gate instead of silently widening the core ring. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>enforce-core-ring-whitelist</id>
+            <configuration>
+              <rules>
+                <bannedDependencies>
+                  <includes combine.children="append">
+                    <include>org.apache.calcite:calcite-core</include>
+                    <include>org.apache.calcite:calcite-linq4j</include>
+                    <include>org.apache.calcite.avatica:avatica-core</include>
+                    <include>org.apache.commons:commons-math3</include>
+                    <include>org.slf4j:slf4j-api</include>
+                    <!-- Guava and the annotation-only artifacts it declares -->
+                    <include>com.google.guava:guava</include>
+                    <include>com.google.guava:failureaccess</include>
+                    <include>com.google.guava:listenablefuture</include>
+                    <include>com.google.j2objc:j2objc-annotations</include>
+                    <include>com.google.code.findbugs:jsr305</include>
+                    <include>com.google.errorprone:error_prone_annotations</include>
+                    <include>org.checkerframework:checker-qual</include>
+                    <include>org.jspecify:jspecify</include>
+                  </includes>
+                </bannedDependencies>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

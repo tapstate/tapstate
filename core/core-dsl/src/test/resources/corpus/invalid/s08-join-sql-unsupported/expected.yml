@@ -1,0 +1,3 @@
+rule: join-sql-unsupported
+path: transforms[0].sql
+note: "FULL OUTER JOIN is outside the supported subset; refused at parse, not at assembly"

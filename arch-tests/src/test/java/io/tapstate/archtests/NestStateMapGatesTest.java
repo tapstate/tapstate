@@ -3,9 +3,12 @@ package io.tapstate.archtests;
 import com.hazelcast.config.IndexConfig;
 import com.hazelcast.config.IndexType;
 import com.hazelcast.config.MapConfig;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.map.IMap;
 import com.tngtech.archunit.core.domain.JavaAccess;
+import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.domain.JavaModifier;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import java.util.LinkedHashMap;
@@ -35,12 +38,28 @@ import static org.assertj.core.api.Assertions.assertThat;
  * map - with one, what the carried write is handed is a clone of the state rather than the state - so an
  * index added years later would put the copy back with nothing to show for it and nothing reporting it.
  *
+ * <p><b>One put is allowed, in one place, and it is a cost decision rather than a loosening.</b> A carried
+ * write is handed the current entry, so on a key that is not resident the substrate fetches it from the
+ * layer behind the map first - and that write overwrites what it is handed without reading it. Onto a key
+ * a read has just found nothing under, a put buys that round trip back for one copy of a state holding
+ * only what the drain just brought. The two store the same thing, so nothing but cost is at stake; the ban
+ * is what keeps it to the one write where the arithmetic comes out that way.
+ *
  * <p><b>Reach past one key.</b> Every edge into a nest vertex is partitioned by the key that vertex files
  * its state under, so the entry an event needs is on the member and the partition the event is already on.
  * A call that spans the map - listing it, sizing it, running over its entries - abandons that: it becomes
  * a cluster-wide operation whose cost grows with the whole keyspace rather than with the event. On a single
  * member it is merely a scan of everything and looks like it works, so the day this is wrong is the day a
  * second member appears, long after the code was written.
+ *
+ * <p><b>One reach past a single key is allowed, and it is not a loosening of the ban above.</b> A row that
+ * a level points at belongs to no document - one of them can sit under thousands at once - so there is no
+ * partition it could be on that is also the partition of a document naming it, and it is fetched by the key
+ * set that document already carries. That grows with the document doing the asking, not with the keyspace,
+ * which is the property every ban here exists to keep. It is confined to the one store that holds those
+ * rows, and its own case asserts both halves: nothing else reads a key set, and that store still does - a
+ * batch that quietly became a round trip per reference leaves every document correct and fails nothing, so
+ * only a case that insists on its presence would ever notice.
  *
  * <p>Both bans are checked against a fixture that really uses each mechanism before production is scanned.
  * A ban that matches nothing passes for free and keeps passing after the API it names is renamed, so the
@@ -58,11 +77,23 @@ class NestStateMapGatesTest {
     /** The single class that may name expiry, because naming it is how it is turned off. */
     private static final String DECLARES_WHAT_A_STATE_MAP_IS = NEST + "NestMaps";
 
+    /**
+     * The store behind every namespace, and the single class allowed either of the two exceptions below:
+     * reading several keys in one call, and putting a state across the map. Both are allowed here and
+     * nowhere else, and each case states its own reason for it.
+     */
+    private static final String THE_STORE_BEHIND_EVERY_NAMESPACE = NEST + "MapNestStore";
+
     private static final Map<String, Predicate<JavaAccess<?>>> EXPIRY_MECHANISMS = expiryMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> WHOLE_MAP_MECHANISMS = wholeMapMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> PUT_ACROSS_MECHANISMS = putAcrossMechanisms();
+
+    private static final Map<String, Predicate<JavaAccess<?>>> PUT_ONTO_NOTHING_MECHANISMS =
+            putOntoNothingMechanisms();
+
+    private static final Map<String, Predicate<JavaAccess<?>>> BOUNDED_READ_MECHANISMS = boundedReadMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> INDEX_MECHANISMS = indexMechanisms();
 
@@ -89,6 +120,15 @@ class NestStateMapGatesTest {
                         + "gate would pass over production code that uses it", mechanism)
                 .isNotEmpty());
         PUT_ACROSS_MECHANISMS.forEach((mechanism, detects) -> assertThat(accesses(fixtureClasses, detects, ""))
+                .as("%s is no longer detected - the API it names has moved or been renamed, and this "
+                        + "gate would pass over production code that uses it", mechanism)
+                .isNotEmpty());
+        PUT_ONTO_NOTHING_MECHANISMS.forEach((mechanism, detects) ->
+                assertThat(accesses(fixtureClasses, detects, ""))
+                        .as("%s is no longer detected - the API it names has moved or been renamed, and "
+                                + "this gate would pass over production code that uses it", mechanism)
+                        .isNotEmpty());
+        BOUNDED_READ_MECHANISMS.forEach((mechanism, detects) -> assertThat(accesses(fixtureClasses, detects, ""))
                 .as("%s is no longer detected - the API it names has moved or been renamed, and this "
                         + "gate would pass over production code that uses it", mechanism)
                 .isNotEmpty());
@@ -119,13 +159,81 @@ class NestStateMapGatesTest {
     }
 
     @Test
+    @DisplayName("only the store holding the rows a level points at reads several keys at once")
+    void readingASetOfKeysIsConfinedToTheStoreThatHoldsReferredToRows() {
+        BOUNDED_READ_MECHANISMS.forEach((mechanism, detects) -> {
+            List<String> found = accesses(productionClasses, detects, NEST);
+            assertThat(found)
+                    .as("%s is the one reach past a single key this design allows, and it is allowed in "
+                            + "one place. A row a level points at belongs to no document - one of them "
+                            + "can sit under thousands at once - so it cannot be on the partition of any "
+                            + "document that names it, and it is read by a key set the document already "
+                            + "carries. Anywhere else, the ban above is the rule", mechanism)
+                    .allMatch(access -> access.startsWith(THE_STORE_BEHIND_EVERY_NAMESPACE + " ->"));
+            assertThat(found)
+                    .as("%s has left the one place it was allowed. Either those rows are no longer read "
+                            + "in one call - which is a round trip per reference wearing the same shape, "
+                            + "every document still correct and nothing failing - or this gate is now "
+                            + "guarding nothing at all", mechanism)
+                    .isNotEmpty();
+        });
+    }
+
+    @Test
+    @DisplayName("every nest processor says which kind of thread it runs on")
+    void everyNestProcessorDeclaresWhetherItIsCooperative() {
+        List<String> silent = productionClasses.stream()
+                .filter(type -> type.getName().startsWith(NEST))
+                .filter(type -> type.isAssignableTo(Processor.class))
+                .filter(type -> !type.getModifiers().contains(JavaModifier.ABSTRACT))
+                .filter(type -> type.tryGetMethod("isCooperative").isEmpty())
+                .map(JavaClass::getName)
+                .toList();
+
+        assertThat(silent)
+                .as("a nest processor reaches the state layer, and a call into it waits. Waiting on a "
+                        + "cooperative thread stops every other vertex sharing that thread, not just this "
+                        + "one - and cooperative is what a processor is unless it says otherwise, so the "
+                        + "whole of the mistake is saying nothing. It looks like nothing until some "
+                        + "unrelated pipeline sharing the thread goes quiet. Declare it either way")
+                .isEmpty();
+    }
+
+    @Test
     @DisplayName("state is carried to its key rather than put across the map")
     void noNestCodePutsStateAcrossTheMap() {
         PUT_ACROSS_MECHANISMS.forEach((mechanism, detects) ->
                 assertThat(accesses(productionClasses, detects, NEST))
                         .as("%s: a put serializes the whole assembled document on every write, where "
-                                + "carrying it to its own key serializes none of it", mechanism)
+                                + "carrying it to its own key serializes none of it. Measured as the pair "
+                                + "a level performs - read the state out, change it, write it back - on "
+                                + "the object format these maps are configured with: put costs two "
+                                + "serializations and two deserializations per write, carry costs one of "
+                                + "each, at every state size measured. Measure it on the binary format "
+                                + "instead and the two come out equal, which is the trap: that is a "
+                                + "carrier this operator does not use", mechanism)
                         .isEmpty());
+    }
+
+    @Test
+    @DisplayName("only the write onto a key holding nothing puts a state across the map")
+    void puttingAStateAcrossTheMapIsConfinedToTheWriteOntoAKeyHoldingNothing() {
+        PUT_ONTO_NOTHING_MECHANISMS.forEach((mechanism, detects) -> {
+            List<String> found = accesses(productionClasses, detects, NEST);
+            assertThat(found)
+                    .as("%s is the one put this design allows, and it is allowed in one place: the write "
+                            + "onto a key a read has just found nothing under, where the copy it costs "
+                            + "buys back the fetch a carried write would make for a value nobody reads. "
+                            + "Anywhere else, the ban above is the rule - a put there costs a copy of the "
+                            + "whole assembled document on every single write", mechanism)
+                    .allMatch(access -> access.startsWith(THE_STORE_BEHIND_EVERY_NAMESPACE + " ->"));
+            assertThat(found)
+                    .as("%s has left the one place it was allowed, so either that write is carried again - "
+                            + "which is a round trip behind the map per key per residency, every document "
+                            + "still correct and nothing failing - or this gate is now guarding nothing "
+                            + "at all", mechanism)
+                    .isNotEmpty();
+        });
     }
 
     @Test
@@ -141,8 +249,31 @@ class NestStateMapGatesTest {
 
     private static Map<String, Predicate<JavaAccess<?>>> putAcrossMechanisms() {
         Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
-        named(mechanisms, "putting the state across the map", "put", "set", "putAsync", "setAsync",
+        named(mechanisms, "putting the state across the map", "put", "putAsync", "setAsync",
                 "putIfAbsent", "putTransient", "replace");
+        return Map.copyOf(mechanisms);
+    }
+
+    /**
+     * Putting a state across the map. Kept apart from the ban above so it can be allowed in exactly one
+     * place and stay banned in every other, the same way the bounded read is: it is the write onto a key
+     * holding nothing, where a copy of the state is the cheaper of the two and everywhere else it is not.
+     */
+    private static Map<String, Predicate<JavaAccess<?>>> putOntoNothingMechanisms() {
+        Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
+        named(mechanisms, "putting the state across the map", "set");
+        return Map.copyOf(mechanisms);
+    }
+
+    /**
+     * Reading several keys in one call. It is not a whole-map mechanism: the keys are handed in, so what it
+     * costs grows with the document asking rather than with the keyspace - which is the property every ban
+     * above is actually protecting. It is kept apart so it can be allowed in exactly one place and stay
+     * banned in every other.
+     */
+    private static Map<String, Predicate<JavaAccess<?>>> boundedReadMechanisms() {
+        Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
+        named(mechanisms, "reading a handed-in set of keys", "getAll");
         return Map.copyOf(mechanisms);
     }
 
@@ -176,7 +307,7 @@ class NestStateMapGatesTest {
         named(mechanisms, "measuring the whole map", "size", "isEmpty");
         named(mechanisms, "writing or removing across keys", "putAll", "setAll", "removeAll",
                 "clear", "evictAll");
-        named(mechanisms, "reading across keys", "getAll", "loadAll");
+        named(mechanisms, "reading across keys", "loadAll");
         named(mechanisms, "running over more than one entry", "executeOnEntries", "executeOnKeys",
                 "aggregate", "project", "forEach");
         return Map.copyOf(mechanisms);

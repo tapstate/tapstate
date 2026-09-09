@@ -14,12 +14,15 @@ import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Settings;
@@ -29,6 +32,9 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
@@ -87,6 +93,16 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     /** A namespace belonging to some other pipeline, which no stop of this one may touch. */
     private static final String OTHER_PIPELINE_NAMESPACE = "nest.other_pipe.some_step.$root";
 
+    private static final String SOURCE_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, PARENT_SOURCE);
+    private static final String CHILD_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, CHILD_SOURCE);
+    private static final String GRANDCHILD_CONNECTOR_NAMESPACE =
+            connectorNamespace(PIPELINE, GRANDCHILD_SOURCE);
+    private static final String SINK_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "sync_1");
+    private static final String VIEW_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "orders_view");
+    private static final String OTHER_PIPELINE_CONNECTOR_NAMESPACE = connectorNamespace("other_pipe", PARENT_SOURCE);
+    private static final String UNOPENED_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "removed_node");
+    private static final String GLOBAL_CONNECTOR_NAMESPACE = "pdk.global-state";
+
     private HazelcastInstance member;
 
     @BeforeEach
@@ -112,11 +128,11 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
-    @DisplayName("the namespaces a stop drops are every vertex's state and parking area, plus where the shape was written down")
+    @DisplayName("the namespaces a stop drops are every runtime component's state")
     void namesEveryNamespaceTheTreeKeepsStateIn() {
         InMemoryStorePort store = seedStore();
 
-        Set<String> namespaces = new StoreBackedDagSource(store).stateNamespacesOf(PIPELINE);
+        Set<String> namespaces = namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE));
 
         // Two per compiled vertex - the state itself and the area where a subtree sits while it moves
         // between documents - for the resolver serving the embed that has children and for the assembler;
@@ -127,17 +143,46 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         // will ever send again. A stop that dropped everything else and left those behind would keep them
         // under a name no run afterwards looks at.
         assertThat(namespaces).containsExactlyInAnyOrder(ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE,
-                ROOT_NAMESPACE + ".parking", ITEMS_NAMESPACE + ".parking");
+                ROOT_NAMESPACE + ".parking", ITEMS_NAMESPACE + ".parking", SOURCE_CONNECTOR_NAMESPACE,
+                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE);
     }
 
     @Test
-    void aPipelineThatNestsNothingHasNoNamespaceToBeLetGoOf() {
+    void everythingTheProductDeclaresItKeepsIsAKindItsOwnDescriptionCanName() {
+        InMemoryStorePort store = seedStore();
+
+        List<String> labels = new StoreBackedDagSource(store).stateHeldBy(PIPELINE).stream()
+                .map(PipelineStateHolding::label)
+                .toList();
+
+        // The gate the rendered description cannot be without. That description is written from the
+        // vocabulary, so it stays true about everything in the vocabulary by construction -- and says
+        // nothing at all about a kind of state a real pipeline turns out to hold under a name the
+        // vocabulary never heard of. This is what turns that into a red test rather than a sentence
+        // that is quietly incomplete.
+        assertThat(labels).isNotEmpty();
+        assertThat(PipelineStateInventory.vocabulary().stream()
+                .map(PipelineStateHolding::label).toList())
+                .as("a kind of state the product keeps under a name no surface can speak")
+                .containsAll(labels);
+    }
+
+    @Test
+    void aPipelineThatNestsNothingStillNamesItsConnectorState() {
         InMemoryStorePort store = seedStore();
         store.artifacts().save(pipelineWithoutNest());
 
-        assertThat(new StoreBackedDagSource(store).stateNamespacesOf(PIPELINE))
-                .describedAs("a stop of an ordinary pipeline drops nothing, and notes nothing to drop later")
-                .isEmpty();
+        assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE);
+    }
+
+    @Test
+    void aViewSinkIsNamedAlongsideTheCaptureConnectorThatFeedsIt() {
+        InMemoryStorePort store = seedStore();
+        store.artifacts().save(pipelineWithView());
+
+        assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE);
     }
 
     @Test
@@ -146,7 +191,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         InMemoryStorePort store = seedStore();
         seedState(store, ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE, OTHER_PIPELINE_NAMESPACE);
 
-        actuator(store).stop(PIPELINE);
+        actuator(store).stop(PIPELINE, true);
 
         assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isEmpty();
         assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isEmpty();
@@ -158,6 +203,80 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         assertThat(store.keyedState().load(OTHER_PIPELINE_NAMESPACE, "k"))
                 .describedAs("a stop drops what this pipeline named, never what merely looks like it")
                 .isPresent();
+    }
+
+    @Test
+    @DisplayName("a stop asked to keep the state leaves it standing, and leaves no drop for a later start")
+    void stoppingWithoutClearingTouchesNothingNowOrAtTheNextStart() {
+        InMemoryStorePort store = seedStore();
+        seedState(store, ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE, OTHER_PIPELINE_NAMESPACE);
+        EngineLifecycleActuator actuator = actuator(store);
+
+        actuator.stop(PIPELINE, false);
+
+        assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(SHAPE_NAMESPACE, "k")).isPresent();
+        // The map as well as the store behind it, for the mirror of the reason the clearing case gives:
+        // a reader answers from the map, so dropping that alone takes the state away from everything
+        // that would look for it while every load above still says it is there.
+        assertThat(member.getMap(ROOT_NAMESPACE).get("k")).isEqualTo("held");
+        assertThat(member.getMap(ITEMS_NAMESPACE).get("k")).isEqualTo("held");
+
+        // The second half is the one that discriminates. A stop that wrote the drop down and then merely
+        // declined to carry it out passes everything above: the note it left is finished by the next
+        // start, so the state goes at the start of a pipeline whose owner asked for it to be kept, and
+        // nothing between the two says a word. Keeping has to mean nothing was written down either.
+        actuator.start(PIPELINE);
+
+        assertThat(store.keyedState().load(ROOT_NAMESPACE, "k"))
+                .describedAs("still there across the start that follows, not merely across the stop")
+                .isPresent();
+        assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(SHAPE_NAMESPACE, "k")).isPresent();
+        assertThat(member.getMap(ROOT_NAMESPACE).get("k"))
+                .describedAs("and still readable from where a run reads it, across that start")
+                .isEqualTo("held");
+        assertThat(member.getMap(ITEMS_NAMESPACE).get("k")).isEqualTo("held");
+    }
+
+    @Test
+    @DisplayName("purging a pipeline clears its exact connector state and keeps every other connector state")
+    void purgingClearsOnlyTheStoppedPipelinesConnectorState() {
+        InMemoryStorePort store = seedStore();
+        seedState(store, SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE,
+                OTHER_PIPELINE_CONNECTOR_NAMESPACE, UNOPENED_CONNECTOR_NAMESPACE, GLOBAL_CONNECTOR_NAMESPACE);
+
+        actuator(store).stop(PIPELINE, true);
+
+        assertThat(store.keyedState().load(SOURCE_CONNECTOR_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(SINK_CONNECTOR_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(OTHER_PIPELINE_CONNECTOR_NAMESPACE, "k"))
+                .describedAs("a stop reaches no connector state owned by another pipeline")
+                .isPresent();
+        assertThat(store.keyedState().load(UNOPENED_CONNECTOR_NAMESPACE, "k"))
+                .describedAs("a stop drops the runtime's exact nodes rather than a namespace prefix")
+                .isPresent();
+        assertThat(store.keyedState().load(GLOBAL_CONNECTOR_NAMESPACE, "k"))
+                .describedAs("the deployment-wide connector map belongs to no pipeline")
+                .isPresent();
+    }
+
+    @Test
+    @DisplayName("keeping state on stop leaves connector-state bytes unchanged")
+    void stoppingWithoutPurgeLeavesConnectorStateBytesUnchanged() {
+        InMemoryStorePort store = seedStore();
+        byte[] sourceBytes = new byte[] {0, 1, 2, 3};
+        byte[] sinkBytes = new byte[] {4, 5, 6, 7};
+        store.keyedState().save(SOURCE_CONNECTOR_NAMESPACE, "cursor", sourceBytes);
+        store.keyedState().save(SINK_CONNECTOR_NAMESPACE, "checkpoint", sinkBytes);
+
+        actuator(store).stop(PIPELINE, false);
+
+        assertThat(store.keyedState().load(SOURCE_CONNECTOR_NAMESPACE, "cursor"))
+                .hasValueSatisfying(bytes -> assertThat(bytes).containsExactly(sourceBytes));
+        assertThat(store.keyedState().load(SINK_CONNECTOR_NAMESPACE, "checkpoint"))
+                .hasValueSatisfying(bytes -> assertThat(bytes).containsExactly(sinkBytes));
     }
 
     /**
@@ -174,7 +293,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.nestDeadLetters().record(new NestDeadLetterRecord(OTHER_PIPELINE_NAMESPACE, "e2", "orders",
                 "1:1", 0L, 0L, Map.of("id", 2)));
 
-        actuator(store).stop(PIPELINE);
+        actuator(store).stop(PIPELINE, true);
 
         assertThat(store.nestDeadLetters().read(ITEMS_NAMESPACE, 10)).isEmpty();
         assertThat(store.nestDeadLetters().read(OTHER_PIPELINE_NAMESPACE, 10))
@@ -193,7 +312,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         // the pipeline is in, and the run already up goes on keeping state where it was built to keep it.
         store.artifacts().save(pipelineWithoutNest());
 
-        actuator.stop(PIPELINE);
+        actuator.stop(PIPELINE, true);
 
         // Worked out from the pipeline as it now reads, the names are none at all - and a stop that drops
         // none leaves every entry where it is with nothing left that can name it: the namespaces are gone
@@ -230,22 +349,24 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
-    @DisplayName("a pipeline that nests nothing writes no record of keeping state, and notes no drop")
-    void anOrdinaryPipelineIsUntouchedByAnyOfThis() {
+    @DisplayName("a pipeline that nests nothing records connector state and drops its record after purge")
+    void aPipelineWithoutNestsRecordsConnectorState() {
         InMemoryStorePort store = seedStore();
         store.artifacts().save(pipelineWithoutNest());
         EngineLifecycleActuator actuator = actuator(store);
 
         actuator.start(PIPELINE);
-        actuator.stop(PIPELINE);
 
-        // Recording "this run keeps state in nowhere" would put a record where a pipeline with no state has
-        // none to describe, and every later reader would have to tell that from a run that kept something.
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))
-                .describedAs("a pipeline with no nest in it leaves nothing written down")
+                .hasValueSatisfying(bytes -> assertThat(new String(bytes, StandardCharsets.UTF_8))
+                        .contains(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE));
+        actuator.stop(PIPELINE, true);
+
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))
+                .describedAs("purging drops the record of the connector namespaces it cleared")
                 .isEmpty();
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "namespaces"))
-                .describedAs("and so notes no drop for a later start to finish")
+                .describedAs("and leaves no pending drop behind")
                 .isEmpty();
     }
 
@@ -294,7 +415,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
         actuator.start(PIPELINE);
         awaitRunning();
-        actuator.stop(PIPELINE);
+        actuator.stop(PIPELINE, true);
         // Read only once the job is genuinely finished, which is the moment the two orderings first differ.
         // Read at the moment the stop returns, a drop that had raced ahead would look identical to one that
         // had waited: the write it is racing has not landed yet either, so the map is empty under both.
@@ -386,8 +507,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         }
 
         @Override
-        public Set<String> stateNamespacesOf(String pipelineId) {
-            return Set.of(namespace);
+        public List<PipelineStateHolding> stateHeldBy(String pipelineId) {
+            return List.of(PipelineStateInventory.OPERATOR_STATE.in(Set.of(namespace)));
         }
     }
 
@@ -485,7 +606,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         aliases.put("o", FromRef.literal(PARENT_TABLE));
         aliases.put("i", FromRef.literal(CHILD_TABLE));
         aliases.put("p", FromRef.literal(GRANDCHILD_TABLE));
-        return new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE, GRANDCHILD_SOURCE),
+        return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true), SourceRef.spec(GRANDCHILD_SOURCE, true)),
                 List.of(Step.inline(STEP, FromClause.aliases(aliases), body, null)), null,
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
@@ -494,9 +615,15 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
     /** The same pipeline with its nest step taken out, so nothing keeps state. */
     private static PipelineResource pipelineWithoutNest() {
-        return new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE), List.of(), null,
+        return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true)), List.of(), null,
                 new ServeBlock.Inline(null, FromRef.literal(PARENT_SOURCE),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
+    }
+
+    private static PipelineResource pipelineWithView() {
+        return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true)), List.of(),
+                new ViewBlock.Inline("orders_view", FromRef.literal(PARENT_SOURCE), "id", null, null), null,
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 
@@ -507,5 +634,15 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
     private static DiscoveredSourceModel discovered(String connectionId, SourceTable table) {
         return new DiscoveredSourceModel(connectionId, "fake", 0L, new SourceModel(List.of(table)));
+    }
+    /** Where the declared holdings are kept, flattened -- the same reduction the actuator makes. */
+    private static Set<String> namespacesOf(List<PipelineStateHolding> held) {
+        Set<String> namespaces = new java.util.LinkedHashSet<>();
+        held.forEach(holding -> namespaces.addAll(holding.namespaces()));
+        return namespaces;
+    }
+
+    private static String connectorNamespace(String pipelineId, String nodeId) {
+        return ConnectorStateNamespace.of(new PipelineNode(pipelineId, nodeId));
     }
 }

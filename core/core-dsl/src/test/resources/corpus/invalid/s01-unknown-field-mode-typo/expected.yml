@@ -1,4 +1,3 @@
 rule: unknown-field
-adr: "ADR-0016 §11.5"
 path: mod
 note: "typo of 'mode'; fields outside the v1 schema are rejected, never ignored"

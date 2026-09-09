@@ -74,6 +74,11 @@ final class PdkSinkWriter implements SinkWriter {
         this.createIndex = createIndex;
     }
 
+    /** The connector this writer drives, and the state scope it was opened under. */
+    PdkConnector connector() {
+        return connector;
+    }
+
     @Override
     public CompletionStage<WriteResult> write(List<Envelope> records) {
         return CompletableFuture.supplyAsync(() -> deliver(records));
@@ -152,8 +157,8 @@ final class PdkSinkWriter implements SinkWriter {
         return result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
     }
 
-    private static TapRecordEvent encode(Envelope env) {
-        return (TapRecordEvent) TapEventCodec.encode(env);
+    private TapRecordEvent encode(Envelope env) {
+        return (TapRecordEvent) TapEventCodec.encode(env, connector.codecs());
     }
 
     /** Reforge a row envelope into an insert (append mode): the row's payload becomes an inserted row. */

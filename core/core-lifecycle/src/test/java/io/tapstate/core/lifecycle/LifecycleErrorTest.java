@@ -21,6 +21,10 @@ class LifecycleErrorTest {
                 "lifecycle.illegal-transition",
                 // start/resume refused because the pipeline's revision is not the latest applied one
                 "lifecycle.incompatible-revision",
+                // a stop that did not say whether to clear what the pipeline has accumulated
+                "lifecycle.purge-state-not-stated",
+                // a start or resume named a draft without an executable source-to-output path
+                "lifecycle.pipeline-not-runnable",
                 // a lifecycle verb named a pipeline that was never applied
                 "lifecycle.unknown-pipeline");
     }
@@ -34,6 +38,11 @@ class LifecycleErrorTest {
                 .containsExactlyInAnyOrder("requested", "latest");
         // pipeline = the id the caller named
         assertThat(LifecycleError.UNKNOWN_PIPELINE.placeholders())
+                .containsExactlyInAnyOrder("pipeline");
+        // pipeline = the id the stop was aimed at
+        assertThat(LifecycleError.PURGE_STATE_NOT_STATED.placeholders())
+                .containsExactlyInAnyOrder("pipeline");
+        assertThat(LifecycleError.PIPELINE_NOT_RUNNABLE.placeholders())
                 .containsExactlyInAnyOrder("pipeline");
     }
 }

@@ -1,0 +1,116 @@
+# Keep the public distribution counters that expire.
+#
+# GitHub's traffic API serves only the trailing 14 days. A day not captured inside that window is gone
+# permanently, which is why this runs on a schedule rather than when someone remembers.
+#
+# The series lands as a file in the private tapstate/gtm repository. A year of daily counters is about
+# 33 KB, so git is the right store: versioned, diffable, backed up with the repository, no new vendor
+# and no new storage credential, and the history is itself the record of what was observed when.
+#
+# Everything captured here is a DISTRIBUTION SIGNAL, not the funnel's denominator. The denominator is
+# the installer callback. These numbers are never summed and none of them is a count of people.
+name: funnel capture
+
+on:
+  schedule:
+    # Twice weekly, Monday and Thursday. Weekly was NOT comfortably inside the 14-day window as it
+    # claimed: one missed run puts 14 days between successful captures, which is exactly when the
+    # oldest days expire -- the boundary, not a margin. Two runs a week means a single miss leaves at
+    # most 7 days, and two consecutive misses still leave under 14.
+    - cron: '17 4 * * 1,4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: funnel-capture
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The token must reach two repositories: tapstate to read /traffic/*, and gtm to store the
+      # series. create-github-app-token scopes to the current repository unless told otherwise, so
+      # both are named here -- a token scoped to one of them fails on the other, late and confusingly.
+      - name: Mint the app token
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            tapstate
+            gtm
+
+      # /traffic/* requires push access, and `administration` is not among the permissions
+      # GITHUB_TOKEN can be granted -- measured 2026-09-01, HTTP 403 "Resource not accessible by
+      # integration". The App carries it instead. This step fails the run loudly rather than storing
+      # an empty series: a counter that cannot be read and a counter that reads zero are the same
+      # bytes downstream, and only one of them is a fact.
+      # The minting error above is generic ("at least one repository ... not accessible"), and it is the
+      # first thing anyone meets when the app is not set up yet. Two settings changes are needed and
+      # neither is guessable from that sentence, so they are named here rather than in a document
+      # nobody reading a red run will open.
+      - name: What to do when the token could not be minted
+        if: failure() && steps.token.outcome == 'failure'
+        run: |
+          echo "The app token could not be minted for both repositories. Two things are needed:"
+          echo
+          echo "  1. install the app on tapstate/gtm as well as tapstate/tapstate"
+          echo "     (installation settings -> Repository access -> add gtm)"
+          echo "  2. grant it 'Administration: read', which /traffic/* requires and which"
+          echo "     GITHUB_TOKEN can never have"
+          echo
+          echo "A permission change does not take effect until an owner accepts it on the"
+          echo "installation page -- that acceptance is the step most often missed."
+          exit 1
+
+      - name: Check the token can read the traffic API
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -eu
+          if ! gh api "repos/${GITHUB_REPOSITORY}/traffic/clones" >/dev/null 2>err.txt; then
+            echo "the app token cannot read /traffic/clones:"
+            sed 's/^/  /' err.txt
+            echo
+            echo "grant the app 'Administration: read' on this repository, then accept the new"
+            echo "permission on the installation -- a permission change does not take effect until"
+            echo "an owner accepts it."
+            exit 1
+          fi
+          echo "ok: the app token can read the traffic API"
+
+      - name: Check out the store
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/gtm
+          token: ${{ steps.token.outputs.token }}
+          path: gtm-store
+
+      - name: Capture
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          sh scripts/funnel-capture.sh --store gtm-store/funnel
+          sh scripts/funnel-capture.sh --store gtm-store/funnel --gaps
+
+      # Printed into the run itself, so opening a run answers "what do we know now" rather than only
+      # "did the job succeed". The week starts 7 days back, which is the window this run just closed.
+      - name: Report
+        run: |
+          sh scripts/funnel-report.sh --store gtm-store/funnel \
+            --week "$(date -u -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-7d +%Y-%m-%d)"
+
+      - name: Publish the series
+        run: |
+          git -C gtm-store config user.email "${{ github.actor }}@users.noreply.github.com"
+          git -C gtm-store config user.name "funnel capture"
+          sh scripts/funnel-publish.sh --repo-dir gtm-store \
+            --message "funnel: capture $(date -u +%Y-%m-%d)"

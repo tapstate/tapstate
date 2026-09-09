@@ -46,6 +46,12 @@ final class NestTreeFixtures {
         return new Embed(alias, on, EmbedAs.ARRAY, path, arrayKey, null, null, null);
     }
 
+    /** The same embed declaring what identifies one of its rows, rather than taking the stream's own. */
+    static Embed keyed(Embed embed, List<String> key) {
+        return new Embed(embed.from(), embed.on(), embed.as(), embed.path(), key,
+                embed.arrayKey(), embed.ignoreUpdates(), embed.trackKeyChanges(), embed.embed());
+    }
+
     /** The same embed with key tracking turned on, for the cases about the append-mode conflict. */
     static Embed tracking(Embed embed) {
         return new Embed(embed.from(), embed.on(), embed.as(), embed.path(), embed.arrayKey(),
@@ -66,6 +72,12 @@ final class NestTreeFixtures {
         known.put("item", new NestTable("items", List.of("item_id")));
         known.put("profile", new NestTable("profiles", List.of("customer_id")));
         known.put("keyless", new NestTable("keyless_rows", List.of()));
+        // No primary key, so the identity has to come from an index. One of them is an answer; two of
+        // them is a choice nothing here is entitled to make.
+        known.put("uniquelyIndexed",
+                new NestTable("uniquely_indexed", List.of(), List.of(List.of("serial_no"))));
+        known.put("twiceIndexed",
+                new NestTable("twice_indexed", List.of(), List.of(List.of("serial_no"), List.of("batch_no"))));
         return known::get;
     }
 }

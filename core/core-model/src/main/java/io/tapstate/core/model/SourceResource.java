@@ -8,7 +8,7 @@ import java.util.Objects;
 
 /**
  * {@code kind: source} — independent collection/mining resource owning connection config
- * and (for CDC) the SRS (ADR-0016 §3/§4). Dual role (X18): when referenced purely as a
+ * and (for CDC) the SRS (§3/§4). Dual role (X18): when referenced purely as a
  * connection supplier by sync/push elements, {@code mode}/{@code tables} may be absent;
  * conditional requiredness is a validate-layer rule.
  */
@@ -47,5 +47,19 @@ public record SourceResource(
     @Override
     public String kind() {
         return "source";
+    }
+
+    /**
+     * Whether this source buffers its changes through the shared replay store.
+     *
+     * <p>On unless the source says otherwise: a source with no {@code srs} block, or one whose block
+     * leaves {@code enabled} unset, is buffered. Only an explicit {@code enabled: false} turns it off.
+     *
+     * <p>It lives on the resource because more than one layer asks -- the capture side to decide how to
+     * run, the control side to decide whether the answer may change right now -- and two readings of a
+     * default are two things that can disagree about a source nobody wrote the field on.
+     */
+    public boolean srsEnabled() {
+        return srs == null || srs.enabled() == null || srs.enabled();
     }
 }

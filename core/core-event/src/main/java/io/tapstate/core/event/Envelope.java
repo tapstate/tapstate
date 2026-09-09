@@ -2,8 +2,10 @@ package io.tapstate.core.event;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The standard event envelope: one change event as every transform sees it, the common currency of
@@ -43,7 +45,8 @@ public record Envelope(
         Map<String, Object> before,
         Map<String, Object> after,
         Map<String, Object> schema,
-        Map<String, ChainPosition> positions) {
+        Map<String, ChainPosition> positions,
+        Set<String> removed) {
 
     public Envelope {
         Objects.requireNonNull(op, "op");
@@ -52,6 +55,13 @@ public record Envelope(
         after = copyOrNull(after);
         schema = copyOrNull(schema);
         positions = positions == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(positions));
+        removed = removed == null ? Set.of() : Collections.unmodifiableSet(new LinkedHashSet<>(removed));
+    }
+
+    /** An envelope saying nothing was dropped, which is every producer that only ever adds fields. */
+    public Envelope(Op op, long ts, String src, Map<String, Object> before, Map<String, Object> after,
+            Map<String, Object> schema, Map<String, ChainPosition> positions) {
+        this(op, ts, src, before, after, schema, positions, Set.of());
     }
 
     /** An envelope covering nothing — the shape every producer but a source builds. */
@@ -75,7 +85,25 @@ public record Envelope(
 
     /** A copy covering {@code positions}, every other slot unchanged — how the runtime carries them on. */
     public Envelope withPositions(Map<String, ChainPosition> positions) {
-        return new Envelope(op, ts, src, before, after, schema, positions);
+        return new Envelope(op, ts, src, before, after, schema, positions, removed);
+    }
+
+    /**
+     * A copy saying that {@code removed} are fields this row no longer has, every other slot unchanged.
+     *
+     * <p><b>A field that stopped being produced and a field that never existed are the same row, and only
+     * the producer can tell them apart.</b> Every write into a keyed target applies a row by setting the
+     * fields in it — an upsert into a document store, a column list in an update statement — so a field
+     * that simply stops appearing is left standing in the target for as long as the row lives. Nothing
+     * reports it: the write succeeds, the row that arrived is correct, and the stale field belongs to no
+     * event anyone can point at. Naming it here is the only place the difference still exists.
+     *
+     * <p>What belongs here is the top level of the row and nothing deeper. A field inside another is
+     * replaced along with whatever holds it, because that container is itself a field of this row and is
+     * written whole.
+     */
+    public Envelope withRemoved(Set<String> removed) {
+        return new Envelope(op, ts, src, before, after, schema, positions, removed);
     }
 
     /**

@@ -24,6 +24,7 @@ class ControlOperationsTest {
                         "source.draft",
                         "source.list",
                         "source.get",
+                        "source.schema",
                         "source.update",
                         "source.delete",
                         "connection.test",
@@ -33,10 +34,17 @@ class ControlOperationsTest {
                         "connector.register",
                         "connector.list",
                         "connector.get",
+                        "connector.icon",
                         "data-browser.collections",
                         "data-browser.find",
                         "data-browser.stats",
                         "cluster.members",
+                        "pipeline.list",
+                        "pipeline.get",
+                        "pipeline.layout.get",
+                        "pipeline.layout.update",
+                        "pipeline.create",
+                        "pipeline.update",
                         "pipeline.start",
                         "pipeline.stop",
                         "pipeline.pause",
@@ -45,6 +53,10 @@ class ControlOperationsTest {
                         "pipeline.metrics",
                         "pipeline.snapshot",
                         "pipeline.logs",
+                        "pipeline.position",
+                        "pipeline.set-position",
+                        "pipeline.derived-schema",
+                        "pipeline.accept-derived-schema",
                         "user.create",
                         "user.passwd",
                         "user.list",
@@ -66,6 +78,7 @@ class ControlOperationsTest {
         assertThat(registry.resolve("source.draft").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.get").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("source.schema").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.update").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("source.delete").scope()).isEqualTo(Scope.WRITE);
         // connection.test persists its result for later query, so it is a state-mutating write.
@@ -80,10 +93,11 @@ class ControlOperationsTest {
         // connector.register ingests a connector artifact into the distribution store, so it is a
         // state-mutating write.
         assertThat(registry.resolve("connector.register").scope()).isEqualTo(Scope.WRITE);
-        // connector.list reads the online catalog view (bundled snapshot union registered rows); it
-        // mutates nothing, so it is read.
+        // connector.list reads registered authoring candidates from the online catalog view; it mutates
+        // nothing, so it is read.
         assertThat(registry.resolve("connector.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.get").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("connector.icon").scope()).isEqualTo(Scope.READ);
         // the three data-browser verbs look at what a declared source's own database holds. They read
         // through to the connector and persist nothing at all — not even the result, unlike the two
         // connection probes — so they are read-scoped.
@@ -93,13 +107,16 @@ class ControlOperationsTest {
         // cluster.members reads live topology; it is authenticated like every registry operation, but
         // needs no write or admin privilege.
         assertThat(registry.resolve("cluster.members").scope()).isEqualTo(Scope.READ);
-        // the four pipeline lifecycle verbs write desired state, so they are write-scoped.
-        for (String id : List.of("pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
+        // The layout update replaces editor metadata, while the lifecycle verbs write desired state.
+        for (String id : List.of(
+                "pipeline.layout.update", "pipeline.create", "pipeline.update", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.WRITE);
         }
-        // the pipeline observation reads (status/metrics/snapshot store-backed, logs node-local) are all
+        // The static Pipeline projection, layout read, and observation reads are all
         // read faces; read-scoped, unaudited.
-        for (String id : List.of("pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs")) {
+        for (String id : List.of(
+                "pipeline.list", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
+                "pipeline.snapshot", "pipeline.logs")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
         for (String id : List.of("user.create", "user.passwd", "user.list", "token.create", "token.revoke", "token.list")) {
@@ -123,6 +140,8 @@ class ControlOperationsTest {
                         "pipeline.stop",
                         "pipeline.pause",
                         "pipeline.resume",
+                        "pipeline.update",
+                        "pipeline.create",
                         "user.create",
                         "user.passwd",
                         "token.create",
@@ -137,16 +156,22 @@ class ControlOperationsTest {
                 "source.draft",
                 "source.list",
                 "source.get",
+                "source.schema",
                 "connection.test-result",
                 "connection.schema",
                 "connector.list",
                 "connector.get",
+                "connector.icon",
                 "data-browser.collections",
                 "data-browser.find",
                 "data-browser.stats",
                 "cluster.members",
                 "user.list",
                 "token.list",
+                "pipeline.list",
+                "pipeline.get",
+                "pipeline.layout.get",
+                "pipeline.layout.update",
                 "pipeline.status",
                 "pipeline.metrics",
                 "pipeline.snapshot",
@@ -160,7 +185,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(37);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(49);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
@@ -178,6 +203,8 @@ class ControlOperationsTest {
     void mcpFaceIsTheOnlineAuthoringClosurePlusTheReadFaceAndRestExposureRemainsEmpty() {
         // The read face joins on the same terms as everything else here — a mark on the registry entry.
         // The three are read-scoped, so a caller holding no write capability still gets all three.
+        // pause / resume are here for the stop's sake: with only the clearing verb open, the answer it
+        // demands is a question with one available answer, and the caller on this face is a model.
         assertThat(registry.exposedOn(Frontend.MCP))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
@@ -187,8 +214,11 @@ class ControlOperationsTest {
                         "connection.test", "connection.test-result",
                         "connection.discover-schema", "connection.schema",
                         "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-                        "pipeline.start", "pipeline.stop", "pipeline.status",
+                        "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+                        "pipeline.status",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
+                        // Neither half of the resume-point pair is here: where to resume from turns on
+                        // the source's retention window, which nothing on this face can see.
                         "data-browser.collections", "data-browser.find", "data-browser.stats");
         // Deliberately the widest ceiling, not the shipped one: REST carries no operation at any stage,
         // which is a stronger statement than "none has reached the stage we ship".

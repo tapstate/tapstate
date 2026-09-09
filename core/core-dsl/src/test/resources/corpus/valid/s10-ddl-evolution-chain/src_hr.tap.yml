@@ -1,4 +1,4 @@
-# ADR-0016 §14.10 — upstream DDL / schema evolution, full five-hop chain in one batch:
+# §14.10 — upstream DDL / schema evolution, full five-hop chain in one batch:
 # capture -> envelope op:ddl -> map passthrough -> srs track / view additive
 # -> sink apply (X5/X15).
 version: tapstate/v1

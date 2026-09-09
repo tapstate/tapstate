@@ -2,7 +2,9 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.SourcePosition;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -31,12 +33,12 @@ public final class CaptureHealth {
         failure.compareAndSet(null, error);
     }
 
-    /** Wraps an event handler as a listener that records a stream failure on this health through {@link #fail}. */
-    CaptureListener recording(CaptureListener onEvent) {
+    /** Wraps a batch handler as a listener that records a stream failure on this health through {@link #fail}. */
+    CaptureListener recording(CaptureListener onBatch) {
         return new CaptureListener() {
             @Override
-            public void onEvent(Envelope event) {
-                onEvent.onEvent(event);
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                onBatch.onBatch(events, position);
             }
 
             @Override

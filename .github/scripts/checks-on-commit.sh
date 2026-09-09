@@ -89,19 +89,29 @@ fallback_head=""
 fallback_runs=""
 fallback_declined=""
 fallback_tried=0
+# `gh api` writes the error body to stdout, not stderr, when a request fails, so a read taken
+# without its exit status hands back that document instead of the value asked for -- and it is
+# non-empty, which is the only thing the guards below test for. A failed read then walked past them
+# as if it were a sha, the trees were compared against a JSON document, and the refusal that came
+# out named that document as the head commit it had declined to read: a diagnosis nobody made,
+# printed at release time as the reason a release was refused. Every read in here is optional -- one
+# that cannot be answered means there is no fallback, never a value -- so they all go through this,
+# and a failed one comes back empty, which is what each caller already handles. The two reads above
+# are not optional and keep their own handling: they refuse, and print what the API said.
+api() { local out; out="$(gh api "$@" 2>/dev/null)" || return 1; printf '%s' "$out"; }
 resolve_fallback() {
   [ "$fallback_tried" = 0 ] || return 0
   fallback_tried=1
   local head tree head_tree
-  head="$(gh api "repos/${repo}/commits/${sha}/pulls" --jq '.[0].head.sha // empty' 2>/dev/null)"
+  head="$(api "repos/${repo}/commits/${sha}/pulls" --jq '.[0].head.sha // empty')"
   # Kept although no case witnesses it, and that is worth saying rather than leaving to be found:
   # the same input is caught downstream by the empty-runs check, so deleting this line reddens
   # nothing. It earns its place anyway -- an empty sha here would build `commits/`, which is the
   # list-commits endpoint and answers 200 with an array, and the only thing standing between that
   # and a borrowed answer would be jq failing to find a field in it.
   [ -n "$head" ] || return 0
-  tree="$(gh api "repos/${repo}/commits/${sha}" --jq '.commit.tree.sha // empty' 2>/dev/null)"
-  head_tree="$(gh api "repos/${repo}/commits/${head}" --jq '.commit.tree.sha // empty' 2>/dev/null)"
+  tree="$(api "repos/${repo}/commits/${sha}" --jq '.commit.tree.sha // empty')"
+  head_tree="$(api "repos/${repo}/commits/${head}" --jq '.commit.tree.sha // empty')"
   if [ -z "$tree" ] || [ "$tree" != "$head_tree" ]; then
     # Recorded rather than dropped. Refusing here is right, but it is a different refusal from a
     # lane that never started: the answer exists and is about different code, and what fixes it is
@@ -109,8 +119,8 @@ resolve_fallback() {
     fallback_declined="$head"
     return 0
   fi
-  fallback_runs="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" \
-      --jq '.check_runs[] | [.name, .status, .conclusion, .started_at] | @tsv' 2>/dev/null)"
+  fallback_runs="$(api --paginate "repos/${repo}/commits/${head}/check-runs" \
+      --jq '.check_runs[] | [.name, .status, .conclusion, .started_at] | @tsv')"
   [ -n "$fallback_runs" ] || return 0
   fallback_head="$head"
 }
@@ -123,9 +133,17 @@ resolve_fallback() {
 # same name, which is the one that ships a bad release.
 #
 # So the runs for a name are ordered, not indexed -- by when they started, latest first, which is what
-# a re-run means and what the branch rules themselves read. Cancelled, skipped and neutral are left
-# out of that ordering entirely: they are not verdicts about the code, so they answer only when
-# nothing else does, and then they still refuse.
+# a re-run means and what the branch rules themselves read. Only verdicts take part in that ordering.
+#
+# A run still in flight is not one, and letting it answer while a finished verdict existed cost a
+# release attempt: someone cut a branch off the release commit four minutes in, that branch started
+# its own suite of the same names against the same sha, and the gate waited on it -- not for the ten
+# minutes that would have been tolerable, but fatally, because this runs inside a job that reads exit
+# 3 as a failure. Anyone branching off the release commit could stop the release. So in-flight answers
+# only when no verdict exists at all, which is the honest "nothing is known yet" this gate opened with.
+#
+# Cancelled, skipped and neutral rank below even that: they are not verdicts about the code and never
+# will be, so they answer last, and then they still refuse.
 #
 # Ranking by severity instead -- a failure outranking a success for the same name -- was tried here
 # first and is wrong, for a reason worth leaving written down: a required check can fail for something
@@ -140,10 +158,11 @@ resolve_fallback() {
 pick() { # $1 = tsv runs, $2 = name -> the one line that speaks for it, or empty
   awk -F'\t' -v want="$2" '
     $1 != want { next }
+    $2 != "completed" { if ($4 >= wait_at) { wait_at = $4; wait = $1 "\t" $2 "\t" $3 } ; next }
     $3 == "cancelled" || $3 == "skipped" || $3 == "neutral" \
                       { if ($4 >= moot_at) { moot_at = $4; moot = $1 "\t" $2 "\t" $3 } ; next }
                       { if ($4 >= said_at) { said_at = $4; said = $1 "\t" $2 "\t" $3 } }
-    END { print said ? said : moot }
+    END { print said ? said : (wait ? wait : moot) }
   ' <<<"$1"
 }
 
@@ -178,6 +197,7 @@ while IFS= read -r name; do
   if [ -z "$line" ]; then
     if [ -n "$fallback_declined" ]; then
       echo "::error::'${name}' did not run on ${sha}, and ${fallback_declined} — the head of the pull request it came from — carries a different tree, so what ran there is not an answer about this commit"
+      stale_merge=1
     else
       echo "::error::'${name}' never ran on ${sha} — a check that was not dispatched leaves no record, so this cannot be read off the failures"
     fi
@@ -211,6 +231,23 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 if [ "$unsettled" -ne 0 ]; then
+  # Said once, after the names: the cause and the cure are the same for every one of them, and
+  # repeating it per check buries the list it belongs to.
+  #
+  # How a commit reaches this state: a pull request was merged while its branch was NOT up to date,
+  # so the merge commit's tree is neither side's -- and checks that only run on `pull_request` never
+  # saw that combination. They cannot be run against it now either; nothing dispatches them on a
+  # push. The commit is not broken, it is unanswered, and it stays unanswered forever.
+  #
+  # Naming the way out matters because the obvious one does not work. Releasing an older commit that
+  # IS answered looks right and fails later and more expensively: `workflow_dispatch` takes a ref,
+  # never a bare commit, so any lane that has to be started cannot be started at it, and the gate
+  # that waits for that lane then waits for something nobody will ever produce.
+  if [ "${stale_merge:-0}" = "1" ]; then
+    echo "::error::This commit merged a branch that was not up to date, so the pull-request-only checks above never ran against this tree — and they cannot be run against it now."
+    echo "::error::Merge one more pull request that IS up to date with the default branch; its checks then answer for the new tip. Releasing an older commit instead does not work — the lanes that must be dispatched take a ref, not a commit."
+    echo "::error::It is reachable at all only when \"require branches to be up to date\" is bypassed."
+  fi
   echo "Nothing above has concluded anything yet, so this says nothing about ${sha} either way."
   exit 3
 fi

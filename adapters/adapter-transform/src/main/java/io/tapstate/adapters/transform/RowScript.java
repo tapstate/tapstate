@@ -1,5 +1,6 @@
 package io.tapstate.adapters.transform;
 
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import java.util.ArrayList;
@@ -108,8 +109,11 @@ final class RowScript {
         record.put("op", event.op().symbol());
         record.put("ts", event.ts());
         record.put("src", event.src());
-        record.put("before", event.before());
-        record.put("after", event.after());
+        // Unwrapped: a guest sees a carrier as an opaque host object, so `after._id === "64f0..."` is
+        // false for every row and the script neither fails nor warns. The carrier does not survive the
+        // round trip - a script rebuilds the whole record, so every value it hands back is a new one.
+        record.put("before", ConvertedValue.unwrapRow(event.before()));
+        record.put("after", ConvertedValue.unwrapRow(event.after()));
         record.put("schema", event.schema());
         return record;
     }
@@ -121,13 +125,17 @@ final class RowScript {
         Object op = record.get("op");
         Object ts = record.get("ts");
         Object src = record.get("src");
+        // The removal a step before this one declared is carried through. It is the only way a target
+        // hears that a field went, so rebuilding the record without it silently withdraws the statement.
+        // Safe even where the script puts the field back: a removal is only ever applied to a field the
+        // row does not carry, so a re-added one simply stops being a removal.
         return new Envelope(
                 opOf(op, source),
                 ts instanceof Number number ? number.longValue() : source.ts(),
                 src != null ? String.valueOf(src) : source.src(),
                 dataMap(record.get("before")),
                 dataMap(record.get("after")),
-                dataMap(record.get("schema")));
+                dataMap(record.get("schema"))).withRemoved(source.removed());
     }
 
     // The output op: the source's when the script left it alone, else the wire symbol it wrote. An op

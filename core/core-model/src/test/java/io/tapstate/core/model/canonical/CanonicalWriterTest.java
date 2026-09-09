@@ -7,8 +7,10 @@ import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.PushFormat;
@@ -218,7 +220,7 @@ class CanonicalWriterTest {
 
         @Test
         void writesRegexTableRefsAndCelTableFilterQuoted() {
-            // §4 of ADR-0016: /…/ regex form; tables[].filter is a CEL expression and
+            // §4: /…/ regex form; tables[].filter is a CEL expression and
             // CEL fields are always double-quoted (§6).
             SourceResource src = new SourceResource("src_mix", null, "mysql",
                     Map.of("host", "10.0.0.1"), SourceMode.CDC,
@@ -279,7 +281,7 @@ class CanonicalWriterTest {
         void omitsConstantDefaultsInSyncElements() {
             // canonical-form.md sample B: write_mode upsert and auto_create_table true are
             // documented constant defaults (§4) — dropped; ddl apply is non-default — kept.
-            PipelineResource p = new PipelineResource("ora2my_ods", null, List.of("src_ora"),
+            PipelineResource p = new PipelineResource("ora2my_ods", null, List.of(SourceRef.bare("src_ora")),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.regex(".*"),
                             List.of(new SyncElement("my_ods", "tgt_my", WriteMode.UPSERT,
@@ -312,7 +314,7 @@ class CanonicalWriterTest {
         void expandsUseSugarAndOmitsUseEqualLocalIds() {
             // canonical-form.md sample C: string sugar becomes use: objects, from is always
             // explicit (auto-generated step id filter_1), id == use is omitted (§5).
-            PipelineResource p = new PipelineResource("crm_pack", null, List.of("src_crm"),
+            PipelineResource p = new PipelineResource("crm_pack", null, List.of(SourceRef.bare("src_crm")),
                     List.of(Step.inline("filter_1", FromClause.list(FromRef.literal("customers")),
                                     new TransformBody.Filter("op != 'd'"), null),
                             Step.use(null, "mask_pii",
@@ -344,14 +346,14 @@ class CanonicalWriterTest {
 
         @Test
         void writesMapAndNestFullTreeWithSortedAliasMaps() {
-            // ADR-0016 §14.2: map projection keeps declared field order (§6); nest/join
+            // §14.2: map projection keeps declared field order (§6); nest/join
             // alias maps and on maps sort lexicographically; full-tree embed key order per §3.
             LinkedHashMap<String, FieldRule> fields = new LinkedHashMap<>();
             fields.put("customer_id", FieldRule.rename("CUST_ID"));
             fields.put("name", FieldRule.rename("CUST_NAME"));
             fields.put("segment", FieldRule.rename("SEG_CODE"));
 
-            PipelineResource p = new PipelineResource("customer_360", null, List.of("src_ins"),
+            PipelineResource p = new PipelineResource("customer_360", null, List.of(SourceRef.bare("src_ins")),
                     List.of(Step.inline("clean", FromClause.list(FromRef.literal("CUSTOMERS")),
                                     new TransformBody.MapProjection(fields), null),
                             Step.inline("c360",
@@ -433,17 +435,18 @@ class CanonicalWriterTest {
 
         @Test
         void writesMultiSourceListAndJoinSqlAsLiteralBlock() {
-            // ADR-0016 §14.8: multi-source = flow list (X13); join sql is user content,
+            // §14.8: multi-source = flow list (X13); join sql is user content,
             // emitted as a literal block with value-driven chomping (§6).
             PipelineResource p = new PipelineResource("cust_stats", null,
-                    List.of("src_crm", "src_erp"),
+                    List.of(SourceRef.bare("src_crm"), SourceRef.bare("src_erp")),
                     List.of(Step.inline("cust_orders",
                             FromClause.aliases(Map.of(
                                     "c", FromRef.literal("customers"),
                                     "o", FromRef.literal("orders"))),
-                            new TransformBody.Join("duckdb",
-                                    "SELECT c.id AS customer_id, count(*) AS order_cnt, sum(o.amount) AS total\n"
-                                            + "FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id\n"), null)),
+                            new TransformBody.Join(JoinEngine.BUILTIN,
+                                    "SELECT c.id AS customer_id, o.id AS order_id, o.amount AS amount\n"
+                                            + "FROM c JOIN o ON o.customer_id = c.id\n"),
+                            null)),
                     new ViewBlock.Inline("cust_stats", FromRef.literal("cust_orders"),
                             "customer_id",
                             new Storage(null, new Storage.Warm("cust_stats", null), null), null),
@@ -460,10 +463,10 @@ class CanonicalWriterTest {
                         from:
                           c: customers
                           o: orders
-                        engine: duckdb
+                        engine: builtin
                         sql: |
-                          SELECT c.id AS customer_id, count(*) AS order_cnt, sum(o.amount) AS total
-                          FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id
+                          SELECT c.id AS customer_id, o.id AS order_id, o.amount AS amount
+                          FROM c JOIN o ON o.customer_id = c.id
                     view:
                       id: cust_stats
                       from: cust_orders
@@ -476,8 +479,8 @@ class CanonicalWriterTest {
 
         @Test
         void writesJsScriptAsLiteralBlockAndKeepsNonDefaultWriteMode() {
-            // ADR-0016 §14.4: js escape hatch; append is non-default so it stays.
-            PipelineResource p = new PipelineResource("kfk2my", null, List.of("src_kfk"),
+            // §14.4: js escape hatch; append is non-default so it stays.
+            PipelineResource p = new PipelineResource("kfk2my", null, List.of(SourceRef.bare("src_kfk")),
                     List.of(Step.inline("parse", FromClause.list(FromRef.literal("orders_topic")),
                             new TransformBody.Js(
                                     "function process(record, ctx) { record.after = JSON.parse(record.after.value); return record; }\n"), null)),
@@ -509,9 +512,9 @@ class CanonicalWriterTest {
 
         @Test
         void writesPushElementsWithCelFormatQuoted() {
-            // ADR-0016 §14.5 + X11: push element key order id, source, topic, format,
+            // §14.5 + X11: push element key order id, source, topic, format,
             // options; CEL format is always double-quoted with the = marker.
-            PipelineResource p = new PipelineResource("my2kfk", null, List.of("src_my"),
+            PipelineResource p = new PipelineResource("my2kfk", null, List.of(SourceRef.bare("src_my")),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.literal("orders"), null, null,
                             List.of(new PushElement(null, "tgt_kfk", "orders_events", null),
@@ -538,7 +541,7 @@ class CanonicalWriterTest {
         void omitsSettingsBlockWhenAllFieldsAreDefaults() {
             // §4: error_policy fail / batch_size 1000 / parallelism 1 are constant
             // defaults; a settings block reduced to nothing disappears.
-            PipelineResource p = new PipelineResource("p_min", null, List.of("src_a"),
+            PipelineResource p = new PipelineResource("p_min", null, List.of(SourceRef.bare("src_a")),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.regex(".*"),
                             List.of(new SyncElement(null, "tgt_b", null, null, null)),
@@ -559,7 +562,7 @@ class CanonicalWriterTest {
 
         @Test
         void keepsOnlyNonDefaultSettingsFields() {
-            PipelineResource p = new PipelineResource("p_set", null, List.of("src_a"),
+            PipelineResource p = new PipelineResource("p_set", null, List.of(SourceRef.bare("src_a")),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.regex(".*"),
                             List.of(new SyncElement(null, "tgt_b", null, null, null)),
@@ -586,7 +589,7 @@ class CanonicalWriterTest {
         void writesReadAxisAfterCrossCuttingFieldsAndOmitsDefaults() {
             // read axis renders after schedule; read_mode: snapshot_and_cdc and start_from: latest
             // are the defaults and drop out — only the non-default read_mode / start_from survive.
-            PipelineResource p = new PipelineResource("p_read", null, List.of("src_a"),
+            PipelineResource p = new PipelineResource("p_read", null, List.of(SourceRef.bare("src_a")),
                     null, null,
                     new ServeBlock.Inline(null, FromRef.regex(".*"),
                             List.of(new SyncElement(null, "tgt_b", null, null, null)),
@@ -613,7 +616,7 @@ class CanonicalWriterTest {
             // §3: step key order id, type, from, <body>, experimental. Options sat between the body
             // and experimental until the engine's option vocabulary went empty; what the order has
             // to pin now is that experimental comes last.
-            PipelineResource p = new PipelineResource("p_opt", null, List.of("src_a"),
+            PipelineResource p = new PipelineResource("p_opt", null, List.of(SourceRef.bare("src_a")),
                     List.of(Step.inline("flt", FromClause.list(FromRef.literal("orders")),
                             new TransformBody.Filter("op != 'd'"),
                             Map.of("vectorized", true))),
@@ -648,7 +651,7 @@ class CanonicalWriterTest {
 
         @Test
         void writesTransformDefinitionWithoutFrom() {
-            // ADR-0016 §14.11 / X19: definition body = pure logic, from is forbidden;
+            // §14.11 / X19: definition body = pure logic, from is forbidden;
             // drop rule renders as boolean false.
             TransformResource t = new TransformResource("mask_pii", null,
                     new TransformBody.MapProjection(orderedFields()), null);

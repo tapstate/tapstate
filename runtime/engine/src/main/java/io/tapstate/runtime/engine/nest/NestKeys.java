@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import io.tapstate.core.event.ConvertedValue;
 import java.util.Objects;
 
 /** Reading the few things a nest vertex needs off an event, the same way at every vertex. */
@@ -27,7 +28,12 @@ final class NestKeys {
     static List<Object> valuesOf(Map<String, Object> row, List<String> fields) {
         List<Object> values = new ArrayList<>(fields.size());
         for (String field : fields) {
-            values.add(row.get(field));
+            // Unwrapped: a value a connector converted travels in a carrier, and the other side of the
+            // join need not have met a conversion at all - a carrier never equals the plain value inside
+            // it, so a key built from one matches nothing and nothing reports it: the join runs, the rows
+            // arrive, and the document simply never fills in. Two carriers do compare by their parts, so
+            // it is the mixed pairing this is here for, not the matched one.
+            values.add(ConvertedValue.unwrap(row.get(field)));
         }
         return Collections.unmodifiableList(values);
     }
@@ -58,8 +64,9 @@ final class NestKeys {
     }
 
     /**
-     * Stops the job on an update that arrives without the row it replaces, where the author asked for
-     * structural key changes to be followed on this stream.
+     * Stops the job on an update whose earlier row cannot say where the row was, where the author asked
+     * for structural key changes to be followed on this stream. {@code compared} names the columns this
+     * vertex reads off that row for the edge it arrived on.
      *
      * <p>The after image alone cannot answer the only question that matters here. A row that moved to
      * another parent and a row that had an unrelated column edited arrive looking the same - a row sitting
@@ -67,16 +74,96 @@ final class NestKeys {
      * new place while leaving it in the old one, so the document keeps a copy the source no longer has.
      * Nothing downstream can notice that, which is why it fails here instead of being worked around.
      *
+     * <p><b>An earlier row is not a boolean, and testing for one is what let the worst case through.</b> A
+     * minimal row image sends the columns identifying the row and nothing else, so the row is there and the
+     * compared column is not - which reads as a row that used to hang under nothing. What then goes out is
+     * a detach addressed to a parent that never existed and an attach to the real new one, so the element
+     * arrives under its new parent while the old one is never told, with the switch on and nothing
+     * reported. So the question asked here is which columns arrived, never whether the row did.
+     *
+     * <p>A column whose value is genuinely null still passes, which is why this asks for the key and not
+     * for the value: the column is there, so the key built from it is the key the element was filed under.
+     *
      * <p>Only updates are refused. An insert has no earlier row at all and a deletion carries one as the
      * only row it has, so refusing either would be refusing the shape of the event rather than a source
      * that sends too little.
+     *
+     * <p><b>Ahead of every read of the event, and that placement is load-bearing.</b> Nothing about this
+     * change is applied before the refusal, so a run that hits it has produced no divergent document to
+     * put right: every earlier event either carried these columns and was followed correctly, or would
+     * have been refused here in its turn.
      */
-    static void requireBeforeImageWhereKeysAreTracked(NestInbound edge, Envelope event) {
-        if (!edge.tracksKeyChanges() || event.op() != Op.UPDATE || event.before() != null) {
+    static void requireBeforeImageWhereKeysAreTracked(NestInbound edge, Envelope event,
+            List<String> compared) {
+        if (!edge.tracksKeyChanges() || event.op() != Op.UPDATE) {
+            return;
+        }
+        List<String> missing = absentFrom(event.before(), compared);
+        if (missing.isEmpty()) {
             return;
         }
         throw new TapstateException(NestError.KEY_CHANGE_TRACKING_REQUIRES_BEFORE_IMAGE,
-                Map.of("alias", edge.alias(), "table", edge.table()), null);
+                Map.of("alias", edge.alias(), "table", edge.table(),
+                        "columns", String.join(", ", missing)), null);
+    }
+
+    /** Which of {@code compared} the earlier row does not carry - all of them where it never came. */
+    private static List<String> absentFrom(Map<String, Object> was, List<String> compared) {
+        if (was == null) {
+            return compared;
+        }
+        List<String> absent = new ArrayList<>();
+        for (String column : compared) {
+            if (!was.containsKey(column)) {
+                absent.add(column);
+            }
+        }
+        return absent;
+    }
+
+    /**
+     * Stops the job on an update of a stream whose rows are recorded against what they point at, where
+     * that update arrives without the row it replaces.
+     *
+     * <p>Where a row points is read off the row itself, so recording it needs nothing more. Taking that
+     * record back out is the other half, and only the earlier row can say which entry to take it out of -
+     * an update naming a different row and an update that only edited a column arrive looking the same.
+     *
+     * <p><b>Refused rather than passed over, because passing over it is invisible.</b> Every document
+     * still renders correctly and every count downstream is right; what grows is the record of who points
+     * where, and nothing reads that out loud. Left alone it surfaces as one of two things much later - a
+     * row nothing points at any more kept for the life of the job, or an edit refused on a fanout that was
+     * never real.
+     *
+     * <p>Only updates are refused, for the same reason as the tracking above: an insert points somewhere
+     * for the first time and leaves nothing behind, and a deletion is taken out on the other edge, where it
+     * happens whether this one carried an earlier row or not.
+     */
+    static void requireBeforeImageWhereReferencesAreRecorded(NestLookup lookup, Envelope event) {
+        if (event.op() != Op.UPDATE || saysWhereItPointed(event.before(), lookup)) {
+            return;
+        }
+        throw new TapstateException(NestError.REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE,
+                Map.of("alias", lookup.referrerAlias(), "refPath", NestTopology.render(lookup.pathId())),
+                null);
+    }
+
+    /**
+     * Whether an earlier row says enough to find the entry to take out - the columns holding the
+     * reference, and the ones identifying the row making it.
+     *
+     * <p><b>Which columns are there, not whether the row is.</b> A change stream with no pre-image
+     * configured sends an earlier row that is present and holds nothing, which is the shape most sources
+     * actually produce and is a different value from none at all. Read as a row it says this one used to
+     * point at null, so the entry taken out is one nobody ever wrote while the real one stays - the same
+     * leak, reached through the branch that looks like it is handling it.
+     *
+     * <p>A column that is genuinely null is left alone, which is why this asks for the key and never for
+     * the value: the column is present, so the key built from it is the key the entry was written under.
+     */
+    private static boolean saysWhereItPointed(Map<String, Object> was, NestLookup lookup) {
+        return was != null && was.keySet().containsAll(lookup.referenceFields())
+                && was.keySet().containsAll(lookup.referrerIdentity());
     }
 
     /**

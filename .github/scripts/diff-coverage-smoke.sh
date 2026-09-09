@@ -84,7 +84,7 @@ expect() { # expect <name> <want text> [range]
   local name="$1" want="$2" out code
   out="$(run "${3:-}")"
   code=$?
-  if [ "$code" = 0 ] && printf '%s' "$out" | grep -qF "$want"; then
+  if [ "$code" = 0 ] && grep -qF "$want" <<<"$out"; then
     printf '  ok    %s\n' "$name"
     passed=$((passed + 1))
   else
@@ -97,7 +97,7 @@ expect() { # expect <name> <want text> [range]
 refute() { # refute <name> <unwanted text> [range]
   local name="$1" unwanted="$2" out
   out="$(run "${3:-}")"
-  if printf '%s' "$out" | grep -qF "$unwanted"; then
+  if grep -qF "$unwanted" <<<"$out"; then
     printf '  FAIL  %s\n        did not want %s, got: %s\n' "$name" "$unwanted" "$out"
     failed=$((failed + 1))
   else

@@ -31,16 +31,16 @@ import static java.util.stream.Collectors.groupingBy;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The error-code build gates (ADR-0024 D5) — the mono-repo replacement for the legacy "maintain a
+ * The error-code build gates — the mono-repo replacement for the legacy "maintain a
  * spreadsheet" myth. One reactor build sees every first-party code, so global uniqueness / format /
  * registered-domain / stability become a build-time assertion instead of human discipline.
  *
  * <p>Scanning reuses arch-tests' existing capability (ArchUnit's {@code ClassFileImporter} to find
- * the enums, then {@code values()} via reflection) — no second scanning library (ADR-0024 D5-6).
+ * the enums, then {@code values()} via reflection) — no second scanning library.
  * Production scope only ({@code DO_NOT_INCLUDE_TESTS}), so throwaway test enums never leak in.
  *
  * <p>Codes belonging to connectors are deliberately out of scope: those arrive in runtime-loaded jars
- * the build cannot see, and are guarded at runtime instead (ADR-0024 D6).
+ * the build cannot see, and are guarded at runtime instead.
  *
  * <p>What is in scope, and is not a connector code, is the wording this repository ships for the
  * connector API's own diagnostic keys. Those keys are a fixed part of that API, the connectors carry

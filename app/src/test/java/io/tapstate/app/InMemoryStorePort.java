@@ -6,11 +6,14 @@ import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
@@ -28,7 +31,9 @@ final class InMemoryStorePort implements StorePort {
     private final InMemoryObservationStore observations = new InMemoryObservationStore();
     private final InMemoryArtifactStore artifacts;
     private final InMemorySrsMetaStore meta = new InMemorySrsMetaStore();
+    private final InMemorySrsLogStore srsLog = new InMemorySrsLogStore();
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
+    private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
     private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
     private final InMemoryNestDeadLetterStore nestDeadLetters = new InMemoryNestDeadLetterStore();
 
@@ -61,8 +66,23 @@ final class InMemoryStorePort implements StorePort {
     }
 
     @Override
+    public PipelineLayoutStore layouts() {
+        throw new UnsupportedOperationException("pipeline layouts are not exercised by this assembly test");
+    }
+
+    @Override
     public SrsMetaStore meta() {
         return meta;
+    }
+
+    @Override
+    public SrsLogStore srsLog() {
+        return srsLog;
+    }
+
+    @Override
+    public DerivedSchemaStore derivedSchemas() {
+        return derivedSchemas;
     }
 
     @Override

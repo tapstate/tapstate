@@ -64,6 +64,10 @@ public final class E2eExecutor {
         provision(envelope.setup());
         for (Seed seed : envelope.seed()) {
             binding.seed(seed.table(), seed.rows());
+            if (!seed.beforeImages()) {
+                // After the seed, because the seed lays the table down and arranges it to send them.
+                binding.withoutBeforeImages(seed.table());
+            }
         }
         // Discovery trails the seed: a source model is read out of what the source holds, and the seed is
         // what puts it there.
@@ -172,6 +176,7 @@ public final class E2eExecutor {
                     case RESUME -> heldStreams.remove(stream.sourceId());
                 }
             }
+            case Step.Composed composed -> binding.restart(pipelineId, composed.verb().rereadsEverything());
             case Step.Cdc cdc -> {
                 switch (cdc.change()) {
                     case Step.Change.Generated generated ->

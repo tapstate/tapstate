@@ -1,8 +1,10 @@
 package io.tapstate.control.restapi;
 
-import io.tapstate.control.core.AuditedSourceService;
-import io.tapstate.control.core.SourceDraft;
+import io.tapstate.control.core.SchemaReport;
+import io.tapstate.control.core.SourceSchemaQueryService;
+import io.tapstate.control.core.SourceInput;
 import io.tapstate.control.core.SourceError;
+import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.SourceView;
 import io.tapstate.core.common.TapstateException;
 import org.springframework.http.HttpHeaders;
@@ -27,16 +29,18 @@ class SourceController {
 
     private static final String QUOTED_HASH = "\"[0-9a-f]{64}\"";
 
-    private final AuditedSourceService sources;
+    private final SourceProjectionService sources;
+    private final SourceSchemaQueryService schemas;
 
-    SourceController(AuditedSourceService sources) {
+    SourceController(SourceProjectionService sources, SourceSchemaQueryService schemas) {
         this.sources = Objects.requireNonNull(sources, "sources");
+        this.schemas = Objects.requireNonNull(schemas, "schemas");
     }
 
     @Verb("source.create")
     @PostMapping("/sources")
-    ResponseEntity<SourceView> create(@RequestBody SourceDraft draft) {
-        SourceView created = sources.create(AuthenticatedCaller.subject(), draft);
+    ResponseEntity<SourceView> create(@RequestBody SourceInput input) {
+        SourceView created = sources.create(AuthenticatedCaller.subject(), input);
         return ResponseEntity.created(URI.create("/api/sources/" + created.id()))
                 .eTag(created.contentHash())
                 .body(created);
@@ -55,14 +59,20 @@ class SourceController {
         return ResponseEntity.ok().eTag(view.contentHash()).body(view);
     }
 
+    @Verb("source.schema")
+    @GetMapping("/sources/{id}/schema")
+    ResponseEntity<SchemaReport> schema(@PathVariable("id") String id) {
+        return ResponseEntity.of(schemas.find(id));
+    }
+
     @Verb("source.update")
     @PutMapping("/sources/{id}")
     ResponseEntity<SourceView> replace(
             @PathVariable("id") String id,
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch,
-            @RequestBody SourceDraft draft) {
+            @RequestBody SourceInput input) {
         SourceView replaced = sources.replace(
-                AuthenticatedCaller.subject(), id, expectedHash(id, ifMatch), draft);
+                AuthenticatedCaller.subject(), id, expectedHash(id, ifMatch), input);
         return ResponseEntity.ok().eTag(replaced.contentHash()).body(replaced);
     }
 

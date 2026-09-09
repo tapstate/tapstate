@@ -17,6 +17,7 @@ import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
@@ -141,11 +142,7 @@ public final class CanonicalWriter {
     private Node.MapN pipeline(PipelineResource p) {
         B b = new B();
         header(b, p);
-        if (p.sources().size() == 1) {
-            b.scalar("source", p.sources().get(0));
-        } else {
-            b.scalarSeq("source", p.sources());
-        }
+        b.put("source", sources(p.sources()));
         if (p.transforms() != null) {
             List<Node> steps = new ArrayList<>();
             for (Step st : p.transforms()) {
@@ -232,6 +229,29 @@ public final class CanonicalWriter {
         return new Node.SeqN(items);
     }
 
+    private Node sources(List<SourceRef> refs) {
+        // X13: one source carrying no switch of its own is a bare scalar; every other shape is a
+        // list, in which a reference carrying no switch is still a bare string. The switch itself is
+        // never omitted when present -- reading it back as absent would mean "take the source's
+        // value", which is the link this field exists to cut.
+        if (refs.size() == 1 && refs.get(0) instanceof SourceRef.Bare only) {
+            return scalar(only.id());
+        }
+        List<Node> items = new ArrayList<>();
+        for (SourceRef ref : refs) {
+            switch (ref) {
+                case SourceRef.Bare bare -> items.add(scalar(bare.id()));
+                case SourceRef.Spec spec -> {
+                    B e = new B();
+                    e.scalar("id", spec.id());
+                    e.scalar("srs", spec.srs());
+                    items.add(e.build());
+                }
+            }
+        }
+        return new Node.SeqN(items);
+    }
+
     private Node srs(Srs srs) {
         B b = new B();
         b.scalar("key", srs.key());
@@ -286,7 +306,7 @@ public final class CanonicalWriter {
                 b.put("root", nestRoot(n.root()));
             }
             case TransformBody.Join j -> {
-                b.scalar("engine", j.engine());
+                b.scalar("engine", j.engine().yaml());
                 b.literal("sql", j.sql());
             }
         }
@@ -326,6 +346,7 @@ public final class CanonicalWriter {
             b.freeMap("on", new TreeMap<>(e.on()));
             b.scalar("as", e.as().yaml());
             b.scalar("path", e.path());
+            b.scalarSeq("key", e.key());
             b.scalarSeq("arrayKey", e.arrayKey());
             b.scalar("ignoreUpdates", e.ignoreUpdates());
             b.scalar("trackKeyChanges", e.trackKeyChanges());
@@ -393,7 +414,7 @@ public final class CanonicalWriter {
         switch (serve) {
             case ServeBlock.Inline s -> {
                 b.scalar("id", s.id());
-                b.scalar("from", fromRef(s.from()));
+                b.put("from", serveFrom(s.from()));
                 serveElements(b, s.sync(), s.query(), s.push());
             }
             case ServeBlock.Use u -> {
@@ -401,10 +422,18 @@ public final class CanonicalWriter {
                     b.scalar("id", u.id());
                 }
                 b.scalar("use", u.use());
-                b.scalar("from", fromRef(u.from()));
+                b.put("from", serveFrom(u.from()));
             }
         }
         return b.build();
+    }
+
+    /** Preserve the legacy scalar spelling for one serve input and use a sequence for multiple inputs. */
+    private Node serveFrom(FromClause from) {
+        if (from instanceof FromClause.Flow flow && flow.refs().size() == 1) {
+            return scalar(fromRef(flow.refs().getFirst()));
+        }
+        return fromClause(from);
     }
 
     private void serveElements(B b, List<SyncElement> sync, List<QueryElement> query,

@@ -4,21 +4,28 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.Envelope;
+import io.tapstate.runtime.engine.EnvelopeSerializer;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
+import io.tapstate.runtime.engine.join.JoinMaps;
+import io.tapstate.runtime.engine.join.JoinStateMapStoreFactory;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -56,14 +63,21 @@ class HazelcastConfiguration {
     HazelcastInstance hazelcastMember(HazelcastProperties properties, @Nullable SrsMetaStore srsMetaStore,
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
             @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
-            @Nullable NestDeadLetterStore nestDeadLetterStore) {
-        Config config = memberConfig(properties, nestStateStore, nestSettings);
+            @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore) {
+        Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         HazelcastInstance member = startMember(() -> Hazelcast.newHazelcastInstance(config));
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
         // Jet source and resolved member-side -- can reach it through the user context and publish durable
         // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
         if (srsMetaStore != null) {
             member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, srsMetaStore);
+        }
+        // Bind the change log too, so the capture runtime can cut it back at the durable frontier. The
+        // rings already reach it through their own configuration; this is the same store, reached the way
+        // everything else the runtime resolves member-side is reached. A run with no store binds nothing,
+        // and nothing is cut -- because nothing was written down either.
+        if (srsLogStore != null) {
+            member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, srsLogStore);
         }
         // Bind the connector provisioner onto the member so a sink-writer factory -- carried onto the Jet
         // sink vertex and resolved member-side -- can reach it and open its target connector. A run with no
@@ -72,6 +86,17 @@ class HazelcastConfiguration {
         if (connectorProvisioner != null) {
             member.getUserContext().put(
                     PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY, connectorProvisioner);
+        }
+        // Bind the layer a connector's own notes are kept in onto the member, for the same reason the
+        // provisioner is: the sink-writer factory crosses to whichever member runs the sink vertex and a live
+        // store does not survive the crossing, so the node travels and the store is picked up where the
+        // connector is actually opened. The read side needs no such indirection -- it opens its connector in
+        // the process that holds the store -- which is why only the write side reaches through here. A run
+        // with no store (mongo disabled) binds nothing, and a sink connector then keeps its notes for the life
+        // of the open, exactly as it did before there was anywhere to file them.
+        if (nestStateStore != null) {
+            member.getUserContext().put(
+                    PdkSinkWriterFactory.CONNECTOR_STATE_STORE_USER_CONTEXT_KEY, nestStateStore);
         }
         // Bind the snapshot buffer onto the member so a source vertex -- resolved member-side by the ring name
         // it carries -- can drain this ring's snapshot rows and emit them ahead of the cdc tail. The coordinator
@@ -87,7 +112,14 @@ class HazelcastConfiguration {
         // with no store (mongo disabled) binds nothing, and its maps declare no store to resolve.
         if (nestStateStore != null) {
             NestStateMapStoreFactory.bindTo(member, nestStateStore);
+            // The same layer, bound again under the join's own key. One key shared between them would
+            // read as tidier and would make "these two are told about different layers" impossible to
+            // say - which is a thing a deployment may one day want to say, and a thing neither of them
+            // could then express without the other noticing.
+            JoinStateMapStoreFactory.bindTo(member, nestStateStore);
         }
+        makeNestCapable(member, nestStateStore, nestSettings);
+        makeJoinCapable(member, nestStateStore);
         // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
         // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
         // reached through a handle that does not survive being written into a graph. A run with no store
@@ -97,6 +129,61 @@ class HazelcastConfiguration {
             DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
         }
         return member;
+    }
+
+    /**
+     * Declares what every nest state map on {@code member} is, once the member is already running.
+     *
+     * <p><b>After the member starts, and that is the whole of this method.</b> A namespace belongs to a
+     * pipeline, so a per-pipeline budget can only be written once there is a pipeline - which is always
+     * after this. The substrate resolves a map's configuration by looking through the static
+     * configuration by pattern first and only then at what was added while it ran, so a pattern left in
+     * the static configuration answers for every namespace and no exact configuration behind it is ever
+     * reached. Declared here instead, the pattern and the exact names sit in the same place, where an
+     * exact name wins over a pattern - which is what makes a pipeline's own number the one in force.
+     *
+     * <p>Measured before it was moved: a budget of 271 applied to a namespace read back as 271 from every
+     * way of asking, while the map ran on the process-wide 4,000 and held all 700 entries written to it.
+     * Neither the substrate nor the configuration says anything when that happens; the only trace is how
+     * many entries are resident, which nothing was reading.
+     *
+     * <p>Only with a store behind them, for the reason the store binding above gives: nest state must
+     * outlive the process, so a map that keeps it in memory alone is not a smaller version of this. A run
+     * with no store drives no pipeline, so no vertex ever asks for a state map. {@code nestStateStore} is
+     * therefore allowed to be null and is not annotated as such: this is not a bean method, so nothing
+     * reads the annotation, and the one that would be written here is deprecated.
+     */
+    static void makeNestCapable(HazelcastInstance member, KeyedStateStore nestStateStore,
+            NestSettings nestSettings) {
+        if (nestStateStore == null) {
+            return;
+        }
+        member.getConfig().addMapConfig(nestSettings.backedStateMaps());
+    }
+
+    /**
+     * Declares what every join state map on {@code member} is, once the member is already running.
+     *
+     * <p><b>After the member starts, for the reason {@link #makeNestCapable} gives.</b> The substrate
+     * resolves a map's configuration by looking through the static configuration by pattern first and
+     * only then at what was added while it ran, so a pattern left in the static configuration answers
+     * for every namespace and no exact configuration behind it is ever reached. Join state carries no
+     * per-namespace configuration today, so nothing is being shadowed yet; it is declared here so that
+     * the day one is added it is reached, rather than being ignored with nothing saying so.
+     *
+     * <p><b>Its own method rather than a line inside the nest one.</b> Nest and join are two mechanisms
+     * that happen to want the same treatment here, not one mechanism; folded together, "these two are
+     * configured differently" becomes a thing neither could express without the other noticing.
+     *
+     * <p>Only with a store behind them, for the reason the store binding gives: join state is what lets
+     * a broken target table be rebuilt without reading the source again, so a map that keeps it in
+     * memory alone is not a smaller version of this but a way to lose it quietly.
+     */
+    static void makeJoinCapable(HazelcastInstance member, KeyedStateStore joinStateStore) {
+        if (joinStateStore == null) {
+            return;
+        }
+        member.getConfig().addMapConfig(JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY));
     }
 
     /**
@@ -132,7 +219,13 @@ class HazelcastConfiguration {
 
     /** Builds the single-member config with the default limits, for a caller configuring none. */
     static Config memberConfig(HazelcastProperties properties, @Nullable KeyedStateStore nestStateStore) {
-        return memberConfig(properties, nestStateStore, NestSettings.defaults());
+        return memberConfig(properties, nestStateStore, NestSettings.defaults(), null);
+    }
+
+    /** As above, with nest settings but no change log -- the shape a caller that has no store gets. */
+    static Config memberConfig(HazelcastProperties properties, @Nullable KeyedStateStore nestStateStore,
+            NestSettings nestSettings) {
+        return memberConfig(properties, nestStateStore, nestSettings, null);
     }
 
     /**
@@ -141,7 +234,7 @@ class HazelcastConfiguration {
      * installed.
      */
     static Config memberConfig(HazelcastProperties properties, @Nullable KeyedStateStore nestStateStore,
-            NestSettings nestSettings) {
+            NestSettings nestSettings, @Nullable SrsLogStore srsLogStore) {
         Config config = new Config();
         config.setClusterName(properties.getClusterName());
         // Member logs flow through the same operational logging setup as the rest of the process.
@@ -172,24 +265,45 @@ class HazelcastConfiguration {
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(SrsItem.class)
                 .setImplementation(new SrsItemSerializer()));
-        config.addRingBufferConfig(new RingbufferConfig("srs.*")
+        // And a change itself, for the same reason and one more: a change is three row images of names to
+        // whatever the source had, which the zero-configuration mechanism refuses outright. Registered
+        // here rather than where it is needed, because where it is needed is any edge between two
+        // members - and a member that cannot write one only finds out on the first event of the first
+        // graph to be spread across two of them, at the edge carrying its root stream.
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(Envelope.class)
+                .setImplementation(new EnvelopeSerializer()));
+        RingbufferConfig rings = new RingbufferConfig("srs.*")
                 .setCapacity(SRS_RING_CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
-        // Make the member nest-capable. A nest vertex's state map is created on demand, by the name the
-        // compiled topology gave that vertex, so what those maps are has to be declared before any of them
-        // exists. The engine owns their shape -- the assembly root only installs it here, next to the ring
-        // it does the same for.
+                .setBackupCount(0);
+        // Put the change log behind them when there is one. The ring writes through it before admitting a
+        // change, so every change in the ring is already written down, and a ring rebuilt on a later member
+        // numbers on from what the record holds rather than reusing sequences it already named.
         //
-        // Only with a store behind them. Nest state must outlive the process: it holds changes that have
-        // been let past the source's read offset on the strength of being held here, so a map that keeps
-        // them in memory alone is not a smaller version of this, it is a way to lose them silently. There
-        // is no shape for that, and nothing needs one -- a run with no store drives no pipeline, so no
-        // vertex ever asks for a state map.
-        if (nestStateStore != null) {
-            config.addMapConfig(nestSettings.backedStateMaps());
+        // Not a replay path, and nothing here reads a change back out: a restart re-mines the ring from the
+        // durable source read offset instead.
+        //
+        // A factory rather than a single store: the ring's store hook is told a sequence and an item but
+        // never which ring is asking, and only the factory call is given the name. A live instance is
+        // allowed here because this configuration is built before the member starts; a configuration added
+        // to a running member is written down and broadcast, which no live object survives.
+        if (srsLogStore != null) {
+            rings.setRingbufferStoreConfig(new RingbufferStoreConfig()
+                    .setEnabled(true)
+                    .setFactoryImplementation(new SrsLogRingbufferStoreFactory(srsLogStore)));
         }
+        config.addRingBufferConfig(rings);
+        // What a nest state map is is NOT declared here, and the omission is load-bearing: it is declared
+        // once the member is running, by makeNestCapable. A pattern placed in this static configuration
+        // answers for every namespace and shadows the per-pipeline budget added later, which the substrate
+        // reports nowhere -- see that method.
+        //
+        // A join state map is declared by a pattern too, and is left out of here for the same reason and
+        // under the same rule, by makeJoinCapable. Join state carries no per-namespace budget today, so
+        // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
+        // maps were in until the day one was added.
         return config;
     }
 }

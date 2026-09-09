@@ -1,14 +1,30 @@
 {
   "rewrites": [
-    { "source": "/", "destination": "/quickstart.sh" },
-    { "source": "/cli", "destination": "/install.sh" }
+    {
+      "source": "/",
+      "destination": "/quickstart.sh"
+    },
+    {
+      "source": "/cli",
+      "destination": "/install.sh"
+    },
+    {
+      "source": "/e",
+      "destination": "/api/event"
+    }
   ],
   "headers": [
     {
       "source": "/(.*)",
       "headers": [
-        { "key": "Content-Type", "value": "text/plain; charset=utf-8" },
-        { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, must-revalidate"
+        }
       ]
     }
   ]

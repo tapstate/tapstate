@@ -6,6 +6,8 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.DerivedSchema;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SchemaVersion;
@@ -15,6 +17,7 @@ import io.tapstate.spi.store.StateStore;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -100,6 +103,26 @@ final class NoReclaimStores {
         };
     }
 
+    static DerivedSchemaStore derivedSchemas() {
+        return new DerivedSchemaStore() {
+            @Override
+            public Optional<DerivedSchema> latest(String pipelineId, String stepId) {
+                throw unexpected("DerivedSchemaStore.latest");
+            }
+
+            @Override
+            public void record(String pipelineId, String stepId, Map<String, String> schema,
+                    String statement, String derivedFrom, String derivedBy) {
+                throw unexpected("DerivedSchemaStore.record");
+            }
+
+            @Override
+            public void delete(String pipelineId) {
+                throw unexpected("DerivedSchemaStore.delete");
+            }
+        };
+    }
+
     static SrsMetaStore srsMeta() {
         return new SrsMetaStore() {
             @Override
@@ -113,7 +136,13 @@ final class NoReclaimStores {
             }
 
             @Override
-            public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+            public void rewindSourceReadOffset(String miningChainId, String token) {
+                // No test on this double writes a position back; a call here is a wiring mistake, not a case.
+                throw new UnsupportedOperationException("rewindSourceReadOffset");
+            }
+
+            @Override
+            public void advanceSourceReadOffset(String miningChainId, io.tapstate.core.event.ChainPosition position) {
                 throw unexpected("SrsMetaStore.advanceSourceReadOffset");
             }
 
@@ -139,7 +168,7 @@ final class NoReclaimStores {
             }
 
             @Override
-            public void markSnapshotComplete(String miningChainId, String table) {
+            public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
                 throw unexpected("SrsMetaStore.markSnapshotComplete");
             }
 
@@ -161,6 +190,11 @@ final class NoReclaimStores {
             @Override
             public void detachConsumer(String miningChainId, String pipelineId) {
                 throw unexpected("SrsMetaStore.detachConsumer");
+            }
+
+            @Override
+            public void dropChain(String miningChainId) {
+                throw unexpected("SrsMetaStore.dropChain");
             }
         };
     }

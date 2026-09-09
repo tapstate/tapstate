@@ -18,6 +18,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -55,7 +56,7 @@ import org.junit.jupiter.api.Test;
  * elsewhere, and wall-clock numbers do not belong in a build gate. Its name keeps it out of the
  * default surefire selection, so it costs a build nothing and is run deliberately:
  *
- * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestCascadeCostBench -DfailIfNoTests=false}</pre>
+ * <pre>{@code mvn -o test -pl runtime/engine -am -Dtest=NestCascadeCostBench -Dsurefire.failIfNoSpecifiedTests=false}</pre>
  *
  * <p>Latency is read off the row itself rather than off the job: a stamp travels in the deepest leaf
  * row and is read again when the document carrying it reaches the sink, so what is measured is one
@@ -357,7 +358,7 @@ class NestCascadeCostBench {
 
         Step step = Step.inline("doc", FromClause.aliases(aliasRefs),
                 new TransformBody.Nest(null, null, root), null);
-        PipelineResource pipeline = new PipelineResource("bench" + depth, null, sourceIds,
+        PipelineResource pipeline = new PipelineResource("bench" + depth, null, sourceIds.stream().<SourceRef>map(SourceRef::bare).toList(),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),

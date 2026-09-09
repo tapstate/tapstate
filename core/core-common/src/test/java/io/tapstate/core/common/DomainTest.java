@@ -24,7 +24,7 @@ class DomainTest {
                         "dsl", "cli", "core", "catalog", "schema", "lifecycle", "role", "boot",
                         "actuation", "store", "migration", "connector", "transform", "io", "control",
                         "engine", "monitor", "data-browser", "artifact", "source", "mcp",
-                        "capture", "nest");
+                        "capture", "nest", "pipeline", "position");
     }
 
     @Test
@@ -39,6 +39,7 @@ class DomainTest {
         assertThat(Domain.isRegistered("engine")).isTrue();
         assertThat(Domain.isRegistered("monitor")).isTrue();
         assertThat(Domain.isRegistered("data-browser")).isTrue();
+        assertThat(Domain.isRegistered("pipeline")).isTrue();
         // the constant's own spelling is not a registered id -- only its kebab form is
         assertThat(Domain.isRegistered("data_browser")).isFalse();
         assertThat(Domain.isRegistered("artifact")).isTrue();

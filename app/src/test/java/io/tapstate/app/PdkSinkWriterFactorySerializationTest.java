@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
@@ -27,11 +28,30 @@ class PdkSinkWriterFactorySerializationTest {
                 "mongodb", Map.of("uri", "u"), WriteMode.UPSERT, DdlPolicy.APPLY,
                 new TargetTable("orders", List.of(
                         new TargetField("id", "INT", true),
-                        new TargetField("amount", "DECIMAL", false))));
+                        new TargetField("amount", "DECIMAL", false))),
+                new PipelineNode("p1", "to_mongo"));
 
         Object restored = roundTrip(factory);
 
         assertThat(restored).isInstanceOf(PdkSinkWriterFactory.class);
+    }
+
+    /**
+     * The node has to survive the trip, because the member that deserializes this factory is where the
+     * connector is actually opened and there is nothing there to re-derive it from. A node that did not
+     * travel arrives null, and a null node is a legitimate value meaning "scope nothing" - so the sink
+     * would open, write every row correctly, and quietly keep the connector's own notes nowhere. Nothing
+     * downstream of the write can see the difference.
+     */
+    @Test
+    void the_node_it_writes_for_survives_the_trip_onto_the_dag() throws Exception {
+        PdkSinkWriterFactory factory = new PdkSinkWriterFactory(
+                "mongodb", Map.of("uri", "u"), WriteMode.UPSERT, DdlPolicy.APPLY,
+                (TargetTable) null, new PipelineNode("p1", "to_mongo"));
+
+        Object restored = roundTrip(factory);
+
+        assertThat(((PdkSinkWriterFactory) restored).node()).isEqualTo(new PipelineNode("p1", "to_mongo"));
     }
 
     private static Object roundTrip(Object value) throws Exception {

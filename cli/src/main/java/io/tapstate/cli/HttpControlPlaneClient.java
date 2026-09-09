@@ -34,6 +34,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The production {@link ControlPlaneClient}, backed by the JDK HTTP client (no third-party
@@ -871,11 +872,22 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
-    public LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb) {
+    public LifecycleOutcome lifecycle(
+            URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + ":" + verb, credential)
-                    .POST(HttpRequest.BodyPublishers.noBody())
-                    .build();
+            // Only a stop has anything to say in a body, and it is refused by the server without one.
+            // The other three send none at all rather than an empty object, which keeps them the
+            // requests they already were.
+            HttpRequest.BodyPublisher body = purgeState == null
+                    ? HttpRequest.BodyPublishers.noBody()
+                    : HttpRequest.BodyPublishers.ofString(
+                            "{\"purgeState\":" + purgeState + "}", StandardCharsets.UTF_8);
+            HttpRequest.Builder builder =
+                    authed(baseUrl, "/api/pipelines/" + pipelineId + ":" + verb, credential).POST(body);
+            if (purgeState != null) {
+                builder = builder.header("Content-Type", "application/json");
+            }
+            HttpRequest request = builder.build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -945,6 +957,71 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         } catch (IOException | RuntimeException e) {
             return new MetricsOutcome.Unreachable();
         }
+    }
+
+    @Override
+    public PositionOutcome position(URI baseUrl, String credential, String pipelineId) {
+        return positionCall(() -> authed(
+                baseUrl, "/api/pipelines/" + pipelineId + "/position", credential).GET().build());
+    }
+
+    @Override
+    public PositionOutcome setPosition(
+            URI baseUrl, String credential, String pipelineId, String document) {
+        return positionCall(() -> authed(baseUrl, "/api/pipelines/" + pipelineId + "/position", credential)
+                .header("Content-Type", "application/json")
+                .PUT(HttpRequest.BodyPublishers.ofString(document, StandardCharsets.UTF_8))
+                .build());
+    }
+
+    /**
+     * The read and the write-back differ only in the request they send: both answer with the same document
+     * and are refused in the same shapes, so one place decides what a body and a status code mean.
+     */
+    private PositionOutcome positionCall(Supplier<HttpRequest> request) {
+        try {
+            HttpResponse<String> response =
+                    send(request.get(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                PositionOutcome.Found found = positionFound(response.body());
+                return found == null ? new PositionOutcome.Unreachable() : found;
+            }
+            Rejection r = rejection(response.body(), "The server refused the request.");
+            return new PositionOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new PositionOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new PositionOutcome.Unreachable();
+        }
+    }
+
+    /**
+     * The document as it arrived, plus the little of it a sentence needs: for each chain, where it now
+     * resumes and which other pipelines read it. Null unless the body is a document with a chains array,
+     * so a 200 from something that is not this server reads as unreachable rather than as an empty answer.
+     */
+    private static PositionOutcome.Found positionFound(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> m) || !(m.get("chains") instanceof List<?> raw)) {
+            return null;
+        }
+        List<PositionOutcome.Chain> chains = new ArrayList<>();
+        for (Object entry : raw) {
+            if (entry instanceof Map<?, ?> chain && chain.get("chainId") instanceof String chainId) {
+                String token = chain.get("resumeFrom") instanceof Map<?, ?> from
+                        && from.get("token") instanceof String value ? value : null;
+                List<String> shared = new ArrayList<>();
+                if (chain.get("sharedWith") instanceof List<?> others) {
+                    for (Object other : others) {
+                        if (other instanceof String id) {
+                            shared.add(id);
+                        }
+                    }
+                }
+                chains.add(new PositionOutcome.Chain(chainId, token, List.copyOf(shared)));
+            }
+        }
+        return new PositionOutcome.Found(body, List.copyOf(chains));
     }
 
     @Override
@@ -1046,6 +1123,80 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             return new SnapshotOutcome.Found(id, tables);
         }
         return null;
+    }
+
+    @Override
+    public DerivedSchemaOutcome derivedSchema(URI baseUrl, String credential, String pipelineId) {
+        HttpRequest.Builder request =
+                authed(baseUrl, "/api/pipelines/" + pipelineId + "/derived-schema", credential);
+        return derivedSchemaCall(pipelineId, request.GET().build());
+    }
+
+    @Override
+    public DerivedSchemaOutcome acceptDerivedSchema(URI baseUrl, String credential, String pipelineId) {
+        HttpRequest.Builder request =
+                authed(baseUrl, "/api/pipelines/" + pipelineId + ":accept-derived-schema", credential);
+        return derivedSchemaCall(pipelineId,
+                request.POST(HttpRequest.BodyPublishers.noBody()).build());
+    }
+
+    /**
+     * The read and the accept share this, because they answer with the same body: what a caller wants
+     * back from an accept is the shape now on record, and returning nothing would leave a scripted
+     * accept unable to say what it took.
+     */
+    private DerivedSchemaOutcome derivedSchemaCall(String pipelineId, HttpRequest request) {
+        try {
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                List<RemoteDerivedStep> steps = derivedSteps(response.body());
+                return steps == null
+                        ? new DerivedSchemaOutcome.Unreachable()
+                        : new DerivedSchemaOutcome.Found(pipelineId, steps);
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new DerivedSchemaOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new DerivedSchemaOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new DerivedSchemaOutcome.Unreachable();
+        }
+    }
+
+    /**
+     * The step reports decoded from a 200 body, or {@code null} when the body is not the array of step
+     * objects this contract promises. An empty array is a legitimate empty answer - a pipeline with no
+     * join step derives nothing - and decodes to an empty list rather than to a shape failure.
+     */
+    private static List<RemoteDerivedStep> derivedSteps(String body) {
+        if (!(JsonReader.parse(body) instanceof List<?> reports)) {
+            return null;
+        }
+        List<RemoteDerivedStep> steps = new ArrayList<>();
+        for (Object entry : reports) {
+            if (!(entry instanceof Map<?, ?> report) || !(report.get("step") instanceof String step)) {
+                return null;
+            }
+            List<RemoteDerivedColumn> columns = new ArrayList<>();
+            if (report.get("columns") instanceof List<?> cells) {
+                for (Object cell : cells) {
+                    if (cell instanceof Map<?, ?> c && c.get("column") instanceof String column) {
+                        columns.add(new RemoteDerivedColumn(column, string(c.get("recorded")),
+                                string(c.get("derived")), string(c.get("target"))));
+                    }
+                }
+            }
+            steps.add(new RemoteDerivedStep(step, string(report.get("targetTable")),
+                    Boolean.TRUE.equals(report.get("targetKnown")), columns));
+        }
+        return steps;
+    }
+
+    /** A JSON cell as a string, or null where it is absent - which is what an absent side means here. */
+    private static String string(Object value) {
+        return value instanceof String s ? s : null;
     }
 
     @Override

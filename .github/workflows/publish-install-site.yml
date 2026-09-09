@@ -126,13 +126,28 @@ jobs:
           # deployed to the domain the README tells people to pipe into sh.
           pinned="$(.github/scripts/site-from-tag.sh "$tag" "$site")"
           echo "publishing the entry points pinned to $pinned"
-          if git show "$tag:deploy/install-site/vercel.json" > "$site/vercel.json" 2>/dev/null; then
-            echo "routing: from $tag"
+          # The receiver and the routing that reaches it are ONE unit, taken from one source. Deciding
+          # their provenance separately is how this published a working function nobody could reach:
+          # the receiver fell back to this checkout because the tag lacked it, while the routing came
+          # from the tag -- whose vercel.json exists and simply has no /e rewrite. The fallback tests
+          # whether the file is there, not whether it mentions the route, so it never fired. Deploy
+          # succeeded, both static entry points matched byte for byte, and /e answered 404 with the
+          # function live at its default path behind it. A tag old enough to lack the receiver is old
+          # enough to lack the route that reaches it.
+          mkdir -p "$site/api"
+          if git show "$tag:deploy/install-site/api/event.js" > "$site/api/event.js" 2>/dev/null \
+             && git show "$tag:deploy/install-site/vercel.json" > "$site/vercel.json" 2>/dev/null; then
+            echo "receiver + routing: from $tag"
           else
-            echo "routing: $tag predates the checked-in routing; using this checkout's vercel.json"
+            echo "receiver + routing: $tag predates the checked-in receiver; using this checkout's copies"
+            cp deploy/install-site/api/event.js "$site/api/event.js"
             cp deploy/install-site/vercel.json "$site/vercel.json"
           fi
-          ls -l "$site"
+          # And then it is checked rather than trusted. The rule above is one line of shell away from
+          # being wrong again; this refuses the result -- before anything reaches the edge -- whenever
+          # a function has no route or a route has no function.
+          deploy/install-site/check-site.sh "$site"
+          ls -lR "$site"
           echo "dir=$site" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to production
@@ -188,3 +203,48 @@ jobs:
             echo "not yet serving the new deployment; retrying in 15s"
             sleep 15
           done
+
+          # The receiver is a route, not content, so the byte comparison above cannot see it. Two
+          # probes, neither of which stores anything.
+          #
+          # First: a GET. The handler answers 405 to anything but POST, so 405 proves the route
+          # resolves to the function. A 404 means the site published with a /e rewrite pointing at
+          # nothing.
+          code="$(curl -s -o /dev/null -w '%{http_code}' "https://$SITE_DOMAIN/e")"
+          if [ "$code" = "405" ]; then
+            echo "ok: the event receiver is live (GET /e -> 405, as it should be)"
+          else
+            echo "the event receiver is not live: GET /e answered $code, expected 405" >&2
+            exit 1
+          fi
+
+          # Second: a POST of well-formed JSON that is not a valid event. It must answer 400, and 400
+          # here now means something specific: the body was READ and PARSED, and then the validator
+          # rejected the event. A request whose body could not be read at all answers 415.
+          #
+          # That distinction is the whole point of this probe. It used to accept 400 for either, and
+          # 0.4.4 shipped a receiver that answered 400 to EVERY request -- valid events included --
+          # because the body never arrived as a parsed object. Deploy green, both probes green, every
+          # install event rejected, and the installer swallows the status by design. Nothing anywhere
+          # said so; the first symptom would have been an install count that stayed at zero, which is
+          # indistinguishable from nobody installing.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+                    -X POST -H 'Content-Type: application/json' \
+                    -d '{"installation_id":"no"}' "https://$SITE_DOMAIN/e")"
+          if [ "$code" = "400" ]; then
+            echo "ok: the receiver validates (POST of a malformed event -> 400)"
+          elif [ "$code" = "415" ]; then
+            echo "the receiver could not read a JSON body it was handed (415)." >&2
+            echo "Every install event would be refused the same way, silently." >&2
+            exit 1
+          else
+            echo "the receiver did not validate: a well-formed JSON body answered $code, expected 400" >&2
+            exit 1
+          fi
+
+          # What is deliberately NOT probed here: a successful write. The only POST that reaches
+          # storage is a well-formed event, and sending one would fabricate an install in the very
+          # denominator this endpoint exists to measure -- a probe that corrupts its own measurement.
+          # A broken credential surfaces two other ways instead: the handler answers 500 rather than
+          # 204 when a store fails, so the platform's own function metrics show it, and the weekly
+          # report warns when distribution signals are non-zero while the install count is not.

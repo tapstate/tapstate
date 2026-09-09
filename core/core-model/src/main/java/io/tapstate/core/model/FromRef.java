@@ -3,7 +3,7 @@ package io.tapstate.core.model;
 import java.util.Objects;
 
 /**
- * One upstream reference in the {@code from:} addressing system (ADR-0016 §4/§5/§8, X9):
+ * One upstream reference in the {@code from:} addressing system (§4/§5/§8, X9):
  * a literal token (step id / table name / {@code source_id.table} disambiguation — frozen
  * link) or a {@code /…/} regex (dynamic link). Resolution against the declared source
  * universe is a validate-layer concern; the model stores the token.

@@ -7,7 +7,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * One element of {@code source.tables} (ADR-0016 §4, X9/X12): bare name (literal, frozen
+ * One element of {@code source.tables} (§4, X9/X12): bare name (literal, frozen
  * link), {@code /…/} regex (dynamic link), or an object carrying per-table configuration.
  */
 @Doc("A table selected from the source: a bare name, a regex pattern, or an object with per-table configuration.")

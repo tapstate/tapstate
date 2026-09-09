@@ -1,0 +1,103 @@
+# Cost instrument lane.
+#
+# The nest cost benches measure what one event costs in wall-clock and in bytes. Not one of them
+# asserts anything: each runs, prints a table and passes. That is deliberate. A wall-clock number is a
+# property of the machine rather than of the design - the same tree and the same code measured 6.9 s on
+# a build runner and over 60 s on a developer's, and loading that developer's machine moved it by a
+# further factor of nearly four. A gate over a number like that is flaky, and a flaky gate is switched
+# off. What the merge gate carries instead is a count of what the operator did per event, which travels
+# between machines; these instruments produce the trend those counts cannot.
+#
+# Because they assert nothing, the one way this lane can fail is the one that matters: a bench that no
+# longer runs at all. Nothing else reports that. A class the selector stops reaching leaves no output
+# and no failure, which reads exactly like a lane that had nothing to do - and that is how five
+# witnesses in another lane came to be written, committed, documented with their own run instructions
+# and then never run by anything. So the classes on disk are counted against the output they left, and
+# an empty output counts as absence too.
+#
+# The tables go into the run summary rather than only into the log. An instrument nobody can find the
+# output of measures nothing; a number that costs a log download to read is a number that gets read
+# once.
+#
+# This is its own lane rather than a step on the connector one, for two reasons. A release waits on
+# that lane, and an instrument that rotted must not be able to hold up a release. And these benches
+# need no connector jars, so a step there would queue behind minutes of building them.
+#
+# Scope is the engine module's benches. The store adapter has a bench of the same shape that is
+# deliberately left out: it drives a real container, and its own documentation says it is to be run by
+# hand. Reversing that is its owner's call, not this lane's.
+#
+# `-am` is load-bearing rather than habit. Without it the module under test resolves its dependencies
+# from the local repository instead of from this tree, so a bench compiled against these sources runs
+# against whatever was installed last. That surfaces from inside the bench as NoSuchMethodError, which
+# reads as a broken instrument rather than as a build that was pointed at the wrong classes.
+name: Cost instruments
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Off the hour, and clear of the connector lane's slot: scheduled runs are queued, and two of ours
+    # asking at the same moment only makes both of them wait.
+    - cron: "40 17 * * *"
+
+concurrency:
+  group: cost-instruments-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  instruments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          # Root pom pins the toolchain by version only (21, no vendor);
+          # setup-java registers the installed JDK in ~/.m2/toolchains.xml.
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Run the cost instruments
+        # The selector is a pattern rather than a list of names, so a bench added later runs here
+        # without anyone remembering to edit this file - and the check below fails if one stops being
+        # reached. failIfNoSpecifiedTests is off because the pattern matches nothing in most of the
+        # modules the reactor has to build to get here.
+        #
+        # redirectTestOutputToFile puts each bench's tables in a file of its own, which is what lets
+        # the next step publish them without picking them back out of the build log.
+        run: >
+          mvn -B -pl runtime/engine -am test
+          -Dtest='*Bench'
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dmaven.test.redirectTestOutputToFile=true
+
+      - name: Every instrument on disk measured something, and here is what
+        # Two absences, neither of them visible in a build that passed: a bench the selector no longer
+        # reaches leaves no output file at all, and a bench that ran but printed nothing leaves an
+        # empty one. A count of failures sees neither, because there were none.
+        if: always()
+        run: |
+          reports=runtime/engine/target/surefire-reports
+          expected=$(find runtime/engine/src/test -name '*Bench.java' | wc -l | tr -d ' ')
+          ran=$(find "$reports" -name '*Bench-output.txt' 2>/dev/null | wc -l | tr -d ' ')
+          empty=$(find "$reports" -name '*Bench-output.txt' -empty 2>/dev/null | wc -l | tr -d ' ')
+          echo "bench classes present: $expected, produced output: $ran, of which empty: $empty"
+          for f in "$reports"/*Bench-output.txt; do
+            [ -e "$f" ] || continue
+            name=${f##*/}
+            {
+              echo "### ${name%-output.txt}"
+              echo '```'
+              cat "$f"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ "$ran" -lt "$expected" ]; then
+            echo "$expected bench classes are checked in and $ran left output: the selector no longer reaches them all" >&2
+            exit 1
+          fi
+          if [ "$empty" != "0" ]; then
+            echo "$empty bench class(es) ran and printed nothing" >&2
+            exit 1
+          fi

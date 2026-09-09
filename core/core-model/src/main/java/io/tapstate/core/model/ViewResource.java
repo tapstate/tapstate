@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * {@code kind: view} — reusable MDM sink definition body (ADR-0016 §7, X19): pure
+ * {@code kind: view} — reusable MDM sink definition body (§7, X19): pure
  * declaration of where/how to materialize; no {@code from:} (wiring belongs to the pipeline).
  */
 @Doc("A reusable view: declares where and how to materialize data, without any inbound wiring.")

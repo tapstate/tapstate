@@ -39,7 +39,7 @@ final class Wiring {
     Wiring(PipelineResource pipeline, Map<String, Resource> byId) {
         this.pipeline = pipeline;
         this.byId = byId;
-        this.allSources = new LinkedHashSet<>(pipeline.sources());
+        this.allSources = new LinkedHashSet<>(pipeline.sourceIds());
         if (pipeline.transforms() != null) {
             for (Step step : pipeline.transforms()) {
                 nodeFrom.put(step.id(), step.from());

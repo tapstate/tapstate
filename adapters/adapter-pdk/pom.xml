@@ -90,7 +90,38 @@
       <artifactId>assertj-core</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- The driver types a connector registers conversions for, so the value-model cases can build the
+         real ones. Whether such a type can cross a wire decides which lane its value takes, and that is
+         a property of the class itself - a stand-in would answer for the stand-in. Test scope: no
+         production code in this module names a driver type, and rule R3 keeps it that way. -->
+    <dependency>
+      <groupId>org.mongodb</groupId>
+      <artifactId>bson</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Publish this module's test classes as a test-jar. The one consumer is the assembly module's own
+           test scope, which drives the sink-writer factory end to end and needs a connector to open: the
+           synthetic connectors compiled here are the only ones in the build that exist without a real jar,
+           and duplicating that fixture is what this avoids. Test scope on the consuming side, so nothing
+           from here reaches the shipped artifact. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>test-jar</id>
+            <goals>
+              <goal>test-jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 
   <profiles>
     <!-- Real-connector regression. Activated by the same property the gated test keys on, so

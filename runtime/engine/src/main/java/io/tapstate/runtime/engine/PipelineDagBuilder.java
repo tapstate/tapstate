@@ -13,6 +13,9 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.runtime.engine.join.JoinDag;
+import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.NestDag;
 import io.tapstate.runtime.engine.nest.NestFrontier;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -75,6 +78,46 @@ public final class PipelineDagBuilder {
             TransformBody.Nest nest = nestOf(step);
             if (nest != null) {
                 namespaces.addAll(NestTopology.compile(pipeline.id(), step.id(), nest, tables).stateNamespaces());
+            }
+        }
+        return namespaces;
+    }
+
+    /**
+     * Every namespace this pipeline's joins keep state in, empty for a pipeline that has none: the mirror of
+     * the driving rows, and a mirror and a reverse index for each source the step is wired to.
+     *
+     * <p>Named here rather than left out because the state is not a cache. The mirrors hold each dimension
+     * row as it last was, so a run inheriting them widens fresh driving rows with values the source no
+     * longer holds - and nothing reports that. The job runs, the row count is right, every row is present,
+     * and each column reads as plausible.
+     *
+     * <p><b>Every source the step declares, rather than only the ones a run writes to.</b> Which of them is
+     * driven from is the query's answer, not the wiring's, so telling them apart would mean deriving the
+     * plan - which needs each source's discovered model and refuses without it. A takedown must not depend
+     * on the query still compiling or on a model still being there: what it cannot name it strands for
+     * good, because the store has no way to list what it holds. Naming one that was never written costs a
+     * drop that finds nothing, which is the direction this can afford to be wrong in.
+     *
+     * <p>Which steps are joins is decided by {@link #joinOf}, the same way the build decides it, for the
+     * reason {@link #nestStateNamespaces} gives: two walks that judged it differently would drop the
+     * namespaces of one set of steps while a run wrote to another's.
+     */
+    public static Set<String> joinStateNamespaces(PipelineResource pipeline) {
+        if (pipeline.transforms() == null) {
+            return Set.of();
+        }
+        Set<String> namespaces = new LinkedHashSet<>();
+        for (Step step : pipeline.transforms()) {
+            if (joinOf(step) == null) {
+                continue;
+            }
+            namespaces.add(JoinMaps.factMirror(pipeline.id(), step.id()));
+            // A join's from: is an alias map by construction - the step model refuses any other shape for
+            // one - so this is an invariant rather than a case, and a violation crashes bare.
+            for (String alias : ((FromClause.Aliases) step.from()).aliases().keySet()) {
+                namespaces.add(JoinMaps.dimensionMirror(pipeline.id(), step.id(), alias));
+                namespaces.add(JoinMaps.reverseIndex(pipeline.id(), step.id(), alias));
             }
         }
         return namespaces;
@@ -147,6 +190,15 @@ public final class PipelineDagBuilder {
         return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest ? nest : null;
     }
 
+    /**
+     * The join this step declares, or {@code null} where the step is anything else. One place answers
+     * it so that everything walking a pipeline's transforms agrees on what a join is.
+     */
+    private static TransformBody.Join joinOf(Step step) {
+        return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
+                ? join : null;
+    }
+
     /** Builds the Jet DAG for a validated pipeline against the given leaf and reference bindings. */
     public static DAG build(PipelineResource pipeline, DagBindings bindings) {
         return build(pipeline, bindings, null);
@@ -183,7 +235,7 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
         PipelineChains chains = frontier == null ? null : new PipelineChains();
 
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             List<String> sourceKeys = bindings.sourceKeys().apply(sourceId);
             if (sourceKeys == null || sourceKeys.isEmpty()) {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
@@ -236,6 +288,26 @@ public final class PipelineDagBuilder {
                     assembled = true;
                     continue;
                 }
+                if (joinOf(step) != null) {
+                    Step.Inline inline = (Step.Inline) step;
+                    // A join draws its own vertex and its own edges: one edge per source it reads, each
+                    // partitioned by the key of the state that edge is about to change.
+                    if (bindings.join() == null) {
+                        throw new IllegalStateException("transform step '" + step.id()
+                                + "' is a join, but no join binding was supplied to the builder");
+                    }
+                    JoinPlan plan = bindings.join().plans().apply(step);
+                    byKey.put(step.id(), JoinDag.attach(dag, plan, pipeline.id(), step.id(),
+                            bindings.join().factKeyColumns().apply(step),
+                            alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
+                            vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
+                            bindings.join().stores()));
+                    if (chains != null) {
+                        chains.derived(step.id(), nestUpstream(inline.from(), bindings));
+                    }
+                    assembled = true;
+                    continue;
+                }
                 List<String> upstream = resolveClause(step.from(), bindings);
                 Vertex vertex = transformVertex(dag, step, bindings, axes,
                         chains == null ? null : chains.perOrdinal(upstream));
@@ -260,8 +332,9 @@ public final class PipelineDagBuilder {
             // A declared view IS its own instruction to materialize: the pipeline needs no serve block
             // to reach the state store, and the vertex is a terminal sink like any other.
             List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
-            Vertex vertex = dag.newVertex(VIEW_VERTEX_PREFIX + view.id(),
-                    sinkVertex(bindings.viewSinks().apply(view), sinkAck, axes, assembled));
+            String viewName = VIEW_VERTEX_PREFIX + view.id();
+            Vertex vertex = dag.newVertex(viewName,
+                    sinkVertex(viewName, bindings.viewSinks().apply(view), sinkAck, axes, assembled));
             connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
             readsAs.put(view.id(), upstream);
         }
@@ -277,7 +350,7 @@ public final class PipelineDagBuilder {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
                 Vertex vertex = dag.newVertex(name,
-                        sinkVertex(bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
+                        sinkVertex(name, bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
                 connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
             }
         }
@@ -301,15 +374,16 @@ public final class PipelineDagBuilder {
      * a bound to, so its frontier stands still. That is the direction to fail in: reading a stream of
      * several chains as though it were one would ack positions whose changes are still in flight.
      */
-    private static ProcessorMetaSupplier sinkVertex(SupplierEx<? extends SinkWriter> writerFactory,
+    private static ProcessorMetaSupplier sinkVertex(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAck, ChainAxes axes, boolean assembled) {
         if (sinkAck == null) {
-            return SinkProcessor.metaSupplier(writerFactory);
+            return SinkProcessor.metaSupplier(vertexName, writerFactory);
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
-                : ContiguousPrefix::new;
-        return SinkProcessor.metaSupplier(writerFactory, sinkAck, frontier);
+                : () -> new ContiguousPrefix(axes);
+        return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier);
     }
 
     /**
@@ -317,9 +391,9 @@ public final class PipelineDagBuilder {
      * topology, not a transform - a passthrough vertex whose several inbound edges are the merge, so
      * the transform-port binding is never asked for one; every other stateless step (filter / map / a
      * scripted row transform) runs the one generic adapter over the port the binding supplies. A
-     * {@code nest} never reaches here: it draws a sub-graph of its own instead of a single vertex. A
-     * {@code join} or an unresolved {@code use:} reference is out of this builder's scope and is
-     * refused; extending to them replaces the refusal, not the seam.
+     * {@code nest} never reaches here: it draws a sub-graph of its own instead of a single vertex, and
+     * neither does a {@code join}, for the same reason. An unresolved {@code use:} reference is out of
+     * this builder's scope and is refused.
      */
     private static Vertex transformVertex(DAG dag, Step step, DagBindings bindings, ChainAxes axes,
             Map<Integer, List<String>> chainsByOrdinal) {
@@ -328,18 +402,14 @@ public final class PipelineDagBuilder {
                     "transform step '" + step.id() + "' is a use-reference; resolve it to an inline step first");
         }
         TransformBody body = inline.body();
-        if (body instanceof TransformBody.Join) {
-            throw new IllegalArgumentException(
-                    "transform step '" + step.id() + "' is a stateful " + body.type()
-                            + "; the linear DAG builder does not carry it");
-        }
         if (body instanceof TransformBody.Union) {
             // The merge is the topology, so nothing is transformed here - but the frontier still has to be
             // worked out per edge. The combined bound the engine would forward is never delivered at all
             // for a chain only one of the merged streams carries, which is the whole shape a union is.
-            return dag.newVertex(step.id(), PassthroughProcessor.metaSupplier(axes, chainsByOrdinal));
+            return dag.newVertex(step.id(),
+                    PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal));
         }
-        return dag.newVertex(step.id(), TransformProcessor.metaSupplier(
+        return dag.newVertex(step.id(), TransformProcessor.metaSupplier(step.id(),
                 bindings.transformPorts().apply(step), axes, chainsByOrdinal));
     }
 
@@ -415,6 +485,19 @@ public final class PipelineDagBuilder {
         return verticesOf(resolve(ref, bindings), byKey);
     }
 
+    /** The vertices named by a serve flow, preserving every selected table in one sink path. */
+    private static List<Vertex> upstreamOf(FromClause from, Map<String, Vertex> byKey,
+            DagBindings bindings, Map<String, List<Vertex>> readsAs) {
+        if (from instanceof FromClause.Flow flow) {
+            List<Vertex> upstream = new ArrayList<>();
+            for (FromRef ref : flow.refs()) {
+                upstream.addAll(upstreamOf(ref, byKey, bindings, readsAs));
+            }
+            return upstream;
+        }
+        throw new IllegalArgumentException("serve.from must be a flow of references");
+    }
+
     /** The vertices those producer keys name, refusing a key no vertex was built for. */
     private static List<Vertex> verticesOf(List<String> keys, Map<String, Vertex> byKey) {
         List<Vertex> vertices = new ArrayList<>();
@@ -428,13 +511,28 @@ public final class PipelineDagBuilder {
         return vertices;
     }
 
-    /** Draws one edge from each upstream vertex into the destination, on fresh ordinals per endpoint. */
+    /**
+     * Draws one edge from each upstream vertex into the destination, on fresh ordinals per endpoint, and
+     * routes every one of them to the single processor the destination runs.
+     *
+     * <p>Every destination this builder draws to - a stateless step, a union, a view sink, a serve sink -
+     * is pinned to total parallelism one, because a sink acks an ordered stream of positions and a second
+     * lane would break that order. That pin puts the one processor on the member owning the vertex's name,
+     * and leaves the rest of the cluster running a stand-in that refuses input. So the routing here is not
+     * a tuning choice: an edge that hands items to whatever is local delivers everything produced on any
+     * other member to that stand-in, and the job dies on the first such event.
+     *
+     * <p>The key is the destination's own name, which is exactly what the vertex was pinned by. Nothing
+     * checks that the two agree, and on one member nothing can: there the local processor is the only
+     * place input can come from, so a mis-keyed edge and a correct one are the same graph.
+     */
     private static void connect(DAG dag, List<Vertex> upstream, Vertex destination,
             Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal) {
         for (Vertex source : upstream) {
             int from = outboundOrdinal.merge(source, 1, Integer::sum) - 1;
             int to = inboundOrdinal.merge(destination, 1, Integer::sum) - 1;
-            dag.edge(Edge.from(source, from).to(destination, to));
+            dag.edge(Edge.from(source, from).to(destination, to)
+                    .distributed().allToOne(destination.getName()));
         }
     }
 }

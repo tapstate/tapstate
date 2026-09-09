@@ -10,10 +10,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * One nested document under assembly: the root row, the tree of elements attached beneath it, and the
@@ -149,6 +151,30 @@ public final class RootAssembly implements Serializable {
         rootFields = copyOf(fields);
         rootOrder = order;
         rootPresent = true;
+        fromRoot.add(positions);
+        return true;
+    }
+
+    /**
+     * Takes note of a change that alters what this document renders without altering anything it holds -
+     * an edit to a row it points at, which is read out of that row's own namespace when the document is
+     * drawn rather than kept here.
+     *
+     * <p>Held beside the root's own positions and released by the same send, because a send is what carries
+     * the edit downstream: nothing else does. Until then the frontier has to stay below it, or an edit that
+     * reached no sink would be neither delivered nor replayable, and every document pointing at that row
+     * would come back from a restart quietly stale.
+     *
+     * <p>Nothing is absorbed for a document that is not there. A word arriving for a root that has not
+     * turned up, or has been deleted, wakes nothing and covers nothing - and holding its position would pin
+     * the chain on a document that will never be drawn again. The edit is not lost by that: the row it
+     * changed is already filed, so a root arriving later renders from what the row says now.
+     */
+    public boolean absorb(Map<String, ChainPosition> positions) {
+        Objects.requireNonNull(positions, "positions");
+        if (!rootPresent) {
+            return false;
+        }
         fromRoot.add(positions);
         return true;
     }
@@ -576,13 +602,134 @@ public final class RootAssembly implements Serializable {
      * occupies and whether an absent one renders as an empty array or not at all.
      */
     public Optional<Map<String, Object>> render(List<EmbedSlot> slots) {
+        return render(slots, Map.of());
+    }
+
+    /**
+     * The document as it now stands, with the rows it points at filled in from {@code resolved} - what was
+     * fetched for the identities {@link #referencesNeeded} asked for, by namespace.
+     *
+     * <p>A reference with nothing fetched for it renders no field at all, exactly as an object embed with
+     * no element does. The two cases it covers want the same thing: a row that was deleted is gone from the
+     * document rather than frozen at its last value, and a row that has not arrived yet is not shown as
+     * absent data. Telling those apart is not this method's to do - it renders what it was handed.
+     */
+    public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         Objects.requireNonNull(slots, "slots");
+        Objects.requireNonNull(resolved, "resolved");
         if (!rootPresent) {
             return Optional.empty();
         }
         Map<String, Object> document = new LinkedHashMap<>(rootFields);
-        renderInto(document, children, slots);
+        renderInto(document, children, slots, resolved);
         return Optional.of(document);
+    }
+
+    /**
+     * The embeds this tree declares that {@code rendered} carries no field for - what the document had to
+     * say about them is that they are not there.
+     *
+     * <p><b>Rendering no field and having no such embed are the same document, and a target cannot tell
+     * them apart.</b> Every write into a keyed target applies a document by setting the fields in it, so a
+     * field that stops being rendered is left standing in the target at its last value for as long as the
+     * document lives - and nothing reports it, because the write succeeds and the document that arrived is
+     * right. Measured on a live stack: a document went on naming a deleted row for fifteen minutes and
+     * through a restart, while the document the engine emitted had not named it since the deletion.
+     *
+     * <p><b>Only the top level, and that is the whole rule rather than a simplification.</b> An embed
+     * nested inside another is written as part of whatever holds it - that container is a field of this
+     * document and is set whole - so naming it would be naming a field no target keeps separately. What
+     * cannot be reached that way is exactly a top-level field that has gone, which is this.
+     *
+     * <p>An embed that has never rendered is named too, and harmlessly: a target asked to drop what it does
+     * not have drops nothing. Telling "gone" from "never here" would need a memory of what was last sent,
+     * which is a second copy of every document to save nothing.
+     */
+    public static Set<String> embedsNotRendered(List<EmbedSlot> slots, Map<String, Object> rendered) {
+        Objects.requireNonNull(slots, "slots");
+        Objects.requireNonNull(rendered, "rendered");
+        Set<String> absent = new LinkedHashSet<>();
+        for (EmbedSlot slot : slots) {
+            if (!rendered.containsKey(slot.path())) {
+                absent.add(slot.path());
+            }
+        }
+        return absent;
+    }
+
+    /**
+     * Which rows this document would have to be handed to render, by the namespace each is kept in. It is
+     * asked before rendering rather than during it, so that a document naming two hundred rows is one reach
+     * for two hundred keys instead of two hundred reaches - and so that the depth they sit at costs
+     * nothing, every level's references landing in the same request as the root's.
+     *
+     * <p>A reference whose columns are null on the row carrying it asks for nothing. There is no row that
+     * answers to a key of nulls, and asking would spend a lookup to be told so.
+     */
+    public Map<String, Set<List<Object>>> referencesNeeded(List<EmbedSlot> slots) {
+        Objects.requireNonNull(slots, "slots");
+        Map<String, Set<List<Object>>> needed = new LinkedHashMap<>();
+        if (rootPresent) {
+            collectReferences(rootFields, children, slots, needed);
+        }
+        return needed;
+    }
+
+    /**
+     * Whether this document names a row nothing has been heard about yet, in which case it is not shown at
+     * all until that row turns up.
+     *
+     * <p>An order whose customer has not arrived renders as an order with no customer - a document the
+     * source never had. The version after it is right, so nothing stays wrong; what is wrong is that a sink
+     * has already passed the first one on, and two tables read at once routinely arrive in this order for
+     * no reason but one of them being slower to start.
+     *
+     * <p><b>Deleted is not "not heard about", and that is the whole of the distinction.</b> The row that was
+     * deleted left an empty entry behind, so it answers here as present and the document goes out without
+     * the field. Reading absence alone would hold such a document for ever, waiting on an arrival that has
+     * already happened.
+     *
+     * <p>Nothing here ends the wait on a clock. What ends it is the row arriving - which reaches this
+     * document because the row pointing at it was recorded against it when it came through, whether or not
+     * the row it named existed yet.
+     */
+    public boolean waitsForARowItPointsAt(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
+        Objects.requireNonNull(slots, "slots");
+        Objects.requireNonNull(resolved, "resolved");
+        for (Map.Entry<String, Set<List<Object>>> named : referencesNeeded(slots).entrySet()) {
+            Map<Object, Map<String, Object>> rows = resolved.getOrDefault(named.getKey(), Map.of());
+            for (List<Object> key : named.getValue()) {
+                if (!rows.containsKey(key)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static void collectReferences(Map<String, Object> fields,
+            Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
+            Map<String, Set<List<Object>>> needed) {
+        for (EmbedSlot slot : slots) {
+            if (slot.isReference()) {
+                List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields());
+                if (!key.contains(null)) {
+                    needed.computeIfAbsent(slot.lookupMap(), namespace -> new LinkedHashSet<>()).add(key);
+                }
+                continue;
+            }
+            Map<List<Object>, ElementNode> elements = held.get(slot.path());
+            if (elements == null) {
+                continue;
+            }
+            for (ElementNode element : elements.values()) {
+                if (!element.deleted()) {
+                    collectReferences(element.fields(), element.children(), slot.children(), needed);
+                }
+            }
+        }
     }
 
     private boolean mutate(NestElement change) {
@@ -882,29 +1029,62 @@ public final class RootAssembly implements Serializable {
     }
 
     private static void renderInto(Map<String, Object> document,
-            Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots) {
+            Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         for (EmbedSlot slot : slots) {
+            if (slot.isReference()) {
+                // Read off the row this level already carries. The columns holding the reference are ones
+                // the row has anyway, so pointing at something costs the document no bytes of its own.
+                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields());
+                Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
+                // A row that is not filed at all has not been fetched; one filed and empty has been
+                // deleted. Neither is something to render, and frozen at its last value is the one thing
+                // it must not be: the source no longer has that row, so neither may the document.
+                boolean live = row != null && !row.isEmpty();
+                // The shape is whatever `as` says, here exactly as for a gathered embed. Which side of the
+                // join carries the other's identity decides where a row is read from - it does not decide,
+                // and is not decided by, what the row looks like once it is in. An array holds the one row
+                // pointed at and stays an empty array when there is none; an object goes missing instead,
+                // which is the whole of the difference between the two shapes.
+                switch (slot.as()) {
+                    case ARRAY -> {
+                        List<Map<String, Object>> pointedAt = new ArrayList<>();
+                        if (live) {
+                            pointedAt.add(new LinkedHashMap<>(row));
+                        }
+                        document.put(slot.path(), pointedAt);
+                    }
+                    case OBJECT -> {
+                        if (live) {
+                            document.put(slot.path(), new LinkedHashMap<>(row));
+                        }
+                    }
+                }
+                continue;
+            }
             Map<List<Object>, ElementNode> elements = held.get(slot.path());
             switch (slot.as()) {
-                case ARRAY -> document.put(slot.path(), liveOf(elements, slot));
+                case ARRAY -> document.put(slot.path(), liveOf(elements, slot, resolved));
                 case OBJECT -> latestOf(elements)
-                        .ifPresent(element -> document.put(slot.path(), renderOne(element, slot)));
+                        .ifPresent(element -> document.put(slot.path(), renderOne(element, slot, resolved)));
             }
         }
     }
 
-    private static Map<String, Object> renderOne(ElementNode element, EmbedSlot slot) {
+    private static Map<String, Object> renderOne(ElementNode element, EmbedSlot slot,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         Map<String, Object> rendered = new LinkedHashMap<>(element.fields());
-        renderInto(rendered, element.children(), slot.children());
+        renderInto(rendered, element.children(), slot.children(), resolved);
         return rendered;
     }
 
-    private static List<Map<String, Object>> liveOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot) {
+    private static List<Map<String, Object>> liveOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         List<Map<String, Object>> live = new ArrayList<>();
         if (elements != null) {
             for (ElementNode element : elements.values()) {
                 if (!element.deleted()) {
-                    live.add(renderOne(element, slot));
+                    live.add(renderOne(element, slot, resolved));
                 }
             }
         }

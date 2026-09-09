@@ -9,6 +9,7 @@ import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeBlock;
@@ -33,9 +34,11 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
@@ -62,7 +65,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.spec("orders_src", true)),
                 List.of(filter("keep_even", "row.id % 2 == 0", FromRef.literal("orders_src"))),
                 null,
                 serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
@@ -88,7 +91,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
         store.artifacts().save(new ViewResource("order_state", null, "order_id", null, null, null));
         store.artifacts().save(new PipelineResource(
-                "p", null, List.of("orders_src"), null,
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Use(null, "order_state", FromRef.literal("orders_src")),
                 null, null, null));
 
@@ -106,7 +109,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(new ServeResource(
                 "publish", null, List.of(sync("sync_1", "orders_dest")), null, null, null));
         store.artifacts().save(new PipelineResource(
-                "p", null, List.of("orders_src"), null, null,
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null, null,
                 new ServeBlock.Use(null, "publish", FromRef.literal("orders_src")),
                 null, null));
         discovered(store, "orders_src", "orders");
@@ -124,7 +127,7 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(cdcSource("orders_src", "orders"));
         store.artifacts().save(new PipelineResource(
-                "p", null, List.of("orders_src"), null,
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
                 null, null, null));
 
@@ -143,7 +146,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
         store.artifacts().save(new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.spec("orders_src", true)),
                 null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
                 null, null, null));
@@ -276,7 +279,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(cdcSource("orders_src", "orders"));
         store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
         store.artifacts().save(new PipelineResource(
-                "p", null, List.of("orders_src"), null,
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
                 null, null, null));
         return store;
@@ -297,7 +300,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.spec("orders_src", true)),
                 null,
                 null,
                 serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")),
@@ -320,11 +323,37 @@ class StoreBackedDagSourceTest {
                 SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
-                "multi", null, List.of("multi_src"), null, null,
+                "multi", null, List.of(SourceRef.spec("multi_src", true)), null, null,
                 serve(FromRef.literal("multi_src"), sync("sync_1", "orders_dest")), null, null));
         discovered(store, "multi_src", "orders", "customers");
 
         DAG dag = new StoreBackedDagSource(store).dagFor("multi");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "multi_src.orders", "multi_src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("multi_src.orders", "serve.sync_1"),
+                "multi_src.customers->serve.sync_1#0,1");
+    }
+
+    @Test
+    void keeps_an_explicit_multi_table_serve_subset_on_one_sink_path() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "multi_subset", null, List.of(SourceRef.bare("multi_src")), null, null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromClause.list(
+                                FromRef.literal("multi_src.orders"),
+                                FromRef.literal("multi_src.customers")),
+                        List.of(sync("sync_1", "orders_dest")), null, null),
+                null, null));
+        discovered(store, "multi_src", "orders", "customers");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("multi_subset");
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
                 "multi_src.orders", "multi_src.customers", "serve.sync_1");
@@ -343,7 +372,7 @@ class StoreBackedDagSourceTest {
                 new SourceTable("customers", List.of(), List.of(), List.of())))));
         store.artifacts().save(connectionSupplier("all_dest"));
         store.artifacts().save(new PipelineResource(
-                "all", null, List.of("all_src"), null, null,
+                "all", null, List.of(SourceRef.spec("all_src", true)), null, null,
                 serve(FromRef.literal("all_src"), sync("sync_1", "all_dest")), null, null));
 
         DAG dag = new StoreBackedDagSource(store).dagFor("all");
@@ -362,7 +391,7 @@ class StoreBackedDagSourceTest {
                 List.of(TableRef.literal("Player"), TableRef.literal("PlayerCard"), TableRef.literal("Orders")), null, null));
         store.artifacts().save(connectionSupplier("players_dest"));
         store.artifacts().save(new PipelineResource(
-                "players", null, List.of("players_src"), null, null,
+                "players", null, List.of(SourceRef.spec("players_src", true)), null, null,
                 serve(FromRef.regex("Player.*"), sync("sync_1", "players_dest")), null, null));
         discovered(store, "players_src", "Player", "PlayerCard", "Orders");
 
@@ -382,7 +411,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(cdcSource("src_b", "orders"));
         store.artifacts().save(connectionSupplier("dest"));
         store.artifacts().save(new PipelineResource(
-                "ambiguous", null, List.of("src_a", "src_b"), null, null,
+                "ambiguous", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true)), null, null,
                 serve(FromRef.literal("orders"), sync("sync_1", "dest")), null, null));
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
@@ -397,7 +426,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(cdcSource("src_a", "orders"));
         store.artifacts().save(connectionSupplier("dest"));
         store.artifacts().save(new PipelineResource(
-                "missing", null, List.of("src_a"), null, null,
+                "missing", null, List.of(SourceRef.spec("src_a", true)), null, null,
                 serve(FromRef.literal("src_a.customers"), sync("sync_1", "dest")), null, null));
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("missing"))
@@ -574,13 +603,30 @@ class StoreBackedDagSourceTest {
             throw new UnsupportedOperationException();
         }
 
+        @Override
+        public PipelineLayoutStore layouts() {
+            throw new UnsupportedOperationException();
+        }
+
         private final SrsMetaStore meta = new InMemorySrsMetaStore();
+        private final SrsLogStore srsLog = new InMemorySrsLogStore();
+        private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
         private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
         private final InMemoryNestDeadLetterStore nestDeadLetters = new InMemoryNestDeadLetterStore();
 
         @Override
         public SrsMetaStore meta() {
             return meta;
+        }
+
+        @Override
+        public SrsLogStore srsLog() {
+            return srsLog;
+        }
+
+        @Override
+        public io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() {
+            return derivedSchemas;
         }
 
         @Override

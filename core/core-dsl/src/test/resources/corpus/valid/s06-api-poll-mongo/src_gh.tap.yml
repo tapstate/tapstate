@@ -1,4 +1,4 @@
-# ADR-0016 §14.6 — GitHub API polling -> MongoDB (api mode).
+# §14.6 — GitHub API polling -> MongoDB (api mode).
 # tables[].name = API resource = logical stream name (X12); pk = upsert key (§4).
 version: tapstate/v1
 kind: source

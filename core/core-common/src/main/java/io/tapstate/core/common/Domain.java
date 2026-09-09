@@ -5,8 +5,8 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * The authoritative registry of first-party error-code domains (ADR-0024 D2). The {@code <domain>}
- * segment of every canonical code must be one of these — the build-time format gate (ADR-0024 D5-2)
+ * The authoritative registry of first-party error-code domains. The {@code <domain>}
+ * segment of every canonical code must be one of these — the build-time format gate
  * rejects any code whose domain is unregistered. This closes the legacy class of bug where a typo
  * (e.g. {@code dls.} for {@code dsl.}) silently minted a brand-new namespace.
  *
@@ -74,11 +74,19 @@ public enum Domain {
     ARTIFACT,
     // source-specific control operations: identity, optimistic concurrency and reference protection
     SOURCE,
+    // pipeline-specific control operations: identity, optimistic concurrency and editor metadata
+    PIPELINE,
     // local MCP presentation: sidecar input, connector-spec and upstream-response failures
     MCP,
     // runtime data plane: reading a source's snapshot / cdc into the replay store — diagnosable
     // capture-configuration faults such as an unparsable consumption start point (runtime)
-    CAPTURE;
+    CAPTURE,
+    // the recorded point a pipeline's read of a chain resumes from, read out and written back:
+    // diagnosable refusals of a write-back — one aimed at a chain the pipeline does not read, one that
+    // would move a chain still being read, one that changed a reading rather than the resume point, and
+    // one that asks for no move at all. Distinct from CAPTURE, which owns what goes wrong when a run
+    // consumes a start point, and from MONITOR, which reports a run without ever setting anything
+    POSITION;
 
 
     /**

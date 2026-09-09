@@ -11,19 +11,28 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 
 /**
- * A member-local buffer that carries one source's bounded snapshot rows from the capture side to the source
- * vertex, keyed by the per-table change ring the source reads. The capture side appends every snapshot row
- * for a ring; the source vertex drains them once and emits them ahead of the ring's cdc tail. That ordering
- * is the data-consistency guarantee: a snapshot row (the older value) must reach the sink before any cdc
- * change of the same key, or a stale snapshot would overwrite a newer change.
+ * A member-local hand-off from the capture side to the source vertex, keyed by the per-table change ring
+ * the source reads. The capture side appends; the source vertex takes what is there and emits it ahead of
+ * whatever the ring holds. That ordering is the data-consistency guarantee: a snapshot row (the older
+ * value) must reach the sink before any cdc change of the same key, or a stale snapshot would overwrite a
+ * newer change.
  *
- * <p>It is plain member-local state, never a distributed structure: there is one embedded member per process,
- * the capture side that writes and the source vertex that reads run in that one process, and a snapshot row
- * carries no source position, so it never needs to survive a member restart the way the cdc ring's durable
- * source offset does. Both sides may touch it concurrently, so it is backed by concurrent maps and queues.
+ * <p>It carries a source's bounded snapshot rows, and on a source running with the shared ring switched
+ * off it carries that source's changes too -- there is no ring for them to travel on, so this is the whole
+ * of how they reach the sink. That second use is unbounded and lasts as long as the pipeline does, which
+ * is why the vertex comes back to it rather than reading it once.
  *
- * <p>A drain is once-consumed: it removes a ring's rows and returns them, so a second drain of the same ring
- * yields nothing. That matches how the source vertex resolves the buffer exactly once when it initializes.
+ * <p>It is plain member-local state, never a distributed structure: there is one embedded member per
+ * process, and the capture side that writes and the source vertex that reads both run in that one process.
+ * Nothing in it needs to survive a member restart, but not because nothing in it is positioned -- a change
+ * handed over by a ring-less tail carries its position like any other. It is because a restart re-reads
+ * from the durable offset, and that offset only ever moves to what a sink has confirmed: whatever was
+ * waiting here when the process died sits above it and is read again. Both sides may touch it
+ * concurrently, so it is backed by concurrent maps and queues.
+ *
+ * <p>A drain is once-consumed: it removes a ring's rows and returns them, so a second drain of the same
+ * ring yields only what arrived since. That is what lets the vertex come back to it on every pass without
+ * re-emitting anything -- taking whatever is waiting and leaving an empty queue behind.
  */
 public final class SnapshotBuffer {
 

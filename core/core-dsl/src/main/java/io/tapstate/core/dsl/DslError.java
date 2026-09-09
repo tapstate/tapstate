@@ -6,7 +6,7 @@ import io.tapstate.core.common.Severity;
 import java.util.Set;
 
 /**
- * The {@code dsl} domain's error codes (ADR-0024 D1; the domain's first consumer, plan poc1 B3-7).
+ * The {@code dsl} domain's error codes (the domain's first consumer, plan poc1 B3-7).
  * Each constant a well-formed artifact can raise on its own maps 1:1 to a corpus rule-vocabulary key
  * (corpus/README.md) — the symbol is the vocabulary key, the canonical code prefixes it with the
  * {@code dsl.} domain.
@@ -20,7 +20,7 @@ import java.util.Set;
  *
  * <p>{@code placeholders()} is the named-argument contract: every throw site supplies a value for
  * each name, and (once the catalog lands in the presentation layer) the build-time placeholder
- * gate checks message templates against it (ADR-0024 D5-4). {@code path} is present on every semantic
+ * gate checks message templates against it. {@code path} is present on every semantic
  * code — the field path of the offending node, carried both as a typed accessor on {@link DslException}
  * and as a message argument — but absent on {@link #MALFORMED_YAML}, which is pre-semantic.
  */
@@ -117,7 +117,17 @@ public enum DslError implements TapstateErrorCode {
      *  {@link #ROW_EXPRESSION_TYPE_UNSUPPORTED}: whether a table has a key is knowledge no artifact
      *  carries, only a discovered model does. */
     UPSERT_NEEDS_KEY(
-            "dsl.upsert-needs-key", Set.of("table", "source", "path"));
+            "dsl.upsert-needs-key", Set.of("table", "source", "path")),
+    /** A join's {@code sql:} is not SQL at all. {@code detail} carries the parser's own diagnosis,
+     *  which already names the line and column it stopped at. Kept apart from
+     *  {@link #JOIN_SQL_UNSUPPORTED} because the two send a reader in opposite directions: one to
+     *  their own typing, the other to what this release supports. */
+    JOIN_SQL_NOT_PARSABLE("dsl.join-sql-not-parsable", Set.of("detail", "path")),
+    /** A join's {@code sql:} parses but uses a construct this release does not run. {@code shape}
+     *  names it as SQL spells it ({@code FULL OUTER JOIN}, {@code GROUP BY}, {@code COUNT}), and
+     *  {@code line} / {@code column} locate it within the SQL text itself, not within the YAML. */
+    JOIN_SQL_UNSUPPORTED(
+            "dsl.join-sql-unsupported", Set.of("shape", "line", "column", "path"));
 
     private final String code;
     private final Set<String> placeholders;

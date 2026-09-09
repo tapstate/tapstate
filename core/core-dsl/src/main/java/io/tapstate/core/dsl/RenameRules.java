@@ -17,7 +17,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * The sink-side target-name gate (ADR-0016 §8, X4). A {@code serve.sync} rename decides which table a sink
+ * The sink-side target-name gate (§8, X4). A {@code serve.sync} rename decides which table a sink
  * creates and writes, so two rules hold at validate time rather than at first write:
  *
  * <ul>
@@ -113,7 +113,7 @@ final class RenameRules {
      */
     private static Set<String> declaredTables(PipelineResource pipeline, Map<String, SourceResource> sources) {
         Set<String> tables = new LinkedHashSet<>();
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = sources.get(sourceId);
             if (source == null || source.tables() == null) {
                 return Set.of();

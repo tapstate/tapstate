@@ -17,7 +17,8 @@ class ControlApiSchemaTest {
             "source.draft",
             "connection.test", "connection.test-result", "connection.discover-schema", "connection.schema",
             "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-            "pipeline.start", "pipeline.stop", "pipeline.status", "pipeline.metrics",
+            "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+            "pipeline.status", "pipeline.metrics",
             "pipeline.snapshot", "pipeline.logs",
             "data-browser.collections", "data-browser.find", "data-browser.stats");
 

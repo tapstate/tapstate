@@ -133,6 +133,35 @@ class IssuerBindingTest {
     }
 
     @Test
+    void aSeedThatRefusesDiscoveryIsACodedDiagnosticRatherThanACrash() {
+        // A server predating /.well-known/tapstate answers the probe with a plain refusal whose body
+        // carries no code of its own, so the transport supplies the generic message. That is the shape
+        // a user hits when their CLI is a release ahead of their server.
+        URI seed = URI.create("https://old.example.com");
+        RecordingDiscovery client = new RecordingDiscovery(Map.of(seed,
+                new DiscoveryOutcome.Rejected("", "Issuer discovery was refused by the server.")));
+
+        assertThatThrownBy(() -> new IssuerBinding(client).verify(context(seed), null))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).isEqualTo("cli.issuer-discovery-rejected");
+                    assertThat(error.args()).containsEntry("seed", seed.toString());
+                    assertThat(error.args())
+                            .containsEntry("reason", "Issuer discovery was refused by the server.");
+                });
+    }
+
+    @Test
+    void aCodedRefusalKeepsTheServersOwnCodeInTheReason() {
+        URI seed = URI.create("https://guarded.example.com");
+        RecordingDiscovery client = new RecordingDiscovery(Map.of(seed,
+                new DiscoveryOutcome.Rejected("control.auth-failed", "Authentication failed.")));
+
+        assertThatThrownBy(() -> new IssuerBinding(client).verify(context(seed), null))
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args())
+                        .containsEntry("reason", "control.auth-failed: Authentication failed."));
+    }
+
+    @Test
     void sessionDefaultsFailClosedUntilAClientImplementsThem() {
         URI seed = URI.create("https://node.example.com");
         RecordingDiscovery client = new RecordingDiscovery(Map.of(), true);
@@ -199,7 +228,9 @@ class IssuerBindingTest {
         @Override public DataBrowserOutcome.Collections collections(URI u, String c, String id) { throw new AssertionError(); }
         @Override public DataBrowserOutcome.Stats stats(URI u, String c, String id, String collection) { throw new AssertionError(); }
         @Override public DataBrowserOutcome.Find find(URI u, String c, String id, String collection, Object f, DataBrowserCall.Order o, Integer l) { throw new AssertionError(); }
-        @Override public LifecycleOutcome lifecycle(URI u, String c, String id, String v) { throw new AssertionError(); }
+        @Override public LifecycleOutcome lifecycle(URI u, String c, String id, String v, Boolean p) { throw new AssertionError(); }
+        @Override public PositionOutcome position(URI u, String c, String id) { throw new AssertionError(); }
+        @Override public PositionOutcome setPosition(URI u, String c, String id, String d) { throw new AssertionError(); }
         @Override public StatusOutcome status(URI u, String c, String id) { throw new AssertionError(); }
         @Override public MetricsOutcome metrics(URI u, String c, String id) { throw new AssertionError(); }
         @Override public SnapshotOutcome snapshot(URI u, String c, String id) { throw new AssertionError(); }

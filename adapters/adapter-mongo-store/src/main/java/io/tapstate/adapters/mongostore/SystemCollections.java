@@ -90,6 +90,29 @@ public enum SystemCollections {
      */
     SYSTEM_META("system_meta", Database.STORE, MongoConnection.class, Strategy.MIGRATED, 1),
 
+    /**
+     * Where an editor put a pipeline's nodes, one document per pipeline. Nothing the product runs reads
+     * it, so its shape follows the editor rather than the model - but it is kept about the product's own
+     * workspace, so the version scheme carries it like the rest of this database.
+     */
+    PIPELINE_LAYOUTS(MongoStorePort.PIPELINE_LAYOUTS, Database.STORE, MongoPipelineLayoutStore.class,
+            Strategy.MIGRATED, 0),
+
+    /**
+     * The durable change log, one document per change, keyed by the ring it was written to and the
+     * sequence that ring gave it. It needs no index of its own - that compound key is the index. Another
+     * line owns how this one evolves, the same one that owns the record above it.
+     */
+    SRS_LOG(MongoStorePort.SRS_LOG, Database.STORE, MongoSrsLogStore.class, Strategy.OWNED_ELSEWHERE, 0),
+
+    /**
+     * What a pipeline's steps worked out their own columns to be, one document per pipeline holding each
+     * step's version history. Both questions it is asked are answered by the id alone, so it adds no
+     * index. Another line owns how this one evolves.
+     */
+    DERIVED_SCHEMAS(MongoStorePort.DERIVED_SCHEMAS, Database.STORE, MongoDerivedSchemaStore.class,
+            Strategy.OWNED_ELSEWHERE, 0),
+
     // ---- the operator-state database: not versioned here, but still taken from here ----
 
     OPERATOR_STATE(MongoStorePort.OPERATOR_STATE, Database.NEST, MongoKeyedStateStore.class,

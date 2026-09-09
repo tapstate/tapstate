@@ -24,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * NOT validate DSL semantics (that is the validate engine built in B3 against this corpus).
  *
  * Contract (documented in corpus/README.md):
- * - valid/ holds one workspace directory per ADR-0016 §14 scenario (s01..s11),
+ * - valid/ holds one workspace directory per §14 scenario (s01..s11),
  *   reference-closed within the directory, no expectation sidecars.
  * - invalid/ holds minimal self-contained batches, each with exactly one expected.yml
  *   declaring the violated rule from a fixed vocabulary.
@@ -36,7 +36,7 @@ class CorpusSmokeTest {
     private static final Path VALID = CORPUS.resolve("valid");
     private static final Path INVALID = CORPUS.resolve("invalid");
 
-    /** One directory prefix per ADR-0016 §14 scenario (14.1 -> s01 ... 14.11 -> s11). */
+    /** One directory prefix per §14 scenario (14.1 -> s01 ... 14.11 -> s11). */
     private static final List<String> SCENARIO_PREFIXES = List.of(
             "s01-", "s02-", "s03-", "s04-", "s05-", "s06-",
             "s07-", "s08-", "s09-", "s10-", "s11-");
@@ -56,7 +56,9 @@ class CorpusSmokeTest {
             "duplicate-id",         // id collision: top-level / pipeline-internal uniqueness, or step-id shadowing (§2/F8, §5)
             "unsupported-mode",     // source mode outside the connector's capability matrix (§4 / C3)
             "config-type-mismatch", // connector config value of the wrong declared type (C3)
-            "invalid-config-value");// connector config value outside the declared enum choices (C3)
+            "invalid-config-value", // connector config value outside the declared enum choices (C3)
+            "join-sql-not-parsable", // a join's sql: is not SQL at all (SS2)
+            "join-sql-unsupported");// a join's sql: uses a construct this release does not run (SS2)
 
     private static final Set<String> KINDS = Set.of("source", "pipeline", "transform", "view", "serve");
 
@@ -70,7 +72,7 @@ class CorpusSmokeTest {
     }
 
     @Test
-    @DisplayName("valid/ covers every ADR-0016 §14 scenario with a non-empty workspace directory")
+    @DisplayName("valid/ covers every §14 scenario with a non-empty workspace directory")
     void validCoversAllScenarios() throws IOException {
         assertThat(VALID).isDirectory();
         List<Path> dirs = subDirectories(VALID);

@@ -107,6 +107,14 @@
                 "type": "integer",
                 "description": "How many generated rows to lay down: ids 1..N, each with seq equal to its id.",
                 "minimum": 0
+              },
+              "before_image": {
+                "type": "string",
+                "description": "Whether this table's source sends the row an update replaces. Absent means 'full', which is what a seeded table is arranged for; 'none' asks the driver to put it back to what a change stream does on its own.",
+                "enum": [
+                  "full",
+                  "none"
+                ]
               }
             }
           },
@@ -141,6 +149,14 @@
                     "description": "An integer or a string; wider value types are a widening of the vocabulary."
                   }
                 }
+              },
+              "before_image": {
+                "type": "string",
+                "description": "Whether this table's source sends the row an update replaces. Absent means 'full', which is what a seeded table is arranged for; 'none' asks the driver to put it back to what a change stream does on its own.",
+                "enum": [
+                  "full",
+                  "none"
+                ]
               }
             }
           }
@@ -152,9 +168,11 @@
       "oneOf": [
         {
           "type": "string",
-          "description": "A lifecycle verb, spelled as the product spells it. There is no rewind: re-snapshotting is stop then start.",
+          "description": "A step written on its own: a lifecycle verb spelled as the product spells it, or a word the terminal offers that expands into several of them. There is no rewind: re-snapshotting is stop then start, which is what restart --rerun does.",
           "enum": [
             "pause",
+            "restart",
+            "restart --rerun",
             "resume",
             "start",
             "stop"

@@ -38,6 +38,12 @@ public final class SourceRepresentation {
         return toModel(draft, existing, true);
     }
 
+    /** Builds a persistent Source from structured HTTP input and catalog-driven secret rules. */
+    public SourceResource toModel(SourceInput input, SourceResource existing) {
+        Objects.requireNonNull(input, "input");
+        return toModel(input.asDraft(), existing, true);
+    }
+
     /** Builds a draft Source while applying only the draft's explicit secret removals. */
     SourceResource toDraftModel(SourceDraft draft) {
         return toModel(draft, null, false);

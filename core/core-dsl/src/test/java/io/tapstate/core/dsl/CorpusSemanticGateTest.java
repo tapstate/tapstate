@@ -24,15 +24,15 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
- * The B3-7 semantic acceptance gate: the whole ADR-0016 §14 corpus driven end to end through
+ * The B3-7 semantic acceptance gate: the whole §14 corpus driven end to end through
  * parse + validate (the offline half). It complements {@code CorpusSmokeTest} (the structural
  * gate) by asserting DSL <em>semantics</em>:
  * <ul>
  *   <li>every valid scenario loads clean — the real false-positive guard;</li>
  *   <li>every invalid scenario is rejected with the corpus-declared {@link DslError} code at the
  *       declared field path;</li>
- *   <li>the thrown named arguments exactly satisfy that code's placeholder contract (ADR-0024
- *       D5-4, the runtime half the build gate cannot link statically);</li>
+ *   <li>the thrown named arguments exactly satisfy that code's placeholder contract — the
+ *       runtime half the build gate cannot link statically;</li>
  *   <li>every {@link DslError} is witnessed by at least one case — the corpus rule vocabulary
  *       (corpus/README.md) maps 1:1 to the enum.</li>
  * </ul>
@@ -60,7 +60,7 @@ class CorpusSemanticGateTest {
         DslException ex = (DslException) thrown;
         assertThat(ex.code()).isEqualTo(DslError.ofSymbol(rule));
         assertThat(ex.path()).isEqualTo(path);
-        // ADR-0024 D5-4 (runtime half): the thrown args exactly cover the code's placeholder contract
+        // Runtime half: the thrown args exactly cover the code's placeholder contract
         assertThat(ex.args().keySet()).containsExactlyInAnyOrderElementsOf(ex.code().placeholders());
     }
 

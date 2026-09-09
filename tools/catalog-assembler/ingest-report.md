@@ -1,7 +1,7 @@
 # Connector catalog ingest report
 
-Spec SHA: `0bbc5d2c`
-Capability SHA: `0bbc5d2c`
+Spec SHA: `f3bd43a`
+Capability SHA: `f3bd43a`
 Ingested connectors: 78
 
 ## Unclassified — no resolvable mode (need tapstate.modes)

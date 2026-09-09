@@ -33,6 +33,30 @@ class JsonReaderTest {
     }
 
     @Test
+    void parsesDecimalsBeyondDoublesRangeExactlyRatherThanAsAnInfinity() {
+        // A connector's spec states a column's bounds as literals, and a 128-bit decimal's are far past
+        // what a double holds. Parsed as one they become an infinity, whose text form is the word
+        // "Infinity" - not a number at all, and rejected by whatever reads the bound back, which drops
+        // the whole type rather than the bound. Same call this already makes for an integer past long.
+        assertThat(JsonReader.parse("1E+6145")).isEqualTo(new java.math.BigDecimal("1E+6145"));
+        assertThat(JsonReader.parse("-1E+6145")).isEqualTo(new java.math.BigDecimal("-1E+6145"));
+        // What a double does hold is still a double: this widens nothing that already worked.
+        assertThat(JsonReader.parse("1.5")).isInstanceOf(Double.class);
+    }
+
+    @Test
+    void parsesDecimalsBelowDoublesRangeExactlyRatherThanAsZero() {
+        // The mirror of the case above, and the quieter half: a type states both of its bounds, so a
+        // literal that reaches one reaches the other. Under what a double holds the parse answers zero,
+        // which unlike an infinity is well-formed and reads as a bound somebody meant.
+        assertThat(JsonReader.parse("1E-6143")).isEqualTo(new java.math.BigDecimal("1E-6143"));
+        assertThat(JsonReader.parse("-1E-6143")).isEqualTo(new java.math.BigDecimal("-1E-6143"));
+        // A literal that is itself zero is not that, and stays the double it always was.
+        assertThat(JsonReader.parse("0.0")).isInstanceOf(Double.class);
+        assertThat(JsonReader.parse("-0.0")).isInstanceOf(Double.class);
+    }
+
+    @Test
     void parsesStringEscapesAndUnicode() {
         assertThat(JsonReader.parse("\"a\\\"b\\\\c\\n\"")).isEqualTo("a\"b\\c\n");
         assertThat(JsonReader.parse("\"\\u20ac\"")).isEqualTo("€");

@@ -90,12 +90,47 @@ esac
 title="Release $version: publish the documentation site"
 tag="v$version"
 
+# Open a request in the documentation repository and put it in front of the person it is for.
+#
+# The create and the assignment are two calls on purpose. With `--assignee` on the create, a
+# rejected assignment failed the whole command *after* the issue had already been opened, so a
+# single exit code stood for two opposite states -- no request at all, and a request that reaches
+# nobody -- and the message named the wrong one. Measured across three releases: the issue existed
+# every time, unassigned, while the step said it could not be opened and settle then found it again
+# by title and counted it as one of four.
+#
+# Every outcome goes to stdout, and gh's own error is kept rather than discarded. The caller tees
+# stdout into the step summary; `>/dev/null 2>&1` is why three releases could say "could not" and
+# never why, and the reason is the only part that tells anybody what to change.
+ask() {
+    ask_title="$1"
+    ask_body="$2"
+    ask_done="$3"
+    if ! ask_out="$(gh issue create --repo "$repo" --title "$ask_title" --body "$ask_body" 2>&1)"; then
+        echo "::warning::$repo holds no request for $tag -- ask $owner by hand: $ask_out"
+        echo "$repo  could not open \"$ask_title\" -- ask $owner by hand: $ask_out"
+        return 0
+    fi
+    # gh prints the URL on success; anything it says besides that is not the issue. Taking the last
+    # line would hand a warning to the assignment and report the request as unassignable.
+    ask_url="$(printf '%s\n' "$ask_out" | grep -oE 'https://[^[:space:]]+/issues/[0-9]+' | tail -1)"
+    if ask_err="$(gh issue edit "${ask_url##*/}" --repo "$repo" --add-assignee "$owner" 2>&1 >/dev/null)"; then
+        echo "$repo  $ask_done"
+    else
+        # The request exists and reaches nobody. It sits in a repository its owner does not watch,
+        # nothing else in the release mentions it, and the release goes out either way -- so this
+        # warning is the only thing between a silent request and a person.
+        echo "::warning::$ask_url asks for $tag but could not be assigned to $owner -- tell them by hand: $ask_err"
+        echo "$repo  opened $ask_url for $tag, unassigned -- tell $owner by hand: $ask_err"
+    fi
+}
+
 if [ "$verb" = open ]; then
     if [ "$plan" = 1 ]; then
         echo "$repo  open issue \"$title\", assigned to $owner"
         exit 0
     fi
-    gh issue create --repo "$repo" --title "$title" --assignee "$owner" --body \
+    ask "$title" \
 "tapstate $tag is being released. The site is published from \`main\`, so publishing this release's
 documentation means merging \`next\` into \`main\`.
 
@@ -107,9 +142,7 @@ publishes:
   issue asking you to finish and then create \`$tag\` yourself.
 
 Nothing here blocks the release. It does decide whether the tag is one less thing for you to do." \
-        >/dev/null 2>&1 \
-        && echo "$repo  asked $owner to publish the site for $tag" \
-        || echo "$repo  could not open the release issue -- ask $owner by hand" >&2
+        "asked $owner to publish the site for $tag"
     exit 0
 fi
 
@@ -127,7 +160,9 @@ find_issue() {
         state="$(printf '%s' "$found" | jq -r --arg t "$title" 'first(.[]|select(.title==$t))|.state' | tr '[:upper:]' '[:lower:]')"
         number="$(printf '%s' "$found" | jq -r --arg t "$title" 'first(.[]|select(.title==$t))|.number')"
     else
-        echo "$repo  no single issue titled \"$title\" ($n found); treating as not done" >&2
+        # stdout, like every other outcome here: the caller tees stdout into the step summary and
+        # tees stderr nowhere, so this is the only place the decision below can be seen from.
+        echo "$repo  no single issue titled \"$title\" ($n found); treating as not done"
         state="open"
     fi
 }
@@ -200,19 +235,39 @@ if [ "$state" = closed ]; then
         echo "$repo  site is published: tag $tag on main, and say so on the issue"
         exit 0
     fi
-    sha="$(gh api "repos/$repo/git/ref/heads/main" --jq '.object.sha' 2>/dev/null)"
+    # Every outcome below goes to stdout, and gh's own error travels with it, for the reason the
+    # withdrawal half does the same: the caller tees stdout into the step summary and tees stderr
+    # nowhere, so a release that tagged the published site and one that could not used to leave the
+    # same green step and the same empty summary, and `>/dev/null 2>&1` meant even a person who went
+    # and looked at the other repository was told the fact and never why.
+    #
+    # `gh api` writes the error body to stdout when a request fails, so a read taken for its output
+    # alone hands back that document rather than the sha -- and it is non-empty, which is all an
+    # emptiness guard tests for. The sha is picked out of what came back instead: on success that is
+    # the only thing there, and nothing a failure prints can be mistaken for one.
+    read_out="$(gh api "repos/$repo/git/ref/heads/main" --jq '.object.sha' 2>&1)"
+    sha="$(printf '%s\n' "$read_out" | grep -oE '^[0-9a-f]{40}$' | tail -1)"
     if [ -z "$sha" ]; then
-        echo "$repo  cannot read main; leaving $tag to $owner" >&2
+        echo "::warning::$repo has no $tag for the published site: its main could not be read -- $owner can create the tag by hand: $read_out"
+        echo "$repo  cannot read main, so $tag was not created -- $owner can create it by hand: $read_out"
         exit 0
     fi
-    if gh release create "$tag" --repo "$repo" --target "$sha" --title "$tag" \
+    if create_err="$(gh release create "$tag" --repo "$repo" --target "$sha" --title "$tag" \
          --notes "The documentation published with tapstate $tag. What changed is in the tapstate release: $notes_url" \
-         >/dev/null 2>&1; then
+         2>&1 >/dev/null)"; then
         echo "$repo  $tag created on main"
-        [ -z "${number:-}" ] || gh issue comment "$number" --repo "$repo" \
-            --body "Released as \`$tag\`, cut from \`main\`. Nothing further needed here." >/dev/null 2>&1 || true
+        # A note that does not land costs nobody anything to act on -- the site is published and the
+        # tag is there -- so it is said plainly and raises no warning.
+        if [ -n "${number:-}" ] && ! note_err="$(gh issue comment "$number" --repo "$repo" \
+                --body "Released as \`$tag\`, cut from \`main\`. Nothing further needed here." 2>&1 >/dev/null)"; then
+            echo "$repo  #$number was not told that $tag exists: $note_err"
+        fi
     else
-        echo "$repo  could not create $tag -- $owner can create it by hand" >&2
+        # The site is published and its documentation carries no tag for this version. Nothing else
+        # in the release mentions it and the release goes out either way, so this warning is the only
+        # thing between that and a person.
+        echo "::warning::$repo has no $tag for the published site -- $owner can create it by hand: $create_err"
+        echo "$repo  could not create $tag -- $owner can create it by hand: $create_err"
     fi
     exit 0
 fi
@@ -221,8 +276,7 @@ if [ "$plan" = 1 ]; then
     echo "$repo  site not published yet: open a second issue asking $owner to finish and tag $tag"
     exit 0
 fi
-gh issue create --repo "$repo" --title "Still to do: publish the documentation for $tag" \
-   --assignee "$owner" --body \
+ask "Still to do: publish the documentation for $tag" \
 "tapstate $tag has been released. The documentation for it has not been published yet -- the earlier
 issue asking for \`next\` to be merged into \`main\` is still open, and the release did not wait for
 it, by design.
@@ -237,7 +291,5 @@ The tag is yours this time rather than ours because the release has already gone
 going to create it after the fact.
 
 The tapstate release: $notes_url" \
-   >/dev/null 2>&1 \
-   && echo "$repo  site not published in time; asked $owner to finish and tag $tag themselves" \
-   || echo "$repo  could not open the follow-up issue -- tell $owner by hand" >&2
+   "site not published in time; asked $owner to finish and tag $tag themselves"
 exit 0
