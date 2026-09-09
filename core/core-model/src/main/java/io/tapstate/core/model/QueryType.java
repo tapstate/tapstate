@@ -1,6 +1,6 @@
 package io.tapstate.core.model;
 
-/** Pull-side publish surface type (ADR-0016 §8); runtime = GA. */
+/** Pull-side publish surface type (§8); runtime = GA. */
 @Doc("The kind of pull-based query surface a served resource exposes to consumers.")
 public enum QueryType {
     @Doc("A RESTful HTTP endpoint queried over standard request/response semantics.")

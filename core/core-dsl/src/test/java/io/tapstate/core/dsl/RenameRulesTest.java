@@ -21,7 +21,7 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
- * The sink-side rename gate (ADR-0016 §8, X4): a rename must name every target table it produces, and no two
+ * The sink-side rename gate (§8, X4): a rename must name every target table it produces, and no two
  * source tables written to one connection may resolve onto the same target name. Both are judged here, at
  * validate time, over the tables the pipeline's sources declare — a rename that only fails once rows are
  * flowing has already created the wrong table, or merged two of them.

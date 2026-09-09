@@ -6,8 +6,8 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Push egress payload shape (ADR-0016 §8, X11). Absent = the canonical tapstate envelope
- * (§6 of the ADR); custom = whole-payload CEL projection or per-field object form.
+ * Push egress payload shape (§8, X11). Absent = the canonical tapstate envelope
+ * (§6); custom = whole-payload CEL projection or per-field object form.
  */
 @Doc("Shape of the egress payload pushed to the target; absent means the default tapstate envelope.")
 public sealed interface PushFormat {

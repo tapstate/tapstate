@@ -3,7 +3,7 @@ package io.tapstate.core.model;
 import java.util.Objects;
 
 /**
- * One projection rule of a {@code map} step / push {@code format} object (ADR-0016 §5,
+ * One projection rule of a {@code map} step / push {@code format} object (§5,
  * X11): {@code $src} rename, {@code false} drop, literal value, or {@code =CEL} computed
  * row expression. Unlisted fields pass through (runtime semantics, not modeled here).
  */

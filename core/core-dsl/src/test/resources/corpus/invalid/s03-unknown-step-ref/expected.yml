@@ -1,4 +1,3 @@
 rule: missing-reference
-adr: "ADR-0016 §8 (from addressing) + §4"
 path: serve.from
 note: "'open_onlyy' resolves to no step id and no table in the declared source universe"

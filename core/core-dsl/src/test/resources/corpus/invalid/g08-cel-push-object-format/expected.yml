@@ -1,4 +1,3 @@
 rule: illegal-expression
-adr: "ADR-0016 §12"
 path: serve.push[0].format.tag
 note: "push object-form computed field '=after.region +' is not well-formed CEL"

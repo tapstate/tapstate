@@ -1,4 +1,3 @@
 rule: mode-mismatch
-adr: "ADR-0016 §1 (X7)"
 path: settings.schedule
 note: "schedule on a pipeline whose source is mode: cdc (unbounded); legal for bounded modes only"

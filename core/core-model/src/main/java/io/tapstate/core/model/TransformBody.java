@@ -7,7 +7,7 @@ import java.util.Objects;
 
 /**
  * Type-specific payload of a transform — shared between inline pipeline steps and
- * {@code kind: transform} definition bodies (ADR-0016 §5, X19: a definition body is pure
+ * {@code kind: transform} definition bodies (§5, X19: a definition body is pure
  * logic; wiring lives on the step).
  */
 @Doc("Type-specific payload of a transform, selected by the type discriminator.")

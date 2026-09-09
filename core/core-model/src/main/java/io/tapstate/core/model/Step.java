@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * One element of {@code pipeline.transforms} (ADR-0016 §5): an inline definition or a
+ * One element of {@code pipeline.transforms} (§5): an inline definition or a
  * {@code use:} reference to a {@code kind: transform} definition body (X19).
  *
  * <p>The model is the post-normalization form: every step carries an id (anonymous inline
@@ -50,7 +50,7 @@ public sealed interface Step {
             boolean aliased = body instanceof TransformBody.Nest || body instanceof TransformBody.Join;
             if (aliased != (from instanceof FromClause.Aliases)) {
                 throw new IllegalArgumentException(
-                        "nest/join take an alias-map from:, streaming steps take a list from: (ADR-0016 §5)");
+                        "nest/join take an alias-map from:, streaming steps take a list from: (§5)");
             }
             options = copy(options);
             experimental = copy(experimental);

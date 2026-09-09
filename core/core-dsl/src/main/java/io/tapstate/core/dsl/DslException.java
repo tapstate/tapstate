@@ -7,7 +7,7 @@ import java.util.Map;
 
 /**
  * A located DSL error (plan poc1 B3): the {@code dsl} domain's typed {@link TapstateException}
- * subclass (ADR-0024 D4). It carries a {@link DslError} code plus the named arguments that are
+ * subclass. It carries a {@link DslError} code plus the named arguments that are
  * the single source of variable data, and adds the typed location accessors the parse layer needs
  * — the field {@code path}, the 1-based {@code line} / {@code column} ({@code 0} when unknown), and
  * the originating {@code source} file name (attached by the workspace loader; {@code null} for

@@ -4,7 +4,7 @@ import java.util.Map;
 
 /**
  * A top-level {@code .tap.yml} resource. One document holds exactly one resource;
- * identity is the top-level {@code id} (ADR-0016 §2, F6).
+ * identity is the top-level {@code id} (§2, F6).
  *
  * <p>The model represents the {@code tapstate/v1} grammar only — {@code version} is a
  * constant of the contract, not a field of the model.
