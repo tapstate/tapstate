@@ -181,6 +181,78 @@ class McpOperationExecutorTest {
     }
 
     @Test
+    void sourceListPreservesServerErrorsInsteadOfProjectingThem() throws Exception {
+        HttpServer server = server(exchange -> answer(exchange, 400,
+                "{\"code\":\"control.malformed-request\",\"message\":\"bad page\"}"));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
+
+            assertThat(result.error()).isTrue();
+            assertThat(result.body()).containsEntry("code", "control.malformed-request");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sourceListFailsClosedForMissingItemsOrRequiredSummaryFields() throws Exception {
+        List<String> responses = List.of(
+                "{\"items\":{}}",
+                "{\"items\":[{\"id\":\"orders\"}]}");
+        AtomicInteger response = new AtomicInteger();
+        HttpServer server = server(exchange -> answer(exchange, 200,
+                responses.get(response.getAndIncrement())));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            McpResult missingItems = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
+            McpResult missingConnector = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
+
+            assertThat(missingItems.body()).containsEntry("code", "mcp.invalid-server-response");
+            assertThat(missingConnector.body()).containsEntry("code", "mcp.invalid-server-response");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listArgumentsAcceptIntegralFloatingPointValuesAndRejectMalformedValues() throws Exception {
+        List<String> paths = new ArrayList<>();
+        HttpServer server = server(exchange -> {
+            paths.add(exchange.getRequestURI().toString());
+            answer(exchange, 200, "{\"items\":[]}");
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            McpResult floatingPoint = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("limit", 2.0d, "offset", 1.0f));
+            McpResult fractional = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("limit", 1.5d));
+            McpResult text = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("limit", "two"));
+            McpResult negativeOffset = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("offset", -1));
+            McpResult largeOffset = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("offset", (long) Integer.MAX_VALUE + 1));
+
+            assertThat(floatingPoint.error()).isFalse();
+            assertThat(paths).containsExactly("/api/pipelines?limit=2&offset=1");
+            assertThat(fractional.body()).containsEntry("code", "control.malformed-request");
+            assertThat(text.body()).containsEntry("code", "control.malformed-request");
+            assertThat(negativeOffset.body()).containsEntry("code", "control.malformed-request");
+            assertThat(largeOffset.body()).containsEntry("code", "control.malformed-request");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void aReadThatAsksForNothingSendsNothingRatherThanThisFacesOwnDefaults() throws Exception {
         // The plan's claim is that the four surfaces share one request shape, which holds only while none
         // of them answers a question of its own. A face that filled in its own limit here would agree with
