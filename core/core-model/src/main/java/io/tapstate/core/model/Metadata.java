@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Optional annotation block of any resource (ADR-0016 §2). Carries labels and a free-text
+ * Optional annotation block of any resource (§2). Carries labels and a free-text
  * description; never carries identity ({@code metadata.name} was abolished by F6).
  */
 @Doc("Optional annotation block: labels plus a free-text description. Never carries identity.")

@@ -7,7 +7,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * {@code kind: serve} — reusable publish-surface definition body (ADR-0016 §8, X19):
+ * {@code kind: serve} — reusable publish-surface definition body (§8, X19):
  * sync / query / push declarations without {@code from:} wiring.
  */
 @Doc("Reusable publish-surface definition holding sync, query and push declarations without source wiring.")

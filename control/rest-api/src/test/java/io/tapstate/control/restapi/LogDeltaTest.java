@@ -12,7 +12,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * tail, which lines are new. The common case is an append (the ring grew); eviction shifts the window,
  * so the anchor (the last already-sent line) is located by its last occurrence and only the lines after
  * it are new. When the anchor is gone entirely — a burst evicted it — the whole current tail is re-sent
- * (the ADR's "worst case: re-attach and continue tailing"), which is honest for a bounded node-local
+ * (the accepted worst case: re-attach and continue tailing), which is honest for a bounded node-local
  * sink rather than silently dropping a gap.
  */
 class LogDeltaTest {

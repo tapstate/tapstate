@@ -1,9 +1,9 @@
 package io.tapstate.core.model;
 
 /**
- * SRS configuration surface (ADR-0016 §4) — only legal on {@code mode: cdc} sources
+ * SRS configuration surface (§4) — only legal on {@code mode: cdc} sources
  * (validate-layer rule). {@code key} is the shared mining-chain assertion; physical SRS
- * internals belong to the storage ADR, not this model.
+ * internals belong to the storage layer, not this model.
  */
 @Doc("Stream Replay Store configuration; only valid on sources running in cdc mode.")
 public record Srs(

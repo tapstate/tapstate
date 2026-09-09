@@ -168,6 +168,8 @@ jobs:
           ps="$(curl -s -u "$SONAR_TOKEN:" "$host/api/qualitygates/project_status?projectKey=tapstate&pullRequest=${PR_NUMBER}" || true)"
           status="$(printf '%s' "$ps" | jq -r '.projectStatus.status // "UNKNOWN"' 2>/dev/null || echo UNKNOWN)"
           details="$(printf '%s' "$ps" | jq -r '.projectStatus.conditions[]? | select(.status=="ERROR") | "- `\(.metricKey)`: \(.actualValue) (fails \(.comparator) \(.errorThreshold))"' 2>/dev/null || true)"
+          bugs="$(curl -s -u "$SONAR_TOKEN:" "$host/api/issues/search?componentKeys=tapstate&pullRequest=${PR_NUMBER}&resolved=false&types=BUG&ps=100" || true)"
+          bug_details="$(printf '%s' "$bugs" | jq -r '.issues[]? | "- `\(.rule)` [\(.severity)]: `\(.component | sub("^tapstate:"; "")):\(.line // "?")` — \(.message)"' 2>/dev/null || true)"
 
           case "$status" in
             OK)    emoji="white_check_mark";   verdict="passed" ;;
@@ -184,6 +186,9 @@ jobs:
             printf '### :%s: SonarQube quality gate: **%s**\n\n' "$emoji" "$verdict"
             if [ -n "${details:-}" ]; then
               printf 'Failing conditions:\n%s\n\n' "$details"
+            fi
+            if [ -n "${bug_details:-}" ]; then
+              printf 'Open reliability issues:\n%s\n\n' "$bug_details"
             fi
             printf '[Open the pull-request dashboard](%s)\n\n' "$dashboard"
             printf '_Posted by CI from the SonarQube pull-request quality gate._\n'

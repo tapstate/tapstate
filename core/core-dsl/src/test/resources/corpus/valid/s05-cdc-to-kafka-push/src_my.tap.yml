@@ -1,4 +1,4 @@
-# ADR-0016 §14.5 — MySQL CDC -> Kafka (DB to event bus). Incremental only = pipeline read_mode (§1).
+# §14.5 — MySQL CDC -> Kafka (DB to event bus). Incremental only = pipeline read_mode (§1).
 version: tapstate/v1
 kind: source
 id: src_my

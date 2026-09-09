@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * B3-4: parse the three reusable definition kinds — {@code kind: transform / view / serve}
- * (ADR-0016 §5/§7/§8, X19). A definition body is pure logic; {@code from:} is forbidden
+ * (§5/§7/§8, X19). A definition body is pure logic; {@code from:} is forbidden
  * (wiring belongs to the referencing pipeline step). The bodies reuse the same payload
  * grammar as inline pipeline blocks, so the assertions here mirror the inline ones minus the
  * {@code from:} wiring. Canonical key order for definitions is canonical-form.md §3 (rows

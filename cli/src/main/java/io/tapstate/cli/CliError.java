@@ -6,7 +6,7 @@ import io.tapstate.core.common.Severity;
 import java.util.Set;
 
 /**
- * The {@code cli} domain's error codes (ADR-0024 D1) — surface-layer diagnosables that are not DSL
+ * The {@code cli} domain's error codes — surface-layer diagnosables that are not DSL
  * semantics: the scaffolding wizard's refusals and bad-input conditions. Thrown as a base
  * {@link io.tapstate.core.common.TapstateException} (no DSL source position) and rendered through the
  * message catalog like any other coded diagnostic.

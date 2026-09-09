@@ -8,7 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * {@code kind: pipeline} — the composing runnable unit (ADR-0016 §1, X17): references
+ * {@code kind: pipeline} — the composing runnable unit (§1, X17): references
  * pre-created sources by id (never inline), wires transforms / view / serve, carries
  * task-level settings. Minimal composition (source + view/serve) is a validate-layer rule.
  */
@@ -18,8 +18,8 @@ public record PipelineResource(
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,
-        @Doc(value = "The sources this pipeline reads from; at least one is required. Each is a bare "
-                + "source id, or an object carrying this pipeline's own srs switch for that source.",
+        @Doc(value = "Pre-created sources this pipeline reads from. Each is a bare source id or an object "
+                + "carrying this pipeline's own srs switch; blank drafts may omit the list.",
                 required = true, key = "source")
         @YamlScalarOrList
         List<SourceRef> sources,
@@ -38,7 +38,7 @@ public record PipelineResource(
     public PipelineResource {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(sources, "sources");
-        if (sources.isEmpty()) {
+        if (sources.isEmpty() && (transforms != null && !transforms.isEmpty() || view != null || serve != null)) {
             throw new IllegalArgumentException("source: must reference at least one source (X17)");
         }
         sources = List.copyOf(sources);

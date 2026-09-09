@@ -1,4 +1,3 @@
 rule: duplicate-id
-adr: "ADR-0016 §5 (no shadowing)"
 path: transforms[0].id
 note: "step id 'orders' shadows table 'orders' in src_a; rename the step"

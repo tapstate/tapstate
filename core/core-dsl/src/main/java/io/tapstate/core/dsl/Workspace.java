@@ -11,7 +11,7 @@ import java.util.Map;
 
 /**
  * A validated batch of parsed resources sharing one top-level id namespace (plan poc1 B3-5/B3-6).
- * Offline, the closure is the batch (ADR-0021 §3): every reference resolves within it. Building a
+ * Offline, the closure is the batch: every reference resolves within it. Building a
  * workspace enforces two batch-level invariants — the F8 / §2 id rule (top-level ids unique across
  * the batch) and reference closure ({@link ReferenceClosure}: source / from / use / sink references
  * resolve, X17 composition holds). Directory loading with per-file attribution is {@link WorkspaceLoader}.

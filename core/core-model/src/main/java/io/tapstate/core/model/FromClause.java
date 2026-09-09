@@ -6,7 +6,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The {@code from:} wiring of a transform step (ADR-0016 §5): list form for streaming
+ * The {@code from:} wiring of a transform step (§5): list form for streaming
  * steps (multi-item = per-table group), alias-map form for nest / join named upstreams.
  */
 @Doc("The upstream wiring of a transform step: either a list of references for streaming steps, or a map of named upstreams for nest and join.")
