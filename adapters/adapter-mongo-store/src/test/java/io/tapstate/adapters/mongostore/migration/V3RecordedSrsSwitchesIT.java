@@ -4,6 +4,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.PipelineResource;
@@ -90,7 +91,7 @@ class V3RecordedSrsSwitchesIT {
         seed(artifacts, pipelineReading("p_off", "src_off"));
         seed(artifacts, pipelineReading("p_default", "src_default"));
 
-        new V3RecordedSrsSwitches().up(database);
+        new V3RecordedSrsSwitches().up(database, ChangeSet.Fence.HELD);
 
         assertThat(recordedSwitchOf(artifacts, "p_off"))
                 .as("the source says the replay store is off, so the reference has to say so too")
@@ -110,7 +111,7 @@ class V3RecordedSrsSwitchesIT {
         seed(artifacts, pipelineReading("p_off", "src_off"));
         String before = artifacts.find(new Document("_id", "p_off")).first().getString("contentHash");
 
-        new V3RecordedSrsSwitches().up(database);
+        new V3RecordedSrsSwitches().up(database, ChangeSet.Fence.HELD);
 
         Document stored = artifacts.find(new Document("_id", "p_off")).first();
         assertThat(stored.getString("contentHash"))
@@ -126,10 +127,10 @@ class V3RecordedSrsSwitchesIT {
         seed(artifacts, SOURCE_WITH_SRS_OFF);
         seed(artifacts, TARGET);
         seed(artifacts, pipelineReading("p_off", "src_off"));
-        new V3RecordedSrsSwitches().up(database);
+        new V3RecordedSrsSwitches().up(database, ChangeSet.Fence.HELD);
         Document afterFirst = artifacts.find(new Document("_id", "p_off")).first();
 
-        new V3RecordedSrsSwitches().up(database);
+        new V3RecordedSrsSwitches().up(database, ChangeSet.Fence.HELD);
 
         assertThat(artifacts.find(new Document("_id", "p_off")).first()).isEqualTo(afterFirst);
     }
@@ -144,13 +145,38 @@ class V3RecordedSrsSwitchesIT {
         seed(artifacts, pipelineReading("p_gone", "src_missing"));
         Document before = artifacts.find(new Document("_id", "p_off")).first();
 
-        Throwable thrown = catchThrowable(() -> new V3RecordedSrsSwitches().up(database));
+        Throwable thrown = catchThrowable(() -> new V3RecordedSrsSwitches().up(database, ChangeSet.Fence.HELD));
 
         assertThat(thrown).hasMessageContaining("p_gone").hasMessageContaining("src_missing");
         assertThat(artifacts.find(new Document("_id", "p_off")).first())
                 .as("nothing is written when any reference cannot be answered: one version number "
                         + "covers the collection, so a half-done run reads as finished")
                 .isEqualTo(before);
+    }
+
+    @Test
+    void aReferenceNamingASourceTheStoreHoldsButCannotReadSaysThatInsteadOfCallingItMissing() {
+        MongoDatabase database = freshDatabase("v3_unreadable_source");
+        MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
+        seed(artifacts, TARGET);
+        artifacts.insertOne(new Document("_id", "src_alien").append("kind", "source")
+                .append("body", new Document("version", "tapstate/v9").append("kind", "source"))
+                .append("contentHash", "whatever-it-was"));
+        seed(artifacts, pipelineReading("p_alien_src", "src_alien"));
+
+        Throwable thrown = catchThrowable(() -> new V3RecordedSrsSwitches().up(database, ChangeSet.Fence.HELD));
+
+        assertThat(thrown)
+                .as("src_alien is held -- it is unreadable. Reporting it as absent sends the operator "
+                        + "looking for a document that is not missing, and the fact that would resolve "
+                        + "it is the bind failure this used to discard")
+                .hasMessageContaining("src_alien")
+                .hasMessageContaining("cannot read")
+                .isNot(new org.assertj.core.api.Condition<>(
+                        t -> t.getMessage().contains("does not hold"), "reported as absent"));
+        assertThat(thrown.getCause())
+                .as("why it would not bind is the whole of what an operator acts on here")
+                .isNotNull();
     }
 
     @Test
@@ -165,7 +191,7 @@ class V3RecordedSrsSwitchesIT {
                 .append("contentHash", "whatever-it-was");
         artifacts.insertOne(unbindable);
 
-        new V3RecordedSrsSwitches().up(database);
+        new V3RecordedSrsSwitches().up(database, ChangeSet.Fence.HELD);
 
         assertThat(recordedSwitchOf(artifacts, "p_off"))
                 .as("the readable pipeline is still done")
@@ -184,7 +210,7 @@ class V3RecordedSrsSwitchesIT {
         seed(artifacts, pipelineReading("p_off", "src_off"));
 
         assertThat(new V3RecordedSrsSwitches().dryRunSummary(database)).contains("1 pipeline");
-        new V3RecordedSrsSwitches().up(database);
+        new V3RecordedSrsSwitches().up(database, ChangeSet.Fence.HELD);
         assertThat(new V3RecordedSrsSwitches().dryRunSummary(database)).contains("already records");
     }
 

@@ -5,6 +5,7 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
+import io.tapstate.adapters.mongostore.ChangeSet.Fence;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.testsupport.RequiresDocker;
@@ -18,6 +19,8 @@ import org.testcontainers.utility.DockerImageName;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -306,7 +309,78 @@ class MigrationRunnerIT {
         assertThat(indexNames(database, SystemCollections.SESSIONS)).containsExactly("_id_");
     }
 
+    @Test
+    void aChangesetWhoseLockWentStaleWhileItRanStopsBeforeItsNextWrite() {
+        MongoDatabase database = freshDatabase("runner_stalled");
+        StalledClock clock = new StalledClock();
+        AtomicInteger writes = new AtomicInteger();
+
+        TapstateException thrown = catchThrowableOfType(
+                () -> MigrationRunner.migrate(database,
+                        List.of(stallingPast(1, LOCK_TTL, clock, writes)), LOCK_TTL, PATIENT, clock),
+                TapstateException.class);
+
+        assertThat(writes)
+                .as("the first write lands, the stall outlives the lock, and the second must not: by "
+                        + "then another member may already hold the store, and a late write puts this "
+                        + "member's shape back over whatever that one has done")
+                .hasValue(1);
+        assertThat(thrown).isNotNull();
+        assertThat(installedVersion(database))
+                .as("and the version is not recorded, so the next start runs the changeset again")
+                .isNotEqualTo(1);
+    }
+
     // ---- fixtures ----
+
+    /** A clock a changeset can push forward from inside its own run, the way a stall does. */
+    private static final class StalledClock extends Clock {
+
+        private Instant now = Instant.now();
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        void stall(Duration duration) {
+            now = now.plus(duration);
+        }
+    }
+
+    /**
+     * A changeset that writes, stalls past the life of the lock, and tries to write again -- which is
+     * the shape of every takeover that matters: not a member that has stopped, but one that comes back.
+     */
+    private static ChangeSet stallingPast(int version, Duration lockTtl, StalledClock clock,
+            AtomicInteger writes) {
+        return new ChangeSet() {
+            @Override
+            public int version() {
+                return version;
+            }
+
+            @Override
+            public void up(MongoDatabase database, Fence fence) {
+                fence.requireStillHeld();
+                writes.incrementAndGet();
+                clock.stall(lockTtl.plusSeconds(1));
+                fence.requireStillHeld();
+                writes.incrementAndGet();
+            }
+        };
+    }
+
 
     /** A changeset that records that it ran, so a resumed run can be told from a repeated one. */
     private static ChangeSet counting(int version, AtomicInteger runs) {
@@ -317,7 +391,8 @@ class MigrationRunnerIT {
             }
 
             @Override
-            public void up(MongoDatabase database) {
+            public void up(MongoDatabase database, Fence fence) {
+                fence.requireStillHeld();
                 runs.incrementAndGet();
             }
         };
@@ -332,7 +407,7 @@ class MigrationRunnerIT {
             }
 
             @Override
-            public void up(MongoDatabase database) {
+            public void up(MongoDatabase database, Fence fence) {
                 throw new IllegalStateException(because);
             }
         };
@@ -347,7 +422,7 @@ class MigrationRunnerIT {
             }
 
             @Override
-            public void up(MongoDatabase ignored) {
+            public void up(MongoDatabase ignored, Fence fence) {
                 schemaDocuments(database).updateOne(SCHEMA_ID,
                         new Document("$inc", new Document("lock.epoch", 1L)));
             }

@@ -4,7 +4,9 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -55,6 +57,36 @@ class V2StructuredArtifactsIT {
             connector: mysql
             """;
 
+    /**
+     * A source exactly as the last release emitted it: {@code options} was an accepted, emitted field,
+     * and this build defines no engine option at all. Written out rather than rendered through this
+     * build's writer -- rendering it here would produce the one shape that cannot exhibit the fault,
+     * which is why every fixture above is blind to it.
+     */
+    private static final String RELEASED_WITH_OPTIONS = """
+            version: tapstate/v1
+            kind: source
+            id: src_ora
+            connector: oracle
+            config:
+              host: 10.20.0.15
+              port: 1521
+            mode: cdc
+            tables: [ORDERS, CUSTOMERS]
+            options:
+              include_ddl: true
+            """;
+
+    /** A view as the last release accepted one: it had no required primary_key, and this build does. */
+    private static final String RELEASED_WITHOUT_PRIMARY_KEY = """
+            version: tapstate/v1
+            kind: view
+            id: hr
+            storage:
+              hot:
+                ttl: P1D
+            """;
+
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
@@ -74,7 +106,7 @@ class V2StructuredArtifactsIT {
         seedTextBodied(artifacts, ORDERS);
         seedTextBodied(artifacts, CUSTOMERS);
 
-        new V2StructuredArtifacts().up(database);
+        new V2StructuredArtifacts().up(database, ChangeSet.Fence.HELD);
 
         Resource orders = PARSER.parse(ORDERS);
         Document stored = artifacts.find(new Document("_id", "orders")).first();
@@ -99,10 +131,10 @@ class V2StructuredArtifactsIT {
         MongoDatabase database = freshDatabase("v2_twice");
         MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
         seedTextBodied(artifacts, ORDERS);
-        new V2StructuredArtifacts().up(database);
+        new V2StructuredArtifacts().up(database, ChangeSet.Fence.HELD);
         Document afterFirst = artifacts.find(new Document("_id", "orders")).first();
 
-        new V2StructuredArtifacts().up(database);
+        new V2StructuredArtifacts().up(database, ChangeSet.Fence.HELD);
 
         assertThat(artifacts.find(new Document("_id", "orders")).first()).isEqualTo(afterFirst);
     }
@@ -117,7 +149,7 @@ class V2StructuredArtifactsIT {
         artifacts.insertOne(new Document("_id", "broken_two").append("kind", "source")
                 .append("canonical", "version: tapstate/v9\nkind: source\nid: broken_two\n"));
 
-        Throwable thrown = catchThrowable(() -> new V2StructuredArtifacts().up(database));
+        Throwable thrown = catchThrowable(() -> new V2StructuredArtifacts().up(database, ChangeSet.Fence.HELD));
 
         assertThat(thrown).hasMessageContaining("broken_one").hasMessageContaining("broken_two");
         assertThat(artifacts.find(new Document("_id", "orders")).first().getString("canonical"))
@@ -127,13 +159,58 @@ class V2StructuredArtifactsIT {
     }
 
     @Test
+    void aBodyTheLastReleaseWroteIsReadThroughTheFieldThisBuildRetired() {
+        MongoDatabase database = freshDatabase("v2_retired");
+        MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
+        seedAsWritten(artifacts, "src_ora", "source", RELEASED_WITH_OPTIONS);
+
+        new V2StructuredArtifacts().up(database, ChangeSet.Fence.HELD);
+
+        Document stored = artifacts.find(new Document("_id", "src_ora")).first();
+        assertThat(stored).isNotNull();
+        assertThat(stored.get("canonical"))
+                .as("it moved: refusing it instead leaves the store with no forward path at all, since "
+                        + "this changeset is the only thing that reads the text and the server does not "
+                        + "start until it succeeds")
+                .isNull();
+        Document body = (Document) stored.get("body");
+        assertThat(body.get("options"))
+                .as("the field is retired, so it is dropped rather than carried into a structure that "
+                        + "has nowhere to put it")
+                .isNull();
+        assertThat(PARSER.fromTree(body).id())
+                .as("everything else survives the drop")
+                .isEqualTo("src_ora");
+        assertThat(body.getString("connector")).isEqualTo("oracle");
+    }
+
+    @Test
+    void aFieldThisBuildNewlyRequiresIsRefusedNamingTheFieldAndTheCode() {
+        MongoDatabase database = freshDatabase("v2_required");
+        MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
+        seedAsWritten(artifacts, "hr", "view", RELEASED_WITHOUT_PRIMARY_KEY);
+
+        Throwable thrown = catchThrowable(() -> new V2StructuredArtifacts().up(database, ChangeSet.Fence.HELD));
+
+        assertThat(thrown)
+                .as("dropping is for a field this build retired; nothing here can invent a key nobody "
+                        + "wrote, so this one is still refused -- but with what an operator acts on")
+                .hasMessageContaining("hr")
+                .hasMessageContaining("dsl.missing-field")
+                .hasMessageContaining("primary_key");
+        assertThat(thrown.getCause())
+                .as("the position and the stack survive the bare throw the runner re-codes")
+                .isInstanceOf(DslException.class);
+    }
+
+    @Test
     void aStoreWithNothingLeftToMoveSaysSoWithoutTouchingIt() {
         MongoDatabase database = freshDatabase("v2_dryrun");
         MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
         seedTextBodied(artifacts, ORDERS);
 
         assertThat(new V2StructuredArtifacts().dryRunSummary(database)).contains("1 artifact");
-        new V2StructuredArtifacts().up(database);
+        new V2StructuredArtifacts().up(database, ChangeSet.Fence.HELD);
         assertThat(new V2StructuredArtifacts().dryRunSummary(database)).contains("no artifact");
     }
 
@@ -144,6 +221,21 @@ class V2StructuredArtifactsIT {
                 .append("kind", resource.kind())
                 .append("canonical", canonical(raw))
                 .append("contentHash", textHashOf(raw)));
+    }
+
+    /**
+     * One document holding the text a previous release wrote, stored verbatim.
+     *
+     * <p>{@link #seedTextBodied} cannot serve here: it renders through this build's writer, so whatever
+     * it seeds is already in this build's grammar -- the one shape a grammar narrowing cannot show up
+     * in. The hash is the text one a store of that vintage holds.
+     */
+    private static void seedAsWritten(MongoCollection<Document> artifacts, String id, String kind,
+            String asWritten) {
+        artifacts.insertOne(new Document("_id", id)
+                .append("kind", kind)
+                .append("canonical", asWritten)
+                .append("contentHash", CanonicalHash.ofText(asWritten)));
     }
 
     private static String canonical(String raw) {

@@ -7,6 +7,7 @@ import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.IndexOptions;
 import io.tapstate.adapters.mongostore.ChangeSet;
+import io.tapstate.adapters.mongostore.ChangeSet.Fence;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import org.bson.Document;
 
@@ -40,7 +41,7 @@ public final class V1BaselineIndexes implements ChangeSet {
     }
 
     @Override
-    public void up(MongoDatabase database) {
+    public void up(MongoDatabase database, Fence fence) {
         for (SystemCollections row : SystemCollections.values()) {
             // Only the store database is reached from here. The operator-state collections are in
             // another one and outside this scheme entirely; they declare no index, so this skips
@@ -50,6 +51,7 @@ public final class V1BaselineIndexes implements ChangeSet {
                 continue;
             }
             for (SystemCollections.IndexSpec index : row.indexes()) {
+                fence.requireStillHeld();
                 build(row.indexTargetOn(database), index);
             }
         }

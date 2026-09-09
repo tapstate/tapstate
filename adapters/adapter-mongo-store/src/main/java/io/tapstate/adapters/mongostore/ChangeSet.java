@@ -29,8 +29,46 @@ public interface ChangeSet {
      * Moves the store on. Runs under the migration lock, with every other member either waiting or not
      * yet started. Throwing leaves the recorded version at the step before this one, so the next start
      * runs this changeset again — which is what makes re-runnability a requirement rather than a nicety.
+     *
+     * <p>Consult {@code fence} before each write. Holding the lock is not a fact that stays true for the
+     * length of a changeset: a member that stalls past the lock's lifetime is taken over while it is
+     * still inside this method, and the writes it makes on waking land behind whatever the member that
+     * replaced it has already done. The store then records a version whose work has been partly undone,
+     * and nothing revisits it — every changeset selects on the shape the store is now recorded as past.
      */
-    void up(MongoDatabase database);
+    void up(MongoDatabase database, Fence fence);
+
+    /**
+     * Whether the member running a changeset still holds the migration lock.
+     *
+     * <p>This exists because the epoch cannot travel with a changeset's own writes. Every write the lock
+     * itself makes carries the epoch it acquired and is refused once that epoch is stale; a changeset
+     * writes into documents that have no epoch on them, so nothing about the write can refuse it. What
+     * is left is for the writer to ask first.
+     *
+     * <p>Asking is not free of a window — the lock can go stale between the question and the write that
+     * follows it — but that window is one write long instead of one changeset long, and it is the one a
+     * conditional update could close only if the documents carried the epoch.
+     */
+    @FunctionalInterface
+    interface Fence {
+
+        /**
+         * Returns normally while the lock is still held, and throws once it is not.
+         *
+         * <p>Throwing here is the same outcome as a changeset failing for any other reason: the recorded
+         * version stays where it was, and the member refuses to start rather than carrying on into a
+         * store somebody else is changing.
+         */
+        void requireStillHeld();
+
+        /**
+         * A fence for a caller that holds nothing to lose — a test driving one changeset directly, or a
+         * dry run. Never use it inside the runner: it answers the question the runner exists to ask.
+         */
+        Fence HELD = () -> {
+        };
+    }
 
     /**
      * The name this changeset is reported and compared under. The class's own name, so that renaming the

@@ -4,6 +4,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
+import io.tapstate.adapters.mongostore.ChangeSet.Fence;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import org.bson.Document;
 
@@ -51,13 +52,14 @@ public final class V4DiscardInventedPositions implements ChangeSet {
     }
 
     @Override
-    public void up(MongoDatabase database) {
+    public void up(MongoDatabase database, Fence fence) {
         MongoCollection<Document> chains = SystemCollections.SRS_META.on(database);
         try (MongoCursor<Document> cursor = chains.find().iterator()) {
             while (cursor.hasNext()) {
                 Document chain = cursor.next();
                 Document unset = invented(chain);
                 if (!unset.isEmpty()) {
+                    fence.requireStillHeld();
                     chains.updateOne(new Document("_id", chain.get("_id")), new Document("$unset", unset));
                 }
             }

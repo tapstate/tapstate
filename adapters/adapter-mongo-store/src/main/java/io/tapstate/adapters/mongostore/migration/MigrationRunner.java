@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -68,8 +70,12 @@ public final class MigrationRunner {
     /** How long a member waits for the holder to finish before refusing to start. */
     static final Duration WAIT_TIMEOUT = Duration.ofMinutes(5);
 
-    /** How often the holder says it is still alive. Comfortably inside the interval above. */
-    private static final Duration HEARTBEAT_INTERVAL = LOCK_TTL.dividedBy(3);
+    /**
+     * How many times the holder says it is still alive within one lock lifetime. Beating on a fraction
+     * of the lock this run actually took, rather than on a fixed period, is what keeps a shorter lock
+     * from outliving its own first beat -- which would end the run as though it had been taken over.
+     */
+    private static final int BEATS_PER_LOCK_LIFE = 3;
 
     /** How often a waiting member looks again. Short enough not to add noticeably to a start. */
     private static final Duration POLL_INTERVAL = Duration.ofMillis(500);
@@ -164,7 +170,7 @@ public final class MigrationRunner {
         while (true) {
             OptionalLong epoch = meta.tryAcquire(member, lockTtl, clock.instant());
             if (epoch.isPresent()) {
-                applyPending(database, meta, changeSets, epoch.getAsLong());
+                applyPending(database, meta, changeSets, epoch.getAsLong(), lockTtl, clock);
                 return;
             }
             // Somebody else is doing it. Their finishing is what releases this member to start, and
@@ -184,7 +190,27 @@ public final class MigrationRunner {
 
     /** Runs every changeset the store has not had yet, recording each as it succeeds. */
     private static void applyPending(MongoDatabase database, SystemMetaStore meta,
-            List<ChangeSet> changeSets, long epoch) {
+            List<ChangeSet> changeSets, long epoch, Duration lockTtl, Clock clock) {
+        // What the changesets consult before each write. Two things end the hold, and both have to be
+        // read here because neither implies the other: the store telling this member the lock has been
+        // taken (an answer that only arrives if a beat runs), and the lease simply running out (which is
+        // what a stall long enough to matter looks like from inside -- it freezes the beat thread too,
+        // so waiting to be told would be waiting for the thread that is not running).
+        // Derived from the lock this run actually took, not from the default: a beat that arrives less
+        // often than the lock lives cannot keep the lease below alive, and the run would refuse itself.
+        Duration beatInterval = lockTtl.dividedBy(BEATS_PER_LOCK_LIFE);
+        AtomicBoolean takenOver = new AtomicBoolean(false);
+        AtomicReference<Instant> goodUntil = new AtomicReference<>(clock.instant().plus(lockTtl));
+        ChangeSet.Fence fence = () -> {
+            if (takenOver.get()) {
+                throw new IllegalStateException(
+                        "the migration lock was taken over while this changeset was running");
+            }
+            if (!clock.instant().isBefore(goodUntil.get())) {
+                throw new IllegalStateException("the migration lock has not been kept alive for longer "
+                        + "than it lives, so another member may already hold it");
+            }
+        };
         // Closing waits for a heartbeat write already in flight to finish; shutdownNow() only interrupts
         // it, and a Mongo write that has been dispatched still lands. Waiting here is what keeps a late
         // heartbeat from re-stamping the lock the release below is giving up.
@@ -199,12 +225,19 @@ public final class MigrationRunner {
             // this one is still changing it. Losing a beat is survivable; losing all of them is not.
             heartbeat.scheduleAtFixedRate(() -> {
                 try {
-                    meta.heartbeat(epoch, Instant.now());
+                    // The answer is the whole point of the beat: false says the lock is already somebody
+                    // else's, and carrying on writing after that is what puts one member's work back over
+                    // another's. Losing the beat instead extends nothing -- the lease below runs out.
+                    if (meta.heartbeat(epoch, Instant.now())) {
+                        goodUntil.set(clock.instant().plus(lockTtl));
+                    } else {
+                        takenOver.set(true);
+                    }
                 } catch (RuntimeException beatFailed) {
                     LOG.warn("system data migration heartbeat failed; the lock is held until it lands "
                             + "again or goes stale", beatFailed);
                 }
-            }, HEARTBEAT_INTERVAL.toMillis(), HEARTBEAT_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+            }, beatInterval.toMillis(), beatInterval.toMillis(), TimeUnit.MILLISECONDS);
             // Re-read under the lock, and refuse the same way: the member that just released it may
             // have been a later build that moved the store past this one.
             int installed = versionOrRefuse(meta, highestVersionIn(changeSets));
@@ -212,7 +245,7 @@ public final class MigrationRunner {
                 if (changeSet.version() <= installed) {
                     continue;
                 }
-                runOne(database, meta, epoch, changeSet);
+                runOne(database, meta, epoch, changeSet, fence);
             }
         } finally {
             meta.release(epoch);
@@ -220,12 +253,13 @@ public final class MigrationRunner {
     }
 
     /** One changeset, with its outcome recorded the moment it succeeds rather than at the end of them all. */
-    private static void runOne(MongoDatabase database, SystemMetaStore meta, long epoch, ChangeSet changeSet) {
+    private static void runOne(MongoDatabase database, SystemMetaStore meta, long epoch,
+            ChangeSet changeSet, ChangeSet.Fence fence) {
         String name = changeSet.changeSetName();
         LOG.info("system data changeset {} (version {}) starting", name, changeSet.version());
         long startedAt = System.nanoTime();
         try {
-            changeSet.up(database);
+            changeSet.up(database, fence);
         } catch (RuntimeException e) {
             // The recorded version stays at the changeset before this one, so the next start runs this
             // one again from the top -- which is why every changeset has to be re-runnable.

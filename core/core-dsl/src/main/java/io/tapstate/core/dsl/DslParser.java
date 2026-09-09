@@ -46,6 +46,7 @@ import org.yaml.snakeyaml.error.MarkedYAMLException;
 import org.yaml.snakeyaml.error.YAMLException;
 import org.yaml.snakeyaml.nodes.MappingNode;
 import org.yaml.snakeyaml.nodes.Node;
+import org.yaml.snakeyaml.nodes.NodeTuple;
 import org.yaml.snakeyaml.nodes.ScalarNode;
 import org.yaml.snakeyaml.nodes.SequenceNode;
 import org.yaml.snakeyaml.representer.Representer;
@@ -152,12 +153,58 @@ public final class DslParser {
 
     /** Parses one YAML document into its {@link Resource} model. */
     public Resource parse(String yaml) {
+        return bind(rootMapping(yaml));
+    }
+
+    /**
+     * Parses text an earlier release wrote, dropping the keys this build has retired since.
+     *
+     * <p>A release that stops accepting a field it used to emit leaves behind stored text this build's
+     * grammar refuses. The only thing that reads that text is the upgrade, so refusing it there strands
+     * the store with no forward path at all: the server does not start, and the one component that
+     * would repair the document is the one throwing. Dropping the retired key is the whole of what
+     * carrying it forward could mean -- this build has nowhere to put the value.
+     *
+     * <p>The keys are named by the caller and kept nowhere here, because what a given upgrade retired
+     * is a fact about that upgrade rather than about the grammar. This is not a leniency switch for
+     * ordinary parsing: nothing on the authoring path may call it, and a document reaching a user is
+     * still read by {@link #parse}.
+     *
+     * <p>It drops only what it is given. A field this build newly *requires* is the opposite fact with
+     * a different answer -- nothing here can invent the value -- so such a document is still refused,
+     * and the refusal names the field.
+     */
+    public Resource parseDropping(String yaml, Set<String> retiredKeys) {
+        Objects.requireNonNull(retiredKeys, "retiredKeys");
+        MappingNode mapping = rootMapping(yaml);
+        drop(mapping, Set.copyOf(retiredKeys));
+        return bind(mapping);
+    }
+
+    private static MappingNode rootMapping(String yaml) {
         Node root = compose(yaml);
         if (!(root instanceof MappingNode mapping)) {
             throw YamlMap.error(DslError.ILLEGAL_VALUE, "", root,
                     Map.of("value", YamlMap.nodeTypeName(root), "expected", "a mapping"));
         }
-        return bind(mapping);
+        return mapping;
+    }
+
+    /** Removes the named keys wherever they sit in a composed document, at any depth. */
+    private static void drop(Node node, Set<String> keys) {
+        if (node instanceof MappingNode mapping) {
+            List<NodeTuple> kept = new ArrayList<>(mapping.getValue().size());
+            for (NodeTuple tuple : mapping.getValue()) {
+                if (tuple.getKeyNode() instanceof ScalarNode key && keys.contains(key.getValue())) {
+                    continue;
+                }
+                drop(tuple.getValueNode(), keys);
+                kept.add(tuple);
+            }
+            mapping.setValue(kept);
+        } else if (node instanceof SequenceNode sequence) {
+            sequence.getValue().forEach(item -> drop(item, keys));
+        }
     }
 
     /**

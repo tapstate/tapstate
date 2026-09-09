@@ -4,6 +4,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
@@ -68,7 +69,7 @@ class V4DiscardInventedPositionsIT {
         MongoCollection<Document> chains = SystemCollections.SRS_META.on(database);
         chains.insertOne(chainCarrying(INVENTED_SEAM, INVENTED_WATERMARK, "w3"));
 
-        new V4DiscardInventedPositions().up(database);
+        new V4DiscardInventedPositions().up(database, ChangeSet.Fence.HELD);
 
         Document stored = chains.find(new Document("_id", "chain")).first();
         assertThat(stored).isNotNull();
@@ -100,7 +101,7 @@ class V4DiscardInventedPositionsIT {
         chains.insertOne(chainCarrying(tokenFor("seam"), tokenFor("read"), tokenFor("acked")));
         Document before = chains.find(new Document("_id", "chain")).first();
 
-        new V4DiscardInventedPositions().up(database);
+        new V4DiscardInventedPositions().up(database, ChangeSet.Fence.HELD);
 
         assertThat(chains.find(new Document("_id", "chain")).first())
                 .as("these are places in a change stream that a source really named; discarding one "
@@ -113,10 +114,10 @@ class V4DiscardInventedPositionsIT {
         MongoDatabase database = freshDatabase("v4_twice");
         MongoCollection<Document> chains = SystemCollections.SRS_META.on(database);
         chains.insertOne(chainCarrying(INVENTED_SEAM, INVENTED_WATERMARK, "w3"));
-        new V4DiscardInventedPositions().up(database);
+        new V4DiscardInventedPositions().up(database, ChangeSet.Fence.HELD);
         Document afterFirst = chains.find(new Document("_id", "chain")).first();
 
-        new V4DiscardInventedPositions().up(database);
+        new V4DiscardInventedPositions().up(database, ChangeSet.Fence.HELD);
 
         assertThat(chains.find(new Document("_id", "chain")).first()).isEqualTo(afterFirst);
     }

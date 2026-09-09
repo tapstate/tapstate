@@ -467,9 +467,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         if (id == null || !(consumersRaw instanceof Document consumersDoc) || !(schemaRaw instanceof List<?> entries)) {
             // A stored meta missing a field this version requires is store corruption, surfaced as a
             // coded io diagnostic rather than a bare cast / unboxing crash while reconstructing.
+            // Three grounds, so the name has to be chosen from all three: reporting the second one's
+            // field while the first fired sends the reader to a field that is intact, and leaves the
+            // one actually missing named nowhere.
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                     Map.of("id", String.valueOf(id),
-                            "field", consumersRaw instanceof Document ? "schemaHistory" : "consumerOffsets"), null);
+                            "field", id == null ? "_id"
+                                    : consumersRaw instanceof Document ? "schemaHistory" : "consumerOffsets"), null);
         }
         List<ConsumerOffset> consumers = new ArrayList<>();
         for (Map.Entry<String, Object> entry : consumersDoc.entrySet()) {

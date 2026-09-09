@@ -17,6 +17,7 @@ import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StoredArtifactRecord;
 import io.tapstate.testsupport.RequiresDocker;
+import io.tapstate.adapters.mongostore.ChangeSet;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -462,7 +463,7 @@ class MongoArtifactStoreIT {
             store.saveAll(List.of(PARSER.parse(ORDERS), PARSER.parse(ORDERS_SYNC)));
             // Built by the product from the row's own declaration rather than written out here: a test
             // that created its own index would keep passing over a release that ships none.
-            new V1BaselineIndexes().up(database);
+            new V1BaselineIndexes().up(database, ChangeSet.Fence.HELD);
 
             assertThat(store.listStored("source")).singleElement()
                     .satisfies(row -> assertThat(row.id()).isEqualTo("orders"));

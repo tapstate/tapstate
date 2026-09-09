@@ -4,6 +4,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
+import io.tapstate.adapters.mongostore.ChangeSet.Fence;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.PipelineResource;
@@ -36,6 +37,11 @@ import java.util.Map;
  * <p>A pipeline naming a source the store does not hold stops the changeset rather than being skipped.
  * The reference closure makes that unreachable through apply, so a store containing one is a store this
  * cannot reason about, and a value chosen for it would be the guess the capture side refuses to make.
+ *
+ * <p>A source the store holds but this build cannot read stops it too, and says so separately. The two
+ * are opposite facts with opposite remedies -- one document to create, one document to repair -- and
+ * reporting the second as the first sends the operator looking for something that is not missing, with
+ * the one fact that would have resolved it (why the body would not bind) thrown away.
  */
 public final class V3RecordedSrsSwitches implements ChangeSet {
 
@@ -48,12 +54,14 @@ public final class V3RecordedSrsSwitches implements ChangeSet {
     }
 
     @Override
-    public void up(MongoDatabase database) {
+    public void up(MongoDatabase database, Fence fence) {
         MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
-        Map<String, Boolean> switchesBySource = ownSwitches(artifacts);
+        Map<String, RuntimeException> unreadableSources = new LinkedHashMap<>();
+        Map<String, Boolean> switchesBySource = ownSwitches(artifacts, unreadableSources);
 
         Map<String, Document> recorded = new LinkedHashMap<>();
         List<String> dangling = new ArrayList<>();
+        List<String> unreadable = new ArrayList<>();
         for (Map.Entry<String, PipelineResource> entry : bareReferrers(artifacts).entrySet()) {
             PipelineResource pipeline = entry.getValue();
             List<SourceRef> refs = new ArrayList<>(pipeline.sources().size());
@@ -65,7 +73,10 @@ public final class V3RecordedSrsSwitches implements ChangeSet {
                 }
                 Boolean own = switchesBySource.get(ref.id());
                 if (own == null) {
-                    dangling.add(entry.getKey() + " -> " + ref.id());
+                    // Which list it goes in is the whole of what the operator is told: absent means
+                    // create the source, unreadable means repair the one that is already there.
+                    (unreadableSources.containsKey(ref.id()) ? unreadable : dangling)
+                            .add(entry.getKey() + " -> " + ref.id());
                     answered = false;
                     continue;
                 }
@@ -83,28 +94,63 @@ public final class V3RecordedSrsSwitches implements ChangeSet {
             recorded.put(entry.getKey(), new Document("body", new Document(WRITER.tree(written)))
                     .append("contentHash", CanonicalHash.of(written)));
         }
+        if (!unreadable.isEmpty()) {
+            // Thrown bare: the runner turns whatever a changeset throws into the coded failure naming it.
+            // The bind failure travels as the cause -- it is the only thing that says what is wrong with
+            // the source document, and it was the reason this reference could not be answered at all.
+            throw new IllegalStateException("cannot record an srs switch for " + unreadable.size()
+                    + " reference(s) naming a source this store holds but this build cannot read: "
+                    + unreadable, firstFailure(unreadable, unreadableSources));
+        }
         if (!dangling.isEmpty()) {
             // Thrown bare: the runner turns whatever a changeset throws into the coded failure naming it.
             throw new IllegalStateException("cannot record an srs switch for " + dangling.size()
                     + " reference(s) naming a source this store does not hold: " + dangling);
         }
 
-        recorded.forEach((id, update) ->
-                artifacts.updateOne(new Document("_id", id), new Document("$set", update)));
+        for (Map.Entry<String, Document> entry : recorded.entrySet()) {
+            fence.requireStillHeld();
+            artifacts.updateOne(new Document("_id", entry.getKey()), new Document("$set", entry.getValue()));
+        }
     }
 
-    /** Every stored source's own switch, read the way the control side reads it. */
-    private static Map<String, Boolean> ownSwitches(MongoCollection<Document> artifacts) {
+    /**
+     * Every stored source's own switch, read the way the control side reads it -- and, kept apart, why
+     * each source that would not bind did not, collected into {@code unreadable} by its stored id.
+     *
+     * <p>The failures are carried out rather than dropped because a referrer turns one into a hard stop,
+     * and at that point the difference between "no such source" and "that source will not read" is the
+     * whole of what the operator needs.
+     */
+    private static Map<String, Boolean> ownSwitches(MongoCollection<Document> artifacts,
+            Map<String, RuntimeException> unreadable) {
         Map<String, Boolean> switches = new LinkedHashMap<>();
         try (MongoCursor<Document> cursor = artifacts.find(new Document("kind", "source")).iterator()) {
             while (cursor.hasNext()) {
                 Document document = cursor.next();
-                if (bind(document) instanceof SourceResource source) {
-                    switches.put(source.id(), source.srsEnabled());
+                String id = String.valueOf(document.get("_id"));
+                if (!(document.get("body") instanceof Document body)) {
+                    unreadable.put(id, new IllegalStateException(
+                            "the stored source holds no structured body to read the switch from"));
+                    continue;
+                }
+                try {
+                    if (PARSER.fromTree(body) instanceof SourceResource source) {
+                        switches.put(source.id(), source.srsEnabled());
+                    }
+                } catch (RuntimeException unbindable) {
+                    unreadable.put(id, unbindable);
                 }
             }
         }
         return switches;
+    }
+
+    /** The bind failure behind the first reported reference, which is {@code "<referrer> -> <source>"}. */
+    private static RuntimeException firstFailure(List<String> references,
+            Map<String, RuntimeException> unreadableSources) {
+        String reference = references.get(0);
+        return unreadableSources.get(reference.substring(reference.lastIndexOf("-> ") + 3));
     }
 
     /** The stored pipelines that name at least one source bare, bound out of their structured bodies. */
