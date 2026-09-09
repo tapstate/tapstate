@@ -185,7 +185,10 @@ def full_suite(arguments):
 
 def matrix_job(text, job):
     body = re.search(r'^  ' + re.escape(job) + r':[^\n]*\n(.*?)(?=^  [\w-]+:|\Z)', text, re.M | re.S)
-    return bool(body and re.search(r'^\s+matrix:', body[1], re.M))
+    # Inline or aliased strategies cannot prove a single raw Maven execution.
+    # The recognized shard driver remains valid with a strategy in either form.
+    return bool(body and (re.search(r'^\s+matrix:', body[1], re.M)
+                         or re.search(r'^    strategy:[ \t]*[^#\s]', body[1], re.M)))
 
 
 try:
