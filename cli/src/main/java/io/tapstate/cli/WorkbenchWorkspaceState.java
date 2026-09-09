@@ -23,7 +23,7 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
 
     WorkbenchWorkspaceState open(Path relativePath, String content) {
         return new WorkbenchWorkspaceState(
-                Focus.FILES, Optional.of(Document.open(relativePath, content)));
+                Focus.VIEWER, Optional.of(Document.open(relativePath, content)));
     }
 
     WorkbenchWorkspaceState toggleFocus() {
@@ -58,7 +58,7 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
             return this;
         }
         return new WorkbenchWorkspaceState(
-                Focus.VIEWER, Optional.of(document.orElseThrow().edit(key)));
+                Focus.VIEWER, Optional.of(document.orElseThrow().navigate(key)));
     }
 
     WorkbenchWorkspaceState paste(String text) {
@@ -73,6 +73,14 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
             return this;
         }
         return new WorkbenchWorkspaceState(Focus.VIEWER, Optional.of(document.orElseThrow().cancelEdit()));
+    }
+
+    WorkbenchWorkspaceState requestCancelEdit() {
+        if (!editing()) {
+            return this;
+        }
+        return new WorkbenchWorkspaceState(
+                Focus.VIEWER, Optional.of(document.orElseThrow().requestCancelEdit()));
     }
 
     WorkbenchWorkspaceState saved(boolean closeEditor) {
@@ -109,8 +117,10 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
             Path relativePath,
             String originalContent,
             String content,
+            int selectedLine,
             int cursorOffset,
-            boolean editing) {
+            boolean editing,
+            boolean pendingDiscard) {
 
         Document {
             Objects.requireNonNull(relativePath, "relativePath");
@@ -122,26 +132,81 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
             if (cursorOffset < 0 || cursorOffset > content.length()) {
                 throw new IllegalArgumentException("Cursor is outside the document");
             }
+            if (selectedLine < 0 || selectedLine >= lineCount(content)) {
+                throw new IllegalArgumentException("Selected line is outside the document");
+            }
+            if (pendingDiscard && (!editing || !dirty(originalContent, content))) {
+                throw new IllegalArgumentException("Discard confirmation requires dirty edit mode");
+            }
         }
 
         static Document open(Path relativePath, String content) {
-            return new Document(relativePath.normalize(), content, content, 0, false);
+            return new Document(relativePath.normalize(), content, content, 0, 0, false, false);
         }
 
         Document edit() {
-            return editing ? this : new Document(relativePath, content, content, 0, true);
+            return editing ? this : new Document(
+                    relativePath, content, content, selectedLine,
+                    lineStart(content, selectedLine), true, false);
         }
 
         Document cancelEdit() {
-            return new Document(relativePath, originalContent, originalContent, 0, false);
+            int line = Math.min(selectedLine, lineCount(originalContent) - 1);
+            return new Document(
+                    relativePath, originalContent, originalContent, line,
+                    lineStart(originalContent, line), false, false);
+        }
+
+        Document requestCancelEdit() {
+            if (!editing) {
+                return this;
+            }
+            if (!dirty()) {
+                return cancelEdit();
+            }
+            return new Document(
+                    relativePath, originalContent, content, selectedLine,
+                    cursorOffset, true, true);
         }
 
         Document saved(boolean closeEditor) {
-            return new Document(relativePath, content, content, cursorOffset, !closeEditor);
+            int line = cursorLine();
+            return new Document(
+                    relativePath, content, content, line, cursorOffset, !closeEditor, false);
         }
 
         boolean dirty() {
-            return !content.equals(originalContent);
+            return dirty(originalContent, content);
+        }
+
+        int cursorLine() {
+            return lineOfOffset(content, cursorOffset);
+        }
+
+        int cursorColumn() {
+            return cursorOffset - lineStart(cursorOffset);
+        }
+
+        int scopeLine() {
+            if (!editing) {
+                return -1;
+            }
+            String[] lines = content.split("\\n", -1);
+            int row = cursorLine();
+            String current = lines[row];
+            int currentIndent = current.isBlank() ? cursorColumn() : leadingSpaces(current);
+            for (int index = row - 1; index >= 0; index--) {
+                String candidate = lines[index];
+                String trimmed = candidate.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                    continue;
+                }
+                int indent = leadingSpaces(candidate);
+                if (indent < currentIndent && yamlScope(trimmed)) {
+                    return index;
+                }
+            }
+            return -1;
         }
 
         Document insert(String value) {
@@ -159,6 +224,17 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
         }
 
         Document edit(KeyEvent key) {
+            if (pendingDiscard) {
+                if (key.isConfirm()) {
+                    return cancelEdit();
+                }
+                if (key.isCancel()) {
+                    return new Document(
+                            relativePath, originalContent, content, selectedLine,
+                            cursorOffset, true, false);
+                }
+                return this;
+            }
             if (key.isDeleteBackward()) {
                 if (cursorOffset == 0) {
                     return this;
@@ -214,6 +290,28 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
             return this;
         }
 
+        Document navigate(KeyEvent key) {
+            if (editing || pendingDiscard) {
+                return this;
+            }
+            int lines = lineCount(content);
+            int next = selectedLine;
+            if (key.isUp()) {
+                next = Math.max(0, selectedLine - 1);
+            } else if (key.isDown()) {
+                next = Math.min(lines - 1, selectedLine + 1);
+            } else if (key.isHome()) {
+                next = 0;
+            } else if (key.isEnd()) {
+                next = lines - 1;
+            }
+            return next == selectedLine
+                    ? this
+                    : new Document(
+                            relativePath, originalContent, content, next,
+                            lineStart(content, next), false, false);
+        }
+
         private int lineStart(int offset) {
             int newline = content.lastIndexOf('\n', Math.max(0, offset - 1));
             return newline < 0 ? 0 : newline + 1;
@@ -227,11 +325,70 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
         private Document move(int offset) {
             return offset == cursorOffset
                     ? this
-                    : new Document(relativePath, originalContent, content, offset, editing);
+                    : new Document(
+                            relativePath, originalContent, content, selectedLine,
+                            offset, editing, pendingDiscard);
         }
 
         private Document with(String nextContent, int nextCursorOffset) {
-            return new Document(relativePath, originalContent, nextContent, nextCursorOffset, editing);
+            return new Document(
+                    relativePath, originalContent, nextContent, selectedLine,
+                    nextCursorOffset, editing, false);
+        }
+
+        private static boolean dirty(String original, String current) {
+            return !current.equals(original);
+        }
+
+        private static int lineCount(String value) {
+            int count = 1;
+            for (int index = 0; index < value.length(); index++) {
+                if (value.charAt(index) == '\n') {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private static int lineOfOffset(String value, int offset) {
+            int line = 0;
+            for (int index = 0; index < offset; index++) {
+                if (value.charAt(index) == '\n') {
+                    line++;
+                }
+            }
+            return line;
+        }
+
+        private static int lineStart(String value, int line) {
+            if (line == 0) {
+                return 0;
+            }
+            int current = 0;
+            for (int index = 0; index < value.length(); index++) {
+                if (value.charAt(index) == '\n' && ++current == line) {
+                    return index + 1;
+                }
+            }
+            return value.length();
+        }
+
+        private static int leadingSpaces(String value) {
+            int count = 0;
+            while (count < value.length() && value.charAt(count) == ' ') {
+                count++;
+            }
+            return count;
+        }
+
+        private static boolean yamlScope(String trimmed) {
+            if (trimmed.endsWith(":")) {
+                return true;
+            }
+            if (!trimmed.startsWith("- ")) {
+                return false;
+            }
+            return trimmed.substring(2).contains(":");
         }
     }
 }

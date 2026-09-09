@@ -73,9 +73,9 @@ class WorkbenchRendererTest {
                 .contains("1 Overview", "2 Workspace", "3 Sources", "4 Pipelines", "0 More")
                 .contains("Resources")
                 .contains("source", "pipeline", "in sync 1", "local only 1")
-                .contains("Remote artifacts: 2")
                 .contains("1-4 views", "c context", "a auth", "0 more", "r refresh", "q quit")
-                .doesNotContain(secret, "/admin", "explicit", "F1", "F2", "command palette",
+                .doesNotContain(secret, "/admin", "explicit", "Remote artifacts:",
+                        "F1", "F2", "command palette",
                         "Up/Down select", "[2]", "[1]", "[0]");
         assertThat(rendered.layout().tooSmall()).isFalse();
         assertThat(rendered.layout().wide()).isFalse();
@@ -133,8 +133,12 @@ class WorkbenchRendererTest {
 
         assertThat(compact.layout().wide()).isFalse();
         assertThat(wide.layout().wide()).isTrue();
-        assertThat(compact.text()).contains("KIND▼", "IDENTIFIER");
-        assertThat(wide.text()).contains("KIND▼", "| IDENTIFIER");
+        assertThat(compact.text())
+                .contains("IDENTIFIER▼", "STATE", "WORKSPACE")
+                .doesNotContain("KIND", "REMOTE");
+        assertThat(wide.text())
+                .contains("IDENTIFIER▼", "| STATE", "| WORKSPACE")
+                .doesNotContain("KIND", "REMOTE");
         assertOccupiedToRightEdge(compact);
         assertOccupiedToRightEdge(wide);
     }
@@ -151,7 +155,8 @@ class WorkbenchRendererTest {
                 .contains("Resources", "source", "pipeline", "drifted 1")
                 .doesNotContain("customer-source", "billing-pipeline", "operations-view");
         assertThat(render(100, 28, accepted(snapshot).select(WorkbenchState.WorkbenchTab.WORKSPACE)).text())
-                .contains("source/customer.tap.yml", "pipeline/billing.tap.yml")
+                .contains("customer.tap.yml", "billing.tap.yml", "Path: pipeline/billing.tap.yml")
+                .doesNotContain("🔌 source/customer.tap.yml", "🔀 pipeline/billing.tap.yml")
                 .doesNotContain("operations-view");
         assertThat(render(100, 28, accepted(snapshot).select(WorkbenchState.WorkbenchTab.SOURCES)).text())
                 .contains("customer-source")
@@ -183,7 +188,7 @@ class WorkbenchRendererTest {
                 .contains("Alignment: local only 1 | remote only 2 | in sync 3");
         assertThat(lineOf(rendered.buffer(), 19))
                 .contains("drifted 4 | invalid local 5 | unknown 6");
-        assertThat(lineOf(rendered.buffer(), 21)).contains("Remote artifacts: 16");
+        assertThat(lineOf(rendered.buffer(), 21)).doesNotContain("Remote artifacts:");
         assertThat(lineOf(rendered.buffer(), 22)).startsWith("╰");
         assertThat(lineOf(rendered.buffer(), 23))
                 .contains("1-4 views", "c context", "a auth", "0 more", "r refresh", "q quit");
@@ -202,7 +207,9 @@ class WorkbenchRendererTest {
                 .select(WorkbenchState.WorkbenchTab.WORKSPACE));
 
         assertThat(rendered.text())
-                .contains("Files", "Info", "Source", "🔌", "source/local.tap.yml", "○ absent")
+                .contains("Files", "Info", "YAML", "🔌", "local.tap.yml", "○ absent")
+                .contains("Path: source/local.tap.yml")
+                .doesNotContain("🔌 source/local.tap.yml")
                 .doesNotContain("remote only", "view/broken.tap.yml", "broken");
     }
 
@@ -215,15 +222,54 @@ class WorkbenchRendererTest {
                 .select(WorkbenchState.WorkbenchTab.WORKSPACE)
                 .withWorkspaceView(WorkbenchWorkspaceState.empty().open(
                         Path.of("source/orders.tap.yml"),
-                        "apiVersion: tapstate/v1\nkind: Source\nmetadata:\n  name: orders\n"));
+                        "apiVersion: tapstate/v1\nkind: Source\nmetadata:\n  name: orders\n# note\n"));
 
         Rendered rendered = render(120, 30, state);
 
         assertThat(rendered.text())
-                .contains("╭ Files ", "╭ Info ", "╭ Source [source/orders.tap.yml] ")
-                .contains("source/orders.tap.yml", "●", "Remote: ● present")
-                .contains("1 apiVersion: tapstate/v1", "2 kind: Source")
-                .contains("Enter open", "F4 edit", "Tab viewer");
+                .contains("╭ Files ", "╭ Info ", "╭ YAML [orders.tap.yml] ")
+                .contains("orders.tap.yml", "Path: source/orders.tap.yml", "●", "Remote: ● present")
+                .contains(">> 1 apiVersion: tapstate/v1", "2 kind: Source")
+                .contains("F4 edit", "Tab files")
+                .doesNotContain("Enter open", "Tab viewer", "Remote artifacts:");
+
+        int keyColumn = findColumn(rendered.buffer(), findLine(rendered.buffer(), "apiVersion"), "apiVersion");
+        int valueColumn = findColumn(rendered.buffer(), findLine(rendered.buffer(), "tapstate/v1"), "tapstate/v1");
+        assertThat(rendered.buffer().get(keyColumn, findLine(rendered.buffer(), "apiVersion")).style().fg())
+                .isEqualTo(WorkbenchTheme.dark().label().fg());
+        assertThat(rendered.buffer().get(valueColumn, findLine(rendered.buffer(), "tapstate/v1")).style().fg())
+                .isEqualTo(WorkbenchTheme.dark().warning().fg());
+        int commentY = findLine(rendered.buffer(), "# note");
+        int commentX = findColumn(rendered.buffer(), commentY, "# note");
+        assertThat(rendered.buffer().get(commentX, commentY).style().fg())
+                .isEqualTo(WorkbenchTheme.dark().muted().fg());
+        assertThat(rendered.buffer().get(keyColumn, findLine(rendered.buffer(), "apiVersion")).style().bg())
+                .isEqualTo(WorkbenchTheme.dark().selection().bg());
+    }
+
+    @Test
+    void editorHighlightsTheCursorRowAndNearestYamlScopeLikeCamel() {
+        WorkbenchArtifactRow source = row(
+                "source", "orders", WorkbenchAlignment.IN_SYNC, "source/orders.tap.yml", true);
+        WorkbenchWorkspaceState workspace = WorkbenchWorkspaceState.empty()
+                .open(Path.of("source/orders.tap.yml"), "spec:\n  config:\n    batchSize: 100\n")
+                .navigate(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.DOWN))
+                .navigate(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.DOWN))
+                .edit();
+        WorkbenchState state = accepted(snapshot(
+                        new WorkbenchRemoteState.Available(1), List.of(source)))
+                .select(WorkbenchState.WorkbenchTab.WORKSPACE)
+                .withWorkspaceView(workspace);
+
+        Rendered rendered = render(120, 30, state);
+        int scopeY = findLine(rendered.buffer(), "config:");
+        int scopeX = findColumn(rendered.buffer(), scopeY, "config:");
+        int cursorY = findLine(rendered.buffer(), ">> 3");
+
+        assertThat(rendered.buffer().get(scopeX, scopeY).style().fg())
+                .isEqualTo(WorkbenchTheme.dark().accent().fg());
+        assertThat(rendered.buffer().get(findColumn(rendered.buffer(), cursorY, ">>"), cursorY)
+                .style().bg()).isEqualTo(WorkbenchTheme.dark().selection().bg());
     }
 
     @Test
@@ -241,18 +287,18 @@ class WorkbenchRendererTest {
 
         Rendered rendered = render(157, 28, state);
         String header = lineOf(rendered.buffer(), 4);
-        assertThat(header).contains("IDENTIFIER▼");
+        assertThat(header).contains("STATE▼");
         assertThat(rendered.text().indexOf("alpha"))
                 .isLessThan(rendered.text().indexOf("zeta"));
         assertThat(rendered.text()).contains("s sort", "Esc back", "r refresh");
 
-        int kindColumn = header.indexOf("KIND");
         int identifierColumn = header.indexOf("IDENTIFIER");
-        assertThat(rendered.buffer().get(kindColumn, 4).style().fg())
-                .isEqualTo(WorkbenchTheme.dark().base().fg());
-        assertThat(rendered.buffer().get(identifierColumn, 4).style().effectiveModifiers())
-                .contains(Modifier.BOLD);
+        int stateColumn = header.indexOf("STATE");
         assertThat(rendered.buffer().get(identifierColumn, 4).style().fg())
+                .isEqualTo(WorkbenchTheme.dark().base().fg());
+        assertThat(rendered.buffer().get(stateColumn, 4).style().effectiveModifiers())
+                .contains(Modifier.BOLD);
+        assertThat(rendered.buffer().get(stateColumn, 4).style().fg())
                 .isEqualTo(WorkbenchTheme.dark().label().fg());
         String footer = lineOf(rendered.buffer(), 27);
         int sortKey = footer.indexOf("s sort");
@@ -260,6 +306,30 @@ class WorkbenchRendererTest {
                 .isEqualTo(WorkbenchTheme.dark().hintKey().bg());
         assertThat(rendered.buffer().get(sortKey + 2, 27).style().bg())
                 .isEqualTo(WorkbenchTheme.dark().base().bg());
+        assertThat(header).doesNotContain("KIND", "REMOTE");
+    }
+
+    @Test
+    void dirtyWorkspaceEditorMarksTheFileAndRendersCamelDiscardConfirmation() {
+        WorkbenchArtifactRow source = row(
+                "source", "orders", WorkbenchAlignment.IN_SYNC, "source/orders.tap.yml", true);
+        WorkbenchWorkspaceState workspace = WorkbenchWorkspaceState.empty()
+                .open(Path.of("source/orders.tap.yml"), "apiVersion: tapstate/v1\nmetadata:\n  name: orders\n")
+                .edit()
+                .edit(KeyEvent.ofChar('#'))
+                .requestCancelEdit();
+        WorkbenchState state = accepted(snapshot(
+                        new WorkbenchRemoteState.Available(1), List.of(source)))
+                .select(WorkbenchState.WorkbenchTab.WORKSPACE)
+                .withWorkspaceView(workspace);
+
+        Rendered rendered = render(120, 30, state);
+
+        assertThat(rendered.text())
+                .contains("orders.tap.yml *", "Edit [orders.tap.yml *]")
+                .contains("Discard Changes?", "Unsaved changes will be lost.")
+                .contains("Enter confirm", "Esc cancel")
+                .doesNotContain("Remote artifacts:");
     }
 
     @Test
@@ -467,9 +537,9 @@ class WorkbenchRendererTest {
         assertThat(CharWidth.of(arabicSymbol)).isEqualTo(1);
         assertThat(CharWidth.of(hangulLeadingConsonant)).isEqualTo(1);
 
-        assertUnicodeColumnBoundary("a".repeat(23) + arabicSymbol + "X", arabicSymbol);
+        assertUnicodeColumnBoundary("a".repeat(41) + arabicSymbol + "X", arabicSymbol);
         assertUnicodeColumnBoundary(
-                "a".repeat(23) + hangulLeadingConsonant + "X", hangulLeadingConsonant);
+                "a".repeat(41) + hangulLeadingConsonant + "X", hangulLeadingConsonant);
     }
 
     @Test
@@ -521,9 +591,10 @@ class WorkbenchRendererTest {
                         new WorkbenchRemoteState.Available(0), List.of(row)))
                 .select(WorkbenchState.WorkbenchTab.SOURCES));
 
-        int symbolX = 33;
+        int symbolX = lineOf(rendered.buffer(), 5).indexOf(boundarySymbol);
+        assertThat(symbolX).isGreaterThanOrEqualTo(0);
         assertThat(rendered.buffer().get(symbolX, 5).symbol()).isEqualTo(boundarySymbol);
-        assertThat(rendered.buffer().get(34, 5).symbol()).isEqualTo(" ");
+        assertThat(rendered.buffer().get(symbolX + 1, 5).symbol()).isEqualTo(" ");
         assertThat(lineOf(rendered.buffer(), 5)).doesNotContain("X");
         assertOccupiedToRightEdge(rendered);
     }

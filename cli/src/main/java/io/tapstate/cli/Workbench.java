@@ -304,9 +304,15 @@ final class Workbench {
                 runner.quit();
                 return true;
             }
+            if (runtime.state().workspaceView().document()
+                    .map(WorkbenchWorkspaceState.Document::pendingDiscard)
+                    .orElse(false)) {
+                return runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().edit(key)));
+            }
             if (key.isCancel()) {
                 return runtime.updateState(state -> state.withWorkspaceView(
-                        state.workspaceView().cancelEdit()));
+                        state.workspaceView().requestCancelEdit()));
             }
             if (key.hasCtrl() && key.isCharIgnoreCase('s')) {
                 return saveWorkspaceFile(false);

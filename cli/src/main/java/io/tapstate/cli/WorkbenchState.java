@@ -310,11 +310,11 @@ record WorkbenchTableState(
     }
 
     WorkbenchTableState(int selectedIndex, int scrollOffset) {
-        this(selectedIndex, scrollOffset, WorkbenchSortColumn.KIND, false);
+        this(selectedIndex, scrollOffset, WorkbenchSortColumn.IDENTIFIER, false);
     }
 
     static WorkbenchTableState empty() {
-        return new WorkbenchTableState(-1, 0, WorkbenchSortColumn.KIND, false);
+        return new WorkbenchTableState(-1, 0, WorkbenchSortColumn.IDENTIFIER, false);
     }
 
     WorkbenchTableState clamp(int rowCount) {
@@ -372,11 +372,9 @@ record WorkbenchTableState(
 }
 
 enum WorkbenchSortColumn {
-    KIND("KIND"),
     IDENTIFIER("IDENTIFIER"),
-    ALIGNMENT("ALIGNMENT"),
-    LOCAL("LOCAL"),
-    REMOTE("REMOTE");
+    ALIGNMENT("STATE"),
+    LOCAL("WORKSPACE");
 
     private final String label;
 

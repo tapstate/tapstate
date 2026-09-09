@@ -20,6 +20,8 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** Pure, snapshot-only workbench renderer with an immutable pointer hit map. */
 final class WorkbenchRenderer {
@@ -32,6 +34,12 @@ final class WorkbenchRenderer {
     private static final int TAB_LABELS_Y = 2;
     private static final int CONTENT_Y = 3;
     private static final WorkbenchTheme DEFAULT_THEME = WorkbenchTheme.dark();
+    private static final Pattern YAML_COMMENT = Pattern.compile("(^|\\s)#.*$");
+    private static final Pattern YAML_KEY = Pattern.compile("^(\\s*-?\\s*)([\\w./${}\\-]+)\\s*:");
+    private static final Pattern YAML_BOOLEAN_NULL = Pattern.compile(":\\s+(true|false|null)\\s*$");
+    private static final Pattern YAML_NUMBER = Pattern.compile(":\\s+(\\d+\\.?\\d*)\\s*$");
+    private static final Pattern YAML_STRING_VALUE = Pattern.compile("\"(?:[^\"\\\\]|\\\\.)*\"|'[^']*'");
+    private static final Pattern YAML_LIST_MARKER = Pattern.compile("^(\\s*)(-)(\\s)");
 
     private WorkbenchRenderer() {
     }
@@ -381,10 +389,10 @@ final class WorkbenchRenderer {
         Block filesBlock = panel("Files", filesFocused, theme);
         Block infoBlock = panel("Info", filesFocused, theme);
         String viewerTitle = state.workspaceView().document()
-                .map(document -> (document.editing() ? "Edit" : "Source")
-                        + " [" + displayRelativePath(document.relativePath()) + "]"
-                        + (document.dirty() ? " *" : ""))
-                .orElse("Source");
+                .map(document -> (document.editing() ? "Edit" : "YAML")
+                        + " [" + fileName(document.relativePath())
+                        + (document.dirty() ? " *" : "") + "]")
+                .orElse("YAML");
         Block viewerBlock = panel(viewerTitle, !filesFocused, theme);
         frame.renderWidget(filesBlock, filesArea);
         frame.renderWidget(infoBlock, infoArea);
@@ -412,7 +420,11 @@ final class WorkbenchRenderer {
                 default -> "📄";
             };
             Path relativePath = row.local().getFirst().relativePath();
-            String label = icon + " " + displayRelativePath(relativePath);
+            boolean dirty = state.workspaceView().document()
+                    .filter(document -> document.dirty()
+                            && document.relativePath().equals(relativePath.normalize()))
+                    .isPresent();
+            String label = icon + " " + fileName(relativePath) + (dirty ? " *" : "");
             int y = filesInner.y() + index - scroll;
             Style style = index == selected ? theme.selection() : theme.base();
             int labelWidth = row.remote().isEmpty()
@@ -440,11 +452,7 @@ final class WorkbenchRenderer {
                     displayRelativePath(row.local().getFirst().relativePath()), theme);
             y = renderInfoLine(frame, infoInner, y, "Remote",
                     row.remote().isEmpty() ? "○ absent" : "● present", theme);
-            y = renderInfoLine(frame, infoInner, y, "State", words(row.alignment()), theme);
-            write(frame, infoInner.x(), y, notification(state), notificationStyle(state, theme), infoInner);
-        } else {
-            write(frame, infoInner.x(), infoInner.y(), notification(state),
-                    notificationStyle(state, theme), infoInner);
+            renderInfoLine(frame, infoInner, y, "State", words(row.alignment()), theme);
         }
 
         Rect viewerInner = viewerBlock.inner(viewerArea);
@@ -453,9 +461,12 @@ final class WorkbenchRenderer {
                 () -> {
                     write(frame, viewerInner.x(), viewerInner.y(),
                             "Select a file and press Enter to open it.", theme.muted(), viewerInner);
-                    write(frame, viewerInner.x(), viewerInner.bottom() - 1,
-                            notification(state), notificationStyle(state, theme), viewerInner);
+                    writeNotification(frame, viewerInner.x(), viewerInner.bottom() - 1,
+                            state, theme, viewerInner);
                 });
+        state.workspaceView().document()
+                .filter(WorkbenchWorkspaceState.Document::pendingDiscard)
+                .ifPresent(ignored -> renderDiscardPopup(frame, viewerArea, theme));
         return new ContentLayout(List.copyOf(hits), capacity);
     }
 
@@ -471,6 +482,11 @@ final class WorkbenchRenderer {
 
     private static int renderInfoLine(
             Frame frame, Rect area, int y, String label, String value, WorkbenchTheme theme) {
+        if (displayWidth(label) + 2 + displayWidth(value) > area.width()) {
+            write(frame, area.x(), y, label + ":", theme.muted(), area);
+            write(frame, area.x() + 1, y + 1, value, theme.base(), area);
+            return y + 2;
+        }
         int x = area.x();
         x += write(frame, x, y, label + ": ", theme.muted(), area);
         write(frame, x, y, value, theme.base(), area);
@@ -483,34 +499,139 @@ final class WorkbenchRenderer {
             WorkbenchWorkspaceState.Document document,
             WorkbenchTheme theme) {
         String[] lines = document.content().split("\\n", -1);
-        int cursorLine = 0;
-        int cursorColumn = 0;
-        int consumed = 0;
-        for (int index = 0; index < lines.length; index++) {
-            int end = consumed + lines[index].length();
-            if (document.cursorOffset() <= end) {
-                cursorLine = index;
-                cursorColumn = document.cursorOffset() - consumed;
-                break;
-            }
-            consumed = end + 1;
-        }
-        int scroll = Math.max(0, cursorLine - area.height() + 1);
+        int activeLine = document.editing() ? document.cursorLine() : document.selectedLine();
+        int cursorColumn = document.cursorColumn();
+        int scroll = Math.max(0, activeLine - area.height() + 1);
         int numberWidth = Integer.toString(lines.length).length();
         int limit = Math.min(lines.length, scroll + area.height());
         for (int index = scroll; index < limit; index++) {
             int y = area.y() + index - scroll;
             int x = area.x();
+            boolean active = index == activeLine;
+            Style activeBackground = theme.selection().bg()
+                    .map(color -> Style.EMPTY.bg(color))
+                    .orElse(Style.EMPTY);
+            if (active) {
+                frame.buffer().setStyle(new Rect(area.x(), y, area.width(), 1), activeBackground);
+            }
+            x += write(frame, x, y, active ? ">> " : "   ",
+                    active ? theme.label().bold().patch(activeBackground) : theme.base(), area);
             x += write(frame, x, y, pad(Integer.toString(index + 1), numberWidth) + " ",
-                    theme.muted(), area);
-            write(frame, x, y, lines[index], theme.base(), area);
-            if (document.editing() && index == cursorLine && x < area.right()) {
+                    (active ? theme.label().bold() : theme.muted()).patch(activeBackground), area);
+            renderYamlLine(frame, x, y, lines[index], theme, activeBackground, area);
+            if (document.editing() && index == document.scopeLine() && index != activeLine) {
+                frame.buffer().setStyle(new Rect(area.x(), y, area.width(), 1), theme.accent().bold());
+            }
+            if (document.editing() && index == activeLine && x < area.right()) {
                 String cursor = cursorColumn < lines[index].length()
                         ? String.valueOf(lines[index].charAt(cursorColumn)) : " ";
                 int cursorX = x + displayWidth(lines[index].substring(0, cursorColumn));
                 write(frame, cursorX, y, cursor, theme.accentBackground(), area);
             }
         }
+    }
+
+    private static void renderYamlLine(
+            Frame frame,
+            int x,
+            int y,
+            String text,
+            WorkbenchTheme theme,
+            Style rowBackground,
+            Rect area) {
+        Style[] styles = new Style[text.length()];
+        applyPattern(styles, text, YAML_COMMENT, theme.muted());
+
+        Matcher key = YAML_KEY.matcher(text);
+        if (key.find()) {
+            applyRange(styles, key.start(2), key.end(2), theme.label());
+            int colon = text.indexOf(':', key.end(2));
+            if (colon >= 0) {
+                applyRange(styles, colon, colon + 1, theme.base().bold());
+            }
+        }
+        applyPattern(styles, text, YAML_STRING_VALUE, theme.warning());
+        applyPatternGroup(styles, text, YAML_BOOLEAN_NULL, 1, theme.info());
+        applyPatternGroup(styles, text, YAML_NUMBER, 1, theme.info());
+
+        Matcher listMarker = YAML_LIST_MARKER.matcher(text);
+        if (listMarker.find()) {
+            applyRange(styles, listMarker.start(2), listMarker.end(2), theme.base().bold());
+        }
+        int colon = text.indexOf(':');
+        if (colon >= 0 && colon + 1 < text.length()) {
+            int valueStart = colon + 1;
+            while (valueStart < text.length() && text.charAt(valueStart) == ' ') {
+                valueStart++;
+            }
+            boolean styledValue = false;
+            for (int index = valueStart; index < text.length(); index++) {
+                if (styles[index] != null) {
+                    styledValue = true;
+                    break;
+                }
+            }
+            if (!styledValue) {
+                applyRange(styles, valueStart, text.length(), theme.warning());
+            }
+        }
+
+        int offset = 0;
+        while (offset < text.length() && x < area.right()) {
+            Style style = styles[offset] == null ? theme.base() : styles[offset];
+            int end = offset + 1;
+            while (end < text.length() && Objects.equals(styles[end], styles[offset])) {
+                end++;
+            }
+            x += write(frame, x, y, text.substring(offset, end), style.patch(rowBackground), area);
+            offset = end;
+        }
+    }
+
+    private static void applyPattern(Style[] styles, String text, Pattern pattern, Style style) {
+        Matcher matcher = pattern.matcher(text);
+        while (matcher.find()) {
+            applyRange(styles, matcher.start(), matcher.end(), style);
+        }
+    }
+
+    private static void applyPatternGroup(
+            Style[] styles, String text, Pattern pattern, int group, Style style) {
+        Matcher matcher = pattern.matcher(text);
+        while (matcher.find()) {
+            applyRange(styles, matcher.start(group), matcher.end(group), style);
+        }
+    }
+
+    private static void applyRange(Style[] styles, int start, int end, Style style) {
+        for (int index = start; index < end && index < styles.length; index++) {
+            if (styles[index] == null) {
+                styles[index] = style;
+            }
+        }
+    }
+
+    private static void renderDiscardPopup(Frame frame, Rect area, WorkbenchTheme theme) {
+        int width = Math.min(44, Math.max(40, area.width() - 4));
+        width = Math.min(width, area.width() - 2);
+        int height = 6;
+        Rect popup = new Rect(
+                area.x() + Math.max(0, (area.width() - width) / 2),
+                area.y() + Math.max(0, (area.height() - height) / 2),
+                width,
+                height);
+        frame.renderWidget(Clear.INSTANCE, popup);
+        Block block = Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(theme.warning())
+                .title(Title.from(Line.from(Span.styled(
+                        " Discard Changes? ", theme.warning().bold()))))
+                .build();
+        frame.renderWidget(block, popup);
+        Rect inner = block.inner(popup);
+        writeCentered(frame, inner, inner.y() + 1, "Unsaved changes will be lost.", theme.base());
+        writeCentered(frame, inner, inner.y() + 3, "Enter confirm    Esc cancel", theme.base());
     }
 
     private static void renderOverview(
@@ -583,11 +704,9 @@ final class WorkbenchRenderer {
         for (int index = scroll; index < limit; index++) {
             WorkbenchArtifactRow row = sortedRows.get(index);
             String line = columns.format(
-                    row.key().kind(),
                     row.key().id(),
                     words(row.alignment()),
-                    localMarker(row),
-                    remoteMarker(row));
+                    localMarker(row));
             int y = area.y() + 1 + index - scroll;
             Style style = index == selected ? theme.selection() : theme.base();
             int width = write(frame, area.x(), y, line, style, area);
@@ -606,8 +725,7 @@ final class WorkbenchRenderer {
             WorkbenchTheme theme) {
         int x = area.x();
         WorkbenchSortColumn[] sortColumns = WorkbenchSortColumn.values();
-        int[] widths = {columns.kind(), columns.identifier(), columns.alignment(),
-                columns.local(), columns.remote()};
+        int[] widths = {columns.identifier(), columns.alignment(), columns.local()};
         for (int index = 0; index < sortColumns.length; index++) {
             WorkbenchSortColumn column = sortColumns[index];
             boolean active = column == table.sortColumn();
@@ -623,11 +741,9 @@ final class WorkbenchRenderer {
     static List<WorkbenchArtifactRow> sorted(
             List<WorkbenchArtifactRow> rows, WorkbenchTableState table) {
         Comparator<WorkbenchArtifactRow> comparator = switch (table.sortColumn()) {
-            case KIND -> Comparator.comparing(row -> row.key().kind(), String.CASE_INSENSITIVE_ORDER);
             case IDENTIFIER -> Comparator.comparing(row -> row.key().id(), String.CASE_INSENSITIVE_ORDER);
             case ALIGNMENT -> Comparator.comparing(row -> words(row.alignment()), String.CASE_INSENSITIVE_ORDER);
             case LOCAL -> Comparator.comparing(WorkbenchRenderer::localMarker, String.CASE_INSENSITIVE_ORDER);
-            case REMOTE -> Comparator.comparingInt(row -> row.remote().size());
         };
         comparator = comparator
                 .thenComparing(row -> row.key().kind(), String.CASE_INSENSITIVE_ORDER)
@@ -655,7 +771,7 @@ final class WorkbenchRenderer {
         return switch (remote) {
             case WorkbenchRemoteState.Available available -> available.artifactCount() == 0
                     ? "Remote workspace is empty"
-                    : "Remote artifacts: " + available.artifactCount();
+                    : "";
             case WorkbenchRemoteState.NotConfigured ignored -> "No context selected";
             case WorkbenchRemoteState.SignedOut ignored -> "Signed out";
             case WorkbenchRemoteState.Offline ignored -> "Server offline";
@@ -709,6 +825,13 @@ final class WorkbenchRenderer {
     }
 
     private static List<FooterHint> workspaceFooter(WorkbenchState state) {
+        if (state.workspaceView().document()
+                .map(WorkbenchWorkspaceState.Document::pendingDiscard)
+                .orElse(false)) {
+            return List.of(
+                    new FooterHint("Enter", "confirm"),
+                    new FooterHint("Esc", "cancel"));
+        }
         if (state.workspaceView().editing()) {
             return List.of(
                     new FooterHint("↑↓←→", "navigate"),
@@ -814,14 +937,6 @@ final class WorkbenchRenderer {
                 : first + " (+" + (row.local().size() - 1) + ')';
     }
 
-    private static String remoteMarker(WorkbenchArtifactRow row) {
-        return switch (row.remote().size()) {
-            case 0 -> "-";
-            case 1 -> "remote";
-            default -> row.remote().size() + " remote";
-        };
-    }
-
     private static String emptyRowsMessage(WorkbenchState.WorkbenchTab tab) {
         return switch (tab) {
             case OVERVIEW -> "No overview data.";
@@ -863,6 +978,19 @@ final class WorkbenchRenderer {
             return fileName == null ? "-" : fileName.toString();
         }
         return normalized.toString();
+    }
+
+    private static String fileName(Path path) {
+        Path name = path.normalize().getFileName();
+        return name == null ? "-" : name.toString();
+    }
+
+    private static void writeNotification(
+            Frame frame, int x, int y, WorkbenchState state, WorkbenchTheme theme, Rect area) {
+        String notification = notification(state);
+        if (!notification.isBlank()) {
+            write(frame, x, y, notification, notificationStyle(state, theme), area);
+        }
     }
 
     private static String words(Enum<?> value) {
@@ -1020,37 +1148,29 @@ final class WorkbenchRenderer {
     }
 
     private record Columns(
-            int kind,
             int identifier,
             int alignment,
             int local,
-            int remote,
             String separator) {
 
         static Columns forWidth(int width, boolean wide) {
             if (wide) {
-                int remote = Math.max(8, width - 14 - 36 - 18 - 55 - 12);
-                return new Columns(14, 36, 18, 55, remote, " | ");
+                int local = Math.max(24, width - 40 - 18 - 6);
+                return new Columns(40, 18, local, " | ");
             }
-            int remote = 8;
-            int local = Math.max(12, Math.min(30, width / 3));
-            int kind = 8;
+            int local = Math.max(16, Math.min(34, width / 3));
             int alignment = 14;
-            int identifier = Math.max(12, width - kind - alignment - local - remote - 4);
-            return new Columns(kind, identifier, alignment, local, remote, " ");
+            int identifier = Math.max(12, width - alignment - local - 2);
+            return new Columns(identifier, alignment, local, " ");
         }
 
         String format(
-                String kindValue,
                 String idValue,
                 String alignmentValue,
-                String localValue,
-                String remoteValue) {
-            return pad(kindValue, kind)
-                    + separator + pad(idValue, identifier)
+                String localValue) {
+            return pad(idValue, identifier)
                     + separator + pad(alignmentValue, alignment)
-                    + separator + pad(localValue, local)
-                    + separator + pad(remoteValue, remote);
+                    + separator + pad(localValue, local);
         }
     }
 }

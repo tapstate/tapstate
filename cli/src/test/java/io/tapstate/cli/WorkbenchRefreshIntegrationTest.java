@@ -195,14 +195,39 @@ class WorkbenchRefreshIntegrationTest {
                     .hasValueSatisfying(document -> {
                         assertThat(document.relativePath()).isEqualTo(Path.of("pipeline/orders.tap.yml"));
                         assertThat(document.editing()).isFalse();
+                        assertThat(document.selectedLine()).isZero();
                     });
+            assertThat(runtime.state().workspaceView().focus())
+                    .isEqualTo(WorkbenchWorkspaceState.Focus.VIEWER);
+
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.DOWN), null)).isTrue();
+            assertThat(runtime.state().workspaceView().document())
+                    .hasValueSatisfying(document -> assertThat(document.selectedLine()).isEqualTo(1));
 
             assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.F4), null)).isTrue();
             assertThat(session.handleEvent(KeyEvent.ofChar('#'), null)).isTrue();
+            assertThat(runtime.state().workspaceView().document())
+                    .hasValueSatisfying(document -> {
+                        assertThat(document.content()).contains("#kind: Pipeline");
+                        assertThat(document.pendingDiscard()).isFalse();
+                    });
+
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ESCAPE), null)).isTrue();
+            assertThat(runtime.state().workspaceView().document())
+                    .hasValueSatisfying(document -> {
+                        assertThat(document.editing()).isTrue();
+                        assertThat(document.pendingDiscard()).isTrue();
+                    });
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ESCAPE), null)).isTrue();
+            assertThat(runtime.state().workspaceView().document())
+                    .hasValueSatisfying(document -> {
+                        assertThat(document.editing()).isTrue();
+                        assertThat(document.pendingDiscard()).isFalse();
+                    });
             assertThat(session.handleEvent(KeyEvent.ofChar('s', KeyModifiers.CTRL), null)).isTrue();
 
             assertThat(savedPath).hasValue(Path.of("pipeline/orders.tap.yml"));
-            assertThat(savedContent.get()).startsWith("#apiVersion: tapstate/v1");
+            assertThat(savedContent.get()).contains("#kind: Pipeline");
             assertThat(runtime.state().workspaceView().document())
                     .hasValueSatisfying(document -> {
                         assertThat(document.editing()).isTrue();

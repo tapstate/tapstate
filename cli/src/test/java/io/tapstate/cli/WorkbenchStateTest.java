@@ -62,16 +62,16 @@ class WorkbenchStateTest {
         WorkbenchState state = accepted(snapshot(3, 7, 2, 2, 2))
                 .select(WorkbenchState.WorkbenchTab.SOURCES);
 
-        assertThat(state.sourcesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.KIND);
-        state = state.reduce(KeyEvent.ofChar('s'), 4);
         assertThat(state.sourcesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.IDENTIFIER);
+        state = state.reduce(KeyEvent.ofChar('s'), 4);
+        assertThat(state.sourcesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.ALIGNMENT);
         assertThat(state.sourcesTable().sortReversed()).isFalse();
 
         state = state.reduce(KeyEvent.ofChar('S'), 4);
-        assertThat(state.sourcesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.IDENTIFIER);
+        assertThat(state.sourcesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.ALIGNMENT);
         assertThat(state.sourcesTable().sortReversed()).isTrue();
-        assertThat(state.workspaceTable().sortColumn()).isEqualTo(WorkbenchSortColumn.KIND);
-        assertThat(state.pipelinesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.KIND);
+        assertThat(state.workspaceTable().sortColumn()).isEqualTo(WorkbenchSortColumn.IDENTIFIER);
+        assertThat(state.pipelinesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.IDENTIFIER);
     }
 
     @Test
@@ -188,6 +188,29 @@ class WorkbenchStateTest {
 
         assertThat(unchanged).isSameAs(awaiting);
         assertThat(unchanged.snapshot()).isEmpty();
+    }
+
+    @Test
+    void dirtyWorkspaceEditRequiresConfirmationBeforeDiscarding() {
+        WorkbenchWorkspaceState workspace = WorkbenchWorkspaceState.empty()
+                .open(java.nio.file.Path.of("source/orders.tap.yml"), "kind: Source\n")
+                .edit()
+                .edit(KeyEvent.ofChar('#'))
+                .requestCancelEdit();
+
+        assertThat(workspace.editing()).isTrue();
+        assertThat(workspace.document()).hasValueSatisfying(document -> {
+            assertThat(document.dirty()).isTrue();
+            assertThat(document.pendingDiscard()).isTrue();
+        });
+
+        WorkbenchWorkspaceState discarded = workspace.edit(KeyEvent.ofKey(KeyCode.ENTER));
+        assertThat(discarded.editing()).isFalse();
+        assertThat(discarded.document()).hasValueSatisfying(document -> {
+            assertThat(document.content()).isEqualTo("kind: Source\n");
+            assertThat(document.dirty()).isFalse();
+            assertThat(document.pendingDiscard()).isFalse();
+        });
     }
 
     private static WorkbenchState accepted(WorkbenchSnapshot snapshot) {
