@@ -8,6 +8,7 @@ import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
@@ -166,6 +167,50 @@ class StoreBackedDagSourceTest {
         assertThat(store.derivedSchemas.latest("three", "events_src.events"))
                 .get().extracting(DerivedSchema::schema)
                 .isEqualTo(Map.of("e_id", "INT64 NULL", "kind", "STRING NULL"));
+    }
+
+    @Test
+    void every_step_records_the_model_it_derives_rather_than_only_the_nodes_that_read() {
+        // A pipeline with no join in it. A source node is recorded by the copy and a join step by the
+        // drift check - two of the eight node kinds - so a pipeline built out of the other six has a
+        // recorded model for what it reads and none for anything it does to it. Asserted shape by
+        // shape rather than by counting records: a walk that filed its upstream unchanged under each
+        // step id would satisfy "every step has one" while saying the dropped column is still there.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        Map<String, FieldRule> dropRegion = new LinkedHashMap<>();
+        dropRegion.put("region", FieldRule.drop());
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.MapProjection(dropRegion), null, null),
+                        filter("keep_even", "row.id % 2 == 0", FromRef.literal("trimmed"))),
+                null,
+                serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("region", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(store.derivedSchemas.latest("p", "orders_src.orders"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL", "region", "STRING NULL"));
+        assertThat(store.derivedSchemas.latest("p", "trimmed"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+        // A step that reshapes nothing still records. What a reader asks of a step is what the
+        // pipeline produces there, and a step with no record answers that nobody ever derived one -
+        // which is the same answer a step that failed to derive gives.
+        assertThat(store.derivedSchemas.latest("p", "keep_even"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
     }
 
     @Test

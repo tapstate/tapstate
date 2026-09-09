@@ -88,6 +88,7 @@ final class StoreBackedDagSource implements DagSource {
     private final StoreReachability storeReachability;
     private final JoinSchemaDrift joinSchemaDrift;
     private final SourceSchemaCopy sourceSchemaCopy;
+    private final StepSchemaRecord stepSchemaRecord;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -160,6 +161,7 @@ final class StoreBackedDagSource implements DagSource {
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
         this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
         this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
+        this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
     }
 
     @Override
@@ -197,6 +199,12 @@ final class StoreBackedDagSource implements DagSource {
         // with whatever was recorded most recently instead - the two agree right up to the moment
         // somebody records a new shape, which is the only moment the question is worth asking.
         derivedSteps.addAll(compiledJoins.keySet());
+        // Every other step's own model, worked out from the copies above and from each other. Without
+        // this a pipeline records what it reads and what it joins, and nothing for the steps in
+        // between - so a reader asking what it produces at one of those cannot tell a step whose model
+        // was never derived from a step that could not be described.
+        derivedSteps.addAll(deriveStepSchemas(pipelineId, pipeline, sourceVertices, sourceKeyByTable,
+                sourceKeysById, stepIds, compiledJoins));
         pinWhatThisRunHolds(pipelineId, derivedSteps);
         // A nest or a join emits under the id of the step that produced it rather than under a table name,
         // so the resolution above - which answers per source table - says nothing about it. Registering it
@@ -537,6 +545,115 @@ final class StoreBackedDagSource implements DagSource {
             }
         }
         return null;
+    }
+
+    /**
+     * Derives what every transform step of this pipeline produces and files it beside the pipeline,
+     * answering the step ids that got a record.
+     *
+     * <p><b>A second walk over the same graph, deliberately.</b> The one above answers what a single
+     * source table's rows look like where a terminal reads them, because that is what a target table is
+     * built to; this one answers what a node produces, which is what a reader asking about the
+     * pipeline's shape is asking. A step merging two streams has one answer to this question and one
+     * per stream to the other, so neither walk can be made to serve both without one of them becoming
+     * wrong.
+     *
+     * <p><b>A join is derived here and recorded elsewhere.</b> The drift check above records it, having
+     * first held it to what it produced before; recording it again here would append a second version
+     * of a shape that did not move. It is still derived, because a step reading a join needs its
+     * columns.
+     *
+     * <p><b>Fixed point rather than a topological sort.</b> Steps are declared in whatever order the
+     * author wrote them, so a single pass can meet a step before its upstream. Passing until nothing
+     * new resolves reaches the same answer without anything having to order the graph, and leaves a
+     * step whose inputs never resolve simply unrecorded - which is the same reading a source table
+     * nothing has discovered gets.
+     */
+    // ponytail: O(steps^2) worst case; a pipeline with enough steps for that to be felt wants a
+    // topological order instead.
+    private List<String> deriveStepSchemas(
+            String pipelineId, PipelineResource pipeline, Map<String, SourceVertex> sourceVertices,
+            Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
+            Set<String> stepIds, Map<String, CompiledJoin> compiledJoins) {
+        List<Step.Inline> steps = new ArrayList<>();
+        for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
+            if (step instanceof Step.Inline inline) {
+                steps.add(inline);
+            }
+        }
+        Map<String, NodeColumns> derived = new LinkedHashMap<>();
+        // Seeded with the joins so that a step reading one can be worked out; they are not recorded
+        // again below.
+        compiledJoins.forEach((stepId, compiled) ->
+                derived.put(stepId, NodeColumns.of(compiled.body(), Map.of(), compiled.plan())));
+        List<String> recorded = new ArrayList<>();
+        boolean progressed = true;
+        while (progressed) {
+            progressed = false;
+            for (Step.Inline step : steps) {
+                if (derived.containsKey(step.id())) {
+                    continue;
+                }
+                Map<String, NodeColumns> inputs = inputsOf(pipelineId, step, sourceVertices,
+                        sourceKeyByTable, sourceKeysById, stepIds, derived);
+                if (inputs == null) {
+                    continue;
+                }
+                NodeColumns columns = NodeColumns.of(step.body(), inputs, null);
+                derived.put(step.id(), columns);
+                progressed = true;
+                if (stepSchemaRecord.record(pipelineId, step.id(), columns, inputs, step.body())) {
+                    recorded.add(step.id());
+                }
+            }
+        }
+        return recorded;
+    }
+
+    /**
+     * What reaches one step, keyed by the reference the author wrote it under, or null while any of
+     * those references cannot be answered yet.
+     *
+     * <p><b>Keyed by the reference rather than by what it resolves to</b>, because a nest names its root
+     * by that reference and has to find it here. One reference resolving to several source tables - a
+     * multi-table source, a regex - arrives as their merge, which is what a node reading that reference
+     * receives.
+     *
+     * <p>A nest whose root is not among these keys is left unrecorded rather than derived: this walk
+     * only writes down what the assembly already works out, and a recorder is not the thing that should
+     * refuse an assembly that otherwise builds.
+     */
+    private Map<String, NodeColumns> inputsOf(
+            String pipelineId, Step.Inline step, Map<String, SourceVertex> sourceVertices,
+            Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
+            Set<String> stepIds, Map<String, NodeColumns> derived) {
+        Map<String, NodeColumns> inputs = new LinkedHashMap<>();
+        for (FromRef ref : refsOf(step.from())) {
+            List<NodeColumns> reached = new ArrayList<>();
+            for (String key : upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
+                SourceVertex vertex = sourceVertices.get(key);
+                NodeColumns columns = vertex != null ? copiedColumns(pipelineId, vertex) : derived.get(key);
+                if (columns == null) {
+                    return null;
+                }
+                reached.add(columns);
+            }
+            if (reached.isEmpty()) {
+                return null;
+            }
+            inputs.put(referenceOf(ref), NodeColumns.merged(reached));
+        }
+        if (inputs.isEmpty()
+                || (step.body() instanceof TransformBody.Nest nest
+                        && !inputs.containsKey(nest.root().from()))) {
+            return null;
+        }
+        return inputs;
+    }
+
+    /** The text a reference was written as, which is the name a nest's root is declared under. */
+    private static String referenceOf(FromRef ref) {
+        return ref instanceof FromRef.Literal literal ? literal.ref() : ((FromRef.Regex) ref).pattern();
     }
 
     /** This pipeline's own copy of one source table's model, as a node's columns. */
