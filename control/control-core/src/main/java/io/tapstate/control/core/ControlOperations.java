@@ -64,8 +64,8 @@ public final class ControlOperations {
                     + "version has moved on, if another resource still references the id, or if the id is a "
                     + "pipeline that is not stopped.");
 
-    // Source CRUD remains available to the authenticated REST face while its MCP projection is retired.
-    // The draft operation is the only Source operation exposed to MCP.
+    // Source mutations and single-resource reads remain off MCP; source.list and source.draft are the
+    // read-only Source operations exposed to model-facing clients.
     public static final Operation SOURCE_CREATE = new Operation(
             "source.create", Scope.WRITE, true, ControlApiSchema.ref("source.create"),
             "Create and persist one Source through the Server control API.", CLI_ONLY);
@@ -75,7 +75,7 @@ public final class ControlOperations {
                     + " This does not create an artifact or audit record.");
     public static final Operation SOURCE_LIST = new Operation(
             "source.list", Scope.READ, false, ControlApiSchema.ref("source.list"),
-            "List Sources with secret-redacted config and configured-secret field names.", CLI_ONLY);
+            "List Sources with secret-redacted config and configured-secret field names.", CLI_AND_MCP);
     public static final Operation SOURCE_GET = new Operation(
             "source.get", Scope.READ, false, ControlApiSchema.ref("source.get"),
             "Get one Source with secret-redacted config and configured-secret field names.", CLI_ONLY);
@@ -171,8 +171,8 @@ public final class ControlOperations {
     // pipeline's desired state (an intent the runtime later converges). There is no rewind verb — a re-dig
     // is stop then start composed at the surface.
     public static final Operation PIPELINE_LIST = new Operation(
-            "pipeline.list", Scope.READ, false, null,
-            "List static Pipeline artifacts with resolved Source summaries.", CLI_ONLY);
+            "pipeline.list", Scope.READ, false, ControlApiSchema.ref("pipeline.list"),
+            "List static Pipeline artifacts with resolved Source summaries.", CLI_AND_MCP);
     public static final Operation PIPELINE_GET = new Operation(
             "pipeline.get", Scope.READ, false, null,
             "Get one static Pipeline artifact with resolved Source summaries.", CLI_ONLY);
