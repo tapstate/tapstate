@@ -176,7 +176,7 @@ class McpOnlineControlIT {
                         .as("the Source list returned by the existing server list API")
                         .containsExactly("src_browse");
                 assertThat(((Map<?, ?>) sources.getFirst()).keySet().stream().map(String::valueOf).toList())
-                        .containsExactlyInAnyOrder("id", "metadata", "connector");
+                        .containsExactlyInAnyOrder("id", "connector");
 
                 send(input, """
                         {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
