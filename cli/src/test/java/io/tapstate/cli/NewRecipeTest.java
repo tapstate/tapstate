@@ -9,9 +9,12 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The first three recipes that write a workspace: {@code sample}, {@code mirrored-table} and
@@ -153,9 +156,11 @@ class NewRecipeTest {
                 .isEqualTo(BlankRecipe.bundled("source/example_source.tap.yml"));
         assertThat(Files.readString(ws.resolve("pipeline/example_pipeline.tap.yml")))
                 .isEqualTo(BlankRecipe.bundled("pipeline/example_pipeline.tap.yml"));
-        // the escape hatch writes exactly these two and nothing else - no .env, no .gitignore
+        assertThat(Files.readString(ws.resolve(".gitignore"))).isEqualTo(".env\n");
+        // The skeleton tells its reader to put a password in .env, so the escape hatch must keep that
+        // future file out of a routine `git add .` even though it does not create the secret itself.
         try (var entries = Files.list(ws)) {
-            assertThat(entries).hasSize(2);
+            assertThat(entries).hasSize(3);
         }
     }
 
@@ -196,6 +201,19 @@ class NewRecipeTest {
                 + "  source/orders_src.tap.yml  source orders_src: mysql, cdc\n"
                 + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed primary_key: id;");
         assertThat(r.out()).contains("\n  .env  ").contains("\n  .gitignore  ");
+    }
+
+    @Test
+    void secretEnvIsOwnerReadWriteOnlyWherePosixPermissionsExist(@TempDir Path home, @TempDir Path ws)
+            throws IOException {
+        assertThat(mirrored(home, ws).code()).isZero();
+
+        Path env = ws.resolve(".env");
+        assumeTrue(Files.getFileAttributeView(env, PosixFileAttributeView.class) != null,
+                "a filesystem without POSIX permissions cannot express owner-only mode");
+
+        assertThat(Files.getPosixFilePermissions(env))
+                .containsExactlyInAnyOrder(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
     }
 
     /**
