@@ -80,8 +80,14 @@ public enum SystemCollections {
             Strategy.IMMUTABLE, 0, Kind.GRIDFS_BUCKET,
             new IndexSpec(List.of("metadata.connectorId"), false)),
 
-    /** One coordination record per mining chain. Another line owns how this one evolves. */
-    SRS_META(MongoStorePort.SRS_META, Database.STORE, MongoSrsMetaStore.class, Strategy.OWNED_ELSEWHERE, 0),
+    /**
+     * One coordination record per mining chain. Another line owns what this record means and how its
+     * shape moves on, and changesets here still leave that alone. What they do reach is a value an
+     * earlier build of this product wrote into it and no longer stands behind: the positions it made up
+     * before anything asked a connector for one. Erasing those is not a say in how the record evolves,
+     * and it cannot be done from the outside, so it is done here.
+     */
+    SRS_META(MongoStorePort.SRS_META, Database.STORE, MongoSrsMetaStore.class, Strategy.MIGRATED, 0),
 
     /**
      * The one document recording which schema version the store has been brought to, and the lock the
