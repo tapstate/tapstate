@@ -166,7 +166,7 @@ def full_suite(arguments):
         arguments = arguments[1:]
         executable = Path(arguments[0]).name
     if executable == 'ci-shard.sh':
-        return len(arguments) > 1 and arguments[1] == 'run'
+        return 'shards' if len(arguments) > 1 and arguments[1] == 'run' else False
     if executable not in ('mvn', 'mvnw'):
         return False
     args = arguments[1:]
@@ -180,7 +180,12 @@ def full_suite(arguments):
     for index, arg in enumerate(args):
         if arg in ('-f', '--file') and index + 1 < len(args) and args[index + 1] not in ('pom.xml', './pom.xml'):
             return False
-    return True
+    return 'maven'
+
+
+def matrix_job(text, job):
+    body = re.search(r'^  ' + re.escape(job) + r':[^\n]*\n(.*?)(?=^  [\w-]+:|\Z)', text, re.M | re.S)
+    return bool(body and re.search(r'^\s+matrix:', body[1], re.M))
 
 
 try:
@@ -191,7 +196,14 @@ try:
         events, body = triggers(text)
         if not events & {'push', 'pull_request'}:
             continue
-        calls = [(job, line) for job, line, script in runs(text) for command in commands(script) if full_suite(command)]
+        calls = []
+        for job, line, script in runs(text):
+            for command in commands(script):
+                suite = full_suite(command)
+                if suite == 'maven' and matrix_job(text, job):
+                    raise ValueError(f'{path.name}:{job}:{line}: full-reactor Maven matrix repeats tests; use the shard driver')
+                if suite:
+                    calls.append((job, line))
         locations.extend(f'{path.name}:{job}:{line}' for job, line in calls)
         if calls and push_overlaps_pr(events, body):
             overlapping.append(path.name)
