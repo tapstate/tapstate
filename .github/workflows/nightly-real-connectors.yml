@@ -1,130 +1,194 @@
-# Real-connector witness lane.
-#
-# Runs the real-connector end-to-end witnesses across both fidelity tiers: the product embedded in the
-# test JVM, and the shipped boot jar in its own process. They drive real Tapdata connectors, so they
-# need a Docker daemon for the databases and the connectors' runtime jars. Which connectors is the
-# build script's default list rather than anything named here, so the two cannot drift. The default
-# CI build skips them (no jars); this lane is where they are meant to run.
-#
-# The witnesses come in two shapes and this lane runs both, because neither shape can stand in for the
-# other. Most are declarative examples, swept by PublishedExamplesIT; the rest are bespoke classes, for
-# the claims the specification vocabulary cannot yet spell. A lane that ran only one shape would report
-# green over the other having never run.
-#
-# Each shape gets the gate that fits it, and the two catch different absences:
-#   - the manifest gate reads the swept examples name by name, so a skipped or never-discovered example
-#     fails rather than being summed away;
-#   - the count check covers the bespoke classes, which no manifest lists.
-#
-# The bespoke selector is a pattern rather than a list of names. It used to name two witnesses, which is
-# how five nest witnesses came to be written, committed, documented with their own run instructions - and
-# never run by anything. A list has to be edited by whoever adds a witness, and nothing fails when they do
-# not: the new witness simply never runs, and its absence looks exactly like a lane that had nothing to
-# do. Three product faults sat behind those five, each one enough on its own to stop a nest reaching a
-# real sink.
-#
-# The jars are built here from the connectors' own source. They used to be named as a directory somebody
-# had staged on the runner by hand, which is what kept this lane unscheduled: a nightly cannot depend on
-# a person having put files somewhere first. Building them makes a run self-sufficient, so the schedule
-# below is live.
-#
-# Every way this can go wrong is red rather than skipped. A clone or build failure stops the job; the
-# connector gate fails rather than skips when the staged directory does not resolve both jars; and the
-# Docker gate fails rather than skips in CI. A lane whose whole purpose is running the real thing must
-# never report green having run nothing.
+# Real connectors run on both fidelity tiers. The source pattern drives both the
+# exact shard selectors and the aggregate expectation; a new witness joins automatically.
 name: Real connectors
 
 on:
   workflow_dispatch:
   schedule:
-    # Off the hour on purpose: GitHub queues scheduled runs, and the top of an hour is when everyone
-    # else's are queued too, so an on-the-hour schedule is the one most likely to start late.
     - cron: "30 19 * * *"
 
 concurrency:
-  group: real-connectors-${{ github.ref }}
+  group: real-connectors-sharded-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  real-connectors:
+  connector-plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: A JDK 17 for the connectors, whose pinned Lombok predates JDK 21
-        # Their build dies mid-reactor under a newer JDK, on a javac internal that names nothing about
-        # Lombok. Installed first so its JAVA_HOME can be captured while it is the current one; the
-        # product's own JDK is set up after this and takes JAVA_HOME back.
+      - name: Plan all source-selected connector witnesses
+        run: .github/scripts/connector-witnesses.sh plan --durations .github/connector-test-durations.json --output "$RUNNER_TEMP/connector-shards.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-shard-plan
+          path: ${{ runner.temp }}/connector-shards.json
+          if-no-files-found: error
+
+  connector-jars:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Connector JDK compatible with its pinned Lombok
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - run: echo "TAPSTATE_CONNECTOR_JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          cache: maven
+          cache-dependency-path: |
+            **/pom.xml
+            .github/scripts/connector-cache.sh
+            scripts/build-real-connectors.sh
+            .github/maven-settings-connectors.xml
+      - name: Seed isolated connector dependencies
+        run: |
+          mkdir -p "$HOME/.m2/repository" "$RUNNER_TEMP/connector-m2"
+          rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$HOME/.m2/repository/" "$RUNNER_TEMP/connector-m2/"
+      - name: Resolve current upstream source
+        id: source
+        run: |
+          git clone --depth 1 https://github.com/tapdata/tapdata-connectors.git "$RUNNER_TEMP/connector-source"
+          echo "sha=$(git -C "$RUNNER_TEMP/connector-source" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # These are remote dependencies only. prepare always refreshes their snapshot
+      # metadata and checks resolved bytes before a cached connector jar is eligible.
+      - name: Restore remote PDK dependencies
+        uses: actions/cache/restore@v4
+        id: pdk
+        with:
+          path: ${{ runner.temp }}/connector-m2/io/tapdata
+          key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
+      - name: Resolve current snapshot artifacts
+        id: inputs
+        run: |
+          .github/scripts/connector-cache.sh prepare --checkout "$RUNNER_TEMP/connector-source" --repo-local "$RUNNER_TEMP/connector-m2" --output "$RUNNER_TEMP/connector-inputs.json"
+          echo "key=$(.github/scripts/connector-cache.sh key --manifest "$RUNNER_TEMP/connector-inputs.json")" >> "$GITHUB_OUTPUT"
+      # Reuse delays discovering faults outside the resolved source/snapshot inputs.
+      # A miss also means possible cache eviction, not necessarily an upstream change.
+      - uses: actions/cache/restore@v4
+        id: jars
+        with:
+          path: ${{ runner.temp }}/connectors
+          key: ${{ steps.inputs.outputs.key }}
+      - name: Build current connector jars on a miss
+        if: steps.jars.outputs.cache-hit != 'true'
+        env:
+          MAVEN_ARGS: -nsu -Dmaven.repo.local=${{ runner.temp }}/connector-m2
+        run: |
+          scripts/build-real-connectors.sh --checkout "$RUNNER_TEMP/connector-source" "$RUNNER_TEMP/connectors"
+          .github/scripts/connector-cache.sh seal --checkout "$RUNNER_TEMP/connector-source" --manifest "$RUNNER_TEMP/connector-inputs.json" --repo-local "$RUNNER_TEMP/connector-m2" --jars "$RUNNER_TEMP/connectors"
+      - name: Verify exact connector jar evidence
+        run: .github/scripts/connector-cache.sh verify --manifest "$RUNNER_TEMP/connector-inputs.json" --jars "$RUNNER_TEMP/connectors"
+      - uses: actions/cache/save@v4
+        if: steps.jars.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/connectors
+          key: ${{ steps.inputs.outputs.key }}
+      - name: Cache verified remote PDK dependencies
+        if: steps.pdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/connector-m2/io/tapdata
+          key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
+      - name: Retain only third-party Maven dependencies
+        if: always()
+        run: rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$RUNNER_TEMP/connector-m2/" "$HOME/.m2/repository/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-jars
+          path: ${{ runner.temp }}/connectors
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
+  connector-witnesses:
+    needs: [connector-plan, connector-jars]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]
+    env:
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
           cache: maven
-      - name: Build the connector jars from source
-        # Shares the Maven cache the product build restores above. On a cold cache this step is minutes
-        # of downloads rather than of compiling - the connectors pull a large dependency graph, and the
-        # MySQL one builds a vendored Debezium.
-        #
-        # No --modules: this lane wants the script's default list, which is the set its witnesses drive.
-        # The catalog refresh passes its own list, derived from the probe manifest.
-        run: scripts/build-real-connectors.sh "${{ runner.temp }}/connectors"
-      - name: Real-connector witnesses on both tiers
-        # Docker 29 rejects the API version testcontainers negotiates by default, so pin it. The surefire
-        # selector matches nothing, so only the failsafe witnesses run: the example sweep, and the bespoke
-        # classes the pattern names. With the connectors directory named, the sweep's gate turns the
-        # real-connector examples from skipped to mandatory.
-        run: >
-          mvn -B -pl e2e -am verify
-          -Dapi.version=1.44
-          -Dtapstate.e2e.connectors-dir="${{ runner.temp }}/connectors"
-          -Dtest=ZzzNoSuchSurefireSelector -Dsurefire.failIfNoSpecifiedTests=false
-          -Dit.test=PublishedExamplesIT,RealMysqlToMongo*IT,Nest*IT,DataBrowser*IT,Watch*IT,AnObjectIdReadsBackTheSameThroughBothFacesIT,SinkValueRoundTripIT
-          -Dfailsafe.failIfNoSpecifiedTests=false
-      # The scene each failing example left behind, before its containers went away. This lane is where
-      # the examples actually run - the default CI build skips them for want of connector jars - so it is
-      # the lane whose failures are worth a scene, and the one where a second run to add a print statement
-      # costs another connector build. Uploaded on failure only, and the collector writes no address: these
-      # artifacts leave a public repository and a connection uri carries its credentials inside it.
+      - uses: actions/download-artifact@v4
+        with:
+          name: connector-shard-plan
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: connector-jars
+          path: ${{ runner.temp }}/connectors
+      - name: Seed isolated Maven dependencies
+        run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - name: Install the reactor without executing tests
+        run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Run this exact connector witness shard
+        # Docker 29 requires a newer API than the pinned testcontainers default.
+        env:
+          MAVEN_ARGS: -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=${{ runner.temp }}/connectors
+        run: .github/scripts/connector-witnesses.sh run --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+      - name: Admit reports and the sweep's witness ledger
+        run: .github/scripts/connector-witnesses.sh pack --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/connector-results/$SHARD"
+      - name: Retain only third-party Maven dependencies
+        if: always()
+        run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/connector-results
+          if-no-files-found: error
+          retention-days: 7
       - name: The scene where an end-to-end case failed
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-failure-scenes
-          path: e2e/target/failure-scenes/
+          name: connector-failure-${{ matrix.shard }}
+          path: |
+            e2e/target/failure-scenes/
+            e2e/target/failsafe-reports/
+            e2e/target/witness-ledger.txt
+            e2e/target/witness-ledgers/
           if-no-files-found: ignore
           retention-days: 7
 
+  # Release gates require this exact non-matrix name, including on missing shards.
+  real-connectors:
+    needs: [connector-plan, connector-witnesses]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: connector-shard-plan
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: connector-results-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/connector-results
+      - name: Globally admit every witness and its exact ledger
+        run: .github/scripts/connector-witnesses.sh verify --plan "$RUNNER_TEMP/connector-shards.json" --artifacts "$RUNNER_TEMP/connector-results" --restore .
+      - name: Require successful shard jobs
+        env:
+          SHARD_RESULT: ${{ needs.connector-witnesses.result }}
+        run: test "$SHARD_RESULT" = success
       - name: Witness gate
-        # Aggregate counts cannot see a witness that never ran; this reads the manifest name by name
-        # against the ledger the sweep wrote, and fails on absence. It covers the swept examples only -
-        # the bespoke classes are in no manifest, which is what the next step is for.
         run: .github/scripts/witness-gate.sh
-      - name: Every witness the pattern names actually ran
-        # The run above tolerates a selector matching nothing, because the reactor builds modules holding
-        # no integration tests at all. That tolerance is also the one way this lane can report green having
-        # run nothing, which is the outcome it exists to prevent - so the count is checked rather than
-        # trusted. The expectation is derived from the same pattern the selector uses, so adding a witness
-        # needs no edit here, while narrowing the selector past a witness that still exists fails.
-        #
-        # The sweep's own class is counted on both sides rather than left out: it writes a report like any
-        # other, so excluding it from the expectation would hand the count a spare report to cover a
-        # bespoke witness that did not run.
-        if: always()
-        run: |
-          expected=$(ls e2e/src/test/java/io/tapstate/e2e/PublishedExamplesIT.java \
-                        e2e/src/test/java/io/tapstate/e2e/RealMysqlToMongo*IT.java \
-                        e2e/src/test/java/io/tapstate/e2e/Nest*IT.java \
-                        e2e/src/test/java/io/tapstate/e2e/AnObjectIdReadsBackTheSameThroughBothFacesIT.java \
-                        e2e/src/test/java/io/tapstate/e2e/SinkValueRoundTripIT.java 2>/dev/null | wc -l | tr -d ' ')
-          ran=$(ls e2e/target/failsafe-reports/*.txt 2>/dev/null | wc -l | tr -d ' ')
-          echo "witness classes present: $expected, ran: $ran"
-          if [ "$ran" -lt "$expected" ]; then
-            echo "$expected witness classes are checked in and $ran ran: the selector no longer reaches them all" >&2
-            exit 1
-          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-aggregate
+          path: |
+            e2e/target/failsafe-reports/
+            e2e/target/witness-ledger.txt
+            e2e/target/witness-ledgers/
+          if-no-files-found: error
+          retention-days: 7
