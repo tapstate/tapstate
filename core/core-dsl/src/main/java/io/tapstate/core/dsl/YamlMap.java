@@ -108,11 +108,14 @@ final class YamlMap {
      * was left out. Leaving one out is a property of the document, so it comes back located like
      * every other malformed artifact -- passing the null on reaches a model record that null-checks
      * it, and the author is handed a NullPointerException naming an internal component instead.
+     *
+     * <p>Reports what {@link #requirePresent} reports, since the two differ only in whether the
+     * requirement is stated per field or per record. The field travels as its own parameter rather
+     * than inside a sentence, which is what lets it be matched on and rendered per locale.
      */
     <T> T require(String key, T value) {
         if (value == null) {
-            throw error(DslError.COMPOSITION, childPath(key), self,
-                    Map.of("detail", "required field '" + key + "' is missing"));
+            throw error(DslError.MISSING_FIELD, childPath(key), self, Map.of("field", key));
         }
         return value;
     }
