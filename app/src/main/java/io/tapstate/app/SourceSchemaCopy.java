@@ -76,7 +76,7 @@ final class SourceSchemaCopy {
      * the same reading the join side already takes of a discovered column. Writing NOT NULL instead
      * would be a claim nothing here can support.
      */
-    private static Map<String, String> columnsOf(SourceTable table) {
+    static Map<String, String> columnsOf(SourceTable table) {
         Map<String, String> columns = new LinkedHashMap<>();
         for (SourceField field : table.fields()) {
             columns.put(field.name(), JoinSchemaDrift.declaredType(field.type(), true));

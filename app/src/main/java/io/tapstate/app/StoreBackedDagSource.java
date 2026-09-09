@@ -57,6 +57,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -203,8 +204,9 @@ final class StoreBackedDagSource implements DagSource {
         // this a pipeline records what it reads and what it joins, and nothing for the steps in
         // between - so a reader asking what it produces at one of those cannot tell a step whose model
         // was never derived from a step that could not be described.
-        derivedSteps.addAll(deriveStepSchemas(pipelineId, pipeline, sourceVertices, sourceKeyByTable,
-                sourceKeysById, stepIds, compiledJoins));
+        derivedSteps.addAll(recordStepSchemas(pipelineId, pipeline,
+                deriveSteps(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds,
+                        compiledJoins, vertex -> copiedColumns(pipelineId, vertex))));
         pinWhatThisRunHolds(pipelineId, derivedSteps);
         // A nest or a join emits under the id of the step that produced it rather than under a table name,
         // so the resolution above - which answers per source table - says nothing about it. Registering it
@@ -571,10 +573,11 @@ final class StoreBackedDagSource implements DagSource {
      */
     // ponytail: O(steps^2) worst case; a pipeline with enough steps for that to be felt wants a
     // topological order instead.
-    private List<String> deriveStepSchemas(
-            String pipelineId, PipelineResource pipeline, Map<String, SourceVertex> sourceVertices,
+    private StepDerivations deriveSteps(
+            PipelineResource pipeline, Map<String, SourceVertex> sourceVertices,
             Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
-            Set<String> stepIds, Map<String, CompiledJoin> compiledJoins) {
+            Set<String> stepIds, Map<String, CompiledJoin> compiledJoins,
+            Function<SourceVertex, NodeColumns> sourceColumns) {
         List<Step.Inline> steps = new ArrayList<>();
         for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
             if (step instanceof Step.Inline inline) {
@@ -582,11 +585,11 @@ final class StoreBackedDagSource implements DagSource {
             }
         }
         Map<String, NodeColumns> derived = new LinkedHashMap<>();
-        // Seeded with the joins so that a step reading one can be worked out; they are not recorded
-        // again below.
+        // Seeded with the joins so that a step reading one can be worked out; they carry no entry in
+        // the inputs below and so are not recorded again here.
         compiledJoins.forEach((stepId, compiled) ->
                 derived.put(stepId, NodeColumns.of(compiled.body(), Map.of(), compiled.plan())));
-        List<String> recorded = new ArrayList<>();
+        Map<String, Map<String, NodeColumns>> reaching = new LinkedHashMap<>();
         boolean progressed = true;
         while (progressed) {
             progressed = false;
@@ -594,19 +597,83 @@ final class StoreBackedDagSource implements DagSource {
                 if (derived.containsKey(step.id())) {
                     continue;
                 }
-                Map<String, NodeColumns> inputs = inputsOf(pipelineId, step, sourceVertices,
-                        sourceKeyByTable, sourceKeysById, stepIds, derived);
+                Map<String, NodeColumns> inputs = inputsOf(step, sourceVertices,
+                        sourceKeyByTable, sourceKeysById, stepIds, derived, sourceColumns);
                 if (inputs == null) {
                     continue;
                 }
-                NodeColumns columns = NodeColumns.of(step.body(), inputs, null);
-                derived.put(step.id(), columns);
+                derived.put(step.id(), NodeColumns.of(step.body(), inputs, null));
+                reaching.put(step.id(), inputs);
                 progressed = true;
-                if (stepSchemaRecord.record(pipelineId, step.id(), columns, inputs, step.body())) {
-                    recorded.add(step.id());
-                }
             }
         }
+        return new StepDerivations(derived, reaching);
+    }
+
+    /**
+     * What each of this pipeline's nodes works out today, keyed the way the record is keyed: source
+     * nodes under the qualified table id, steps under their own. Read-only - nothing here records, which
+     * is what lets the read face ask the same question as the assembly without writing an answer to it.
+     */
+    Map<String, NodeColumns> derivedNodesOf(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
+        Map<String, NodeColumns> steps = deriveSteps(pipeline, sourceVertices,
+                sourceKeyByTable(sourceVertices), sourceKeysById(sourceVertices), stepIds(pipeline),
+                compiledJoins(pipeline, sourceIdByTable(sourceVertices)), this::discoveredColumns)
+                .columns();
+        Map<String, NodeColumns> nodes = new LinkedHashMap<>();
+        for (SourceVertex vertex : sourceVertices.values()) {
+            NodeColumns columns = discoveredColumns(vertex);
+            if (columns != null) {
+                nodes.put(SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()), columns);
+            }
+        }
+        // In the order the pipeline declares them, which is the order the face promises - the walk
+        // above resolves them in whatever order their inputs came ready.
+        for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
+            NodeColumns columns = steps.get(step.id());
+            if (columns != null) {
+                nodes.put(step.id(), columns);
+            }
+        }
+        return nodes;
+    }
+
+    /**
+     * What one source table holds in the world right now, rather than what this pipeline copied of it.
+     *
+     * <p>The distinction is the whole of the read face: a report answering from the copy would compare
+     * the copy with itself and agree every time, which is the one answer that must not be produced by
+     * a source having moved.
+     */
+    private NodeColumns discoveredColumns(SourceVertex vertex) {
+        SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
+        SourceModel discovered = SourceDiscovery.model(storePort, source);
+        SourceTable table = discovered == null ? null : discoveredTable(discovered, vertex.table());
+        return table == null ? null : NodeColumns.known(SourceSchemaCopy.columnsOf(table));
+    }
+
+    /** What every step of a pipeline derives, and what reached each of the ones this walk worked out. */
+    private record StepDerivations(
+            Map<String, NodeColumns> columns, Map<String, Map<String, NodeColumns>> reaching) {
+    }
+
+    /**
+     * Records what the walk above worked out, answering the step ids that got a record. Separate from
+     * the walk because the read face runs the same walk and must write nothing.
+     */
+    private List<String> recordStepSchemas(
+            String pipelineId, PipelineResource pipeline, StepDerivations derived) {
+        List<String> recorded = new ArrayList<>();
+        derived.reaching().forEach((stepId, inputs) -> {
+            if (stepOf(pipeline, stepId) instanceof Step.Inline inline
+                    && stepSchemaRecord.record(pipelineId, stepId,
+                            derived.columns().get(stepId), inputs, inline.body())) {
+                recorded.add(stepId);
+            }
+        });
         return recorded;
     }
 
@@ -624,15 +691,16 @@ final class StoreBackedDagSource implements DagSource {
      * refuse an assembly that otherwise builds.
      */
     private Map<String, NodeColumns> inputsOf(
-            String pipelineId, Step.Inline step, Map<String, SourceVertex> sourceVertices,
+            Step.Inline step, Map<String, SourceVertex> sourceVertices,
             Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
-            Set<String> stepIds, Map<String, NodeColumns> derived) {
+            Set<String> stepIds, Map<String, NodeColumns> derived,
+            Function<SourceVertex, NodeColumns> sourceColumns) {
         Map<String, NodeColumns> inputs = new LinkedHashMap<>();
         for (FromRef ref : refsOf(step.from())) {
             List<NodeColumns> reached = new ArrayList<>();
             for (String key : upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
                 SourceVertex vertex = sourceVertices.get(key);
-                NodeColumns columns = vertex != null ? copiedColumns(pipelineId, vertex) : derived.get(key);
+                NodeColumns columns = vertex != null ? sourceColumns.apply(vertex) : derived.get(key);
                 if (columns == null) {
                     return null;
                 }

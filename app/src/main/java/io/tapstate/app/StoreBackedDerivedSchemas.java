@@ -13,7 +13,6 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
-import io.tapstate.core.sql.OutputField;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -71,14 +70,29 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
         // shape while the pipeline runs, and that is exactly when this report is read: answering with
         // the newest would describe a pipeline that is not the one going on.
         boolean live = aRunExists(pipelineId);
+        // Every node with a model of its own, not only the joins. A pipeline without a join used to
+        // answer with an empty list, which is also what an unknown id answers - so the one face anyone
+        // can ask said nothing at all about a source table that grew a column between two runs.
+        Map<String, StoreBackedDagSource.CompiledJoin> compiledJoins =
+                joins.compiledJoinsOf(pipelineId);
         List<StepReport> reports = new ArrayList<>();
-        joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> {
-            Map<String, String> derived = columnsOf(compiled);
-            Map<String, String> recorded = heldBy(live, pipelineId, stepId)
+        joins.derivedNodesOf(pipelineId).forEach((nodeId, node) -> {
+            // A node nobody can describe - a script, or anything under one - is left out rather than
+            // reported with no columns: an empty row reads as a node that produces nothing, and the
+            // two want opposite reactions.
+            if (!node.known()) {
+                return;
+            }
+            Map<String, String> derived = node.columns();
+            Map<String, String> recorded = heldBy(live, pipelineId, nodeId)
                     .map(DerivedSchema::schema)
                     .orElse(Map.of());
-            String table = compiled.factTable();
-            Map<String, String> target = targetColumns.get(table);
+            // Only a join writes into a table of its own here; a source node reads one and a step
+            // passes rows on, so naming a table for either would report what it reads as what it
+            // writes.
+            StoreBackedDagSource.CompiledJoin compiled = compiledJoins.get(nodeId);
+            String table = compiled == null ? null : compiled.factTable();
+            Map<String, String> target = table == null ? null : targetColumns.get(table);
             Set<String> names = new LinkedHashSet<>(recorded.keySet());
             names.addAll(derived.keySet());
             List<ColumnReport> columns = new ArrayList<>();
@@ -86,7 +100,7 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
                 columns.add(new ColumnReport(name, recorded.get(name), derived.get(name),
                         target == null ? null : target.get(name)));
             }
-            reports.add(new StepReport(stepId, table, target != null, columns));
+            reports.add(new StepReport(nodeId, table, target != null, columns));
         });
         return List.copyOf(reports);
     }
@@ -186,15 +200,6 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
         return storePort.desired().read(pipelineId)
                 .map(DesiredState::targetState)
                 .orElse(PipelineState.NEW);
-    }
-
-    /** The columns a join publishes: output name to declared type, in the order it publishes them. */
-    private static Map<String, String> columnsOf(StoreBackedDagSource.CompiledJoin compiled) {
-        Map<String, String> columns = new LinkedHashMap<>();
-        for (OutputField field : compiled.plan().outputFields()) {
-            columns.put(field.name(), JoinSchemaDrift.declaredType(field));
-        }
-        return columns;
     }
 
     /**

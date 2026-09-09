@@ -54,8 +54,7 @@ class DerivedSchemaReportTest {
 
         List<DerivedSchemas.StepReport> report = new StoreBackedDerivedSchemas(store, auditGate).compare("wide");
 
-        assertThat(report).singleElement().satisfies(step -> {
-            assertThat(step.step()).isEqualTo("widen");
+        assertThat(rowFor(report, "widen")).satisfies(step -> {
             assertThat(step.targetTable()).isEqualTo("orders");
             assertThat(step.targetKnown()).isTrue();
             assertThat(step.columns()).extracting(DerivedSchemas.ColumnReport::column)
@@ -86,7 +85,7 @@ class DerivedSchemaReportTest {
 
         List<DerivedSchemas.StepReport> report = new StoreBackedDerivedSchemas(store, auditGate).compare("wide");
 
-        assertThat(report).singleElement().satisfies(step -> {
+        assertThat(rowFor(report, "widen")).satisfies(step -> {
             assertThat(step.targetKnown()).isFalse();
             assertThat(step.columns()).allSatisfy(column -> assertThat(column.target()).isNull());
         });
@@ -106,7 +105,7 @@ class DerivedSchemaReportTest {
 
         List<DerivedSchemas.StepReport> report = new StoreBackedDerivedSchemas(store, auditGate).compare("wide");
 
-        assertThat(report).singleElement().satisfies(step -> {
+        assertThat(rowFor(report, "widen")).satisfies(step -> {
             assertThat(step.targetKnown()).isFalse();
             assertThat(step.columns()).allSatisfy(column -> assertThat(column.target()).isNull());
         });
@@ -145,11 +144,47 @@ class DerivedSchemaReportTest {
     }
 
     @Test
-    @DisplayName("a pipeline with no join derives nothing and reports nothing")
-    void aPipelineWithNoJoinReportsNothing() {
+    @DisplayName("a pipeline with no join is still reported on - on what it reads")
+    void aPipelineWithNoJoinIsReportedOnWhatItReads() {
+        // The read face used to stop at joins, so a pipeline without one answered with an empty list -
+        // and a source table that grew a column between two runs was invisible to the only face anyone
+        // can ask. Empty is also what an unknown pipeline id answers, so the two were the same reply.
         InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("plain");
 
-        assertThat(new StoreBackedDerivedSchemas(store, auditGate).compare("plain")).isEmpty();
+        List<DerivedSchemas.StepReport> report =
+                new StoreBackedDerivedSchemas(store, auditGate).compare("plain");
+
+        assertThat(rowFor(report, "orders_src.orders")).satisfies(node -> {
+            // No target table of its own: a source node writes into nothing, and saying "orders" here
+            // would report the table it reads as the table it writes.
+            assertThat(node.targetTable()).isNull();
+            assertThat(node.targetKnown()).isFalse();
+            assertThat(node.columns()).extracting(DerivedSchemas.ColumnReport::column)
+                    .containsExactly("id", "customer_ref");
+        });
+    }
+
+    @Test
+    @DisplayName("a step is reported beside the source it reads, at the columns it actually produces")
+    void aStepIsReportedBesideTheSourceItReadsFrom() {
+        // The discriminating half: the step drops a column the source has. A face that reported the
+        // step by handing back what reached it would name the step and carry the source's columns,
+        // which reads as agreement while describing rows the pipeline never emits.
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("mapped");
+
+        List<DerivedSchemas.StepReport> report =
+                new StoreBackedDerivedSchemas(store, auditGate).compare("mapped");
+
+        assertThat(rowFor(report, "orders_src.orders").columns())
+                .extracting(DerivedSchemas.ColumnReport::column)
+                .containsExactly("id", "customer_ref");
+        assertThat(rowFor(report, "trim").columns())
+                .extracting(DerivedSchemas.ColumnReport::column)
+                .containsExactly("id");
+        assertThat(rowFor(report, "trim").columns())
+                .noneMatch(DerivedSchemas.ColumnReport::drifted);
     }
 
     @Test
@@ -328,7 +363,7 @@ class DerivedSchemaReportTest {
 
         List<DerivedSchemas.StepReport> partial =
                 new StoreBackedDerivedSchemas(store, auditGate).compare("wide");
-        assertThat(partial).singleElement().satisfies(step -> assertThat(step.columns())
+        assertThat(rowFor(partial, "widen")).satisfies(step -> assertThat(step.columns())
                 .filteredOn(column -> column.column().equals("order_id"))
                 .singleElement()
                 .satisfies(column -> assertThat(column.drifted()).isTrue()));
@@ -336,14 +371,22 @@ class DerivedSchemaReportTest {
         new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide");
 
         assertThat(new StoreBackedDerivedSchemas(store, auditGate).compare("wide"))
-                .singleElement()
-                .satisfies(step -> assertThat(step.columns()).noneMatch(DerivedSchemas.ColumnReport::drifted));
+                .allSatisfy(step -> assertThat(step.columns()).noneMatch(DerivedSchemas.ColumnReport::drifted));
+    }
+
+    /** One node's row, from a report that carries one per node rather than one per join. */
+    private static DerivedSchemas.StepReport rowFor(
+            List<DerivedSchemas.StepReport> report, String node) {
+        return report.stream()
+                .filter(row -> row.step().equals(node))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no report row for '" + node + "' in "
+                        + report.stream().map(DerivedSchemas.StepReport::step).toList()));
     }
 
     /** The recorded declared type of the join's key column, which is what every report above turns on. */
     private static String recordedKeyOf(List<DerivedSchemas.StepReport> report) {
-        assertThat(report).hasSize(1);
-        return report.get(0).columns().stream()
+        return rowFor(report, "widen").columns().stream()
                 .filter(column -> column.column().equals("order_id"))
                 .findFirst()
                 .orElseThrow()
@@ -402,7 +445,7 @@ class DerivedSchemaReportTest {
         DslParser parser = new DslParser();
         List<Resource> resources = new ArrayList<>();
         for (String document : List.of(ORDERS_SRC, CUSTOMERS_SRC, TARGET, TARGET_2, joinPipeline,
-                PLAIN_PIPELINE)) {
+                PLAIN_PIPELINE, MAPPED_PIPELINE)) {
             resources.add(parser.parse(document));
         }
         Workspace.of(resources);
@@ -494,6 +537,21 @@ class DerivedSchemaReportTest {
             serve:
               from: widen
               sync: [ { id: sync_1, source: orders_dest } ]
+            """;
+
+    private static final String MAPPED_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: mapped
+            source: [ orders_src ]
+            transforms:
+              - id: trim
+                type: map
+                from: orders
+                fields: { customer_ref: false }
+            serve:
+              from: trim
+              sync: [ { id: sync_m, source: orders_dest } ]
             """;
 
     private static final String PLAIN_PIPELINE = """
