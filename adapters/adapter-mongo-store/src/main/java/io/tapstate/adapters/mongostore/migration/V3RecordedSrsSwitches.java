@@ -57,6 +57,7 @@ public final class V3RecordedSrsSwitches implements ChangeSet {
         for (Map.Entry<String, PipelineResource> entry : bareReferrers(artifacts).entrySet()) {
             PipelineResource pipeline = entry.getValue();
             List<SourceRef> refs = new ArrayList<>(pipeline.sources().size());
+            boolean answered = true;
             for (SourceRef ref : pipeline.sources()) {
                 if (ref instanceof SourceRef.Spec) {
                     refs.add(ref);
@@ -65,9 +66,16 @@ public final class V3RecordedSrsSwitches implements ChangeSet {
                 Boolean own = switchesBySource.get(ref.id());
                 if (own == null) {
                     dangling.add(entry.getKey() + " -> " + ref.id());
+                    answered = false;
                     continue;
                 }
                 refs.add(new SourceRef.Spec(ref.id(), own));
+            }
+            if (!answered) {
+                // Left unbuilt rather than built short: a pipeline missing the reference it could not
+                // answer is refused by its own record, and that refusal would be reported here in place
+                // of the one naming the source. The run stops below either way.
+                continue;
             }
             Resource written = new PipelineResource(pipeline.id(), pipeline.metadata(), refs,
                     pipeline.transforms(), pipeline.view(), pipeline.serve(), pipeline.settings(),
