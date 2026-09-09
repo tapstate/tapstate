@@ -324,7 +324,7 @@ class McpOnlineControlIT {
                 kind: pipeline
                 id: pipeline_browse
                 source: src_browse
-                settings: { read_mode: snapshot }
+                settings: { read_mode: snapshot_only }
                 view:
                   id: v_pipeline
                   from: %s
