@@ -11,13 +11,18 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +55,7 @@ final class LocalStack {
     static final String DIR = ".tapstate/local-stack";
     static final String COMPOSE_FILE = "docker-compose.yml";
     private static final String ENV_FILE = ".env";
+    private static final String ADMIN_LOCK_FILE = ".admin.lock";
     private static final String CONNECTORS_DIR = "connectors";
     private static final String COMPOSE_RESOURCE = "/local-stack/" + COMPOSE_FILE;
     /** The token the bundled compose file carries where the server's version goes. */
@@ -94,7 +100,8 @@ final class LocalStack {
                 Path part = to.resolveSibling(to.getFileName() + ".part");
                 try {
                     HttpResponse<Path> response = client.send(
-                            HttpRequest.newBuilder(from).GET().build(), HttpResponse.BodyHandlers.ofFile(part));
+                            HttpRequest.newBuilder(from).GET().build(), HttpResponse.BodyHandlers.ofFile(part,
+                                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING));
                     if (response.statusCode() != 200) {
                         throw new IOException("HTTP " + response.statusCode() + " from " + from);
                     }
@@ -118,6 +125,7 @@ final class LocalStack {
     }
 
     private final Path dir;
+    private final String projectName;
     private final ProcessRunner runner;
     private final Downloader downloader;
     private final BooleanSupplier dockerOnPath;
@@ -137,6 +145,7 @@ final class LocalStack {
     LocalStack(Path home, ProcessRunner runner, Downloader downloader, BooleanSupplier dockerOnPath,
                ControlPlaneClient probe, UnaryOperator<String> env, LongConsumer sleeper, int healthPolls) {
         this.dir = home.resolve(DIR);
+        this.projectName = projectNameFor(home);
         this.runner = runner;
         this.downloader = downloader;
         this.dockerOnPath = dockerOnPath;
@@ -159,7 +168,7 @@ final class LocalStack {
 
     /** The one command that stops it - the whole of the stack's interface after a start. */
     String stopCommand() {
-        return "docker compose -f " + dir.resolve(COMPOSE_FILE) + " down";
+        return "docker compose -p " + projectName + " -f " + dir.resolve(COMPOSE_FILE) + " down";
     }
 
     /**
@@ -197,13 +206,13 @@ final class LocalStack {
         }
         createDirectories();
         Files.writeString(dir.resolve(COMPOSE_FILE), composeFile(Cli.VERSION_NUMBER));
-        Admin admin = savedAdmin().orElseGet(this::writeAdmin);
+        Admin admin = initializeAdmin();
         stageConnectors();
         if (prose != null) {
             prose.println("Starting the local development stack in Docker; the first start pulls images and can take a few minutes.");
             prose.flush();
         }
-        ProcessRunner.Result up = run(dir, "docker", "compose", "up", "-d");
+        ProcessRunner.Result up = run(dir, "docker", "compose", "-p", projectName, "up", "-d");
         if (!up.succeeded()) {
             throw unavailable("docker compose up failed" + (up.stderr().isBlank() ? "" : ": " + up.stderr().strip()));
         }
@@ -212,6 +221,11 @@ final class LocalStack {
             throw unavailable("the stack in " + dir + " was started but did not answer on " + ServerBinding.DEFAULT_SERVER_TEXT
                     + " within " + (healthPolls * POLL_MILLIS / 1_000) + " s; look at its logs with"
                     + " docker compose -f " + dir.resolve(COMPOSE_FILE) + " logs, or stop it with " + stopCommand());
+        }
+        ProcessRunner.Result bootstrap = run(dir, "docker", "compose", "-p", projectName, "wait", "bootstrap");
+        if (!bootstrap.succeeded()) {
+            throw unavailable("the bootstrap service in " + dir + " did not complete successfully"
+                    + (bootstrap.stderr().isBlank() ? "" : ": " + bootstrap.stderr().strip()));
         }
         return admin;
     }
@@ -284,6 +298,16 @@ final class LocalStack {
     }
 
     /** Writes the {@code .env} with a fresh random password, readable by this user alone where the filesystem can say so. */
+    private Admin initializeAdmin() throws IOException {
+        Path lock = dir.resolve(ADMIN_LOCK_FILE);
+        try (FileChannel channel = FileChannel.open(lock, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+             FileLock ignored = channel.lock()) {
+            Optional<Admin> existing = savedAdmin();
+            return existing.orElseGet(this::writeAdmin);
+        }
+    }
+
+    /** Writes a new administrator only while {@link #initializeAdmin()} holds the process-wide lock. */
     private Admin writeAdmin() {
         byte[] random = new byte[24];
         new SecureRandom().nextBytes(random);
@@ -291,7 +315,8 @@ final class LocalStack {
         String password = Base64.getUrlEncoder().withoutPadding().encodeToString(random);
         Path file = dir.resolve(ENV_FILE);
         try {
-            Files.writeString(file, ENV_ADMIN_USER + "=" + ADMIN_USER + "\n" + ENV_ADMIN_PASSWORD + "=" + password + "\n");
+            Files.writeString(file, ENV_ADMIN_USER + "=" + ADMIN_USER + "\n" + ENV_ADMIN_PASSWORD + "=" + password + "\n",
+                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
             try {
                 Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
             } catch (UnsupportedOperationException notPosix) {
@@ -330,7 +355,23 @@ final class LocalStack {
             String releases = env.apply(ENV_BASE_URL);
             base = (releases == null || releases.isBlank() ? RELEASES : releases) + CONNECTORS_PATH;
         }
-        return base.endsWith("/") ? base : base + "/";
+        String normalized = base.endsWith("/") ? base : base + "/";
+        URI endpoint = URI.create(normalized);
+        if (!"https".equalsIgnoreCase(endpoint.getScheme()) || endpoint.getHost() == null) {
+            throw unavailable("connector download endpoint must be an https URL: " + normalized);
+        }
+        return normalized;
+    }
+
+    /** A stable Compose project per home, so two users never share containers or the named volume. */
+    static String projectNameFor(Path home) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(home.toAbsolutePath().normalize().toString().getBytes(StandardCharsets.UTF_8));
+            return "tapstate-" + HexFormat.of().formatHex(digest, 0, 8);
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
     }
 
     /** The compose file as written: the bundled one, with the CLI's own version in the server image. */

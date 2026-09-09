@@ -28,7 +28,7 @@ class NewGuidedTest {
     private static final List<String> TITLES = List.of(
             "Try it with sample data",
             "Mirror one table, as it changes",
-            "Mirror a table, renamed / filtered / trimmed",
+            "Mirror a table, renamed / filtered / reordered",
             "Assemble several tables into one object",
             "Consolidate the same table from several databases",
             BLANK);

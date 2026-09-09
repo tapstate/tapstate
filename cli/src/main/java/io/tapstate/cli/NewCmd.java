@@ -122,7 +122,7 @@ final class NewCmd implements Callable<Integer> {
     String view;
 
     @Option(names = "--keep", paramLabel = "COLS",
-            description = "Columns to keep, comma-separated (reshaped-table recipe; default: all).")
+            description = "Columns to put first, comma-separated (reshaped-table recipe; other columns still pass through).")
     String keep;
 
     @Option(names = "--rename", paramLabel = "OLD=NEW[,...]",

@@ -49,19 +49,23 @@ final class ConsolidatedTableRecipe {
             throw new RecipeRun.Usage("a table name is required (--table in scripts)");
         }
         List<Database> databases = flags.databases().isEmpty()
-                ? askDatabases(prompter, catalog)
+                ? askDatabases(prompter, catalog, flags.connector(), flags.set())
                 : databasesFromFlags(flags.databases(), catalog);
         String view = flags.view() != null ? flags.view() : prompter.ask(VIEW_QUESTION, table + "_all");
         return new Answers(table, databases, RecipeSupport.orDefault(view, table + "_all"));
     }
 
     /** Two databases without asking whether to go on - fewer is not this recipe - then as many as wanted. */
-    private static List<Database> askDatabases(Prompter prompter, TapstateCatalog catalog) {
+    private static List<Database> askDatabases(Prompter prompter, TapstateCatalog catalog, String firstConnector,
+                                               Map<String, String> firstConfig) {
         List<Database> databases = new ArrayList<>();
-        String preferred = RecipeSupport.DEFAULT_CONNECTOR;
+        String preferred = firstConnector == null ? RecipeSupport.DEFAULT_CONNECTOR
+                : RecipeSupport.checkedConnector(firstConnector, catalog);
         do {
-            String connector = RecipeSupport.chooseConnector(prompter, catalog, preferred);
-            databases.add(new Database(connector, RecipeSupport.connection(connector, Map.of(), prompter, catalog)));
+            String connector = databases.isEmpty() && firstConnector != null ? preferred
+                    : RecipeSupport.chooseConnector(prompter, catalog, preferred);
+            Map<String, String> given = databases.isEmpty() ? firstConfig : Map.of();
+            databases.add(new Database(connector, RecipeSupport.connection(connector, given, prompter, catalog)));
             preferred = connector;
         } while (databases.size() < 2 || RecipeSupport.yes(prompter, ANOTHER_QUESTION, false));
         return databases;

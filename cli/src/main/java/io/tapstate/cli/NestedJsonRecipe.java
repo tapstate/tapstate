@@ -13,8 +13,10 @@ import io.tapstate.core.model.ViewBlock;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The {@code nested-json} recipe: several tables assembled into one document per root row. It asks
@@ -72,6 +74,8 @@ final class NestedJsonRecipe {
         String connector = flags.connector();
         if (connector == null) {
             connector = RecipeSupport.chooseConnector(prompter, catalog, RecipeSupport.DEFAULT_CONNECTOR);
+        } else {
+            connector = RecipeSupport.checkedConnector(connector, catalog);
         }
         Database root = new Database(connector, RecipeSupport.connection(connector, flags.set(), prompter, catalog));
         RecipeRun.Flags.Nested given = flags.nested();
@@ -187,11 +191,18 @@ final class NestedJsonRecipe {
             }
         }
         List<RecipeSupport.PlannedSource> sources = new ArrayList<>();
+        Set<String> sourceIds = new HashSet<>();
         sources.add(RecipeSupport.source(rootId, answers.root().connector(), answers.root().config(), rootTables,
                 catalog));
+        sourceIds.add(rootId);
         for (Child child : answers.children()) {
             if (child.database() != null) {
-                sources.add(RecipeSupport.source(RecipeSupport.identifier(child.table()) + "_src",
+                String sourceId = RecipeSupport.identifier(child.table()) + "_src";
+                if (!sourceIds.add(sourceId)) {
+                    throw new RecipeRun.Usage("nested-json tables produce the same source id '" + sourceId
+                            + "'; choose names that stay distinct after normalization");
+                }
+                sources.add(RecipeSupport.source(sourceId,
                         child.database().connector(), child.database().config(), List.of(child.table()), catalog));
             }
         }

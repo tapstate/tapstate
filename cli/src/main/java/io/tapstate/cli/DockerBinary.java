@@ -20,13 +20,21 @@ final class DockerBinary {
 
     /** Whether {@code docker} resolves on the PATH. Nothing is executed. */
     static boolean isOnThePath() {
-        String path = System.getenv("PATH");
+        return isOnThePath(System.getenv("PATH"), System.getProperty("os.name", "").startsWith("Windows"));
+    }
+
+    static boolean isOnThePath(String path, boolean windows) {
         if (path == null || path.isBlank()) {
             return false;
         }
+        String[] candidates = windows ? new String[] {"docker.exe", "docker"} : new String[] {"docker"};
         for (String entry : path.split(File.pathSeparator)) {
-            if (!entry.isBlank() && Files.isExecutable(Path.of(entry, "docker"))) {
-                return true;
+            if (!entry.isBlank()) {
+                for (String candidate : candidates) {
+                    if (Files.isExecutable(Path.of(entry, candidate))) {
+                        return true;
+                    }
+                }
             }
         }
         return false;

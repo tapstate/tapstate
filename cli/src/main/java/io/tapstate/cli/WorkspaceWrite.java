@@ -99,8 +99,8 @@ final class WorkspaceWrite {
         for (int i = 0; i < files.size(); i++) {
             Touched target = touched.get(i);
             try {
-                Files.writeString(target.path(), files.get(i).content());
                 done.add(target);
+                Files.writeString(target.path(), files.get(i).content());
                 restrictSecrets(target.path());
             } catch (IOException cannotWrite) {
                 // All or none, kept as a promise rather than as an intention. What this invocation

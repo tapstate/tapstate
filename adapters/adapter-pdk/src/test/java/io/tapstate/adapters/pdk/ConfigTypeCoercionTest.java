@@ -99,6 +99,16 @@ class ConfigTypeCoercionTest {
     }
 
     @Test
+    void aDeclaredNumberOutsideTheFiniteRangeIsACodedRefusal(@TempDir Path dir) {
+        TapstateException thrown = catchThrowableOfType(
+                () -> open(dir, "port", "1e309"), TapstateException.class);
+
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code().code()).isEqualTo("connector.config-type-mismatch");
+        assertThat(thrown.args()).containsEntry("field", "port").containsEntry("value", "1e309");
+    }
+
+    @Test
     void aDeclaredBooleanSpelledAsTextReachesTheConnectorAsABoolean(@TempDir Path dir) {
         // The same defect in the shape that surfaces later: a string boolean passes the connection test
         // and only fails at write time, after the pipeline has already reported itself running.

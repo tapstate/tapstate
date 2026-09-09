@@ -50,7 +50,7 @@ class NewListTest {
                 """
                 sample              Try it with sample data
                 mirrored-table      Mirror one table, as it changes
-                reshaped-table      Mirror a table, renamed / filtered / trimmed
+                reshaped-table      Mirror a table, renamed / filtered / reordered
                 nested-json         Assemble several tables into one object
                 consolidated-table  Consolidate the same table from several databases
                 blank               Skeleton files only - I will write it myself
@@ -84,7 +84,7 @@ class NewListTest {
                     },
                     {
                       "id": "reshaped-table",
-                      "title": "Mirror a table, renamed / filtered / trimmed",
+                      "title": "Mirror a table, renamed / filtered / reordered",
                       "runnable": true,
                       "uses": [
                         "cdc",

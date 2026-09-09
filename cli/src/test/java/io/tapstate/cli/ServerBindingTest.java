@@ -11,6 +11,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.List;
 import java.util.function.UnaryOperator;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -40,6 +41,7 @@ class ServerBindingTest {
         final ScriptedProcessRunner runner = new ScriptedProcessRunner();
         final LocalStackTest.FakeDownloader downloads = new LocalStackTest.FakeDownloader();
         boolean dockerOnPath = true;
+        boolean startMakesHealthy = true;
         int polls = LocalStack.HEALTH_POLLS;
 
         Fakes(boolean listening) {
@@ -49,10 +51,14 @@ class ServerBindingTest {
         Fakes(FakeHealthProbe probe) {
             this.probe = probe;
             runner.answerUnlessScripted("docker compose version", LocalStackTest.COMPOSE_PRESENT);
-            runner.when("docker compose up -d", () -> probe.healthy = true);
         }
 
         LocalStack stack(Path home, UnaryOperator<String> env) {
+            runner.when("docker compose -p " + LocalStack.projectNameFor(home) + " up -d", () -> {
+                if (startMakesHealthy) {
+                    probe.healthy = true;
+                }
+            });
             return new LocalStack(home, runner, downloads, () -> dockerOnPath, probe, env, millis -> { }, polls);
         }
     }
@@ -134,6 +140,29 @@ class ServerBindingTest {
         assertThat(manager(home).contextBoundExactlyTo(ws2)).contains("local");
     }
 
+    @Test
+    void aSameNamedContextForAnotherServerIsNeverAdopted(@TempDir Path home, @TempDir Path ws) throws IOException {
+        manager(home).create("local", List.of(URI.create("http://other.example:8080")), true);
+
+        binding(home, new ScriptedPrompter("", "", "pw"), new Fakes(true)).bind(ws, null, false, null);
+
+        assertThat(manager(home).contextBoundExactlyTo(ws)).contains("local-2");
+        assertThat(ContextConfigStore.underHome(home).load().contexts().get("local-2").seeds())
+                .containsExactly(DEFAULT_SERVER);
+    }
+
+    @Test
+    void contextsForTheSameHostButDifferentPortsStaySeparate(@TempDir Path home, @TempDir Path first,
+                                                             @TempDir Path second) throws IOException {
+        Fakes fakes = new Fakes(true);
+
+        binding(home, null, fakes, PASSWORD_IN_ENV).bind(first, URI.create("https://example:8080"), false, "u");
+        binding(home, null, fakes, PASSWORD_IN_ENV).bind(second, URI.create("https://example:9090"), false, "u");
+
+        assertThat(manager(home).contextBoundExactlyTo(first)).contains("https-example-8080");
+        assertThat(manager(home).contextBoundExactlyTo(second)).contains("https-example-9090");
+    }
+
     // ---- nothing listening on the default ---------------------------------------------------------
 
     @Test
@@ -148,11 +177,13 @@ class ServerBindingTest {
         assertThat(prose.toString()).contains(ServerBinding.LOCAL_STACK_OFFER);
         assertThat(fakes.runner.calls).containsExactly(
                 "(cwd): docker compose version",
-                stackDir(home) + ": docker compose up -d");
+                stackDir(home) + ": docker compose -p " + LocalStack.projectNameFor(home) + " up -d",
+                stackDir(home) + ": docker compose -p " + LocalStack.projectNameFor(home) + " wait bootstrap");
         String password = DotEnv.read(stackDir(home).resolve(".env")).get("TAPSTATE_ADMIN_PASSWORD");
         assertThat(fakes.probe.logins).containsExactly("admin:" + password);
         assertThat(manager(home).contextBoundExactlyTo(ws)).contains("local");
-        assertThat(prose.toString()).contains("to stop it: docker compose -f " + stackDir(home));
+        assertThat(prose.toString()).contains("to stop it: docker compose -p " + LocalStack.projectNameFor(home)
+                + " -f " + stackDir(home));
     }
 
     @Test
@@ -165,7 +196,7 @@ class ServerBindingTest {
 
         assertThat(fakes.runner.calls).as("a typed URL starts no stack").isEmpty();
         assertThat(fakes.probe.logins).containsExactly("u:pw");
-        assertThat(manager(home).contextBoundExactlyTo(ws)).contains("example");
+        assertThat(manager(home).contextBoundExactlyTo(ws)).contains("https-example-9999");
     }
 
     @Test
@@ -180,6 +211,22 @@ class ServerBindingTest {
 
         assertThat(second.probe.logins).containsExactly("admin:" + password);
         assertThat(manager(home).contextBoundExactlyTo(ws)).contains("local");
+    }
+
+    @Test
+    void aRejectedSavedAdminFallsBackToCredentialsForAnotherLocalServer(@TempDir Path home, @TempDir Path ws)
+            throws IOException {
+        binding(home, new ScriptedPrompter("", ""), new Fakes(false)).bind(home.resolve("first"), null, false, null);
+        Fakes second = new Fakes(true);
+        second.probe.loginOutcome = new LoginOutcome.Rejected("auth.invalid-credentials", "no");
+        ScriptedPrompter prompter = new ScriptedPrompter("", "real-admin", "real-password");
+
+        assertThatThrownBy(() -> binding(home, prompter, second).bind(ws, null, false, null))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.AUTH_LOGIN_REJECTED));
+        assertThat(second.probe.logins).hasSize(2).endsWith("real-admin:real-password");
+        assertThat(prompter.asked).contains(ServerBinding.USERNAME_QUESTION);
+        assertThat(prompter.secretQuestions).contains(ServerBinding.PASSWORD_QUESTION);
     }
 
     // ---- what a script gets -----------------------------------------------------------------------
@@ -203,7 +250,7 @@ class ServerBindingTest {
 
         binding(home, null, fakes).bind(ws, null, true, null);
 
-        assertThat(fakes.runner.calls).hasSize(2);
+        assertThat(fakes.runner.calls).hasSize(3);
         assertThat(manager(home).contextBoundExactlyTo(ws)).contains("local");
     }
 
@@ -214,7 +261,7 @@ class ServerBindingTest {
 
         binding(home, null, fakes).bind(ws, null, true, null);
 
-        assertThat(fakes.runner.calls).hasSize(2);
+        assertThat(fakes.runner.calls).hasSize(3);
         String password = DotEnv.read(stackDir(home).resolve(".env")).get("TAPSTATE_ADMIN_PASSWORD");
         assertThat(fakes.probe.logins).containsExactly("admin:" + password);
         assertThat(manager(home).contextBoundExactlyTo(ws)).contains("local");
@@ -244,7 +291,7 @@ class ServerBindingTest {
                 .bind(ws, URI.create("https://example:9999"), false, "u");
 
         assertThat(fakes.probe.logins).containsExactly("u:from-env");
-        assertThat(manager(home).contextBoundExactlyTo(ws)).contains("example");
+        assertThat(manager(home).contextBoundExactlyTo(ws)).contains("https-example-9999");
     }
 
     @Test
@@ -319,7 +366,7 @@ class ServerBindingTest {
     void aStackThatNeverAnswersIsRefusedNamingItAndBindsNothing(@TempDir Path home, @TempDir Path ws) {
         Fakes fakes = new Fakes(false);
         fakes.polls = 3;
-        fakes.runner.when("docker compose up -d", () -> { });
+        fakes.startMakesHealthy = false;
 
         assertThatThrownBy(() -> binding(home, new ScriptedPrompter("", ""), fakes).bind(ws, null, false, null))
                 .isInstanceOf(TapstateException.class)

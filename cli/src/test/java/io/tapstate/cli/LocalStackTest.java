@@ -138,7 +138,7 @@ class LocalStackTest {
     private static LocalStack stack(Path home, ScriptedProcessRunner runner, FakeDownloader downloads,
                                     FakeHealthProbe probe, UnaryOperator<String> env, int polls) {
         runner.answerUnlessScripted("docker compose version", COMPOSE_PRESENT);
-        runner.when("docker compose up -d", () -> probe.healthy = true);
+        runner.when("docker compose -p " + LocalStack.projectNameFor(home) + " up -d", () -> probe.healthy = true);
         return new LocalStack(home, runner, downloads, () -> true, probe, env, millis -> { }, polls);
     }
 
@@ -163,7 +163,8 @@ class LocalStackTest {
         // the preflight runs from wherever the CLI is: the stack directory does not exist yet on a first run
         assertThat(runner.calls).containsExactly(
                 "(cwd): docker compose version",
-                dir + ": docker compose up -d");
+                dir + ": docker compose -p " + LocalStack.projectNameFor(home) + " up -d",
+                dir + ": docker compose -p " + LocalStack.projectNameFor(home) + " wait bootstrap");
         assertThat(Files.readString(dir.resolve("docker-compose.yml"))).isEqualTo(COMPOSE_GOLDEN);
         // the three engines the release publishes jars for, from the release location, into the seed dir
         assertThat(downloads.fetched).containsExactly(
@@ -195,7 +196,7 @@ class LocalStackTest {
 
         assertThat(again.password()).as("regenerating it would lock out the admin already bootstrapped")
                 .isEqualTo(admin.password());
-        assertThat(runner.calls).hasSize(4).filteredOn(call -> call.endsWith("docker compose up -d")).hasSize(2);
+        assertThat(runner.calls).hasSize(6).filteredOn(call -> call.endsWith(" up -d")).hasSize(2);
         assertThat(downloads.fetched).as("a jar already staged is not fetched again").hasSize(3);
     }
 
@@ -216,21 +217,58 @@ class LocalStackTest {
         LocalStack stack = stack(home, new ScriptedProcessRunner(), new FakeDownloader(), new FakeHealthProbe(false));
 
         assertThat(stack.dir()).isEqualTo(dir(home));
-        assertThat(stack.stopCommand()).isEqualTo("docker compose -f " + dir(home) + "/docker-compose.yml down");
+        assertThat(stack.stopCommand()).isEqualTo("docker compose -p " + LocalStack.projectNameFor(home)
+                + " -f " + dir(home) + "/docker-compose.yml down");
     }
 
     @Test
     void theConnectorLocationCanBePointedElsewhereTheWayTheQuickstartIs(@TempDir Path home) throws IOException {
         FakeDownloader downloads = new FakeDownloader();
         FakeHealthProbe probe = new FakeHealthProbe(false);
-        UnaryOperator<String> env = name -> "TAPSTATE_CONNECTORS_URL".equals(name) ? "http://mirror/jars/" : null;
+        UnaryOperator<String> env = name -> "TAPSTATE_CONNECTORS_URL".equals(name) ? "https://mirror/jars/" : null;
 
         stack(home, new ScriptedProcessRunner(), downloads, probe, env, LocalStack.HEALTH_POLLS).start(null);
 
         assertThat(downloads.fetched).containsExactly(
-                "http://mirror/jars/mysql-connector.jar",
-                "http://mirror/jars/mongodb-connector.jar",
-                "http://mirror/jars/postgres-connector.jar");
+                "https://mirror/jars/mysql-connector.jar",
+                "https://mirror/jars/mongodb-connector.jar",
+                "https://mirror/jars/postgres-connector.jar");
+    }
+
+    @Test
+    void aConnectorMirrorMustUseHttps(@TempDir Path home) {
+        UnaryOperator<String> env = name -> "TAPSTATE_CONNECTORS_URL".equals(name) ? "http://mirror/jars/" : null;
+
+        assertThatThrownBy(() -> stack(home, new ScriptedProcessRunner(), new FakeDownloader(),
+                new FakeHealthProbe(false), env, LocalStack.HEALTH_POLLS).start(null))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).args().get("reason").toString())
+                        .contains("must be an https URL"));
+    }
+
+    @Test
+    void aFailedBootstrapIsRefusedAfterTheServerBecomesHealthy(@TempDir Path home) {
+        ScriptedProcessRunner runner = new ScriptedProcessRunner()
+                .answer("docker compose version", COMPOSE_PRESENT)
+                .answer("docker compose -p " + LocalStack.projectNameFor(home) + " wait bootstrap",
+                        new ProcessRunner.Result(1, "", "bootstrap exited 1"));
+        FakeHealthProbe probe = new FakeHealthProbe(false);
+        runner.when("docker compose -p " + LocalStack.projectNameFor(home) + " up -d", () -> probe.healthy = true);
+        LocalStack stack = new LocalStack(home, runner, new FakeDownloader(), () -> true, probe,
+                name -> null, millis -> { }, LocalStack.HEALTH_POLLS);
+
+        assertThatThrownBy(() -> stack.start(null))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).args().get("reason").toString())
+                        .contains("bootstrap service").contains("bootstrap exited 1"));
+        assertThat(runner.calls).endsWith(home.resolve(".tapstate/local-stack") + ": docker compose -p "
+                + LocalStack.projectNameFor(home) + " wait bootstrap");
+    }
+
+    @Test
+    void composeProjectsAreIsolatedByHome(@TempDir Path parent) {
+        assertThat(LocalStack.projectNameFor(parent.resolve("one")))
+                .isNotEqualTo(LocalStack.projectNameFor(parent.resolve("two")));
     }
 
     @Test
@@ -283,7 +321,8 @@ class LocalStackTest {
     void aFailedUpIsRefusedWithWhatComposeSaid(@TempDir Path home) {
         ScriptedProcessRunner runner = new ScriptedProcessRunner()
                 .answer("docker compose version", COMPOSE_PRESENT)
-                .answer("docker compose up -d", new ProcessRunner.Result(1, "", "Cannot connect to the Docker daemon"));
+                .answer("docker compose -p " + LocalStack.projectNameFor(home) + " up -d",
+                        new ProcessRunner.Result(1, "", "Cannot connect to the Docker daemon"));
         FakeHealthProbe probe = new FakeHealthProbe(false);
         LocalStack stack = new LocalStack(home, runner, new FakeDownloader(), () -> true, probe,
                 name -> null, millis -> { }, LocalStack.HEALTH_POLLS);
@@ -309,7 +348,8 @@ class LocalStackTest {
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.DOCKER_UNAVAILABLE))
                 .satisfies(e -> assertThat(((TapstateException) e).args().get("reason").toString())
                         .contains(dir(home).toString())
-                        .contains("docker compose -f " + dir(home) + "/docker-compose.yml down"));
+                        .contains("docker compose -p " + LocalStack.projectNameFor(home) + " -f "
+                                + dir(home) + "/docker-compose.yml down"));
         assertThat(probe.probed).hasSize(3);
         assertThat(slept).containsExactly(LocalStack.POLL_MILLIS, LocalStack.POLL_MILLIS);
     }

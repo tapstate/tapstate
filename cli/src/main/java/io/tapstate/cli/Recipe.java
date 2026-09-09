@@ -28,7 +28,7 @@ record Recipe(String id, String title, boolean runnable, List<String> uses) {
     static final List<Recipe> CATALOG = List.of(
             new Recipe("sample", "Try it with sample data", true, List.of()),
             new Recipe("mirrored-table", "Mirror one table, as it changes", true, List.of("cdc")),
-            new Recipe("reshaped-table", "Mirror a table, renamed / filtered / trimmed", true,
+            new Recipe("reshaped-table", "Mirror a table, renamed / filtered / reordered", true,
                     List.of("cdc", "map", "filter")),
             new Recipe("nested-json", "Assemble several tables into one object", true, List.of("nest")),
             new Recipe("consolidated-table", "Consolidate the same table from several databases", true,

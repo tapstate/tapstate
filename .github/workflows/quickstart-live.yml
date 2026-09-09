@@ -142,6 +142,10 @@ jobs:
           # broken. The store database below is already read off the script for the same reason.
           ver="$(sed -n 's/^CLI_VERSION="\(.*\)"$/\1/p' "$script" | head -1)"
           [ -n "$ver" ] || { echo "no CLI_VERSION found in the script under test" >&2; exit 1; }
+          if [ "$LEG" = published ] && [ "v$ver" != "$tag" ]; then
+            echo "published install script declares v$ver, but the newest release is $tag" >&2
+            exit 1
+          fi
           ref="ghcr.io/tapstate/tapstate:$ver"
           grep -q "image: ghcr.io/tapstate/tapstate:" "$compose" \
             || { echo "no server image reference found in $compose" >&2; exit 1; }

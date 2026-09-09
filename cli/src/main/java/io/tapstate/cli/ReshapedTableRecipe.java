@@ -30,7 +30,7 @@ import java.util.Map;
 final class ReshapedTableRecipe {
 
     static final String RECIPE = "reshaped-table";
-    static final String KEEP_QUESTION = "Columns to keep (comma list; blank = keep all)";
+    static final String KEEP_QUESTION = "Columns to put first (comma list; other columns still pass through)";
     static final String RENAME_QUESTION = "Columns to rename (old=new, comma list; blank = none)";
     static final String DROP_QUESTION = "Columns to drop (comma list; blank = none)";
     static final String WHERE_QUESTION = "Row filter (a CEL expression such as after.region == 'US'; blank = none)";

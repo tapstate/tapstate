@@ -106,10 +106,24 @@ final class FirstRunSummary {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("id", pipeline.id());
             entry.put("state", pipeline.state());
+            if (!pipeline.notes().isEmpty()) {
+                entry.put("notes", pipeline.notes());
+            }
             lines.add(entry);
         }
         env.put("pipelines", lines);
+        // Keep the established source-id list stable for consumers that select it directly. Stage notes
+        // are additive, keyed by the same IDs, just as pipeline entries carry their own notes.
         env.put("sources", sources.stream().map(UpSource::id).toList());
+        Map<String, List<String>> sourceNotes = new LinkedHashMap<>();
+        for (UpSource source : sources) {
+            if (!source.notes().isEmpty()) {
+                sourceNotes.put(source.id(), source.notes());
+            }
+        }
+        if (!sourceNotes.isEmpty()) {
+            env.put("sourceNotes", sourceNotes);
+        }
         env.put("state", nothingToDo ? UP_UNCHANGED : UP_STATE);
         env.put("next", UP_NEXT);
         return env;
@@ -118,7 +132,6 @@ final class FirstRunSummary {
     /**
      * The text form.
      *
-     * @param server the server the workspace is bound to, which is what {@code up} will bring it to
      */
     static void text(PrintWriter o, RecipeRun.Result result) {
         o.println("Workspace: " + result.root());
