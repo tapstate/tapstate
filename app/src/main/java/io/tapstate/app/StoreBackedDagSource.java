@@ -171,10 +171,8 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
         // The pipeline takes its own copy of what discovery found for each table it reads, before anything
         // downstream is worked out from it. Reading the discovery directly instead would let a
-        // re-discovery change the shape of this run's input while the run is already using it. Taken
-        // only where there is none: a copy already here is this pipeline's, and replacing it is an
-        // adoption, which happens through the verb for that rather than because somebody pressed start.
-        List<String> derivedSteps = new ArrayList<>(copySourceSchemas(pipelineId, sourceVertices, true));
+        // re-discovery change the shape of this run's input while the run is already using it.
+        List<String> derivedSteps = new ArrayList<>(copySourceSchemas(pipelineId, sourceVertices));
         Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
         Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
         Set<String> stepIds = stepIds(pipeline);
@@ -297,29 +295,15 @@ final class StoreBackedDagSource implements DagSource {
      * <p>A table nothing has discovered is skipped rather than recorded empty. Authoring against an
      * undiscovered source is allowed, and a start that actually needs the model refuses by name before it
      * binds anything.
-     *
-     * <p><b>{@code onlyWhenAbsent} separates taking a copy from replacing one.</b> A table that already
-     * has a copy keeps it: the physical model is the truth, but a pipeline adopts a move in it through
-     * the verb that exists for that, and assembling is not that verb. Replacing here instead would let a
-     * re-discovery reach a pipeline the next time anyone starts it - no drift reported, nobody having
-     * accepted anything, and the author's own pipeline reading columns they never saw. The table is
-     * still returned as a step this run is assembled from, because a copy that was already there is
-     * exactly as much a thing to pin as one taken just now.
      */
-    private List<String> copySourceSchemas(
-            String pipelineId, Map<String, SourceVertex> sourceVertices, boolean onlyWhenAbsent) {
+    private List<String> copySourceSchemas(String pipelineId, Map<String, SourceVertex> sourceVertices) {
         List<String> copied = new ArrayList<>();
         for (SourceVertex vertex : sourceVertices.values()) {
-            String nodeId = SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table());
-            if (onlyWhenAbsent && storePort.derivedSchemas().latest(pipelineId, nodeId).isPresent()) {
-                copied.add(nodeId);
-                continue;
-            }
             SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
             SourceModel discovered = SourceDiscovery.model(storePort, source);
             if (sourceSchemaCopy.copy(pipelineId, vertex.sourceId(), vertex.table(),
                     discovered == null ? null : discoveredTable(discovered, vertex.table()))) {
-                copied.add(nodeId);
+                copied.add(SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()));
             }
         }
         return copied;
@@ -338,7 +322,7 @@ final class StoreBackedDagSource implements DagSource {
     List<String> copySourceSchemas(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
-        return copySourceSchemas(pipelineId, sourceVertices(pipeline), false);
+        return copySourceSchemas(pipelineId, sourceVertices(pipeline));
     }
 
     /**

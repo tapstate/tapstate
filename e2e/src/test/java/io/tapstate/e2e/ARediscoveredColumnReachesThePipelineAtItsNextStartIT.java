@@ -19,35 +19,33 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * A column that appears in a source after a pipeline has copied it does not reach that pipeline because
- * somebody started it again. Accepting is what takes it.
+ * A column that appears in a source reaches the pipeline the next time it is started, and the target it
+ * creates is built to include it.
  *
  * <p>A pipeline holds its own copy of what discovery found for each table it reads, and what it publishes
- * is worked forward from that copy - including the table its sink is created to. Re-taking the copy every
- * time the pipeline is assembled empties that of meaning: the world moving arrives the next time anybody
- * presses start, with nothing reported and nobody having accepted anything, and the pipeline then produces
- * columns its author never saw. Nothing fails when it happens - rows still cross and the target still
- * fills - so only a case that reads the target's own shape says so.
+ * is worked forward from that copy - including the table its sink is created to. What the copy buys is
+ * that the shape does not move under a run that is already using it: a run holds the version it was
+ * assembled from and re-reads none of them. It is <b>not</b> that the pipeline stops seeing its source.
+ * Taking the copy only once would freeze a pipeline on the shape its first ever start happened to find,
+ * and every later start would build a target missing columns the source has had for months, with the
+ * operator's only way out being to delete the pipeline and write it again.
  *
  * <p><b>The target's header is the witness, and the choice is the whole difficulty of this case.</b> The
  * rows are not: a row carries whatever the connector read, so a new column arriving in the data says
  * nothing about which model the pipeline was assembled from. A header does - this connector writes the
  * resolved target model's fields when the product supplies one - and it is the observation a document
- * target cannot offer, because a document simply has no column the row did not fill.
+ * target cannot offer, because a document has no column a row did not fill.
  *
  * <p><b>Every run's write is made observable rather than assumed.</b> The target file is removed before
  * each start and the case waits for it to come back, so the header being read is the one this run wrote;
  * stopping purges the resume position so the next start snapshots again rather than tailing from where
- * the last one ended and writing nothing.
- *
- * <p><b>The third run is not decoration.</b> An assertion that the header did not move is satisfied just
- * as well by a source that never changed, and the two read identically. Accepting and watching the column
- * arrive is what proves the world moved and the product saw it.
+ * the last one ended and writing nothing. The first run is the control: without it, a header carrying the
+ * new column proves nothing, because nobody showed it was ever absent.
  */
-class ARediscoveredColumnIsReportedRatherThanTakenIT {
+class ARediscoveredColumnReachesThePipelineAtItsNextStartIT {
 
     private static final String SOURCE_ID = "src_file";
-    private static final String PIPELINE_ID = "e2e_copy_stands_still";
+    private static final String PIPELINE_ID = "e2e_copy_follows_the_source";
     private static final String TABLE = "orders";
 
     @TempDir
@@ -83,10 +81,11 @@ class ARediscoveredColumnIsReportedRatherThanTakenIT {
     }
 
     @Test
-    void aColumnThatAppearsAfterTheCopyIsNotTakenByStartingAgain() {
+    void aColumnThatAppearsInTheSourceIsInTheTargetTheNextRunCreates() {
         writeOrders("id,amount\n1,12\n");
 
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_copy_stands_still"))) {
+        try (ServerHandle server =
+                InProcessServer.start(SharedMongo.replicaSetUrl("e2e_copy_follows_the_source"))) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, read(connectorJar));
@@ -96,7 +95,7 @@ class ARediscoveredColumnIsReportedRatherThanTakenIT {
                     "pipeline.tap.yml", pipeline()));
             discover(control);
 
-            // The first start is what takes the copy: the pipeline is assembled from it.
+            // The control: the column is nowhere yet, so its arrival below is the run's doing.
             runOnce(control);
             assertThat(targetHeader()).containsExactly("id", "amount");
 
@@ -106,14 +105,7 @@ class ARediscoveredColumnIsReportedRatherThanTakenIT {
 
             runOnce(control);
             assertThat(targetHeader())
-                    .as("starting again took the new column into the pipeline's own copy")
-                    .containsExactly("id", "amount");
-
-            control.acceptDerivedSchema(PIPELINE_ID);
-
-            runOnce(control);
-            assertThat(targetHeader())
-                    .as("accepting is what takes it")
+                    .as("the next run builds its target from what the source holds now")
                     .containsExactly("id", "amount", "note");
         }
     }

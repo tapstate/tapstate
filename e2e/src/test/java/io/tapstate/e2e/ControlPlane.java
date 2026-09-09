@@ -416,12 +416,6 @@ final class ControlPlane {
                 .toList();
     }
 
-    /** Records what the pipeline works out today as the shape to hold it to from here. */
-    void acceptDerivedSchema(String pipelineId) {
-        expect(send(authed("/api/pipelines/" + urlSegment(pipelineId) + ":accept-derived-schema", "")),
-                200, "accept the derived schema of " + pipelineId);
-    }
-
     /**
      * Drives a connection test and returns the report body verbatim. The verb probes the connection
      * for real - it inits the connector, discovers, and reads a small sample - so it exercises paths
