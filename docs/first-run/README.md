@@ -62,7 +62,7 @@ curated, worded by outcome, not by mechanism:
 |---|---|---|---|
 | `sample` | Try it with sample data | the three demo files (MySQL orders + PostgreSQL shipments → one order document) | built-in demo stack |
 | `mirrored-table` | Mirror one table, as it changes | one source, one pipeline, one view of the same shape | `cdc` |
-| `reshaped-table` | Mirror a table, renamed / filtered / trimmed | as above, plus `map` and/or `filter` steps | `cdc`, `map`, `filter` |
+| `reshaped-table` | Mirror a table, renamed / filtered / reordered | as above, plus `map` and/or `filter` steps | `cdc`, `map`, `filter` |
 | `nested-json` | Assemble several tables into one object | one or more sources, one pipeline with a `nest` step, one view | `nest` |
 | `consolidated-table` | Consolidate the same table from several databases | one source per database, one pipeline with a `union` step, one view | `union` |
 | `blank` | Skeleton files only - I will write it myself | one source and one pipeline, as skeletons with placeholder values | — |
@@ -93,7 +93,7 @@ points:
   "recipes": [
     { "id": "sample",            "title": "Try it with sample data",                          "runnable": true,  "uses": [] },
     { "id": "mirrored-table",    "title": "Mirror one table, as it changes",                  "runnable": true,  "uses": ["cdc"] },
-    { "id": "reshaped-table",    "title": "Mirror a table, renamed / filtered / trimmed",     "runnable": true,  "uses": ["cdc", "map", "filter"] },
+    { "id": "reshaped-table",    "title": "Mirror a table, renamed / filtered / reordered",   "runnable": true,  "uses": ["cdc", "map", "filter"] },
     { "id": "nested-json",       "title": "Assemble several tables into one object",          "runnable": true,  "uses": ["nest"] },
     { "id": "consolidated-table","title": "Consolidate the same table from several databases","runnable": true,  "uses": ["union"] },
     { "id": "blank",             "title": "Skeleton files only - I will write it myself",       "runnable": false, "uses": [] }
@@ -114,7 +114,7 @@ and are not asked. Ids are suggested and taken on an empty reply.
 |---|---|
 | `sample` | nothing |
 | `mirrored-table` | connector (official list, default `mysql`) · connection fields · one table (no default; a blank answer is refused, not re-asked) · view id (defaults to the table name) |
-| `reshaped-table` | as `mirrored-table`, then: columns to keep or rename, columns to drop, an optional row filter. No script step — a transform that needs code is written by hand after `blank` or by editing the file |
+| `reshaped-table` | as `mirrored-table`, then: columns to put first or rename, columns to drop, an optional row filter. Unlisted columns still pass through. No script step — a transform that needs code is written by hand after `blank` or by editing the file |
 | `nested-json` | the root table (connector · connection · table · key), then one or more child tables (connector · connection · table · the columns that join it to the root · one-to-one or one-to-many) |
 | `consolidated-table` | the table name once, then two or more databases (connector · connection) that hold it |
 | `blank` | nothing — the skeletons are written as they stand, for you to edit |
@@ -133,7 +133,7 @@ can rely on it:
   `string`-typed port comes out as `port: "3306"`); the demo files are hand-written and differ in
   such spacing, which is fine — they are copied, never generated;
 - a choice list's default is its first entry (for the recipe question, `sample`);
-- `reshaped-table`: "columns to keep" is written as identity renames (`region: $region`) — a `map`
+- `reshaped-table`: "columns to put first" is written as identity renames (`region: $region`) — a `map`
   step lets unlisted fields through, so keeping fixes the order but does not trim; "drop" is an
   explicit drop (`internal_note: false`); a rename wins over a keep of the same column. The step ids
   are `reshape` (map) and `keep` (filter); with nothing to reshape the recipe writes exactly what

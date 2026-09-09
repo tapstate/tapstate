@@ -127,7 +127,8 @@ final class ConfigTypeCoercion {
         try {
             return Long.valueOf(value);
         } catch (NumberFormatException fractionalOrTooLarge) {
-            return Double.valueOf(value);
+            Double parsed = Double.valueOf(value);
+            return Double.isFinite(parsed) ? parsed : null;
         }
     }
 

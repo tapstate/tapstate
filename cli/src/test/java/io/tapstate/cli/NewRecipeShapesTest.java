@@ -481,6 +481,29 @@ class NewRecipeShapesTest {
     }
 
     @Test
+    void nestedJsonRejectsAConnectorFlagThatTheInteractivePathCannotUse(@TempDir Path home, @TempDir Path ws) {
+        NewRecipeTest.Run r = run(home, new ScriptedPrompter(), "new", "nested-json",
+                "--connector", "kafka", "--root", "orders", "--child", "shipments:order_id=id",
+                "-w", ws.toString());
+
+        assertThat(r.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).contains("cli.connector-not-official");
+        assertThat(ws.resolve("source")).doesNotExist();
+    }
+
+    @Test
+    void nestedJsonRejectsDifferentTablesThatNormalizeToOneExternalSource(@TempDir Path home, @TempDir Path ws) {
+        NewRecipeTest.Run r = run(home, new ScriptedPrompter(), "new", "nested-json", "--yes",
+                "--connector", "mysql", "--set", "host=db", "--root", "order-items",
+                "--child", "order_items:order_id=id", "--child-connector", "mysql", "--child-set", "host=db2",
+                "-w", ws.toString());
+
+        assertThat(r.code()).isEqualTo(NewCmd.EXIT_USAGE);
+        assertThat(r.err()).contains("same source id 'order_items_src'");
+        assertThat(ws.resolve("source")).doesNotExist();
+    }
+
+    @Test
     void nestedJsonJsonListsTheFilesWithTheirKinds(@TempDir Path home, @TempDir Path ws) {
         NewRecipeTest.Run r = nested(home, ws, "-o", "json");
 
@@ -548,6 +571,54 @@ class NewRecipeShapesTest {
         assertThat(consolidated(home, flags).code()).isZero();
         assertSameFiles(ws, flags, "source/orders_1_src.tap.yml", "source/orders_2_src.tap.yml",
                 "pipeline/orders_sync.tap.yml", ".env", ".gitignore");
+    }
+
+    @Test
+    void interactiveConsolidatedTableUsesConnectorAndConfigFlagsForItsFirstDatabase() {
+        Prompter prompter = new Prompter() {
+            @Override
+            public String ask(String question, String defaultValue) {
+                if (question.equals(ConsolidatedTableRecipe.TABLE_QUESTION)) {
+                    return "orders";
+                }
+                if (question.equals(ConsolidatedTableRecipe.ANOTHER_QUESTION)) {
+                    return "n";
+                }
+                if (question.toLowerCase(java.util.Locale.ROOT).contains("host")) {
+                    return "db2";
+                }
+                if (question.toLowerCase(java.util.Locale.ROOT).contains("username")) {
+                    return "u2";
+                }
+                return defaultValue == null ? "value" : "";
+            }
+
+            @Override
+            public String secret(String question) {
+                return "s2";
+            }
+
+            @Override
+            public String choose(String question, List<String> options) {
+                return "mysql";
+            }
+
+            @Override
+            public String lines(String question) {
+                return "";
+            }
+        };
+        RecipeRun.Flags flags = new RecipeRun.Flags("postgres",
+                java.util.Map.of("host", "db1", "username", "u1", "password", "s1"), null, null,
+                new RecipeRun.Flags.Reshape(null, null, null, null),
+                new RecipeRun.Flags.Nested(null, null, List.of(), null, java.util.Map.of()), List.of());
+
+        ConsolidatedTableRecipe.Answers answers = ConsolidatedTableRecipe.ask(prompter, flags,
+                io.tapstate.core.catalog.TapstateCatalog.load());
+
+        assertThat(answers.databases().getFirst().connector()).isEqualTo("postgres");
+        assertThat(answers.databases().getFirst().config()).containsEntry("host", "db1")
+                .containsEntry("username", "u1").containsEntry("password", "s1");
     }
 
     /**

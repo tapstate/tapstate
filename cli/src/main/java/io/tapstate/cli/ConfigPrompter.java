@@ -53,7 +53,7 @@ final class ConfigPrompter {
         Map<String, Object> config = new LinkedHashMap<>();
         Map<String, String> unread = new LinkedHashMap<>(given);
         for (ConfigField field : fields) {
-            if (!(field.required() || field.secret()) || !visibleByDefault(field, fields, config)) {
+            if (!(field.required() || field.secret()) || !visibleByDefault(field, fields, given, config)) {
                 continue;
             }
             String raw = unread.remove(field.name());
@@ -102,12 +102,16 @@ final class ConfigPrompter {
     }
 
     /** As {@link #visible}, with an unanswered controller read as its own catalog default. */
-    private boolean visibleByDefault(ConfigField field, List<ConfigField> fields, Map<String, Object> answered) {
+    private boolean visibleByDefault(ConfigField field, List<ConfigField> fields, Map<String, String> given,
+                                     Map<String, Object> answered) {
         VisibleWhen vw = field.visibleWhen();
         if (vw == null) {
             return true;
         }
-        Object controller = answered.get(vw.controllingField());
+        Object controller = given.get(vw.controllingField());
+        if (controller == null) {
+            controller = answered.get(vw.controllingField());
+        }
         if (controller == null) {
             controller = fields.stream()
                     .filter(f -> f.name().equals(vw.controllingField()))

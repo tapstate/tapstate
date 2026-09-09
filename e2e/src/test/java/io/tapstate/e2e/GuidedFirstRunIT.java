@@ -8,6 +8,7 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -75,6 +76,8 @@ class GuidedFirstRunIT {
     private static Map<String, Object> mysql;
     private static Path home;
     private static Path workspace;
+    @TempDir
+    static Path temporaryRoot;
 
     @BeforeAll
     static void bringUpTheWorld() throws Exception {
@@ -92,8 +95,8 @@ class GuidedFirstRunIT {
         mongo = new MongoEndpoints();
         // Views land in the "views" database of the server's own replica set, under the view's id.
         viewStore = EndpointAddress.uri(SharedMongo.replicaSetUrl("views"));
-        home = Files.createTempDirectory("tapstate-first-run-home");
-        workspace = Files.createTempDirectory("tapstate-first-run-workspace");
+        home = Files.createDirectories(temporaryRoot.resolve("home"));
+        workspace = Files.createDirectories(temporaryRoot.resolve("workspace"));
     }
 
     @AfterAll
@@ -159,7 +162,7 @@ class GuidedFirstRunIT {
     @Test
     @Order(3)
     void aSourceThatDoesNotAnswerFailsPreflightByStageAndCode() throws IOException {
-        Path unreachable = Files.createTempDirectory("tapstate-first-run-unreachable");
+        Path unreachable = Files.createDirectories(temporaryRoot.resolve("unreachable"));
         copy(workspace, unreachable);
         Path source = unreachable.resolve("source/" + SOURCE_ID + ".tap.yml");
         String pointedAtAClosedPort = Files.readString(source, StandardCharsets.UTF_8)

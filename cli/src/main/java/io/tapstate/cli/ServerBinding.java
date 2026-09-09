@@ -125,7 +125,7 @@ final class ServerBinding {
      */
     private void bindServer(Path workspace, URI server, boolean startLocal, String user) throws IOException {
         if (probe.isHealthy(server)) {
-            signInAndBind(workspace, server, credentialsFor(server, user), false);
+            signInAndBind(workspace, server, credentialsFor(server, user, true), false, user);
             return;
         }
         if (!server.equals(DEFAULT_SERVER)) {
@@ -144,7 +144,7 @@ final class ServerBinding {
             }
         }
         LocalStack.Admin admin = stack.start(prose);
-        signInAndBind(workspace, DEFAULT_SERVER, new Credentials(admin.user(), admin.password()), true);
+        signInAndBind(workspace, DEFAULT_SERVER, new Credentials(admin.user(), admin.password(), false), true, user);
         say("local stack: " + stack.dir());
         say("to stop it: " + stack.stopCommand());
     }
@@ -155,11 +155,11 @@ final class ServerBinding {
      * the flags and the environment when nobody can be asked. Resolved before anything is registered,
      * so a script missing its password is refused with the store exactly as it was.
      */
-    private Credentials credentialsFor(URI server, String user) throws IOException {
-        if (server.equals(DEFAULT_SERVER)) {
+    private Credentials credentialsFor(URI server, String user, boolean allowSavedLocalAdmin) throws IOException {
+        if (allowSavedLocalAdmin && server.equals(DEFAULT_SERVER)) {
             LocalStack.Admin saved = stack.savedAdmin().orElse(null);
             if (saved != null) {
-                return new Credentials(saved.user(), saved.password());
+                return new Credentials(saved.user(), saved.password(), true);
             }
         }
         String username = user != null ? user : askUsername();
@@ -171,7 +171,7 @@ final class ServerBinding {
             }
             password = prompter.secret(PASSWORD_QUESTION);
         }
-        return new Credentials(username, password);
+        return new Credentials(username, password, false);
     }
 
     /** The default is admin either way: it is what a fresh server's first administrator is called. */
@@ -191,14 +191,11 @@ final class ServerBinding {
      * signed in, the binding waits for the stack's boot-time sweep to register the bundled connectors,
      * so the first {@code up} never lands in the seconds between the server listening and them existing.
      */
-    private void signInAndBind(Path workspace, URI server, Credentials credentials, boolean justStarted)
+    private void signInAndBind(Path workspace, URI server, Credentials credentials, boolean justStarted, String user)
             throws IOException {
-        String name = server.equals(DEFAULT_SERVER) ? LOCAL_CONTEXT : contextNameFor(server);
-        ContextDefinition definition = contexts.suggestions().stream()
-                .filter(choice -> choice.name().equals(name))
-                .map(ContextManager.ContextChoice::definition)
-                .findFirst()
-                .orElseGet(() -> contexts.create(name, List.of(server), true));
+        ContextManager.ContextChoice choice = contextFor(server);
+        String name = choice.name();
+        ContextDefinition definition = choice.definition();
         ResolvedContext.Named context = new ResolvedContext.Named(name, definition, ResolvedContext.Source.EXPLICIT);
         Supplier<AuthService.LoginResult> attempt =
                 () -> auth.login(context, credentials.user(), credentials.password(), false);
@@ -211,9 +208,16 @@ final class ServerBinding {
                     stack.awaitConnectors(() -> registeredConnectors(success.session()));
                 }
             }
-            case AuthService.LoginResult.Rejected rejected -> throw new TapstateException(
-                    CliError.AUTH_LOGIN_REJECTED,
-                    Map.of("code", rejected.code(), "principal", rejected.principal()), null);
+            case AuthService.LoginResult.Rejected rejected -> {
+                if (credentials.savedLocalAdmin()) {
+                    // A saved stack directory outlives its containers. When a different local server is
+                    // now listening on the same port, let explicit credentials replace the stale admin.
+                    signInAndBind(workspace, server, credentialsFor(server, user, false), false, user);
+                    return;
+                }
+                throw new TapstateException(CliError.AUTH_LOGIN_REJECTED,
+                        Map.of("code", rejected.code(), "principal", rejected.principal()), null);
+            }
             case AuthService.LoginResult.Unreachable ignored -> throw new TapstateException(
                     CliError.AUTH_LOGIN_UNREACHABLE, Map.of("context", name), null);
         }
@@ -255,7 +259,27 @@ final class ServerBinding {
      * secret rather than naming it in the shape of an assignment, which is what a credential scanner
      * reads as one - the redaction is the point of this method, and it should not read like the leak.
      */
-    private record Credentials(String user, String password) {
+    /** Finds an exact-server context or claims the first free name derived from that server. */
+    private ContextManager.ContextChoice contextFor(URI server) {
+        String base = server.equals(DEFAULT_SERVER) ? LOCAL_CONTEXT : contextNameFor(server);
+        List<ContextManager.ContextChoice> choices = contexts.suggestions();
+        for (int suffix = 1; ; suffix++) {
+            String name = suffix == 1 ? base : base + "-" + suffix;
+            ContextManager.ContextChoice existing = choices.stream()
+                    .filter(choice -> choice.name().equals(name))
+                    .findFirst()
+                    .orElse(null);
+            if (existing == null) {
+                ContextDefinition created = contexts.create(name, List.of(server), true);
+                return new ContextManager.ContextChoice(name, created, false);
+            }
+            if (existing.definition().seeds().equals(List.of(server))) {
+                return existing;
+            }
+        }
+    }
+
+    private record Credentials(String user, String password, boolean savedLocalAdmin) {
         @Override
         public String toString() {
             return "Credentials[user=" + user + ", secret redacted]";
@@ -274,11 +298,12 @@ final class ServerBinding {
     }
 
     /**
-     * The context name a typed server is registered under: its host, with anything a context name
-     * cannot carry (an IPv6 literal's brackets, say) folded to dashes.
+     * The context name a typed server is registered under: scheme, host and effective port, with
+     * anything a context name cannot carry (an IPv6 literal's brackets, say) folded to dashes.
      */
     static String contextNameFor(URI server) {
-        String name = server.getHost()
+        int port = server.getPort() >= 0 ? server.getPort() : "https".equalsIgnoreCase(server.getScheme()) ? 443 : 80;
+        String name = (server.getScheme() + "-" + server.getHost() + "-" + port)
                 .replaceAll("[^A-Za-z0-9._-]", "-")
                 .replaceFirst("^[^A-Za-z0-9]+", "");
         return name.isEmpty() ? "server" : name;

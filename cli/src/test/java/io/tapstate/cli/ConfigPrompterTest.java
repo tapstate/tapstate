@@ -140,4 +140,22 @@ class ConfigPrompterTest {
         assertThat(notAsked.asked).as("a flag answer is not asked again; only the port's default is taken")
                 .containsExactly("port");
     }
+
+    @Test
+    void essentialWalkUsesASuppliedControllerBeforeItsDefault() {
+        ConfigField mode = new ConfigField("deploymentMode", ConfigType.STRING, Map.of("en_US", "mode"), false,
+                "standalone", false, List.of(opt("standalone"), opt("cluster")), null);
+        ConfigField host = new ConfigField("host", ConfigType.STRING, Map.of("en_US", "host"), true, null, false,
+                List.of(), new VisibleWhen("deploymentMode", List.of("standalone")));
+        ConfigField secret = new ConfigField("password", ConfigType.STRING, Map.of("en_US", "password"), false,
+                null, true, List.of(), null);
+
+        ScriptedPrompter prompter = new ScriptedPrompter("s");
+        Map<String, Object> config = new ConfigPrompter().collectEssential(
+                List.of(mode, host, secret), Map.of("deploymentMode", "cluster"), prompter);
+
+        assertThat(config).containsExactly(Map.entry("password", "s"), Map.entry("deploymentMode", "cluster"));
+        assertThat(prompter.asked).isEmpty();
+        assertThat(prompter.secretQuestions).containsExactly("password");
+    }
 }

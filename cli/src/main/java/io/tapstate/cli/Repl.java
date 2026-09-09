@@ -3855,6 +3855,7 @@ final class Repl {
             Set<String> registered;
             switch (listConnectors()) {
                 case ConnectorListOutcome.Listed listed -> registered = listed.connectors().stream()
+                        .filter(connector -> "registered".equals(connector.origin()))
                         .map(CatalogConnector::id).collect(Collectors.toSet());
                 case ConnectorListOutcome.Rejected rejected -> {
                     return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()),

@@ -295,6 +295,22 @@ class UpCmdTest {
     }
 
     @Test
+    void aBundledConnectorDoesNotSatisfyTheRegisteredConnectorPreflight(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.registeredConnectors = List.of("postgres");
+        client.bundledConnectors = List.of("mysql");
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.err()).contains("up: preflight failed on orders_src: connector.not-registered")
+                .contains("mysql");
+        assertThat(client.calls).containsExactly("isHealthy", "connectorList");
+    }
+
+    @Test
     void anUnreachableDiscoveryStopsAtDiscoverNamingTheSource(@TempDir Path home, @TempDir Path ws) {
         scaffold(home, ws);
         signIn(home);
@@ -553,6 +569,24 @@ class UpCmdTest {
     }
 
     @Test
+    void jsonCarriesNotesForUnchangedSourcesWithoutChangingTheSourceIdList(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.applyChange = "UNCHANGED";
+        client.schemaOutcome = new ConnectionSchemaOutcome.Found(client.schema);
+        client.pipelineState = "RUNNING";
+
+        Run r = up(home, client, "up", "-w", ws.toString(), "-o", "json");
+
+        assertThat(r.code()).as(r.all()).isZero();
+        assertThat(r.out()).contains("\"sources\": [\n    \"orders_src\"")
+                .contains("\"sourceNotes\": {")
+                .contains("\"orders_src\": [")
+                .contains("\"apply: unchanged\"");
+    }
+
+    @Test
     void helpSaysWhatItDoesAndListsTheStages() {
         CommandLine cl = Cli.newCommandLine();
         StringWriter out = new StringWriter();
@@ -583,6 +617,7 @@ class UpCmdTest {
         /** The drafts each apply carried, kept whole: what reaches the wire is the thing under test. */
         final List<List<LocalDraft>> applied = new ArrayList<>();
         List<String> registeredConnectors = List.of("mysql", "postgres");
+        List<String> bundledConnectors = List.of();
         /** What every applied item reports back: CREATED on a first run, UNCHANGED on a converged one. */
         String applyChange = "CREATED";
         /** When set, what a batch holding the pipeline is answered with instead of its items. */
@@ -633,9 +668,12 @@ class UpCmdTest {
         @Override
         public ConnectorListOutcome connectorList(URI u, String c) {
             calls.add("connectorList");
-            return new ConnectorListOutcome.Listed(registeredConnectors.stream()
-                    .map(id -> new CatalogConnector(id, id, "database", List.of("cdc"), true, "registered"))
-                    .toList());
+            List<CatalogConnector> connectors = new ArrayList<>();
+            registeredConnectors.forEach(id -> connectors.add(
+                    new CatalogConnector(id, id, "database", List.of("cdc"), true, "registered")));
+            bundledConnectors.forEach(id -> connectors.add(
+                    new CatalogConnector(id, id, "database", List.of("cdc"), true, "bundled")));
+            return new ConnectorListOutcome.Listed(connectors);
         }
 
         @Override
