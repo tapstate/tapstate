@@ -331,7 +331,67 @@ class MigrationRunnerIT {
                 .isNotEqualTo(1);
     }
 
+    @Test
+    void aChangesetToldByTheBeatThatItsLockIsGoneStopsBeforeItsNextWrite() {
+        // The other half, and the one the lease cannot cover: here the lock is genuinely somebody
+        // else's and the store says so when asked. Nothing read that answer, so the run carried on
+        // writing into a store another member was already changing. A short lock is what makes this
+        // observable -- the beat is a fraction of the lock this run took, so the answer arrives inside
+        // a test rather than a minute later.
+        MongoDatabase database = freshDatabase("runner_told");
+        Duration shortLock = Duration.ofSeconds(3);
+        AtomicInteger writes = new AtomicInteger();
+
+        TapstateException thrown = catchThrowableOfType(
+                () -> MigrationRunner.migrate(database,
+                        List.of(losingTheLockMidRun(1, database, shortLock, writes)),
+                        shortLock, PATIENT, CLOCK),
+                TapstateException.class);
+
+        assertThat(writes)
+                .as("the beat came back false and the second write did not happen; the lease is still "
+                        + "alive at this point, so nothing but the answer could have stopped it")
+                .hasValue(1);
+        assertThat(thrown).isNotNull();
+    }
+
     // ---- fixtures ----
+
+    /**
+     * A changeset that writes, has its lock taken while it works, waits long enough for one beat to
+     * come back and say so, and tries to write again.
+     */
+    private static ChangeSet losingTheLockMidRun(int version, MongoDatabase database, Duration lockTtl,
+            AtomicInteger writes) {
+        return new ChangeSet() {
+            @Override
+            public int version() {
+                return version;
+            }
+
+            @Override
+            public void up(MongoDatabase ignored, Fence fence) {
+                fence.requireStillHeld();
+                writes.incrementAndGet();
+                schemaDocuments(database).updateOne(SCHEMA_ID,
+                        new Document("$inc", new Document("lock.epoch", 1L)));
+                // Two beats' worth, and still well inside the lock's own life, so a refusal here can
+                // only have come from what the beat was told.
+                sleepFor(lockTtl.dividedBy(3).multipliedBy(2).plusMillis(500));
+                fence.requireStillHeld();
+                writes.incrementAndGet();
+            }
+        };
+    }
+
+    private static void sleepFor(Duration duration) {
+        try {
+            Thread.sleep(duration.toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+    }
 
     /** A clock a changeset can push forward from inside its own run, the way a stall does. */
     private static final class StalledClock extends Clock {
