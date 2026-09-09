@@ -43,7 +43,7 @@ def check(workflows, contexts):
     assert 'install' in shards and '-DskipTests' in shards and 'RUNNER_TEMP/m2' in shards
     assert 'if-no-files-found: error' in shards, 'missing shard artifact must fail'
     sonar = ci.get('sonarqube', '')
-    sonar_name = "    name: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && 'ci-summary' || 'sonarqube' }}"
+    sonar_name = '    name: sonarqube'
     assert sonar_name in sonar.splitlines(), 'sonarqube must keep its exact name on analysis events'
     assert not re.search(r'^\s+matrix:', sonar, re.M), 'sonarqube must not be a matrix'
     assert 'needs: build' in sonar and 'always()' in sonar, 'sonarqube must report failed builds'
@@ -68,7 +68,7 @@ for original, replacement in [
     ('  build:', '  build-renamed:'),
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),
-    ("&& 'ci-summary' || 'sonarqube'", "&& 'ci-summary' || 'sonar-renamed'"),
+    ('    name: sonarqube', '    name: sonar-renamed'),
 ]:
     assert original in workflows['ci.yml'], f'mutation target absent: {original}'
     mutated = {**workflows, 'ci.yml': workflows['ci.yml'].replace(original, replacement, 1)}

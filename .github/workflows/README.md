@@ -13,7 +13,11 @@ runs on pull request creation and updates. `push` tests the integration branch
 This avoids a second suite both when a pull request already exists and when it
 is opened after a branch push. Before opening a pull request, explicitly run
 `gh workflow run ci.yml --ref <branch>` when CI validation is needed. Manual runs
-are deliberate additional executions and are not automatic duplicate runs.
+are deliberate additional executions and are not automatic duplicate runs. They
+include Sonar analysis and its quality gate when repository secrets are present;
+there is no separate cheap branch-push lane. CI and manual PR analysis share a
+Sonar concurrency group with cancellation disabled so in-flight server analyses
+finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
@@ -59,3 +63,10 @@ The scanner still reads its own current indexes and downloads missing versions;
 cache hits never skip report admission, analysis, or the quality gate. Cache
 lookup failures fall back to ordinary analysis. `sonar-cache-smoke.sh` protects
 the identity and workflow bindings, alongside the analysis-path regressions.
+
+Artifact admission runs once in `build`, before coverage merging and analysis.
+Shard artifacts carry reports, declared coverage data, and only their own
+modules' test bytecode. Production bytecode comes from the aggregate build.
+Source discovery uses Maven's default test naming patterns and rejects custom
+Surefire/Failsafe includes or excludes (including file-based, execution, managed,
+and profile configuration) rather than silently omitting tests.

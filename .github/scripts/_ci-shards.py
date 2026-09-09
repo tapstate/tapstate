@@ -59,6 +59,15 @@ def reactor(root):
     modules = []
     def visit(directory, inherited_it=False):
         tree = pom(directory / 'pom.xml')
+        # Source discovery implements Maven's default name patterns. Reject custom
+        # selectors, including managed/profile/execution configuration, before a
+        # plan can certify the same incomplete cohort on both sides of admission.
+        for plugin in tree.findall('.//plugin'):
+            if plugin.findtext('artifactId') in ('maven-surefire-plugin', 'maven-failsafe-plugin'):
+                for config in plugin.findall('.//configuration'):
+                    require(not any(config.find(name) is not None for name in
+                                    ('includes', 'excludes', 'includesFile', 'excludesFile')),
+                            'unsupported test selection in ' + str(directory / 'pom.xml'))
         bound_it = inherited_it or any(
             p.findtext('artifactId') == 'maven-failsafe-plugin'
             and p.find("executions/execution/goals/goal[.='integration-test']") is not None
@@ -262,9 +271,8 @@ def pack(args, root, plan):
     require(not output.exists(), 'artifact output already exists: ' + str(output))
     files = output / 'files'
     paths = report_paths + [root / p for p in shard['required_exec']]
-    for module, _ in reactor(root):
-        for folder in ['classes', 'test-classes']:
-            paths += [p for p in (root / module / 'target' / folder).rglob('*') if p.is_file()]
+    for module in sorted({t['module'] for t in shard['tests']}):
+        paths += [p for p in (root / module / 'target/test-classes').rglob('*') if p.is_file()]
     for path in paths:
         require(not path.is_symlink(), 'symlink artifact: ' + str(path))
         dest = files / path.relative_to(root)
@@ -299,8 +307,10 @@ def verify(args, root, plan):
             require(not path.is_symlink(), 'symlink artifact: ' + str(path))
             if path.is_file():
                 relative = path.relative_to(files).as_posix()
-                require(re.fullmatch(r'.+/target/(?:classes/.+|test-classes/.+|(?:surefire|failsafe)-reports/TEST-[^/]+\.xml|jacoco(?:-it)?\.exec)', relative),
+                require(re.fullmatch(r'.+/target/(?:test-classes/.+|(?:surefire|failsafe)-reports/TEST-[^/]+\.xml|jacoco(?:-it)?\.exec)', relative),
                         'unexpected artifact path: ' + relative)
+                require(relative.split('/target/', 1)[0] in {t['module'] for t in shard['tests']},
+                        'artifact outside shard modules: ' + relative)
                 actual_files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
         require(actual_files == declared_files, 'artifact files differ from manifest: ' + shard['id'])
         _, statistics, report_classes = reports(files, shard)

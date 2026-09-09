@@ -23,6 +23,7 @@ with tempfile.TemporaryDirectory() as tmp:
         for module in ['e2e','runtime/engine','core']:
             shutil.rmtree(root/module/'target',ignore_errors=True)
             put(module+'/target/classes/sample/Production.class','bytecode')
+            put(module+'/target/test-classes/sample/Helper.class','helper-bytecode')
         for test in shard['tests']:
             phase='failsafe' if test['kind']=='it' else 'surefire'
             name=test['class']; count='0' if name.endswith('DisabledTest') else '1'
@@ -33,6 +34,10 @@ with tempfile.TemporaryDirectory() as tmp:
                 put(test['module']+'/target/'+phase+'-reports/TEST-'+name+'$Nested.xml',f'<testsuite name="{name}$Nested" tests="1" failures="0" errors="0"><testcase classname="{name}$Nested" name="nested"/></testsuite>')
         for path in shard['required_exec']: put(path,'execution-data')
         subprocess.run([os.environ['AGGREGATE_GATE'],'pack','--root',tmp,'--plan',str(root/'plan.json'),'--shard',shard['id'],'--output',str(artifacts/shard['id'])],check=True)
+        packed=json.loads((artifacts/shard['id']/'manifest.json').read_text())['files']
+        assert not any('/target/classes/' in p for p in packed), 'production bytecode is rebuilt by the aggregate'
+        owners={t['module'] for t in shard['tests']}
+        assert {p.split('/target/')[0] for p in packed if '/test-classes/' in p}==owners, 'test bytecode must be limited to this shard modules'
     def verify(expect=True, rehash=False):
         # A self-consistent but incomplete manifest must still fail report admission.
         if rehash:
@@ -52,6 +57,10 @@ with tempfile.TemporaryDirectory() as tmp:
     assert len(list((root/'restored').rglob('TEST-*.xml')))==8
     backup=root/'backup'; shutil.copytree(artifacts,backup)
     def reset(): shutil.rmtree(artifacts); shutil.copytree(backup,artifacts)
+    for path in ['engine/files/runtime/engine/target/classes/sample/Production.class',
+                 'engine/files/core/target/test-classes/sample/Helper.class']:
+        put('artifacts/'+path,'unexpected-bytecode')
+        verify(False, rehash=True); reset()
     # Distinct ordinary and nested suites cannot silently collide in the restored namespace.
     for pattern in ['TEST-sample.*IT.xml', 'TEST-sample.*IT$Nested.xml']:
         for p in artifacts.rglob(pattern): p.rename(p.with_name('TEST-shared.xml'))
@@ -73,5 +82,5 @@ with tempfile.TemporaryDirectory() as tmp:
     (alien/'TEST-extra.xml').write_text('<testsuite name="sample.ExtraTest" tests="1" errors="0" failures="0"/>'); verify(False, rehash=True); reset()
     # A test added after planning invalidates the source-selected cohort.
     put('core/src/test/java/sample/NewTest.java','package sample; class NewTest {}'); verify(False)
-print('ci-aggregate smoke: 17 admission cases passed')
+print('ci-aggregate smoke: 19 admission cases and shard-local bytecode payload passed')
 PY

@@ -61,6 +61,16 @@ cases = [
     ('flow steps fail closed', {'one.yml': workflow(), 'two.yml': 'on: push\njobs:\n  duplicate:\n    steps: [{run: mvn verify}]\n'}, False, ['unsupported']),
     ('module working directory is not a full suite', {'one.yml': workflow(extra='      - run: mvn verify\n        working-directory: e2e\n')}, True, ['found 1']),
 ]
+for wrapped in ["bash -c 'mvn -B verify'", "sh -ec 'mvn -B verify'", 'timeout 30m mvn verify',
+                'timeout --signal=TERM --kill-after=5s 30m mvn verify', 'nice mvn verify',
+                'nice -n 5 mvn verify', 'stdbuf -o0 mvn verify', 'xargs mvn verify',
+                'env -i mvn verify', 'unknown-wrapper mvn verify', 'unknown-wrapper "mvn -B verify"', 'bash -c "$COMMAND"',
+                "bash -c 'mvn verify; mvn verify'", 'bash -x ./mvnw verify']:
+    cases.append(('wrapped duplicate: '+wrapped, {'one.yml': workflow(), 'two.yml': workflow(wrapped)}, False, []))
+for wrapped in ["bash -c 'mvn -B verify'", 'timeout 30m mvn verify', 'nice -n 5 mvn verify',
+                'stdbuf -o0 mvn verify', 'env -i mvn verify']:
+    cases.append(('one wrapped call: '+wrapped, {'one.yml': workflow(wrapped)}, True, ['found 1']))
+cases.append(('quoted shell diagnostic', {'one.yml': workflow("bash -c 'echo mvn verify'\nmvn verify")}, True, ['found 1']))
 # Prove that the wrapper fixture executes a second suite using a harmless recorder.
 # This is an independent shell observation, not a prediction from the gate parser.
 with tempfile.TemporaryDirectory() as temporary:
@@ -76,6 +86,13 @@ with tempfile.TemporaryDirectory() as temporary:
         assert run.returncode == 0, run.stdout + run.stderr
         assert record.read_text().splitlines() == ['-B verify', '-B verify'], wrapper
     print('time recorder: 3 wrappers each executed exactly 2 Maven calls', flush=True)
+    for wrapped in ["bash -c 'mvn -B verify'", "sh -ec 'mvn -B verify'", 'nice -n 5 mvn -B verify',
+                    'env -i PATH="'+environment['PATH']+'" CALL_RECORD="'+str(record)+'" mvn -B verify']:
+        record.write_text('')
+        run=subprocess.run(['bash','-c','mvn -B verify\n'+wrapped],env=environment,capture_output=True,text=True)
+        assert run.returncode==0, run.stdout+run.stderr
+        assert record.read_text().splitlines()==['-B verify','-B verify'], wrapped
+    print('shell/env/nice recorder: 4 wrappers each executed exactly 2 Maven calls',flush=True)
 
 with tempfile.TemporaryDirectory() as temporary:
     directory = Path(temporary)

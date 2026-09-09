@@ -28,11 +28,11 @@ on:
 
   workflow_dispatch:
 
-# Keep analyses serialized with manual pull-request analysis. Branch pushes can
-# cancel superseded builds; an analysis already in progress must finish.
+# Keep analyses serialized with manual pull-request analysis. In-flight server
+# analyses must finish; subsequent PR updates wait for the active run.
 concurrency:
-  group: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && format('ci-{0}-{1}', github.workflow, github.ref) || format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}
-  cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') }}
+  group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -109,11 +109,8 @@ jobs:
   # including every shard's declared report and coverage files, before reporting green.
   build:
     outputs:
-      sonar-required: ${{ env.SONAR_REQUIRED }}
       sonar-enabled: ${{ steps.guard.outputs.run }}
       sonar-outcome: ${{ steps.analyze.outcome }}
-    env:
-      SONAR_REQUIRED: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/')) }}
     needs: [shard-plan, test-shards]
     if: ${{ always() }}
     runs-on: ubuntu-latest
@@ -128,7 +125,6 @@ jobs:
           cache: maven
       - name: Check secret availability
         id: guard
-        if: env.SONAR_REQUIRED == 'true'
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -212,9 +208,6 @@ jobs:
           key: sonar-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sonar-cache-key.outputs.server }}-${{ steps.sonar-cache-key.outputs.manifest }}
           restore-keys: |
             sonar-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sonar-cache-key.outputs.server }}-
-      - name: Admit Sonar inputs
-        if: steps.guard.outputs.run == 'true'
-        run: .github/scripts/sonar-inputs.sh --root . --plan "$RUNNER_TEMP/shards.json" --artifacts "$RUNNER_TEMP/ci-artifacts" --restore .
       - name: Merge coverage from every declared shard
         run: |
           mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -N jacoco:merge@jacoco-merge-reactor
@@ -324,10 +317,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # A native check preserves fork-token behavior. The branch-push summary has a
-  # different name so ws pushes create no skipped or unevaluated sonarqube check.
+  # A stable native check preserves fork-token behavior for every subscribed event.
   sonarqube:
-    name: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && 'ci-summary' || 'sonarqube' }}
+    name: sonarqube
     needs: build
     if: ${{ always() }}
     runs-on: ubuntu-latest
@@ -335,17 +327,11 @@ jobs:
       - name: Report analysis outcome
         env:
           BUILD_RESULT: ${{ needs.build.result }}
-          SONAR_REQUIRED: ${{ needs.build.outputs.sonar-required }}
           SONAR_ENABLED: ${{ needs.build.outputs.sonar-enabled }}
           SONAR_OUTCOME: ${{ needs.build.outputs.sonar-outcome }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = success
-          if [ "$SONAR_REQUIRED" = false ]; then
-            echo 'Build and shard admission passed.' >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          test "$SONAR_REQUIRED" = true
           if [ "$SONAR_ENABLED" = false ]; then
             echo '::notice title=SonarQube not evaluated::Repository secrets were unavailable. This check is green because analysis was skipped, not because the quality gate passed.'
             printf '## SonarQube: not evaluated\n\nRepository secrets were unavailable (including fork pull requests). This check is green because analysis was skipped, not because the quality gate passed. See the build summary for the reason and diff coverage.\n' >> "$GITHUB_STEP_SUMMARY"

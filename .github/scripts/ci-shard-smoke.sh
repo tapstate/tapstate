@@ -53,5 +53,28 @@ with tempfile.TemporaryDirectory() as tmp:
     args=(root/'mvn-args').read_text().splitlines(); assert '-am' not in args and 'verify' in args and '-pl' in args
     assert any(a.startswith('-Dtest=') and all(name in a for name in ['FixedSleepGateTest','ErrorCodeGatesTest','NestStateSerialFormGatesTest']) for a in args)
     assert set(args[args.index('-pl')+1].split(','))=={'arch-tests', 'core', 'e2e'}, 'source-scanning gates must run in their owning modules'
+    # A custom Maven selector must not disappear from both sides of admission.
+    original=(root/'core/pom.xml').read_text()
+    put('core/src/test/java/sample/CustomSpec.java','package sample; class CustomSpec {}')
+    for plugin in ['maven-surefire-plugin', 'maven-failsafe-plugin']:
+        for selector in ['includes', 'excludes', 'includesFile', 'excludesFile']:
+            config=f'<configuration><{selector}>custom-selection</{selector}></configuration>'
+            for placement in ['plugin', 'execution', 'managed', 'profile']:
+                body=f'<executions><execution>{config}</execution></executions>' if placement=='execution' else config
+                plugins=f'<plugins><plugin><artifactId>{plugin}</artifactId>{body}</plugin></plugins>'
+                build='<build>'+('<pluginManagement>'+plugins+'</pluginManagement>' if placement=='managed' else plugins)+'</build>'
+                pom='<project>'+('<profiles><profile>'+build+'</profile></profiles>' if placement=='profile' else build)+'</project>'
+                put('core/pom.xml',pom)
+                result=subprocess.run(cmd,capture_output=True,text=True)
+                assert result.returncode!=0 and 'unsupported test selection' in result.stderr, (plugin,selector,placement,result.stdout,result.stderr)
+    put('core/pom.xml',original)
+    # The same guard must run on consumption, after a plan was already produced.
+    put('core/pom.xml',original.replace('</plugins>','<plugin><artifactId>maven-surefire-plugin</artifactId><configuration><includes/></configuration></plugin></plugins>'))
+    result=subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')],capture_output=True,text=True)
+    assert result.returncode!=0 and 'unsupported test selection' in result.stderr, result.stdout+result.stderr
+    put('core/pom.xml',original)
+    # Non-test plugins may legitimately have selection fields with the same names.
+    put('core/pom.xml',original.replace('</plugins>','<plugin><artifactId>maven-enforcer-plugin</artifactId><configuration><includes/></configuration></plugin></plugins>'))
+    subprocess.run(cmd,check=True)
 print('ci-shard smoke: source discovery, exact assignment, balance and source-gate placement passed')
 PY
