@@ -23,6 +23,10 @@ with tempfile.TemporaryDirectory() as tmp:
     assert len(plan['expected'])==7, plan['expected']
     ident=lambda t:(t['module'],t['kind'],t['class'])
     assert Counter(ident(t) for s in plan['shards'] for t in s['tests'])==Counter(ident(t) for t in plan['expected'])
+    owners={t['class']: (s['id'], t['module']) for s in plan['shards'] for t in s['tests']}
+    assert owners['sample.FixedSleepGateTest']==('rest', 'e2e')
+    for name in ['ErrorCodeGatesTest', 'NestStateSerialFormGatesTest']:
+        assert owners['sample.'+name]==('rest', 'arch-tests')
     assert next(s for s in plan['shards'] if s['id']=='rest')['required_exec']==['arch-tests/target/jacoco.exec','core/target/jacoco.exec','e2e/target/jacoco.exec']
     assert all(not s['required_exec'] for s in plan['shards'][:2])
     assert plan['shards'][0]['tests'][0]['class']=='sample.LongIT'
@@ -36,6 +40,8 @@ with tempfile.TemporaryDirectory() as tmp:
     generic=cmd[:-2]+['--output',str(root/'generic.json'),'--inventory',str(root/'inventory.json'),'--count','3']
     subprocess.run(generic,check=True)
     p=json.loads((root/'generic.json').read_text()); assert len(p['shards'])==3 and len(p['expected'])==6
+    seeded=json.loads((root/'inventory.json').read_text())
+    assert Counter(ident(t) for s in p['shards'] for t in s['tests'])==Counter(ident(t) for t in seeded), 'generic shard assignments must cover the independent seed exactly once'
     # Recompute from assigned classes; the sharder cannot certify its own load totals.
     hints=json.loads((root/'durations.json').read_text())
     loads=[sum(hints[t['class']] for t in s['tests']) for s in p['shards']]
@@ -46,6 +52,6 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')],check=True,env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']})
     args=(root/'mvn-args').read_text().splitlines(); assert '-am' not in args and 'verify' in args and '-pl' in args
     assert any(a.startswith('-Dtest=') and all(name in a for name in ['FixedSleepGateTest','ErrorCodeGatesTest','NestStateSerialFormGatesTest']) for a in args)
-    assert 'arch-tests' in args[args.index('-pl')+1]
-print('ci-shard smoke: 14 assertions passed')
+    assert set(args[args.index('-pl')+1].split(','))=={'arch-tests', 'core', 'e2e'}, 'source-scanning gates must run in their owning modules'
+print('ci-shard smoke: source discovery, exact assignment, balance and source-gate placement passed')
 PY

@@ -93,6 +93,11 @@ else:
     }
     assert set(evidence['snapshots']) == expected_aliases, 'resolved snapshot closure differs from fixture dependency graph'
     assert first == prepare(), 'unchanged snapshots changed key'
+    changed_source = dict(evidence, source_sha='f' * 40)
+    assert changed_source['source_sha'] != evidence['source_sha']
+    source_probe = root / 'source-changed.json'
+    source_probe.write_text(json.dumps(changed_source))
+    assert first != call('key', '--manifest', source_probe), 'changed connector source did not invalidate key'
     second = prepare(root / 'new.json', SNAPSHOT_BUILD='20260909.010203-2')
     assert first != second, 'republished PDK did not invalidate key'
     prepare()
