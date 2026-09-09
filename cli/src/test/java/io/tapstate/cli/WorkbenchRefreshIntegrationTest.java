@@ -6,6 +6,7 @@ import dev.tamboui.terminal.Frame;
 import dev.tamboui.tui.event.Event;
 import dev.tamboui.tui.event.KeyCode;
 import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.KeyModifiers;
 import dev.tamboui.tui.event.MouseButton;
 import dev.tamboui.tui.event.MouseEvent;
 import dev.tamboui.tui.event.PasteEvent;
@@ -137,6 +138,77 @@ class WorkbenchRefreshIntegrationTest {
         assertThat(session.handleEvent(MouseEvent.press(MouseButton.LEFT, 18, 2), null)).isTrue();
         assertThat(runtime.state().selectedTab()).isEqualTo(WorkbenchState.WorkbenchTab.WORKSPACE);
 
+    }
+
+    @Test
+    void workspaceOpensEditsAndSavesThroughTheTypedFileGateway() {
+        ImmediateScheduler scheduler = new ImmediateScheduler();
+        WorkbenchSnapshot snapshot = connectedLocalSnapshot(0, 1);
+        WorkbenchRuntime runtime = new WorkbenchRuntime(
+                WorkbenchState.initial().expectSnapshot(snapshot).acceptSnapshot(snapshot),
+                scheduler,
+                () -> true,
+                event -> {
+                });
+        AtomicReference<Path> savedPath = new AtomicReference<>();
+        AtomicReference<String> savedContent = new AtomicReference<>();
+        WorkbenchActionGateway gateway = new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return List.of();
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public LoginResult login(LoginRequest request, SecretBuffer password) {
+                password.close();
+                return new LoginResult.Unavailable();
+            }
+
+            @Override
+            public FileReadResult readWorkspaceFile(Path relativePath) {
+                return new FileReadResult.Loaded(relativePath, "apiVersion: tapstate/v1\nkind: Pipeline\n");
+            }
+
+            @Override
+            public FileWriteResult writeWorkspaceFile(Path relativePath, String content) {
+                savedPath.set(relativePath);
+                savedContent.set(content);
+                return new FileWriteResult.Saved();
+            }
+        };
+
+        try (Workbench.Session session = new Workbench.Session(
+                runtime, (generation, sequence, token) -> snapshot, gateway)) {
+            assertThat(session.handleEvent(KeyEvent.ofChar('2'), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            assertThat(runtime.state().workspaceView().document())
+                    .hasValueSatisfying(document -> {
+                        assertThat(document.relativePath()).isEqualTo(Path.of("pipeline/orders.tap.yml"));
+                        assertThat(document.editing()).isFalse();
+                    });
+
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.F4), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofChar('#'), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofChar('s', KeyModifiers.CTRL), null)).isTrue();
+
+            assertThat(savedPath).hasValue(Path.of("pipeline/orders.tap.yml"));
+            assertThat(savedContent.get()).startsWith("#apiVersion: tapstate/v1");
+            assertThat(runtime.state().workspaceView().document())
+                    .hasValueSatisfying(document -> {
+                        assertThat(document.editing()).isTrue();
+                        assertThat(document.dirty()).isFalse();
+                    });
+        }
     }
 
     @Test
@@ -361,6 +433,39 @@ class WorkbenchRefreshIntegrationTest {
             assertThat(runtime.state().snapshot())
                     .map(WorkbenchSnapshot::identity)
                     .contains(new WorkbenchSnapshot.Identity(1, 1));
+        }
+    }
+
+    @Test
+    void contextFormNavigatesFieldsAndEscapeReturnsToThePicker() {
+        ImmediateScheduler scheduler = new ImmediateScheduler();
+        WorkbenchRuntime runtime = new WorkbenchRuntime(
+                WorkbenchState.initial(), scheduler, () -> true, event -> {
+                });
+        WorkbenchActionGateway gateway = activationGateway(List.of());
+
+        try (Workbench.Session session = new Workbench.Session(
+                runtime,
+                (generation, sequence, token) -> signedOutSnapshot(generation, sequence),
+                gateway)) {
+            assertThat(session.handleEvent(KeyEvent.ofChar('c'), null)).isTrue();
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ENTER), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay ->
+                    assertThat(((WorkbenchOverlayState.ContextCreate) overlay).stage())
+                            .isEqualTo(WorkbenchOverlayState.ContextCreate.Stage.NAME));
+
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.DOWN), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay ->
+                    assertThat(((WorkbenchOverlayState.ContextCreate) overlay).stage())
+                            .isEqualTo(WorkbenchOverlayState.ContextCreate.Stage.SERVER));
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.UP), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay ->
+                    assertThat(((WorkbenchOverlayState.ContextCreate) overlay).stage())
+                            .isEqualTo(WorkbenchOverlayState.ContextCreate.Stage.NAME));
+
+            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ESCAPE), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay ->
+                    assertThat(overlay).isInstanceOf(WorkbenchOverlayState.ContextPicker.class));
         }
     }
 
@@ -668,6 +773,31 @@ class WorkbenchRefreshIntegrationTest {
 
     private static void await(CountDownLatch latch) throws InterruptedException {
         assertThat(latch.await(2, TimeUnit.SECONDS)).isTrue();
+    }
+
+    private static WorkbenchActionGateway activationGateway(List<WorkbenchActionGateway.ContextOption> contexts) {
+        return new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return contexts;
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                return new ContextResult.Unavailable();
+            }
+
+            @Override
+            public LoginResult login(LoginRequest request, SecretBuffer password) {
+                password.close();
+                return new LoginResult.Unavailable();
+            }
+        };
     }
 
     private static void awaitIgnoringInterrupt(CountDownLatch latch) {

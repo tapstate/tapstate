@@ -1,6 +1,5 @@
 package io.tapstate.cli;
 
-import dev.tamboui.buffer.Cell;
 import dev.tamboui.layout.Rect;
 import dev.tamboui.style.Style;
 import dev.tamboui.terminal.Frame;
@@ -11,9 +10,11 @@ import dev.tamboui.widgets.block.Block;
 import dev.tamboui.widgets.block.BorderType;
 import dev.tamboui.widgets.block.Borders;
 import dev.tamboui.widgets.block.Title;
+import dev.tamboui.widgets.Clear;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -56,7 +57,7 @@ final class WorkbenchRenderer {
         Rect contentArea = new Rect(
                 area.x(), area.y() + CONTENT_Y, area.width(), footerY - (area.y() + CONTENT_Y));
         ContentLayout content = renderContent(frame, contentArea, state, wide, theme);
-        write(frame, area.x(), footerY, footer(state), theme.muted(), area);
+        renderFooter(frame, area, footerY, state, theme);
         List<OverlayHit> overlayHits = state.overlay()
                 .map(overlay -> renderOverlay(frame, area, overlay, theme))
                 .orElseGet(List::of);
@@ -162,14 +163,15 @@ final class WorkbenchRenderer {
         int x = area.x() + (area.width() - width) / 2;
         int y = area.y() + (area.height() - height) / 2;
         Rect box = new Rect(x, y, width, height);
-        frame.buffer().fill(box, new Cell(" ", theme.base()));
-        write(frame, x, y, "+" + "-".repeat(width - 2) + "+", theme.accent(), area);
-        for (int row = 1; row < height - 1; row++) {
-            write(frame, x, y + row, "|", theme.accent(), area);
-            write(frame, x + width - 1, y + row, "|", theme.accent(), area);
-        }
-        write(frame, x, y + height - 1,
-                "+" + "-".repeat(width - 2) + "+", theme.accent(), area);
+        frame.renderWidget(Clear.INSTANCE, box);
+        Block block = Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(theme.accent())
+                .title(Title.from(Line.from(Span.styled(
+                        " " + overlayTitle(overlay) + " ", theme.title()))))
+                .build();
+        frame.renderWidget(block, box);
 
         return switch (overlay) {
             case WorkbenchOverlayState.More more -> renderMore(frame, area, box, more, theme);
@@ -182,14 +184,23 @@ final class WorkbenchRenderer {
         };
     }
 
+    private static String overlayTitle(WorkbenchOverlayState overlay) {
+        return switch (overlay) {
+            case WorkbenchOverlayState.More ignored -> "More";
+            case WorkbenchOverlayState.ContextPicker ignored -> "Choose Context";
+            case WorkbenchOverlayState.ContextCreate ignored -> "New Context";
+            case WorkbenchOverlayState.Login login -> "Sign in to " + login.contextName();
+            case WorkbenchOverlayState.Help ignored -> "Help";
+        };
+    }
+
     private static List<OverlayHit> renderMore(
             Frame frame, Rect area, Rect box, WorkbenchOverlayState.More more, WorkbenchTheme theme) {
-        write(frame, box.x() + 2, box.y() + 1, "More", theme.title(), area);
         List<String> entries = List.of("Context", "Authentication", "Help");
         List<OverlayHit> hits = new ArrayList<>();
         for (int index = 0; index < entries.size(); index++) {
             String line = (index == more.selectedIndex() ? "> " : "  ") + entries.get(index);
-            int rowY = box.y() + 2 + index;
+            int rowY = box.y() + 1 + index;
             int width = write(frame, box.x() + 2, rowY, line,
                     index == more.selectedIndex() ? theme.selection() : theme.base(), area);
             hits.add(new OverlayHit(index, new Rect(box.x() + 2, rowY, width, 1)));
@@ -203,20 +214,19 @@ final class WorkbenchRenderer {
             Rect box,
             WorkbenchOverlayState.ContextPicker picker,
             WorkbenchTheme theme) {
-        write(frame, box.x() + 2, box.y() + 1, "Choose context", theme.title(), area);
         List<OverlayHit> hits = new ArrayList<>();
         int visible = Math.min(10, picker.contexts().size());
         for (int index = 0; index < visible; index++) {
             WorkbenchActionGateway.ContextOption context = picker.contexts().get(index);
             String line = (index == picker.selectedIndex() ? "> " : "  ")
                     + context.name() + (context.suggested() ? "  suggested" : "");
-            int rowY = box.y() + 2 + index;
+            int rowY = box.y() + 1 + index;
             int width = write(frame, box.x() + 2, rowY, line,
                     index == picker.selectedIndex() ? theme.selection() : theme.base(), area);
             hits.add(new OverlayHit(index, new Rect(box.x() + 2, rowY, width, 1)));
         }
         int createIndex = picker.contexts().size();
-        int createY = box.y() + 2 + visible;
+        int createY = box.y() + 1 + visible;
         String createLine = (createIndex == picker.selectedIndex() ? "> " : "  ") + "+ New Context";
         int createWidth = write(frame, box.x() + 2, createY, createLine,
                 createIndex == picker.selectedIndex() ? theme.selection() : theme.accent(), area);
@@ -233,69 +243,53 @@ final class WorkbenchRenderer {
             Rect box,
             WorkbenchOverlayState.ContextCreate create,
             WorkbenchTheme theme) {
-        write(frame, box.x() + 2, box.y() + 1, "New Context", theme.title(), area);
-        write(frame, box.x() + 2, box.y() + 2,
-                marker(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.NAME)
-                        + "Name: " + create.name(),
-                fieldStyle(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.NAME, theme), area);
-        write(frame, box.x() + 2, box.y() + 3,
-                marker(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.SERVER)
-                        + "Server: " + create.server(),
-                fieldStyle(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.SERVER, theme), area);
-        write(frame, box.x() + 2, box.y() + 4,
-                marker(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS)
-                        + "Verify TLS: " + (create.verifyTls() ? "Yes" : "No"),
-                fieldStyle(create.stage(), WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS, theme), area);
+        renderFormField(frame, area, box.x() + 2, box.y() + 1, "Name", create.name(),
+                create.stage() == WorkbenchOverlayState.ContextCreate.Stage.NAME, theme);
+        renderFormField(frame, area, box.x() + 2, box.y() + 2, "Server", create.server(),
+                create.stage() == WorkbenchOverlayState.ContextCreate.Stage.SERVER, theme);
+        renderFormField(frame, area, box.x() + 2, box.y() + 3, "Verify TLS",
+                create.verifyTls() ? "Yes" : "No",
+                create.stage() == WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS, theme);
         String hint = create.pending()
                 ? "Creating context..."
                 : create.stage() == WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS
                         ? "Y/N or Space toggle  Enter create  Esc cancel"
                         : "Enter next  Esc cancel";
-        write(frame, box.x() + 2, box.y() + 6, hint, theme.muted(), area);
+        write(frame, box.x() + 2, box.y() + 5, hint, theme.muted(), area);
         create.message().ifPresent(message -> write(
-                frame, box.x() + 2, box.y() + 7, message, theme.error(), area));
+                frame, box.x() + 2, box.y() + 6, message, theme.error(), area));
         return List.of();
     }
 
-    private static String marker(
-            WorkbenchOverlayState.ContextCreate.Stage actual,
-            WorkbenchOverlayState.ContextCreate.Stage expected) {
-        return actual == expected ? "> " : "  ";
-    }
-
-    private static Style fieldStyle(
-            WorkbenchOverlayState.ContextCreate.Stage actual,
-            WorkbenchOverlayState.ContextCreate.Stage expected,
+    private static void renderFormField(
+            Frame frame,
+            Rect area,
+            int x,
+            int y,
+            String label,
+            String value,
+            boolean active,
             WorkbenchTheme theme) {
-        return actual == expected ? theme.selection() : theme.base();
+        int next = x + write(frame, x, y, active ? "> " : "  ", theme.muted(), area);
+        next += write(frame, next, y, label + ":", active ? theme.label().bold() : theme.muted(), area);
+        write(frame, next, y, " " + value, theme.base(), area);
     }
 
     private static List<OverlayHit> renderLogin(
             Frame frame, Rect area, Rect box, WorkbenchOverlayState.Login login, WorkbenchTheme theme) {
-        write(frame, box.x() + 2, box.y() + 1,
-                "Sign in to " + login.contextName(), theme.title(), area);
         boolean transientLogin = transientLogin(login);
-        int usernameY = box.y() + (transientLogin ? 3 : 2);
+        int usernameY = box.y() + (transientLogin ? 2 : 1);
         int passwordY = usernameY + 1;
         int hintY = passwordY + 1;
         int messageY = hintY + 1;
         if (transientLogin) {
-            write(frame, box.x() + 2, box.y() + 2,
-                    (login.stage() == WorkbenchOverlayState.Login.Stage.SERVER ? "> " : "  ")
-                            + "Server: " + login.server(),
-                    login.stage() == WorkbenchOverlayState.Login.Stage.SERVER
-                            ? theme.selection() : theme.base(), area);
+            renderLoginField(frame, area, box.x() + 2, box.y() + 1, "Server", login.server(),
+                    login.stage() == WorkbenchOverlayState.Login.Stage.SERVER, theme);
         }
-        write(frame, box.x() + 2, usernameY,
-                (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME ? "> " : "  ")
-                        + "Username: " + login.username(),
-                login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME
-                        ? theme.selection() : theme.base(), area);
-        write(frame, box.x() + 2, passwordY,
-                (login.stage() == WorkbenchOverlayState.Login.Stage.PASSWORD ? "> " : "  ")
-                        + "Password: " + login.password().mask(),
-                login.stage() == WorkbenchOverlayState.Login.Stage.PASSWORD
-                        ? theme.selection() : theme.base(), area);
+        renderLoginField(frame, area, box.x() + 2, usernameY, "Username", login.username(),
+                login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME, theme);
+        renderLoginField(frame, area, box.x() + 2, passwordY, "Password", login.password().mask(),
+                login.stage() == WorkbenchOverlayState.Login.Stage.PASSWORD, theme);
         String hint = login.pending()
                 ? "Signing in..."
                 : login.stage() != WorkbenchOverlayState.Login.Stage.PASSWORD
@@ -307,16 +301,21 @@ final class WorkbenchRenderer {
         return List.of();
     }
 
+    private static void renderLoginField(
+            Frame frame, Rect area, int x, int y, String label, String value,
+            boolean active, WorkbenchTheme theme) {
+        renderFormField(frame, area, x, y, label, value, active, theme);
+    }
+
     private static boolean transientLogin(WorkbenchOverlayState.Login login) {
         return login.stage() == WorkbenchOverlayState.Login.Stage.SERVER || !login.server().isBlank();
     }
 
     private static List<OverlayHit> renderHelp(
             Frame frame, Rect area, Rect box, WorkbenchTheme theme) {
-        write(frame, box.x() + 2, box.y() + 1, "Help", theme.title(), area);
-        write(frame, box.x() + 2, box.y() + 2, "1-4 switch views", theme.base(), area);
-        write(frame, box.x() + 2, box.y() + 3, "c context   a authentication", theme.base(), area);
-        write(frame, box.x() + 2, box.y() + 4,
+        write(frame, box.x() + 2, box.y() + 1, "1-4 switch views", theme.base(), area);
+        write(frame, box.x() + 2, box.y() + 2, "c context   a authentication", theme.base(), area);
+        write(frame, box.x() + 2, box.y() + 3,
                 "r refresh   q quit   Esc close", theme.base(), area);
         return List.of();
     }
@@ -327,6 +326,10 @@ final class WorkbenchRenderer {
             WorkbenchState state,
             boolean wide,
             WorkbenchTheme theme) {
+        if (state.selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                && state.snapshot().isPresent()) {
+            return renderWorkspace(frame, area, state, state.snapshot().orElseThrow(), theme);
+        }
         Block block = Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
@@ -358,6 +361,156 @@ final class WorkbenchRenderer {
         write(frame, inner.x(), inner.bottom() - 1,
                 notification(state), notificationStyle(state, theme), inner);
         return new ContentLayout(rowHits, visibleRows);
+    }
+
+    private static ContentLayout renderWorkspace(
+            Frame frame,
+            Rect area,
+            WorkbenchState state,
+            WorkbenchSnapshot snapshot,
+            WorkbenchTheme theme) {
+        int leftWidth = Math.clamp(area.width() / 3, 28, 44);
+        int infoHeight = Math.min(8, area.height() - 8);
+        int filesHeight = area.height() - infoHeight;
+        Rect filesArea = new Rect(area.x(), area.y(), leftWidth, filesHeight);
+        Rect infoArea = new Rect(area.x(), area.y() + filesHeight, leftWidth, infoHeight);
+        Rect viewerArea = new Rect(area.x() + leftWidth, area.y(), area.width() - leftWidth, area.height());
+
+        boolean filesFocused = state.workspaceView().focus() == WorkbenchWorkspaceState.Focus.FILES
+                && !state.workspaceView().editing();
+        Block filesBlock = panel("Files", filesFocused, theme);
+        Block infoBlock = panel("Info", filesFocused, theme);
+        String viewerTitle = state.workspaceView().document()
+                .map(document -> (document.editing() ? "Edit" : "Source")
+                        + " [" + displayRelativePath(document.relativePath()) + "]"
+                        + (document.dirty() ? " *" : ""))
+                .orElse("Source");
+        Block viewerBlock = panel(viewerTitle, !filesFocused, theme);
+        frame.renderWidget(filesBlock, filesArea);
+        frame.renderWidget(infoBlock, infoArea);
+        frame.renderWidget(viewerBlock, viewerArea);
+
+        Rect filesInner = filesBlock.inner(filesArea);
+        List<WorkbenchArtifactRow> rows = sorted(snapshot.workspace().rows(), state.workspaceTable());
+        int selected = rows.isEmpty()
+                ? -1 : Math.clamp(state.workspaceTable().selectedIndex(), 0, rows.size() - 1);
+        int capacity = Math.max(1, filesInner.height());
+        int maximumScroll = Math.max(0, rows.size() - capacity);
+        int scroll = Math.clamp(state.workspaceTable().scrollOffset(), 0, maximumScroll);
+        if (selected >= 0 && selected < scroll) {
+            scroll = selected;
+        } else if (selected >= scroll + capacity) {
+            scroll = selected - capacity + 1;
+        }
+        List<RowHit> hits = new ArrayList<>();
+        int limit = Math.min(rows.size(), scroll + capacity);
+        for (int index = scroll; index < limit; index++) {
+            WorkbenchArtifactRow row = rows.get(index);
+            String icon = switch (row.key().kind()) {
+                case "source" -> "🔌";
+                case "pipeline" -> "🔀";
+                default -> "📄";
+            };
+            Path relativePath = row.local().getFirst().relativePath();
+            String label = icon + " " + displayRelativePath(relativePath);
+            int y = filesInner.y() + index - scroll;
+            Style style = index == selected ? theme.selection() : theme.base();
+            int labelWidth = row.remote().isEmpty()
+                    ? filesInner.width() : Math.max(1, filesInner.width() - 2);
+            write(frame, filesInner.x(), y, pad(label, labelWidth), style, filesInner);
+            if (!row.remote().isEmpty()) {
+                write(frame, filesInner.right() - 1, y, "●", theme.success(), filesInner);
+            }
+            hits.add(new RowHit(
+                    WorkbenchState.WorkbenchTab.WORKSPACE,
+                    index,
+                    new Rect(filesInner.x(), y, filesInner.width(), 1)));
+        }
+        if (rows.isEmpty()) {
+            write(frame, filesInner.x(), filesInner.y(), "No workspace files.", theme.base(), filesInner);
+        }
+
+        Rect infoInner = infoBlock.inner(infoArea);
+        if (selected >= 0) {
+            WorkbenchArtifactRow row = rows.get(selected);
+            int y = infoInner.y();
+            y = renderInfoLine(frame, infoInner, y, "Kind", row.key().kind(), theme);
+            y = renderInfoLine(frame, infoInner, y, "ID", row.key().id(), theme);
+            y = renderInfoLine(frame, infoInner, y, "Path",
+                    displayRelativePath(row.local().getFirst().relativePath()), theme);
+            y = renderInfoLine(frame, infoInner, y, "Remote",
+                    row.remote().isEmpty() ? "○ absent" : "● present", theme);
+            y = renderInfoLine(frame, infoInner, y, "State", words(row.alignment()), theme);
+            write(frame, infoInner.x(), y, notification(state), notificationStyle(state, theme), infoInner);
+        } else {
+            write(frame, infoInner.x(), infoInner.y(), notification(state),
+                    notificationStyle(state, theme), infoInner);
+        }
+
+        Rect viewerInner = viewerBlock.inner(viewerArea);
+        state.workspaceView().document().ifPresentOrElse(
+                document -> renderDocument(frame, viewerInner, document, theme),
+                () -> {
+                    write(frame, viewerInner.x(), viewerInner.y(),
+                            "Select a file and press Enter to open it.", theme.muted(), viewerInner);
+                    write(frame, viewerInner.x(), viewerInner.bottom() - 1,
+                            notification(state), notificationStyle(state, theme), viewerInner);
+                });
+        return new ContentLayout(List.copyOf(hits), capacity);
+    }
+
+    private static Block panel(String title, boolean focused, WorkbenchTheme theme) {
+        return Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(focused ? theme.accent() : theme.muted())
+                .title(Title.from(Line.from(Span.styled(
+                        " " + title + " ", focused ? theme.title() : theme.muted()))))
+                .build();
+    }
+
+    private static int renderInfoLine(
+            Frame frame, Rect area, int y, String label, String value, WorkbenchTheme theme) {
+        int x = area.x();
+        x += write(frame, x, y, label + ": ", theme.muted(), area);
+        write(frame, x, y, value, theme.base(), area);
+        return y + 1;
+    }
+
+    private static void renderDocument(
+            Frame frame,
+            Rect area,
+            WorkbenchWorkspaceState.Document document,
+            WorkbenchTheme theme) {
+        String[] lines = document.content().split("\\n", -1);
+        int cursorLine = 0;
+        int cursorColumn = 0;
+        int consumed = 0;
+        for (int index = 0; index < lines.length; index++) {
+            int end = consumed + lines[index].length();
+            if (document.cursorOffset() <= end) {
+                cursorLine = index;
+                cursorColumn = document.cursorOffset() - consumed;
+                break;
+            }
+            consumed = end + 1;
+        }
+        int scroll = Math.max(0, cursorLine - area.height() + 1);
+        int numberWidth = Integer.toString(lines.length).length();
+        int limit = Math.min(lines.length, scroll + area.height());
+        for (int index = scroll; index < limit; index++) {
+            int y = area.y() + index - scroll;
+            int x = area.x();
+            x += write(frame, x, y, pad(Integer.toString(index + 1), numberWidth) + " ",
+                    theme.muted(), area);
+            write(frame, x, y, lines[index], theme.base(), area);
+            if (document.editing() && index == cursorLine && x < area.right()) {
+                String cursor = cursorColumn < lines[index].length()
+                        ? String.valueOf(lines[index].charAt(cursorColumn)) : " ";
+                int cursorX = x + displayWidth(lines[index].substring(0, cursorColumn));
+                write(frame, cursorX, y, cursor, theme.accentBackground(), area);
+            }
+        }
     }
 
     private static void renderOverview(
@@ -408,16 +561,15 @@ final class WorkbenchRenderer {
             int visibleRows,
             WorkbenchTheme theme) {
         Columns columns = Columns.forWidth(area.width(), wide);
-        write(frame, area.x(), area.y(),
-                columns.format("KIND", "IDENTIFIER", "ALIGNMENT", "LOCAL", "REMOTE"),
-                theme.label().bold(), area);
+        renderTableHeader(frame, area, columns, table, theme);
         if (rows.isEmpty()) {
             write(frame, area.x(), area.y() + 1,
                     emptyRowsMessage(tab), theme.base(), area);
             return List.of();
         }
 
-        int selected = Math.clamp(table.selectedIndex(), 0, rows.size() - 1);
+        List<WorkbenchArtifactRow> sortedRows = sorted(rows, table);
+        int selected = Math.clamp(table.selectedIndex(), 0, sortedRows.size() - 1);
         int maximumScroll = Math.max(0, rows.size() - visibleRows);
         int scroll = Math.clamp(table.scrollOffset(), 0, maximumScroll);
         if (selected < scroll) {
@@ -427,9 +579,9 @@ final class WorkbenchRenderer {
         }
 
         List<RowHit> hits = new ArrayList<>();
-        int limit = Math.min(rows.size(), scroll + visibleRows);
+        int limit = Math.min(sortedRows.size(), scroll + visibleRows);
         for (int index = scroll; index < limit; index++) {
-            WorkbenchArtifactRow row = rows.get(index);
+            WorkbenchArtifactRow row = sortedRows.get(index);
             String line = columns.format(
                     row.key().kind(),
                     row.key().id(),
@@ -444,6 +596,46 @@ final class WorkbenchRenderer {
             }
         }
         return List.copyOf(hits);
+    }
+
+    private static void renderTableHeader(
+            Frame frame,
+            Rect area,
+            Columns columns,
+            WorkbenchTableState table,
+            WorkbenchTheme theme) {
+        int x = area.x();
+        WorkbenchSortColumn[] sortColumns = WorkbenchSortColumn.values();
+        int[] widths = {columns.kind(), columns.identifier(), columns.alignment(),
+                columns.local(), columns.remote()};
+        for (int index = 0; index < sortColumns.length; index++) {
+            WorkbenchSortColumn column = sortColumns[index];
+            boolean active = column == table.sortColumn();
+            String label = column.label() + (active ? table.sortReversed() ? "▲" : "▼" : "");
+            x += write(frame, x, area.y(), pad(label, widths[index]),
+                    active ? theme.label().bold() : theme.base().bold(), area);
+            if (index < sortColumns.length - 1) {
+                x += write(frame, x, area.y(), columns.separator(), theme.muted(), area);
+            }
+        }
+    }
+
+    static List<WorkbenchArtifactRow> sorted(
+            List<WorkbenchArtifactRow> rows, WorkbenchTableState table) {
+        Comparator<WorkbenchArtifactRow> comparator = switch (table.sortColumn()) {
+            case KIND -> Comparator.comparing(row -> row.key().kind(), String.CASE_INSENSITIVE_ORDER);
+            case IDENTIFIER -> Comparator.comparing(row -> row.key().id(), String.CASE_INSENSITIVE_ORDER);
+            case ALIGNMENT -> Comparator.comparing(row -> words(row.alignment()), String.CASE_INSENSITIVE_ORDER);
+            case LOCAL -> Comparator.comparing(WorkbenchRenderer::localMarker, String.CASE_INSENSITIVE_ORDER);
+            case REMOTE -> Comparator.comparingInt(row -> row.remote().size());
+        };
+        comparator = comparator
+                .thenComparing(row -> row.key().kind(), String.CASE_INSENSITIVE_ORDER)
+                .thenComparing(row -> row.key().id(), String.CASE_INSENSITIVE_ORDER);
+        if (table.sortReversed()) {
+            comparator = comparator.reversed();
+        }
+        return rows.stream().sorted(comparator).toList();
     }
 
     private static String notification(WorkbenchState state) {
@@ -474,14 +666,72 @@ final class WorkbenchRenderer {
         };
     }
 
-    private static String footer(WorkbenchState state) {
+    private static void renderFooter(
+            Frame frame, Rect area, int y, WorkbenchState state, WorkbenchTheme theme) {
         boolean hasSelectableRows = state.selectedTab().hasTable()
                 && state.snapshot()
                         .map(snapshot -> !rows(snapshot, state.selectedTab()).isEmpty())
                         .orElse(false);
-        return "1-4 views  c context  a auth  0 more"
-                + (hasSelectableRows ? "  Up/Down select" : "")
-                + "  r refresh  q quit";
+        List<FooterHint> hints = switch (state.selectedTab()) {
+            case OVERVIEW -> List.of(
+                    new FooterHint("1-4", "views"),
+                    new FooterHint("c", "context"),
+                    new FooterHint("a", "auth"),
+                    new FooterHint("0", "more"),
+                    new FooterHint("r", "refresh"),
+                    new FooterHint("q", "quit"));
+            case WORKSPACE -> hasSelectableRows
+                    ? workspaceFooter(state)
+                    : List.of(
+                            new FooterHint("Esc", "back"),
+                            new FooterHint("r", "refresh"),
+                            new FooterHint("q", "quit"));
+            case SOURCES, PIPELINES -> hasSelectableRows
+                    ? List.of(
+                            new FooterHint("↑↓", "navigate"),
+                            new FooterHint("Esc", "back"),
+                            new FooterHint("s", "sort"),
+                            new FooterHint("r", "refresh"),
+                            new FooterHint("q", "quit"))
+                    : List.of(
+                            new FooterHint("Esc", "back"),
+                            new FooterHint("r", "refresh"),
+                            new FooterHint("q", "quit"));
+        };
+        int x = area.x();
+        for (FooterHint hint : hints) {
+            x += write(frame, x, y, " " + hint.key() + " ", theme.hintKey(), area);
+            x += write(frame, x, y, hint.label() + "  ", theme.base(), area);
+            if (x >= area.right()) {
+                return;
+            }
+        }
+    }
+
+    private static List<FooterHint> workspaceFooter(WorkbenchState state) {
+        if (state.workspaceView().editing()) {
+            return List.of(
+                    new FooterHint("↑↓←→", "navigate"),
+                    new FooterHint("Esc", "cancel"),
+                    new FooterHint("Ctrl+S", "save"),
+                    new FooterHint("F5", "save & close"));
+        }
+        if (state.workspaceView().focus() == WorkbenchWorkspaceState.Focus.VIEWER) {
+            return List.of(
+                    new FooterHint("↑↓", "navigate"),
+                    new FooterHint("Esc", "back"),
+                    new FooterHint("F4", "edit"),
+                    new FooterHint("Tab", "files"));
+        }
+        List<FooterHint> hints = new ArrayList<>(List.of(
+                new FooterHint("↑↓", "navigate"),
+                new FooterHint("Esc", "back"),
+                new FooterHint("Enter", "open"),
+                new FooterHint("F4", "edit")));
+        if (state.workspaceView().document().isPresent()) {
+            hints.add(new FooterHint("Tab", "viewer"));
+        }
+        return List.copyOf(hints);
     }
 
     private static String tabLabel(WorkbenchState.WorkbenchTab tab) {
@@ -764,6 +1014,9 @@ final class WorkbenchRenderer {
         private ContentLayout {
             rowHits = List.copyOf(rowHits);
         }
+    }
+
+    private record FooterHint(String key, String label) {
     }
 
     private record Columns(

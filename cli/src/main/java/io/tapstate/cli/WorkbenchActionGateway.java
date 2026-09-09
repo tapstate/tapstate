@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -15,6 +16,14 @@ interface WorkbenchActionGateway {
     ContextResult createContext(String name, URI server, boolean verifyTls);
 
     LoginResult login(LoginRequest request, SecretBuffer password);
+
+    default FileReadResult readWorkspaceFile(Path relativePath) {
+        return new FileReadResult.Unavailable();
+    }
+
+    default FileWriteResult writeWorkspaceFile(Path relativePath, String content) {
+        return new FileWriteResult.Unavailable();
+    }
 
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
@@ -63,6 +72,26 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements LoginResult {
+        }
+    }
+
+    sealed interface FileReadResult {
+        record Loaded(Path relativePath, String content) implements FileReadResult {
+            public Loaded {
+                Objects.requireNonNull(relativePath, "relativePath");
+                Objects.requireNonNull(content, "content");
+            }
+        }
+
+        record Unavailable() implements FileReadResult {
+        }
+    }
+
+    sealed interface FileWriteResult {
+        record Saved() implements FileWriteResult {
+        }
+
+        record Unavailable() implements FileWriteResult {
         }
     }
 }

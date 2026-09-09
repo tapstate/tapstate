@@ -12,6 +12,7 @@ record WorkbenchState(
         Optional<WorkbenchSnapshot> snapshot,
         Optional<WorkbenchOverlayState> overlay,
         WorkbenchTableState workspaceTable,
+        WorkbenchWorkspaceState workspaceView,
         WorkbenchTableState sourcesTable,
         WorkbenchTableState pipelinesTable) {
 
@@ -21,6 +22,7 @@ record WorkbenchState(
         Objects.requireNonNull(snapshot, "snapshot");
         Objects.requireNonNull(overlay, "overlay");
         Objects.requireNonNull(workspaceTable, "workspaceTable");
+        Objects.requireNonNull(workspaceView, "workspaceView");
         Objects.requireNonNull(sourcesTable, "sourcesTable");
         Objects.requireNonNull(pipelinesTable, "pipelinesTable");
     }
@@ -32,6 +34,7 @@ record WorkbenchState(
                 Optional.empty(),
                 Optional.empty(),
                 WorkbenchTableState.empty(),
+                WorkbenchWorkspaceState.empty(),
                 WorkbenchTableState.empty(),
                 WorkbenchTableState.empty());
     }
@@ -46,6 +49,20 @@ record WorkbenchState(
         WorkbenchTab next = switchTab(key);
         if (next != selectedTab) {
             return copy(next, workspaceTable, sourcesTable, pipelinesTable);
+        }
+        if (selectedTab == WorkbenchTab.WORKSPACE
+                && workspaceView.focus() == WorkbenchWorkspaceState.Focus.VIEWER) {
+            return this;
+        }
+        if (selectedTab != WorkbenchTab.OVERVIEW
+                && selectedTab != WorkbenchTab.WORKSPACE
+                && key.isChar('s')) {
+            return withTable(selectedTab, table(selectedTab).cycleSort());
+        }
+        if (selectedTab != WorkbenchTab.OVERVIEW
+                && selectedTab != WorkbenchTab.WORKSPACE
+                && key.isChar('S')) {
+            return withTable(selectedTab, table(selectedTab).reverseSort());
         }
         int delta = navigationDelta(key, visibleRows);
         if (delta == 0 || !selectedTab.hasTable()) {
@@ -70,6 +87,7 @@ record WorkbenchState(
                 snapshot,
                 Optional.of(nextOverlay),
                 workspaceTable,
+                workspaceView,
                 sourcesTable,
                 pipelinesTable);
     }
@@ -81,6 +99,7 @@ record WorkbenchState(
                 snapshot,
                 Optional.empty(),
                 workspaceTable,
+                workspaceView,
                 sourcesTable,
                 pipelinesTable);
     }
@@ -114,6 +133,7 @@ record WorkbenchState(
                 contextChanged ? Optional.empty() : snapshot,
                 overlay,
                 contextChanged ? WorkbenchTableState.empty() : workspaceTable,
+                contextChanged ? WorkbenchWorkspaceState.empty() : workspaceView,
                 contextChanged ? WorkbenchTableState.empty() : sourcesTable,
                 contextChanged ? WorkbenchTableState.empty() : pipelinesTable);
     }
@@ -136,6 +156,7 @@ record WorkbenchState(
                 Optional.of(published),
                 overlay,
                 workspaceTable.clamp(published.workspace().rows().size()),
+                workspaceView,
                 sourcesTable.clamp(published.sources().rows().size()),
                 pipelinesTable.clamp(published.pipelines().rows().size()));
     }
@@ -154,7 +175,16 @@ record WorkbenchState(
             WorkbenchTableState workspace,
             WorkbenchTableState sources,
             WorkbenchTableState pipelines) {
-        return new WorkbenchState(tab, expectedSnapshot, snapshot, overlay, workspace, sources, pipelines);
+        return new WorkbenchState(
+                tab, expectedSnapshot, snapshot, overlay,
+                workspace, workspaceView, sources, pipelines);
+    }
+
+    WorkbenchState withWorkspaceView(WorkbenchWorkspaceState view) {
+        Objects.requireNonNull(view, "view");
+        return new WorkbenchState(
+                selectedTab, expectedSnapshot, snapshot, overlay,
+                workspaceTable, view, sourcesTable, pipelinesTable);
     }
 
     private WorkbenchTableState table(WorkbenchTab tab) {
@@ -260,9 +290,14 @@ record WorkbenchState(
 }
 
 /** Immutable selection and scroll state for one table tab. */
-record WorkbenchTableState(int selectedIndex, int scrollOffset) {
+record WorkbenchTableState(
+        int selectedIndex,
+        int scrollOffset,
+        WorkbenchSortColumn sortColumn,
+        boolean sortReversed) {
 
     WorkbenchTableState {
+        Objects.requireNonNull(sortColumn, "sortColumn");
         if (selectedIndex < -1) {
             throw new IllegalArgumentException("Selected index must be -1 or greater");
         }
@@ -274,8 +309,12 @@ record WorkbenchTableState(int selectedIndex, int scrollOffset) {
         }
     }
 
+    WorkbenchTableState(int selectedIndex, int scrollOffset) {
+        this(selectedIndex, scrollOffset, WorkbenchSortColumn.KIND, false);
+    }
+
     static WorkbenchTableState empty() {
-        return new WorkbenchTableState(-1, 0);
+        return new WorkbenchTableState(-1, 0, WorkbenchSortColumn.KIND, false);
     }
 
     WorkbenchTableState clamp(int rowCount) {
@@ -289,7 +328,7 @@ record WorkbenchTableState(int selectedIndex, int scrollOffset) {
         int scroll = Math.min(scrollOffset, selected);
         return selected == selectedIndex && scroll == scrollOffset
                 ? this
-                : new WorkbenchTableState(selected, scroll);
+                : new WorkbenchTableState(selected, scroll, sortColumn, sortReversed);
     }
 
     WorkbenchTableState move(int delta, int rowCount, int visibleRows) {
@@ -318,6 +357,34 @@ record WorkbenchTableState(int selectedIndex, int scrollOffset) {
         }
         return selected == selectedIndex && scroll == scrollOffset
                 ? this
-                : new WorkbenchTableState(selected, scroll);
+                : new WorkbenchTableState(selected, scroll, sortColumn, sortReversed);
+    }
+
+    WorkbenchTableState cycleSort() {
+        WorkbenchSortColumn[] columns = WorkbenchSortColumn.values();
+        WorkbenchSortColumn next = columns[(sortColumn.ordinal() + 1) % columns.length];
+        return new WorkbenchTableState(selectedIndex, scrollOffset, next, false);
+    }
+
+    WorkbenchTableState reverseSort() {
+        return new WorkbenchTableState(selectedIndex, scrollOffset, sortColumn, !sortReversed);
+    }
+}
+
+enum WorkbenchSortColumn {
+    KIND("KIND"),
+    IDENTIFIER("IDENTIFIER"),
+    ALIGNMENT("ALIGNMENT"),
+    LOCAL("LOCAL"),
+    REMOTE("REMOTE");
+
+    private final String label;
+
+    WorkbenchSortColumn(String label) {
+        this.label = label;
+    }
+
+    String label() {
+        return label;
     }
 }

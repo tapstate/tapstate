@@ -277,7 +277,42 @@ final class Repl {
             public LoginResult login(LoginRequest request, SecretBuffer password) {
                 return loginFromWorkbench(request, password);
             }
+
+            @Override
+            public FileReadResult readWorkspaceFile(Path relativePath) {
+                try {
+                    Path file = resolveWorkbenchFile(relativePath);
+                    return new FileReadResult.Loaded(relativePath.normalize(), Files.readString(file));
+                } catch (IOException | RuntimeException unavailable) {
+                    return new FileReadResult.Unavailable();
+                }
+            }
+
+            @Override
+            public FileWriteResult writeWorkspaceFile(Path relativePath, String content) {
+                try {
+                    Path file = resolveWorkbenchFile(relativePath);
+                    Files.writeString(file, content);
+                    return new FileWriteResult.Saved();
+                } catch (IOException | RuntimeException unavailable) {
+                    return new FileWriteResult.Unavailable();
+                }
+            }
         };
+    }
+
+    private Path resolveWorkbenchFile(Path relativePath) throws IOException {
+        Objects.requireNonNull(relativePath, "relativePath");
+        Path normalized = relativePath.normalize();
+        if (normalized.isAbsolute() || normalized.startsWith("..")) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        Path root = workdir.toRealPath();
+        Path file = root.resolve(normalized).toRealPath();
+        if (!file.startsWith(root) || !Files.isRegularFile(file)) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        return file;
     }
 
     private synchronized List<WorkbenchActionGateway.ContextOption> workbenchContextOptions() {
@@ -335,6 +370,7 @@ final class Repl {
         }
         try {
             contextManager.create(name, List.of(server), verifyTls);
+            contextManager.bind(workdir, name);
             return selectWorkbenchContext(name);
         } catch (RuntimeException unavailable) {
             return new WorkbenchActionGateway.ContextResult.Unavailable();

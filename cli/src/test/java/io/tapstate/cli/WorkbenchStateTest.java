@@ -58,6 +58,23 @@ class WorkbenchStateTest {
     }
 
     @Test
+    void tableSortCyclesColumnsAndUppercaseSReversesOnlyTheActiveTab() {
+        WorkbenchState state = accepted(snapshot(3, 7, 2, 2, 2))
+                .select(WorkbenchState.WorkbenchTab.SOURCES);
+
+        assertThat(state.sourcesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.KIND);
+        state = state.reduce(KeyEvent.ofChar('s'), 4);
+        assertThat(state.sourcesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.IDENTIFIER);
+        assertThat(state.sourcesTable().sortReversed()).isFalse();
+
+        state = state.reduce(KeyEvent.ofChar('S'), 4);
+        assertThat(state.sourcesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.IDENTIFIER);
+        assertThat(state.sourcesTable().sortReversed()).isTrue();
+        assertThat(state.workspaceTable().sortColumn()).isEqualTo(WorkbenchSortColumn.KIND);
+        assertThat(state.pipelinesTable().sortColumn()).isEqualTo(WorkbenchSortColumn.KIND);
+    }
+
+    @Test
     void navigationRespectsBoundsAndKeepsSelectionInsideViewport() {
         WorkbenchState state = accepted(snapshot(3, 7, 6, 0, 0))
                 .select(WorkbenchState.WorkbenchTab.WORKSPACE);

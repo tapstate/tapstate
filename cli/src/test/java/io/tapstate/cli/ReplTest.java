@@ -4520,7 +4520,7 @@ class ReplTest {
 
     @Test
     void workbenchGatewayCreatesAContextThroughTheSharedManager(@TempDir Path home)
-            throws IOException {
+            throws Exception {
         Path workspace = Files.createDirectory(home.resolve("orders"));
         URI seed = URI.create("http://127.0.0.1:7900");
         ContextConfigStore store = ContextConfigStore.underHome(home);
@@ -4546,8 +4546,52 @@ class ReplTest {
         assertThat(store.load().contexts()).containsOnlyKeys("dev");
         assertThat(store.load().contexts().get("dev").seeds()).containsExactly(seed);
         assertThat(store.load().lastContext()).isEqualTo("dev");
+        assertThat(store.load().workspaceBindings())
+                .containsEntry(workspace.toRealPath().toString(), "dev");
         assertThat(repl.session().isConnected()).isTrue();
         assertThat(repl.session().isAuthenticated()).isFalse();
+
+        Repl reopened = new Repl(
+                commandLine,
+                workspace,
+                client,
+                new ScriptedPrompter(),
+                name -> null,
+                new ContextResolver(store, name -> null),
+                null,
+                null,
+                new ContextManager(store));
+        WorkbenchSnapshot reopenedSnapshot = reopened.workbenchDataSource()
+                .load(1, 1, new RefreshRequest.CancellationToken());
+        assertThat(reopenedSnapshot.session().contextName()).contains("dev");
+        assertThat(reopenedSnapshot.session().connection()).isEqualTo(WorkbenchConnection.CONNECTED);
+        assertThat(reopenedSnapshot.session().authentication()).isEqualTo(WorkbenchAuthentication.SIGNED_OUT);
+    }
+
+    @Test
+    void workbenchFileGatewayStaysInsideTheWorkspace(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectories(home.resolve("orders/source"));
+        Path root = workspace.getParent();
+        Path artifact = workspace.resolve("orders.tap.yml");
+        Files.writeString(artifact, "kind: Source\n");
+        Path outside = home.resolve("outside.tap.yml");
+        Files.writeString(outside, "do-not-change\n");
+        Harness harness = harness(root, new FakeControlPlane(URI.create("http://127.0.0.1:7900")));
+        WorkbenchActionGateway gateway = harness.repl().workbenchActionGateway();
+
+        assertThat(gateway.readWorkspaceFile(Path.of("source/orders.tap.yml")))
+                .isEqualTo(new WorkbenchActionGateway.FileReadResult.Loaded(
+                        Path.of("source/orders.tap.yml"), "kind: Source\n"));
+        assertThat(gateway.writeWorkspaceFile(
+                Path.of("source/orders.tap.yml"), "kind: Source\nmetadata: {}\n"))
+                .isEqualTo(new WorkbenchActionGateway.FileWriteResult.Saved());
+        assertThat(Files.readString(artifact)).contains("metadata: {}");
+
+        assertThat(gateway.readWorkspaceFile(Path.of("../outside.tap.yml")))
+                .isEqualTo(new WorkbenchActionGateway.FileReadResult.Unavailable());
+        assertThat(gateway.writeWorkspaceFile(Path.of("../outside.tap.yml"), "overwritten"))
+                .isEqualTo(new WorkbenchActionGateway.FileWriteResult.Unavailable());
+        assertThat(Files.readString(outside)).isEqualTo("do-not-change\n");
     }
 
     @Test

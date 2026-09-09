@@ -11,6 +11,7 @@ import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -203,6 +204,13 @@ final class Workbench {
                 }
                 return handleOverlayEvent(event);
             }
+            if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                    && runtime.state().workspaceView().editing()) {
+                return handleWorkspaceEditorEvent(event, runner);
+            }
+            if (event instanceof PasteEvent) {
+                return false;
+            }
             if (event instanceof KeyEvent key) {
                 if (key.isCharIgnoreCase('q') || key.isCtrlC()) {
                     runner.quit();
@@ -211,6 +219,37 @@ final class Workbench {
                 if (key.isCharIgnoreCase('r') && refreshCoordinator != null) {
                     refresh();
                     return true;
+                }
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE) {
+                    if (runtime.state().workspaceView().focus()
+                            == WorkbenchWorkspaceState.Focus.VIEWER
+                            && (key.isUp() || key.isDown() || key.isLeft() || key.isRight()
+                                    || key.isHome() || key.isEnd())) {
+                        return runtime.updateState(state -> state.withWorkspaceView(
+                                state.workspaceView().navigate(key)));
+                    }
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.TAB)) {
+                        return runtime.updateState(state -> state.withWorkspaceView(
+                                state.workspaceView().toggleFocus()));
+                    }
+                    if (key.isConfirm() && runtime.state().workspaceView().focus()
+                            == WorkbenchWorkspaceState.Focus.FILES) {
+                        return openSelectedWorkspaceFile(false);
+                    }
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.F4)) {
+                        if (runtime.state().workspaceView().focus()
+                                == WorkbenchWorkspaceState.Focus.VIEWER
+                                && runtime.state().workspaceView().document().isPresent()) {
+                            return runtime.updateState(state -> state.withWorkspaceView(
+                                    state.workspaceView().edit()));
+                        }
+                        return openSelectedWorkspaceFile(true);
+                    }
+                    if (key.isCancel() && !runtime.state().workspaceView()
+                            .equals(WorkbenchWorkspaceState.empty())) {
+                        return runtime.updateState(state -> state.withWorkspaceView(
+                                state.workspaceView().back()));
+                    }
                 }
                 if (key.isCharIgnoreCase('c')) {
                     return openContextEntry();
@@ -241,11 +280,95 @@ final class Workbench {
                 var clickedRow = layout.rowAt(mouse.x(), mouse.y());
                 if (clickedRow.isPresent()) {
                     WorkbenchRenderer.RowHit row = clickedRow.orElseThrow();
-                    return runtime.updateState(state -> state.selectRow(
-                            row.tab(), row.rowIndex(), visibleRows()));
+                    return runtime.updateState(state -> {
+                        WorkbenchState selected = state.selectRow(
+                                row.tab(), row.rowIndex(), visibleRows());
+                        return row.tab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                                ? selected.withWorkspaceView(selected.workspaceView().focusFiles())
+                                : selected;
+                    });
                 }
             }
             return false;
+        }
+
+        private boolean handleWorkspaceEditorEvent(Event event, TuiRunner runner) {
+            if (event instanceof PasteEvent paste) {
+                return runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().paste(paste.text())));
+            }
+            if (!(event instanceof KeyEvent key)) {
+                return true;
+            }
+            if (key.isCtrlC()) {
+                runner.quit();
+                return true;
+            }
+            if (key.isCancel()) {
+                return runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().cancelEdit()));
+            }
+            if (key.hasCtrl() && key.isCharIgnoreCase('s')) {
+                return saveWorkspaceFile(false);
+            }
+            if (key.isKey(dev.tamboui.tui.event.KeyCode.F5)) {
+                return saveWorkspaceFile(true);
+            }
+            return runtime.updateState(state -> state.withWorkspaceView(
+                    state.workspaceView().edit(key)));
+        }
+
+        private boolean openSelectedWorkspaceFile(boolean edit) {
+            if (actionGateway == null) {
+                return false;
+            }
+            Optional<WorkbenchArtifactRow> selected = selectedWorkspaceRow();
+            if (selected.isEmpty() || selected.orElseThrow().local().isEmpty()) {
+                return true;
+            }
+            Path relativePath = selected.orElseThrow().local().getFirst().relativePath();
+            return switch (actionGateway.readWorkspaceFile(relativePath)) {
+                case WorkbenchActionGateway.FileReadResult.Loaded loaded -> runtime.updateState(state -> {
+                    WorkbenchWorkspaceState opened = state.workspaceView()
+                            .open(loaded.relativePath(), loaded.content());
+                    return state.withWorkspaceView(edit ? opened.edit() : opened);
+                });
+                case WorkbenchActionGateway.FileReadResult.Unavailable ignored -> true;
+            };
+        }
+
+        private Optional<WorkbenchArtifactRow> selectedWorkspaceRow() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> rows = WorkbenchRenderer.sorted(
+                    state.snapshot().orElseThrow().workspace().rows(), state.workspaceTable());
+            if (rows.isEmpty()) {
+                return Optional.empty();
+            }
+            int selected = Math.clamp(state.workspaceTable().selectedIndex(), 0, rows.size() - 1);
+            return Optional.of(rows.get(selected));
+        }
+
+        private boolean saveWorkspaceFile(boolean closeEditor) {
+            if (actionGateway == null) {
+                return false;
+            }
+            WorkbenchWorkspaceState.Document document = runtime.state().workspaceView()
+                    .document().orElseThrow();
+            return switch (actionGateway.writeWorkspaceFile(
+                    document.relativePath(), document.content())) {
+                case WorkbenchActionGateway.FileWriteResult.Saved ignored -> {
+                    runtime.updateState(state -> state.withWorkspaceView(
+                            state.workspaceView().saved(closeEditor)));
+                    if (refreshCoordinator != null) {
+                        refresh();
+                    }
+                    yield true;
+                }
+                case WorkbenchActionGateway.FileWriteResult.Unavailable ignored -> true;
+            };
         }
 
         private boolean handleOverlayEvent(Event event) {
@@ -274,7 +397,9 @@ final class Workbench {
             }
             if (key.isCancel()) {
                 clearOverlaySecret();
-                runtime.updateState(WorkbenchState::closeOverlay);
+                runtime.updateState(state -> previousOverlay(overlay)
+                        .map(state::withOverlay)
+                        .orElseGet(state::closeOverlay));
                 return true;
             }
             return switch (overlay) {
@@ -319,7 +444,7 @@ final class Workbench {
                 if (picker.selectedIndex() == picker.contexts().size()) {
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextCreate(
                             WorkbenchOverlayState.ContextCreate.Stage.NAME,
-                            "", "", true, false, Optional.empty())));
+                            "", "", true, false, Optional.empty(), Optional.of(picker))));
                 } else {
                     selectContext(picker);
                 }
@@ -331,6 +456,14 @@ final class Workbench {
                 WorkbenchOverlayState.ContextCreate create, KeyEvent key) {
             if (create.pending()) {
                 return true;
+            }
+            if (key.isUp() || key.isDown()) {
+                WorkbenchOverlayState.ContextCreate.Stage[] stages =
+                        WorkbenchOverlayState.ContextCreate.Stage.values();
+                int current = create.stage().ordinal();
+                int next = Math.floorMod(current + (key.isUp() ? -1 : 1), stages.length);
+                return updateContextCreate(create, stages[next], create.name(), create.server(),
+                        create.verifyTls(), Optional.empty());
             }
             if (key.isDeleteBackward()) {
                 String name = create.name();
@@ -365,22 +498,38 @@ final class Workbench {
             if (login.pending()) {
                 return true;
             }
+            if (key.isUp() || key.isDown()) {
+                WorkbenchOverlayState.Login.Stage[] stages = transientLogin(login)
+                        ? WorkbenchOverlayState.Login.Stage.values()
+                        : new WorkbenchOverlayState.Login.Stage[]{
+                            WorkbenchOverlayState.Login.Stage.USERNAME,
+                            WorkbenchOverlayState.Login.Stage.PASSWORD};
+                int current = 0;
+                for (int index = 0; index < stages.length; index++) {
+                    if (stages[index] == login.stage()) {
+                        current = index;
+                        break;
+                    }
+                }
+                int next = Math.floorMod(current + (key.isUp() ? -1 : 1), stages.length);
+                return updateLogin(login, stages[next], login.server(), login.username(), Optional.empty());
+            }
             if (key.isDeleteBackward()) {
                 if (login.stage() == WorkbenchOverlayState.Login.Stage.SERVER) {
                     String server = deleteLastCodePoint(login.server());
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                             login.contextName(), login.stage(), server, login.username(),
-                            login.password(), false, Optional.empty())));
+                            login.password(), false, Optional.empty(), login.previous())));
                 } else if (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME) {
                     String username = deleteLastCodePoint(login.username());
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                             login.contextName(), login.stage(), login.server(), username,
-                            login.password(), false, Optional.empty())));
+                            login.password(), false, Optional.empty(), login.previous())));
                 } else {
                     login.password().deleteLast();
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                             login.contextName(), login.stage(), login.server(), login.username(),
-                            login.password(), false, Optional.empty())));
+                            login.password(), false, Optional.empty(), login.previous())));
                 }
                 return true;
             }
@@ -389,17 +538,20 @@ final class Workbench {
                     if (validServer(login.server())) {
                         runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                                 login.server(), WorkbenchOverlayState.Login.Stage.USERNAME,
-                                login.server(), login.username(), login.password(), false, Optional.empty())));
+                                login.server(), login.username(), login.password(), false,
+                                Optional.empty(), login.previous())));
                     } else {
                         runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                                 login.contextName(), login.stage(), login.server(), login.username(),
-                                login.password(), false, Optional.of("Enter an absolute server URL"))));
+                                login.password(), false, Optional.of("Enter an absolute server URL"),
+                                login.previous())));
                     }
                 } else if (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME) {
                     if (!login.username().isBlank()) {
                         runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                                 login.contextName(), WorkbenchOverlayState.Login.Stage.PASSWORD,
-                                login.server(), login.username(), login.password(), false, Optional.empty())));
+                                login.server(), login.username(), login.password(), false,
+                                Optional.empty(), login.previous())));
                     }
                 } else if (login.password().length() > 0) {
                     submitLogin(login);
@@ -472,7 +624,7 @@ final class Workbench {
                 boolean verifyTls,
                 Optional<String> message) {
             return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextCreate(
-                    stage, name, server, verifyTls, current.pending(), message)));
+                    stage, name, server, verifyTls, current.pending(), message, current.previous())));
         }
 
         private void submitContextCreate(WorkbenchOverlayState.ContextCreate create) {
@@ -480,7 +632,8 @@ final class Workbench {
                 return;
             }
             WorkbenchOverlayState.ContextCreate pending = new WorkbenchOverlayState.ContextCreate(
-                    create.stage(), create.name(), create.server(), create.verifyTls(), true, Optional.empty());
+                    create.stage(), create.name(), create.server(), create.verifyTls(), true,
+                    Optional.empty(), create.previous());
             runtime.updateState(state -> state.withOverlay(pending));
             actionCoordinator.submit(
                     () -> actionGateway.createContext(
@@ -499,17 +652,17 @@ final class Workbench {
                 if (login.stage() == WorkbenchOverlayState.Login.Stage.SERVER) {
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                             login.contextName(), login.stage(), value.toString(), login.username(),
-                            login.password(), false, Optional.empty())));
+                            login.password(), false, Optional.empty(), login.previous())));
                 } else {
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                             login.contextName(), login.stage(), login.server(), value.toString(),
-                            login.password(), false, Optional.empty())));
+                            login.password(), false, Optional.empty(), login.previous())));
                 }
             } else {
                 login.password().append(text);
                 runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                         login.contextName(), login.stage(), login.server(), login.username(), login.password(),
-                        false, Optional.empty())));
+                        false, Optional.empty(), login.previous())));
             }
             return true;
         }
@@ -520,7 +673,11 @@ final class Workbench {
             }
             List<WorkbenchActionGateway.ContextOption> contexts = actionGateway.contexts();
             return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextPicker(
-                    contexts, 0, false, Optional.empty())));
+                    contexts,
+                    0,
+                    false,
+                    Optional.empty(),
+                    state.overlay().filter(WorkbenchOverlayState.More.class::isInstance))));
         }
 
         private boolean openAuthEntry() {
@@ -538,7 +695,8 @@ final class Workbench {
                         "",
                         new SecretBuffer(),
                         false,
-                        Optional.empty())));
+                        Optional.empty(),
+                        state.overlay().filter(WorkbenchOverlayState.More.class::isInstance))));
             }
             if (session.authentication() != WorkbenchAuthentication.SIGNED_OUT) {
                 return false;
@@ -553,7 +711,8 @@ final class Workbench {
                     "",
                     new SecretBuffer(),
                     false,
-                    Optional.empty())));
+                    Optional.empty(),
+                    state.overlay().filter(WorkbenchOverlayState.More.class::isInstance))));
         }
 
         private void selectContext(WorkbenchOverlayState.ContextPicker picker) {
@@ -591,34 +750,39 @@ final class Workbench {
             }
             runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                     login.contextName(), login.stage(), login.server(), login.username(),
-                    login.password(), true, Optional.empty())));
+                    login.password(), true, Optional.empty(), login.previous())));
             Optional<URI> server = login.server().isBlank()
                     ? Optional.empty() : Optional.of(URI.create(login.server()));
             actionCoordinator.submit(
                     () -> actionGateway.login(
                             new WorkbenchActionGateway.LoginRequest(server, login.username()), login.password()),
                     result -> completeLogin(
-                            login.contextName(), login.server(), login.username(), result));
+                            login.contextName(), login.server(), login.username(), login.previous(), result));
         }
 
         private void completeLogin(
                 String contextName,
                 String server,
                 String username,
+                Optional<WorkbenchOverlayState> previous,
                 WorkbenchActionGateway.LoginResult result) {
             switch (result) {
                 case WorkbenchActionGateway.LoginResult.SignedIn ignored -> refreshAfterActivation();
                 case WorkbenchActionGateway.LoginResult.Rejected rejected -> showLoginFailure(
-                        contextName, server, username, "Sign in rejected: " + rejected.code());
+                        contextName, server, username, previous, "Sign in rejected: " + rejected.code());
                 case WorkbenchActionGateway.LoginResult.Unreachable ignored -> showLoginFailure(
-                        contextName, server, username, "Server is unreachable");
+                        contextName, server, username, previous, "Server is unreachable");
                 case WorkbenchActionGateway.LoginResult.Unavailable ignored -> showLoginFailure(
-                        contextName, server, username, "Sign in is unavailable");
+                        contextName, server, username, previous, "Sign in is unavailable");
             }
         }
 
         private void showLoginFailure(
-                String contextName, String server, String username, String message) {
+                String contextName,
+                String server,
+                String username,
+                Optional<WorkbenchOverlayState> previous,
+                String message) {
             runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
                     contextName,
                     WorkbenchOverlayState.Login.Stage.PASSWORD,
@@ -626,7 +790,33 @@ final class Workbench {
                     username,
                     new SecretBuffer(),
                     false,
-                    Optional.of(message))));
+                    Optional.of(message),
+                    previous)));
+        }
+
+        private boolean updateLogin(
+                WorkbenchOverlayState.Login login,
+                WorkbenchOverlayState.Login.Stage stage,
+                String server,
+                String username,
+                Optional<String> message) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    login.contextName(), stage, server, username, login.password(), false,
+                    message, login.previous())));
+        }
+
+        private static boolean transientLogin(WorkbenchOverlayState.Login login) {
+            return login.stage() == WorkbenchOverlayState.Login.Stage.SERVER || !login.server().isBlank();
+        }
+
+        private static Optional<WorkbenchOverlayState> previousOverlay(WorkbenchOverlayState overlay) {
+            return switch (overlay) {
+                case WorkbenchOverlayState.ContextPicker picker -> picker.previous();
+                case WorkbenchOverlayState.ContextCreate create -> create.previous();
+                case WorkbenchOverlayState.Login login -> login.previous();
+                case WorkbenchOverlayState.Help ignored -> Optional.of(new WorkbenchOverlayState.More(2));
+                case WorkbenchOverlayState.More ignored -> Optional.empty();
+            };
         }
 
         private static boolean validServer(String value) {
