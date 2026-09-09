@@ -788,6 +788,7 @@ class JoinDriverTest {
 
         private final JoinStores held;
         private Runnable arrival;
+        private Runnable afterIndexAdd;
 
         ArrivesMidWalk(JoinStores held) {
             this.held = held;
@@ -852,12 +853,37 @@ class JoinDriverTest {
         @Override
         public void indexAdd(String source, String dimensionKey, String factKey) {
             held.indexAdd(source, dimensionKey, factKey);
+            Runnable interleaved = afterIndexAdd;
+            afterIndexAdd = null;
+            if (interleaved != null) {
+                interleaved.run();
+            }
         }
 
         @Override
         public void indexRemove(String source, String dimensionKey, String factKey) {
             held.indexRemove(source, dimensionKey, factKey);
         }
+    }
+
+    @Test
+    void aDimensionRebuildDuringFactAdmissionDoesNotLoseTheFact() {
+        ArrivesMidWalk stores = new ArrivesMidWalk(new MapJoinStores());
+        Fixture facts = new Fixture(JoinKind.LEFT, stores);
+        Fixture dimensions = new Fixture(JoinKind.LEFT, stores);
+        dimensions.apply(dimension("c", insert(Map.of("id", 1L, "name", "Ada"))));
+        // Fact and dimension edges reach different processors. Run the dimension processor in the
+        // interval immediately after the fact processor publishes the reverse-index entry.
+        stores.afterIndexAdd = () -> dimensions.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace"))));
+        facts.apply(fact(insert(Map.of("id", 10L, "cust_id", 1L))));
+        dimensions.clear();
+
+        dimensions.apply(dimension("c",
+                update(Map.of("id", 1L, "name", "Grace"), Map.of("id", 1L, "name", "Hopper"))));
+
+        assertThat(dimensions.published()).containsExactly(
+                Map.entry(Op.INSERT, Map.of("order_id", 10L, "customer_name", "Hopper")));
     }
 
     private static Map<String, Object> rowOf(String first, Object firstValue, String second,
