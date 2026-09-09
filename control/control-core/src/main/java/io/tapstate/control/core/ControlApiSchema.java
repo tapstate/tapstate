@@ -63,6 +63,7 @@ public final class ControlApiSchema {
         bind(refs, "artifact.apply", "ArtifactApply");
         bind(refs, "artifact.delete", "ArtifactDelete");
         bind(refs, "artifact.get", "ArtifactGet");
+        bind(refs, "pipeline.list", "PipelineList");
         bind(refs, "pipeline.start", "PipelineStart");
         bind(refs, "pipeline.stop", "PipelineStop");
         bind(refs, "pipeline.pause", "PipelinePause");
@@ -186,6 +187,7 @@ public final class ControlApiSchema {
         pair(defs, "ArtifactGet", object(List.of("id"), Map.of("id", id), false), artifactResult);
 
         Map<String, Object> pipelineId = object(List.of("id"), Map.of("id", id), false);
+        pair(defs, "PipelineList", empty, opaque);
         pair(defs, "PipelineStart", pipelineId, opaque);
         Map<String, Object> stopRequest = object(
                 List.of("id", "purgeState"),
