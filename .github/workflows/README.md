@@ -50,3 +50,12 @@ The structural gate checks executable Maven lifecycle and shard-driver calls in
 automatic push/PR workflows, rather than workflow comments or diagnostic text.
 The existing shard and aggregate gates prove that the one logical suite covers
 the entire discovered test set.
+
+The analysis job caches only `~/.sonar/cache`, separately from Maven packages.
+Every run reads the current server's plugin and scanner-engine indexes to key
+the cache by their content hashes. A changed index can restore unchanged binaries
+from the same server's older cache and save the updated cache under a new key.
+The scanner still reads its own current indexes and downloads missing versions;
+cache hits never skip report admission, analysis, or the quality gate. Cache
+lookup failures fall back to ordinary analysis. `sonar-cache-smoke.sh` protects
+the identity and workflow bindings, alongside the analysis-path regressions.

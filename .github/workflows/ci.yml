@@ -192,6 +192,26 @@ jobs:
           jar="$(find control/mcp-server/target -maxdepth 1 -name 'mcp-server-*-boot.jar' -print -quit)"
           test -n "$jar"
           bash control/mcp-server/mcp-smoke.sh "$jar"
+      - name: Identify Sonar cache inputs
+        id: sonar-cache-key
+        if: steps.guard.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: .github/scripts/sonar-cache-key.sh >> "$GITHUB_OUTPUT"
+      # A server-content key permits saving newly downloaded plugin versions.
+      # Older entries can supply unchanged binaries; native hashes select updates.
+      - name: Restore Sonar analyzer binaries
+        id: sonar-cache
+        if: steps.guard.outputs.run == 'true' && steps.sonar-cache-key.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: sonar-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sonar-cache-key.outputs.server }}-${{ steps.sonar-cache-key.outputs.manifest }}
+          restore-keys: |
+            sonar-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sonar-cache-key.outputs.server }}-
       - name: Admit Sonar inputs
         if: steps.guard.outputs.run == 'true'
         run: .github/scripts/sonar-inputs.sh --root . --plan "$RUNNER_TEMP/shards.json" --artifacts "$RUNNER_TEMP/ci-artifacts" --restore .
@@ -398,7 +418,7 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh .github/scripts/connector-witnesses.sh .github/scripts/connector-witnesses-smoke.sh .github/scripts/connector-cache.sh .github/scripts/connector-cache-smoke.sh .github/scripts/connector-workflow-smoke.sh .github/scripts/one-verify.sh .github/scripts/one-verify-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh .github/scripts/connector-witnesses.sh .github/scripts/connector-witnesses-smoke.sh .github/scripts/connector-cache.sh .github/scripts/connector-cache-smoke.sh .github/scripts/connector-workflow-smoke.sh .github/scripts/one-verify.sh .github/scripts/one-verify-smoke.sh .github/scripts/sonar-cache-key.sh .github/scripts/sonar-cache-smoke.sh
       - name: One automatic full test suite
         run: bash .github/scripts/one-verify.sh
       - name: Full test invocation cases
@@ -414,6 +434,7 @@ jobs:
           bash .github/scripts/ci-maven-cache-smoke.sh
           bash .github/scripts/sonar-inputs-smoke.sh
           bash .github/scripts/sonar-workflow-smoke.sh
+          bash .github/scripts/sonar-cache-smoke.sh
       - name: CI timing cases
         run: bash .github/scripts/ci-timing-smoke.sh
       - name: refresh driver cases
