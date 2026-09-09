@@ -90,7 +90,7 @@ final class SharedMySql {
     }
 
     /** Binlog CDC needs replication privileges the default test user lacks; they are granted as root. */
-    private static void grantReplication(MySQLContainer<?> server) {
+    static void grantReplication(MySQLContainer<?> server) {
         try (Connection root = asRoot(server); Statement statement = root.createStatement()) {
             statement.execute("GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD, SELECT ON *.* TO '"
                     + server.getUsername() + "'@'%'");
