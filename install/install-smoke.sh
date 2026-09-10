@@ -382,6 +382,29 @@ else
   bad "missing minimums must produce no notice (rc=$RC): $OUT"
 fi
 
+# --- the CPU the x86-64 binary needs: a build choice nothing downstream can see ----------------------
+# Every case above asks whether the machine is old in a way the installer can measure -- an OS version,
+# a glibc. There is a third way to be too old, and it is the one nothing here can see: a native image is
+# compiled for a CPU feature set, and on AMD64 native-image's default requires AVX, AVX2, BMI1, BMI2 and
+# FMA. No x86-64 machine older than Haswell (2013) has them. Such a machine does not get a slower CLI,
+# it gets one that cannot start -- the check runs before main(), so there is no exit code the CLI chose
+# and no message it wrote, which leaves the installer and the quickstart nothing to shape into an
+# explanation. Reported from an Ivy Bridge Xeon where every container came up healthy and the CLI could
+# not run at all.
+#
+# The feature set is a build flag in cli/pom.xml's native profile, which is where this reads it. A
+# binary exists only inside the release job, and by the time one does the choice has already been made;
+# the installer meanwhile publishes linux-x64 and darwin-x64 with no way of knowing what was chosen.
+march="$(sed -n 's/.*<buildArg>-march=\(.*\)<\/buildArg>.*/\1/p' "$HERE/../cli/pom.xml" | head -1)"
+case "$march" in
+  "")
+    bad "cli/pom.xml's native profile pins no -march, so the CLI is built for native-image's own default and cannot start on a CPU without AVX2/BMI2/FMA -- every x86-64 machine older than Haswell" ;;
+  native | x86-64-v3 | x86-64-v4)
+    bad "the CLI is built with -march=$march, which needs CPU features x86-64 machines older than Haswell do not have" ;;
+  *)
+    ok "the x86-64 CLI is built for a CPU baseline that predates AVX2 (-march=$march)" ;;
+esac
+
 # --- the tap alias: opt-in shortcut, never a second copy of the binary --------------------------------
 # `tapstate` stays the only real command; `tap` exists to save keystrokes. It is a link to the same
 # target the stable entry points at, so an upgrade moves both at once -- two independent copies would
