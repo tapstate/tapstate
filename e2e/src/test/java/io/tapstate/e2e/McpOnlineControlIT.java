@@ -317,6 +317,7 @@ class McpOnlineControlIT {
                 id: %s
                 connector: %s
                 config: { uri: "%s" }
+                mode: cdc
                 """.formatted(id, E2eConnectorJar.BROWSABLE_CONNECTOR_ID, directory);
     }
 
