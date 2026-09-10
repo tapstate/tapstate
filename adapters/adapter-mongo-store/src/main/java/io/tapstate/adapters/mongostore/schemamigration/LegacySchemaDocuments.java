@@ -28,12 +28,8 @@ public final class LegacySchemaDocuments {
         string(envelope.get("connectorId"), id, "connectorId");
         integer(envelope.get("discoveredAt"), id, "discoveredAt");
         List<Document> tables = documents(envelope.get("tables"), id, "tables");
-        Set<String> names = new HashSet<>();
         for (Document table : tables) {
-            String name = string(table.get("name"), id, "tables.name");
-            if (!names.add(name)) {
-                throw unreadable(id, "tables.name");
-            }
+            string(table.get("name"), id, "tables.name");
             for (Document field : optionalDocuments(table.get("fields"), id, "tables.fields")) {
                 string(field.get("name"), id, "tables.fields.name");
                 optionalString(field.get("type"), id, "tables.fields.type");

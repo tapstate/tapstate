@@ -1,7 +1,8 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoCollection;
-import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.FindOneAndReplaceOptions;
+import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.DiscoveredSourceModel;
@@ -24,7 +25,7 @@ import java.util.UUID;
 /**
  * The MongoDB discovered-schema store: stores the discovery envelope for a connection as an envelope
  * document keyed by the connection's id — the connector id and discovery time it reports — plus one
- * document per table, keyed {@code <connectionId>.<generation>.<tableName>}, carrying that table's
+ * document per table, keyed {@code <connectionId>.<generation>.<ordinal>}, carrying that table's
  * fields, primary key and indexes.
  *
  * <p><b>Why a table per document.</b> The whole envelope used to be one document, which put every
@@ -40,8 +41,10 @@ import java.util.UUID;
  * With the tables spread over many documents there is no single write that replaces them, so each
  * discovery writes its tables under a fresh generation - invisible, because nothing points at them -
  * and then names that generation in the envelope. That last step is a one-document write, so a reader
- * sees the whole discovery or none of it. Superseded generations are swept afterwards; a run that
- * dies before the sweep leaves documents nothing reads, and the next discovery removes them.
+ * rechecks the envelope after loading its tables and retries if publication changed meanwhile.
+ * Publication atomically returns the displaced envelope: only that generation can be swept, never
+ * another writer's unpublished or newly current tables. A process lost before its sweep can leave
+ * unreachable documents; reclaiming those requires coordination with in-flight writers.
  *
  * <p>The envelope is a fixed shape of plain scalars and lists, so it is mapped field by field rather
  * than through a generic value normalization; on read the driver's {@code Document} / list values are
@@ -86,8 +89,8 @@ public final class MongoSchemaStore implements SchemaStore {
     /**
      * The one character separating the parts of a table key. A connection id cannot contain it, so the
      * connection's own documents are exactly the keys in {@code [<id>., <id>/)} and no other
-     * connection's fall in that range. A table name may contain it and never needs splitting back out:
-     * the name is stored as a field of its own.
+     * connection's fall in that range. Table names are stored as values, so duplicate names and
+     * separator characters cannot collide in document keys.
      */
     private static final char SEPARATOR = '.';
 
@@ -101,35 +104,44 @@ public final class MongoSchemaStore implements SchemaStore {
         for (int order = 0; order < model.size(); order++) {
             SourceTable table = model.get(order);
             tables.add(tableDocument(table)
-                    .append("_id", tableKey(connectionId, generation, table.name()))
+                    .append("_id", tableKey(connectionId, generation, order))
                     .append(GENERATION, generation)
                     // Discovery order is part of what was stored and read back, so it is carried
-                    // explicitly: documents come back in key order, which is table-name order.
+                    // explicitly: document key order need not match numeric discovery order.
                     .append("order", order));
         }
         if (!tables.isEmpty()) {
             StoreIo.run(connectionId, () -> collection.insertMany(tables));
         }
-        // The flip. Until this lands the tables above are unreachable, and after it the previous
-        // generation's are; being one document write, no reader can observe a mixture of the two.
-        StoreIo.run(() -> collection.replaceOne(
+        // Returning the displaced envelope in the same atomic operation establishes exactly which
+        // generation this writer owns the cleanup for, even when another process publishes next.
+        Document displaced = StoreIo.call(() -> collection.findOneAndReplace(
                 new Document("_id", connectionId),
                 envelope(discovered, generation),
-                new ReplaceOptions().upsert(true)));
-        StoreIo.run(() -> collection.deleteMany(new Document("_id", ownedKeys(connectionId))
-                .append(GENERATION, new Document("$ne", generation))));
+                new FindOneAndReplaceOptions().upsert(true).returnDocument(ReturnDocument.BEFORE)));
+        if (displaced != null && displaced.get(GENERATION) instanceof String previous) {
+            StoreIo.run(() -> collection.deleteMany(new Document("_id", ownedKeys(connectionId))
+                    .append(GENERATION, previous)));
+        }
     }
 
     @Override
     public Optional<DiscoveredSourceModel> get(String connectionId) {
         Objects.requireNonNull(connectionId, "connectionId");
-        Document document = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
-        // Verified startup has already moved legacy envelopes into the current shape. Keep the
-        // read guard for direct store callers: never misread an inline envelope as an empty database.
-        if (document == null || !carriesResolvedTypes(document)) {
-            return Optional.empty();
+        while (true) {
+            Document document = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
+            // Verified startup already moved legacy envelopes into the current shape.
+            if (document == null || !carriesResolvedTypes(document)) {
+                return Optional.empty();
+            }
+            List<Document> tables = storedTables(connectionId, document);
+            Document current = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
+            // The tables may have been reclaimed between these reads. A fresh UUID on every save
+            // prevents an intervening publication from returning to the generation we first saw.
+            if (current != null && Objects.equals(document.get(GENERATION), current.get(GENERATION))) {
+                return Optional.of(toDiscovered(document, tables));
+            }
         }
-        return Optional.of(toDiscovered(document, storedTables(connectionId, document)));
     }
 
     /**
@@ -170,9 +182,9 @@ public final class MongoSchemaStore implements SchemaStore {
                 .append("$lt", connectionId + (char) (SEPARATOR + 1));
     }
 
-    private static String tableKey(String connectionId, String generation, String tableName) {
+    private static String tableKey(String connectionId, String generation, int order) {
         ownedKeys(connectionId);
-        return connectionId + SEPARATOR + generation + SEPARATOR + tableName;
+        return connectionId + SEPARATOR + generation + SEPARATOR + order;
     }
 
     /**

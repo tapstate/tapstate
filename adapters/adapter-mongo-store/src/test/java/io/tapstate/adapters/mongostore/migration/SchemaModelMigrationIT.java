@@ -85,6 +85,36 @@ class SchemaModelMigrationIT {
     }
 
     @Test
+    void duplicateLegacyNamesSurviveInterruptedMigrationAndRediscoveryInOrder() {
+        MongoDatabase database = freshDatabase("schema_duplicate_names");
+        MongoCollection<Document> sources = SystemCollections.SOURCE_SCHEMAS.on(database);
+        Document old = source("source");
+        List<Document> original = old.getList("tables", Document.class);
+        original.getLast().put("name", original.getFirst().getString("name"));
+        sources.insertOne(old);
+        AtomicInteger writes = new AtomicInteger();
+        assertThatThrownBy(() -> changeSet(5).up(database, () -> {
+            if (writes.incrementAndGet() == 2) {
+                throw new IllegalStateException("lost lease");
+            }
+        })).isInstanceOf(IllegalStateException.class).hasMessage("lost lease");
+        assertThat(sources.find(new Document("_id", "source")).first()).isEqualTo(old);
+
+        migrateAtStartup(database);
+
+        MongoSchemaStore store = new MongoSchemaStore(sources);
+        DiscoveredSourceModel read = store.get("source").orElseThrow();
+        assertThat(read.model().tables()).extracting(SourceTable::name).containsExactly("z.orders", "z.orders");
+        List<Document> moved = sources.find(new Document("order", new Document("$exists", true)))
+                .sort(new Document("order", 1)).into(new ArrayList<>());
+        moved.forEach(table -> { table.remove("_id"); table.remove("generation"); table.remove("order"); });
+        assertThat(moved).containsExactlyElementsOf(original);
+        store.save(read);
+        assertThat(store.get("source")).contains(read);
+        assertThat(sources.countDocuments()).isEqualTo(3);
+    }
+
+    @Test
     void preResolutionObservationsRetainUnknownTypesAndRediscoveryReplacesTheMigration() {
         MongoDatabase database = freshDatabase("schema_unresolved_source");
         MongoCollection<Document> sources = SystemCollections.SOURCE_SCHEMAS.on(database);
@@ -296,7 +326,7 @@ class SchemaModelMigrationIT {
         MongoCollection<Document> sources = SystemCollections.SOURCE_SCHEMAS.on(database);
         Document original = source("source");
         sources.insertOne(original);
-        Document conflicting = new Document("_id", "source.migration-v5.z.orders")
+        Document conflicting = new Document("_id", "source.migration-v5.0")
                 .append("name", "z.orders").append("fields", List.of()).append("generation", "migration-v5")
                 .append("order", 0);
         sources.insertOne(conflicting);

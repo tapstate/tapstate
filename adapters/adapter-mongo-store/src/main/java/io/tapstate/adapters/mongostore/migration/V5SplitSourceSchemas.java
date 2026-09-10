@@ -45,7 +45,7 @@ public final class V5SplitSourceSchemas implements ChangeSet {
                 List<Document> tables = LegacySchemaDocuments.tables(legacy, id);
                 for (int order = 0; order < tables.size(); order++) {
                     Document table = tables.get(order);
-                    String key = id + "." + GENERATION + "." + table.getString("name");
+                    String key = id + "." + GENERATION + "." + order;
                     Document split = new Document(table).append("_id", key)
                             .append("generation", GENERATION).append("order", order);
                     // A deterministic key makes an interrupted copy resumable without orphaning a

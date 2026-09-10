@@ -23,6 +23,8 @@ import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -233,6 +235,102 @@ class MongoSchemaStoreIT {
             assertThat(read.model().tables()).extracting(SourceTable::name)
                     .containsExactly("orders", "customers");
         });
+    }
+
+    @Test
+    void aReaderRetriesWhenItsGenerationIsReclaimedBeforeTheTableRead() {
+        withStore((store, collection) -> {
+            DiscoveredSourceModel before = observation(1, "old");
+            DiscoveredSourceModel after = observation(2, "new");
+            store.save(before);
+            MongoCollection<Document> interrupted = interleave(collection,
+                    call -> call.name().equals("find") && call.arguments()[0] instanceof Document filter
+                            && filter.containsKey("generation"),
+                    () -> new MongoSchemaStore(collection).save(after), false);
+
+            assertThat(new MongoSchemaStore(interrupted).get("orders-db")).contains(after);
+        });
+    }
+
+    @Test
+    void aWriterCannotDeleteAnotherWritersUnpublishedTables() {
+        withStore((store, collection) -> {
+            store.save(observation(1, "old"));
+            DiscoveredSourceModel last = observation(3, "last");
+            MongoCollection<Document> interrupted = interleave(collection,
+                    call -> call.name().equals("insertMany"),
+                    () -> new MongoSchemaStore(collection).save(observation(2, "middle")), true);
+
+            new MongoSchemaStore(interrupted).save(last);
+
+            assertThat(store.get("orders-db")).contains(last);
+            assertThat(collection.countDocuments()).isEqualTo(2);
+        });
+    }
+
+    @Test
+    void aDelayedSweepCannotDeleteTheNewCurrentGeneration() {
+        withStore((store, collection) -> {
+            store.save(observation(1, "old"));
+            DiscoveredSourceModel last = observation(3, "last");
+            MongoCollection<Document> interrupted = interleave(collection,
+                    call -> call.name().equals("deleteMany"),
+                    () -> new MongoSchemaStore(collection).save(last), false);
+
+            new MongoSchemaStore(interrupted).save(observation(2, "middle"));
+
+            assertThat(store.get("orders-db")).contains(last);
+            assertThat(collection.countDocuments()).isEqualTo(2);
+        });
+    }
+
+    @Test
+    void duplicateTableNamesRetainTheirDistinctObservationsAndOrder() {
+        withStore((store, collection) -> {
+            DiscoveredSourceModel duplicateNames = new DiscoveredSourceModel("orders-db", "mysql", 1,
+                    new SourceModel(List.of(
+                            new SourceTable("orders", List.of(new SourceField("first", "int")),
+                                    List.of(), List.of()),
+                            new SourceTable("orders", List.of(new SourceField("second", "varchar")),
+                                    List.of(), List.of()))));
+            store.save(duplicateNames);
+
+            assertThat(store.get("orders-db")).contains(duplicateNames);
+            assertThat(collection.countDocuments()).isEqualTo(3);
+        });
+    }
+
+    private static DiscoveredSourceModel observation(long time, String table) {
+        return new DiscoveredSourceModel("orders-db", "mysql", time,
+                new SourceModel(List.of(new SourceTable(table, List.of(), List.of(), List.of()))));
+    }
+
+    private record Call(String name, Object[] arguments) { }
+
+    /** Pauses one driver operation while an independent store completes a real Mongo write. */
+    @SuppressWarnings("unchecked")
+    private static MongoCollection<Document> interleave(MongoCollection<Document> delegate,
+            Predicate<Call> match, Runnable action, boolean after) {
+        AtomicBoolean fired = new AtomicBoolean();
+        return (MongoCollection<Document>) Proxy.newProxyInstance(
+                MongoCollection.class.getClassLoader(), new Class<?>[] {MongoCollection.class},
+                (proxy, invoked, args) -> {
+                    boolean run = match.test(new Call(invoked.getName(), args))
+                            && fired.compareAndSet(false, true);
+                    if (run && !after) {
+                        action.run();
+                    }
+                    Object result;
+                    try {
+                        result = invoked.invoke(delegate, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                    if (run && after) {
+                        action.run();
+                    }
+                    return result;
+                });
     }
 
     /** The collection, with one named method failing the way a lost connection would. */
