@@ -204,7 +204,14 @@ class WorkbenchRefreshIntegrationTest {
             assertThat(runtime.state().workspaceView().document())
                     .hasValueSatisfying(document -> assertThat(document.selectedLine()).isEqualTo(1));
 
-            assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.F4), null)).isTrue();
+            session.render(Frame.forTesting(Buffer.empty(new Rect(0, 0, 120, 30))));
+            WorkbenchRenderer.FooterHit edit = session.layout().footerHits().stream()
+                    .filter(hit -> hit.action() == WorkbenchRenderer.FooterAction.EDIT)
+                    .findFirst()
+                    .orElseThrow();
+            assertThat(session.handleEvent(
+                    MouseEvent.press(MouseButton.LEFT, edit.area().x(), edit.area().y()), null)).isTrue();
+            assertThat(runtime.state().workspaceView().editing()).isTrue();
             assertThat(session.handleEvent(KeyEvent.ofChar('#'), null)).isTrue();
             assertThat(runtime.state().workspaceView().document())
                     .hasValueSatisfying(document -> {

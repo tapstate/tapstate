@@ -115,6 +115,10 @@ final class WorkbenchTheme {
         return style(TokenName.LABEL);
     }
 
+    Style codeKey() {
+        return style(TokenName.CODE_KEY);
+    }
+
     private Style style(TokenName token) {
         return styles.get(token);
     }
@@ -146,6 +150,7 @@ final class WorkbenchTheme {
                     Style.EMPTY.fg(Color.WHITE).bg(Color.hex("#285A63")).bold());
             fallback.put(TokenName.INFO, Style.EMPTY.fg(Color.hex("#8CCFD8")));
             fallback.put(TokenName.LABEL, Style.EMPTY.fg(Color.hex("#D7C986")));
+            fallback.put(TokenName.CODE_KEY, Style.EMPTY.fg(Color.hex("#D98AB6")));
         } else {
             fallback.put(TokenName.BASE, Style.EMPTY.fg(Color.hex("#203033")).bg(Color.hex("#F7FAFA")));
             fallback.put(TokenName.MUTED, Style.EMPTY.fg(Color.hex("#647477")));
@@ -153,6 +158,7 @@ final class WorkbenchTheme {
                     Style.EMPTY.fg(Color.BLACK).bg(Color.hex("#B9E1E5")).bold());
             fallback.put(TokenName.INFO, Style.EMPTY.fg(Color.hex("#225D8A")));
             fallback.put(TokenName.LABEL, Style.EMPTY.fg(Color.hex("#725E12")));
+            fallback.put(TokenName.CODE_KEY, Style.EMPTY.fg(Color.hex("#9A3E6B")));
         }
         fallback.put(TokenName.ACCENT, Style.EMPTY.fg(accent));
         fallback.put(TokenName.ACCENT_BACKGROUND, Style.EMPTY.fg(accentForeground).bg(accent).bold());
@@ -196,7 +202,8 @@ final class WorkbenchTheme {
         WARNING("warning"),
         ERROR("error"),
         INFO("info"),
-        LABEL("label");
+        LABEL("label"),
+        CODE_KEY("code-key");
 
         private final String cssId;
 

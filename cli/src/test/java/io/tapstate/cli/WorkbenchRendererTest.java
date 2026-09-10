@@ -73,7 +73,7 @@ class WorkbenchRendererTest {
                 .contains("1 Overview", "2 Workspace", "3 Sources", "4 Pipelines", "0 More")
                 .contains("Resources")
                 .contains("source", "pipeline", "in sync 1", "local only 1")
-                .contains("1-4 views", "c context", "a auth", "0 more", "r refresh", "q quit")
+                .contains("1-4  views", "c  context", "a  auth", "0  more", "r  refresh", "q  quit")
                 .doesNotContain(secret, "/admin", "explicit", "Remote artifacts:",
                         "F1", "F2", "command palette",
                         "Up/Down select", "[2]", "[1]", "[0]");
@@ -114,7 +114,7 @@ class WorkbenchRendererTest {
                 .doesNotContain("[2]", "[1]", "[0]");
         assertThat(lineOf(rendered.buffer(), 3)).startsWith("╭").contains(" Overview ");
         assertThat(lineOf(rendered.buffer(), 22)).startsWith("╰");
-        assertThat(lineOf(rendered.buffer(), 23)).contains("c context", "a auth", "q quit");
+        assertThat(lineOf(rendered.buffer(), 23)).contains("c  context", "a  auth", "q  quit");
         assertThat(rendered.layout().actionHits())
                 .extracting(hit -> hit.launcher().name())
                 .contains("CONTEXT", "AUTH", "MORE");
@@ -191,7 +191,7 @@ class WorkbenchRendererTest {
         assertThat(lineOf(rendered.buffer(), 21)).doesNotContain("Remote artifacts:");
         assertThat(lineOf(rendered.buffer(), 22)).startsWith("╰");
         assertThat(lineOf(rendered.buffer(), 23))
-                .contains("1-4 views", "c context", "a auth", "0 more", "r refresh", "q quit");
+                .contains("1-4  views", "c  context", "a  auth", "0  more", "r  refresh", "q  quit");
         assertThat(rendered.text())
                 .contains("source", "local 7", "remote 8", "pipeline", "local 2", "remote 3");
     }
@@ -230,13 +230,13 @@ class WorkbenchRendererTest {
                 .contains("╭ Files ", "╭ Info ", "╭ YAML [orders.tap.yml] ")
                 .contains("orders.tap.yml", "Path: source/orders.tap.yml", "●", "Remote: ● present")
                 .contains(">> 1 apiVersion: tapstate/v1", "2 kind: Source")
-                .contains("F4 edit", "Tab files")
-                .doesNotContain("Enter open", "Tab viewer", "Remote artifacts:");
+                .contains("F4  edit", "Tab  files")
+                .doesNotContain("Enter  open", "Tab  viewer", "Remote artifacts:");
 
         int keyColumn = findColumn(rendered.buffer(), findLine(rendered.buffer(), "apiVersion"), "apiVersion");
         int valueColumn = findColumn(rendered.buffer(), findLine(rendered.buffer(), "tapstate/v1"), "tapstate/v1");
         assertThat(rendered.buffer().get(keyColumn, findLine(rendered.buffer(), "apiVersion")).style().fg())
-                .isEqualTo(WorkbenchTheme.dark().label().fg());
+                .isEqualTo(WorkbenchTheme.dark().codeKey().fg());
         assertThat(rendered.buffer().get(valueColumn, findLine(rendered.buffer(), "tapstate/v1")).style().fg())
                 .isEqualTo(WorkbenchTheme.dark().warning().fg());
         int commentY = findLine(rendered.buffer(), "# note");
@@ -245,6 +245,10 @@ class WorkbenchRendererTest {
                 .isEqualTo(WorkbenchTheme.dark().muted().fg());
         assertThat(rendered.buffer().get(keyColumn, findLine(rendered.buffer(), "apiVersion")).style().bg())
                 .isEqualTo(WorkbenchTheme.dark().selection().bg());
+        int inactiveKeyY = findLine(rendered.buffer(), "kind: Source");
+        int inactiveKeyX = findColumn(rendered.buffer(), inactiveKeyY, "kind");
+        assertThat(rendered.buffer().get(inactiveKeyX, inactiveKeyY).style().bg())
+                .isEqualTo(WorkbenchTheme.dark().base().bg());
     }
 
     @Test
@@ -290,7 +294,7 @@ class WorkbenchRendererTest {
         assertThat(header).contains("STATE▼");
         assertThat(rendered.text().indexOf("alpha"))
                 .isLessThan(rendered.text().indexOf("zeta"));
-        assertThat(rendered.text()).contains("s sort", "Esc back", "r refresh");
+        assertThat(rendered.text()).contains("s  sort", "Esc  back", "r  refresh");
 
         int identifierColumn = header.indexOf("IDENTIFIER");
         int stateColumn = header.indexOf("STATE");
@@ -301,11 +305,12 @@ class WorkbenchRendererTest {
         assertThat(rendered.buffer().get(stateColumn, 4).style().fg())
                 .isEqualTo(WorkbenchTheme.dark().label().fg());
         String footer = lineOf(rendered.buffer(), 27);
-        int sortKey = footer.indexOf("s sort");
+        int sortKey = footer.indexOf("s  sort");
         assertThat(rendered.buffer().get(sortKey, 27).style().bg())
                 .isEqualTo(WorkbenchTheme.dark().hintKey().bg());
         assertThat(rendered.buffer().get(sortKey + 2, 27).style().bg())
                 .isEqualTo(WorkbenchTheme.dark().base().bg());
+        assertThat(footer).contains("s  sort");
         assertThat(header).doesNotContain("KIND", "REMOTE");
     }
 
@@ -328,7 +333,7 @@ class WorkbenchRendererTest {
         assertThat(rendered.text())
                 .contains("orders.tap.yml *", "Edit [orders.tap.yml *]")
                 .contains("Discard Changes?", "Unsaved changes will be lost.")
-                .contains("Enter confirm", "Esc cancel")
+                .contains("Enter  confirm", "Esc  cancel")
                 .doesNotContain("Remote artifacts:");
     }
 
@@ -367,7 +372,7 @@ class WorkbenchRendererTest {
                 .select(WorkbenchState.WorkbenchTab.SOURCES));
 
         assertThat(rendered.text())
-                .contains("↑↓ navigate", "Esc back", "s sort", "r refresh", "q quit")
+                .contains("↑↓  navigate", "Esc  back", "s  sort", "r  refresh", "q  quit")
                 .doesNotContain("Left/Right switch");
     }
 
@@ -457,6 +462,11 @@ class WorkbenchRendererTest {
                 .contains(WorkbenchRenderer.Launcher.CONTEXT);
         assertThat(layout.actionAt(more.area().x(), more.area().y()))
                 .contains(WorkbenchRenderer.Launcher.MORE);
+        assertThat(layout.footerHits()).isNotEmpty().isUnmodifiable();
+        for (WorkbenchRenderer.FooterHit hit : layout.footerHits()) {
+            assertThat(layout.footerActionAt(hit.area().x(), hit.area().y())).contains(hit.action());
+            assertThat(layout.footerActionAt(hit.area().right() - 1, hit.area().y())).contains(hit.action());
+        }
         assertThat(layout.tabHits()).isUnmodifiable();
         assertThat(layout.rowHits()).isUnmodifiable();
         assertThat(layout.actionHits()).isUnmodifiable();
@@ -579,8 +589,8 @@ class WorkbenchRendererTest {
 
         assertThat(rendered.text())
                 .contains(emptyMessage, "Remote workspace is empty")
-                .contains("Esc back", "r refresh", "q quit")
-                .doesNotContain("↑↓ navigate");
+                .contains("Esc  back", "r  refresh", "q  quit")
+                .doesNotContain("↑↓  navigate");
         assertThat(rendered.layout().rowHits()).isEmpty();
     }
 

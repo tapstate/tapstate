@@ -12,3 +12,4 @@ $accent: #4FACBC;
 #error      { color: #F48771; }
 #info       { color: #8CCFD8; }
 #label      { color: #D7C986; }
+#code-key   { color: #D98AB6; }

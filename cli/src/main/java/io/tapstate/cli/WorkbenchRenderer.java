@@ -65,13 +65,13 @@ final class WorkbenchRenderer {
         Rect contentArea = new Rect(
                 area.x(), area.y() + CONTENT_Y, area.width(), footerY - (area.y() + CONTENT_Y));
         ContentLayout content = renderContent(frame, contentArea, state, wide, theme);
-        renderFooter(frame, area, footerY, state, theme);
+        FooterLayout footer = renderFooter(frame, area, footerY, state, theme);
         List<OverlayHit> overlayHits = state.overlay()
                 .map(overlay -> renderOverlay(frame, area, overlay, theme))
                 .orElseGet(List::of);
         return new RenderLayout(
                 false, wide, content.visibleRows(), header.tabHits(), content.rowHits(),
-                header.actionHits(), overlayHits);
+                header.actionHits(), footer.hits(), overlayHits);
     }
 
     private static void renderTooSmall(Frame frame, Rect area, WorkbenchTheme theme) {
@@ -508,17 +508,19 @@ final class WorkbenchRenderer {
             int y = area.y() + index - scroll;
             int x = area.x();
             boolean active = index == activeLine;
-            Style activeBackground = theme.selection().bg()
-                    .map(color -> Style.EMPTY.bg(color))
-                    .orElse(Style.EMPTY);
+            Style rowBackground = active
+                    ? theme.selection().bg()
+                            .map(color -> Style.EMPTY.bg(color))
+                            .orElse(Style.EMPTY)
+                    : Style.EMPTY;
             if (active) {
-                frame.buffer().setStyle(new Rect(area.x(), y, area.width(), 1), activeBackground);
+                frame.buffer().setStyle(new Rect(area.x(), y, area.width(), 1), rowBackground);
             }
             x += write(frame, x, y, active ? ">> " : "   ",
-                    active ? theme.label().bold().patch(activeBackground) : theme.base(), area);
+                    active ? theme.label().bold().patch(rowBackground) : theme.base(), area);
             x += write(frame, x, y, pad(Integer.toString(index + 1), numberWidth) + " ",
-                    (active ? theme.label().bold() : theme.muted()).patch(activeBackground), area);
-            renderYamlLine(frame, x, y, lines[index], theme, activeBackground, area);
+                    (active ? theme.label().bold() : theme.muted()).patch(rowBackground), area);
+            renderYamlLine(frame, x, y, lines[index], theme, rowBackground, area);
             if (document.editing() && index == document.scopeLine() && index != activeLine) {
                 frame.buffer().setStyle(new Rect(area.x(), y, area.width(), 1), theme.accent().bold());
             }
@@ -544,7 +546,7 @@ final class WorkbenchRenderer {
 
         Matcher key = YAML_KEY.matcher(text);
         if (key.find()) {
-            applyRange(styles, key.start(2), key.end(2), theme.label());
+            applyRange(styles, key.start(2), key.end(2), theme.codeKey());
             int colon = text.indexOf(':', key.end(2));
             if (colon >= 0) {
                 applyRange(styles, colon, colon + 1, theme.base().bold());
@@ -782,7 +784,7 @@ final class WorkbenchRenderer {
         };
     }
 
-    private static void renderFooter(
+    private static FooterLayout renderFooter(
             Frame frame, Rect area, int y, WorkbenchState state, WorkbenchTheme theme) {
         boolean hasSelectableRows = state.selectedTab().hasTable()
                 && state.snapshot()
@@ -790,38 +792,47 @@ final class WorkbenchRenderer {
                         .orElse(false);
         List<FooterHint> hints = switch (state.selectedTab()) {
             case OVERVIEW -> List.of(
-                    new FooterHint("1-4", "views"),
-                    new FooterHint("c", "context"),
-                    new FooterHint("a", "auth"),
-                    new FooterHint("0", "more"),
-                    new FooterHint("r", "refresh"),
-                    new FooterHint("q", "quit"));
+                    new FooterHint("1-4", "views", Optional.empty()),
+                    new FooterHint("c", "context", Optional.of(FooterAction.CONTEXT)),
+                    new FooterHint("a", "auth", Optional.of(FooterAction.AUTH)),
+                    new FooterHint("0", "more", Optional.of(FooterAction.MORE)),
+                    new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
+                    new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
             case WORKSPACE -> hasSelectableRows
                     ? workspaceFooter(state)
                     : List.of(
-                            new FooterHint("Esc", "back"),
-                            new FooterHint("r", "refresh"),
-                            new FooterHint("q", "quit"));
+                            new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
+                            new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
+                            new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
             case SOURCES, PIPELINES -> hasSelectableRows
                     ? List.of(
-                            new FooterHint("↑↓", "navigate"),
-                            new FooterHint("Esc", "back"),
-                            new FooterHint("s", "sort"),
-                            new FooterHint("r", "refresh"),
-                            new FooterHint("q", "quit"))
+                            new FooterHint("↑↓", "navigate", Optional.empty()),
+                            new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
+                            new FooterHint("s", "sort", Optional.of(FooterAction.SORT)),
+                            new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
+                            new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)))
                     : List.of(
-                            new FooterHint("Esc", "back"),
-                            new FooterHint("r", "refresh"),
-                            new FooterHint("q", "quit"));
+                            new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
+                            new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
+                            new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
         };
         int x = area.x();
+        List<FooterHit> hits = new ArrayList<>();
         for (FooterHint hint : hints) {
+            int start = x;
             x += write(frame, x, y, " " + hint.key() + " ", theme.hintKey(), area);
-            x += write(frame, x, y, hint.label() + "  ", theme.base(), area);
+            x += write(frame, x, y, " " + hint.label() + "   ", theme.base(), area);
+            int end = x;
+            hint.action().ifPresent(action -> {
+                if (end > start) {
+                    hits.add(new FooterHit(action, new Rect(start, y, end - start, 1)));
+                }
+            });
             if (x >= area.right()) {
-                return;
+                return new FooterLayout(hits);
             }
         }
+        return new FooterLayout(hits);
     }
 
     private static List<FooterHint> workspaceFooter(WorkbenchState state) {
@@ -829,30 +840,30 @@ final class WorkbenchRenderer {
                 .map(WorkbenchWorkspaceState.Document::pendingDiscard)
                 .orElse(false)) {
             return List.of(
-                    new FooterHint("Enter", "confirm"),
-                    new FooterHint("Esc", "cancel"));
+                    new FooterHint("Enter", "confirm", Optional.of(FooterAction.DISCARD)),
+                    new FooterHint("Esc", "cancel", Optional.of(FooterAction.CANCEL_DISCARD)));
         }
         if (state.workspaceView().editing()) {
             return List.of(
-                    new FooterHint("↑↓←→", "navigate"),
-                    new FooterHint("Esc", "cancel"),
-                    new FooterHint("Ctrl+S", "save"),
-                    new FooterHint("F5", "save & close"));
+                    new FooterHint("↑↓←→", "navigate", Optional.empty()),
+                    new FooterHint("Esc", "cancel", Optional.of(FooterAction.CANCEL_EDIT)),
+                    new FooterHint("Ctrl+S", "save", Optional.of(FooterAction.SAVE)),
+                    new FooterHint("F5", "save & close", Optional.of(FooterAction.SAVE_AND_CLOSE)));
         }
         if (state.workspaceView().focus() == WorkbenchWorkspaceState.Focus.VIEWER) {
             return List.of(
-                    new FooterHint("↑↓", "navigate"),
-                    new FooterHint("Esc", "back"),
-                    new FooterHint("F4", "edit"),
-                    new FooterHint("Tab", "files"));
+                    new FooterHint("↑↓", "navigate", Optional.empty()),
+                    new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
+                    new FooterHint("F4", "edit", Optional.of(FooterAction.EDIT)),
+                    new FooterHint("Tab", "files", Optional.of(FooterAction.TOGGLE_FOCUS)));
         }
         List<FooterHint> hints = new ArrayList<>(List.of(
-                new FooterHint("↑↓", "navigate"),
-                new FooterHint("Esc", "back"),
-                new FooterHint("Enter", "open"),
-                new FooterHint("F4", "edit")));
+                new FooterHint("↑↓", "navigate", Optional.empty()),
+                new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
+                new FooterHint("Enter", "open", Optional.of(FooterAction.OPEN)),
+                new FooterHint("F4", "edit", Optional.of(FooterAction.EDIT))));
         if (state.workspaceView().document().isPresent()) {
-            hints.add(new FooterHint("Tab", "viewer"));
+            hints.add(new FooterHint("Tab", "viewer", Optional.of(FooterAction.TOGGLE_FOCUS)));
         }
         return List.copyOf(hints);
     }
@@ -1052,6 +1063,7 @@ final class WorkbenchRenderer {
             List<TabHit> tabHits,
             List<RowHit> rowHits,
             List<ActionHit> actionHits,
+            List<FooterHit> footerHits,
             List<OverlayHit> overlayHits) {
 
         RenderLayout {
@@ -1061,11 +1073,12 @@ final class WorkbenchRenderer {
             tabHits = List.copyOf(tabHits);
             rowHits = List.copyOf(rowHits);
             actionHits = List.copyOf(actionHits);
+            footerHits = List.copyOf(footerHits);
             overlayHits = List.copyOf(overlayHits);
         }
 
         static RenderLayout forTooSmallFrame() {
-            return new RenderLayout(true, false, 0, List.of(), List.of(), List.of(), List.of());
+            return new RenderLayout(true, false, 0, List.of(), List.of(), List.of(), List.of(), List.of());
         }
 
         Optional<WorkbenchState.WorkbenchTab> tabAt(int x, int y) {
@@ -1085,6 +1098,13 @@ final class WorkbenchRenderer {
             return actionHits.stream()
                     .filter(hit -> hit.area().contains(x, y))
                     .map(ActionHit::launcher)
+                    .findFirst();
+        }
+
+        Optional<FooterAction> footerActionAt(int x, int y) {
+            return footerHits.stream()
+                    .filter(hit -> hit.area().contains(x, y))
+                    .map(FooterHit::action)
                     .findFirst();
         }
 
@@ -1126,6 +1146,31 @@ final class WorkbenchRenderer {
         }
     }
 
+    enum FooterAction {
+        CONTEXT,
+        AUTH,
+        MORE,
+        REFRESH,
+        QUIT,
+        BACK,
+        SORT,
+        OPEN,
+        EDIT,
+        TOGGLE_FOCUS,
+        SAVE,
+        SAVE_AND_CLOSE,
+        CANCEL_EDIT,
+        DISCARD,
+        CANCEL_DISCARD
+    }
+
+    record FooterHit(FooterAction action, Rect area) {
+        FooterHit {
+            Objects.requireNonNull(action, "action");
+            Objects.requireNonNull(area, "area");
+        }
+    }
+
     record OverlayHit(int index, Rect area) {
         OverlayHit {
             Objects.requireNonNull(area, "area");
@@ -1144,7 +1189,13 @@ final class WorkbenchRenderer {
         }
     }
 
-    private record FooterHint(String key, String label) {
+    private record FooterLayout(List<FooterHit> hits) {
+        private FooterLayout {
+            hits = List.copyOf(hits);
+        }
+    }
+
+    private record FooterHint(String key, String label, Optional<FooterAction> action) {
     }
 
     private record Columns(

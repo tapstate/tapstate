@@ -273,6 +273,10 @@ final class Workbench {
                                 new WorkbenchOverlayState.More(0)));
                     };
                 }
+                var footerAction = layout.footerActionAt(mouse.x(), mouse.y());
+                if (footerAction.isPresent()) {
+                    return handleFooterAction(footerAction.orElseThrow(), runner);
+                }
                 var clickedTab = layout.tabAt(mouse.x(), mouse.y());
                 if (clickedTab.isPresent()) {
                     return runtime.updateState(state -> state.select(clickedTab.orElseThrow()));
@@ -290,6 +294,52 @@ final class Workbench {
                 }
             }
             return false;
+        }
+
+        WorkbenchRenderer.RenderLayout layout() {
+            return layout;
+        }
+
+        private boolean handleFooterAction(WorkbenchRenderer.FooterAction action, TuiRunner runner) {
+            return switch (action) {
+                case CONTEXT -> openContextEntry();
+                case AUTH -> openAuthEntry();
+                case MORE -> runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.More(0)));
+                case REFRESH -> {
+                    if (refreshCoordinator == null) {
+                        yield false;
+                    }
+                    refresh();
+                    yield true;
+                }
+                case QUIT -> {
+                    if (runner == null) {
+                        yield false;
+                    }
+                    runner.quit();
+                    yield true;
+                }
+                case BACK -> runtime.updateState(state -> state.selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                        && !state.workspaceView().equals(WorkbenchWorkspaceState.empty())
+                        ? state.withWorkspaceView(state.workspaceView().back())
+                        : state.reduce(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE), visibleRows()));
+                case SORT -> runtime.updateState(state -> state.reduce(KeyEvent.ofChar('s'), visibleRows()));
+                case OPEN -> openSelectedWorkspaceFile(false);
+                case EDIT -> runtime.state().workspaceView().focus() == WorkbenchWorkspaceState.Focus.VIEWER
+                        && runtime.state().workspaceView().document().isPresent()
+                        ? runtime.updateState(state -> state.withWorkspaceView(state.workspaceView().edit()))
+                        : openSelectedWorkspaceFile(true);
+                case TOGGLE_FOCUS -> runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().toggleFocus()));
+                case SAVE -> saveWorkspaceFile(false);
+                case SAVE_AND_CLOSE -> saveWorkspaceFile(true);
+                case CANCEL_EDIT -> runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().requestCancelEdit()));
+                case DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER))));
+                case CANCEL_DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE))));
+            };
         }
 
         private boolean handleWorkspaceEditorEvent(Event event, TuiRunner runner) {
