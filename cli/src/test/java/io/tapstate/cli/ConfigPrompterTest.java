@@ -158,4 +158,18 @@ class ConfigPrompterTest {
         assertThat(prompter.asked).isEmpty();
         assertThat(prompter.secretQuestions).containsExactly("password");
     }
+
+    @Test
+    void essentialWalkTreatsNullControllerDefaultAsHidden() {
+        ConfigField controller = new ConfigField("sslValidate", ConfigType.BOOLEAN,
+                Map.of("en_US", "sslValidate"), false, null, false, List.of(), null);
+        ConfigField gated = new ConfigField("sslCa", ConfigType.STRING,
+                Map.of("en_US", "sslCa"), true, null, false, List.of(),
+                new VisibleWhen("sslValidate", List.of("true")));
+
+        Map<String, Object> config = new ConfigPrompter().collectEssential(
+                List.of(controller, gated), Map.of(), new ScriptedPrompter("unused"));
+
+        assertThat(config).isEmpty();
+    }
 }

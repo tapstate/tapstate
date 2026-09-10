@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * The connector config Q&A: walks a connector's config fields and asks for each visible one through
@@ -116,6 +117,7 @@ final class ConfigPrompter {
             controller = fields.stream()
                     .filter(f -> f.name().equals(vw.controllingField()))
                     .map(ConfigField::defaultValue)
+                    .filter(Objects::nonNull)
                     .findFirst()
                     .orElse(null);
         }
