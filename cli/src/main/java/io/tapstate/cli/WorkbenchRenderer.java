@@ -516,11 +516,17 @@ final class WorkbenchRenderer {
             if (active) {
                 frame.buffer().setStyle(new Rect(area.x(), y, area.width(), 1), rowBackground);
             }
-            x += write(frame, x, y, active ? ">> " : "   ",
-                    active ? theme.label().bold().patch(rowBackground) : theme.base(), area);
-            x += write(frame, x, y, pad(Integer.toString(index + 1), numberWidth) + " ",
-                    (active ? theme.label().bold() : theme.muted()).patch(rowBackground), area);
-            renderYamlLine(frame, x, y, lines[index], theme, rowBackground, area);
+            if (document.editing()) {
+                x += write(frame, x, y, pad(Integer.toString(index + 1), numberWidth) + " |",
+                        theme.muted().patch(rowBackground), area);
+                write(frame, x, y, lines[index], theme.base().patch(rowBackground), area);
+            } else {
+                x += write(frame, x, y, active ? ">> " : "   ",
+                        active ? theme.label().bold().patch(rowBackground) : theme.base(), area);
+                x += write(frame, x, y, pad(Integer.toString(index + 1), numberWidth) + " ",
+                        (active ? theme.label().bold() : theme.muted()).patch(rowBackground), area);
+                renderYamlLine(frame, x, y, lines[index], theme, rowBackground, area);
+            }
             if (document.editing() && index == document.scopeLine() && index != activeLine) {
                 frame.buffer().setStyle(new Rect(area.x(), y, area.width(), 1), theme.accent().bold());
             }

@@ -252,7 +252,7 @@ class WorkbenchRendererTest {
     }
 
     @Test
-    void editorHighlightsTheCursorRowAndNearestYamlScopeLikeCamel() {
+    void editorUsesPlainTextGutterAndNearestYamlScopeLikeCamel() {
         WorkbenchArtifactRow source = row(
                 "source", "orders", WorkbenchAlignment.IN_SYNC, "source/orders.tap.yml", true);
         WorkbenchWorkspaceState workspace = WorkbenchWorkspaceState.empty()
@@ -268,11 +268,15 @@ class WorkbenchRendererTest {
         Rendered rendered = render(120, 30, state);
         int scopeY = findLine(rendered.buffer(), "config:");
         int scopeX = findColumn(rendered.buffer(), scopeY, "config:");
-        int cursorY = findLine(rendered.buffer(), ">> 3");
+        int cursorY = findLine(rendered.buffer(), "3 |    batchSize: 100");
+        int cursorX = findColumn(rendered.buffer(), cursorY, "batchSize");
 
+        assertThat(rendered.text()).doesNotContain(">>");
         assertThat(rendered.buffer().get(scopeX, scopeY).style().fg())
                 .isEqualTo(WorkbenchTheme.dark().accent().fg());
-        assertThat(rendered.buffer().get(findColumn(rendered.buffer(), cursorY, ">>"), cursorY)
+        assertThat(rendered.buffer().get(cursorX, cursorY).style().fg())
+                .isEqualTo(WorkbenchTheme.dark().base().fg());
+        assertThat(rendered.buffer().get(cursorX, cursorY)
                 .style().bg()).isEqualTo(WorkbenchTheme.dark().selection().bg());
     }
 
