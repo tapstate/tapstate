@@ -208,6 +208,7 @@ position.field-not-editable
 position.nothing-to-write
 position.write-back-while-live
 role.unsupported
+schema.column-name-reads-as-a-path
 source.already-exists
 source.id-mismatch
 source.in-use

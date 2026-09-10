@@ -657,6 +657,9 @@ nest.state-far-exceeds-memory-budget:
 nest.capacity-estimate-incomplete:
   message: "Nest level {embedPath} of pipeline {pipeline} could be sized from {counted} of the {total} inputs feeding it; the rest report no row count, so what was estimated is a floor."
   solution: "Discover the sources feeding that level so their tables report row counts, then apply again to have it sized on all of them."
+schema.column-name-reads-as-a-path:
+  message: "Pipeline {pipeline} writes column {column} of table {table} to {target}, which reads a dot in a key as a step into a nested document rather than as part of a name."
+  solution: "The rows cross correctly and the key is really written, but a read for {column} on {target} answers nothing unless the dot is escaped, and no index can be declared over it at all, because an index key is written in that same path syntax. If it is a column you will query or index, rename it in {source}, or give it a name without a dot in a map step before it is written."
 # Connector-supplied connection-test diagnostics.
 #
 # The connector API's typed test exceptions carry translation keys rather than sentences, and the
