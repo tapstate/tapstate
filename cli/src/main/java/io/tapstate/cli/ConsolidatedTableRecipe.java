@@ -118,7 +118,7 @@ final class ConsolidatedTableRecipe {
             inputs.add(FromRef.literal(sourceId + "." + answers.table()));
         }
         Step consolidate = Step.inline("consolidate", new FromClause.Flow(inputs), new TransformBody.Union(),
-                null, null);
+                null);
         ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal("consolidate"), "id", null, null);
         PipelineResource pipeline = new PipelineResource(stem + "_sync", null,
                 sources.stream().<SourceRef>map(s -> SourceRef.bare(s.resource().id())).toList(),

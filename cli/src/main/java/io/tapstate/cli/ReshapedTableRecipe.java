@@ -88,12 +88,12 @@ final class ReshapedTableRecipe {
         }
         if (!fields.isEmpty()) {
             steps.add(Step.inline("reshape", FromClause.list(FromRef.literal(upstream)),
-                    new TransformBody.MapProjection(fields), null, null));
+                    new TransformBody.MapProjection(fields), null));
             upstream = "reshape";
         }
         if (answers.where() != null) {
             steps.add(Step.inline("keep", FromClause.list(FromRef.literal(upstream)),
-                    new TransformBody.Filter(answers.where()), null, null));
+                    new TransformBody.Filter(answers.where()), null));
             upstream = "keep";
         }
         ViewBlock view = new ViewBlock.Inline(answers.table().view(), FromRef.literal(upstream), "id", null, null);

@@ -84,7 +84,7 @@ final class RecipeSupport {
         }
         List<TableRef> refs = tables.stream().<TableRef>map(TableRef::literal).toList();
         return new PlannedSource(
-                new SourceResource(sourceId, null, connector, config, SourceMode.CDC, refs, null, null, null),
+                new SourceResource(sourceId, null, connector, config, SourceMode.CDC, refs, null, null),
                 secrets);
     }
 
