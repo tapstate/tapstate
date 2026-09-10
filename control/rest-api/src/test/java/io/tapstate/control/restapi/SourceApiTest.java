@@ -11,6 +11,8 @@ import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.OperationRegistry;
+import io.tapstate.control.core.SchemaDiscoveryService;
+import io.tapstate.control.core.SourceConnectionResolver;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.PlanAdvisories;
@@ -28,6 +30,8 @@ import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
+import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
+import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
@@ -115,6 +119,22 @@ class SourceApiTest {
         assertThat(body.path("connectionId").asText()).isEqualTo("orders");
         assertThat(body.path("tables")).extracting(table -> table.path("name").asText())
                 .containsExactly("orders", "audit_log", "customers");
+    }
+
+    @Test
+    void refreshingASavedSourceDoesNotLoseItsPersistedPassword() throws Exception {
+        create("mysql-refresh", "saved");
+
+        JsonNode saved = JSON.readTree(request("reader").get().uri("/api/sources/mysql-refresh")
+                .retrieve().body(String.class));
+        assertThat(saved.path("config").has("password")).isFalse();
+
+        Map<String, Object> redactedConfig = JSON.convertValue(saved.path("config"), Map.class);
+        context.getBean(SchemaDiscoveryService.class).discover(
+                saved.path("id").asText(), saved.path("connector").asText(), redactedConfig, "writer");
+
+        assertThat(context.getBean(RecordingSchemaDiscoveryProbe.class).captured().settings())
+                .containsEntry("password", SECRET);
     }
 
     @Test
@@ -501,6 +521,13 @@ class SourceApiTest {
         @Bean SourceSchemaQueryService sourceSchemaQueryService(ArtifactStore artifacts, SchemaStore schemas) {
             return new SourceSchemaQueryService(artifacts, schemas);
         }
+        @Bean RecordingSchemaDiscoveryProbe schemaDiscoveryProbe() { return new RecordingSchemaDiscoveryProbe(); }
+        @Bean SchemaDiscoveryService schemaDiscoveryService(
+                RecordingSchemaDiscoveryProbe probe, InMemorySchemaStore schemas, AuditGate auditGate, Clock clock,
+                InMemoryArtifactStore artifacts) {
+            return new SchemaDiscoveryService(
+                    probe, schemas, auditGate, clock, null, new SourceConnectionResolver(artifacts));
+        }
         @Bean RecordingAuditStore auditStore() { return new RecordingAuditStore(); }
         @Bean Clock clock() { return Clock.fixed(Instant.parse("2026-07-13T00:00:00Z"), ZoneOffset.UTC); }
         @Bean AuditGate auditGate(AuditStore auditStore, Clock clock) {
@@ -605,6 +632,21 @@ class SourceApiTest {
         @Override
         public synchronized Optional<DiscoveredSourceModel> get(String connectionId) {
             return Optional.ofNullable(byId.get(connectionId));
+        }
+    }
+
+    private static final class RecordingSchemaDiscoveryProbe implements SchemaDiscoveryProbe {
+        private ConnectionConfig captured;
+
+        ConnectionConfig captured() {
+            return captured;
+        }
+
+        @Override
+        public SourceModel discover(ConnectionConfig config) {
+            captured = config;
+            return new SourceModel(List.of(new SourceTable(
+                    "orders", List.of(new SourceField("id", "bigint")), List.of("id"), List.of())));
         }
     }
 }
