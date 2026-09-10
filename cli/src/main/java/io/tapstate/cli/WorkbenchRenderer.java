@@ -358,7 +358,7 @@ final class WorkbenchRenderer {
         WorkbenchSnapshot snapshot = state.snapshot().orElseThrow();
         List<RowHit> rowHits;
         if (state.selectedTab() == WorkbenchState.WorkbenchTab.OVERVIEW) {
-            renderOverview(frame, inner, snapshot.overview(), theme);
+            renderOverview(frame, inner, snapshot, theme);
             rowHits = List.of();
         } else {
             List<WorkbenchArtifactRow> rows = rows(snapshot, state.selectedTab());
@@ -643,16 +643,33 @@ final class WorkbenchRenderer {
     }
 
     private static void renderOverview(
-            Frame frame, Rect area, WorkbenchOverviewSnapshot overview, WorkbenchTheme theme) {
-        write(frame, area.x(), area.y(), "Resources", theme.label().bold(), area);
-        int rowsY = area.y() + 1;
+            Frame frame, Rect area, WorkbenchSnapshot snapshot, WorkbenchTheme theme) {
+        WorkbenchOverviewSnapshot overview = snapshot.overview();
         int summaryY = area.bottom() - 4;
-        int kindCapacity = Math.max(1, summaryY - rowsY);
+        int y = area.y();
+        List<String> guidance = onboardingGuidance(snapshot);
+        if (!guidance.isEmpty()) {
+            write(frame, area.x(), y++, "Getting started", theme.label().bold(), area);
+            for (String step : guidance) {
+                if (y >= summaryY) {
+                    break;
+                }
+                write(frame, area.x(), y++, step, theme.base(), area);
+            }
+            if (y < summaryY) {
+                y++;
+            }
+        }
+        if (y < summaryY) {
+            write(frame, area.x(), y++, "Resources", theme.label().bold(), area);
+        }
+        int rowsY = y;
+        int kindCapacity = Math.max(0, summaryY - rowsY);
         boolean overflow = overview.kinds().size() > kindCapacity;
         int visibleKinds = Math.min(
                 overview.kinds().size(),
-                overflow ? kindCapacity - 1 : kindCapacity);
-        int y = rowsY;
+                overflow ? Math.max(0, kindCapacity - 1) : kindCapacity);
+        y = rowsY;
         for (int index = 0; index < visibleKinds; index++) {
             WorkbenchKindCount kind = overview.kinds().get(index);
             String remote = kind.remoteCount().isPresent()
@@ -680,6 +697,21 @@ final class WorkbenchRenderer {
                 theme.base(), area);
     }
 
+    private static List<String> onboardingGuidance(WorkbenchSnapshot snapshot) {
+        List<String> guidance = new ArrayList<>();
+        WorkbenchSessionSnapshot session = snapshot.session();
+        if (session.connection() == WorkbenchConnection.NO_CONTEXT) {
+            guidance.add("Press c to add or choose a Tapstate Server");
+            guidance.add("Press a to sign in after choosing a server");
+        } else if (session.authentication() == WorkbenchAuthentication.SIGNED_OUT) {
+            guidance.add("Press a to sign in");
+        }
+        if (snapshot.workspace().rows().isEmpty()) {
+            guidance.add("Add a *.tap.yml file to this workspace");
+        }
+        return List.copyOf(guidance);
+    }
+
     private static List<RowHit> renderTable(
             Frame frame,
             Rect area,
@@ -689,8 +721,14 @@ final class WorkbenchRenderer {
             boolean wide,
             int visibleRows,
             WorkbenchTheme theme) {
-        Columns columns = Columns.forWidth(area.width(), wide);
-        renderTableHeader(frame, area, columns, table, theme);
+        int markerWidth = 3;
+        Rect tableArea = new Rect(
+                area.x() + markerWidth,
+                area.y(),
+                Math.max(1, area.width() - markerWidth),
+                area.height());
+        Columns columns = Columns.forWidth(tableArea.width(), wide);
+        renderTableHeader(frame, tableArea, columns, table, theme);
         if (rows.isEmpty()) {
             write(frame, area.x(), area.y() + 1,
                     emptyRowsMessage(tab), theme.base(), area);
@@ -717,7 +755,8 @@ final class WorkbenchRenderer {
                     localMarker(row));
             int y = area.y() + 1 + index - scroll;
             Style style = index == selected ? theme.selection() : theme.base();
-            int width = write(frame, area.x(), y, line, style, area);
+            String marker = index == selected ? ">> " : "   ";
+            int width = write(frame, area.x(), y, marker + line, style, area);
             if (width > 0) {
                 hits.add(new RowHit(tab, index, new Rect(area.x(), y, width, 1)));
             }
@@ -877,7 +916,7 @@ final class WorkbenchRenderer {
     private static String tabLabel(WorkbenchState.WorkbenchTab tab) {
         return switch (tab) {
             case OVERVIEW -> "🌊  1 Overview";
-            case WORKSPACE -> "📁  2 Workspace";
+            case WORKSPACE -> "💻  2 Workspace";
             case SOURCES -> "🔌  3 Sources";
             case PIPELINES -> "🔀  4 Pipelines";
         };

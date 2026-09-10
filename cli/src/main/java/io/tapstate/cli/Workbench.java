@@ -785,13 +785,31 @@ final class Workbench {
         private void completeContextSelection(WorkbenchActionGateway.ContextResult result) {
             switch (result) {
                 case WorkbenchActionGateway.ContextResult.Ready ready -> {
-                    refreshAfterActivation();
+                    if (ready.signedIn()) {
+                        refreshAfterActivation();
+                    } else {
+                        Optional<WorkbenchOverlayState> previous = runtime.state().overlay()
+                                .flatMap(Session::previousOverlay);
+                        openContextLogin(ready.contextName(), previous);
+                    }
                 }
                 case WorkbenchActionGateway.ContextResult.Offline offline -> runtime.updateState(state ->
                         state.withOverlay(contextMessage("Context is offline: " + offline.contextName())));
                 case WorkbenchActionGateway.ContextResult.Unavailable ignored -> runtime.updateState(state ->
                         state.withOverlay(contextMessage("Context could not be selected")));
             }
+        }
+
+        private void openContextLogin(String contextName, Optional<WorkbenchOverlayState> previous) {
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    contextName,
+                    WorkbenchOverlayState.Login.Stage.USERNAME,
+                    "",
+                    "",
+                    new SecretBuffer(),
+                    false,
+                    Optional.empty(),
+                    previous)));
         }
 
         private WorkbenchOverlayState.ContextPicker contextMessage(String message) {

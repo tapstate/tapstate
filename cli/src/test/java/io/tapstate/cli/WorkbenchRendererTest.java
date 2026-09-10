@@ -109,7 +109,7 @@ class WorkbenchRendererTest {
         assertThat(header.indexOf("workspace: /work/catalog")).isLessThan(header.indexOf("auth: alice"));
         assertThat(lineOf(rendered.buffer(), 1)).contains("(2)", "(1)", "(0)");
         assertThat(lineOf(rendered.buffer(), 2))
-                .contains("🌊", "1 Overview", "📁", "2 Workspace", "🔌", "3 Sources",
+                .contains("🌊", "1 Overview", "💻", "2 Workspace", "🔌", "3 Sources",
                         "🔀", "4 Pipelines", "📂", "0 More ▾")
                 .doesNotContain("[2]", "[1]", "[0]");
         assertThat(lineOf(rendered.buffer(), 3)).startsWith("╭").contains(" Overview ");
@@ -164,6 +164,44 @@ class WorkbenchRendererTest {
         assertThat(render(100, 28, accepted(snapshot).select(WorkbenchState.WorkbenchTab.PIPELINES)).text())
                 .contains("billing-pipeline")
                 .doesNotContain("customer-source", "operations-view");
+    }
+
+    @Test
+    void overviewGuidesActivationAndAnEmptyWorkspace() {
+        WorkbenchSessionSnapshot session = new WorkbenchSessionSnapshot(
+                Path.of("/work/empty"),
+                Optional.empty(),
+                Optional.empty(),
+                WorkbenchConnection.NO_CONTEXT,
+                WorkbenchAuthentication.NOT_APPLICABLE,
+                Optional.empty(),
+                Optional.empty(),
+                "v0.4.4");
+        WorkbenchSnapshot snapshot = snapshot(session, new WorkbenchRemoteState.NotConfigured(), List.of());
+
+        assertThat(render(100, 28, accepted(snapshot)).text())
+                .contains("Getting started", "Press c to add or choose a Tapstate Server",
+                        "Press a to sign in", "Add a *.tap.yml file to this workspace");
+    }
+
+    @Test
+    void sourceAndPipelineRowsShowCamelSelectionMarkerAfterKeyboardNavigation() {
+        List<WorkbenchArtifactRow> rows = List.of(
+                row("source", "alpha", WorkbenchAlignment.IN_SYNC, "source/alpha.tap.yml", true),
+                row("source", "beta", WorkbenchAlignment.IN_SYNC, "source/beta.tap.yml", true),
+                row("pipeline", "daily", WorkbenchAlignment.IN_SYNC, "pipeline/daily.tap.yml", true),
+                row("pipeline", "nightly", WorkbenchAlignment.IN_SYNC, "pipeline/nightly.tap.yml", true));
+        WorkbenchSnapshot snapshot = snapshot(new WorkbenchRemoteState.Available(4), rows);
+
+        WorkbenchState sources = accepted(snapshot)
+                .select(WorkbenchState.WorkbenchTab.SOURCES)
+                .reduce(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.DOWN), 10);
+        WorkbenchState pipelines = accepted(snapshot)
+                .select(WorkbenchState.WorkbenchTab.PIPELINES)
+                .reduce(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.DOWN), 10);
+
+        assertThat(render(120, 28, sources).text()).contains(">> beta");
+        assertThat(render(120, 28, pipelines).text()).contains(">> nightly");
     }
 
     @Test
