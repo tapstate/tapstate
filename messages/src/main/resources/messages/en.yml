@@ -336,6 +336,9 @@ io.store-unauthorized:
 io.document-unreadable:
   message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."
+io.schema-read-contention:
+  message: "The schema for connection '{connectionId}' changed during every read attempt."
+  solution: "Wait for re-discovery to finish, then retry."
 io.document-too-large:
   message: "The record for '{id}' no longer fits in one stored document."
   solution: "The store is healthy and retrying will not help. Reduce what is held under this one id."

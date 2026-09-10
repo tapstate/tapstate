@@ -77,6 +77,9 @@ public final class MongoSchemaStore implements SchemaStore {
      */
     static final int RESOLVED_TYPES = 2;
 
+    /** Maximum complete read attempts under publication contention, not a wall-clock timeout. */
+    static final int MAX_READ_ATTEMPTS = 8;
+
     private final MongoCollection<Document> collection;
 
     public MongoSchemaStore(MongoCollection<Document> collection) {
@@ -128,7 +131,7 @@ public final class MongoSchemaStore implements SchemaStore {
     @Override
     public Optional<DiscoveredSourceModel> get(String connectionId) {
         Objects.requireNonNull(connectionId, "connectionId");
-        while (true) {
+        for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt++) {
             Document document = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
             // Verified startup already moved legacy envelopes into the current shape.
             if (document == null || !carriesResolvedTypes(document)) {
@@ -142,6 +145,9 @@ public final class MongoSchemaStore implements SchemaStore {
                 return Optional.of(toDiscovered(document, tables));
             }
         }
+        // Continuous publication must not hold a caller indefinitely or masquerade as no discovery.
+        throw new TapstateException(IoError.SCHEMA_READ_CONTENTION,
+                Map.of("connectionId", connectionId), null);
     }
 
     /**

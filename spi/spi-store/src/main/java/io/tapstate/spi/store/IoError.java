@@ -46,6 +46,12 @@ public enum IoError implements TapstateErrorCode {
     DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id", "field")),
 
     /**
+     * Re-discovery replaced a connection's schema during every permitted read attempt. The store
+     * remains available, but the caller must retry after publication settles to read a coherent model.
+     */
+    SCHEMA_READ_CONTENTION("io.schema-read-contention", Set.of("connectionId")),
+
+    /**
      * A document a store operation had to write is larger than the store will accept. {@code id} is
      * the document's id, or {@code unknown} where the failing call did not name one.
      *

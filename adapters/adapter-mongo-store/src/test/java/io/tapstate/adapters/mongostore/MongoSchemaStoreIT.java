@@ -22,12 +22,15 @@ import java.lang.reflect.Proxy;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * Witnesses the discovered-schema store against a real Mongo replica-set: a saved discovery envelope
@@ -253,6 +256,66 @@ class MongoSchemaStoreIT {
     }
 
     @Test
+    void continuousPublicationFailsAfterEightAttemptsAndALaterReadCanRecover() {
+        withStore((store, collection) -> {
+            store.save(observation(0, "initial"));
+            AtomicInteger reads = new AtomicInteger();
+            AtomicInteger publications = new AtomicInteger();
+            AtomicBoolean publishing = new AtomicBoolean(true);
+            MongoCollection<Document> interrupted = interleave(collection,
+                    call -> {
+                        if (!isTableRead(call)) {
+                            return false;
+                        }
+                        reads.incrementAndGet();
+                        return publishing.get();
+                    },
+                    () -> store.save(observation(publications.incrementAndGet(), "replacement")),
+                    false, 9);
+            MongoSchemaStore reader = new MongoSchemaStore(interrupted);
+
+            // The ninth publication is finite: the unbounded implementation eventually returns,
+            // so this regression fails on its missing diagnostic without hanging the test process.
+            Throwable failure = catchThrowable(() -> reader.get("orders-db"));
+
+            assertThat(failure).isInstanceOf(TapstateException.class);
+            TapstateException coded = (TapstateException) failure;
+            assertThat(coded.code().code()).isEqualTo("io.schema-read-contention");
+            assertThat(coded.args()).containsExactlyEntriesOf(Map.of("connectionId", "orders-db"));
+            assertThat(reads.get()).isEqualTo(8);
+            assertThat(publications.get()).isEqualTo(8);
+
+            publishing.set(false);
+            assertThat(reader.get("orders-db")).contains(observation(8, "replacement"));
+            assertThat(reads.get()).isEqualTo(9);
+        });
+    }
+
+    @Test
+    void aReaderCanSucceedOnItsLastAllowedAttempt() {
+        withStore((store, collection) -> {
+            store.save(observation(0, "initial"));
+            AtomicInteger reads = new AtomicInteger();
+            AtomicInteger publications = new AtomicInteger();
+            MongoCollection<Document> interrupted = interleave(collection,
+                    call -> {
+                        if (!isTableRead(call)) {
+                            return false;
+                        }
+                        reads.incrementAndGet();
+                        return true;
+                    },
+                    () -> store.save(observation(publications.incrementAndGet(), "replacement")),
+                    false, 7);
+
+            assertThat(new MongoSchemaStore(interrupted).get("orders-db"))
+                    .contains(observation(7, "replacement"));
+            assertThat(reads.get()).isEqualTo(8);
+            assertThat(publications.get()).isEqualTo(7);
+        });
+    }
+
+    @Test
     void aWriterCannotDeleteAnotherWritersUnpublishedTables() {
         withStore((store, collection) -> {
             store.save(observation(1, "old"));
@@ -307,16 +370,27 @@ class MongoSchemaStoreIT {
 
     private record Call(String name, Object[] arguments) { }
 
+    private static boolean isTableRead(Call call) {
+        return call.name().equals("find") && call.arguments()[0] instanceof Document filter
+                && filter.containsKey("generation");
+    }
+
     /** Pauses one driver operation while an independent store completes a real Mongo write. */
-    @SuppressWarnings("unchecked")
     private static MongoCollection<Document> interleave(MongoCollection<Document> delegate,
             Predicate<Call> match, Runnable action, boolean after) {
-        AtomicBoolean fired = new AtomicBoolean();
+        return interleave(delegate, match, action, after, 1);
+    }
+
+    /** Finite interleavings let contention regressions fail without an unbounded test fixture. */
+    @SuppressWarnings("unchecked")
+    private static MongoCollection<Document> interleave(MongoCollection<Document> delegate,
+            Predicate<Call> match, Runnable action, boolean after, int maximum) {
+        AtomicInteger fired = new AtomicInteger();
         return (MongoCollection<Document>) Proxy.newProxyInstance(
                 MongoCollection.class.getClassLoader(), new Class<?>[] {MongoCollection.class},
                 (proxy, invoked, args) -> {
                     boolean run = match.test(new Call(invoked.getName(), args))
-                            && fired.compareAndSet(false, true);
+                            && fired.getAndIncrement() < maximum;
                     if (run && !after) {
                         action.run();
                     }
