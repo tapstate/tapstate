@@ -45,7 +45,7 @@ class StorePortTest {
     private static final Instant T1 = Instant.parse("2026-07-03T00:00:01Z");
 
     private static SourceResource source(String id, String connector) {
-        return new SourceResource(id, null, connector, Map.of(), null, null, null, null, null);
+        return new SourceResource(id, null, connector, Map.of(), null, null, null, null);
     }
 
     // --- facade ---
@@ -69,6 +69,23 @@ class StorePortTest {
         assertThat(store.keyedState()).isNotNull();
         assertThat(store.nestDeadLetters()).isNotNull();
         assertThat(store.derivedSchemas()).isNotNull();
+        assertThat(store.layouts()).isNotNull();
+    }
+
+    @Test
+    void layoutIsMutableWithoutChangingTheArtifactTruthLayer() {
+        StorePort store = new InMemoryStore();
+        PipelineLayout layout = new PipelineLayout(
+                "orders_sync",
+                Map.of("source:orders", new PipelineLayout.NodePosition(80, 120)),
+                new PipelineLayout.Viewport(0, 0, 1));
+
+        store.layouts().save(layout);
+
+        assertThat(store.layouts().get("orders_sync")).contains(layout);
+        assertThat(store.artifacts().get("orders_sync")).isEmpty();
+        store.layouts().delete("orders_sync");
+        assertThat(store.layouts().get("orders_sync")).isEmpty();
     }
 
     // --- derived schemas (the side record of what a step works out for itself) ---
@@ -1006,6 +1023,7 @@ class StorePortTest {
         private final Map<String, NestDeadLetterRecord> deadLetters = new LinkedHashMap<>();
         private final Map<String, List<DerivedSchema>> derivedSchemas = new LinkedHashMap<>();
         private final Map<String, Long> pins = new LinkedHashMap<>();
+        private final Map<String, PipelineLayout> layouts = new HashMap<>();
 
         @Override
         public ArtifactStore artifacts() {
@@ -1276,6 +1294,26 @@ class StorePortTest {
                 @Override
                 public void delete(String pipelineId) {
                     derivedSchemas.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
+                }
+            };
+        }
+
+        @Override
+        public PipelineLayoutStore layouts() {
+            return new PipelineLayoutStore() {
+                @Override
+                public Optional<PipelineLayout> get(String pipelineId) {
+                    return Optional.ofNullable(layouts.get(pipelineId));
+                }
+
+                @Override
+                public void save(PipelineLayout layout) {
+                    layouts.put(layout.pipelineId(), layout);
+                }
+
+                @Override
+                public void delete(String pipelineId) {
+                    layouts.remove(pipelineId);
                 }
             };
         }

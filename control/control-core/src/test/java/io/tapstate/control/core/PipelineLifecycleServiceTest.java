@@ -88,6 +88,25 @@ class PipelineLifecycleServiceTest {
     }
 
     @Test
+    void aBlankEditorDraftCannotBeStarted() {
+        artifacts.save("""
+                version: tapstate/v1
+                kind: pipeline
+                id: blank
+                source: []
+                """);
+
+        TapstateException thrown = catchThrowableOfType(
+                TapstateException.class, () -> service.start("alice", "blank"));
+
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code().code()).isEqualTo("lifecycle.pipeline-not-runnable");
+        assertThat(thrown.args()).containsEntry("pipeline", "blank");
+        assertThat(desired.read("blank")).isEmpty();
+        assertThat(audit.records).isEmpty();
+    }
+
+    @Test
     void resumeAtAStaleRevisionIsRefusedWithTheRequestedAndLatest() {
         artifacts.save(PIPELINE_V1);
         service.start("alice", "pl1"); // desired RUNNING at v1
@@ -385,7 +404,7 @@ class PipelineLifecycleServiceTest {
 
     /** The revision of an artifact is the content hash of its canonical form — the same value apply stamps. */
     private static String revisionOf(String dsl) {
-        return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+        return CanonicalHash.of(parse(dsl));
     }
 
     private static final String PIPELINE_V1 = """

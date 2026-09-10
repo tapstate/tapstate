@@ -276,6 +276,6 @@ class NodeColumnsAgainstRuntimeTest {
     }
 
     private static PushElement push(PushFormat format) {
-        return new PushElement(null, "orders_src", "topic", format, null);
+        return new PushElement(null, "orders_src", "topic", format);
     }
 }

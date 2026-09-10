@@ -6,7 +6,7 @@ import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.LifecycleMachine;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
-import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.spi.store.DesiredStore;
 
 import java.util.Map;
@@ -98,18 +98,25 @@ public final class PipelineLifecycleService {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
 
-        String latest = artifacts.get(pipelineId)
-                .map(a -> CanonicalHash.of(a.canonicalForm()))
+        StoredResource latestArtifact = artifacts.getResource(pipelineId)
+                .filter(stored -> stored.resource() instanceof PipelineResource)
                 .orElseThrow(() -> new TapstateException(
                         LifecycleError.UNKNOWN_PIPELINE, Map.of("pipeline", pipelineId), null));
+        PipelineResource pipeline = (PipelineResource) latestArtifact.resource();
+        if ((verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME)
+                && (pipeline.sources().isEmpty() || pipeline.view() == null && pipeline.serve() == null)) {
+            throw new TapstateException(
+                    LifecycleError.PIPELINE_NOT_RUNNABLE, Map.of("pipeline", pipelineId), null);
+        }
+        String latest = latestArtifact.contentHash();
 
         Optional<DesiredState> prior = desired.read(pipelineId);
         PipelineState current = prior.map(DesiredState::targetState).orElse(PipelineState.NEW);
         PipelineState target = LifecycleMachine.transition(current, verb);
 
-        // What the latest artifact would be assembled from, alongside what it hashes to. Both are read off
-        // the same canonical text, so a field that moves one moves the other and the two cannot drift into
-        // disagreeing about what changed.
+        // What the latest artifact would be assembled from, alongside what it hashes to. Both are taken off
+        // the same canonical structure, so a field that moves one moves the other and the two cannot drift
+        // into disagreeing about what changed.
         String latestAssembly = artifacts.assemblyIdentityOf(pipelineId).orElse(null);
 
         // The revision the verb runs at: a fresh start adopts the latest; the other verbs carry forward the

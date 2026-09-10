@@ -1,6 +1,6 @@
 package io.tapstate.core.model;
 
-/** Embed mode of a nest child (ADR-0016 §5.1): 1:N array vs 1:1 object. */
+/** Embed mode of a nest child (§5.1): 1:N array vs 1:1 object. */
 @Doc("How a nested child is embedded into its parent: as a one-to-many array or a one-to-one object.")
 public enum EmbedAs {
     @Doc("One-to-many relationship: matching child rows are embedded as an array.")

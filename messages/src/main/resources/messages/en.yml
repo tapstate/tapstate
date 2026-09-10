@@ -252,6 +252,15 @@ dsl.composition:
 dsl.duplicate-id:
   message: "Duplicate id '{id}' at {path}."
   solution: "Ids must be unique within the workspace; rename one of them."
+dsl.missing-field:
+  message: "Required field '{field}' is missing at {path}."
+  solution: "Add '{field}' to that block. It has no default, and nothing else in the document implies it."
+dsl.mode-required-for-read:
+  message: "Source '{source}' is read by pipeline '{pipeline}' but declares no {path}."
+  solution: "Add '{path}:' to '{source}', saying how it is read. A source named only as a sync or push target supplies a connection rather than rows, and correctly declares none."
+dsl.unsupported-version:
+  message: "This document declares version '{got}', which this build cannot read."
+  solution: "Write one of the supported versions: {supported}. A version is supported for two further minor releases after its successor ships."
 dsl.unsupported-mode:
   message: "Connector '{connector}' does not support mode '{mode}' at {path}."
   solution: "Choose one of the connector's supported modes: {allowed}."
@@ -288,6 +297,9 @@ lifecycle.incompatible-revision:
 lifecycle.purge-state-not-stated:
   message: "Stopping pipeline {pipeline} did not say whether to clear what it has accumulated."
   solution: "Send purgeState true to stop and clear this pipeline's resume position and operator state, or purgeState false to stop and keep them; there is no default because the next run either continues or reads the whole source again."
+lifecycle.pipeline-not-runnable:
+  message: "Pipeline {pipeline} is an incomplete editor draft and cannot be started."
+  solution: "Add at least one Source and a view or serve output, save the Pipeline, then start it."
 lifecycle.unknown-pipeline:
   message: "No pipeline named {pipeline} is applied."
   solution: "Apply the pipeline before acting on it or reading its status, and check the id for typos."
@@ -306,6 +318,15 @@ store.invalid-uri:
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
+migration.data-newer-than-binary:
+  message: "The store holds system data at version {installed}, which is newer than this build supports (up to {supported})."
+  solution: "Start a build at or above the one that wrote it. Downgrading across a system-data version is not supported; to go back, restore the backup taken before the upgrade."
+migration.lock-timeout:
+  message: "Another member ({holder}) has been migrating the system data since {since} and has not finished."
+  solution: "Check that member is still running. If it has died, this one takes over on its own once the lock goes stale; if it is stuck, stop it and start this one again."
+migration.changeset-failed:
+  message: "System data changeset {changeset} failed: {cause}"
+  solution: "Fix what the cause names, then start again -- the migration resumes at this changeset rather than repeating the ones before it."
 io.store-unavailable:
   message: "A store operation could not complete: {detail}."
   solution: "Check the store is reachable and healthy, then retry."
@@ -313,7 +334,7 @@ io.store-unauthorized:
   message: "The store rejected the credentials for the operation."
   solution: "Check the store username and password in the connection settings."
 io.document-unreadable:
-  message: "A stored document with id '{id}' could not be read back."
+  message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."
 io.document-too-large:
   message: "The record for '{id}' no longer fits in one stored document."
@@ -522,6 +543,21 @@ source.srs-change-while-running:
 source.version-conflict:
   message: "Source '{id}' changed after it was read."
   solution: "Read the current Source and retry the operation with its new ETag."
+pipeline.not-found:
+  message: "No Pipeline with id '{id}' exists."
+  solution: "List Pipelines to find an existing id."
+pipeline.already-exists:
+  message: "A Pipeline with id '{id}' already exists."
+  solution: "Choose a different Pipeline id, or edit the existing Pipeline."
+pipeline.id-mismatch:
+  message: "Pipeline id '{bodyId}' in the request body does not match path id '{pathId}'."
+  solution: "Use the same immutable Pipeline id in the request path and body."
+pipeline.precondition-required:
+  message: "Pipeline '{id}' requires its current ETag for this operation."
+  solution: "Read the Pipeline, then retry with its ETag in If-Match."
+pipeline.version-conflict:
+  message: "Pipeline '{id}' changed after it was read."
+  solution: "Read the current Pipeline and retry the operation with its new ETag."
 transform.expression-failed:
   message: "Expression {expr} could not be evaluated for a row: {detail}."
   solution: "Check the expression against the fields and types the row actually carries at runtime."

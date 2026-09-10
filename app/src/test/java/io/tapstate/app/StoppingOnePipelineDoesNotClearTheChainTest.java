@@ -246,7 +246,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         private final SrsCoordinator srsCoordinator;
         private final StoreBackedPipelineCaptureCoordinator coordinator;
         private final SourceResource source = new SourceResource("orders_src", null, "mysql",
-                Map.of("host", "h"), SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null);
+                Map.of("host", "h"), SourceMode.CDC, List.of(TableRef.literal("orders")), null, null);
 
         Fixture() {
             InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
@@ -316,7 +316,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         private static PipelineResource pipeline(String id) {
             return new PipelineResource(id, null, List.of(SourceRef.spec("orders_src", true)), null, null,
                     new ServeBlock.Inline(null, FromRef.literal("orders_src"),
-                            List.of(new SyncElement("sync_1", "orders_src", null, null, null, null)), null, null),
+                            List.of(new SyncElement("sync_1", "orders_src", null, null, null)), null, null),
                     new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);
         }
     }

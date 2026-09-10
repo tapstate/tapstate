@@ -6,7 +6,7 @@ import io.tapstate.core.common.Severity;
 import java.util.Set;
 
 /**
- * The {@code dsl} domain's error codes (ADR-0024 D1; the domain's first consumer, plan poc1 B3-7).
+ * The {@code dsl} domain's error codes (the domain's first consumer, plan poc1 B3-7).
  * Each constant a well-formed artifact can raise on its own maps 1:1 to a corpus rule-vocabulary key
  * (corpus/README.md) — the symbol is the vocabulary key, the canonical code prefixes it with the
  * {@code dsl.} domain.
@@ -20,22 +20,41 @@ import java.util.Set;
  *
  * <p>{@code placeholders()} is the named-argument contract: every throw site supplies a value for
  * each name, and (once the catalog lands in the presentation layer) the build-time placeholder
- * gate checks message templates against it (ADR-0024 D5-4). {@code path} is present on every semantic
+ * gate checks message templates against it. {@code path} is present on every semantic
  * code — the field path of the offending node, carried both as a typed accessor on {@link DslException}
  * and as a message argument — but absent on {@link #MALFORMED_YAML}, which is pre-semantic.
  */
 public enum DslError implements TapstateErrorCode {
 
+    /**
+     * The document declares a grammar version this build cannot read, or declares none. One code for
+     * both: to whoever wrote it they are the same situation -- the document does not say which grammar
+     * it is in -- and the argument says which of the two happened.
+     */
+    UNSUPPORTED_VERSION("dsl.unsupported-version", Set.of("got", "supported")),
     /** A field outside the tapstate/v1 schema (§11.5, strict rejection). */
     UNKNOWN_FIELD("dsl.unknown-field", Set.of("field", "path")),
     /** A field known to the schema but banned in this position (X18/X19). */
     FORBIDDEN_FIELD("dsl.forbidden-field", Set.of("field", "path")),
+    /**
+     * A field the model declares required and the parser cannot supply, left out of the document.
+     * Narrower than the model's non-null contract: an id the parser generates and a {@code from:} it
+     * derives from natural order are non-null in the model yet legitimately absent from the YAML, so
+     * what a document must carry is its own list rather than a reading of the model's.
+     */
+    MISSING_FIELD("dsl.missing-field", Set.of("field", "path")),
     /** An id / table / step reference with no target in the batch (§1/§4/§8). */
     MISSING_REFERENCE("dsl.missing-reference", Set.of("ref", "path")),
     /** A bare table name colliding across declared sources (§4). */
     AMBIGUOUS_REFERENCE("dsl.ambiguous-reference", Set.of("ref", "path")),
     /** An option / block illegal for the source mode or boundedness (§4/X7/X10). */
     MODE_MISMATCH("dsl.mode-mismatch", Set.of("field", "mode", "path")),
+    /**
+     * A source a pipeline reads that declares no {@code mode} (X18). Its own code rather than
+     * {@link #MISSING_FIELD} because the requirement is not a property of the source: the same
+     * document is correct until something reads it, so {@code pipeline} names what made it required.
+     */
+    MODE_REQUIRED_FOR_READ("dsl.mode-required-for-read", Set.of("source", "pipeline", "path")),
     /** An enum or format constraint violation (§2/§8). */
     ILLEGAL_VALUE("dsl.illegal-value", Set.of("value", "expected", "path")),
     /** A CEL expression field that fails to compile or type-check (§12); {@code detail} carries

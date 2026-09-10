@@ -29,6 +29,8 @@ import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayout;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -56,13 +58,14 @@ class ArtifactMutationServiceTest {
     private final InMemoryDesiredStore desired = new InMemoryDesiredStore();
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final InMemoryObservationStore observations = new InMemoryObservationStore();
+    private final InMemoryPipelineLayoutStore layouts = new InMemoryPipelineLayoutStore();
     private final InMemorySrsMetaStore srsMeta = new InMemorySrsMetaStore();
     private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
     private final List<String> reclaimOrder = new ArrayList<>();
     private final RecordingAuditStore auditStore = new RecordingAuditStore();
     private final List<String> followsStopped = new ArrayList<>();
     private final ArtifactMutationService service = new ArtifactMutationService(
-            store, desired, state, observations, srsMeta, derivedSchemas,
+            store, desired, state, observations, layouts, srsMeta, derivedSchemas,
             new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
 
     private static final Clock FIXED_CLOCK =
@@ -163,6 +166,24 @@ class ArtifactMutationServiceTest {
                 ArtifactError.VERSION_CONFLICT,
                 Map.of("id", "orders"));
         assertThat(hash(store.get("orders").orElseThrow())).isEqualTo(before);
+    }
+
+    @Test
+    void aPreconditionHeldFromBeforeTheHashWasReboundIsARefusalRatherThanACrash() {
+        // A client that read an artifact before the upgrade holds the digest of its canonical text. The
+        // stored hash is now taken over the structure, so that value names no version -- and the answer
+        // has to be the ordinary conflict, which tells the client to read again. Anything else (a crash,
+        // or io.document-unreadable) would read as "the store is damaged" over a client that is merely
+        // out of date.
+        SourceResource orders = source("orders");
+        store.save(orders);
+        String heldBeforeTheUpgrade = CanonicalHash.ofText(new CanonicalWriter().write(orders));
+
+        assertArtifactError(
+                () -> service.delete(PRINCIPAL, "orders", heldBeforeTheUpgrade),
+                ArtifactError.VERSION_CONFLICT,
+                Map.of("id", "orders"));
+        assertThat(store.get("orders")).contains(orders);
     }
 
     @Test
@@ -270,6 +291,7 @@ class ArtifactMutationServiceTest {
         state.put("flow", PipelineState.STOPPED);
         desired.put("flow", PipelineState.STOPPED);
         observations.put("flow");
+        layouts.save(new PipelineLayout("flow", Map.of(), new PipelineLayout.Viewport(0, 0, 1)));
         derivedSchemas.put("flow", "widen");
         srsMeta.seed("chain-a", consumer("flow"), consumer("other"));
 
@@ -281,6 +303,7 @@ class ArtifactMutationServiceTest {
         assertThat(desired.pipelineIds()).doesNotContain("flow");
         assertThat(state.read("flow")).isEmpty();
         assertThat(observations.read("flow")).isEmpty();
+        assertThat(layouts.get("flow")).isEmpty();
         // Left behind, this one is worse than residue: the next pipeline applied under the id would be
         // refused at start over a difference against a schema belonging to something that is gone.
         assertThat(derivedSchemas.holdsAnythingFor("flow")).isFalse();
@@ -288,7 +311,23 @@ class ArtifactMutationServiceTest {
         // Shared first: it is the only residue that stalls a different pipeline, so a process that dies
         // mid-reclaim has already contained the damage that was not this pipeline's alone to suffer.
         assertThat(reclaimOrder)
-                .containsExactly("srs", "desired", "state", "observation", "derived-schema");
+                .containsExactly("srs", "desired", "state", "observation", "layout", "derived-schema");
+    }
+
+    @Test
+    void deletingAPipelineReclaimsItsLayoutBeforeTheIdCanBeReused() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        layouts.save(new PipelineLayout("flow", Map.of(
+                "source:orders", new PipelineLayout.NodePosition(40, 80)),
+                new PipelineLayout.Viewport(5, 10, 1.25)));
+
+        service.delete(PRINCIPAL, "flow", hash(flow));
+        store.save(pipeline("flow"));
+
+        assertThat(layouts.get("flow"))
+                .as("a recreated pipeline must not inherit canvas state from the deleted pipeline")
+                .isEmpty();
     }
 
     @Test
@@ -659,7 +698,7 @@ class ArtifactMutationServiceTest {
         return new SourceResource(
                 id, null, "mysql",
                 Map.of("host", "localhost", "port", "3306", "database", "orders", "username", "app"),
-                SourceMode.SNAPSHOT, null, null, null, null);
+                SourceMode.SNAPSHOT, null, null, null);
     }
 
     private static PipelineResource pipeline(String id) {
@@ -671,7 +710,7 @@ class ArtifactMutationServiceTest {
     }
 
     private static TransformResource transform(String id) {
-        return new TransformResource(id, null, new TransformBody.Js("function process(r) { return r; }"), null, null);
+        return new TransformResource(id, null, new TransformBody.Js("function process(r) { return r; }"), null);
     }
 
     private static ViewResource view(String id) {
@@ -683,7 +722,7 @@ class ArtifactMutationServiceTest {
     }
 
     private static String hash(Resource resource) {
-        return CanonicalHash.of(new CanonicalWriter().write(resource));
+        return CanonicalHash.of(resource);
     }
 
     private static void assertArtifactError(
@@ -858,6 +897,27 @@ class ArtifactMutationServiceTest {
             // the reporting is about.
             step("observation", deleteFailure);
             docs.remove(pipelineId);
+        }
+    }
+
+    private final class InMemoryPipelineLayoutStore implements PipelineLayoutStore {
+
+        private final Map<String, PipelineLayout> documents = new LinkedHashMap<>();
+
+        @Override
+        public Optional<PipelineLayout> get(String pipelineId) {
+            return Optional.ofNullable(documents.get(pipelineId));
+        }
+
+        @Override
+        public void save(PipelineLayout layout) {
+            documents.put(layout.pipelineId(), layout);
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            step("layout", null);
+            documents.remove(pipelineId);
         }
     }
 

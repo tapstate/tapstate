@@ -1,4 +1,3 @@
 rule: duplicate-id
-adr: "ADR-0016 §2/§5 (F8 inward) + 2026-06-15 decision"
 path: transforms[1].id
 note: "two transforms steps declare id 'norm'; pipeline-internal ids share one namespace and must be unique"

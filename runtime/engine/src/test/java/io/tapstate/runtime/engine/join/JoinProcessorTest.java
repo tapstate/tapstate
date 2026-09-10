@@ -202,7 +202,7 @@ class JoinProcessorTest {
         List<Object> taken = new ArrayList<>();
         outbox.drainQueueAndReset(0, taken, false);
         for (Object item : taken) {
-            Envelope event = (Envelope) item;
+            Envelope event = ((JoinUpdate) item).event();
             collected.add(event.op() == Op.DELETE ? event.before() : event.after());
         }
     }

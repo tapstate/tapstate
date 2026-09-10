@@ -456,7 +456,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             return number.longValue();
         }
         throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                Map.of("id", String.valueOf(document.get("_id"))), null);
+                Map.of("id", String.valueOf(document.get("_id")), "field", field), null);
     }
 
     /** Reconstructs a meta record from its stored document. */
@@ -467,7 +467,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         if (id == null || !(consumersRaw instanceof Document consumersDoc) || !(schemaRaw instanceof List<?> entries)) {
             // A stored meta missing a field this version requires is store corruption, surfaced as a
             // coded io diagnostic rather than a bare cast / unboxing crash while reconstructing.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+            // Three grounds, so the name has to be chosen from all three: reporting the second one's
+            // field while the first fired sends the reader to a field that is intact, and leaves the
+            // one actually missing named nowhere.
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id),
+                            "field", id == null ? "_id"
+                                    : consumersRaw instanceof Document ? "schemaHistory" : "consumerOffsets"), null);
         }
         List<ConsumerOffset> consumers = new ArrayList<>();
         for (Map.Entry<String, Object> entry : consumersDoc.entrySet()) {
@@ -496,7 +502,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             // the sink created the entry (a sinkAckedSrcpos-only $set) before the reader published any
             // per-table cursor, mirroring how an absent sinkAckedSrcpos reads back as null. It reads as an
             // empty cursor rather than as corruption.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId), null);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", pipelineId, "field", "perTable"), null);
         }
         return new ConsumerOffset(
                 pipelineId, perTableSeq, sinkAckedFrom(document), snapshotCompletedFrom(document));
@@ -524,7 +531,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Long ddlSeq = document.getLong("ddlSeq");
         Object schemaRaw = document.get("schema");
         if (version == null || ddlSeq == null || !(schemaRaw instanceof Document schemaDoc)) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", miningChainId), null);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", miningChainId, "field", "schemaHistory"), null);
         }
         return new SchemaVersion(version, new LinkedHashMap<>(schemaDoc), ddlSeq);
     }
@@ -534,7 +542,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         if (value instanceof Document document) {
             return document;
         }
-        throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", miningChainId), null);
+        throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", miningChainId, "field", "schema"), null);
     }
 
     /**

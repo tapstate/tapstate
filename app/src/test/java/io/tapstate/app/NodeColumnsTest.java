@@ -619,7 +619,7 @@ class NodeColumnsTest {
     }
 
     private static PushElement push(PushFormat format) {
-        return new PushElement(null, "orders_src", "topic", format, null);
+        return new PushElement(null, "orders_src", "topic", format);
     }
 
     private static ServeBlock.Inline serve(List<PushElement> push) {

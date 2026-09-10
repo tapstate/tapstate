@@ -237,7 +237,7 @@
           "$ref": "#/$defs/Metadata"
         },
         "source": {
-          "description": "The sources this pipeline reads from; at least one is required. Each is a bare source id, or an object carrying this pipeline's own srs switch for that source.",
+          "description": "Pre-created sources this pipeline reads from. Each is a bare source id or an object carrying this pipeline's own srs switch; blank drafts may omit the list.",
           "oneOf": [
             {
               "$ref": "#/$defs/SourceRef"
@@ -302,11 +302,6 @@
         "format": {
           "description": "Serialization format used to encode each pushed change event.",
           "$ref": "#/$defs/PushFormat"
-        },
-        "options": {
-          "description": "Connector-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -330,14 +325,14 @@
     },
     "QueryElement": {
       "type": "object",
-      "description": "One query exposed by a serve resource, either parallel egress from the view store or an API served on a sink.",
+      "description": "One query exposed by a serve resource. Today only parallel egress from the view store is served.",
       "properties": {
         "type": {
           "description": "The kind of query this element exposes.",
           "$ref": "#/$defs/QueryType"
         },
         "backend": {
-          "description": "The sync id whose sink serves this query as an API; omit for parallel egress from the view store.",
+          "description": "Reserved: the sync id whose sink would serve this query as an API. Nothing reads it yet — it is accepted, stored and written back unchanged, and naming a sync that does not exist is not refused. Omit it for parallel egress from the view store.",
           "type": "string"
         }
       },
@@ -471,7 +466,7 @@
         },
         "from": {
           "description": "The data source this serve block exposes.",
-          "$ref": "#/$defs/FromRef"
+          "$ref": "#/$defs/FromClause"
         },
         "sync": {
           "description": "Tables continuously synchronized to the serving layer.",
@@ -514,7 +509,7 @@
         },
         "from": {
           "description": "The data source this serve block exposes.",
-          "$ref": "#/$defs/FromRef"
+          "$ref": "#/$defs/FromClause"
         }
       },
       "required": [
@@ -709,11 +704,6 @@
             "$ref": "#/$defs/TableRef"
           }
         },
-        "options": {
-          "description": "Connector-specific source options; the read mode and start position live in pipeline settings.",
-          "type": "object",
-          "additionalProperties": true
-        },
         "srs": {
           "description": "Shared Record Store configuration; only valid on cdc sources.",
           "$ref": "#/$defs/Srs"
@@ -797,11 +787,6 @@
           "description": "The upstream steps or sources this transform reads from.",
           "$ref": "#/$defs/FromClause"
         },
-        "options": {
-          "description": "Transform-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
-        },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",
           "type": "object",
@@ -821,7 +806,7 @@
     },
     "Step.Use": {
       "type": "object",
-      "description": "A reference to a named transform definition; only options may override the referenced body.",
+      "description": "A reference to a named transform definition, used as defined.",
       "properties": {
         "id": {
           "description": "Unique step id within the pipeline; defaults to the referenced transform name.",
@@ -834,11 +819,6 @@
         "from": {
           "description": "The upstream steps or sources this transform reads from.",
           "$ref": "#/$defs/FromClause"
-        },
-        "options": {
-          "description": "Transform-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -920,7 +900,7 @@
       "description": "One serve.sync element — a table-model write of pipeline output to an external store.",
       "properties": {
         "id": {
-          "description": "Optional id for this sync element; required only when referenced by a query backend.",
+          "description": "Optional id for this sync element; generated from its position when omitted.",
           "type": "string"
         },
         "source": {
@@ -940,11 +920,6 @@
           "description": "Policy controlling how schema changes are applied to the target store.",
           "$ref": "#/$defs/DdlPolicy",
           "default": "fail"
-        },
-        "options": {
-          "description": "Connector-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -981,11 +956,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "options": {
-          "description": "Connector-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -1163,11 +1133,6 @@
           "description": "Optional labels and free-text description.",
           "$ref": "#/$defs/Metadata"
         },
-        "options": {
-          "description": "Transform-owned extension options.",
-          "type": "object",
-          "additionalProperties": true
-        },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",
           "type": "object",
@@ -1224,7 +1189,8 @@
       },
       "required": [
         "id",
-        "from"
+        "from",
+        "primary_key"
       ],
       "additionalProperties": false
     },
@@ -1292,7 +1258,8 @@
       "required": [
         "version",
         "kind",
-        "id"
+        "id",
+        "primary_key"
       ],
       "additionalProperties": false
     },

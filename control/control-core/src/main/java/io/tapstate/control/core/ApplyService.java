@@ -1,12 +1,14 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.catalog.TapstateCatalog;
-import io.tapstate.core.common.TapstateType;
-import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.CapabilityRules;
+import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.DiscoveredTable;
 import io.tapstate.core.dsl.RowExpressionTypeRules;
+import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.dsl.WriteKeyRules;
 import io.tapstate.core.model.PipelineResource;
@@ -16,27 +18,34 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
 
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
  * The resource-type-agnostic apply pipeline. {@link #plan} is the front half — validate -> canonical
- * -> hash: it parses each draft (structural + expression checks), validates the whole batch as one
+ * -> hash: it parses each draft (structural + expression checks), validates the submitted batch as one
  * closure (duplicate ids, reference closure, mode rules, and the connector capability matrix against
  * the catalog), judges the batch's row expressions against the columns of the tables its sources were
  * discovered to hold, then emits each resource's canonical form and content hash. It writes nothing. It reads the
  * schema store — an observation of what discovery found, never the config truth layer, which apply is
- * the one writer of — and reads the artifact store for a draft that carries a precondition, to
- * judge that precondition against the stored version, and for a pipeline, to read back the srs
+ * the one writer of. Typed online writes additionally read the artifact truth layer so validation can
+ * include only the relevant dependency/referrer closure; offline {@link #plan} keeps the historical
+ * contract that the submitted batch itself is the closure. A draft carrying a precondition also reads
+ * its stored version to report a stale edit before the atomic write check; a pipeline reads back the srs
  * switches it has already recorded so that an unedited file re-applies as a no-op.
  * {@link #apply} runs a plan and then upserts each artifact into the store by its id, skipping the
  * write when the stored artifact's content hash is unchanged (a no-op).
@@ -47,14 +56,14 @@ import java.util.function.Supplier;
  *
  * <p>Any validation failure aborts with the first coded {@code dsl.*} diagnostic before any upsert, and a
  * draft whose precondition has gone stale aborts the same way with {@code artifact.version-conflict};
- * nothing is written on either. The refusal is of the whole batch, never of the offending draft alone —
- * a batch is one closure, so letting half of it land would store a state nothing ever validated. The
- * batch is the closure: references resolve within the
- * submitted set. The union with store-resident artifacts is layered in where the store is consulted.
+ * nothing is written on either. The refusal is of the whole submitted batch, never of the offending
+ * draft alone — a batch is one closure, so letting half of it land would store a state nothing ever
+ * validated. For typed online writes, the stored workspace is used only to select the validation
+ * dependency/referrer closure and to guard those exact resources against concurrent drift.
  *
  * <p>The catalog is supplied per plan rather than fixed, so the online path validates against the live
- * catalog view — the bundled snapshot union the connectors registered so far — and a connector
- * registered at runtime is honoured without a restart.
+ * capability view — the bundled snapshot with registered rows overlaid — and a connector registered at
+ * runtime is honoured without a restart.
  *
  * <p>The no-op is keyed by the content hash over the canonical form, so re-applying identical content
  * — even with different raw key order — writes nothing. Apply writes the changed set — the created and
@@ -139,27 +148,67 @@ public final class ApplyService {
                 preconditions.put(parsed.id(), draft.expectedContentHash());
             }
         }
-        Workspace workspace = Workspace.of(resources, catalog.get());
+        return planResources(resources, preconditions, ValidationScope.OFFLINE);
+    }
+
+    /**
+     * Plans one or more already-built resources through the same candidate-workspace validation path
+     * used by parsed drafts. Typed control faces call this entry after their input mapper has built a
+     * resource; they do not serialize it to YAML or recreate validation beside apply.
+     */
+    private ApplyPlan planResources(
+            List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope) {
+        Objects.requireNonNull(submitted, "submitted");
+        Objects.requireNonNull(preconditions, "preconditions");
+        Objects.requireNonNull(validationScope, "validationScope");
+        Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
+        List<Resource> storedResources = store.list();
+        List<Resource> candidate = new ArrayList<>();
+        for (Resource stored : storedResources) {
+            if (!submittedIds.contains(stored.id())) {
+                candidate.add(stored);
+            }
+        }
+        candidate.addAll(submitted);
+        TapstateCatalog liveCatalog = catalog.get();
+        List<Resource> validationResources = validationResources(candidate, submitted, validationScope);
+        Workspace workspace = Workspace.of(validationResources, liveCatalog);
+        if (validationScope == ValidationScope.ONLINE_SOURCE) {
+            for (Resource resource : submitted) {
+                if (resource instanceof SourceResource source) {
+                    CapabilityRules.validateOnline(source, liveCatalog);
+                }
+            }
+        }
         // Read once and handed to both: the gate judges the batch against it, then the advisory pass
         // advises on the same reading rather than paying a second round trip for a possibly different one.
-        Map<String, List<DiscoveredTable>> discovered = discoveredTables(resources);
-        RowExpressionTypeRules.validate(resources, discovered);
-        WriteKeyRules.validate(resources, discovered);
+        Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources);
+        RowExpressionTypeRules.validate(validationResources, discovered);
+        WriteKeyRules.validate(validationResources, discovered);
         List<Resource> validated = List.copyOf(workspace.resources());
+        Map<String, String> workspacePreconditions = new LinkedHashMap<>();
+        for (Resource resource : validated) {
+            if (!submittedIds.contains(resource.id())) {
+                workspacePreconditions.put(resource.id(), storedHash(resource));
+            }
+        }
+        Map<String, Resource> validatedById = new LinkedHashMap<>();
         Map<String, SourceResource> batchSources = new LinkedHashMap<>();
         for (Resource resource : validated) {
+            validatedById.put(resource.id(), resource);
             if (resource instanceof SourceResource source) {
                 batchSources.put(source.id(), source);
             }
         }
         List<PreparedArtifact> prepared = new ArrayList<>();
-        for (Resource resource : validated) {
+        for (Resource submittedResource : submitted) {
+            Resource resource = validatedById.get(submittedResource.id());
             Resource recorded = resource instanceof PipelineResource pipeline
                     ? withOwnSrsSwitches(pipeline, batchSources) : resource;
             String canonicalForm = writer.write(recorded);
-            prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(canonicalForm)));
+            prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(recorded)));
         }
-        return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions);
+        return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
     }
 
     /**
@@ -216,6 +265,107 @@ public final class ApplyService {
                 : pipeline;
     }
 
+    /**
+     * Chooses the resource set that semantic validation and discovered-schema gates inspect.
+     *
+     * <p>Offline apply/validate preserves the original contract: the submitted batch is the closure, so
+     * only submitted resources are validated and unrelated stored artifacts cannot reject or warn on it.
+     * Typed online Source/Pipeline writes additionally select the stored dependency/referrer closure they
+     * actually read for validation. That closure is also the only set guarded against concurrent drift;
+     * the rest of the store is neither revalidated nor used as a global optimistic lock.
+     */
+    private static List<Resource> validationResources(
+            List<Resource> candidate, List<Resource> submitted, ValidationScope scope) {
+        if (scope == ValidationScope.OFFLINE) {
+            return List.copyOf(submitted);
+        }
+        Set<String> submittedSourceIds = new LinkedHashSet<>();
+        Set<String> selectedIds = new LinkedHashSet<>();
+        for (Resource resource : submitted) {
+            selectedIds.add(resource.id());
+            if (resource instanceof SourceResource) {
+                submittedSourceIds.add(resource.id());
+            }
+        }
+
+        ReferenceGraph graph = ReferenceGraph.of(candidate);
+        ArrayDeque<String> pending = new ArrayDeque<>(submittedSourceIds);
+        while (!pending.isEmpty()) {
+            String id = pending.removeFirst();
+            for (ReferenceGraph.Edge referrer : graph.referencedBy(id)) {
+                if (selectedIds.add(referrer.id())) {
+                    pending.addLast(referrer.id());
+                }
+            }
+        }
+
+        pending.addAll(selectedIds);
+        while (!pending.isEmpty()) {
+            String id = pending.removeFirst();
+            for (ReferenceGraph.Edge dependency : graph.references(id)) {
+                if (selectedIds.add(dependency.id())) {
+                    pending.addLast(dependency.id());
+                }
+            }
+        }
+        return candidate.stream().filter(resource -> selectedIds.contains(resource.id())).toList();
+    }
+
+    /** Applies one typed resource only while its id is absent. */
+    public ArtifactWriteResult create(String principal, Resource resource) {
+        return create(principal, resource, ControlOperations.ARTIFACT_APPLY);
+    }
+
+    ArtifactWriteResult create(String principal, Resource resource, Operation operation) {
+        return writeTyped(principal, resource, ArtifactWrite.Intent.CREATE_ONLY, null, operation);
+    }
+
+    /** Applies one typed resource only while its stored canonical hash equals {@code expectedContentHash}. */
+    public ArtifactWriteResult replace(String principal, Resource resource, String expectedContentHash) {
+        Objects.requireNonNull(expectedContentHash, "expectedContentHash");
+        return replace(principal, resource, expectedContentHash, ControlOperations.ARTIFACT_APPLY);
+    }
+
+    ArtifactWriteResult replace(
+            String principal, Resource resource, String expectedContentHash, Operation operation) {
+        Objects.requireNonNull(expectedContentHash, "expectedContentHash");
+        return writeTyped(principal, resource, ArtifactWrite.Intent.REPLACE_ONLY, expectedContentHash, operation);
+    }
+
+    private ArtifactWriteResult writeTyped(
+            String principal,
+            Resource resource,
+            ArtifactWrite.Intent intent,
+            String expectedContentHash,
+            Operation operation) {
+        Objects.requireNonNull(principal, "principal");
+        Objects.requireNonNull(resource, "resource");
+        Objects.requireNonNull(operation, "operation");
+        ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        PreparedArtifact prepared = plan.artifacts().getFirst();
+        if (live != null) {
+            List<Resource> stored = store.list();
+            if (prepared.resource() instanceof SourceResource replacement) {
+                live.refuseBufferingChangeWhileLive(
+                        storedSource(stored, replacement.id()), replacement, stored);
+            }
+            if (prepared.resource() instanceof PipelineResource replacement) {
+                live.refuseBufferingChangeWhileLive(
+                        storedPipeline(stored, replacement.id()), replacement);
+            }
+        }
+        ArtifactWrite write = (switch (intent) {
+            case CREATE_ONLY -> ArtifactWrite.createOnly(prepared.resource());
+            case REPLACE_ONLY -> ArtifactWrite.replaceOnly(prepared.resource(), expectedContentHash);
+            case UPSERT -> throw new IllegalArgumentException("typed writes must be conditional");
+        }).guardedBy(plan.workspacePreconditions());
+        ArtifactBatchWrite outcome = auditGate.dispatchAll(
+                operation,
+                List.of(new AuditContext(principal, prepared.id(), expectedContentHash)),
+                () -> store.writeAll(List.of(write)));
+        return new ArtifactWriteResult(prepared, outcome);
+    }
+
     /** Validates and plans a batch while performing no store or audit write. */
     public ArtifactValidationResult validate(List<ArtifactDraft> drafts) {
         final ApplyPlan planned;
@@ -270,14 +420,8 @@ public final class ApplyService {
                             storedPipeline(stored, replacement.id()), replacement);
                 }
                 toWrite.add(prepared.resource());
-                // The declared version travels with the record, so a version-checked edit is
-                // distinguishable in the audit trail from a blind overwrite of the same id. A draft that
-                // declared none records none, which is what that absence then means.
                 String declared = plan.precondition(prepared.id());
                 audited.add(new AuditContext(principal, prepared.id(), declared));
-                // Only the ids this batch actually overwrites are guarded at the write. An unchanged
-                // artifact is not written, so there is nothing for its declared version to protect —
-                // plan() already compared it, and the comparison is all a caller asked for.
                 if (declared != null) {
                     enforced.put(prepared.id(), declared);
                 }
@@ -312,7 +456,6 @@ public final class ApplyService {
         return result;
     }
 
-    /** The stored Source under {@code id}, or null when this apply is creating it. */
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {
         return stored.stream()
                 .filter(PipelineResource.class::isInstance)
@@ -331,36 +474,11 @@ public final class ApplyService {
                 .orElse(null);
     }
 
-    /**
-     * The tables each source in the batch was discovered to hold, keyed by the source's id — which is
-     * also the connection id its discovery is stored under. A source that has never been discovered is
-     * absent from the result rather than present and empty, so the rules can tell "discovered nothing"
-     * apart from "not discovered".
-     *
-     * <p>Each table keeps its own columns. Pooling a source's tables into one column list would have to
-     * call a column two of them type differently unresolved, and one database naming a column
-     * {@code id} in two unrelated tables, typed differently, is the ordinary shape of a database rather
-     * than a corner of it — pooled, the gate would refuse most expressions on most real databases. The
-     * rules judge an expression against the table it reads, so the tables are handed over apart.
-     *
-     * <p>A model counts only when it was discovered through the connector this source now names. Types
-     * are resolved against the declaring connector's own vocabulary, so a model another connector
-     * produced carries types this source's columns were never described in - reading it would be
-     * judging one source's expression against a different source's answers. Keeping the connection's id
-     * across such a change does not make the old model apply to the new connector, so a mismatch reads
-     * as undiscovered: the author is asked to discover, and discovering is what makes it true.
-     *
-     * <p>What this does not check is whether the model is current. The stored model is what the last
-     * discovery found, and the source it describes can change afterwards without anything here
-     * changing - the connection settings can be edited, or the database itself altered under settings
-     * that never moved. The check is against the last discovery, by design, and only a fresh discovery
-     * makes it fresh.
-     *
-     * <p>A batch carrying no pipeline is answered without reading the store at all. Only a pipeline
-     * holds a row expression, so there would be nothing to judge what was read against - and a batch
-     * of endpoints alone is an ordinary thing to apply, which would otherwise pay a store round trip
-     * per source for an answer nobody consults.
-     */
+    private enum ValidationScope {
+        OFFLINE,
+        ONLINE_SOURCE
+    }
+
     private Map<String, List<DiscoveredTable>> discoveredTables(List<Resource> resources) {
         Map<String, List<DiscoveredTable>> bySource = new LinkedHashMap<>();
         if (resources.stream().noneMatch(PipelineResource.class::isInstance)) {
@@ -379,11 +497,6 @@ public final class ApplyService {
                             for (SourceField field : table.fields()) {
                                 columns.put(field.name(), field.type());
                             }
-                            // The row count travels with the columns, absence and all: a table nobody
-                            // counted has to stay distinguishable from one counted and found empty.
-                            // The declared key travels the same way, and for the same reason a rule
-                            // about writes needs it: whether a write can be matched to an existing
-                            // row is a property of the table, decided where the table is described.
                             tables.add(new DiscoveredTable(
                                     table.name(), columns, table.primaryKey(),
                                     table.approximateRowCount()));
@@ -394,7 +507,6 @@ public final class ApplyService {
         return bySource;
     }
 
-    /** Classifies one prepared artifact without mutating the store. */
     private ArtifactOutcome outcome(PreparedArtifact prepared) {
         Optional<Resource> existing = store.get(prepared.id());
         ArtifactOutcome.Change change = existing.isEmpty()
@@ -405,17 +517,11 @@ public final class ApplyService {
         return new ArtifactOutcome(prepared.id(), prepared.kind(), change, prepared.contentHash());
     }
 
-    /** The content hash of a stored artifact, recomputed over its canonical form for the no-op check. */
+    /** The content hash of a stored artifact, recomputed over its canonical structure. */
     private String storedHash(Resource stored) {
-        return CanonicalHash.of(writer.write(stored));
+        return CanonicalHash.of(stored);
     }
 
-    /**
-     * Refuses a draft whose optional precondition no longer names the stored version. A draft without
-     * one is left alone, which is what keeps a caller that never asked for the check from ever being
-     * refused by it. An id that is not stored at all cannot match any version, and is reported as
-     * absent rather than as a conflict, so an author whose target was deleted is told what happened.
-     */
     private void requireCurrentVersion(ArtifactDraft draft, Resource parsed) {
         String expected = draft.expectedContentHash();
         if (expected == null) {
@@ -433,7 +539,6 @@ public final class ApplyService {
         try {
             return parser.parse(draft.content());
         } catch (DslException e) {
-            // A parse error is located at exactly this draft; attribute it when the origin is known.
             throw draft.source() != null ? e.withSource(draft.source()) : e;
         }
     }

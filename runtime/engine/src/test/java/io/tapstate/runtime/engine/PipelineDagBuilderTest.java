@@ -59,6 +59,43 @@ class PipelineDagBuilderTest {
     }
 
     @Test
+    void one_serve_sink_accepts_multiple_explicit_source_table_references() {
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of(SourceRef.bare("src")),
+                null,
+                null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromClause.list(
+                                FromRef.literal("src.orders"),
+                                FromRef.literal("src.customers")),
+                        List.of(sync("sync_1", "orders_dest")),
+                        null,
+                        null),
+                null, null);
+
+        DagBindings bindings = new DagBindings(
+                srcId -> stubMeta(),
+                step -> (SupplierEx<TransformPort>) () -> ev -> List.of(ev),
+                syncElement -> stubWriter(),
+                ref -> Map.of(
+                        FromRef.literal("src.orders"), List.of("src.orders"),
+                        FromRef.literal("src.customers"), List.of("src.customers"))
+                        .getOrDefault(ref, List.of()),
+                sourceId -> List.of("src.orders", "src.customers"),
+                viewBlock -> stubWriter());
+
+        DAG dag = PipelineDagBuilder.build(pipeline, bindings);
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "src.orders", "src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("src.orders", "serve.sync_1", 0, 0),
+                edge("src.customers", "serve.sync_1", 0, 1));
+    }
+
+    @Test
     void view_without_serve_is_a_source_then_a_materialization_sink() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
@@ -268,11 +305,10 @@ class PipelineDagBuilderTest {
 
     /**
      * The positive control for the case below: with the binding supplied, the join is drawn rather than
-     * refused - one vertex, and one edge per source its plan reads, each arriving on its own ordinal so
-     * the vertex can tell which side a change came from.
+     * refused. Source changes keep their own ordinals, and final projection meets at the output key.
      */
     @Test
-    void join_step_draws_one_vertex_and_one_edge_per_source() {
+    void join_step_routes_final_projection_by_the_fact_key() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
                 List.of(SourceRef.bare("orders_src"), SourceRef.bare("customers_src")),
@@ -287,11 +323,31 @@ class PipelineDagBuilderTest {
                 FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()));
 
         assertThat(vertexNames(dag))
-                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "serve.sync_1");
+                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1");
         assertThat(edges(dag)).contains(
                 edge("orders_src", "j", 0, 0),
                 edge("customers_src", "j", 0, 1),
-                edge("j", "serve.sync_1", 0, 0));
+                edge("j", "j:project", 0, 0),
+                edge("j:project", "serve.sync_1", 0, 0));
+        Edge projection = dag.getInboundEdges("j:project").getFirst();
+        assertThat(projection.isDistributed()).isTrue();
+        assertThat(projection.getPartitioner()).isNotNull();
+        @SuppressWarnings("unchecked")
+        com.hazelcast.jet.core.Partitioner<Object> partitioner =
+                (com.hazelcast.jet.core.Partitioner<Object>) projection.getPartitioner();
+        java.util.concurrent.atomic.AtomicReference<Object> routed = new java.util.concurrent.atomic.AtomicReference<>();
+        partitioner.init(key -> {
+            routed.set(key);
+            return 0;
+        });
+        partitioner.getPartition(new io.tapstate.runtime.engine.join.JoinUpdate(
+                io.tapstate.core.sql.JoinKey.of(List.of(10L)).name(),
+                Envelope.insert(1, "j", Map.of("customer", "new"), null)), 17);
+        assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
+        partitioner.getPartition(new io.tapstate.runtime.engine.join.JoinUpdate(
+                io.tapstate.core.sql.JoinKey.of(List.of(10L)).name(),
+                Envelope.delete(1, "j", Map.of("customer", "old"), null)), 17);
+        assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
     }
 
     /**
@@ -322,7 +378,7 @@ class PipelineDagBuilderTest {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
                 List.of(SourceRef.bare("orders_src")),
-                List.of(Step.use("u", "shared_filter", FromClause.list(FromRef.literal("orders_src")), null)),
+                List.of(Step.use("u", "shared_filter", FromClause.list(FromRef.literal("orders_src")))),
                 null,
                 serve(FromRef.literal("u"), sync("sync_1", "orders_dest")),
                 null, null);
@@ -459,29 +515,29 @@ class PipelineDagBuilderTest {
     }
 
     private static SyncElement sync(String id, String dest) {
-        return new SyncElement(id, dest, null, null, null, null);
+        return new SyncElement(id, dest, null, null, null);
     }
 
     private static Step filter(String id, String expr, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null);
     }
 
     private static Step map(String id, FromRef... from) {
         TransformBody body = new TransformBody.MapProjection(Map.of("out", FieldRule.rename("in")));
-        return Step.inline(id, FromClause.list(from), body, null, null);
+        return Step.inline(id, FromClause.list(from), body, null);
     }
 
     private static Step js(String id, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Js("emit(row)"), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Js("emit(row)"), null);
     }
 
     private static Step union(String id, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Union(), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Union(), null);
     }
 
     private static Step joinStep(String id, FromRef from) {
         TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN, "SELECT 1");
-        return Step.inline(id, FromClause.aliases(Map.of("root", from)), body, null, null);
+        return Step.inline(id, FromClause.aliases(Map.of("root", from)), body, null);
     }
 
     /** A join step reading two sources, under the alias names the plan below calls them by. */
@@ -489,7 +545,7 @@ class PipelineDagBuilderTest {
         TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN,
                 "SELECT o.id FROM orders o JOIN customers c ON o.cust_id = c.id");
         return Step.inline(id, FromClause.aliases(new java.util.LinkedHashMap<>(
-                Map.of("o", fact, "c", dimension))), body, null, null);
+                Map.of("o", fact, "c", dimension))), body, null);
     }
 
     /**

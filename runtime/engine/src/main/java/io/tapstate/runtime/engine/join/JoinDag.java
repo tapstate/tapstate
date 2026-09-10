@@ -25,14 +25,15 @@ import java.util.function.Function;
 import java.util.function.ToIntFunction;
 
 /**
- * Draws the vertex and edges one join node compiles to: one vertex, one inbound edge per source the
- * plan reads, and an ordinal per source so the vertex can tell which side a change arrived on.
+ * Draws the state-update and final-projection vertices for one join node. Source edges have distinct
+ * ordinals so the state-update vertex can tell which side a change arrived on.
  *
  * <p><b>Every edge is partitioned and distributed, each by the key of the state it is about to
  * change.</b> Fact rows are routed by the fact row's own key, so the mirror entry for one fact row is
  * only ever written from one place and its changes stay in order; dimension rows are routed by the key
- * they are matched on, for the same reason. Nothing has to be co-located with what it <em>reads</em> -
- * the distributed maps answer a key from wherever it is - so the routing carries no other duty.
+ * they are matched on, for the same reason. Final projection is routed by the fact key: changes from
+ * different source partitions must be refreshed and published by one ordered processor per output
+ * row, or a delayed old image can overwrite a newer match at the sink.
  *
  * <p>A row that is being removed carries its values in its earlier image rather than its later one, so
  * the key is read from whichever image the change has. Reading only the later one would route every
@@ -67,7 +68,7 @@ public final class JoinDag {
         }
 
         Vertex vertex = dag.newVertex(nodeId, ProcessorMetaSupplier.of(new JoinVertexSupplier(
-                plan, pipelineId, nodeId, factKeyColumns, Map.copyOf(sourceByOrdinal), stores)));
+                plan, pipelineId, nodeId, factKeyColumns, Map.copyOf(sourceByOrdinal), stores, false)));
         sourceByOrdinal.forEach((edge, source) -> {
             List<Vertex> producers = sourceUpstream.apply(source);
             if (producers == null || producers.isEmpty()) {
@@ -78,7 +79,11 @@ public final class JoinDag {
             dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(vertex, edge)
                     .partitioned(keyOf(keyColumns.get(source))).distributed());
         });
-        return vertex;
+        Vertex projection = dag.newVertex(nodeId + ":project", ProcessorMetaSupplier.of(new JoinVertexSupplier(
+                plan, pipelineId, nodeId, factKeyColumns, Map.of(), stores, true)));
+        dag.edge(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection)
+                .partitioned(item -> ((JoinUpdate) item).factKey()).distributed());
+        return projection;
     }
 
     /**
@@ -167,23 +172,28 @@ public final class JoinDag {
         private final List<String> factKeyColumns;
         private final Map<Integer, String> sourceByOrdinal;
         private final JoinStoresBinding binding;
+        private final boolean projection;
         private transient JoinStores stores;
         private transient JoinGauge gauge;
 
         private JoinVertexSupplier(JoinPlan plan, String pipelineId, String stepId,
                 List<String> factKeyColumns, Map<Integer, String> sourceByOrdinal,
-                JoinStoresBinding binding) {
+                JoinStoresBinding binding, boolean projection) {
             this.plan = plan;
             this.pipelineId = pipelineId;
             this.stepId = stepId;
             this.factKeyColumns = factKeyColumns;
             this.sourceByOrdinal = sourceByOrdinal;
             this.binding = binding;
+            this.projection = projection;
         }
 
         @Override
         public void init(Context context) {
             stores = binding.bind(context.hazelcastInstance(), pipelineId, stepId);
+            if (projection) {
+                return;
+            }
             // Metered from here and nowhere else: this is the one place a job is what the state is
             // being bound for, and a reading can only be left from a thread running its processors.
             JoinStateStats stats = JoinStateStats.of(context.hazelcastInstance());
@@ -235,8 +245,10 @@ public final class JoinDag {
         public Collection<? extends Processor> get(int count) {
             List<Processor> processors = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
-                processors.add(new JoinProcessor(new JoinDriver(plan, factKeyColumns, stepId, stores,
-                        JoinDriver.DEFAULT_KEYS_PER_READ, gauge), sourceByOrdinal));
+                processors.add(projection
+                        ? new JoinProjectionProcessor(new JoinProjection(plan, factKeyColumns, stepId, stores))
+                        : new JoinProcessor(new JoinDriver(plan, factKeyColumns, stepId, stores,
+                                JoinDriver.DEFAULT_KEYS_PER_READ, gauge), sourceByOrdinal));
             }
             return processors;
         }

@@ -24,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * NOT validate DSL semantics (that is the validate engine built in B3 against this corpus).
  *
  * Contract (documented in corpus/README.md):
- * - valid/ holds one workspace directory per ADR-0016 §14 scenario (s01..s11),
+ * - valid/ holds one workspace directory per §14 scenario (s01..s11),
  *   reference-closed within the directory, no expectation sidecars.
  * - invalid/ holds minimal self-contained batches, each with exactly one expected.yml
  *   declaring the violated rule from a fixed vocabulary.
@@ -36,7 +36,7 @@ class CorpusSmokeTest {
     private static final Path VALID = CORPUS.resolve("valid");
     private static final Path INVALID = CORPUS.resolve("invalid");
 
-    /** One directory prefix per ADR-0016 §14 scenario (14.1 -> s01 ... 14.11 -> s11). */
+    /** One directory prefix per §14 scenario (14.1 -> s01 ... 14.11 -> s11). */
     private static final List<String> SCENARIO_PREFIXES = List.of(
             "s01-", "s02-", "s03-", "s04-", "s05-", "s06-",
             "s07-", "s08-", "s09-", "s10-", "s11-");
@@ -45,9 +45,11 @@ class CorpusSmokeTest {
     private static final Set<String> RULES = Set.of(
             "unknown-field",        // §11.5 strict rejection of fields outside the schema
             "forbidden-field",      // field known to the schema but banned in this position (X18/X19)
+            "missing-field",        // required field the parser cannot supply, left out of the document
             "missing-reference",    // batch-closure reference to a nonexistent id / table / step
             "ambiguous-reference",  // bare table name colliding across sources, no id prefix (§4)
             "mode-mismatch",        // option / block illegal for the source mode or boundedness (§4/X7/X10)
+            "mode-required-for-read", // a source a pipeline reads declares no mode (X18)
             "illegal-value",        // enum / format constraint violation (§2 id charset, §8 enums)
             "illegal-expression",   // CEL expression field fails to compile or type-check (§12)
             "composition",          // structural rule on resource composition (X17 minimal pipeline)
@@ -70,7 +72,7 @@ class CorpusSmokeTest {
     }
 
     @Test
-    @DisplayName("valid/ covers every ADR-0016 §14 scenario with a non-empty workspace directory")
+    @DisplayName("valid/ covers every §14 scenario with a non-empty workspace directory")
     void validCoversAllScenarios() throws IOException {
         assertThat(VALID).isDirectory();
         List<Path> dirs = subDirectories(VALID);

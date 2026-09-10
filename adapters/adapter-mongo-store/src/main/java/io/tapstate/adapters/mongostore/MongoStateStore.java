@@ -129,7 +129,9 @@ public final class MongoStateStore implements StateStore {
         if (stateJson == null || epoch == null || touchMillis == null) {
             // A stored checkpoint missing a field this version requires is store corruption, surfaced
             // as a coded io diagnostic rather than a bare unboxing crash while reconstructing.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id),
+                            "field", stateJson == null ? "stateJson" : epoch == null ? "epoch" : "touchMillis"), null);
         }
         return new CheckpointDoc(id, stateJson, epoch, Instant.ofEpochMilli(touchMillis));
     }

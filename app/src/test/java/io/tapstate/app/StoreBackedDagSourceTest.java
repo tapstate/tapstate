@@ -37,6 +37,7 @@ import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -126,7 +127,7 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("shop_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")),
-                null, null, null));
+                null, null));
         store.artifacts().save(cdcSource("events_src", "events"));
         store.artifacts().save(connectionSupplier("dest"));
         store.artifacts().save(new PipelineResource(
@@ -136,7 +137,7 @@ class StoreBackedDagSourceTest {
                                 FromRef.literal("shop_src.orders"),
                                 FromRef.literal("shop_src.customers"),
                                 FromRef.literal("events_src.events")),
-                        new TransformBody.Union(), null, null)),
+                        new TransformBody.Union(), null)),
                 null,
                 serve(FromRef.literal("all"), sync("sync_1", "dest")),
                 null, null));
@@ -185,7 +186,7 @@ class StoreBackedDagSourceTest {
                 "p", null,
                 List.of(SourceRef.spec("orders_src", true)),
                 List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
-                                new TransformBody.MapProjection(dropRegion), null, null),
+                                new TransformBody.MapProjection(dropRegion), null),
                         filter("keep_even", "row.id % 2 == 0", FromRef.literal("trimmed"))),
                 null,
                 serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
@@ -318,9 +319,9 @@ class StoreBackedDagSourceTest {
                 "p", null,
                 List.of(SourceRef.spec("orders_src", true)),
                 List.of(Step.inline("scripted", FromClause.list(FromRef.literal("orders_src")),
-                                new TransformBody.Js("emit(record)"), null, null),
+                                new TransformBody.Js("emit(record)"), null),
                         Step.inline("trimmed", FromClause.list(FromRef.literal("scripted")),
-                                new TransformBody.MapProjection(dropRegion), null, null)),
+                                new TransformBody.MapProjection(dropRegion), null)),
                 null,
                 serve(FromRef.literal("trimmed"), sync("sync_1", "orders_dest")),
                 null, null));
@@ -366,7 +367,7 @@ class StoreBackedDagSourceTest {
                 "p", null,
                 List.of(SourceRef.spec("orders_src", true)),
                 List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
-                        new TransformBody.MapProjection(dropRegion), null, null)),
+                        new TransformBody.MapProjection(dropRegion), null)),
                 new ViewBlock.Inline("order_state", FromRef.literal("trimmed"), "id", null, null),
                 null, null, null));
         store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
@@ -537,7 +538,7 @@ class StoreBackedDagSourceTest {
     void expands_a_multi_table_source_into_one_source_vertex_per_table() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
                 "multi", null, List.of(SourceRef.spec("multi_src", true)), null, null,
@@ -554,10 +555,36 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void keeps_an_explicit_multi_table_serve_subset_on_one_sink_path() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "multi_subset", null, List.of(SourceRef.bare("multi_src")), null, null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromClause.list(
+                                FromRef.literal("multi_src.orders"),
+                                FromRef.literal("multi_src.customers")),
+                        List.of(sync("sync_1", "orders_dest")), null, null),
+                null, null));
+        discovered(store, "multi_src", "orders", "customers");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("multi_subset");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "multi_src.orders", "multi_src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("multi_src.orders", "serve.sync_1"),
+                "multi_src.customers->serve.sync_1#0,1");
+    }
+
+    @Test
     void omitted_tables_expand_to_the_latest_discovered_source_schema() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("all_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null, null));
+                SourceMode.CDC, null, null, null));
         store.schemas.save(new DiscoveredSourceModel("all_src", "mysql", 1L, new SourceModel(List.of(
                 new SourceTable("orders", List.of(), List.of(), List.of()),
                 new SourceTable("customers", List.of(), List.of(), List.of())))));
@@ -579,8 +606,7 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("players_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC,
-                List.of(TableRef.literal("Player"), TableRef.literal("PlayerCard"), TableRef.literal("Orders")),
-                null, null, null));
+                List.of(TableRef.literal("Player"), TableRef.literal("PlayerCard"), TableRef.literal("Orders")), null, null));
         store.artifacts().save(connectionSupplier("players_dest"));
         store.artifacts().save(new PipelineResource(
                 "players", null, List.of(SourceRef.spec("players_src", true)), null, null,
@@ -663,11 +689,11 @@ class StoreBackedDagSourceTest {
 
     private static SourceResource cdcSource(String id, String table) {
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static SourceResource connectionSupplier(String id) {
-        return new SourceResource(id, null, "mysql", Map.of("host", "d"), null, null, null, null, null);
+        return new SourceResource(id, null, "mysql", Map.of("host", "d"), null, null, null, null);
     }
 
     private static ServeBlock serve(FromRef from, SyncElement... sync) {
@@ -675,11 +701,11 @@ class StoreBackedDagSourceTest {
     }
 
     private static SyncElement sync(String id, String source) {
-        return new SyncElement(id, source, null, null, null, null);
+        return new SyncElement(id, source, null, null, null);
     }
 
     private static Step filter(String id, String expr, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null);
     }
 
     /** Persists the source model a production sync start requires before constructing its DAG. */
@@ -792,6 +818,11 @@ class StoreBackedDagSourceTest {
 
         @Override
         public ObservationStore observations() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public PipelineLayoutStore layouts() {
             throw new UnsupportedOperationException();
         }
 

@@ -481,7 +481,7 @@ final class StoreBackedDagSource implements DagSource {
      * from a table whose rows still carry them.
      */
     private Map<String, TargetTable> publishedTargets(
-            String pipelineId, PipelineResource pipeline, FromRef from, Set<String> streams,
+            String pipelineId, PipelineResource pipeline, FromClause from, Set<String> streams,
             Map<String, TargetTable> bySourceTable, Map<String, SourceVertex> sourceVertices,
             Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
             Set<String> stepIds) {
@@ -491,8 +491,16 @@ final class StoreBackedDagSource implements DagSource {
             if (base == null) {
                 continue;
             }
-            NodeColumns produced = streamColumnsAt(pipelineId, pipeline, from, stream, sourceVertices,
-                    sourceKeyByTable, sourceKeysById, stepIds, new HashSet<>());
+            Map<String, NodeColumns> inputs = new LinkedHashMap<>();
+            for (FromRef ref : refsOf(from)) {
+                NodeColumns columns = streamColumnsAt(pipelineId, pipeline, ref, stream, sourceVertices,
+                        sourceKeyByTable, sourceKeysById, stepIds, new HashSet<>());
+                if (columns != null) {
+                    inputs.put(Integer.toString(inputs.size()), columns);
+                }
+            }
+            NodeColumns produced = inputs.size() == 1 ? inputs.values().iterator().next()
+                    : NodeColumns.of(new TransformBody.Union(), inputs, null);
             if (produced != null && produced.known()) {
                 published.put(stream, publishedAs(base, produced));
             }
@@ -1165,14 +1173,16 @@ final class StoreBackedDagSource implements DagSource {
     /** The source artifacts whose rows can reach one terminal reference. */
     private static Set<String> sourceIdsReaching(
             PipelineResource pipeline,
-            FromRef from,
+            FromClause from,
             Map<String, String> sourceKeyByTable,
             Map<String, List<String>> sourceKeysById,
             Map<String, SourceVertex> sourceVertices,
             Set<String> stepIds) {
         Set<String> sourceIds = new LinkedHashSet<>();
-        collectSourceIds(pipeline, from, sourceKeyByTable, sourceKeysById, sourceVertices,
-                stepIds, sourceIds, new HashSet<>());
+        for (FromRef ref : refsOf(from)) {
+            collectSourceIds(pipeline, ref, sourceKeyByTable, sourceKeysById, sourceVertices,
+                    stepIds, sourceIds, new HashSet<>());
+        }
         return sourceIds;
     }
 
@@ -1210,6 +1220,22 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /** The stream ids a terminal sink can receive: source tables, or a nest step's assembled stream id. */
+    private static Set<String> streamsReaching(
+            PipelineResource pipeline,
+            FromClause from,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> sourceVertices,
+            Set<String> stepIds) {
+        Set<String> streams = new LinkedHashSet<>();
+        for (FromRef ref : refsOf(from)) {
+            collectStreams(pipeline, ref, sourceKeyByTable, sourceKeysById, sourceVertices,
+                    stepIds, streams, new HashSet<>());
+        }
+        return streams;
+    }
+
+    /** The view form remains a single reference; keep its terminal walk scalar. */
     private static Set<String> streamsReaching(
             PipelineResource pipeline,
             FromRef from,

@@ -11,6 +11,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -62,6 +63,11 @@ final class InMemoryStorePort implements StorePort {
     @Override
     public ObservationStore observations() {
         return observations;
+    }
+
+    @Override
+    public PipelineLayoutStore layouts() {
+        throw new UnsupportedOperationException("pipeline layouts are not exercised by this assembly test");
     }
 
     @Override

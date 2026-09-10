@@ -3,7 +3,7 @@ package io.tapstate.core.model;
 import java.util.Objects;
 
 /**
- * The {@code view:} block of a pipeline (ADR-0016 §7): an inline private MDM sink or a
+ * The {@code view:} block of a pipeline (§7): an inline private MDM sink or a
  * {@code use:} reference to a {@code kind: view} definition body. Post-normalization an
  * inline view always carries an id (auto-generated {@code view} when omitted,
  * canonical-form.md §5); a use-reference's id defaults to its target.
@@ -17,7 +17,8 @@ public sealed interface ViewBlock {
                   String id,
                   @Doc(value = "The upstream source this view consumes records from.", required = true)
                   FromRef from,
-                  @Doc("Field or fields that uniquely identify a record in this view.")
+                  @Doc(value = "Field or fields that uniquely identify a record in this view.",
+                       required = true)
                   String primaryKey,
                   @Doc("Storage backend used to persist this view.")
                   Storage storage,

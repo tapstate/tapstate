@@ -138,7 +138,7 @@ class TargetModelResolverTest {
     private static SourceResource multiTableSource(String id, String... tables) {
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
                 java.util.Arrays.stream(tables).map(t -> (TableRef) TableRef.literal(t)).toList(),
-                null, null, null);
+                null, null);
     }
 
     private static SourceTable oneColumnTable(String name) {
@@ -147,7 +147,7 @@ class TargetModelResolverTest {
 
     private static SourceResource cdcSource(String id, String table) {
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static PipelineResource pipeline(String id, String sourceId) {

@@ -146,6 +146,26 @@ class MongoSrsMetaStoreTest {
     }
 
     @Test
+    void toMetaNamesWhicheverOfTheThreeStructuralFieldsIsActuallyAtFault() {
+        // one guard, three grounds. Naming the field of a ground that did not fire points the operator
+        // at a field that is intact, and leaves the one actually missing named nowhere at all.
+        Document noId = new Document("consumerOffsets", new Document()).append("schemaHistory", List.of());
+        Document noConsumers = new Document("_id", "chain").append("schemaHistory", List.of());
+        Document noSchema = new Document("_id", "chain").append("consumerOffsets", new Document());
+
+        assertThat(faultField(noId)).isEqualTo("_id");
+        assertThat(faultField(noConsumers)).isEqualTo("consumerOffsets");
+        assertThat(faultField(noSchema)).isEqualTo("schemaHistory");
+    }
+
+    /** The field a refused read blames, for a document that cannot be reconstructed. */
+    private static String faultField(Document document) {
+        Throwable thrown = catchThrowable(() -> MongoSrsMetaStore.toMeta(document));
+        assertThat(thrown).isInstanceOf(TapstateException.class);
+        return String.valueOf(((TapstateException) thrown).args().get("field"));
+    }
+
+    @Test
     void createDuplicateKeyIsAnOrderingErrorAndOtherWriteFailuresAreCodedIo() {
         // a duplicate _id (re-seed) is a caller ordering error, surfaced bare; any other driver write
         // failure during the seed is a coded io diagnostic. Witnessed deterministically, without a

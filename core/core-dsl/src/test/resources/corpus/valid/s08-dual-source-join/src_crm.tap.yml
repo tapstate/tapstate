@@ -1,4 +1,4 @@
-# ADR-0016 §14.8 — cross-database dual-source join -> report store (multi-source pipeline).
+# §14.8 — cross-database dual-source join -> report store (multi-source pipeline).
 version: tapstate/v1
 kind: source
 id: src_crm

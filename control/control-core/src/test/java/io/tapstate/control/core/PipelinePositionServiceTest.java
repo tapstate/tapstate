@@ -325,7 +325,7 @@ class PipelinePositionServiceTest {
     }
 
     private static SourceResource source(String id) {
-        return new SourceResource(id, null, "mysql", Map.of(), null, null, null,
+        return new SourceResource(id, null, "mysql", Map.of(), null, null,
                 new Srs(null, null, null, null, true), null);
     }
 

@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * {@code kind: view} — reusable MDM sink definition body (ADR-0016 §7, X19): pure
+ * {@code kind: view} — reusable MDM sink definition body (§7, X19): pure
  * declaration of where/how to materialize; no {@code from:} (wiring belongs to the pipeline).
  */
 @Doc("A reusable view: declares where and how to materialize data, without any inbound wiring.")
@@ -15,7 +15,7 @@ public record ViewResource(
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,
-        @Doc("Name of the column used as the view's primary key.")
+        @Doc(value = "Name of the column used as the view's primary key.", required = true)
         String primaryKey,
         @Doc("Where and how the view's data is materialized.")
         Storage storage,

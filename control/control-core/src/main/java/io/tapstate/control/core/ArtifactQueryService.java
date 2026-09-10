@@ -54,6 +54,17 @@ public final class ArtifactQueryService {
         return store.listStored().stream().map(this::view).toList();
     }
 
+    /** Returns one typed stored resource and its canonical hash without parsing canonical text. */
+    public Optional<StoredResource> getResource(String id) {
+        Objects.requireNonNull(id, "id");
+        return store.get(id).map(this::typedView);
+    }
+
+    /** Lists typed stored resources and their canonical hashes without exposing canonical text. */
+    public List<StoredResource> listResources() {
+        return store.list().stream().map(this::typedView).toList();
+    }
+
     /**
      * Lists stored artifacts of the given {@code kind} as their canonical form; a null or blank kind is
      * "no filter" and returns every artifact, the same as {@link #list()}. Read-by-kind lives here in
@@ -63,22 +74,23 @@ public final class ArtifactQueryService {
         if (kind == null || kind.isBlank()) {
             return list();
         }
-        return store.listStored().stream()
-                .filter(r -> r.kind().equals(kind))
-                .map(this::view)
-                .toList();
+        return store.listStored(kind).stream().map(this::view).toList();
     }
 
     private StoredArtifact view(Resource resource) {
-        // The hash is taken over the very bytes this view returns, not over the resource or its id, so a
-        // caller can hand it straight back as a precondition without re-deriving anything.
-        String canonicalForm = writer.write(resource);
+        // The hash comes back beside the canonical form rather than being derivable from it: it is taken
+        // over the resource's structure, so a caller holding only these bytes cannot recompute it and
+        // must hand this field straight back as a precondition.
         return new StoredArtifact(
-                resource.id(), resource.kind(), canonicalForm, CanonicalHash.of(canonicalForm));
+                resource.id(), resource.kind(), writer.write(resource), CanonicalHash.of(resource));
     }
 
     private ArtifactListEntry view(StoredArtifactRecord row) {
         return new ArtifactListEntry(
                 row.id(), row.kind(), row.canonicalForm(), row.contentHash(), row.readable());
+    }
+
+    private StoredResource typedView(Resource resource) {
+        return new StoredResource(resource, CanonicalHash.of(resource));
     }
 }

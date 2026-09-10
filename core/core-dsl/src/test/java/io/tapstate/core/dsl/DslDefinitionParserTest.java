@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * B3-4: parse the three reusable definition kinds — {@code kind: transform / view / serve}
- * (ADR-0016 §5/§7/§8, X19). A definition body is pure logic; {@code from:} is forbidden
+ * (§5/§7/§8, X19). A definition body is pure logic; {@code from:} is forbidden
  * (wiring belongs to the referencing pipeline step). The bodies reuse the same payload
  * grammar as inline pipeline blocks, so the assertions here mirror the inline ones minus the
  * {@code from:} wiring. Canonical key order for definitions is canonical-form.md §3 (rows
@@ -131,16 +131,14 @@ class DslDefinitionParserTest {
                   description: drop deleted rows
                 type: filter
                 expr: "op != 'd'"
-                options: { window: 5m }
                 """;
 
         TransformResource t = (TransformResource) parser.parse(yaml);
 
         assertThat(t.metadata().description()).isEqualTo("drop deleted rows");
         assertThat(t.metadata().labels()).containsEntry("team", "data").containsEntry("tier", "gold");
-        assertThat(t.options()).containsEntry("window", "5m");
         assertThat(((TransformBody.Filter) t.body()).expr()).isEqualTo("op != 'd'");
-        // metadata + options survive the canonical round-trip (fixed point)
+        // metadata survives the canonical round-trip (fixed point)
         assertThat(writer.write(parser.parse(writer.write(t)))).isEqualTo(writer.write(t));
     }
 
