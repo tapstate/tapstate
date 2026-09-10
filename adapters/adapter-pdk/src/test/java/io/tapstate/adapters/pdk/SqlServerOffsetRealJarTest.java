@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.jar.JarFile;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Exercises the real connector's bean and frozen PDK JSON provider without opening a database. */
@@ -54,6 +55,10 @@ class SqlServerOffsetRealJarTest {
                 assertThat((byte[]) type.getMethod("getDdlOffset").invoke(restored))
                         .containsExactly((byte) 0, (byte) 1, (byte) 254, (byte) 255);
                 assertThat(parser.toJson(original)).isEqualTo(before);
+                Object empty = parser.fromJson("{}", type);
+                assertThatThrownBy(() -> SqlServerOffset.forStorage("sqlserver", empty, () -> parser))
+                        .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                        .hasMessageContaining("SQL Server CDC has not published an initial LSN");
                 return null;
             });
             assertThat(Thread.currentThread().getContextClassLoader()).isSameAs(caller);

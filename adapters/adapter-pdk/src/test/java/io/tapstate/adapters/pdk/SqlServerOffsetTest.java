@@ -28,6 +28,7 @@ class SqlServerOffsetTest {
     private static final JsonParser PARSER = (JsonParser) Proxy.newProxyInstance(
             JsonParser.class.getClassLoader(), new Class<?>[]{JsonParser.class}, (proxy, method, args) -> {
                 if (method.getName().equals("toJson")) return JSON.writeValueAsString(args[0]);
+                if (method.getName().equals("fromJson")) return JSON.readValue((String) args[0], Map.class);
                 throw new UnsupportedOperationException(method.getName());
             });
     private static ConnectorClassLoader loader;
@@ -66,6 +67,19 @@ class SqlServerOffsetTest {
                 .containsExactly((byte) 0, (byte) 1, (byte) 254, (byte) 255);
         assertThat(JSON.readTree(JSON.writeValueAsString(original))).isEqualTo(JSON.readTree(POSITION));
         assertThat(token).isEqualTo(ConnectorOffsetCodec.toToken("sqlserver", JSON.writeValueAsString(original)));
+    }
+
+    @Test
+    void aNativeOffsetWithoutAnInitialLsnCannotBeStored() throws Exception {
+        for (String empty : new String[]{null, "", " "}) {
+            Object original = type.getConstructor().newInstance();
+            type.getField("currentStartLSN").set(original, empty);
+            assertThatThrownBy(() -> SqlServerOffset.forStorage("sqlserver", original, () -> PARSER))
+                    .isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("SQL Server CDC has not published an initial LSN")
+                    .extracting(error -> ((TapstateException) error).code())
+                    .isEqualTo(ConnectorError.POSITION_UNRENDERABLE);
+        }
     }
 
     @Test

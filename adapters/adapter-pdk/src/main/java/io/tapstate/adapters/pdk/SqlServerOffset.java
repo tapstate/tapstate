@@ -21,9 +21,17 @@ final class SqlServerOffset {
             return offset;
         }
         try {
-            String nativeOffset = parser.get().toJson(offset);
+            JsonParser json = parser.get();
+            String nativeOffset = json.toJson(offset);
             if (nativeOffset == null || nativeOffset.isBlank()) {
                 throw new IllegalArgumentException("the SQL Server JSON offset is empty");
+            }
+            Map<?, ?> coordinates = json.fromJson(nativeOffset, Map.class);
+            if (coordinates == null || !(coordinates.get("currentStartLSN") instanceof String lsn)
+                    || lsn.isBlank()) {
+                throw new IllegalArgumentException("SQL Server CDC has not published an initial LSN; "
+                        + "verify that SQL Server Agent and the database CDC capture job are running, "
+                        + "then retry after CDC has captured a transaction");
             }
             return nativeOffset;
         } catch (RuntimeException failure) {
