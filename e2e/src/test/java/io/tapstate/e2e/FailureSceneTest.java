@@ -92,6 +92,29 @@ class FailureSceneTest {
                 .contains("order_pipeline");
     }
 
+    @Test
+    void aStatusAssertionDuringDiagnosisDoesNotReplaceTheOriginalApplyFailure(@TempDir Path dir) {
+        Path file = dir.resolve("scene.txt");
+        AssertionError original = new AssertionError("source apply failed");
+        SceneBinding binding = new SceneBinding() {
+            @Override
+            public Optional<PipelineState> state(String pipelineId) {
+                throw new AssertionError("expected HTTP 200, got 404: unknown pipeline");
+            }
+        };
+
+        Throwable escaped = org.assertj.core.api.Assertions.catchThrowable(() -> {
+            try {
+                throw original;
+            } catch (AssertionError failed) {
+                FailureScene.write(file, envelope(), binding, "order_pipeline");
+                throw failed;
+            }
+        });
+
+        assertThat(escaped).isSameAs(original);
+    }
+
     private static Envelope envelope() {
         return EnvelopeParser.parse("""
                 name: scene
