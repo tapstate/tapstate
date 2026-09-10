@@ -1,4 +1,4 @@
-package io.tapstate.adapters.mongostore.migration.schema;
+package io.tapstate.adapters.mongostore.schemamigration;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;

@@ -6,7 +6,7 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.SystemCollections;
-import io.tapstate.adapters.mongostore.migration.schema.LegacySchemaDocuments;
+import io.tapstate.adapters.mongostore.schemamigration.LegacySchemaDocuments;
 import org.bson.Document;
 
 import java.util.List;
