@@ -15,6 +15,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -101,7 +102,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
 
     /**
      * What a transform step produces, given what reaches it and, where it has one, what it compiled to.
-     * Six kinds, and the switch is exhaustive over all of them: a seventh cannot be added to the
+     * Seven kinds, and the switch is exhaustive over all of them: an eighth cannot be added to the
      * grammar without this stopping the build.
      *
      * <p><b>A script is the one kind that cannot be answered for, and the answer is final rather than
@@ -124,6 +125,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
             // reached it back unchanged is the whole of it - including when that answer is an unknown,
             // which then keeps naming the step that actually went dark.
             case TransformBody.Filter ignored -> merged(inputs.values());
+            case TransformBody.Unwind unwind -> expanded(unwind, merged(inputs.values()));
             // The merge itself, and nothing besides. It computes what the arm above does, and is
             // written out separately all the same: the two coincide only because a predicate happens
             // not to touch a column, so folding them together would make a later change to one of
@@ -189,6 +191,62 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
                 : TapstateType.UNKNOWN;
         return JoinSchemaDrift.declaredType(type,
                 JoinSchemaDrift.nullableOf(seen) || JoinSchemaDrift.nullableOf(declared));
+    }
+
+    /**
+     * What an expansion produces: the row it was handed, with the expanded column re-declared as one
+     * element instead of the list it was, and an ordinal column beside it where the author asked for
+     * one. <b>The expanded column keeps its position</b> - the row is the parent's, one field
+     * replaced, so a reader comparing this against the row that arrived sees one column change type
+     * rather than a column vanish and another appear at the end.
+     *
+     * <p><b>A column the row does not carry is not conjured.</b> An expansion naming a field that is
+     * not there produces nothing here, the same answer a rename whose source is missing produces:
+     * inventing it would describe a target column no write ever fills. Whether that declaration
+     * should have been refused in the first place is the validator's question, not this one's.
+     *
+     * <p><b>The element column is nullable whatever it is declared as.</b> A list may hold a null
+     * among its elements, and a row kept for an empty list carries nothing there at all - neither is
+     * visible in any declaration, so the only honest answer is the one that allows both. The ordinal
+     * is the other way round: every expanded row has a position, so it is only nullable where empty
+     * lists are kept and a row without an element can reach the target.
+     *
+     * <p><b>An element type nobody declared comes out unknown, and that is the answer rather than a
+     * failure.</b> The type of what sits inside a list is not something a source's schema carries -
+     * the connector framework's own array type has no field for it - so there is nothing here to
+     * read and nothing to infer from. Unknown then travels to the write side as a column with no
+     * declared type, which is the existing way of saying "the connector decides", not a new one.
+     * <b>The declared name is taken as written and not judged here</b>: a name outside the shared
+     * vocabulary lands as unknown, which is the same answer as declaring nothing - so whether a
+     * misspelling is worth refusing is a question for the validator, where refusing it can carry a
+     * reason.
+     */
+    private static NodeColumns expanded(TransformBody.Unwind unwind, NodeColumns upstream) {
+        if (!upstream.known()) {
+            return upstream;
+        }
+        Map<String, String> out = new LinkedHashMap<>(upstream.columns());
+        if (out.containsKey(unwind.path())) {
+            out.put(unwind.path(),
+                    JoinSchemaDrift.declaredType(elementType(unwind.elementType()), true));
+        }
+        if (unwind.includeArrayIndex() != null) {
+            out.put(unwind.includeArrayIndex(), JoinSchemaDrift.declaredType(TapstateType.INT64,
+                    Boolean.TRUE.equals(unwind.preserveNullAndEmptyArrays())));
+        }
+        return known(out);
+    }
+
+    /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
+    private static TapstateType elementType(String declared) {
+        if (declared == null) {
+            return TapstateType.UNKNOWN;
+        }
+        try {
+            return TapstateType.valueOf(declared.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException outsideTheVocabulary) {
+            return TapstateType.UNKNOWN;
+        }
     }
 
     /**

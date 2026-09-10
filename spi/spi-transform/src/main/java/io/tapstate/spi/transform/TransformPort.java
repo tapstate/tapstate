@@ -5,7 +5,7 @@ import java.util.List;
 
 /**
  * The in-pipeline transform of the standard event envelope: the row-level seam a stateless node
- * (map / filter / a scripted row transform) implements. A pure interface over the core ring only
+ * (map / filter / an array expansion / a scripted row transform) implements. A pure interface over the core ring only
  * (rule R2); it names no engine type.
  *
  * <p>One event maps to zero-or-more events, so the same seam covers the stateless family: a map

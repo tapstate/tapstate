@@ -423,6 +423,8 @@ public final class DslParser {
             case "js" -> Set.of("script");
             case "map" -> Set.of("fields");
             case "filter" -> Set.of("expr");
+            case "unwind" -> Set.of("path", "include_array_index",
+                    "preserve_null_and_empty_arrays", "element_key", "element_type");
             case "union" -> Set.of();
             case "nest" -> Set.of(
                     "primary_key", "order", "entries_in_memory", "max_elements_per_document", "root");
@@ -441,6 +443,7 @@ public final class DslParser {
             case "js" -> Set.of("script");
             case "map" -> Set.of("fields");
             case "filter" -> Set.of("expr");
+            case "unwind" -> Set.of("path");
             case "nest" -> Set.of("root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
@@ -457,6 +460,12 @@ public final class DslParser {
                 checkPredicate(s, "expr", expr);
                 yield new TransformBody.Filter(expr);
             }
+            case "unwind" -> new TransformBody.Unwind(
+                    s.requireString("path"),
+                    s.string("include_array_index"),
+                    boolValue(s, "preserve_null_and_empty_arrays"),
+                    s.string("element_key"),
+                    s.string("element_type"));
             case "union" -> new TransformBody.Union();
             case "nest" -> new TransformBody.Nest(
                     s.string("primary_key"),
@@ -472,7 +481,7 @@ public final class DslParser {
                 yield new TransformBody.Join(engine, sql);
             }
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
-                    Map.of("value", type, "expected", "a known transform type (js, map, filter, union, nest, join)"));
+                    Map.of("value", type, "expected", "a known transform type (js, map, filter, unwind, union, nest, join)"));
         };
     }
 

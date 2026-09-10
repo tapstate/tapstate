@@ -265,6 +265,16 @@ public final class PipelineRepresentation {
             case TransformBody.Js js -> value.put("script", js.script());
             case TransformBody.MapProjection map -> value.put("fields", fieldRuleValues(map.fields()));
             case TransformBody.Filter filter -> value.put("expr", filter.expr());
+            // Every key, including the ones the author omitted: this face reports what a pipeline
+            // is, and a key left out of the answer is indistinguishable from a key this face does
+            // not know about - which is the reading a reader of an unfamiliar type arrives with.
+            case TransformBody.Unwind unwind -> {
+                value.put("path", unwind.path());
+                value.put("includeArrayIndex", unwind.includeArrayIndex());
+                value.put("preserveNullAndEmptyArrays", unwind.preserveNullAndEmptyArrays());
+                value.put("elementKey", unwind.elementKey());
+                value.put("elementType", unwind.elementType());
+            }
             case TransformBody.Union ignored -> {
             }
             case TransformBody.Nest nest -> {

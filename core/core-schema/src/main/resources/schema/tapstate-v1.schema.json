@@ -976,6 +976,9 @@
           "$ref": "#/$defs/TransformBody.Filter"
         },
         {
+          "$ref": "#/$defs/TransformBody.Unwind"
+        },
+        {
           "$ref": "#/$defs/TransformBody.Union"
         },
         {
@@ -1111,6 +1114,41 @@
       },
       "required": [
         "type"
+      ]
+    },
+    "TransformBody.Unwind": {
+      "type": "object",
+      "description": "Expands one row into one row per element of an array field.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "unwind"
+        },
+        "path": {
+          "description": "The array field to expand; one output row is produced per element of it.",
+          "type": "string"
+        },
+        "include_array_index": {
+          "description": "Name of a column carrying each element's ordinal within the array; absent adds none.",
+          "type": "string"
+        },
+        "preserve_null_and_empty_arrays": {
+          "description": "Whether a row whose array is null, missing or empty still produces one output row, that field left empty. Absent drops such rows.",
+          "type": "boolean",
+          "default": false
+        },
+        "element_key": {
+          "description": "Field inside each element that identifies the row that element becomes.",
+          "type": "string"
+        },
+        "element_type": {
+          "description": "Declared type of the expanded column; absent leaves the connector to infer one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path"
       ]
     },
     "TransformResource": {
