@@ -281,6 +281,11 @@ install_bundle() {
     mv -f "$staged_link" "$install_dir/tapstate"
     staged_link=""
     install_alias "$install_dir" "$version"
+    # Prune old bundles only after both command links have moved to the complete new bundle.
+    for old_bundle in "$install_dir/versions"/*; do
+        [ -d "$old_bundle" ] || continue
+        [ "$old_bundle" = "$final" ] || rm -rf "$old_bundle"
+    done
 }
 
 # `tap` is a convenience shortcut, never a second command: `tapstate` is what every document, message
