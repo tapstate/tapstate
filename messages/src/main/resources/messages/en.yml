@@ -339,6 +339,9 @@ io.document-unreadable:
 io.schema-read-contention:
   message: "The schema for connection '{connectionId}' changed during every read attempt."
   solution: "Wait for re-discovery to finish, then retry."
+io.schema-write-contention:
+  message: "The schema for connection '{connectionId}' could not be published because its writer lease was reclaimed or concurrent discovery kept changing it."
+  solution: "Wait for re-discovery to finish, then retry discovery."
 io.document-too-large:
   message: "The record for '{id}' no longer fits in one stored document."
   solution: "The store is healthy and retrying will not help. Reduce what is held under this one id."

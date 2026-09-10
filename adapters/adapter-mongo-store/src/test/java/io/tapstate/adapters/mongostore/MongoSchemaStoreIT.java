@@ -316,6 +316,38 @@ class MongoSchemaStoreIT {
     }
 
     @Test
+    void aLaterDiscoveryReclaimsAnAbandonedUnpublishedGeneration() {
+        withStore((store, collection) -> {
+            DiscoveredSourceModel before = observation(1, "old");
+            DiscoveredSourceModel current = observation(3, "current");
+            store.save(before);
+            MongoException failure = new MongoException("injected failure before envelope publication");
+            MongoCollection<Document> interrupted = interleave(collection,
+                    call -> call.name().equals("findOneAndReplace"),
+                    () -> { throw failure; }, false);
+
+            assertThatThrownBy(() -> new MongoSchemaStore(interrupted).save(observation(2, "abandoned")))
+                    .isInstanceOf(TapstateException.class)
+                    .hasCause(failure);
+            assertThat(store.get("orders-db")).contains(before);
+            Document abandoned = collection.find(new Document("name", "abandoned")).first();
+            assertThat(abandoned).isNotNull();
+            assertThat(abandoned.getString("generation")).isNotEqualTo(
+                    collection.find(new Document("_id", "orders-db")).first().getString("generation"));
+
+            MongoSchemaStore laterWriter = new MongoSchemaStore(collection);
+            laterWriter.save(current);
+
+            assertThat(laterWriter.get("orders-db")).contains(current);
+            assertThat(collection.countDocuments(new Document("name", "old"))).isZero();
+            assertThat(collection.countDocuments(new Document("generation", abandoned.getString("generation"))))
+                    .as("unpublished tables left by an abandoned writer must be reclaimed")
+                    .isZero();
+            assertThat(collection.countDocuments()).isEqualTo(2);
+        });
+    }
+
+    @Test
     void aWriterCannotDeleteAnotherWritersUnpublishedTables() {
         withStore((store, collection) -> {
             store.save(observation(1, "old"));
