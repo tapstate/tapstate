@@ -305,9 +305,11 @@ public final class NestDag {
         List<EmbedSlot> slots = topology.slots();
         ChainAxes axes = frontier == null ? null : frontier.axes();
         // The window is named per namespace in the settings, which is where everything a deployment sets
-        // about a nest is named. An append root takes no window at all, and no folding either.
-        NestSendPolicy sending = topology.foldingAllowed()
-                ? NestSendPolicy.within(binding.settings().sendWindowIn(spec.mapName()))
+        // about a nest is named. Append roots and a zero window must send every change, including
+        // changes arriving in the same drain.
+        long windowMillis = binding.settings().sendWindowIn(spec.mapName());
+        NestSendPolicy sending = topology.foldingAllowed() && windowMillis > 0
+                ? NestSendPolicy.within(windowMillis)
                 : NestSendPolicy.everyChange();
         return ProcessorMetaSupplier.of(new NestVertexSupplier(spec, slots, stores, deadLetter, outputStream,
                 axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending,
