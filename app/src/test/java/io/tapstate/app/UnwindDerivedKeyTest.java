@@ -3,6 +3,7 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
@@ -163,6 +164,10 @@ class UnwindDerivedKeyTest {
                 one(expanded), null);
 
         assertThat(projected.columns()).doesNotContainKey("item_no");
+        // Asserted on the node's own answer as well as the published one. The published rule drops
+        // a key column it is not publishing anyway, so through that alone a projection that kept
+        // the claim would look identical - and the claim is read by whatever comes next too.
+        assertThat(projected.key()).isEmpty();
         assertThat(publishedKey(projected)).containsExactly("o_id");
     }
 
@@ -235,6 +240,46 @@ class UnwindDerivedKeyTest {
         agreeing.put("b", expanded);
         assertThat(publishedKey(NodeColumns.of(new TransformBody.Union(), agreeing, null)))
                 .containsExactly("o_id", "item_no");
+    }
+
+    /**
+     * An expansion is free to name its ordinal after a column the table already keys on. Counting it
+     * twice is not a harmless duplicate: the model is built by walking the key in order, so the
+     * target comes out carrying that column twice - a table no store creates, failing at creation
+     * rather than anywhere near the declaration that caused it.
+     */
+    @Test
+    @DisplayName("an added column that is already a key column is not keyed on twice")
+    void anAdditionThatIsAlreadyTheTablesOwnKeyIsNotAddedTwice() {
+        NodeColumns produced = NodeColumns.of(unwind("o_id", null), one(atTheSource()), null);
+
+        assertThat(publishedKey(produced)).containsExactly("o_id");
+        assertThat(StoreBackedDagSource.publishedAs(orders(), produced, atTheSource()).fields())
+                .extracting(TargetField::name).containsExactly("o_id", "o_region", "items");
+    }
+
+    /**
+     * The reverse half stated as the invariant rather than case by case: an expansion is the only
+     * kind that adds anything, so every other kind leaves the published rule exactly what it was.
+     * A join is not built here - its answer comes from a compiled query rather than from what
+     * reaches it, and its arm builds its columns the same way the two below do.
+     */
+    @Test
+    @DisplayName("no kind but an expansion adds anything to the key")
+    void onlyAnExpansionAddsToTheKey() {
+        assertThat(NodeColumns.of(new TransformBody.Filter("true"), one(atTheSource()), null).key())
+                .isEmpty();
+        assertThat(NodeColumns.of(new TransformBody.Union(), one(atTheSource()), null).key())
+                .isEmpty();
+        assertThat(NodeColumns.of(
+                new TransformBody.MapProjection(Map.of("region", FieldRule.rename("o_region"))),
+                one(atTheSource()), null).key()).isEmpty();
+        assertThat(NodeColumns.of(new TransformBody.Js("emit(record)"), one(atTheSource()), null)
+                .key()).isEmpty();
+        assertThat(NodeColumns.of(
+                new TransformBody.Nest(null, null,
+                        new NestRoot("orders", List.of("o_id"), null, null, null)),
+                Map.of("orders", atTheSource()), null).key()).isEmpty();
     }
 
     /** An unknown upstream is still unknown, and an unknown never reaches the published rule. */

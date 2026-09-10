@@ -13,8 +13,12 @@ import java.util.Set;
 
 /**
  * The {@code unwind} port: one row carrying a list becomes one row per element, the list's field
- * holding a single element in each. The parent's other columns travel on every one of them, so
- * lifting a field out of the element is a following {@code map} rather than a second job here.
+ * holding a single element in each. The parent's other columns travel on every one of them.
+ *
+ * <p>Two columns are written beside the element and no others: the ordinal where one was asked for,
+ * and the element's own identifying field where the declaration named one. Both are there because a
+ * target addresses a row by column and neither is reachable as one otherwise. Lifting the rest of an
+ * element's fields is a following {@code map} rather than a second job here.
  *
  * <p>This is the only stateless operator that changes how many rows there are, and everything below
  * follows from that. It is still a pure function of the one event it is handed - an update is paired

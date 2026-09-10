@@ -882,10 +882,10 @@ final class StoreBackedDagSource implements DagSource {
             }
         }
         for (String added : produced.key()) {
-            // Only a column that is actually published: a key naming one that is not is dropped
-            // where the model is built, which turns a key short of a column into a key that reads
-            // whole.
-            if (produced.columns().containsKey(added) && !key.contains(added)) {
+            // Once each. A node whose added column happens to be one of the table's own key columns
+            // would otherwise name it twice, and the model is built by walking the key in order -
+            // so the target comes out carrying that column twice, which is a table no store creates.
+            if (!key.contains(added)) {
                 key.add(added);
             }
         }
