@@ -4,6 +4,7 @@ import io.tapstate.control.client.ControlResponse;
 import io.tapstate.control.client.HttpControlClient;
 import io.tapstate.control.client.RequestBudget;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.ListBounds;
 import io.tapstate.control.core.Operation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
@@ -49,6 +50,7 @@ final class McpOperationExecutor {
                 case "system.version" -> get("/version");
                 case "connector.list" -> get("/api/connectors");
                 case "connector.get" -> get("/api/connectors/" + segment(required(args, "id")));
+                case "source.list" -> sourceList(args);
                 case "source.draft" -> sourceDraft(args);
                 case "connection.test" -> connectionWrite(args, "/api/connections:test");
                 case "connection.test-result" -> get(
@@ -62,6 +64,7 @@ final class McpOperationExecutor {
                 case "artifact.apply" -> post("/api/artifacts:apply", args, RequestBudget.HEAVY);
                 case "artifact.get" -> get("/api/artifacts/" + segment(required(args, "id")));
                 case "artifact.delete" -> artifactDelete(args);
+                case "pipeline.list" -> get(listPath("/api/pipelines", args));
                 case "pipeline.start" -> pipelineAction(args, "start");
                 case "pipeline.stop" -> pipelineStop(args);
                 case "pipeline.pause" -> pipelineAction(args, "pause");
@@ -161,6 +164,89 @@ final class McpOperationExecutor {
                 originalConfig);
     }
 
+    /** Projects the REST Source view to the metadata-only shape safe for a remote model. */
+    private McpResult sourceList(Map<String, Object> arguments) {
+        McpResult result = get(listPath("/api/sources", arguments));
+        if (result.error()) {
+            return result;
+        }
+        Object rawItems = result.body().get("items");
+        if (!(rawItems instanceof List<?> items)) {
+            return invalidServerResponse("source.list");
+        }
+        List<Map<String, Object>> summaries = new java.util.ArrayList<>(items.size());
+        for (Object rawItem : items) {
+            if (!(rawItem instanceof Map<?, ?> item)
+                    || !(item.get("id") instanceof String id)
+                    || !(item.get("connector") instanceof String connector)) {
+                return invalidServerResponse("source.list");
+            }
+            Map<String, Object> summary = new LinkedHashMap<>();
+            summary.put("id", id);
+            Object rawMetadata = item.get("metadata");
+            if (rawMetadata instanceof Map<?, ?> metadata) {
+                Map<String, Object> projectedMetadata = new LinkedHashMap<>();
+                Object labels = metadata.get("labels");
+                if (labels != null) {
+                    projectedMetadata.put("labels", labels);
+                }
+                Object description = metadata.get("description");
+                if (description instanceof String text && !text.isEmpty()) {
+                    projectedMetadata.put("description", text);
+                }
+                if (!projectedMetadata.isEmpty()) {
+                    summary.put("metadata", projectedMetadata);
+                }
+            }
+            summary.put("connector", connector);
+            summaries.add(summary);
+        }
+        return McpResult.success(Map.of("items", summaries));
+    }
+
+    private static McpResult invalidServerResponse(String operation) {
+        return McpResult.coded(McpError.INVALID_SERVER_RESPONSE, Map.of("operation", operation));
+    }
+
+    private static String listPath(String path, Map<String, Object> arguments) {
+        return path + "?limit=" + listLimit(arguments) + "&offset=" + listOffset(arguments);
+    }
+
+    private static int listLimit(Map<String, Object> arguments) {
+        long value = integerArgument(arguments, "limit", ListBounds.DEFAULT_LIMIT);
+        return (int) Math.max(1, Math.min(ListBounds.MAX_LIMIT, value));
+    }
+
+    private static int listOffset(Map<String, Object> arguments) {
+        long value = integerArgument(arguments, "offset", 0);
+        if (value < 0 || value > Integer.MAX_VALUE) {
+            throw malformedListArgument("offset must be between 0 and " + Integer.MAX_VALUE);
+        }
+        return (int) value;
+    }
+
+    private static long integerArgument(Map<String, Object> arguments, String name, long defaultValue) {
+        Object value = arguments.get(name);
+        if (value == null) {
+            return defaultValue;
+        }
+        if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long) {
+            return ((Number) value).longValue();
+        }
+        if (value instanceof Float || value instanceof Double) {
+            double number = ((Number) value).doubleValue();
+            if (Double.isFinite(number) && number == Math.rint(number)
+                    && number >= Long.MIN_VALUE && number <= Long.MAX_VALUE) {
+                return (long) number;
+            }
+        }
+        throw malformedListArgument("`" + name + "` must be an integer");
+    }
+
+    private static TapstateException malformedListArgument(String reason) {
+        return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", reason), null);
+    }
+
     private List<String> connectorSecretFields(String connector) {
         McpResult result = get("/api/connectors/" + segment(connector));
         if (result.error()) {
@@ -222,7 +308,6 @@ final class McpOperationExecutor {
                     config,
                     source.mode(),
                     source.tables(),
-                    source.options(),
                     source.srs(),
                     source.experimental());
             Map<String, Object> body = new LinkedHashMap<>(result.body());

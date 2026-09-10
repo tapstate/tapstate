@@ -180,9 +180,9 @@ class LivePipelinesTest {
         state.put("p1", PipelineState.RUNNING);
         desired.put("p1", PipelineState.RUNNING);
         SourceResource noBlock = new SourceResource(
-                "orders", null, "mysql", Map.of(), null, null, null, null, null);
+                "orders", null, "mysql", Map.of(), null, null, null, null);
         SourceResource unsetFlag = new SourceResource(
-                "orders", null, "mysql", Map.of(), null, null, null,
+                "orders", null, "mysql", Map.of(), null, null,
                 new Srs(null, null, null, null, null), null);
         List<Resource> stored = List.of(noBlock, pipeline("p1", "orders"));
 
@@ -200,7 +200,7 @@ class LivePipelinesTest {
     }
 
     private static SourceResource source(String id, boolean srsEnabled) {
-        return new SourceResource(id, null, "mysql", Map.of(), null, null, null,
+        return new SourceResource(id, null, "mysql", Map.of(), null, null,
                 new Srs(null, null, null, null, srsEnabled), null);
     }
 

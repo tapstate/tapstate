@@ -58,15 +58,12 @@ final class SourceTableSelection {
 
     private static void addSpec(
             SourceResource source, SourceModel discovered, LinkedHashSet<String> selected, TableRef.Spec spec) {
-        List<String> unsupported = new ArrayList<>(3);
+        List<String> unsupported = new ArrayList<>(2);
         if (spec.filter() != null) {
             unsupported.add("filter");
         }
         if (spec.pk() != null && !spec.pk().isEmpty()) {
             unsupported.add("pk");
-        }
-        if (spec.options() != null && !spec.options().isEmpty()) {
-            unsupported.add("options");
         }
         if (!unsupported.isEmpty()) {
             throw new TapstateException(

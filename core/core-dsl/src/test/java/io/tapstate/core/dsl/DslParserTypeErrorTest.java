@@ -1,5 +1,6 @@
 package io.tapstate.core.dsl;
 
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -162,5 +163,27 @@ class DslParserTypeErrorTest {
                               topic: t
                               format: [a, b]
                         """));
+    }
+
+    @Test
+    void aFreeFormConfigHoldingAListIsARefusalNamingConfigRatherThanACastCrash() {
+        // config is read as a free map. An unchecked cast used to let a list through here and fail
+        // later as a ClassCastException: an authoring mistake reported as a fault in the reader, with
+        // no field, no position and no document anywhere in it.
+        String yaml = """
+                version: tapstate/v1
+                kind: source
+                id: src_ora
+                connector: oracle
+                config: [host, port]
+                """;
+
+        Throwable t = catchThrowable(() -> parser.parse(yaml));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.code()).isEqualTo(DslError.ILLEGAL_VALUE);
+        assertThat(ex.path()).isEqualTo("config");
+        assertThat(ex.args()).containsEntry("expected", "a mapping");
     }
 }

@@ -114,9 +114,9 @@ public final class PipelineLifecycleService {
         PipelineState current = prior.map(DesiredState::targetState).orElse(PipelineState.NEW);
         PipelineState target = LifecycleMachine.transition(current, verb);
 
-        // What the latest artifact would be assembled from, alongside what it hashes to. Both are read off
-        // the same canonical text, so a field that moves one moves the other and the two cannot drift into
-        // disagreeing about what changed.
+        // What the latest artifact would be assembled from, alongside what it hashes to. Both are taken off
+        // the same canonical structure, so a field that moves one moves the other and the two cannot drift
+        // into disagreeing about what changed.
         String latestAssembly = artifacts.assemblyIdentityOf(pipelineId).orElse(null);
 
         // The revision the verb runs at: a fresh start adopts the latest; the other verbs carry forward the

@@ -146,7 +146,8 @@ public final class MongoObservationStore implements ObservationStore {
         try {
             return PipelineState.valueOf(state);
         } catch (IllegalArgumentException e) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), e);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "state"), e);
         }
     }
 
@@ -242,6 +243,7 @@ public final class MongoObservationStore implements ObservationStore {
     }
 
     private static TapstateException corrupt(String id) {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", String.valueOf(id), "field", "observation"), null);
     }
 }

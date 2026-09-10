@@ -119,6 +119,12 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public String serverVersion(URI baseUrl) {
+        ServerVersion detail = serverVersionDetail(baseUrl);
+        return detail == null ? null : detail.version();
+    }
+
+    @Override
+    public ServerVersion serverVersionDetail(URI baseUrl) {
         try {
             HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/version"))
                     .timeout(probeTimeout)
@@ -129,10 +135,11 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             if (response.statusCode() != 200) {
                 return null;
             }
-            return JsonReader.parse(response.body()) instanceof Map<?, ?> map
-                    && map.get("version") instanceof String version && !version.isBlank()
-                    ? version
-                    : null;
+            if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                    || !(map.get("version") instanceof String version) || version.isBlank()) {
+                return null;
+            }
+            return new ServerVersion(version, grammars(map.get("dslVersions")), storeVersion(map.get("dataVersion")));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return null;
@@ -142,6 +149,36 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // in the probe above, and is no more a failure of the caller's command than a timeout is.
             return null;
         }
+    }
+
+    /**
+     * The grammar list, or null when the server did not send one. Null and empty are kept apart all the
+     * way to the screen: an empty list is a server that accepts no grammar at all, which is a fact worth
+     * printing, and a build too old to carry the field is not the same fact.
+     */
+    private static List<String> grammars(Object reported) {
+        if (!(reported instanceof List<?> list)) {
+            return null;
+        }
+        List<String> grammars = new ArrayList<>(list.size());
+        for (Object item : list) {
+            if (item instanceof String grammar) {
+                grammars.add(grammar);
+            }
+        }
+        return List.copyOf(grammars);
+    }
+
+    /**
+     * The store's schema version. Integers arrive as {@code Long} from the reader, so the range is
+     * checked rather than assumed; one outside it is reported as not said, because no build writes such
+     * a number and a wrong one printed as fact is worse than an honest blank. The endpoint still carries
+     * whatever it really answered, for anyone who needs to see it.
+     */
+    private static Integer storeVersion(Object reported) {
+        return reported instanceof Long value && value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE
+                ? value.intValue()
+                : null;
     }
 
     @Override
@@ -1605,8 +1642,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     private static RemoteArtifact artifactOf(Map<?, ?> m) {
         if (m.get("id") instanceof String id && m.get("kind") instanceof String kind) {
             String canonical = m.get("canonicalForm") instanceof String s ? s : null;
+            String contentHash = m.get("contentHash") instanceof String h ? h : null;
             boolean readable = !(m.get("readable") instanceof Boolean b) || b;
-            return new RemoteArtifact(id, kind, canonical, readable);
+            return new RemoteArtifact(id, kind, canonical, contentHash, readable);
         }
         return null;
     }
@@ -1617,7 +1655,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 && m.get("kind") instanceof String kind
                 && m.get("canonicalForm") instanceof String canonical
                 && (!(m.get("readable") instanceof Boolean readable) || readable)) {
-            return new RemoteArtifact(id, kind, canonical);
+            return new RemoteArtifact(id, kind, canonical,
+                    m.get("contentHash") instanceof String h ? h : null, true);
         }
         return null;
     }

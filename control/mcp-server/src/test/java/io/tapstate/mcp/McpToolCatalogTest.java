@@ -20,9 +20,9 @@ class McpToolCatalogTest {
     private static final List<String> READ_TOOLS = List.of(
             "system_version",
             "connector_list", "connector_get",
-            "source_draft",
+            "source_draft", "source_list",
             "connection_test_result", "connection_schema", "artifact_validate", "artifact_get",
-            "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
+            "pipeline_list", "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
             "data_browser_collections", "data_browser_find", "data_browser_stats");
 
     private static final List<String> WRITE_TOOLS = List.of(
@@ -41,7 +41,7 @@ class McpToolCatalogTest {
     }
 
     @Test
-    void defaultSurfaceContainsExactlyTheFifteenReadTools() {
+    void defaultSurfaceContainsExactlyTheSeventeenReadTools() {
         assertThat(McpToolCatalog.operations(false).stream().map(McpToolCatalog::toolName))
                 .containsExactlyInAnyOrderElementsOf(READ_TOOLS);
     }
@@ -90,6 +90,30 @@ class McpToolCatalogTest {
         assertThat((String) kind.get("description"))
                 .contains("Absent")
                 .contains("not made here");
+    }
+
+    @Test
+    void listToolsDeclareBoundedPagesAndAConfigurationFreeSourceSummary() {
+        Map<?, ?> sourceRequest = ControlApiSchema.resolve(ControlOperations.SOURCE_LIST.schema().params());
+        Map<?, ?> sourceProperties = (Map<?, ?>) sourceRequest.get("properties");
+        assertThat(sourceProperties.keySet().stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("limit", "offset");
+        assertThat(((Map<?, ?>) sourceProperties.get("limit")).get("minimum")).isEqualTo(1);
+        assertThat(((Map<?, ?>) sourceProperties.get("limit")).get("maximum")).isEqualTo(200);
+        assertThat(((Map<?, ?>) sourceProperties.get("offset")).get("minimum")).isEqualTo(0);
+
+        Map<?, ?> sourceResult = ControlApiSchema.resolve(ControlOperations.SOURCE_LIST.schema().result());
+        Map<?, ?> sourceItem = (Map<?, ?>) ((Map<?, ?>) sourceResult.get("properties"))
+                .get("items");
+        sourceItem = (Map<?, ?>) sourceItem.get("items");
+        assertThat(((List<?>) sourceItem.get("required")).stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("id", "connector");
+        assertThat(((Map<?, ?>) sourceItem.get("properties")).keySet().stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("id", "metadata", "connector");
+        assertThat(ControlOperations.SOURCE_LIST.description())
+                .contains("omitted").contains("limit").contains("offset");
+        assertThat(ControlOperations.PIPELINE_LIST.description())
+                .contains("limit").contains("offset").contains("status");
     }
 
     @Test

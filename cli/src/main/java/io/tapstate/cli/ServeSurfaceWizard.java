@@ -70,7 +70,7 @@ final class ServeSurfaceWizard {
                 WizardPrompts.askSourceRef(prompter, existingSourceIds, "Sync to (target source id)", true);
         WriteMode writeMode = askWriteMode();
         DdlPolicy ddl = askDdl();
-        return new SyncElement("sync_" + n, source, writeMode, null, ddl, null);
+        return new SyncElement("sync_" + n, source, writeMode, null, ddl);
     }
 
     /** Upsert is the canonical default, listed last so an empty reply selects it (and is then omitted). */
@@ -118,7 +118,7 @@ final class ServeSurfaceWizard {
         String source =
                 WizardPrompts.askSourceRef(prompter, existingSourceIds, "Push to (target source id)", true);
         String topic = WizardPrompts.blankToNull(prompter.ask("Topic (blank for none)", null));
-        return new PushElement("push_" + n, source, topic, null, null);
+        return new PushElement("push_" + n, source, topic, null);
     }
 
     private static QueryType queryType(String yaml) {

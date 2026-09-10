@@ -84,7 +84,8 @@ public final class MongoConnectorCatalogStore implements ConnectorCatalogStore {
             // A stored row whose shape cannot be reconstructed is store corruption, surfaced as a coded
             // io diagnostic rather than a bare crash while reconstructing.
             throw new TapstateException(
-                    IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(document.getString("_id"))), e);
+                    IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(document.getString("_id")), "field", "entry"), e);
         }
     }
 

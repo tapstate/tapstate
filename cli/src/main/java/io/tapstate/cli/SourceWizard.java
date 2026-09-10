@@ -37,7 +37,7 @@ final class SourceWizard {
         List<TableRef> tables = askTables(mode);
         String id = askId(connector);
         Map<String, Object> config = new ConfigPrompter().collect(entry.config(), prompter);
-        return new SourceResource(id, null, connector, config, mode, tables, null, null, null);
+        return new SourceResource(id, null, connector, config, mode, tables, null, null);
     }
 
     /**

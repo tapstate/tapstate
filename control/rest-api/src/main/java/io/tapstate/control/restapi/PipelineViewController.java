@@ -5,11 +5,12 @@ import io.tapstate.control.core.PipelineViewService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Objects;
 
-/** Structured JSON projection of static Pipeline artifacts. */
+/** Structured JSON projection of Pipeline artifacts and their current observation state. */
 @RestController
 class PipelineViewController {
 
@@ -21,8 +22,10 @@ class PipelineViewController {
 
     @Verb("pipeline.list")
     @GetMapping("/pipelines")
-    PipelineList list() {
-        return new PipelineList(pipelines.list());
+    PipelineList list(
+            @RequestParam(name = "limit", required = false) Integer limit,
+            @RequestParam(name = "offset", required = false) Integer offset) {
+        return new PipelineList(ListWindow.page(pipelines.list(), limit, offset));
     }
 
     @Verb("pipeline.get")

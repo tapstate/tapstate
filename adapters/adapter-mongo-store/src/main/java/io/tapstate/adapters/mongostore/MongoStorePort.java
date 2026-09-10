@@ -2,7 +2,6 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoDatabase;
-import com.mongodb.client.gridfs.GridFSBuckets;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
@@ -141,28 +140,28 @@ public final class MongoStorePort implements StorePort {
     public MongoStorePort(MongoConnection connection) {
         Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
-        this.artifacts = new MongoArtifactStore(connection.client(), database.getCollection(ARTIFACTS));
-        this.state = new MongoStateStore(database.getCollection(PIPELINE_STATE));
-        this.desired = new MongoDesiredStore(database.getCollection(PIPELINE_DESIRED));
-        this.catalog = new MongoCatalogStore(database.getCollection(CONNECTIONS));
-        this.schemas = new MongoSchemaStore(database.getCollection(SOURCE_SCHEMAS));
-        this.connectors = new MongoConnectorRegistry(GridFSBuckets.create(database, CONNECTOR_ARTIFACTS));
-        this.connectorCatalog = new MongoConnectorCatalogStore(database.getCollection(CONNECTOR_CATALOG));
-        this.connectorSpecs = new MongoConnectorSpecStore(database.getCollection(CONNECTOR_SPECS));
+        this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
+        this.state = new MongoStateStore(SystemCollections.PIPELINE_STATE.on(database));
+        this.desired = new MongoDesiredStore(SystemCollections.PIPELINE_DESIRED.on(database));
+        this.catalog = new MongoCatalogStore(SystemCollections.CONNECTIONS.on(database));
+        this.schemas = new MongoSchemaStore(SystemCollections.SOURCE_SCHEMAS.on(database));
+        this.connectors = new MongoConnectorRegistry(SystemCollections.CONNECTOR_ARTIFACTS.bucketOn(database));
+        this.connectorCatalog = new MongoConnectorCatalogStore(SystemCollections.CONNECTOR_CATALOG.on(database));
+        this.connectorSpecs = new MongoConnectorSpecStore(SystemCollections.CONNECTOR_SPECS.on(database));
         this.connectionTestResults =
-                new MongoConnectionTestResultStore(database.getCollection(CONNECTION_TEST_RESULTS));
-        this.observations = new MongoObservationStore(database.getCollection(PIPELINE_OBSERVATION));
-        this.layouts = new MongoPipelineLayoutStore(database.getCollection(PIPELINE_LAYOUTS));
-        this.meta = new MongoSrsMetaStore(database.getCollection(SRS_META));
-        this.srsLog = new MongoSrsLogStore(database.getCollection(SRS_LOG));
-        this.derivedSchemas = new MongoDerivedSchemaStore(database.getCollection(DERIVED_SCHEMAS));
+                new MongoConnectionTestResultStore(SystemCollections.CONNECTION_TEST_RESULTS.on(database));
+        this.observations = new MongoObservationStore(SystemCollections.PIPELINE_OBSERVATION.on(database));
+        this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
+        this.meta = new MongoSrsMetaStore(SystemCollections.SRS_META.on(database));
+        this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
+        this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));
         // Operator state alone sits in its own database on the same client, for the reasons on the
         // constant. Same connection, same credentials, same lifecycle - a different database. What that
         // operator could not assemble goes in the same database, being produced by the same run.
         MongoDatabase nestState = connection.client().getDatabase(NEST_STATE_DATABASE)
                 .withWriteConcern(NEST_STATE_WRITE_CONCERN);
-        this.keyedState = new MongoKeyedStateStore(nestState.getCollection(OPERATOR_STATE));
-        this.nestDeadLetters = new MongoNestDeadLetterStore(nestState.getCollection(NEST_DEAD_LETTERS));
+        this.keyedState = new MongoKeyedStateStore(SystemCollections.OPERATOR_STATE.on(nestState));
+        this.nestDeadLetters = new MongoNestDeadLetterStore(SystemCollections.NEST_DEAD_LETTERS.on(nestState));
     }
 
     @Override

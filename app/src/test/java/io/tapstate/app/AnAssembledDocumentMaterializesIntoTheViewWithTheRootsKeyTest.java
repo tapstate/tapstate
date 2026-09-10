@@ -153,7 +153,7 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
         // The view names no target of its own: the store it lands in is the deployment's.
         artifacts.save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "fake",
-                Map.of("host", "d"), null, null, null, null, null));
+                Map.of("host", "d"), null, null, null, null));
 
         Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
                 null, null, null);
@@ -162,7 +162,7 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("o", FromRef.literal(PARENT_TABLE));
         aliases.put("i", FromRef.literal(CHILD_TABLE));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
 
         // A view and no serve block: declaring the view is the whole instruction to materialize.
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
@@ -180,7 +180,7 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
 
     private static SourceResource source(String id, String table) {
         return new SourceResource(id, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static DiscoveredSourceModel discovered(String connectionId, SourceTable table) {
