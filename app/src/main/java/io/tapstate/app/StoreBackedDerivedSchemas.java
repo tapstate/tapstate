@@ -123,6 +123,7 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
                     JoinSchemaDrift accepting = new JoinSchemaDrift(storePort.derivedSchemas());
                     joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> accepting.record(
                             pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
+                    joins.refreshStepSchemas(pipelineId);
                     return null;
                 });
     }
@@ -143,6 +144,7 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
         // act on.
         refuseWhileAJobIsProducing(pipelineId);
         joins.copySourceSchemas(pipelineId);
+        joins.refreshStepSchemas(pipelineId);
     }
 
     /**

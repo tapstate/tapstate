@@ -403,10 +403,18 @@ final class StoreBackedDagSource implements DagSource {
      * ambiguity before a pipeline is ever stored.
      */
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline) {
+        return sourceVertices(pipeline, false);
+    }
+
+    private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline, boolean skipUndiscovered) {
         Map<String, SourceVertex> vertices = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
+            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            if (skipUndiscovered && discovered == null) {
+                continue;
+            }
+            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered);
             for (String table : resolution.tables()) {
                 String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
                 vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution));
@@ -601,6 +609,15 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
             Set<String> stepIds, Map<String, CompiledJoin> compiledJoins,
             Function<SourceVertex, NodeColumns> sourceColumns) {
+        return deriveSteps(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById,
+                stepIds, compiledJoins, sourceColumns, false);
+    }
+
+    private StepDerivations deriveSteps(
+            PipelineResource pipeline, Map<String, SourceVertex> sourceVertices,
+            Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
+            Set<String> stepIds, Map<String, CompiledJoin> compiledJoins,
+            Function<SourceVertex, NodeColumns> sourceColumns, boolean incompleteSources) {
         List<Step.Inline> steps = new ArrayList<>();
         for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
             if (step instanceof Step.Inline inline) {
@@ -617,11 +634,11 @@ final class StoreBackedDagSource implements DagSource {
         while (progressed) {
             progressed = false;
             for (Step.Inline step : steps) {
-                if (derived.containsKey(step.id())) {
+                if (derived.containsKey(step.id()) || step.body() instanceof TransformBody.Join) {
                     continue;
                 }
                 Map<String, NodeColumns> inputs = inputsOf(refsOf(step.from()), sourceVertices,
-                        sourceKeyByTable, sourceKeysById, stepIds, derived, sourceColumns);
+                        sourceKeyByTable, sourceKeysById, stepIds, derived, sourceColumns, incompleteSources);
                 if (inputs == null
                         || (step.body() instanceof TransformBody.Nest nest
                                 && !inputs.containsKey(nest.root().from()))) {
@@ -642,13 +659,39 @@ final class StoreBackedDagSource implements DagSource {
         // after the loop because every step it could read from has settled by then.
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             Map<String, NodeColumns> inputs = inputsOf(List.of(view.from()), sourceVertices,
-                    sourceKeyByTable, sourceKeysById, stepIds, derived, sourceColumns);
+                    sourceKeyByTable, sourceKeysById, stepIds, derived, sourceColumns, incompleteSources);
             if (inputs != null) {
                 derived.put(view.id(), NodeColumns.of(view, NodeColumns.merged(inputs.values())));
                 recordable.put(view.id(), new Recordable(inputs, view, false));
             }
         }
         return new StepDerivations(derived, recordable);
+    }
+
+    /**
+     * Records each non-join node after an apply or explicit acceptance, using the same walk as start.
+     * Source copies and join baselines have their own writers; this refresh neither rewrites those
+     * baselines nor moves the versions held by an assembled run. Undiscovered inputs leave only the
+     * affected branches unresolved, so an independent discovered branch still refreshes.
+     */
+    void refreshStepSchemas(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        Map<String, SourceVertex> vertices = sourceVertices(pipeline, true);
+        Map<String, String> keysByTable = sourceKeyByTable(vertices);
+        Map<String, List<String>> keysBySource = sourceKeysById(vertices);
+        Set<String> steps = stepIds(pipeline);
+        boolean incomplete = keysBySource.size() < pipeline.sourceIds().size();
+        Map<String, CompiledJoin> compiled = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
+            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
+                    && inputsOf(refsOf(inline.from()), vertices, keysByTable, keysBySource, steps,
+                            Map.of(), vertex -> copiedColumns(pipelineId, vertex), incomplete) != null) {
+                compiled.put(step.id(), compileJoin(inline, join, sourceIdByTable(vertices)));
+            }
+        }
+        recordStepSchemas(pipelineId, deriveSteps(pipeline, vertices, keysByTable, keysBySource,
+                steps, compiled, vertex -> copiedColumns(pipelineId, vertex), incomplete));
     }
 
     /**
@@ -743,9 +786,14 @@ final class StoreBackedDagSource implements DagSource {
             List<FromRef> refs, Map<String, SourceVertex> sourceVertices,
             Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
             Set<String> stepIds, Map<String, NodeColumns> derived,
-            Function<SourceVertex, NodeColumns> sourceColumns) {
+            Function<SourceVertex, NodeColumns> sourceColumns, boolean incompleteSources) {
         Map<String, NodeColumns> inputs = new LinkedHashMap<>();
         for (FromRef ref : refs) {
+            // A regex could include tables not discovered yet. Recording only its known matches
+            // would turn an incomplete input into a falsely complete model.
+            if (incompleteSources && ref instanceof FromRef.Regex) {
+                return null;
+            }
             List<NodeColumns> reached = new ArrayList<>();
             for (String key : upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
                 SourceVertex vertex = sourceVertices.get(key);
