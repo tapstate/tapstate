@@ -110,8 +110,12 @@ class TapstateCompleterTest {
 
     @Test
     void completesTransformTypeValues() {
+        // Read from the menu rather than written out again here. A type the wizard offers and this
+        // list does not is one the shell stops suggesting, which reads to whoever hits tab as the
+        // type not existing - and a second copy of a list is how that happens without anyone
+        // deciding it.
         assertThat(completer.candidates(List.of("new", "--type", ""), 2))
-                .containsExactlyInAnyOrder("filter", "map", "js", "union", "nest", "join");
+                .containsExactlyInAnyOrderElementsOf(TransformBodyPrompter.TYPES);
         // prefix-filtered like every other option value
         assertThat(completer.candidates(List.of("new", "--type", "j"), 2))
                 .containsExactlyInAnyOrder("js", "join");
@@ -173,7 +177,7 @@ class TapstateCompleterTest {
     @Test
     void jlineAdapterCompletesTheNewTypeOption() throws IOException {
         assertThat(completeLine("new --kind transform --type "))
-                .containsExactlyInAnyOrder("filter", "map", "js", "union", "nest", "join");
+                .containsExactlyInAnyOrderElementsOf(TransformBodyPrompter.TYPES);
     }
 
     @Test
