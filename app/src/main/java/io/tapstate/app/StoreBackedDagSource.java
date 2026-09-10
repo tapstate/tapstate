@@ -332,7 +332,22 @@ final class StoreBackedDagSource implements DagSource {
     List<String> copySourceSchemas(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
-        return copySourceSchemas(pipelineId, sourceVertices(pipeline));
+        List<String> copied = new ArrayList<>();
+        for (String sourceId : pipeline.sourceIds()) {
+            SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
+            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            // Applying an undiscovered source records nothing, including when discovery is needed
+            // to expand an omitted or regex table selector. A start still requires capture resolution.
+            if (discovered == null) {
+                continue;
+            }
+            for (String table : SourceTableSelection.resolve(source, discovered)) {
+                if (sourceSchemaCopy.copy(pipelineId, sourceId, table, discoveredTable(discovered, table))) {
+                    copied.add(SourceSchemaCopy.nodeId(sourceId, table));
+                }
+            }
+        }
+        return copied;
     }
 
     /**

@@ -10,6 +10,14 @@ import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.SourceMode;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.TableRef;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
@@ -17,6 +25,8 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -24,6 +34,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -44,6 +55,59 @@ class DerivedSchemaReportTest {
 
     private final List<AuditRecord> audited = new ArrayList<>();
     private final AuditGate auditGate = new AuditGate(audited::add, FIXED);
+
+    @ParameterizedTest
+    @MethodSource("undiscoveredSelections")
+    void apply_derivation_waits_for_discovery_but_still_copies_discovered_siblings(List<TableRef> selection) {
+        InMemoryStorePort store = partlyDiscovered(selection);
+
+        new StoreBackedDerivedSchemas(store, auditGate).derive("new_pipeline");
+
+        assertThat(store.derivedSchemas().latest("new_pipeline", "pending.orders")).isEmpty();
+        assertThat(store.derivedSchemas().latest("new_pipeline", "known.customers"))
+                .get().extracting(recorded -> recorded.schema()).isEqualTo(Map.of("id", "INT64 NULL"));
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("new_pipeline"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED);
+                    assertThat(error.args()).containsEntry("source", "pending");
+                });
+    }
+
+    @Test
+    void apply_derivation_still_rejects_a_table_absent_from_an_existing_discovery() {
+        InMemoryStorePort store = partlyDiscovered(List.of(TableRef.literal("orders")));
+        store.schemas().save(new DiscoveredSourceModel("pending", "mongodb", 1L,
+                new SourceModel(List.of(new SourceTable("other",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+
+        assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).derive("new_pipeline"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ActuationError.SOURCE_TABLE_NOT_DISCOVERED);
+                    assertThat(error.args()).containsEntry("source", "pending").containsEntry("table", "orders");
+                });
+    }
+
+    private static Stream<List<TableRef>> undiscoveredSelections() {
+        return Stream.of(null, List.of(TableRef.literal("orders")), List.of(TableRef.regex(".*")));
+    }
+
+    private static InMemoryStorePort partlyDiscovered(List<TableRef> selection) {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("pending", null, "mongodb", Map.of("uri", "u"),
+                SourceMode.CDC, selection, null, null));
+        store.artifacts().save(new SourceResource("known", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("customers")), null, null));
+        store.artifacts().save(new SourceResource("destination", null, "mongodb", Map.of("uri", "d"),
+                null, null, null, null));
+        store.artifacts().save(new PipelineResource("new_pipeline", null,
+                List.of(SourceRef.bare("pending"), SourceRef.bare("known")), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("pending"),
+                        List.of(new SyncElement("sync_1", "destination", null, null, null)), null, null), null, null));
+        store.schemas().save(new DiscoveredSourceModel("known", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("customers",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+        return store;
+    }
 
     @Test
     @DisplayName("the report puts what was recorded, what is derived now and what the target holds side by side")
