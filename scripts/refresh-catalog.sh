@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Regenerates the bundled connector catalog from a connectors checkout, in one command.
+# Regenerates the bundled connector catalog from one or more connectors checkouts, in one command.
 #
 # The refresh is four Maven runs across three modules, each gated on its own system properties:
 #
@@ -32,8 +32,12 @@
 #       A spec-face refresh, no jars built. Reuses the checked-in bitmap, so it takes seconds. Enough
 #       when only specification files changed - field names, labels, defaults.
 #
+#   scripts/refresh-catalog.sh --connectors ../tapdata-connectors \
+#       --connectors ../tapdata-connectors-enterprise
+#       Refresh both checkouts together; the first checkout supplies the catalog-wide revision.
+#
 # Options:
-#   --connectors <path>   the tapdata-connectors checkout to read (required)
+#   --connectors <path>   a connectors checkout to read (required; repeat for enterprise)
 #   --dist <dir>          a directory of already-built connector jars; skips the build step
 #   --spec-only           reuse the checked-in bitmap instead of building jars and deriving
 #   --bitmap <path>       the bitmap --spec-only reuses (default: the checked-in one); refused on a
@@ -63,7 +67,7 @@ readonly CHECKED_IN_BITMAP="$ASSEMBLER_MODULE/capability-bitmap.tsv"
 usage() {
   awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
   echo
-  echo "usage: refresh-catalog.sh --connectors <path> [--dist <dir>] [--spec-only] [--bitmap <path>]"
+  echo "usage: refresh-catalog.sh --connectors <path> [--connectors <path>] [--dist <dir>] [--spec-only] [--bitmap <path>]"
   echo "                          [--sha <sha>] [--keep-workspace]"
 }
 
@@ -72,10 +76,10 @@ usage() {
 refuse() { printf 'refresh-catalog: %s\n' "$1" >&2; exit 2; }
 fail()   { printf 'refresh-catalog: %s\n' "$1" >&2; exit 1; }
 
-connectors=""; dist=""; bitmap=""; sha=""; capability_sha=""; spec_only=no; keep_workspace=no
+connector_roots=(); connectors=""; dist=""; bitmap=""; sha=""; capability_sha=""; spec_only=no; keep_workspace=no
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --connectors) connectors="${2:-}"; shift 2 ;;
+    --connectors) connector_roots+=("${2:-}"); shift 2 ;;
     --dist)       dist="${2:-}"; shift 2 ;;
     --bitmap)     bitmap="${2:-}"; shift 2 ;;
     --sha)        sha="${2:-}"; shift 2 ;;
@@ -86,7 +90,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ -z "$connectors" ]; then
+if [ "${#connector_roots[@]}" -eq 0 ]; then
   usage >&2
   refuse "no connectors checkout named"
 fi
@@ -102,12 +106,22 @@ fi
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root" || refuse "cannot enter $repo_root"
 
-[ -d "$connectors" ] || refuse "no such connectors checkout: $connectors"
-connectors="$(cd "$connectors" && pwd)"
-# The assembler's walk reads connectors/ and connectors-javascript/ out of the checkout root. Pointed
-# one level off - at the connectors/ directory itself, a common slip - the walk finds nothing and
-# every downstream step is a green run over an empty worklist.
-[ -d "$connectors/connectors" ] || refuse "$connectors has no connectors/ directory - is it the checkout root?"
+checkout_args=(); catalog_args=()
+for i in "${!connector_roots[@]}"; do
+  connectors="${connector_roots[$i]}"
+  [ -d "$connectors" ] || refuse "no such connectors checkout: $connectors"
+  connectors="$(cd "$connectors" && pwd)"
+  [ -d "$connectors/connectors" ] || refuse "$connectors has no connectors/ directory - is it the checkout root?"
+  connector_roots[$i]="$connectors"
+  checkout_args+=(--checkout "$connectors")
+  if [ "$i" -eq 0 ]; then
+    catalog_args+=("-Dtapstate.catalog.connectors=$connectors")
+  else
+    catalog_args+=("-Dtapstate.catalog.connectors.$i=$connectors")
+  fi
+done
+# Provenance remains catalog-wide; the first checkout supplies its revision.
+connectors="${connector_roots[0]}"
 
 if [ -z "$sha" ]; then
   sha="$(git -C "$connectors" rev-parse --short HEAD 2>/dev/null)"
@@ -169,7 +183,7 @@ run_step "step 1 (probe manifest)" "$ASSEMBLER_REPORT" "$workspace/step1.log" \
   -B -pl "$ASSEMBLER_MODULE" -am test \
   -Dtest=CatalogArtifactTest#emitsTheProbeManifestWhenAskedTo \
   -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtapstate.catalog.connectors="$connectors" \
+  "${catalog_args[@]}" \
   -Dtapstate.catalog.manifest="$manifest"
 [ -s "$manifest" ] || fail "step 1 (probe manifest) produced no manifest at $manifest"
 echo "  $(wc -l < "$manifest" | tr -d ' ') connectors to probe"
@@ -196,18 +210,23 @@ else
     modules=""
     while IFS=$'\t' read -r id module _; do
       [ -n "${module:-}" ] || continue
-      for container in connectors connectors-javascript; do
-        if [ -d "$connectors/$container/$module" ]; then
-          modules="${modules:+$modules,}$id=$container/$module"
-          break
-        fi
+      for checkout in "${connector_roots[@]}"; do
+        found=no
+        for container in connectors connectors-javascript; do
+          if [ -d "$checkout/$container/$module" ]; then
+            modules="${modules:+$modules,}$id=$container/$module"
+            found=yes
+            break
+          fi
+        done
+        [ "$found" = no ] || break
       done
     done < "$manifest"
     [ -n "$modules" ] || fail "step 2 (capability bitmap) resolved no module paths out of $manifest"
     builder="${TAPSTATE_CONNECTOR_BUILD:-$repo_root/scripts/build-real-connectors.sh}"
     module_count="$(printf '%s\n' "$modules" | tr ',' '\n' | wc -l | tr -d ' ')"
     echo "  building $module_count connector module(s) from the manifest into $dist"
-    if ! "$builder" --modules "$modules" --checkout "$connectors" "$dist" > "$workspace/build.log" 2>&1; then
+    if ! "$builder" --modules "$modules" "${checkout_args[@]}" "$dist" > "$workspace/build.log" 2>&1; then
       tail -40 "$workspace/build.log" >&2
       fail "step 2 (capability bitmap) could not build the connector jars (full log: $workspace/build.log)"
     fi
@@ -259,7 +278,7 @@ run_step "step 3 (regenerate)" "$ASSEMBLER_REPORT" "$workspace/step3.log" \
   -B -pl "$ASSEMBLER_MODULE" -am test \
   -Dtest=CatalogArtifactTest#generatedCatalogMatchesTheCheckedInArtifacts \
   -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtapstate.catalog.connectors="$connectors" \
+  "${catalog_args[@]}" \
   -Dtapstate.catalog.update=true \
   -Dtapstate.catalog.bitmap="$bitmap" \
   -Dtapstate.catalog.sha="$sha" \

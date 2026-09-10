@@ -2,7 +2,7 @@
 
 Spec SHA: `f3bd43a`
 Capability SHA: `f3bd43a`
-Ingested connectors: 78
+Ingested connectors: 80
 
 ## Unclassified — no resolvable mode (need tapstate.modes)
 - ai-chat

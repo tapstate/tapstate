@@ -45,6 +45,8 @@ public final class OfficialConnectors {
                 "tencent-db-postgres"));
         kinds.put("mongodb", List.of(
                 "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb"));
+        kinds.put("oracle", List.of("oracle"));
+        kinds.put("sqlserver", List.of("sqlserver"));
         return Collections.unmodifiableMap(kinds);
     }
 

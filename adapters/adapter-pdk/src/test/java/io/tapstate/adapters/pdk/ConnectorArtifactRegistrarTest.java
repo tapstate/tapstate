@@ -188,7 +188,7 @@ class ConnectorArtifactRegistrarTest {
                 "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
                 "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
                 "tencent-db-postgres",
-                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb");
+                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver");
     }
 
     @Test

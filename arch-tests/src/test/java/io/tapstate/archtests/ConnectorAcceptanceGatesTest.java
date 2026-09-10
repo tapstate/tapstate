@@ -80,7 +80,8 @@ class ConnectorAcceptanceGatesTest {
     private static final List<String> MUST_BE_SCANNED = List.of(
             "deploy/quickstart/docker-compose.yml",
             "deploy/quickstart/quickstart.sh",
-            "docs/quickstart-online.md");
+            "docs/quickstart-online.md",
+            "deploy/quickstart/connectors/README.md");
 
     /**
      * Directories that are neither shipped nor written by hand: version-control internals, build output,
@@ -205,20 +206,22 @@ class ConnectorAcceptanceGatesTest {
      * The database kinds the release actually exercises. This independent literal makes adding a
      * kind a deliberate support promise in both the catalog declaration and this gate.
      */
-    private static final List<String> VERIFIED_DATABASE_KINDS = List.of("mysql", "postgres", "mongodb");
+    private static final List<String> VERIFIED_DATABASE_KINDS = List.of("mysql", "postgres", "mongodb", "oracle", "sqlserver");
 
     /** Counts include each database kind's own id and its explicitly accepted variants. */
     private static final Map<String, Integer> EXPECTED_IDS_PER_DATABASE_KIND = Map.of(
             "mysql", 5,
             "postgres", 5,
-            "mongodb", 4);
+            "mongodb", 4,
+            "oracle", 1,
+            "sqlserver", 1);
 
     /** Every id a shipped deployment accepts out of the box, in refusal-message order. */
     private static final List<String> ACCEPTED_OUT_OF_THE_BOX = List.of(
             "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
             "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
             "tencent-db-postgres",
-            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb");
+            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver");
 
     @Test
     @DisplayName("what a shipped deployment accepts out of the box is exactly this set")
@@ -285,7 +288,7 @@ class ConnectorAcceptanceGatesTest {
      * reads the value and for any page that documents it, which is an accusation neither one has earned,
      * and a gate that punishes describing a setting teaches people to stop describing it.
      */
-    private static boolean assignsTheSetting(String text) {
+    static boolean assignsTheSetting(String text) {
         String flattened = text.toLowerCase(Locale.ROOT).replace("-", "").replace("_", "");
         int at = flattened.indexOf(SETTING);
         while (at >= 0) {
