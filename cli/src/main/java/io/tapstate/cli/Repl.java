@@ -369,9 +369,13 @@ final class Repl {
             return new WorkbenchActionGateway.ContextResult.Unavailable();
         }
         try {
-            contextManager.create(name, List.of(server), verifyTls);
+            ContextDefinition definition = contextManager.create(name, List.of(server), verifyTls);
             contextManager.bind(workdir, name);
-            return selectWorkbenchContext(name);
+            contextManager.choose(name);
+            session.disconnect();
+            namedContext = new ResolvedContext.Named(
+                    name, definition, ResolvedContext.Source.EXPLICIT);
+            return new WorkbenchActionGateway.ContextResult.Ready(name, false);
         } catch (RuntimeException unavailable) {
             return new WorkbenchActionGateway.ContextResult.Unavailable();
         }
@@ -395,7 +399,7 @@ final class Repl {
                 session.disconnect();
                 session.connect(List.of(server), server, controlPlane.serverVersion(server));
             }
-            if (!session.isConnected()) {
+            if (!session.isConnected() && (namedContext == null || authService == null)) {
                 return new WorkbenchActionGateway.LoginResult.Unavailable();
             }
             if (namedContext == null || authService == null) {

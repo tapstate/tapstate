@@ -4548,7 +4548,10 @@ class ReplTest {
         assertThat(store.load().lastContext()).isEqualTo("dev");
         assertThat(store.load().workspaceBindings())
                 .containsEntry(workspace.toRealPath().toString(), "dev");
-        assertThat(repl.session().isConnected()).isTrue();
+        assertThat(client.discovered)
+                .as("creating a context must not perform remote issuer discovery")
+                .isEmpty();
+        assertThat(repl.session().isConnected()).isFalse();
         assertThat(repl.session().isAuthenticated()).isFalse();
 
         Repl reopened = new Repl(
