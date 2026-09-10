@@ -314,6 +314,67 @@ class StoreBackedDagSourceTargetModelTest {
                         new TargetField("street", "VARCHAR", false))));
     }
 
+    @Test
+    void each_serve_input_contributes_its_own_transformed_table_model() {
+        InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("orders_src"));
+        store.artifacts().save(new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true), SourceRef.spec("address_src", true)),
+                List.of(Step.inline("address_projection", FromClause.list(FromRef.literal("address_src")),
+                        new TransformBody.MapProjection(Map.of("street", io.tapstate.core.model.FieldRule.drop())),
+                        null)), null,
+                new ServeBlock.Inline(null,
+                        FromClause.list(FromRef.literal("orders_src"), FromRef.literal("address_projection")),
+                        List.of(new SyncElement("sync_1", "orders_dest", null,
+                                new RenameSpec(Map.of("PlayerAddress", "player_address"), null, null, null), null)),
+                        null, null), null, null));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders",
+                List.of(new SourceField("id", "INT"), new SourceField("amount", "DECIMAL")),
+                List.of("id"), List.of())));
+        store.schemas().save(discovered("address_src", "mysql", new SourceTable("PlayerAddress",
+                List.of(new SourceField("id", "INT"), new SourceField("street", "VARCHAR"),
+                        new SourceField("city", "VARCHAR")), List.of("id"), List.of())));
+        Map<String, TargetTable> bound = new LinkedHashMap<>();
+
+        new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
+
+        assertThat(bound).containsOnlyKeys("orders", "PlayerAddress")
+                .containsEntry("orders", new TargetTable("orders", List.of(
+                        new TargetField("id", "INT", true), new TargetField("amount", "DECIMAL", false))))
+                .containsEntry("PlayerAddress", new TargetTable("player_address", List.of(
+                        new TargetField("id", "INT", true), new TargetField("city", "VARCHAR", false))));
+    }
+
+    @Test
+    void serve_inputs_from_different_forks_of_one_table_combine_their_projected_columns() {
+        InMemoryStorePort store = seededPipeline();
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("amounts", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.MapProjection(Map.of(
+                                        "region", io.tapstate.core.model.FieldRule.drop(),
+                                        "obsolete", io.tapstate.core.model.FieldRule.drop())), null),
+                        Step.inline("regions", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.MapProjection(Map.of(
+                                        "amount", io.tapstate.core.model.FieldRule.drop(),
+                                        "obsolete", io.tapstate.core.model.FieldRule.drop())), null)),
+                null, new ServeBlock.Inline(null,
+                        FromClause.list(FromRef.literal("amounts"), FromRef.literal("regions")),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)), null, null),
+                null, null));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders",
+                List.of(new SourceField("id", "INT"), new SourceField("amount", "DECIMAL"),
+                        new SourceField("region", "VARCHAR"), new SourceField("obsolete", "VARCHAR")),
+                List.of("id"), List.of())));
+        Map<String, TargetTable> bound = new LinkedHashMap<>();
+
+        new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
+
+        // The second fork contributes region, while neither fork carries obsolete. Keeping only the
+        // first reference or restoring the wholesale physical model gives a different target shape.
+        assertThat(bound).containsOnlyKeys("orders").containsEntry("orders", new TargetTable("orders", List.of(
+                new TargetField("id", "INT", true), new TargetField("amount", "DECIMAL", false),
+                new TargetField("region", "VARCHAR", false))));
+    }
+
     // ---- fixtures ----------------------------------------------------------------------
 
     /**

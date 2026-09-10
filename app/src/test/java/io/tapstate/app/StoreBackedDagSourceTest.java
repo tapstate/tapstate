@@ -171,6 +171,55 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void rediscovery_alone_leaves_every_nodes_complete_record_unchanged() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
+        store.artifacts().save(new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.MapProjection(Map.of("region", FieldRule.drop())), null),
+                        filter("keep_even", "row.id % 2 == 0", FromRef.literal("trimmed"))),
+                new ViewBlock.Inline("order_state", FromRef.literal("keep_even"), "id", null, null),
+                null, null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("region", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+        new StoreBackedDagSource(store).dagFor("p");
+        Map<String, DerivedSchema> before = new LinkedHashMap<>();
+        for (String node : List.of("orders_src.orders", "trimmed", "keep_even", "order_state")) {
+            DerivedSchema recorded = store.derivedSchemas.latest("p", node).orElseThrow();
+            before.put(node, new DerivedSchema(recorded.version(), recorded.schema(), recorded.statement(),
+                    recorded.derivedFrom(), recorded.derivedBy()));
+        }
+        assertThat(before.get("orders_src.orders").schema())
+                .containsExactly(Map.entry("id", "INT64 NULL"), Map.entry("region", "STRING NULL"));
+        for (String node : List.of("trimmed", "keep_even", "order_state")) {
+            assertThat(before.get(node).schema()).containsExactly(Map.entry("id", "INT64 NULL"));
+        }
+
+        DiscoveredSourceModel changed = new DiscoveredSourceModel("orders_src", "mysql", 2L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "varchar", TapstateType.STRING),
+                                new SourceField("note", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of()))));
+        store.schemas.save(changed);
+
+        // A new apply, start or accept intentionally refreshes the records. Rediscovery alone must
+        // not: reading a live view of the physical model would change these already recorded nodes.
+        assertThat(store.schemas.get("orders_src")).contains(changed);
+        before.forEach((node, snapshot) -> {
+            DerivedSchema after = store.derivedSchemas.latest("p", node).orElseThrow();
+            assertThat(after).as("complete record for %s", node).isEqualTo(snapshot);
+            assertThat(after.schema()).as("column order for %s", node)
+                    .containsExactlyEntriesOf(snapshot.schema());
+        });
+    }
+
+    @Test
     void every_step_records_the_model_it_derives_rather_than_only_the_nodes_that_read() {
         // A pipeline with no join in it. A source node is recorded by the copy and a join step by the
         // drift check - two of the eight node kinds - so a pipeline built out of the other six has a
