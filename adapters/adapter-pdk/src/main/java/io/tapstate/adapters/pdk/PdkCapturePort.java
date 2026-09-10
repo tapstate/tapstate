@@ -502,10 +502,15 @@ public final class PdkCapturePort implements CapturePort {
      * needing a position has to refuse rather than invent one that no connector could be started from.
      */
     private static Optional<SourcePosition> position(PdkConnector connector, Object offset) {
-        return offset == null
-                ? Optional.empty()
-                : Optional.of(new SourcePosition(
-                        ConnectorOffsetCodec.toToken(connector.connectorId(), offset)));
+        if (offset == null) {
+            return Optional.empty();
+        }
+        // A snapshot renders its seam after the read's loader scope has ended. The
+        // connector's native JSON service must still resolve under that same loader.
+        Object represented = read(connector, () -> SqlServerOffset.forStorage(
+                connector.connectorId(), offset, () -> InstanceFactory.instance(JsonParser.class)));
+        return Optional.of(new SourcePosition(
+                ConnectorOffsetCodec.toToken(connector.connectorId(), represented)));
     }
 
     /** Runs a read action under the connector loader, mapping a connector-side failure to a code. */
