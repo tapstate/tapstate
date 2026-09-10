@@ -2,7 +2,10 @@ package io.tapstate.core.catalog;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The release's officially supported connector set. Pinned exactly, because a silent addition here is
@@ -13,14 +16,30 @@ class OfficialConnectorsTest {
 
     @Test
     void pinsTheConnectorsThisReleaseSupports() {
-        // Written out in full rather than counted or matched by prefix. Three of these are the engines
-        // the release verifies; the other twelve are managed variants of those three, and a variant is
-        // in only because someone read it and said so.
+        // Written out in full rather than counted or matched by prefix. The release verifies the
+        // database kinds themselves; each managed variant is accepted by an explicit support decision.
         assertThat(OfficialConnectors.IDS).containsExactly(
                 "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
                 "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
                 "tencent-db-postgres",
                 "mongodb", "mongodb-atlas", "mongodb3", "aliyun-db-mongodb", "tencent-db-mongodb");
+    }
+
+    @Test
+    void databaseKindsKeepTheirDeclaredOrder() {
+        assertThat(OfficialConnectors.IDS_BY_DATABASE_KIND.keySet())
+                .containsExactly("mysql", "postgres", "mongodb");
+    }
+
+    @Test
+    void callersCannotChangeTheSupportedSetOrItsGrouping() {
+        assertThatThrownBy(() -> OfficialConnectors.IDS_BY_DATABASE_KIND.put("other", List.of("other")))
+                .isInstanceOf(UnsupportedOperationException.class);
+        OfficialConnectors.IDS_BY_DATABASE_KIND.values().forEach(ids ->
+                assertThatThrownBy(() -> ids.add("other"))
+                        .isInstanceOf(UnsupportedOperationException.class));
+        assertThatThrownBy(() -> OfficialConnectors.IDS.add("other"))
+                .isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test
