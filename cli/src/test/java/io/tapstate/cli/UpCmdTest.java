@@ -703,7 +703,7 @@ class UpCmdTest {
         }
 
         @Override
-        public LifecycleOutcome lifecycle(URI u, String c, String id, String verb) {
+        public LifecycleOutcome lifecycle(URI u, String c, String id, String verb, Boolean purgeState) {
             calls.add("lifecycle " + verb + " " + id);
             pipelineState = "RUNNING";
             return new LifecycleOutcome.Accepted(id, "RUNNING", "1");
@@ -714,6 +714,12 @@ class UpCmdTest {
             calls.add("status " + id);
             return new StatusOutcome.Found(id, pipelineState);
         }
+
+        @Override
+        public PositionOutcome setPosition(URI u, String c, String id, String document) { throw new AssertionError(); }
+
+        @Override
+        public PositionOutcome position(URI u, String c, String id) { throw new AssertionError(); }
 
         @Override public LoginOutcome login(URI baseUrl, String username, String password) { throw new AssertionError(); }
 

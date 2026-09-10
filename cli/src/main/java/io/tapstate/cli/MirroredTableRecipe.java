@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.ViewBlock;
 
 import java.util.List;
@@ -78,7 +79,7 @@ final class MirroredTableRecipe {
         // source reading one literal table the name resolves to exactly that table.
         ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal(answers.table()), "id", null, null);
         PipelineResource pipeline = new PipelineResource(pipelineId(answers), null,
-                List.of(source.resource().id()), null, view, null, null, null);
+                List.of(SourceRef.bare(source.resource().id())), null, view, null, null, null);
         return RecipeSupport.outputs(List.of(source), pipeline, ASSUMED_PRIMARY_KEY, workspace);
     }
 

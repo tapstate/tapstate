@@ -359,12 +359,14 @@ public final class Cli implements Runnable {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
         for (String verb : COMPOSITE_VERBS) {
-            commandLine.addSubcommand(verb, new ConnectedVerb());
+            if (!verb.equals("up")) {
+                commandLine.addSubcommand(verb, new ConnectedVerb());
+            }
         }
         for (String verb : UNIMPLEMENTED_COMPOSITE_VERBS) {
             commandLine.addSubcommand(verb, new UnimplementedVerb());
         }
-        commandLine.addSubcommand("up", new UpCmd());
+        commandLine.addSubcommand(new UpCmd());
         // The version belongs to the binary, not to any one verb, so every verb reports the same one.
         // Set centrally rather than annotated per class: the standard help mixin registers -V wherever
         // it is applied, and a spec with no version answers that advertised option with an empty line

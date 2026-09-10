@@ -7,6 +7,7 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
@@ -223,7 +224,8 @@ final class NestedJsonRecipe {
                 new TransformBody.Nest(null, null, root), null, null);
         ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal("assemble"), answers.key(), null, null);
         PipelineResource pipeline = new PipelineResource(RecipeSupport.identifier(answers.rootTable()) + "_sync", null,
-                sources.stream().map(s -> s.resource().id()).toList(), List.of(assemble), view, null, null, null);
+                sources.stream().<SourceRef>map(s -> SourceRef.bare(s.resource().id())).toList(),
+                List.of(assemble), view, null, null, null);
         return RecipeSupport.outputs(sources, pipeline, anyArray ? ASSUMED_ARRAY_KEY : null, workspace);
     }
 }

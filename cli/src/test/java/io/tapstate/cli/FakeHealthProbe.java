@@ -88,9 +88,11 @@ final class FakeHealthProbe implements ControlPlaneClient {
     @Override public DataBrowserOutcome.Collections collections(URI u, String c, String id) { throw new AssertionError(); }
     @Override public DataBrowserOutcome.Stats stats(URI u, String c, String id, String collection) { throw new AssertionError(); }
     @Override public DataBrowserOutcome.Find find(URI u, String c, String id, String collection, Object f, DataBrowserCall.Order o, Integer l) { throw new AssertionError(); }
-    @Override public LifecycleOutcome lifecycle(URI u, String c, String id, String v) { throw new AssertionError(); }
+    @Override public LifecycleOutcome lifecycle(URI u, String c, String id, String v, Boolean purgeState) { throw new AssertionError(); }
     @Override public StatusOutcome status(URI u, String c, String id) { throw new AssertionError(); }
     @Override public MetricsOutcome metrics(URI u, String c, String id) { throw new AssertionError(); }
+    @Override public PositionOutcome position(URI u, String c, String id) { throw new AssertionError(); }
+    @Override public PositionOutcome setPosition(URI u, String c, String id, String document) { throw new AssertionError(); }
     @Override public SnapshotOutcome snapshot(URI u, String c, String id) { throw new AssertionError(); }
     @Override public LogsOutcome logs(URI u, String c, String id) { throw new AssertionError(); }
     @Override public String watchStatus(URI u, String c, String id, StatusStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }

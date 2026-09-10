@@ -4,6 +4,7 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
@@ -120,7 +121,8 @@ final class ConsolidatedTableRecipe {
                 null, null);
         ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal("consolidate"), "id", null, null);
         PipelineResource pipeline = new PipelineResource(stem + "_sync", null,
-                sources.stream().map(s -> s.resource().id()).toList(), List.of(consolidate), view, null, null, null);
+                sources.stream().<SourceRef>map(s -> SourceRef.bare(s.resource().id())).toList(),
+                List.of(consolidate), view, null, null, null);
         return RecipeSupport.outputs(sources, pipeline, MirroredTableRecipe.ASSUMED_PRIMARY_KEY, workspace);
     }
 }

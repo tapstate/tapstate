@@ -5,6 +5,7 @@ import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
@@ -97,7 +98,8 @@ final class ReshapedTableRecipe {
         }
         ViewBlock view = new ViewBlock.Inline(answers.table().view(), FromRef.literal(upstream), "id", null, null);
         PipelineResource pipeline = new PipelineResource(MirroredTableRecipe.pipelineId(answers.table()), null,
-                List.of(source.resource().id()), steps.isEmpty() ? null : steps, view, null, null, null);
+                List.of(SourceRef.bare(source.resource().id())), steps.isEmpty() ? null : steps, view, null, null,
+                null);
         return RecipeSupport.outputs(List.of(source), pipeline, MirroredTableRecipe.ASSUMED_PRIMARY_KEY, workspace);
     }
 }

@@ -6,6 +6,7 @@ import io.tapstate.core.dsl.Interpolator;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -3846,7 +3847,8 @@ final class Repl {
             }
             Set<String> local = sources().stream().map(UpDraft::id).collect(Collectors.toSet());
             for (UpDraft pipeline : pipelines()) {
-                for (String source : ((PipelineResource) pipeline.resource()).sources()) {
+                for (SourceRef sourceRef : ((PipelineResource) pipeline.resource()).sources()) {
+                    String source = sourceRef.id();
                     if (!local.contains(source)) {
                         return failure(UpCmd.STAGE_PREFLIGHT, source, CliError.RESOURCE_NOT_FOUND, Map.of("id", source));
                     }
@@ -4048,7 +4050,8 @@ final class Repl {
             }
             List<String> referenced = new ArrayList<>();
             for (UpDraft pipeline : pipelines()) {
-                for (String source : ((PipelineResource) pipeline.resource()).sources()) {
+                for (SourceRef sourceRef : ((PipelineResource) pipeline.resource()).sources()) {
+                    String source = sourceRef.id();
                     if (!referenced.contains(source)) {
                         referenced.add(source);
                     }

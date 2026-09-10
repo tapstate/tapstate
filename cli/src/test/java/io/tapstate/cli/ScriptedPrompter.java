@@ -24,9 +24,6 @@ final class ScriptedPrompter implements Prompter {
     /** The questions routed through {@link #ask}, in order — for asserting a question was (not) asked. */
     final List<String> asked = new ArrayList<>();
 
-    /** The questions routed through {@link #ask}, in order — for asserting a question was (not) asked. */
-    final List<String> asked = new ArrayList<>();
-
     /** The questions routed through {@link #secret} — for asserting masked prompting was used. */
     final List<String> secretQuestions = new ArrayList<>();
 
@@ -58,12 +55,6 @@ final class ScriptedPrompter implements Prompter {
     public String choose(String question, List<String> options) {
         offered.add(options);
         return answers.isEmpty() ? options.get(options.size() - 1) : answers.removeFirst();
-    }
-
-    @Override
-    public String choose(String question, List<String> options, String defaultOption) {
-        offered.add(options);
-        return answers.isEmpty() ? defaultOption : answers.removeFirst();
     }
 
     @Override

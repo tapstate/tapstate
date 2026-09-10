@@ -24,7 +24,7 @@ import java.util.concurrent.Callable;
  * behind that default when nothing is listening, signs in and binds. The scaffolding verbs write
  * files and learn nothing.
  */
-@Command(mixinStandardHelpOptions = true,
+@Command(name = "up", mixinStandardHelpOptions = true,
         description = "Stages, in order: preflight, apply sources, discover, apply workspace, start. "
                 + "Runs again safely: an applied, running workspace is left as it is.")
 final class UpCmd implements Callable<Integer> {
