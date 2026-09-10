@@ -44,7 +44,9 @@ import java.util.Set;
  * one both need the true end and pay it. An append does not: it is told by the page it tries that the
  * page is full, and moves on, so starting from the hint costs an extra attempt in the window where the
  * hint lags and nothing at all the rest of the time. Neither does the trailing-page trim behind a
- * removal, which is handed the end the removal already walked to.
+ * removal, which is handed the end the removal already walked to - only the read that decides whether
+ * the head itself may go is paid again, and that is asked once a bucket has emptied rather than on
+ * every removal.
  */
 public final class ImapJoinStores implements JoinStores {
 
@@ -183,12 +185,19 @@ public final class ImapJoinStores implements JoinStores {
                 pages.executeOnKey(new ReverseBucket.At(dimensionKey, page), new DropIfEmpty()))) {
             page--;
         }
-        pages.executeOnKey(new ReverseBucket.At(dimensionKey, 0), new Hint(page, true));
-        if (page == 0) {
-            // The head goes too once nothing is under this dimension key at all - a bucket that
-            // outlived its rows is an entry spent on nothing, and the budget over these maps counts
-            // entries. It refuses while it still says pages follow it.
-            pages.executeOnKey(new ReverseBucket.At(dimensionKey, 0), new DropIfEmpty());
+        ReverseBucket.At head = new ReverseBucket.At(dimensionKey, 0);
+        boolean headHoldsNothing = Boolean.TRUE.equals(pages.executeOnKey(head, new Hint(page, true)));
+        // The head goes too once nothing is under this dimension key at all - a bucket that outlived
+        // its rows is an entry spent on nothing, and the budget over these maps counts entries. What
+        // says nothing is under it is the page after it, read here and now: the head's own count of
+        // the pages following it has just been lowered onto an end walked to before any of this, so
+        // it does not know about a page an append opened in between, and a head deleted on the
+        // strength of it leaves that page named by nothing. Read only once the head holds nothing,
+        // which is once in a bucket's life rather than once per removal - the page it asks about is
+        // the one that is not there, so the question is a trip to the layer beneath.
+        if (page == 0 && headHoldsNothing
+                && !pages.containsKey(new ReverseBucket.At(dimensionKey, 1))) {
+            pages.executeOnKey(head, new DropIfEmpty(true));
         }
     }
 
@@ -275,14 +284,32 @@ public final class ImapJoinStores implements JoinStores {
     }
 
     /**
-     * Deletes a page that holds nothing, and says whether it did. The head refuses while it still says
-     * pages follow it: deleting it would leave those pages with nothing naming them, and the count
-     * above would answer that this dimension key has no fact rows at all.
+     * Deletes a page that holds nothing, and says whether it did.
+     *
+     * <p><b>The head is refused unless the caller has read the page after it and found nothing
+     * there.</b> The head's own count of the pages that follow it is not evidence on its own: a
+     * removal lowers it onto the end it walked to, which overwrites the bump of an append that opened
+     * a page in between, and a head deleted on the strength of that leaves the page named by nothing
+     * and the count answering that this dimension key has no fact rows at all. Nothing running here
+     * can look at another entry, so the reading is the caller's and its answer is carried in - and
+     * both are required, because each covers the window the other leaves: the reading misses an
+     * append that lands after it, and that append's bump is in the count by the time this runs.
      */
     static final class DropIfEmpty
             implements EntryProcessor<ReverseBucket.At, ReverseBucket, Boolean>, Serializable {
 
         private static final long serialVersionUID = 1L;
+
+        private final boolean nothingFollows;
+
+        /** For any page but the head, which nothing follows by construction. */
+        DropIfEmpty() {
+            this(false);
+        }
+
+        DropIfEmpty(boolean nothingFollows) {
+            this.nothingFollows = nothingFollows;
+        }
 
         @Override
         public Boolean process(Map.Entry<ReverseBucket.At, ReverseBucket> entry) {
@@ -293,7 +320,10 @@ public final class ImapJoinStores implements JoinStores {
             if (!bucket.isEmpty()) {
                 return false;
             }
-            if (entry.getKey().page() == 0 && bucket.furtherPages() > 0) {
+            // The head goes on the caller's word that the page after it is not there, and only while
+            // its own count agrees that none does. Neither is evidence alone: the reading is stale by
+            // the time this runs, and the count was lowered onto an end walked to before that.
+            if (entry.getKey().page() == 0 && !(nothingFollows && bucket.furtherPages() == 0)) {
                 return false;
             }
             entry.setValue(null);
@@ -302,17 +332,22 @@ public final class ImapJoinStores implements JoinStores {
     }
 
     /**
-     * Moves the head's page-count hint. Growing it never loses anything - a hint that is too high is
-     * probed past - and it <b>creates the head where there is none</b>, which is the one thing that
-     * keeps a page from being stranded: an append opening page 1 while the head is being dropped as
-     * empty would otherwise bump nothing, and the count would then answer that the bucket is gone
-     * while page 1 still holds fact rows.
+     * Moves the head's page-count hint, and says whether the head is left holding nothing. The saying
+     * is free where the moving already runs, and it is what tells a trim whether dropping the head is
+     * even worth a read.
+     *
+     * <p>Growing the hint never loses anything - a hint that is too high is probed past - and it
+     * <b>creates the head where there is none</b>, which is the one thing that keeps a page from being
+     * stranded: an append opening page 1 while the head is being dropped as empty would otherwise bump
+     * nothing, and the count would then answer that the bucket is gone while page 1 still holds fact
+     * rows.
      *
      * <p>Lowering it happens only after the pages it counted are actually gone, and never invents a
-     * head: there is nothing to record.
+     * head: there is nothing to record. It is not a statement that nothing follows the head either -
+     * the end it lowers onto was walked to before it ran, and an append may have opened a page since.
      */
     static final class Hint
-            implements EntryProcessor<ReverseBucket.At, ReverseBucket, Void>, Serializable {
+            implements EntryProcessor<ReverseBucket.At, ReverseBucket, Boolean>, Serializable {
 
         private static final long serialVersionUID = 1L;
 
@@ -329,21 +364,19 @@ public final class ImapJoinStores implements JoinStores {
         }
 
         @Override
-        public Void process(Map.Entry<ReverseBucket.At, ReverseBucket> entry) {
+        public Boolean process(Map.Entry<ReverseBucket.At, ReverseBucket> entry) {
             ReverseBucket head = entry.getValue();
             if (head == null) {
-                if (!exact) {
-                    entry.setValue(new ReverseBucket(List.of(), page));
+                if (exact) {
+                    return false;
                 }
-                return null;
+                entry.setValue(new ReverseBucket(List.of(), page));
+                return true;
             }
-            if (!exact && head.furtherPages() >= page) {
-                return null;
-            }
-            if (head.furtherPages() != page) {
+            if (exact ? head.furtherPages() != page : head.furtherPages() < page) {
                 entry.setValue(new ReverseBucket(head.factKeys(), page));
             }
-            return null;
+            return head.isEmpty();
         }
     }
 }
