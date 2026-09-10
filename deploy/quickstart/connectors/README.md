@@ -35,6 +35,12 @@ They are retained only as CI artifacts for 7 days. This distribution boundary do
 establish a license for the upstream enterprise connector repository, which has no
 LICENSE file.
 
+The Oracle Free 23 source example selects `autoLog: false` and uses schema, table
+and column identifiers no longer than 30 characters. The automatic miner requests
+`CONTINUOUS_MINE`, which that database no longer supports. Long schema identifiers
+can pass snapshot reads while Oracle LogMiner marks their changes unsupported;
+Tapstate does not yet reject that configuration before starting.
+
 A refusal is reported for that jar alone and the seed sweep carries on with the rest.
 
 It is **not** how a connector is normally registered, and it is **not** a precondition for

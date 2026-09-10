@@ -23,7 +23,7 @@ final class SharedOracle {
 
     static synchronized Map<String, Object> settings(String database) {
         OracleContainer server = server();
-        String schema = database.toUpperCase(Locale.ROOT);
+        String schema = schemaName(database);
         Map<String, Object> settings = new LinkedHashMap<>();
         settings.put("host", server.getHost());
         settings.put("port", server.getOraclePort());
@@ -50,6 +50,17 @@ final class SharedOracle {
             throw new EnvelopeException("cannot provision the Oracle schema " + schema, error);
         }
         return settings;
+    }
+
+    /** Supplemental LogMiner reports long schema identifiers as unsupported redo. */
+    static String schemaName(String database) {
+        String candidate = database.toUpperCase(Locale.ROOT);
+        int miningNameLimit = 30;
+        if (candidate.length() <= miningNameLimit) {
+            return candidate;
+        }
+        String digest = ProvisionedStores.digest(candidate).toUpperCase(Locale.ROOT);
+        return candidate.substring(0, miningNameLimit - digest.length() - 1) + "_" + digest;
     }
 
     private static OracleContainer server() {

@@ -62,6 +62,13 @@ They are retained only as CI artifacts for 7 days. This distribution boundary do
 establish a license for the upstream enterprise connector repository, which has no
 LICENSE file.
 
+The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
+miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
+mined schema, table and column identifiers within 30 characters. A 63-character
+schema passed snapshot reads in the live check, but Oracle LogMiner marked its
+changes unsupported, so CDC delivered no rows. Tapstate does not yet reject that
+schema configuration before starting.
+
 ## Preparing a relational target
 
 A relational target table is created from the source model when it is absent. The
