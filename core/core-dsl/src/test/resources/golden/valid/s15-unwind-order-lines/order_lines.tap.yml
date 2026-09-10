@@ -1,0 +1,19 @@
+version: tapstate/v1
+kind: pipeline
+id: order_lines
+source: src_orders
+transforms:
+  - id: explode
+    type: unwind
+    from: [orders]
+    path: items
+    include_array_index: item_no
+    preserve_null_and_empty_arrays: true
+    element_key: sku
+    element_type: json
+serve:
+  id: serve
+  from: explode
+  sync:
+    - id: dw
+      source: tgt_lines

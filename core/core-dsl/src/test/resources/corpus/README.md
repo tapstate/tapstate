@@ -41,6 +41,8 @@ cdc read, and `srs.enabled: false`.
 | `s11-reuse-assembly` | §14.11 | Definition bodies + pure-reference assembly | `kind: transform/view/serve` definitions, string = `use:` sugar, natural-order wiring (X19) |
 | `s12-cdc-snapshot-only-rerun` | §14.1 | cdc source read one-shot on a schedule | `settings.read_mode: snapshot_only` bounds a cdc read, so `settings.schedule` is legal (read amendment) |
 | `s13-srs-disabled-passthrough` | §4 | cdc with the Shared Record Store off | `srs.enabled: false` — D14 lightweight passthrough path (read amendment) |
+| `s14-srs-override-on-source-ref` | §4 / X13 | per-source-reference Shared Record Store switch | object and bare-string `source:` elements in one list; scalar sugar does not apply to a single object |
+| `s15-unwind-order-lines` | §5 | one row per element of a list | `type: unwind` with all five payload keys, keyed by `element_key` with the ordinal carried alongside |
 
 ## invalid/ — minimal self-contained violation batches
 
