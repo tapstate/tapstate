@@ -255,7 +255,8 @@ install_bundle() {
        && [ ! -f "$bundle_root/libexec/tapstate-mcp.jar" ]; then
         die "the downloaded bundle did not contain an MCP sidecar."
     fi
-    mkdir -p "$install_dir"
+    # Newly created parents include ~/.tapstate, which the context and auth stores require owner-only.
+    (umask 077; mkdir -p "$install_dir")
     mkdir -p "$install_dir/versions"
     staged="$install_dir/versions/.tapstate-$version.$$"
     mkdir "$staged"
