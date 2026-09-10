@@ -356,6 +356,7 @@ jobs:
           shellcheck -s sh deploy/quickstart/quickstart.sh
           shellcheck deploy/quickstart/quickstart-smoke.sh
           shellcheck deploy/docker/image-smoke.sh
+          shellcheck deploy/docker/dockerfile-smoke.sh
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
           shellcheck deploy/install-site/verify-smoke.sh
@@ -540,6 +541,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # Which jar the image is built from, before spending a Maven build on smoking the image it
+      # produced. Needs no jar of its own -- it builds the real Dockerfile against a synthetic
+      # context -- so it runs first and fails fast.
+      - name: dockerfile smoke (the boot-jar glob must not resolve two candidates silently)
+        run: bash deploy/docker/dockerfile-smoke.sh
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
