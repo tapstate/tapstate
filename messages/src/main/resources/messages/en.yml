@@ -34,7 +34,7 @@ actuation.join-output-schema-engine-changed:
   solution: "Please report this - it is a compatibility break on our side that our own release checks should have caught before you ever saw it. To carry on, run `derived-schema {pipeline}` to see what moved, rebuild the target table for the new column types, then `derived-schema {pipeline} --accept`. Read the difference first: a type that narrowed loses data on the next write, which is a deliberate decision and not a formality. Staying on the version you were running is the other way out."
 actuation.schema-sync-while-running:
   message: "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now."
-  solution: "Pause or stop the pipeline, then run it again. The run itself is safe either way - it holds the columns it was assembled from and re-reads none of them - but recording a different shape while it runs leaves everything that reads the record describing a pipeline that is not the one going on, the target table it would be rebuilt for included. A paused pipeline is accepted; one already asked to resume is not, because it is about to be running again."
+  solution: "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."
 actuation.view-key-missing:
   message: "View `{view}` declares no primary key."
   solution: "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."
@@ -423,6 +423,9 @@ connector.state-unreadable:
 connector.state-value-unsupported:
   message: "This connector tried to keep a value of type {type}, which cannot be stored."
   solution: "Report this against the connector: it is the connector's own state that cannot be held, not anything in your pipeline."
+control.schema-derivation-incomplete:
+  message: "The artifacts were applied, but the model refresh for pipeline `{pipeline}` did not finish: {causeCode} {causeParams}. Its models may be unchanged or partially refreshed."
+  solution: "Resolve the reported cause, then apply again, even if the artifact content is unchanged. Stop the pipeline and wait until it is at rest if a live run blocked the refresh. Inspect `derived-schema {pipeline}` before starting, and use `derived-schema {pipeline} --accept` only after reviewing any remaining drift."
 control.audit-blocked:
   message: "Operation '{op}' was refused because its required audit record could not be written."
   solution: "An audited operation must leave an audit record before it runs; check the store is reachable and healthy, then retry."

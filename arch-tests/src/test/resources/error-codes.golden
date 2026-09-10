@@ -116,6 +116,7 @@ control.bootstrap-closed
 control.bootstrap-forbidden
 control.forbidden
 control.malformed-request
+control.schema-derivation-incomplete
 control.unauthenticated
 control.unreachable
 data-browser.connector-not-browsable

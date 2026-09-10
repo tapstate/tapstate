@@ -566,6 +566,62 @@ class ApplyServiceTest {
     }
 
     @Test
+    void aPostCommitRefreshFailureWarnsAndStillRefreshesLaterPipelines() {
+        List<String> attempted = new ArrayList<>();
+        List<String> refreshed = new ArrayList<>();
+        boolean[] fail = {true};
+        ValidationDiagnostic advisory = new ValidationDiagnostic("control.unreachable", Map.of());
+        ApplyService deriving = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                (resources, discovered) -> List.of(advisory), pipeline -> {
+                    attempted.add(pipeline);
+                    if (fail[0] && pipeline.equals("ora2my_ods")) {
+                        throw new TapstateException(ArtifactError.NOT_FOUND, Map.of("id", "missing_model"), null);
+                    }
+                    refreshed.add(pipeline);
+                });
+        List<ArtifactDraft> batch = List.of(draft(SRC_ORA), draft(PIPELINE),
+                draft(PIPELINE.replace("ora2my_ods", "second_pipeline")), draft(TGT_MY));
+
+        ApplyResult first = deriving.apply("alice", batch);
+
+        assertThat(first.outcomes()).hasSize(4).allSatisfy(outcome ->
+                assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
+        assertThat(store.list()).hasSize(4);
+        assertThat(attempted).containsExactly("ora2my_ods", "second_pipeline");
+        assertThat(refreshed).containsExactly("second_pipeline");
+        assertThat(first.warnings()).hasSize(2).contains(advisory);
+        assertThat(first.warnings().get(1)).satisfies(warning -> {
+            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.params()).containsEntry("pipeline", "ora2my_ods")
+                    .containsEntry("causeCode", ArtifactError.NOT_FOUND.code())
+                    .containsEntry("causeParams", Map.of("id", "missing_model"));
+        });
+
+        fail[0] = false;
+        attempted.clear();
+        refreshed.clear();
+        ApplyResult retried = deriving.apply("alice", batch);
+
+        assertThat(retried.outcomes()).hasSize(4).allSatisfy(outcome ->
+                assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.UNCHANGED));
+        assertThat(retried.warnings()).containsExactly(advisory);
+        assertThat(refreshed).containsExactly("ora2my_ods", "second_pipeline");
+        assertThat(store.saveCount).isEqualTo(4);
+    }
+
+    @Test
+    void aProgrammerFailureDuringRefreshIsNotConvertedToAnAdvisory() {
+        IllegalStateException bug = new IllegalStateException("broken derivation invariant");
+        ApplyService deriving = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), pipeline -> { throw bug; });
+
+        assertThatThrownBy(() -> deriving.apply("alice",
+                List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY)))).isSameAs(bug);
+    }
+
+    @Test
     void theNoOpIsKeyedByCanonicalHashNotRawText() {
         // Re-apply the same resource with a different raw config key order. It canonicalizes and hashes
         // identically, so it is still a no-op — the idempotency key is the hash over the canonical form.

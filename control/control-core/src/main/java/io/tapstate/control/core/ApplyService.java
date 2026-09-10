@@ -448,12 +448,21 @@ public final class ApplyService {
         // precisely the case that needs re-deriving: its content hash covers the pipeline document and
         // nothing else, so a source that moved under it leaves the hash byte-identical and the write
         // skipped. Keying this on the write would leave it silent in the one case it is here for.
+        List<ValidationDiagnostic> warnings = new ArrayList<>(result.warnings());
         for (PreparedArtifact prepared : plan.artifacts()) {
             if (prepared.resource() instanceof PipelineResource) {
-                derivation.derive(prepared.id());
+                try {
+                    derivation.derive(prepared.id());
+                } catch (TapstateException failure) {
+                    // The artifact transaction has committed. A skipped or partial model refresh must
+                    // not report that write as refused, or prevent later pipelines from refreshing.
+                    warnings.add(new ValidationDiagnostic(ControlError.SCHEMA_DERIVATION_INCOMPLETE.code(),
+                            Map.of("pipeline", prepared.id(), "causeCode", failure.code().code(),
+                                    "causeParams", failure.args())));
+                }
             }
         }
-        return result;
+        return new ApplyResult(result.outcomes(), warnings);
     }
 
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {

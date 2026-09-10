@@ -158,16 +158,9 @@ enum ActuationError implements TapstateErrorCode {
     VIEW_STORE_IS_A_CAPTURE_SOURCE("actuation.view-store-is-a-capture-source", Set.of("store")),
 
     /**
-     * A re-copy of the physical model was asked for while a job is carrying the pipeline; {@code
-     * pipeline} is its id, {@code state} what it is doing and {@code desired} what it has been asked to
-     * do. Both are reported because either one alone reads wrong: a pipeline sitting at {@code PAUSED}
-     * is refused when a resume has already been asked for, and a message naming only the paused half
-     * would contradict the rule that paused is allowed. The run itself is not in danger - it holds
-     * the versions it was assembled from and re-reads none of them - so what is refused is the
-     * disagreement: the record would say the pipeline produces one shape while the job going on produces
-     * another, and every read face and every target built from the record would then describe something
-     * that is not running. A paused pipeline is allowed through, having no job producing anything; one
-     * asked to resume is not, being a job about to.
+     * A model refresh was requested before the pipeline was at rest. Both actual and desired states
+     * matter: an actual run may still be stopping, or a new run may already have been requested.
+     * A paused run also retains its assembly, which a resume with an unchanged artifact may reuse.
      */
     SCHEMA_SYNC_WHILE_RUNNING("actuation.schema-sync-while-running",
             Set.of("pipeline", "state", "desired"));

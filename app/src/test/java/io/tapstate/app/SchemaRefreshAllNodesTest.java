@@ -7,31 +7,139 @@ import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.spi.store.DerivedSchema;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.provider.ValueSource;
-import org.junit.jupiter.params.provider.MethodSource;
+import io.tapstate.spi.store.StorePort;
 
 import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.AdditionalAnswers.delegatesTo;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class SchemaRefreshAllNodesTest {
+
+    @Test
+    void aRealMidRefreshStoreFailureIsVisibleAndAnUnchangedApplyRepairsIt() {
+        InMemoryStorePort backing = new InMemoryStorePort();
+        StorePort store = mock(StorePort.class, delegatesTo(backing));
+        DerivedSchemaStore models = mock(DerivedSchemaStore.class, delegatesTo(backing.derivedSchemas()));
+        when(store.derivedSchemas()).thenReturn(models);
+        AuditGate audit = new AuditGate(record -> {}, Clock.systemUTC());
+        StoreBackedDerivedSchemas schemas = new StoreBackedDerivedSchemas(store, audit);
+        ApplyService apply = new ApplyService(TapstateCatalog::load, store.artifacts(), audit,
+                store.schemas(), PlanAdvisories.none(), schemas);
+        discover(backing, false);
+        apply.apply("alice", DRAFTS);
+        OpenRingGenerations.forSources(backing, "orders_src");
+        new StoreBackedDagSource(backing).dagFor("orders_pipeline");
+        Map<String, DerivedSchema> original = records(backing);
+        discover(backing, true);
+        boolean[] fail = {true};
+        doAnswer(call -> {
+            if (fail[0] && call.getArgument(1).equals("trimmed")) {
+                fail[0] = false;
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "test outage"), null);
+            }
+            backing.derivedSchemas().record(call.getArgument(0), call.getArgument(1), call.getArgument(2),
+                    call.getArgument(3), call.getArgument(4), call.getArgument(5));
+            return null;
+        }).when(models).record(anyString(), anyString(), any(), anyString(), anyString(), anyString());
+
+        var partial = apply.apply("alice", DRAFTS);
+
+        assertThat(partial.outcomes()).hasSize(DRAFTS.size()).allSatisfy(outcome ->
+                assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.UNCHANGED));
+        assertThat(partial.warnings()).singleElement().satisfies(warning -> {
+            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.params()).containsEntry("pipeline", "orders_pipeline")
+                    .containsEntry("causeCode", "io.store-unavailable");
+        });
+        assertThat(records(backing).get("snapshot_rows").schema()).containsKey("region");
+        assertThat(records(backing).get("trimmed")).isEqualTo(original.get("trimmed"));
+        assertThat(schemas.compare("orders_pipeline")).hasSize(NODES.size())
+                .filteredOn(step -> step.step().equals("trimmed")).singleElement()
+                .satisfies(step -> assertThat(step.columns()).anyMatch(DerivedSchemas.ColumnReport::drifted));
+
+        var repaired = apply.apply("alice", DRAFTS);
+
+        assertThat(repaired.warnings()).isEmpty();
+        assertThat(records(backing)).hasSize(NODES.size());
+        records(backing).forEach((node, record) -> {
+            assertThat(record.schema()).containsKey("region");
+            assertThat(backing.derivedSchemas().pinned("orders_pipeline", node)).contains(original.get(node));
+        });
+        assertThat(schemas.compare("orders_pipeline")).hasSize(NODES.size()).allSatisfy(step ->
+                assertThat(step.columns()).isNotEmpty().noneMatch(DerivedSchemas.ColumnReport::drifted));
+    }
+
+    @ParameterizedTest
+    @MethodSource("liveStates")
+    void applyingWhileARunExistsWarnsWithoutMovingItsModelsOrBlockingOtherArtifacts(PipelineState state) {
+        InMemoryStorePort store = new InMemoryStorePort();
+        AuditGate audit = new AuditGate(record -> {}, Clock.systemUTC());
+        StoreBackedDerivedSchemas schemas = new StoreBackedDerivedSchemas(store, audit);
+        ApplyService apply = new ApplyService(TapstateCatalog::load, store.artifacts(), audit,
+                store.schemas(), PlanAdvisories.none(), schemas);
+        discover(store, false);
+        apply.apply("alice", DRAFTS);
+        OpenRingGenerations.forSources(store, "orders_src");
+        new StoreBackedDagSource(store).dagFor("orders_pipeline");
+        Map<String, DerivedSchema> original = records(store);
+        store.state().create("orders_pipeline", StateJson.of(state), Instant.EPOCH);
+        store.desired().save(new DesiredState("orders_pipeline", state, "revision"));
+        discover(store, true);
+        List<ArtifactDraft> changed = new ArrayList<>(DRAFTS);
+        changed.set(1, new ArtifactDraft("views", DRAFTS.get(1).content().replace("uri: u", "uri: updated")));
+
+        var result = apply.apply("alice", changed);
+
+        assertThat(result.outcomes()).hasSize(3);
+        assertThat(result.outcomes().get(1).change()).isEqualTo(ArtifactOutcome.Change.UPDATED);
+        assertThat(((SourceResource) store.artifacts().get("views").orElseThrow()).config())
+                .containsEntry("uri", "updated");
+        assertThat(result.warnings()).singleElement().satisfies(warning -> {
+            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.params()).containsEntry("pipeline", "orders_pipeline")
+                    .containsEntry("causeCode", "actuation.schema-sync-while-running");
+        });
+        assertThat(records(store)).isEqualTo(original);
+        original.forEach((node, record) ->
+                assertThat(store.derivedSchemas().pinned("orders_pipeline", node)).contains(record));
+    }
+
+    private static Stream<PipelineState> liveStates() {
+        return Stream.of(PipelineState.RUNNING, PipelineState.PAUSED);
+    }
 
     @Test
     void apply_refreshes_a_joins_downstream_nodes_without_accepting_its_drift_baseline() {

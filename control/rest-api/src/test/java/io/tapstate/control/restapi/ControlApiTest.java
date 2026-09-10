@@ -2,6 +2,8 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.ApplyResult;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactOutcome;
@@ -16,7 +18,6 @@ import io.tapstate.control.core.ConnectionTestService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.Operation;
-import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
@@ -240,6 +241,21 @@ class ControlApiTest {
         assertThat(validated.diagnostics()).isEmpty();
         assertThat(validated.warnings()).extracting(ValidationDiagnostic::code)
                 .containsExactly(STUB_ADVISORY_CODE);
+    }
+
+    @Test
+    void aPostCommitRefreshFailureReturnsAppliedOutcomesAndACodedWarningOverHttp() {
+        ApplyResult applied = applyDrafts(SRC_ORA, TGT_MY, PIPELINE.replace("ora2my_ods", "refresh_failed"));
+
+        assertThat(applied.outcomes()).hasSize(3).allSatisfy(outcome ->
+                assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
+        assertThat(context.getBean(ArtifactStore.class).get("refresh_failed")).isPresent();
+        assertThat(applied.warnings()).singleElement().satisfies(warning -> {
+            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.params()).containsEntry("pipeline", "refresh_failed")
+                    .containsEntry("causeCode", "io.store-unavailable")
+                    .containsEntry("causeParams", Map.of("detail", "test outage"));
+        });
     }
 
     @Test
@@ -770,7 +786,12 @@ class ControlApiTest {
         @Bean
         ApplyService applyService(ArtifactStore store, AuditGate auditGate) {
             return new ApplyService(TapstateCatalog::load, store, auditGate, new EmptySchemaStore(),
-                    ControlApiTest::adviseOnWarnedArtifacts, SchemaDerivation.none());
+                    ControlApiTest::adviseOnWarnedArtifacts, pipeline -> {
+                        if (pipeline.equals("refresh_failed")) {
+                            throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                                    Map.of("detail", "test outage"), null);
+                        }
+                    });
         }
 
         @Bean

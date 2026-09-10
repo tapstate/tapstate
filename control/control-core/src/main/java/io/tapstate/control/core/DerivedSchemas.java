@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import java.util.List;
+import java.util.Objects;
 
 /**
  * The read face and the one write a pipeline's derived output columns have: what a step was recorded
@@ -36,18 +37,17 @@ import java.util.List;
  *   <tr><th>When</th><th>What happens</th></tr>
  *   <tr><td>a start</td><td>re-copies, derives, and <em>refuses</em> a step whose columns moved for a
  *       reason the author did not ask for. It then writes down which version the run holds</td></tr>
- *   <tr><td>a restart</td><td>a start. There is no verb that resumes onto an assembly without building
- *       one, so anything that re-assembles arrives here - said out loud because a reader should not
- *       have to derive it from the absence of a second path</td></tr>
- *   <tr><td>an apply</td><td>re-copies and derives, and refuses nothing. Unconditional: the case that
- *       most needs it leaves the pipeline's content hash byte-identical</td></tr>
+ *   <tr><td>a restart</td><td>a start, which builds a fresh assembly. Resuming a paused run may reuse
+ *       its existing assembly instead</td></tr>
+ *   <tr><td>an apply</td><td>attempts to re-copy and derive even for unchanged artifacts. A skipped or
+ *       failed refresh is reported as a warning alongside the committed artifact outcomes</td></tr>
  *   <tr><td>{@link #accept}</td><td>re-copies, derives, and records - the way past a refusal, and the
  *       only act a person performs on purpose</td></tr>
  *   <tr><td>a removal</td><td>drops every record the pipeline owns</td></tr>
  *   <tr><td>while a job is carrying it</td><td>{@link #accept} is refused. The run is never at risk -
  *       it holds the versions it was assembled from and re-reads none of them - but a record that no
  *       longer describes the job going on sends every later reader somewhere else. A paused pipeline
- *       is allowed; one already asked to resume is not</td></tr>
+ *       retains its assembly and is also refused</td></tr>
  * </table>
  *
  * <p>Accepting does not touch the target table. Making the target able to hold the new shape is the
@@ -70,9 +70,8 @@ public interface DerivedSchemas {
      * rather than two. Deriving over source copies that were not refreshed records today's answer to
      * yesterday's question: the record then agrees with itself and with nothing outside it.
      *
-     * <p>Refused while a job is carrying the pipeline, or while one has been asked for. Being paused is
-     * not being carried - nothing is producing rows, and both ways out of paused build an assembly
-     * again - so a paused pipeline is accepted and one already asked to resume is not.
+     * <p>Refused until both actual and desired lifecycle states are at rest. A paused run still holds
+     * its assembly, and resuming with an unchanged artifact revision may reuse that assembly.
      *
      * <p>Audited, and attributed to {@code principal}. Moving what a refusal is measured against is the
      * one act that can turn this check off for a pipeline, so who did it and when is worth as much as
@@ -94,9 +93,9 @@ public interface DerivedSchemas {
      */
     record ColumnReport(String column, String recorded, String derived, String target) {
 
-        /** Whether the recorded and the recomputed sides agree - the difference a start is refused over. */
+        /** Whether this column differs, including a column added to or removed from either side. */
         public boolean drifted() {
-            return recorded != null && !recorded.equals(derived);
+            return !Objects.equals(recorded, derived);
         }
     }
 }

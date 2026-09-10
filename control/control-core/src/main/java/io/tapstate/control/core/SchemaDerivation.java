@@ -11,10 +11,12 @@ package io.tapstate.control.core;
  * Apply skips the write for that batch, so anything hung on "did we write" would fail to fire in
  * exactly the case it exists for. This runs whether or not anything was written.
  *
- * <p><b>What it deliberately does not do.</b> It records; it never refuses. The gate that holds a step
- * to the shape it was recorded producing belongs to the start, where a person can be told to go and
- * look before any row moves - and a batch of unrelated resources refused because one pipeline's source
- * widened a column is a refusal nobody can act on from where they are standing.
+ * <p>The drift gate belongs to start, not apply. A refresh may still fail with a coded diagnostic,
+ * including a live pipeline whose models cannot be refreshed yet. Apply has already committed its
+ * artifacts when it calls this port: it reports such failures as per-pipeline warnings and attempts
+ * the remaining pipelines. A failure may leave some models refreshed and others unchanged; the
+ * comparison face exposes that drift, and a subsequent apply retries even when the artifact is unchanged.
+ * Programmer errors remain uncaught.
  *
  * <p>Implemented above the layer that can assemble a pipeline, which is why apply reaches it through an
  * interface rather than calling it. An assembly that has no derivation to offer says so by naming

@@ -325,18 +325,24 @@ class DerivedSchemaReportTest {
     }
 
     @Test
-    @DisplayName("syncing a paused pipeline goes through - nothing is producing rows under it")
-    void syncingAPausedPipelineGoesThrough() {
+    @DisplayName("a paused run keeps its assembly and refuses schema acceptance until stopped")
+    void syncingAPausedPipelineIsRefusedWithoutChangingRecordsOrPins() {
         InMemoryStorePort store = seeded();
         new StoreBackedDagSource(store).dagFor("wide");
         pausedAndStayingThere(store);
+        var original = store.derivedSchemas().latest("wide", "orders_src.orders").orElseThrow();
+        var pinned = store.derivedSchemas().pinned("wide", "orders_src.orders");
         widenTheFactKeyColumn(store);
 
-        assertThatCode(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
-                .doesNotThrowAnyException();
+        assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ActuationError.SCHEMA_SYNC_WHILE_RUNNING);
+                    assertThat(error.args()).containsEntry("state", "PAUSED").containsEntry("desired", "PAUSED");
+                });
 
-        assertThat(store.derivedSchemas().latest("wide", "orders_src.orders"))
-                .get().extracting(recorded -> recorded.schema().get("id")).isEqualTo("DECIMAL NULL");
+        assertThat(store.derivedSchemas().latest("wide", "orders_src.orders")).contains(original);
+        assertThat(store.derivedSchemas().pinned("wide", "orders_src.orders")).isEqualTo(pinned);
+        assertThat(audited).isEmpty();
     }
 
     @Test

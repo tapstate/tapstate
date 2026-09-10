@@ -4,6 +4,7 @@ import io.tapstate.control.core.AuditContext;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.DerivedSchemas;
+import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -109,7 +110,7 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
     public void accept(String principal, String pipelineId) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
-        refuseWhileAJobIsProducing(pipelineId);
+        refuseUnlessAtRest(pipelineId);
         auditGate.dispatch(ControlOperations.PIPELINE_ACCEPT_DERIVED_SCHEMA,
                 new AuditContext(principal, pipelineId), () -> {
                     // The physical model first, then everything worked out from it. This order is what
@@ -131,40 +132,22 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
     @Override
     public void derive(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        // Refused while a job is carrying the pipeline, exactly as accepting is - and it was not, until
-        // the copy gained a reader below it. The table a sink creates is now built from what the
-        // pipeline publishes, worked forward from this copy, so moving the copy under a running job
-        // moves what that job was assembled from: the record would say the pipeline produces one shape
-        // while the job produces another, and every reader of the record afterwards describes a
-        // pipeline that is not the one running.
-        //
-        // Nothing else is gated. What holds a join to the columns it was recorded producing is the
-        // start's business: refusing that here would refuse a whole batch of unrelated resources over
-        // one pipeline whose source widened a column, which is not something the author applying can
-        // act on.
-        refuseWhileAJobIsProducing(pipelineId);
+        // Apply converts this coded refusal into a warning after committing its artifacts. The held
+        // run keeps its models; pipelines that are at rest can still refresh in the same batch.
+        refuseUnlessAtRest(pipelineId);
         joins.copySourceSchemas(pipelineId);
         joins.refreshStepSchemas(pipelineId);
     }
 
     /**
-     * Refuses a re-copy while a job is carrying the pipeline, or while one has been asked for.
-     *
-     * <p>The run is never the thing at risk - it holds the versions it was assembled from and re-reads
-     * none of them. What is refused is the disagreement a re-copy would leave behind: the record would
-     * say the pipeline produces one shape while the job going on produces another, and everything read
-     * off the record afterwards would describe a pipeline that is not running.
-     *
-     * <p><b>Paused is allowed and being resumed is not, and that pair is the whole judgement.</b> A
-     * paused pipeline has no job producing anything, and both ways out of paused re-read the definition
-     * - so a re-copy taken there is picked up rather than bypassed. One already asked to resume is a job
-     * about to carry on under the assembly it was paused with, which is the running case arriving a
-     * moment later. Reading only the checkpoint would let that one through.
+     * A paused run still holds its original assembly, and a resume with an unchanged artifact revision
+     * may reuse it. Model refresh does not change that revision, so both actual and desired lifecycle
+     * states must be at rest before any record is moved.
      */
-    private void refuseWhileAJobIsProducing(String pipelineId) {
+    private void refuseUnlessAtRest(String pipelineId) {
         PipelineState actual = actualStateOf(pipelineId);
         PipelineState desired = desiredStateOf(pipelineId);
-        if (actual == PipelineState.RUNNING || desired == PipelineState.RUNNING) {
+        if (!LivePipelines.isAtRest(actual, desired)) {
             throw new TapstateException(ActuationError.SCHEMA_SYNC_WHILE_RUNNING,
                     Map.of("pipeline", pipelineId, "state", actual.name(), "desired", desired.name()),
                     null);
