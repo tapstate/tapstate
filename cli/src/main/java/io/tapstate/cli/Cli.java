@@ -36,7 +36,9 @@ import java.util.function.Supplier;
         description = {
                 "",
                 "With no command, opens a session: a prompt that holds a workspace and, once you",
-                "connect, a server connection. The session commands are listed below.",
+                "connect, a server connection. The session commands are listed below. It exits",
+                "with the status of the first command in it that was refused, so a script that",
+                "pipes commands in reads one status for the whole run.",
                 "",
                 "With a command, runs it once and exits -- the form for scripts. A command takes",
                 "its own options, so the workspace is `tapstate validate -w DIR`, not",
@@ -567,7 +569,8 @@ public final class Cli implements Runnable {
                 return repl.lastExitCode();
             }
             repl.run();
-            return EXIT_OK;
+            // a session that refused a line has to say so: piped into a script, the status is all it reads
+            return repl.sessionExitCode();
         } finally {
             if (oneShotPrompter instanceof JLinePrompter jline) {
                 jline.close();

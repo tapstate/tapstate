@@ -42,6 +42,18 @@ final class CliOnce {
 
     /** Launches the CLI with its password supplied outside the command line. */
     static Run runWithPassword(String password, String... args) {
+        return launch(password, null, args);
+    }
+
+    /**
+     * The same run with a script on its standard input, which is how something other than a person
+     * drives a whole session: the lines arrive as if typed, and the process ends when they run out.
+     */
+    static Run runSession(String password, String script, String... args) {
+        return launch(password, script, args);
+    }
+
+    private static Run launch(String password, String script, String... args) {
         List<String> command = new ArrayList<>(List.of(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-cp", classpath(),
@@ -60,6 +72,14 @@ final class CliOnce {
                     .redirectError(errFile.toFile());
             if (password != null) {
                 builder.environment().put("TAPSTATE_PASSWORD", password);
+            }
+            if (script != null) {
+                // a file rather than writing down the pipe: the session reads its lines whenever it gets
+                // to them, and a writer racing the reader can fill the buffer and hold both processes
+                Path inFile = Files.createTempFile("cli-in", ".txt");
+                inFile.toFile().deleteOnExit();
+                Files.writeString(inFile, script, StandardCharsets.UTF_8);
+                builder.redirectInput(inFile.toFile());
             }
             Process process = builder.start();
             if (!process.waitFor(2, TimeUnit.MINUTES)) {

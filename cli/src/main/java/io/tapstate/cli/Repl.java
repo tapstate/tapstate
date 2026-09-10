@@ -186,6 +186,9 @@ final class Repl {
     /** The status of the last dispatched line; see {@link #lastExitCode()}. */
     private int lastExitCode;
 
+    /** The status the whole session will leave behind; see {@link #sessionExitCode()}. */
+    private int sessionExitCode = Cli.EXIT_OK;
+
     /** Whether to drop the connect / sign-in confirmations; see {@link #confirm}. */
     private boolean quiet;
 
@@ -307,12 +310,23 @@ final class Repl {
     }
 
     /**
-     * The status the last dispatched line produced, in the same scheme one-shot mode exits with. The
-     * read loop ignores it — a line that failed does not end a session — but a scripted invocation that
-     * runs one line and leaves has nothing else to report with.
+     * The status the last dispatched line produced, in the same scheme one-shot mode exits with. A line
+     * that failed does not end a session, so the read loop reads on past it; what the session leaves
+     * behind is {@link #sessionExitCode()}, which this one is folded into as each line is dispatched.
      */
     int lastExitCode() {
         return lastExitCode;
+    }
+
+    /**
+     * The status the session as a whole earned: the first line that was refused, or success if none was.
+     * A session outlives the line that failed in it, so the last line's status cannot speak for it -- a
+     * script ends with {@code exit}, which succeeds, and reading the status off the end would call every
+     * such run successful. The first refusal is kept rather than the last because the lines after it
+     * mostly fail because of it, and the first one is the one that explains the run.
+     */
+    int sessionExitCode() {
+        return sessionExitCode;
     }
 
     /** Requests any in-flight {@code --watch} / {@code --follow} stream to stop; wired to Ctrl-C in {@link #run}. */
@@ -394,10 +408,11 @@ final class Repl {
     /**
      * Handles one input line. Returns {@code false} when the loop should stop (exit / quit); the status
      * the line produced is left in {@link #lastExitCode()}, which is what a one-shot invocation exits
-     * with. Inside the read loop nothing consumes it — a failed line does not end a session.
+     * with, and folded into {@link #sessionExitCode()}, which is what a whole session exits with. A
+     * failed line does not end a session either way.
      */
     boolean dispatch(String line) {
-        return dispatchLine(line == null ? "" : line.trim());
+        return keepSessionStatus(dispatchLine(line == null ? "" : line.trim()));
     }
 
     /**
@@ -406,7 +421,7 @@ final class Repl {
      * and the shell has already done that job.
      */
     boolean dispatch(List<String> words) {
-        return dispatchWords(words);
+        return keepSessionStatus(dispatchWords(words));
     }
 
     /** Dispatches a scripted command without letting lazy target setup contaminate its stdout. */
@@ -414,10 +429,22 @@ final class Repl {
         boolean previous = this.quiet;
         this.quiet = quiet;
         try {
-            return dispatchWords(words);
+            return keepSessionStatus(dispatchWords(words));
         } finally {
             this.quiet = previous;
         }
+    }
+
+    /**
+     * Folds the status the dispatched line just produced into the session's own, and passes the line's
+     * own answer about whether to keep reading through untouched. Every dispatched line returns through
+     * here, so no caller has to remember to collect a failure it did not stop for.
+     */
+    private boolean keepSessionStatus(boolean keepReading) {
+        if (sessionExitCode == Cli.EXIT_OK) {
+            sessionExitCode = lastExitCode;
+        }
+        return keepReading;
     }
 
     private boolean dispatchLine(String trimmed) {
