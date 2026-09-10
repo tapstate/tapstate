@@ -1,0 +1,11 @@
+version: tapstate/v1
+kind: pipeline
+id: snapshot_resume
+source: src_file
+settings: { read_mode: snapshot_only }
+transforms:
+  - { id: snapshot_rows, from: [orders], type: filter, expr: "op == 'r'" }
+serve:
+  from: snapshot_rows
+  sync:
+    - source: tgt_file

@@ -1,0 +1,29 @@
+# A snapshot-only run has no chain and therefore no durable delivery confirmation. Resume must
+# read its tables again. The first load is allowed to drain before the pause, avoiding a race to
+# suspend a small fixture mid-load; the absence of delivery evidence is the same in either case.
+#
+# Insert a row while paused so the final count cannot be satisfied by the first load. There is no
+# CDC tail, and the filter admits only snapshot rows, so only another snapshot can carry that row.
+# This witnesses the conservative reload decision, not the timing of a partially delivered load.
+#
+# Mutation evidence: make StoreBackedPipelineCaptureCoordinator.snapshotOnChain drop runs with
+# no chain again. Both tiers fail the final await: "tgt_file.orders expected 3, found 2". The
+# neighboring the-snapshot-half-reaches-the-target case still passes on both tiers. Restoring
+# the production fix passes all four runs without changing any assertion.
+name: a-snapshot-only-resume-reads-the-source-again
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  discover: [src_file]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 2 }
+steps:
+  - start
+  - await: { count: { tgt_file.orders: 2 } }
+  - pause
+  - await: { state: PAUSED }
+  - cdc: { src_file.orders: insert 1 }
+  - assert: { count: { tgt_file.orders: 2 } }
+  - resume
+  - await: { count: { tgt_file.orders: 3 } }
