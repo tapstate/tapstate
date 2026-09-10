@@ -120,12 +120,14 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
             int selectedLine,
             int cursorOffset,
             boolean editing,
-            boolean pendingDiscard) {
+            boolean pendingDiscard,
+            Optional<WorkbenchQuickDocProvider.QuickDoc> quickDoc) {
 
         Document {
             Objects.requireNonNull(relativePath, "relativePath");
             Objects.requireNonNull(originalContent, "originalContent");
             Objects.requireNonNull(content, "content");
+            Objects.requireNonNull(quickDoc, "quickDoc");
             if (relativePath.isAbsolute() || relativePath.normalize().startsWith("..")) {
                 throw new IllegalArgumentException("Workspace documents require a relative path");
             }
@@ -138,6 +140,19 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
             if (pendingDiscard && (!editing || !dirty(originalContent, content))) {
                 throw new IllegalArgumentException("Discard confirmation requires dirty edit mode");
             }
+        }
+
+        Document(
+                Path relativePath,
+                String originalContent,
+                String content,
+                int selectedLine,
+                int cursorOffset,
+                boolean editing,
+                boolean pendingDiscard) {
+            this(relativePath, originalContent, content, selectedLine, cursorOffset, editing, pendingDiscard,
+                    WorkbenchQuickDocProvider.BUNDLED.document(
+                            content, editing ? lineOfOffset(content, cursorOffset) : selectedLine));
         }
 
         static Document open(Path relativePath, String content) {

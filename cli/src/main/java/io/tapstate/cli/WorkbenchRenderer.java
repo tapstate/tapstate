@@ -479,7 +479,7 @@ final class WorkbenchRenderer {
 
         Rect viewerInner = viewerBlock.inner(viewerArea);
         state.workspaceView().document().ifPresentOrElse(
-                document -> renderDocument(frame, viewerInner, document, theme),
+                document -> renderWorkspaceDocument(frame, viewerInner, document, theme),
                 () -> {
                     write(frame, viewerInner.x(), viewerInner.y(),
                             "Select a file and press Enter to open it.", theme.muted(), viewerInner);
@@ -490,6 +490,37 @@ final class WorkbenchRenderer {
                 .filter(WorkbenchWorkspaceState.Document::pendingDiscard)
                 .ifPresent(ignored -> renderDiscardPopup(frame, viewerArea, theme));
         return new ContentLayout(List.copyOf(hits), capacity);
+    }
+
+    private static void renderWorkspaceDocument(
+            Frame frame,
+            Rect viewerInner,
+            WorkbenchWorkspaceState.Document document,
+            WorkbenchTheme theme) {
+        boolean showQuickDoc = document.quickDoc().isPresent() && viewerInner.height() >= 8;
+        Rect documentArea = showQuickDoc
+                ? new Rect(viewerInner.x(), viewerInner.y(), viewerInner.width(), viewerInner.height() - 4)
+                : viewerInner;
+        renderDocument(frame, documentArea, document, theme);
+        if (showQuickDoc) {
+            Rect quickDocArea = new Rect(
+                    viewerInner.x(), viewerInner.bottom() - 4, viewerInner.width(), 4);
+            renderQuickDoc(frame, quickDocArea, document.quickDoc().orElseThrow(), theme);
+        }
+    }
+
+    private static void renderQuickDoc(
+            Frame frame,
+            Rect area,
+            WorkbenchQuickDocProvider.QuickDoc quickDoc,
+            WorkbenchTheme theme) {
+        frame.buffer().setStyle(new Rect(area.x(), area.y(), area.width(), 1), theme.muted());
+        write(frame, area.x(), area.y(), "Quick Doc  " + clip(quickDoc.title(), area.width() - 11),
+                quickDoc.validationError().isPresent() ? theme.error().bold() : theme.label().bold(), area);
+        write(frame, area.x(), area.y() + 1, clip(quickDoc.description(), area.width()),
+                quickDoc.validationError().isPresent() ? theme.error() : theme.muted(), area);
+        write(frame, area.x(), area.y() + 2, clip(quickDoc.constraint(), area.width()), theme.info(), area);
+        write(frame, area.x(), area.y() + 3, "Schema: bundled tapstate/v1", theme.muted(), area);
     }
 
     private static Block panel(String title, boolean focused, WorkbenchTheme theme) {

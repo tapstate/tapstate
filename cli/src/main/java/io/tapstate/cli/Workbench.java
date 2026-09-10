@@ -870,8 +870,11 @@ final class Workbench {
 
         private void completeContextDelete(WorkbenchActionGateway.ContextDeleteResult result) {
             switch (result) {
-                case WorkbenchActionGateway.ContextDeleteResult.Deleted ignored -> runtime.updateState(state ->
-                        state.withOverlay(contextMessage("Context deleted")));
+                case WorkbenchActionGateway.ContextDeleteResult.Deleted ignored -> {
+                    refreshCoordinator.advanceContext();
+                    refresh();
+                    runtime.updateState(state -> state.withOverlay(contextMessage("Context deleted")));
+                }
                 case WorkbenchActionGateway.ContextDeleteResult.Unavailable ignored -> runtime.updateState(state ->
                         state.withOverlay(contextMessage("Context could not be deleted")));
             }
