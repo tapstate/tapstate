@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.join;
 import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.map.IMap;
 import io.tapstate.spi.store.KeyedStateStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -265,6 +266,48 @@ class ImapJoinStoresTest {
         assertThat(stores.indexPageCount(DIMENSION, "d1")).isEqualTo(2);
         assertThat(stores.indexPage(DIMENSION, "d1", 0)).isEmpty();
         assertThat(stores.indexPage(DIMENSION, "d1", 1)).containsExactly("f4", "f5");
+    }
+
+    /**
+     * The window the head's own deletion opens. A removal ends by lowering the hint onto the end it
+     * walked to and then dropping the head if it is empty; an append that read the head before that
+     * lowering opens the page the removal has just closed, and its bump is overwritten by the exact
+     * lowering. The head is then dropped believing nothing follows it, and the page holding the fact
+     * key that was just appended is named by nothing at all - after which the count answers that this
+     * dimension key has no fact rows, and a recompute that reads the count stops before it starts.
+     *
+     * <p><b>The steps are driven in that order rather than raced by two threads, on purpose.</b> Each
+     * one is a single entry processor and so is atomic on its own; what is in question is whether the
+     * composition of them admits this end state, which this settles. A race that reproduces once in
+     * ten thousand runs would not be something anyone could act on.
+     */
+    @Test
+    @DisplayName("a page opened while the head is being dropped is still counted")
+    void aPageOpenedWhileTheHeadIsDroppedIsStillCounted() {
+        for (int i = 0; i < 5; i++) {
+            stores.indexAdd(DIMENSION, "d1", "f" + i);
+        }
+        for (int i = 0; i < 4; i++) {
+            stores.indexRemove(DIMENSION, "d1", "f" + i);
+        }
+        // An empty head and one key on page 1: the shape both writers below start from.
+        IMap<ReverseBucket.At, ReverseBucket> pages =
+                member.getMap(JoinMaps.reverseIndex(PIPELINE, STEP, DIMENSION));
+
+        // A, removing the last key of page 1: the drop empties the page and the trim closes it.
+        pages.executeOnKey(new ReverseBucket.At("d1", 1), new ImapJoinStores.Drop("f4"));
+        pages.executeOnKey(new ReverseBucket.At("d1", 1), new ImapJoinStores.DropIfEmpty());
+        // B, appending: it read the head while page 1 was still there, so it opens page 1 again.
+        pages.executeOnKey(new ReverseBucket.At("d1", 1), new ImapJoinStores.Append("f5", 4));
+        pages.executeOnKey(new ReverseBucket.At("d1", 0), new ImapJoinStores.Hint(1));
+        // A again: the exact lowering onto the end it walked to, then the head dropped as empty.
+        pages.executeOnKey(new ReverseBucket.At("d1", 0), new ImapJoinStores.Hint(0, true));
+        pages.executeOnKey(new ReverseBucket.At("d1", 0), new ImapJoinStores.DropIfEmpty());
+
+        assertThat(stores.indexPageCount(DIMENSION, "d1"))
+                .as("the page B opened is still named, rather than the bucket answering as gone")
+                .isEqualTo(2);
+        assertThat(stores.indexPage(DIMENSION, "d1", 1)).containsExactly("f5");
     }
 
     /**
