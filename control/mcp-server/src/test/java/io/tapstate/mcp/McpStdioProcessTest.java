@@ -57,7 +57,7 @@ class McpStdioProcessTest {
             Map<?, ?> listed = readResponse(output, Duration.ofSeconds(10));
             assertThat(listed.get("id")).isEqualTo(2L);
             List<?> tools = (List<?>) ((Map<?, ?>) listed.get("result")).get("tools");
-            assertThat(tools).hasSize(15);
+            assertThat(tools).hasSize(17);
             assertThat(tools.stream()
                     .map(tool -> String.valueOf(((Map<?, ?>) tool).get("name")))
                     .toList())
@@ -69,8 +69,9 @@ class McpStdioProcessTest {
                             "pipeline_logs")
                     // The read face, over the real protocol: a client that spoke to this process would
                     // be offered these three by name, which is the only place that is true end to end.
-                    .contains("data_browser_collections", "data_browser_find", "data_browser_stats")
-                    .doesNotContain("source_create", "source_list", "source_get", "source_update", "source_delete",
+                    .contains("data_browser_collections", "data_browser_find", "data_browser_stats",
+                            "source_list", "pipeline_list")
+                    .doesNotContain("source_create", "source_get", "source_update", "source_delete",
                             "artifact_apply", "pipeline_start", "artifact_delete");
 
             send(input, """
