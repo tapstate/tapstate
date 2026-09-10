@@ -42,7 +42,7 @@ class AssemblyObservationPublisherTest {
     @Test
     void projectsThePerTableSinkAckedPositionAndKeepsRecordCountAbsentWithNoLiveJob() {
         SourceResource source = new SourceResource("orders_src", null, "fake", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal(TABLE)), null, null, null);
+                SourceMode.CDC, List.of(TableRef.literal(TABLE)), null, null);
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source);
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("orders_src", true)), null, null, null, null, null));

@@ -17,7 +17,8 @@ public sealed interface ViewBlock {
                   String id,
                   @Doc(value = "The upstream source this view consumes records from.", required = true)
                   FromRef from,
-                  @Doc("Field or fields that uniquely identify a record in this view.")
+                  @Doc(value = "Field or fields that uniquely identify a record in this view.",
+                       required = true)
                   String primaryKey,
                   @Doc("Storage backend used to persist this view.")
                   Storage storage,

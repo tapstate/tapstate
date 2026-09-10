@@ -18,13 +18,9 @@ public record PushElement(@Doc("Optional id for this push element; defaults to a
                           @Doc("Target topic or channel the change events are pushed to.")
                           String topic,
                           @Doc("Serialization format used to encode each pushed change event.")
-                          PushFormat format,
-                          @Doc("Connector-owned extension options.")
-                          Map<String, Object> options) {
+                          PushFormat format) {
 
     public PushElement {
         Objects.requireNonNull(source, "source");
-        options = options == null ? null
-                : Collections.unmodifiableMap(new LinkedHashMap<>(options));
     }
 }

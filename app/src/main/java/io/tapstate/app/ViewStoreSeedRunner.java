@@ -74,7 +74,7 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
                 // No mode and no tables: this is a connection supplier, not something to read from. The
                 // distinction is load-bearing -- a resource under this id that declares capture settings
                 // is refused as an authored source rather than written into.
-                null, null, null, null, null);
+                null, null, null, null);
         ArtifactMutation outcome = artifacts.create(store);
         if (outcome == ArtifactMutation.CREATED) {
             LOG.info("Registered the managed state store '{}' for views to materialize into", id);

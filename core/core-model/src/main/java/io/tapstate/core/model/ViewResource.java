@@ -15,7 +15,7 @@ public record ViewResource(
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,
-        @Doc("Name of the column used as the view's primary key.")
+        @Doc(value = "Name of the column used as the view's primary key.", required = true)
         String primaryKey,
         @Doc("Where and how the view's data is materialized.")
         Storage storage,

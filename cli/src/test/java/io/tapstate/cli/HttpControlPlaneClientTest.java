@@ -742,7 +742,7 @@ class HttpControlPlaneClientTest {
                 seen);
         try {
             ApplyOutcome outcome = new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("src_kfk.tap.yml", "kind: source\nid: src_kfk\n")));
+                    List.of(new LocalDraft("src_kfk.tap.yml", "version: tapstate/v1\nkind: source\nid: src_kfk\n")));
             assertThat(outcome).isInstanceOf(ApplyOutcome.Applied.class);
             ApplyOutcome.Applied applied = (ApplyOutcome.Applied) outcome;
             assertThat(applied.items()).containsExactly(
@@ -774,7 +774,7 @@ class HttpControlPlaneClientTest {
                 seen);
         try {
             ApplyOutcome outcome = new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("src_kfk.tap.yml", "kind: source\nid: src_kfk\n")));
+                    List.of(new LocalDraft("src_kfk.tap.yml", "version: tapstate/v1\nkind: source\nid: src_kfk\n")));
 
             assertThat(outcome).isInstanceOf(ApplyOutcome.Applied.class);
             ApplyOutcome.Applied applied = (ApplyOutcome.Applied) outcome;
@@ -800,7 +800,7 @@ class HttpControlPlaneClientTest {
                 seen);
         try {
             ApplyOutcome outcome = new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("src_kfk.tap.yml", "kind: source\nid: src_kfk\n")));
+                    List.of(new LocalDraft("src_kfk.tap.yml", "version: tapstate/v1\nkind: source\nid: src_kfk\n")));
 
             ApplyOutcome.Applied applied = (ApplyOutcome.Applied) outcome;
             assertThat(applied.items()).hasSize(1);
@@ -822,11 +822,11 @@ class HttpControlPlaneClientTest {
         HttpServer server = apiServer("/api/artifacts:apply", 200, "{\"outcomes\":[]}", seen);
         try {
             new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("a.tap.yml", "kind: source\nid: a\n", "f".repeat(64))));
+                    List.of(new LocalDraft("a.tap.yml", "version: tapstate/v1\nkind: source\nid: a\n", "f".repeat(64))));
             assertThat(seen.get().body()).contains("\"expectedContentHash\": \"" + "f".repeat(64) + "\"");
 
             new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("a.tap.yml", "kind: source\nid: a\n")));
+                    List.of(new LocalDraft("a.tap.yml", "version: tapstate/v1\nkind: source\nid: a\n")));
             assertThat(seen.get().body()).doesNotContain("expectedContentHash");
         } finally {
             server.stop(0);
@@ -1037,7 +1037,7 @@ class HttpControlPlaneClientTest {
         }
         ApplyOutcome outcome = new HttpControlPlaneClient(Duration.ofMillis(400), Duration.ofMillis(400))
                 .apply(URI.create("http://127.0.0.1:" + closedPort),
-                        "tok", List.of(new LocalDraft("a.tap.yml", "kind: source\n")));
+                        "tok", List.of(new LocalDraft("a.tap.yml", "version: tapstate/v1\nkind: source\n")));
         assertThat(outcome).isInstanceOf(ApplyOutcome.Unreachable.class);
     }
 

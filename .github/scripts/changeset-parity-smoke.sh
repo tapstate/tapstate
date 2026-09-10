@@ -104,6 +104,44 @@ refuses "a migration runner with no changesets where this looks is caught, not r
 refuses "a ref this repository does not know is refused" \
         "$work" empty-base v9.9.9-nope "not a commit"
 
+# What the counting is actually counting. It is files in a directory, not classes implementing
+# anything -- it reads a tree, and a tree has no types in it. So a helper parked next to the runner is
+# a changeset as far as this is concerned, the two lines stop agreeing for a reason that has nothing to
+# do with a changeset, and a release is refused with a message about one.
+seed "$work" helper-base V1
+git_c "$work" checkout --quiet -B helper-beside helper-base
+printf 'class LockDocument {}\n' > "$work/$pkg/LockDocument.java"
+git_c "$work" add -A; git_c "$work" commit --quiet -m "a helper parked with the changesets"
+refuses "a helper parked beside the changesets is counted as one" \
+        "$work" helper-base helper-beside "only in the release: LockDocument"
+
+# And a subdirectory does not get around it: the listing is recursive, so a helper one package down is
+# counted exactly the same. Worth a case of its own because "put it in a subpackage" is the obvious
+# thing to reach for and it does not work.
+git_c "$work" checkout --quiet -B helper-below helper-base
+mkdir -p "$work/$pkg/support"
+printf 'class LockDocument {}\n' > "$work/$pkg/support/LockDocument.java"
+git_c "$work" add -A; git_c "$work" commit --quiet -m "a helper one package down"
+refuses "a helper in a subpackage is counted just the same" \
+        "$work" helper-base helper-below "only in the release: LockDocument"
+
+# The standing consequence for this repository: everything in that package is either the runner or a
+# changeset. Read from the real tree, because the two cases above show what it costs when it is not,
+# and nothing else would notice a helper landing there until a release refused itself.
+# Read from the working tree, not from HEAD. A file added but not yet committed is exactly the state
+# somebody is in while making this mistake, and a check that reads HEAD passes for them and fails in
+# CI -- the one place the answer arrives too late to be useful. Measured: with a helper class sitting
+# in the package, the HEAD-reading form of this case reported it clean.
+strays="$( find "$repo/$pkg" -name '*.java' -type f 2>/dev/null \
+    | sed -n 's|.*/\([A-Za-z0-9_]*\)\.java$|\1|p' \
+    | grep -v '^MigrationRunner$' | grep -v '^V[0-9]' || true )"
+if [ -z "$strays" ]; then
+    echo "ok   - the migration package holds only the runner and the changesets"
+else
+    echo "FAIL - these are neither the runner nor a changeset, and each is counted as one: $strays"
+    failures=$((failures + 1))
+fi
+
 # The release workflow actually calls it, and only for a patch. A check nothing invokes cannot fail.
 wf="$repo/.github/workflows/release.yml"
 if grep -q 'changeset-parity.sh' "$wf"; then

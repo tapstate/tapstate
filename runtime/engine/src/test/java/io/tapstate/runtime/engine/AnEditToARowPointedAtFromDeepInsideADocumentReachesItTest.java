@@ -181,12 +181,12 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
         aliases.put("order", FromRef.literal("orders"));
         aliases.put("line", FromRef.literal("lines"));
         aliases.put("product", FromRef.literal("products"));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
 
         PipelineResource pipeline = new PipelineResource(PIPELINE, null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("lines"), SourceRef.bare("products")), List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();

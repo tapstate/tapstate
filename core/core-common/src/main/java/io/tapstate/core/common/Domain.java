@@ -29,6 +29,12 @@ public enum Domain {
     ACTUATION,
     // storage connectivity: reaching the backing store and its replica-set requirement (adapters)
     STORE,
+    // system-data schema versioning: the startup gate that compares the version the store holds
+    // against the versions this build knows, and the migrator that moves it forward. Distinct from
+    // STORE, which reports that the store could not be reached at all, and from IO, which reports a
+    // failure operating on it once it is up: these say the store was reached and is at a version this
+    // process must not run against (adapters)
+    MIGRATION,
     // pdk bridge: loading, level-gating, driving and projecting a connector (adapters)
     CONNECTOR,
     // stateless row transforms: evaluating an author's CEL expression or js script against an event

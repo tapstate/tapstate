@@ -173,7 +173,7 @@ class DemoCmdTest {
         String mine = "# mine, edited\nkind: source\nid: orders_db\n";
         Files.writeString(theirs, mine);
         Path readOnly = dir.resolve("pipeline/order_pipeline.tap.yml");
-        Files.writeString(readOnly, "kind: pipeline\n");
+        Files.writeString(readOnly, "version: tapstate/v1\nkind: pipeline\n");
         readOnly.toFile().setWritable(false, false);
         // Root can write a file with no write bit, and then there is no failure to roll back from.
         assumeTrue(!Files.isWritable(readOnly), "needs a filesystem that enforces the write bit");
