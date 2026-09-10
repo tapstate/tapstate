@@ -122,13 +122,13 @@ class TheLimitOnWhatWaitsReachesTheJobThatEnforcesItTest {
         aliases.put("customer", FromRef.literal("customers"));
         aliases.put("policy", FromRef.literal("policies"));
         aliases.put("claim", FromRef.literal("claims"));
-        Step step = Step.inline(NODE, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(NODE, FromClause.aliases(aliases), body, null);
 
         PipelineResource pipeline = new PipelineResource(PIPELINE, null,
                 List.of(SourceRef.bare("customers"), SourceRef.bare("policies"), SourceRef.bare("claims")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(NODE),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         List<Map<String, Object>> claimRows = new ArrayList<>();

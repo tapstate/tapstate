@@ -651,7 +651,7 @@ class DataBrowserApiTest {
                     new SourceResource(
                             "views", null, "mongodb",
                             Map.of("uri", "mongodb://db.local", "database", "shop"),
-                            null, null, null, null, null),
+                            null, null, null, null),
                     new ViewResource(
                             "v_order_state",
                             new Metadata(null, "One row per order, shipments inlined"),

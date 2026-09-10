@@ -42,7 +42,7 @@ class DataBrowserCollectionsTest {
     private static final SourceResource VIEWS = new SourceResource(
             "views", null, "mongodb",
             Map.of("uri", "mongodb://db.local", "database", "shop"),
-            null, null, null, null, null);
+            null, null, null, null);
 
     private static final DataBrowserPreview NOTHING = new DataBrowserPreview(List.of(), null, false);
 

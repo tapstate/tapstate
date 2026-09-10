@@ -165,7 +165,6 @@ class PipelineViewServiceTest {
                 null,
                 null,
                 null,
-                null,
                 null);
     }
 

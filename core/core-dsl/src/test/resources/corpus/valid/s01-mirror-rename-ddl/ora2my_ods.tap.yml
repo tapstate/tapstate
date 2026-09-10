@@ -15,4 +15,3 @@ serve:
         case: lower
         prefix: ods_
       ddl: apply
-      options: { auto_create_table: true }

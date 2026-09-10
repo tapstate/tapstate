@@ -162,10 +162,10 @@ class SrsDagRunTest {
                 List.of(SourceRef.bare("orders_src")),
                 List.of(Step.inline("transform",
                         FromClause.list(FromRef.literal("orders_src")),
-                        new TransformBody.Filter("true"), null, null)),
+                        new TransformBody.Filter("true"), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("transform"),
-                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)),
                         null, null),
                 null, null);
     }
