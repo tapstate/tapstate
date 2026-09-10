@@ -497,7 +497,7 @@ final class WorkbenchRenderer {
             Rect viewerInner,
             WorkbenchWorkspaceState.Document document,
             WorkbenchTheme theme) {
-        boolean showQuickDoc = document.quickDoc().isPresent() && viewerInner.height() >= 8;
+        boolean showQuickDoc = document.quickDoc().isPresent() && viewerInner.height() > 10;
         Rect documentArea = showQuickDoc
                 ? new Rect(viewerInner.x(), viewerInner.y(), viewerInner.width(), viewerInner.height() - 4)
                 : viewerInner;
@@ -514,13 +514,17 @@ final class WorkbenchRenderer {
             Rect area,
             WorkbenchQuickDocProvider.QuickDoc quickDoc,
             WorkbenchTheme theme) {
-        frame.buffer().setStyle(new Rect(area.x(), area.y(), area.width(), 1), theme.muted());
-        write(frame, area.x(), area.y(), "Quick Doc  " + clip(quickDoc.title(), area.width() - 11),
-                quickDoc.validationError().isPresent() ? theme.error().bold() : theme.label().bold(), area);
-        write(frame, area.x(), area.y() + 1, clip(quickDoc.description(), area.width()),
-                quickDoc.validationError().isPresent() ? theme.error() : theme.muted(), area);
-        write(frame, area.x(), area.y() + 2, clip(quickDoc.constraint(), area.width()), theme.info(), area);
-        write(frame, area.x(), area.y() + 3, "Schema: bundled tapstate/v1", theme.muted(), area);
+        Style divider = quickDoc.validationError().isPresent() ? theme.error() : theme.muted();
+        String prefix = "─── ";
+        int titleWidth = displayWidth(quickDoc.title());
+        int remaining = Math.max(0, area.width() - displayWidth(prefix) - titleWidth - 1);
+        int x = area.x();
+        x += write(frame, x, area.y(), prefix, divider, area);
+        x += write(frame, x, area.y(), quickDoc.title(), divider.bold(), area);
+        write(frame, x, area.y(), " " + "─".repeat(remaining), divider, area);
+        for (int index = 0; index < quickDoc.entries().size() && index < area.height() - 1; index++) {
+            write(frame, area.x(), area.y() + index + 1, quickDoc.entries().get(index), divider, area);
+        }
     }
 
     private static Block panel(String title, boolean focused, WorkbenchTheme theme) {

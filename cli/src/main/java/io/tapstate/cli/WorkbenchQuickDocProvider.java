@@ -47,15 +47,16 @@ final class WorkbenchQuickDocProvider {
         }
     }
 
-    record QuickDoc(String title, String description, String constraint, Optional<String> validationError) {
+    record QuickDoc(String title, List<String> entries, Optional<String> validationError) {
         QuickDoc {
+            entries = List.copyOf(entries);
             validationError = Optional.copyOf(validationError);
         }
 
         static QuickDoc from(SchemaNode node) {
             String title = node.path() + "  " + node.type() + (node.isRequired() ? "  required" : "  optional");
             String description = node.description() == null || node.description().isBlank()
-                    ? "No bundled description."
+                    ? ""
                     : node.description();
             String constraint = node.enumValues().isEmpty()
                     ? node.children().isEmpty() ? "" : "Fields: " + String.join(", ", node.children())
@@ -63,11 +64,13 @@ final class WorkbenchQuickDocProvider {
                             .map(SchemaNode.EnumValue::value)
                             .reduce((left, right) -> left + ", " + right)
                             .orElse("");
-            return new QuickDoc(title, description, constraint, Optional.empty());
+            return new QuickDoc(title, List.of(description, constraint).stream()
+                    .filter(value -> !value.isBlank())
+                    .toList(), Optional.empty());
         }
 
         static QuickDoc error(String path, String error) {
-            return new QuickDoc(path, "Validation error: " + error, "", Optional.of(error));
+            return new QuickDoc(path, List.of("Validation error: " + error), Optional.of(error));
         }
     }
 

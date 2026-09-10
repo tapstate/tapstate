@@ -290,6 +290,25 @@ class WorkbenchRendererTest {
     }
 
     @Test
+    void workspaceQuickDocUsesCamelMainBottomDividerInsteadOfAnInlineToggle() {
+        WorkbenchArtifactRow source = row(
+                "source", "orders", WorkbenchAlignment.IN_SYNC, "source/orders.tap.yml", true);
+        WorkbenchWorkspaceState workspace = WorkbenchWorkspaceState.empty()
+                .open(Path.of("source/orders.tap.yml"), "kind: source\nid: orders\n")
+                .navigate(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.DOWN));
+        WorkbenchState state = accepted(snapshot(
+                        new WorkbenchRemoteState.Available(1), List.of(source)))
+                .select(WorkbenchState.WorkbenchTab.WORKSPACE)
+                .withWorkspaceView(workspace);
+
+        Rendered rendered = render(120, 30, state);
+
+        assertThat(rendered.text())
+                .contains("─── source.id", "id: orders")
+                .doesNotContain("Quick Doc", "i  quick doc");
+    }
+
+    @Test
     void editorUsesPlainTextGutterAndNearestYamlScopeLikeCamel() {
         WorkbenchArtifactRow source = row(
                 "source", "orders", WorkbenchAlignment.IN_SYNC, "source/orders.tap.yml", true);
