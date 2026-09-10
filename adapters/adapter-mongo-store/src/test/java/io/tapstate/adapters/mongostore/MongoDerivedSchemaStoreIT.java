@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.testsupport.RequiresDocker;
@@ -189,18 +190,17 @@ class MongoDerivedSchemaStoreIT {
         // A stored document written by something else, or damaged, must not reach a caller as a bare
         // cast failure: that is a defect dressed as a runtime crash with no pointer to the document.
         withStore((store, collection) -> {
-            collection.insertOne(new Document("_id", "wide").append("steps",
-                    List.of(new Document("step", "widen").append("versions",
-                            List.of(new Document("version", 0)
-                                    .append("columns", List.of(new Document("name", "id")))
-                                    .append("statement", "sql-a")
-                                    .append("derivedFrom", "src-v1")
-                                    .append("derivedBy", "calcite"))))));
+            collection.insertOne(new Document("_id", "wide.widen").append("versions",
+                    List.of(new Document("version", 0)
+                            .append("columns", List.of(new Document("name", "id")))
+                            .append("statement", "sql-a")
+                            .append("derivedFrom", "src-v1")
+                            .append("derivedBy", "calcite"))));
 
             assertThatThrownBy(() -> store.latest("wide", "widen"))
                     .isInstanceOfSatisfying(TapstateException.class, error -> {
                         assertThat(error.code().code()).isEqualTo("io.document-unreadable");
-                        assertThat(error.args()).containsEntry("id", "wide");
+                        assertThat(error.args()).containsEntry("id", "wide").containsEntry("field", "versions");
                     });
         });
     }
@@ -269,7 +269,7 @@ class MongoDerivedSchemaStoreIT {
      * the next genuine change as the first one - which is why the move happens rather than a discard.
      */
     @Test
-    void aPipelineHeldInTheSupersededDocumentKeepsItsHistoryWhenNextWritten() {
+    void aPipelineMigratedAtStartupKeepsItsHistoryWhenNextWritten() {
         withStore((store, collection) -> {
             collection.insertOne(new Document("_id", "legacy").append("steps", List.of(
                     new Document("step", "widen").append("versions", List.of(
@@ -278,7 +278,11 @@ class MongoDerivedSchemaStoreIT {
                     new Document("step", "enrich").append("versions", List.of(
                             version(0, "name", "STRING NULL", "sql-c"))))));
 
-            // Reading alone must already see it, before anything has moved it across.
+            try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+                SystemCollections.SYSTEM_META.on(client.getDatabase("tapstate")).drop();
+                MigrationRunner.migrate(client.getDatabase("tapstate"));
+            }
+            // Startup has moved every step before the first store read or write.
             assertThat(store.latest("legacy", "widen").orElseThrow().version()).isEqualTo(1L);
 
             store.record("legacy", "widen", columns("id", "STRING NULL"), "sql-d", "src-v9", "calcite");

@@ -69,8 +69,8 @@ public final class MongoSchemaStore implements SchemaStore {
      * <p>Bumped when the tables moved out of the envelope. A document written by the previous build
      * carries its tables inline and names no generation, so reading it through the current path would
      * find no tables and report an empty database - a wrong answer in the shape of a right one.
-     * Answering "not discovered" instead is the same migration this stamp already performed once: a
-     * re-discovery writes the current shape, and nothing here is data a re-discovery cannot rebuild.
+     * Startup migration moves those inline observations into table documents before this reader is
+     * available. The stamp remains a read guard for callers that bypass verified startup.
      */
     static final int RESOLVED_TYPES = 2;
 
@@ -124,11 +124,8 @@ public final class MongoSchemaStore implements SchemaStore {
     public Optional<DiscoveredSourceModel> get(String connectionId) {
         Objects.requireNonNull(connectionId, "connectionId");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
-        // A model written before the types were resolved answers as no model at all. Its columns would
-        // all read as having no resolved type, which is refused wherever a resolved type is needed - and
-        // refused with a diagnostic about the columns, telling the author to change an expression that
-        // is not wrong. Answering "not discovered" instead gives them the one action that fixes it, and
-        // discovering is what makes it true.
+        // Verified startup has already moved legacy envelopes into the current shape. Keep the
+        // read guard for direct store callers: never misread an inline envelope as an empty database.
         if (document == null || !carriesResolvedTypes(document)) {
             return Optional.empty();
         }
@@ -180,9 +177,8 @@ public final class MongoSchemaStore implements SchemaStore {
 
     /**
      * Whether a stored document is a discovery of the model this build reads — that is, one whose
-     * columns carry types resolved onto the tapstate namespace. A document without the stamp predates
-     * that resolution and is answered as no discovery at all, so the author is asked to discover rather
-     * than told that every column they read has no resolved type.
+     * columns carry types resolved onto the tapstate namespace. Startup migrates legacy envelopes
+     * before readers are exposed; direct callers still cannot mistake an old envelope for a new one.
      */
     static boolean carriesResolvedTypes(Document document) {
         return Integer.valueOf(RESOLVED_TYPES).equals(document.getInteger(MODEL_VERSION));

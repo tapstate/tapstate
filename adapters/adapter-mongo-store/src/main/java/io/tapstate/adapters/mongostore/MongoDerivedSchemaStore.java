@@ -83,11 +83,6 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(stepId, "stepId");
         Objects.requireNonNull(schema, "schema");
-        // A write is the moment a pipeline still stored in the superseded shape is moved over, so that
-        // the history it already has - which is the baseline every drift report is compared against - is
-        // carried rather than restarted. A re-derivation could rebuild the latest version but not the
-        // ones before it, and those are the record of what this step used to produce.
-        migrateLegacyDocument(pipelineId);
         List<DerivedSchema> versions = new ArrayList<>(stepVersions(pipelineId, stepId));
         DerivedSchema last = versions.isEmpty() ? null : versions.get(versions.size() - 1);
         if (last != null && last.schema().equals(schema)) {
@@ -170,26 +165,7 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
         if (document != null) {
             return toVersions(document.get("versions"), pipelineId);
         }
-        // Nothing under the split key: a pipeline written before the split still has this step inside its
-        // single document, and answering "never recorded" over it would silently reset the drift baseline
-        // rather than report a difference.
-        return versionsOf(read(pipelineId), pipelineId, stepId);
-    }
-
-    /**
-     * Rewrites a pipeline still held as one document into a document per step, then removes it. Does
-     * nothing for a pipeline already split, which is every pipeline after its first write.
-     */
-    private void migrateLegacyDocument(String pipelineId) {
-        Document legacy = read(pipelineId);
-        if (legacy == null) {
-            return;
-        }
-        for (Document step : stepsOf(legacy, pipelineId)) {
-            String stepId = requireString(step.get("step"), pipelineId);
-            writeStep(pipelineId, stepId, toVersions(step.get("versions"), pipelineId));
-        }
-        StoreIo.run(() -> collection.deleteOne(new Document("_id", pipelineId)));
+        return List.of();
     }
 
     private void writeStep(String pipelineId, String stepId, List<DerivedSchema> versions) {
@@ -220,41 +196,6 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
                 .append("statement", version.statement())
                 .append("derivedFrom", version.derivedFrom())
                 .append("derivedBy", version.derivedBy());
-    }
-
-    /**
-     * The step entries of a document in the superseded one-per-pipeline shape; empty for an absent
-     * document. Read only where a pipeline written before the split is being served or moved over.
-     */
-    private static List<Document> stepsOf(Document document, String pipelineId) {
-        if (document == null) {
-            return List.of();
-        }
-        Object raw = document.get("steps");
-        if (raw == null) {
-            return List.of();
-        }
-        if (!(raw instanceof List<?> steps)) {
-            throw corrupt(pipelineId);
-        }
-        List<Document> out = new ArrayList<>();
-        for (Object entry : steps) {
-            if (!(entry instanceof Document step)) {
-                throw corrupt(pipelineId);
-            }
-            out.add(step);
-        }
-        return out;
-    }
-
-    /** One step's history out of a superseded one-per-pipeline document; empty where it has none. */
-    private static List<DerivedSchema> versionsOf(Document document, String pipelineId, String stepId) {
-        for (Document step : stepsOf(document, pipelineId)) {
-            if (stepId.equals(requireString(step.get("step"), pipelineId))) {
-                return toVersions(step.get("versions"), pipelineId);
-            }
-        }
-        return List.of();
     }
 
     private static List<DerivedSchema> toVersions(Object raw, String pipelineId) {
@@ -295,7 +236,7 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
         } catch (IllegalArgumentException e) {
             // A stored value the record itself rejects - a negative version, a blank provenance - is
             // store corruption, not a caller's bad argument.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId), e);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", "versions"), e);
         }
     }
 
@@ -314,6 +255,6 @@ public final class MongoDerivedSchemaStore implements DerivedSchemaStore {
     }
 
     private static TapstateException corrupt(String pipelineId) {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(pipelineId)), null);
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(pipelineId), "field", "versions"), null);
     }
 }
