@@ -48,7 +48,9 @@ jobs:
         id: source
         run: |
           git clone --depth 1 https://github.com/tapdata/tapdata-connectors.git "$RUNNER_TEMP/connector-source"
-          echo "sha=$(git -C "$RUNNER_TEMP/connector-source" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git clone --depth 1 https://github.com/tapdata/tapdata-connectors-enterprise.git "$RUNNER_TEMP/connector-enterprise-source"
+          echo "enterprise_sha=$(git -C "$RUNNER_TEMP/connector-enterprise-source" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "oss_sha=$(git -C "$RUNNER_TEMP/connector-source" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       # These are remote dependencies only. prepare always refreshes their snapshot
       # metadata and checks resolved bytes before a cached connector jar is eligible.
       - name: Restore remote PDK dependencies
@@ -56,11 +58,11 @@ jobs:
         id: pdk
         with:
           path: ${{ runner.temp }}/connector-m2/io/tapdata
-          key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
+          key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
       - name: Resolve current snapshot artifacts
         id: inputs
         run: |
-          .github/scripts/connector-cache.sh prepare --checkout "$RUNNER_TEMP/connector-source" --repo-local "$RUNNER_TEMP/connector-m2" --output "$RUNNER_TEMP/connector-inputs.json"
+          .github/scripts/connector-cache.sh prepare --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" --repo-local "$RUNNER_TEMP/connector-m2" --output "$RUNNER_TEMP/connector-inputs.json"
           echo "key=$(.github/scripts/connector-cache.sh key --manifest "$RUNNER_TEMP/connector-inputs.json")" >> "$GITHUB_OUTPUT"
       # Reuse delays discovering faults outside the resolved source/snapshot inputs.
       # A miss also means possible cache eviction, not necessarily an upstream change.
@@ -74,8 +76,8 @@ jobs:
         env:
           MAVEN_ARGS: -nsu -Dmaven.repo.local=${{ runner.temp }}/connector-m2
         run: |
-          scripts/build-real-connectors.sh --checkout "$RUNNER_TEMP/connector-source" "$RUNNER_TEMP/connectors"
-          .github/scripts/connector-cache.sh seal --checkout "$RUNNER_TEMP/connector-source" --manifest "$RUNNER_TEMP/connector-inputs.json" --repo-local "$RUNNER_TEMP/connector-m2" --jars "$RUNNER_TEMP/connectors"
+          scripts/build-real-connectors.sh --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" "$RUNNER_TEMP/connectors"
+          .github/scripts/connector-cache.sh seal --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" --manifest "$RUNNER_TEMP/connector-inputs.json" --repo-local "$RUNNER_TEMP/connector-m2" --jars "$RUNNER_TEMP/connectors"
       - name: Verify exact connector jar evidence
         run: .github/scripts/connector-cache.sh verify --manifest "$RUNNER_TEMP/connector-inputs.json" --jars "$RUNNER_TEMP/connectors"
       - uses: actions/cache/save@v4
@@ -88,7 +90,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/connector-m2/io/tapdata
-          key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
+          key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
       - name: Retain only third-party Maven dependencies
         if: always()
         run: rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$RUNNER_TEMP/connector-m2/" "$HOME/.m2/repository/"

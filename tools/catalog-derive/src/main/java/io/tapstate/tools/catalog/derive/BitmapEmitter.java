@@ -10,7 +10,7 @@ import java.util.function.BiFunction;
 import java.util.function.Function;
 
 /**
- * The worklist loop of catalog-derive: for each manifest entry it resolves the module's built jar and
+ * The worklist loop of catalog-derive: for each manifest entry it resolves the connector id's staged jar and
  * probes the named connector class, collecting the registered capability ids keyed by connector id.
  * Two gaps are expected in a real refresh and survived rather than fatal: a connector with no built
  * jar (not part of the OSS dist build), and a connector whose jar cannot be opened or classloaded at
@@ -33,7 +33,7 @@ final class BitmapEmitter {
         Map<String, Set<String>> bitmap = new LinkedHashMap<>();
         Map<String, String> skipped = new LinkedHashMap<>();
         for (ManifestEntry entry : entries) {
-            Optional<Path> jar = jarResolver.apply(entry.module());
+            Optional<Path> jar = jarResolver.apply(entry.id());
             if (jar.isEmpty()) {
                 skipped.put(entry.id(), "no built jar");
                 continue;

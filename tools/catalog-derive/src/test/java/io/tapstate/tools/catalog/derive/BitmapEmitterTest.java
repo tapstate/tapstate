@@ -15,7 +15,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The bitmap emitter is catalog-derive's worklist loop: for each manifest entry it resolves the
- * module's jar and probes the named class, keying the registered capabilities by connector id. Two
+ * connector id's staged jar and probes the named class, keying the registered capabilities by connector id. Two
  * gaps are expected and survived rather than fatal — a connector with no built jar (not in the OSS
  * dist) and a connector whose jar cannot be opened or classloaded at all, which happens when a module
  * encrypts its own shaded jar during packaging so the result is not a zip — both recorded with a
@@ -30,7 +30,7 @@ class BitmapEmitterTest {
                 new ManifestEntry("kafka", "kafka-connector", "io.tapdata.connector.kafka.KafkaConnector"));
 
         Function<String, Optional<Path>> jarResolver =
-                module -> Optional.of(Path.of("/dist", module + "-v1.0.jar"));
+                module -> Optional.of(Path.of("/dist", module + "-connector-v1.0.jar"));
         Map<String, Path> probed = new LinkedHashMap<>();
         BiFunction<Path, String, Set<String>> prober = (jar, connectorClass) -> {
             probed.put(connectorClass, jar);
@@ -56,8 +56,8 @@ class BitmapEmitterTest {
                 new ManifestEntry("hazelcast", "hazelcast-connector", "io.tapdata.connector.hazelcast.HazelcastConnector"));
 
         Function<String, Optional<Path>> jarResolver = module ->
-                module.equals("hazelcast-connector") ? Optional.empty()
-                        : Optional.of(Path.of("/dist", module + "-v1.0.jar"));
+                module.equals("hazelcast") ? Optional.empty()
+                        : Optional.of(Path.of("/dist", module + "-connector-v1.0.jar"));
         BiFunction<Path, String, Set<String>> prober = (jar, connectorClass) -> {
             if (connectorClass.contains("hazelcast")) {
                 throw new AssertionError("must not probe a connector with no jar");
@@ -78,7 +78,7 @@ class BitmapEmitterTest {
                 new ManifestEntry("postgres", "postgres-connector", "io.tapdata.connector.postgres.PostgresConnector"));
 
         Function<String, Optional<Path>> jarResolver =
-                module -> Optional.of(Path.of("/dist", module + "-v1.0.jar"));
+                module -> Optional.of(Path.of("/dist", module + "-connector-v1.0.jar"));
         BiFunction<Path, String, Set<String>> prober = (jar, connectorClass) -> {
             if (connectorClass.endsWith("PostgresConnector")) {
                 throw new IllegalStateException("probing " + connectorClass,
@@ -106,7 +106,7 @@ class BitmapEmitterTest {
                 new ManifestEntry("boom", "boom-connector", "io.tapdata.connector.boom.BoomConnector"));
 
         Function<String, Optional<Path>> jarResolver =
-                module -> Optional.of(Path.of("/dist", module + "-v1.0.jar"));
+                module -> Optional.of(Path.of("/dist", module + "-connector-v1.0.jar"));
         BiFunction<Path, String, Set<String>> prober = (jar, connectorClass) -> {
             if (connectorClass.endsWith("BoomConnector")) {
                 throw new AssertionError("static init blew up");

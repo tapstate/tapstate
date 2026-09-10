@@ -6,12 +6,20 @@ import json, os, pathlib, subprocess, sys, tempfile
 helper = pathlib.Path(sys.argv[1])
 with tempfile.TemporaryDirectory() as temporary:
     root = pathlib.Path(temporary)
-    checkout, repo, jars, bin_dir = [root / name for name in ('checkout', 'repository', 'jars', 'bin')]
-    for directory in (checkout, repo, jars, bin_dir): directory.mkdir()
+    checkout, enterprise, repo, jars, bin_dir = [root / name for name in ('checkout', 'enterprise', 'repository', 'jars', 'bin')]
+    for directory in (checkout, enterprise, repo, jars, bin_dir): directory.mkdir()
     subprocess.run(['git', 'init', '-q', str(checkout)], check=True)
     (checkout / 'pom.xml').write_text('<project/>')
     subprocess.run(['git', '-C', str(checkout), 'add', '.'], check=True)
     subprocess.run(['git', '-C', str(checkout), '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'fixture'], check=True)
+    subprocess.run(['git', 'init', '-q', str(enterprise)], check=True)
+    (enterprise / 'pom.xml').write_text('<project/>')
+    subprocess.run(['git', '-C', str(enterprise), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(enterprise), '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'enterprise fixture'], check=True)
+    for module in ('mysql', 'mongodb', 'postgres'):
+        (checkout / 'connectors' / (module + '-connector')).mkdir(parents=True)
+    for module in ('oracle', 'mssql'):
+        (enterprise / 'connectors' / (module + '-connector')).mkdir(parents=True)
     mock = bin_dir / 'mvn'
     mock.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys, xml.etree.ElementTree as ET
@@ -28,6 +36,10 @@ if any('effective-pom' in arg for arg in args):
         for field, text in [('groupId', 'io.tapdata'), ('artifactId', module + '-connector'), ('version', '1.0-SNAPSHOT')]: ET.SubElement(project, field).text = text
         dependency = ET.SubElement(ET.SubElement(project, 'dependencies'), 'dependency')
         for field, text in [('groupId', 'io.tapdata'), ('artifactId', 'tapdata-pdk-api'), ('version', version), ('type', kind)]: ET.SubElement(dependency, field).text = text
+    project = ET.SubElement(projects, 'project')
+    for field, text in [('groupId', 'io.tapdata'), ('artifactId', 'sql-core'), ('version', '1.0-SNAPSHOT')]: ET.SubElement(project, field).text = text
+    dependency = ET.SubElement(ET.SubElement(projects.find('project'), 'dependencies'), 'dependency')
+    for field, text in [('groupId', 'io.tapdata'), ('artifactId', 'sql-core'), ('version', '1.0-SNAPSHOT')]: ET.SubElement(dependency, field).text = text
     ET.ElementTree(projects).write(value('-Doutput='))
 else:
     resolver = ET.parse(args[args.index('-f') + 1]).getroot()
@@ -71,7 +83,7 @@ else:
         if (result.returncode == 0) != ok: raise AssertionError(f'{args}: {result.stdout}\n{result.stderr}')
         return result.stdout.strip()
     def prepare(output=manifest, **extra):
-        call('prepare', '--checkout', checkout, '--repo-local', repo, '--output', output, extra=extra)
+        call('prepare', '--checkout', checkout, '--checkout', enterprise, '--repo-local', repo, '--output', output, extra=extra)
         return call('key', '--manifest', output)
     first = prepare()
     expected_roots = [
@@ -93,17 +105,30 @@ else:
     }
     assert set(evidence['snapshots']) == expected_aliases, 'resolved snapshot closure differs from fixture dependency graph'
     assert first == prepare(), 'unchanged snapshots changed key'
-    changed_source = dict(evidence, source_sha='f' * 40)
+    assert set(evidence['source_sha']) == {'oss', 'enterprise'}
+    changed_source = dict(evidence, source_sha=dict(evidence['source_sha'], oss='f' * 40))
     assert changed_source['source_sha'] != evidence['source_sha']
     source_probe = root / 'source-changed.json'
     source_probe.write_text(json.dumps(changed_source))
     assert first != call('key', '--manifest', source_probe), 'changed connector source did not invalidate key'
+    changed_enterprise = dict(evidence, source_sha=dict(evidence['source_sha'], enterprise='e' * 40))
+    source_probe.write_text(json.dumps(changed_enterprise))
+    assert first != call('key', '--manifest', source_probe), 'changed enterprise source did not invalidate key'
+    (enterprise / 'pom.xml').write_text('<project>next</project>')
+    subprocess.run(['git', '-C', str(enterprise), '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qam', 'next enterprise revision'], check=True)
+    assert first != prepare(root / 'enterprise-next.json'), 'enterprise checkout revision did not invalidate key'
+    subprocess.run(['git', '-C', str(enterprise), 'reset', '--hard', 'HEAD~1'], check=True, capture_output=True)
     second = prepare(root / 'new.json', SNAPSHOT_BUILD='20260909.010203-2')
     assert first != second, 'republished PDK did not invalidate key'
     prepare()
-    call('prepare', '--checkout', checkout, '--repo-local', repo, '--output', manifest, extra={'METADATA_WARNING':'1'}, ok=False)
-    for name in ('mysql', 'mongodb', 'postgres'): (jars / f'{name}-connector-v1.jar').write_bytes(b'connector')
-    call('seal', '--checkout', checkout, '--manifest', manifest, '--repo-local', repo, '--jars', jars)
+    call('prepare', '--checkout', checkout, '--checkout', enterprise, '--repo-local', repo, '--output', manifest, extra={'METADATA_WARNING':'1'}, ok=False)
+    for name in ('mysql', 'mongodb', 'postgres', 'oracle', 'sqlserver'): (jars / f'{name}-connector-v1.jar').write_bytes(b'connector')
+    # Locally installed prerequisites have no remote timestamp metadata; their source
+    # revisions bind them instead. They must not poison the remote snapshot stamp.
+    local = repo / 'io/tapdata/sql-core/1.0-SNAPSHOT'
+    local.mkdir(parents=True)
+    (local / 'sql-core-1.0-SNAPSHOT.jar').write_bytes(b'local build')
+    call('seal', '--checkout', checkout, '--checkout', enterprise, '--manifest', manifest, '--repo-local', repo, '--jars', jars)
     call('verify', '--manifest', manifest, '--jars', jars)
     # A different probe must never accept an older restored cache.
     call('verify', '--manifest', root / 'new.json', '--jars', jars, ok=False)
@@ -111,8 +136,11 @@ else:
     extra_jar.write_bytes(b'extra')
     call('verify', '--manifest', manifest, '--jars', jars, ok=False)
     extra_jar.unlink()
+    (enterprise / 'pom.xml').write_text('<project>changed</project>')
+    call('seal', '--checkout', checkout, '--checkout', enterprise, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
+    (enterprise / 'pom.xml').write_text('<project/>')
     (checkout / 'pom.xml').write_text('<project>changed</project>')
-    call('seal', '--checkout', checkout, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
+    call('seal', '--checkout', checkout, '--checkout', enterprise, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
     (checkout / 'pom.xml').write_text('<project/>')
     jar = jars / 'mysql-connector-v1.jar'
     jar.write_bytes(b'changed')
@@ -121,19 +149,19 @@ else:
     metadata = repo / 'io/tapdata/pdk-error-code/2.0-SNAPSHOT/maven-metadata-fixture.xml'
     saved = metadata.read_text()
     metadata.unlink()
-    call('seal', '--checkout', checkout, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
+    call('seal', '--checkout', checkout, '--checkout', enterprise, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
     metadata.write_text(saved.replace('2.0-20260908.010203-1', '2.0-SNAPSHOT'))
-    call('seal', '--checkout', checkout, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
+    call('seal', '--checkout', checkout, '--checkout', enterprise, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
     metadata.write_text(saved)
     alias = repo / 'io/tapdata/pdk-error-code/2.0-SNAPSHOT/pdk-error-code-2.0-SNAPSHOT.jar'
     alias.write_bytes(b'locally installed stale artifact')
-    call('seal', '--checkout', checkout, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
+    call('seal', '--checkout', checkout, '--checkout', enterprise, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
     prepare()
     import shutil
     shutil.rmtree(repo / 'io/tapdata/pdk-error-code')
-    call('seal', '--checkout', checkout, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
+    call('seal', '--checkout', checkout, '--checkout', enterprise, '--manifest', manifest, '--repo-local', repo, '--jars', jars, ok=False)
     # A direct PDK component cannot disappear from the effective reactor selection.
     shutil.rmtree(repo / 'io/tapdata/tapdata-pdk-api')
-    call('prepare', '--checkout', checkout, '--repo-local', repo, '--output', manifest, extra={'OMIT_COMPONENT':'tapdata-pdk-api'}, ok=False)
+    call('prepare', '--checkout', checkout, '--checkout', enterprise, '--repo-local', repo, '--output', manifest, extra={'OMIT_COMPONENT':'tapdata-pdk-api'}, ok=False)
     print('connector cache smoke: freshness, jar integrity, missing metadata/component, and build drift passed')
 PY
