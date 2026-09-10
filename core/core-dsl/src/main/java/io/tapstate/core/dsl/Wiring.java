@@ -83,6 +83,22 @@ final class Wiring {
         return attributed(reached);
     }
 
+    /**
+     * The pipeline's own nodes a reference reads through - the steps and views standing between it
+     * and the sources, not the sources themselves. A rule about what a step does to the rows on
+     * their way out needs this rather than {@link #reaching}, which deliberately walks past the
+     * steps to the tables behind them.
+     *
+     * <p>The traversal is the same one, and the set it already keeps to stop a cycle from looping
+     * forever is exactly the set of nodes it followed - so this reads that out rather than walking
+     * the wiring a second way and eventually disagreeing about what a pipeline reads.
+     */
+    Set<String> nodesReaching(FromClause from) {
+        Set<String> followed = new LinkedHashSet<>();
+        collect(from, new LinkedHashSet<>(), followed);
+        return followed;
+    }
+
     /** A serve or view block is wired by a single reference rather than a list of them. */
     Set<Upstream> reaching(FromRef ref) {
         Set<Upstream> reached = new LinkedHashSet<>();

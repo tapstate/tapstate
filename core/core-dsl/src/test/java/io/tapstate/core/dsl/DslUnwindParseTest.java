@@ -4,6 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.Step;
+import io.tapstate.core.model.TransformBody;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -64,10 +68,32 @@ class DslUnwindParseTest {
         return (DslException) thrown;
     }
 
+    /**
+     * A path and nothing else is the whole of what the grammar demands, and it parses into a body
+     * whose four optional keys are simply absent. Asserted on the parsed body rather than on the
+     * batch loading clean: a payload key the parser silently dropped would satisfy "nothing was
+     * thrown" exactly as well as one it read.
+     *
+     * <p>Such a declaration does not go on to <em>load</em>, and that is a different layer's
+     * verdict - naming nothing that varies per element is refused by the write-key rule, in
+     * {@code UnwindWriteKeyRulesTest}. Parsing and being allowed to run are kept apart here on
+     * purpose: this suite is what catches a payload key that never reaches the model at all.
+     */
     @Test
-    @DisplayName("the smallest unwind - a path and nothing else - loads clean")
+    @DisplayName("the smallest unwind - a path and nothing else - parses to a body carrying only it")
     void aPathIsTheWholeOfTheRequiredPayload() {
-        assertThatCode(() -> batch("path: items")).doesNotThrowAnyException();
+        TransformBody.Unwind body = unwindIn(new DslParser().parse(pipeline("path: items")));
+
+        assertThat(body.path()).isEqualTo("items");
+        assertThat(body.elementKey()).isNull();
+        assertThat(body.includeArrayIndex()).isNull();
+        assertThat(body.preserveNullAndEmptyArrays()).isNull();
+        assertThat(body.elementType()).isNull();
+    }
+
+    private static TransformBody.Unwind unwindIn(Resource parsed) {
+        Step step = ((PipelineResource) parsed).transforms().get(0);
+        return (TransformBody.Unwind) ((Step.Inline) step).body();
     }
 
     @Test
@@ -115,6 +141,25 @@ class DslUnwindParseTest {
      * shares stay allowed, so this is checking the boundary between the two sets rather than that
      * the parser refuses anything unfamiliar.
      */
+    @Test
+    @DisplayName("a type name outside the vocabulary is refused, not read as leaving it out")
+    void aMisspelledElementTypeIsRefused() {
+        // Leaving element_type out is a real answer - it hands the choice to the target, the same
+        // way any column nobody resolved a type for does - so a misspelling has to be refused
+        // rather than folded into that answer. Read as "unresolved", `strng` is indistinguishable
+        // from the omission the author never made, and the column silently becomes whatever the
+        // target would have guessed anyway.
+        DslException ex = refused("""
+                path: items
+                element_key: sku
+                element_type: strng
+                """);
+
+        assertThat(ex.code()).isEqualTo(DslError.ILLEGAL_VALUE);
+        assertThat(ex.path()).isEqualTo("transforms[0].element_type");
+        assertThat(ex.args()).containsEntry("value", "strng");
+    }
+
     @Test
     @DisplayName("a payload key belonging to another transform type is refused on an unwind")
     void anotherTypesPayloadKeyIsNotAllowedHere() {

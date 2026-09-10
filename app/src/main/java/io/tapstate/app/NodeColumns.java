@@ -216,10 +216,12 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
      * the connector framework's own array type has no field for it - so there is nothing here to
      * read and nothing to infer from. Unknown then travels to the write side as a column with no
      * declared type, which is the existing way of saying "the connector decides", not a new one.
-     * <b>The declared name is taken as written and not judged here</b>: a name outside the shared
-     * vocabulary lands as unknown, which is the same answer as declaring nothing - so whether a
-     * misspelling is worth refusing is a question for the validator, where refusing it can carry a
-     * reason.
+     * <b>The declared name is not judged here, because the validator already refused it</b>: a name
+     * outside the shared vocabulary is rejected where the author wrote it, with a reason, rather
+     * than resolved leniently into the same unknown that declaring nothing produces. What is left
+     * here is a fallback for a body that reached this far without passing through that check, and
+     * unknown is the right answer for one - it is what a column nobody resolved a type for gets,
+     * not a quiet substitution for a type the author asked for.
      */
     private static NodeColumns expanded(TransformBody.Unwind unwind, NodeColumns upstream) {
         if (!upstream.known()) {

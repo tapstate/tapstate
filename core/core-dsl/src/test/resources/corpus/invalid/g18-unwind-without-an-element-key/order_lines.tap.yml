@@ -1,0 +1,15 @@
+# Invalid: the unwind says which field holds the list but nothing about which element a row is,
+# so all of a row's expanded rows carry its key and the upsert keeps only the last.
+version: tapstate/v1
+kind: pipeline
+id: order_lines
+source: src_orders
+transforms:
+  - id: explode
+    from: [ orders ]
+    type: unwind
+    path: items
+serve:
+  from: explode
+  sync:
+    - { id: dw, source: tgt_lines }

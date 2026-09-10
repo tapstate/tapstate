@@ -1,5 +1,6 @@
 package io.tapstate.core.dsl;
 
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
@@ -60,6 +61,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -465,7 +467,7 @@ public final class DslParser {
                     s.string("include_array_index"),
                     boolValue(s, "preserve_null_and_empty_arrays"),
                     s.string("element_key"),
-                    s.string("element_type"));
+                    elementType(s));
             case "union" -> new TransformBody.Union();
             case "nest" -> new TransformBody.Nest(
                     s.string("primary_key"),
@@ -935,6 +937,22 @@ public final class DslParser {
                     Map.of("value", value, "expected", "a count above zero"));
         }
         return value;
+    }
+
+    /**
+     * The declared type of an unwind's expanded column, held against the shared type vocabulary.
+     *
+     * <p>Leaving it out is a real answer here - it hands the choice to the target, the same way any
+     * column nobody resolved a type for does - which is exactly why a name outside the vocabulary
+     * cannot be folded into that answer. Resolved leniently it would read as "unresolved", making a
+     * misspelling indistinguishable from an omission the author never wrote, and the column would
+     * silently become whatever the target guessed. Kept as the string the model carries: what
+     * travels downstream is the token, not the enum.
+     */
+    private static String elementType(YamlMap s) {
+        TapstateType declared = enumByYaml(
+                TapstateType.values(), t -> t.name().toLowerCase(Locale.ROOT), s, "element_type");
+        return declared == null ? null : declared.name().toLowerCase(Locale.ROOT);
     }
 
     private static Boolean boolValue(YamlMap m, String key) {

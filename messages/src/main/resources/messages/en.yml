@@ -246,6 +246,12 @@ dsl.row-expression-type-unknown:
 dsl.upsert-needs-key:
   message: "The sync at {path} upserts table `{table}` of source `{source}`, but that table declares no key, so no write can be matched to the row it belongs to."
   solution: "Give `{table}` a primary key and discover `{source}` again, or write with `write_mode: append`, which adds rows instead of matching them. A unique index is not enough: only a primary key is read as the key here."
+dsl.unwind-needs-an-element-key:
+  message: "The unwind step `{step}` at {path} names nothing that varies from one element to the next, so every row it expands out of a row would carry that row's own key and the target would keep only the last of them."
+  solution: "Add `element_key` naming a field inside each element that identifies the row it becomes, or `include_array_index` to carry each element's position in the array and be told apart by that."
+dsl.unwind-needs-an-upsert-target:
+  message: "The unwind step `{step}` is written by sync `{sync}`, whose {path} appends rows instead of matching them, so deleting a row would append the elements it used to hold instead of taking their rows away."
+  solution: "Write that sync with `write_mode: upsert`, the default, so the expanded rows can be matched and removed; or serve the unwind to a sync that upserts and keep the append target on output that does not expand."
 dsl.composition:
   message: "Composition rule broken at {path}: {detail}."
   solution: "Review how the resources are wired together."

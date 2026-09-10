@@ -1,0 +1,3 @@
+rule: unwind-needs-an-element-key
+path: transforms[0]
+note: "an unwind naming neither element_key nor include_array_index gives every expanded row the parent's own key"

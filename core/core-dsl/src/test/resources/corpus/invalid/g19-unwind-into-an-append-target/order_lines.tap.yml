@@ -1,0 +1,16 @@
+# Invalid: the expansion keys its rows correctly, but the sync appends instead of matching, so the
+# rows a deleted parent produced can never be taken away again.
+version: tapstate/v1
+kind: pipeline
+id: order_lines
+source: src_orders
+transforms:
+  - id: explode
+    from: [ orders ]
+    type: unwind
+    path: items
+    element_key: sku
+serve:
+  from: explode
+  sync:
+    - { id: dw, source: tgt_lines, write_mode: append }
