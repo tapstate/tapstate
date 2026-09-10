@@ -588,6 +588,12 @@ transform.script-no-process:
 transform.script-output-invalid:
   message: "The js transform script produced output that is not a valid record: {detail}."
   solution: "Ensure process returns a record (or emits one) whose before, after and schema are objects or null."
+transform.unwind-needs-a-complete-before-image:
+  message: "Expanding `{path}` needs the row that an update or a delete replaces, but {detail}, so the rows that row produced cannot be removed."
+  solution: "Configure the source to send the whole earlier row: a document store needs change-stream pre-images turned on for the collection, and a relational source needs its replica identity set to full. Sending only the key columns is not enough here."
+transform.unwind-rows-share-a-key:
+  message: "Two elements of one row expanded `{path}` onto the same key {key}, so the target keeps whichever was written last and the other is lost."
+  solution: "Give the elements something that differs between them - a field of their own named by element_key, or their position in the list via include_array_index - or stop the source producing two elements with one identity."
 nest.sibling-embeds-target-different-parent-keys:
   message: "The embeds under {embedPath} join on different parent fields: {fields}."
   solution: "Have every embed under one parent join on the same parent field; that field is the parent's identity."

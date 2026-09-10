@@ -226,3 +226,5 @@ transform.script-compile-failed
 transform.script-failed
 transform.script-no-process
 transform.script-output-invalid
+transform.unwind-needs-a-complete-before-image
+transform.unwind-rows-share-a-key

@@ -45,14 +45,54 @@ public enum TransformError implements TapstateErrorCode {
      * a {@code before} / {@code after} / {@code schema} that is not an object. {@code detail} names
      * what was wrong.
      */
-    SCRIPT_OUTPUT_INVALID("transform.script-output-invalid", Set.of("detail"));
+    SCRIPT_OUTPUT_INVALID("transform.script-output-invalid", Set.of("detail")),
+
+    /**
+     * Running: an expansion met an update or a delete whose earlier row is not a whole row, so what
+     * the row used to hold cannot be read and the rows it produced cannot be taken away.
+     *
+     * <p><b>Judged on what the row carries, never on whether it has the expanded column.</b> A whole
+     * document that simply has no such column is a legitimate row - an optional field in a document
+     * store is an ordinary thing, and a snapshot read of the same row is required to accept it and
+     * produce nothing. What separates the two is that half a row carries the columns identifying it
+     * and nothing else: a change stream with no pre-image sends exactly that, and so does a
+     * relational source under its default replica identity. {@code detail} says which of the two
+     * conditions failed, since the fix is a different setting in each case.
+     *
+     * <p>Refused rather than absorbed, and that is the whole of this code. Absorbed, the earlier row
+     * reads as a row holding no elements, the delete expands into nothing, and every row the parent
+     * once produced stays in the target with nothing left pointing at it - green run, no error, and
+     * a delete case over a source that does send whole rows passes throughout.
+     */
+    UNWIND_NEEDS_A_COMPLETE_BEFORE_IMAGE(
+            "transform.unwind-needs-a-complete-before-image", Set.of("path", "detail")),
+
+    /**
+     * Running: two elements of one row expand to rows carrying the same key, so the target keeps
+     * whichever is written last and the other is gone with nothing recording it.
+     *
+     * <p>A warning rather than a refusal because the declaration is not wrong: whether two elements
+     * of one row happen to share an identity is a property of the data, which no check made before
+     * the run can see. Both rows are still sent - swallowing one would be this operator deciding
+     * which of an author's elements counts - so what the target holds is unchanged by saying it, and
+     * saying it is the only reason anyone finds out. {@code key} is the shared key value as the
+     * comparison sees it, which is what makes the offending row findable at the source.
+     */
+    UNWIND_ROWS_SHARE_A_KEY(
+            "transform.unwind-rows-share-a-key", Set.of("path", "key"), Severity.WARNING);
 
     private final String code;
     private final Set<String> placeholders;
+    private final Severity severity;
 
     TransformError(String code, Set<String> placeholders) {
+        this(code, placeholders, Severity.ERROR);
+    }
+
+    TransformError(String code, Set<String> placeholders, Severity severity) {
         this.code = code;
         this.placeholders = placeholders;
+        this.severity = severity;
     }
 
     @Override
@@ -62,7 +102,7 @@ public enum TransformError implements TapstateErrorCode {
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return severity;
     }
 
     @Override

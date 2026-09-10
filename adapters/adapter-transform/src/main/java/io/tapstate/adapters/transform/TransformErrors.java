@@ -40,6 +40,24 @@ final class TransformErrors {
         return new TapstateException(TransformError.SCRIPT_OUTPUT_INVALID, Map.of("detail", detail), null);
     }
 
+    /**
+     * An expansion handed an update or a delete whose earlier row is half a row; {@code detail} says
+     * which way it fell short, because the setting that fixes it differs between the two.
+     */
+    static TapstateException unwindNeedsACompleteBeforeImage(String path, String detail) {
+        return new TapstateException(TransformError.UNWIND_NEEDS_A_COMPLETE_BEFORE_IMAGE,
+                Map.of("path", path, "detail", detail), null);
+    }
+
+    /**
+     * Two elements of one row expanding onto the same key. Built and handed to the alert rather than
+     * thrown: the rows are still sent, and this severity means the run carries on.
+     */
+    static TapstateException unwindRowsShareAKey(String path, Object key) {
+        return new TapstateException(TransformError.UNWIND_ROWS_SHARE_A_KEY,
+                Map.of("path", path, "key", String.valueOf(key)), null);
+    }
+
     // The developer-facing detail carried as the {detail} argument: the cause's own message, or its
     // type when it carries none, so the argument map always satisfies the code's placeholder contract.
     private static String detail(Throwable cause) {
