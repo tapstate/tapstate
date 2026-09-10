@@ -87,13 +87,25 @@ final class ControlPlane {
      * because a client asks what it is talking to before it has a credential.
      */
     String version() {
-        HttpResponse<String> response = send(get("/version"));
-        expect(response, 200, "read the version the server reports");
-        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
-                || !(map.get("version") instanceof String version)) {
-            throw new AssertionError("a version answer carried no version: " + response.body());
+        Map<?, ?> answer = versionAnswer();
+        if (!(answer.get("version") instanceof String version)) {
+            throw new AssertionError("a version answer carried no version: " + answer);
         }
         return version;
+    }
+
+    /**
+     * The whole version answer, parsed. A caller checking what the CLI printed reads the fields from
+     * here rather than holding constants of its own, so the two ends of the claim are two readers of the
+     * same endpoint and a test cannot agree with itself.
+     */
+    Map<?, ?> versionAnswer() {
+        HttpResponse<String> response = send(get("/version"));
+        expect(response, 200, "read the version the server reports");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("a version answer was not an object: " + response.body());
+        }
+        return map;
     }
 
     /**

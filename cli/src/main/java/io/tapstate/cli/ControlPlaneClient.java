@@ -32,6 +32,27 @@ interface ControlPlaneClient extends AutoCloseable {
     String serverVersion(URI baseUrl);
 
     /**
+     * Everything {@code GET {baseUrl}/version} says, not only the number: the release this server was
+     * built from, the authoring grammars it accepts, and the schema version of the system data it is
+     * running against. {@code null} when the server does not answer at all, and a null component when it
+     * answers without that part -- a build older than the field, or a run with no store behind it.
+     *
+     * <p>The default keeps the version and knows nothing else, which is what any implementation that has
+     * not been taught the rest can honestly say.
+     */
+    default ServerVersion serverVersionDetail(URI baseUrl) {
+        String version = serverVersion(baseUrl);
+        return version == null ? null : new ServerVersion(version, null, null);
+    }
+
+    /**
+     * What a server says about itself. A null {@code dslVersions} or {@code dataVersion} means the
+     * server did not report it, which is not the same as reporting none: an empty grammar list would be
+     * a server that accepts nothing, and callers must not print the two alike.
+     */
+    record ServerVersion(String version, List<String> dslVersions, Integer dataVersion) { }
+
+    /**
      * Verifies a username / password via {@code POST {baseUrl}/auth/login} and returns the outcome: a
      * bearer token on success, a coded rejection when the server refuses, or unreachable on any I/O
      * failure. Never throws.

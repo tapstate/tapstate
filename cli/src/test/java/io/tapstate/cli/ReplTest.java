@@ -132,6 +132,10 @@ class ReplTest {
         final List<URI> discovered = new ArrayList<>();
         /** What the server answers when asked its version; null is a server that does not say. */
         String serverVersion;
+        /** The grammars it accepts and the schema version of its store; null in either is a server
+         * that does not say, which is not the same as a server that reports none. */
+        List<String> dslVersions;
+        Integer dataVersion;
         /** The canned login outcome and a log of the login calls made ({@code user:pass@base}). */
         LoginOutcome loginOutcome = new LoginOutcome.Unreachable();
         final List<String> loginCalls = new ArrayList<>();
@@ -262,6 +266,13 @@ class ReplTest {
         @Override
         public String serverVersion(URI baseUrl) {
             return healthy.contains(baseUrl) ? serverVersion : null;
+        }
+
+        @Override
+        public ServerVersion serverVersionDetail(URI baseUrl) {
+            return healthy.contains(baseUrl) && serverVersion != null
+                    ? new ServerVersion(serverVersion, dslVersions, dataVersion)
+                    : null;
         }
 
         @Override
@@ -889,6 +900,88 @@ class ReplTest {
         assertThat(out).contains("not reported").contains("node1:7900");
         // never its own number in the server's half -- that is the failure this shape exists to avoid
         assertThat(out).doesNotContain("server " + buildVersion());
+    }
+
+    /**
+     * The question an operator has straight after an upgrade is which system-data version they are on
+     * now, and the verb named after versions is where they go to ask it. The server sends the grammars
+     * and that number in the same body as its own version, so anything short of printing them is the
+     * CLI dropping what it already received and sending the reader to a second command for it.
+     */
+    @Test
+    void theVersionVerbAnswersWithTheGrammarsAndTheDataVersionTheServerSent() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = List.of("tapstate/v1", "tapstate/v2");
+        client.dataVersion = 4;
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList())
+                .contains("dsl    tapstate/v1, tapstate/v2")
+                .contains("data   4");
+    }
+
+    /**
+     * A server that answers with its own number and nothing else -- a build older than either field, or
+     * a run with no store behind it. Not knowing is printed as not knowing, the stance the server half
+     * already takes: a blank where a number belongs reads as agreement, and so does saying nothing.
+     */
+    @Test
+    void theVersionVerbSaysNotReportedForTheHalvesAServerLeavesOut() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = null;
+        client.dataVersion = null;
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList())
+                .contains("dsl    not reported")
+                .contains("data   not reported");
+    }
+
+    /**
+     * A server that sends an empty grammar list is saying it accepts none, which is a different answer
+     * from not sending the field at all -- and printing them alike would hide a server nothing can be
+     * authored against behind a word that means "we could not tell".
+     */
+    @Test
+    void aServerThatAcceptsNoGrammarSaysSoRatherThanReadingAsSilence() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = List.of();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList()).contains("dsl    none").doesNotContain("dsl    not reported");
+    }
+
+    /**
+     * Offline the two extra halves are left out entirely rather than reported as unknown. Nothing about
+     * a grammar set or a store is knowable without a server, and "not reported" there would describe a
+     * server that was never asked -- three lines of not-knowing where one already said it.
+     */
+    @Test
+    void theOfflineVerbLeavesOutTheHalvesOnlyAServerCanAnswer() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = harness(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out).contains("not connected");
+        assertThat(out.lines().toList()).noneMatch(line -> line.startsWith("dsl") || line.startsWith("data"));
     }
 
     /** The version the build was run at -- handed in by surefire, so it is not read back off the code. */

@@ -134,6 +134,45 @@ class HttpControlPlaneClientTest {
         }
     }
 
+    /**
+     * The same body, read whole. The version half is already covered above; what this adds is that the
+     * other two survive the trip, because they arrive together and only one of them used to.
+     */
+    @Test
+    void theDetailCarriesEveryFieldTheServerAnswered() throws Exception {
+        HttpServer server = serverReplying("/version", 200,
+                "{\"version\":\"9.9.9\",\"dslVersions\":[\"tapstate/v1\"],\"dataVersion\":4}");
+        try {
+            ControlPlaneClient.ServerVersion detail =
+                    new HttpControlPlaneClient().serverVersionDetail(baseOf(server));
+            assertThat(detail).isNotNull();
+            assertThat(detail.version()).isEqualTo("9.9.9");
+            assertThat(detail.dslVersions()).containsExactly("tapstate/v1");
+            assertThat(detail.dataVersion()).isEqualTo(4);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    /**
+     * A field the server leaves out has to come back as "did not say", never as an empty list or a
+     * zero: an empty grammar list is a server that accepts nothing and a data version of zero is a
+     * store nobody has migrated, and both are answers a caller would print as fact.
+     */
+    @Test
+    void aFieldTheServerLeavesOutComesBackAsNotSaidRatherThanAsEmpty() throws Exception {
+        HttpServer server = serverReplying("/version", 200, "{\"version\":\"9.9.9\"}");
+        try {
+            ControlPlaneClient.ServerVersion detail =
+                    new HttpControlPlaneClient().serverVersionDetail(baseOf(server));
+            assertThat(detail).isNotNull();
+            assertThat(detail.dslVersions()).isNull();
+            assertThat(detail.dataVersion()).isNull();
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void malformedIssuerDiscoveryResponseIsReportedAsInvalidRatherThanUnreachable() throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
