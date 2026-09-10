@@ -18,7 +18,9 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(sys.argv[1])
-MODULES = 'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector'
+MODULES = 'mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector'
+KINDS = [module.split('=', 1)[0] for module in MODULES.split(',')]
+MODULE_PATHS = ','.join(module.split('=', 1)[1] for module in MODULES.split(','))
 STAMP = 'connector-cache-manifest.json'
 
 
@@ -123,10 +125,10 @@ def load(path):
 
 def jars_at(directory):
     paths = sorted(directory.glob('*.jar'))
-    for connector in ('mysql', 'mongodb', 'postgres'):
+    for connector in KINDS:
         if len([p for p in paths if p.name.startswith(connector + '-connector-v')]) != 1:
             fail(f'expected exactly one shaded {connector} connector jar')
-    if len(paths) != 3:
+    if len(paths) != len(KINDS):
         fail('unexpected connector jar set')
     if any(not path.stat().st_size for path in paths):
         fail('empty connector jar')
@@ -162,7 +164,7 @@ try:
         common = ['mvn', '-B', '-U', f'-Dmaven.repo.local={repository}', '-s', str(settings), '-f', str(checkout / 'pom.xml')]
         with tempfile.TemporaryDirectory() as temporary:
             effective = Path(temporary) / 'effective.xml'
-            run_maven(common + ['-pl', MODULES, '-am', 'org.apache.maven.plugins:maven-help-plugin:3.5.1:effective-pom', f'-Doutput={effective}'])
+            run_maven(common + ['-pl', MODULE_PATHS, '-am', 'org.apache.maven.plugins:maven-help-plugin:3.5.1:effective-pom', f'-Doutput={effective}'])
             roots = roots_from_effective(effective)
             # Separate get executions preserve different versions of the same artifact across
             # modules. A single dependency list would mediate them down to one version. Keeping
