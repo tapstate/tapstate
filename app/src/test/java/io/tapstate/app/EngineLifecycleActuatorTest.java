@@ -8,8 +8,22 @@ import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
+import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.Settings;
+import io.tapstate.core.model.SourceMode;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.srs.CaptureHealth;
+import io.tapstate.runtime.srs.CaptureRun;
+import io.tapstate.runtime.srs.SnapshotBuffer;
+import io.tapstate.runtime.srs.SrsCoordinator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -174,6 +188,62 @@ class EngineLifecycleActuatorTest {
         Job rebuilt = member.getJet().getJob(PIPE);
         assertThat(rebuilt).as("the rebuild submits a job of its own").isNotSameAs(held);
         awaitStatus(rebuilt, JobStatus.RUNNING);
+    }
+
+    /**
+     * The same hold over a pipeline that reads its source once and opens no tail. It rebuilds too, and for
+     * the same reason: what a resume cannot carry on from is the load, and a load is no less unfinished for
+     * having no tail behind it.
+     *
+     * <p>Its rows travel exactly as any other load's do -- appended to the member-local hand-off by the
+     * capture, taken from it by the source vertex, which consumes what is there once. A resume re-runs the
+     * topology under a guarantee that keeps no execution state, so the vertex that comes back finds the
+     * hand-off empty and there is nothing behind it to fill it again: no tail, and a capture that has
+     * already returned. It emits nothing at all, for ever, with the job running, the pipeline reporting
+     * healthy and nothing thrown -- and every row the hold caught in flight is absent from the target for
+     * good.
+     *
+     * <p>Driven through the store-backed coordinator rather than the stand-in above, because the stand-in
+     * is told the answer and this case is about how that answer is reached. A read that opens no tail opens
+     * no chain either, so nothing durable records what its load delivered, and this is exactly the shape
+     * where the question has to be answered without a record to answer it from.
+     *
+     * <p>Asserted on the capture being run a second time, which is the whole of what a rebuild is for here:
+     * the run that refills the hand-off the resumed vertex is about to read.
+     */
+    @Test
+    void aResumeOverASnapshotOnlyLoadThatHasNotReachedTheTargetRebuildsAsWell() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(new PipelineResource(PIPE, null, List.of(SourceRef.spec("orders_src", true)), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"),
+                        List.of(new SyncElement("sync_1", "orders_src", null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_ONLY, "earliest"), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        int[] captures = {0};
+        // What a snapshot-only run really hands back: rows read, and no chain, because it opens no tail.
+        CaptureStarter starter = (spec, passthrough) -> {
+            captures[0]++;
+            return new CaptureRun(Optional.empty(), false, 2L, Map.of("orders", 2L),
+                    Optional.empty(), Optional.of(() -> { }), new CaptureHealth());
+        };
+        PipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), new IdleDagSource(), coordinator, teardown());
+
+        actuator.start(PIPE);
+        Job held = member.getJet().getJob(PIPE);
+        awaitStatus(held, JobStatus.RUNNING);
+        actuator.pause(PIPE);
+        awaitStatus(held, JobStatus.SUSPENDED);
+
+        actuator.resume(PIPE);
+
+        assertThat(captures[0])
+                .as("the resumed vertex reads the hand-off, and only a second capture run refills it")
+                .isEqualTo(2);
     }
 
     /**

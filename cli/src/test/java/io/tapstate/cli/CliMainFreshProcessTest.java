@@ -49,6 +49,68 @@ class CliMainFreshProcessTest {
     private static final String ISSUER = "urn:tapstate:cluster:TEST";
 
     @Test
+    void defaultInstallWithUmask022AllowsContextResolution(@TempDir Path temporary) throws Exception {
+        Assumptions.assumeTrue(Files.getFileStore(temporary).supportsFileAttributeView("posix"));
+        Path home = Files.createDirectory(temporary.resolve("home"));
+        Path installer = Path.of("..").toAbsolutePath().normalize().resolve("install/install.sh");
+        assertThat(installer).isRegularFile();
+        Path installLog = temporary.resolve("install.log");
+        // Only the release payload is stubbed; directory creation runs through the real installer.
+        ProcessBuilder setup = new ProcessBuilder("sh", "-eu", "-c", """
+                installer="$1"
+                fixture="$2"
+                version=$(sed -n 's/^PINNED_VERSION="\\(.*\\)"$/\\1/p' "$installer")
+                platform=$(sh "$installer" --print-platform)
+                bundle="tapstate-cli-$version"
+                mkdir -p "$fixture/stage/$bundle/bin" "$fixture/stage/$bundle/libexec"
+                printf '#!/bin/sh\\nexit 0\\n' > "$fixture/stage/$bundle/bin/tapstate"
+                printf '#!/bin/sh\\nexit 0\\n' > "$fixture/stage/$bundle/libexec/tapstate-mcp"
+                chmod +x "$fixture/stage/$bundle/bin/tapstate" "$fixture/stage/$bundle/libexec/tapstate-mcp"
+                release="$fixture/releases/download/v$version"
+                mkdir -p "$release"
+                asset="tapstate-$version-$platform.tar.gz"
+                tar -czf "$release/$asset" -C "$fixture/stage" "$bundle"
+                cd "$release"
+                if command -v sha256sum >/dev/null 2>&1; then
+                    sha256sum "$asset" > "$asset.sha256"
+                else
+                    shasum -a 256 "$asset" > "$asset.sha256"
+                fi
+                umask 022
+                exec sh "$installer"
+                """, "install-context-test", installer.toString(), temporary.toString());
+        setup.environment().put("HOME", home.toString());
+        setup.environment().remove("TAPSTATE_INSTALL_DIR");
+        setup.environment().remove("TAPSTATE_VERSION");
+        setup.environment().put("TAPSTATE_BASE_URL", temporary.resolve("releases").toUri().toString()
+                .replaceAll("/$", ""));
+        setup.environment().put("TAPSTATE_TELEMETRY", "off");
+        setup.redirectErrorStream(true).redirectOutput(installLog.toFile());
+        Process installation = setup.start();
+        installation.getOutputStream().close();
+        assertThat(awaitExit(installation)).withFailMessage("Installer failed: %s", Files.readString(installLog))
+                .isZero();
+        Path configDirectory = home.resolve(".tapstate");
+        assertThat(directoryEntries(configDirectory)).containsExactly("bin");
+        assertThat(home.resolve(".tapstate/bin/tapstate")).isExecutable();
+        assertThat(Files.getOwner(configDirectory)).isEqualTo(Files.getOwner(home));
+        Set<PosixFilePermission> installedMode = Files.getPosixFilePermissions(configDirectory);
+
+        ProcessResult installed = runCli(home, home, Map.of(), "apply", "--help");
+
+        // Capture the existing missing-context behavior when only the directory mode changes.
+        Files.setPosixFilePermissions(configDirectory, Set.of(PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
+        ProcessResult ownerOnly = runCli(home, home, Map.of(), "apply", "--help");
+        assertThat(ownerOnly.stderr()).contains("error: cli.context-required")
+                .doesNotContain("cli.context-config-permissions");
+        assertThat(installed.stderr())
+                .withFailMessage("apply --help must accept the installer-created directory (mode %s): %s",
+                        installedMode, installed.stderr())
+                .isEqualTo(ownerOnly.stderr());
+    }
+
+    @Test
     void offlineMainBypassesConfiguredTransportAndAuth(@TempDir Path home) throws Exception {
         Path workspace = Files.createDirectory(home.resolve("orders"));
         Path sourceDir = Files.createDirectory(workspace.resolve("source"));
