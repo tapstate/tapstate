@@ -525,7 +525,8 @@ final class StoreBackedDagSource implements DagSource {
             NodeColumns produced = inputs.size() == 1 ? inputs.values().iterator().next()
                     : NodeColumns.of(new TransformBody.Union(), inputs, null);
             if (produced != null && produced.known()) {
-                published.put(stream, publishedAs(base, produced));
+                published.put(stream, publishedAs(base, produced, atTheSource(pipelineId, stream,
+                        sourceVertices)));
             }
         }
         return published;
@@ -830,31 +831,74 @@ final class StoreBackedDagSource implements DagSource {
      * One published stream's target: the columns the pipeline produces, in that order, each carrying
      * what the source declared for it and nothing where the source has no such column.
      *
-     * <p><b>The type stays the source's own spelling.</b> A projection changes which columns travel,
-     * not what a column is; writing the shared type there instead would hand the connector a word its
-     * own DDL does not have. A column the source never had - a written-down value, a computed one -
-     * carries no type at all and is inferred by the connector, the way a join's computed columns and a
-     * view's unresolved ones already are.
+     * <p><b>The type stays the source's own spelling, for as long as it is still true of the
+     * column.</b> A projection changes which columns travel, not what a column is; writing the shared
+     * type there instead would hand the connector a word its own DDL does not have. A column the
+     * source never had - a written-down value, a computed one - carries no type at all and is
+     * inferred by the connector, the way a join's computed columns and a view's unresolved ones
+     * already are.
+     *
+     * <p><b>A column that kept its name but stopped being what the source declared carries no type
+     * either.</b> A node that expands a list writes one element where the list was: the name is the
+     * same, the source's word for it is still on file, and it now describes the wrong thing - so
+     * handing it on builds a column typed for the list and fills it with an element, which is a
+     * table that is wrong from the moment it is created and reports nothing. There is no second word
+     * to offer in its place, because the target's own vocabulary is the connector's and nothing on
+     * this side translates into it; so the answer is the one already reserved for a type nobody
+     * resolved. The comparison is between the two shared-vocabulary answers - what the source's copy
+     * says the column is, against what the pipeline works it out to be - and only their types, never
+     * their nullability: a merge that widens a column to nullable has not changed what it holds.
+     * Where the source's copy cannot be read at all the column keeps its spelling, because an
+     * unreadable copy is not evidence of a change.
      *
      * <p>The key is whatever of the table's own key still travels, key columns leading, because that
      * is the order the sink matches an upsert in. A projection that drops a key column publishes rows
      * with nothing to match on; that reaches the sink as a key one column short and is reported there,
      * against the table being written, rather than being invented back here.
      */
-    private static TargetTable publishedAs(TargetTable base, NodeColumns produced) {
+    static TargetTable publishedAs(TargetTable base, NodeColumns produced, NodeColumns atTheSource) {
         Map<String, TargetField> declared = new LinkedHashMap<>();
         base.fields().forEach(field -> declared.put(field.name(), field));
         List<TargetField> fields = new ArrayList<>(produced.columns().size());
         List<String> key = new ArrayList<>();
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
-            fields.add(new TargetField(column, carried == null ? null : carried.type(), false));
+            boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource);
+            fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false));
             if (carried != null && carried.primaryKey()) {
                 key.add(column);
             }
         }
         return TargetModelResolver.keyedOn(
                 new TargetTable(base.name(), fields, base.indexes()), key);
+    }
+
+    /**
+     * Whether a column still carrying the source's name has stopped holding what the source declared.
+     * Types only, and only where both sides can be read - see {@link #publishedAs}.
+     */
+    private static boolean retyped(String column, NodeColumns produced, NodeColumns atTheSource) {
+        if (atTheSource == null || !atTheSource.known()) {
+            return false;
+        }
+        String declared = atTheSource.columns().get(column);
+        String worked = produced.columns().get(column);
+        return declared != null && worked != null
+                && JoinSchemaDrift.typeOf(declared) != JoinSchemaDrift.typeOf(worked);
+    }
+
+    /**
+     * This pipeline's own copy of what the source declared for one table it reads, or null where
+     * nothing has been copied yet. One vertex is one table, so the table name finds it.
+     */
+    private NodeColumns atTheSource(
+            String pipelineId, String table, Map<String, SourceVertex> sourceVertices) {
+        for (SourceVertex vertex : sourceVertices.values()) {
+            if (vertex.table().equals(table)) {
+                return copiedColumns(pipelineId, vertex);
+            }
+        }
+        return null;
     }
 
     /**
