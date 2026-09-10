@@ -1,0 +1,27 @@
+# Oracle snapshot and LogMiner delivery are checked separately, against the managed store.
+# A working snapshot with a stalled change reader must fail the insert count.
+# Snapshot, insert, update and delete are separate delivery witnesses.
+# The changed sequence is read back: counts alone cannot detect a discarded update.
+name: an-oracle-table-reaches-the-managed-store
+setup:
+  databases:
+    src_ora: { kind: oracle }
+    store: { kind: mongo }
+  connectors: [oracle, mongodb]
+  apply: [src_ora.tap.yml, views.tap.yml, pipeline.tap.yml]
+  discover: [src_ora]
+pipeline: pipeline.tap.yml
+seed:
+  src_ora.orders: { rows: 12 }
+steps:
+  - start
+  - await: { count: { views.order_state: 12 } }
+  - await: { doc: { views.order_state: { where: { id: 5 }, expect: { seq: 5 } } } }
+  - cdc: { src_ora.orders: insert 3 }
+  - await: { count: { views.order_state: 15 } }
+  - await: { doc: { views.order_state: { where: { id: 15 }, expect: { seq: 15 } } } }
+  - cdc: { src_ora.orders: { update: { where: { id: 5 }, set: { seq: 505 } } } }
+  - await: { doc: { views.order_state: { where: { id: 5 }, expect: { seq: 505 } } } }
+  - cdc: { src_ora.orders: { delete: { where: { id: 1 } } } }
+  - await: { count: { views.order_state: 14 } }
+  - assert: { doc: { views.order_state: { where: { id: 5 }, expect: { seq: 505 } } } }

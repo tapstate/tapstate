@@ -1,0 +1,5 @@
+version: tapstate/v1
+kind: source
+id: tgt_db
+connector: mysql
+config: { host: ${TGT_DB_HOST}, port: ${TGT_DB_PORT}, database: ${TGT_DB_DATABASE}, username: ${TGT_DB_USERNAME}, password: ${TGT_DB_PASSWORD} }
