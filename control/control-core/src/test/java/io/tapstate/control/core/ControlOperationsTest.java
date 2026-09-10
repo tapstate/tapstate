@@ -210,11 +210,11 @@ class ControlOperationsTest {
                 .containsExactlyInAnyOrder(
                         "system.version",
                         "connector.list", "connector.get",
-                        "source.draft",
+                        "source.draft", "source.list",
                         "connection.test", "connection.test-result",
                         "connection.discover-schema", "connection.schema",
                         "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-                        "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+                        "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         // Neither half of the resume-point pair is here: where to resume from turns on

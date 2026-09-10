@@ -14,10 +14,10 @@ class ControlApiSchemaTest {
     private static final Set<String> MCP_OPERATIONS = Set.of(
             "system.version",
             "connector.list", "connector.get",
-            "source.draft",
+            "source.draft", "source.list",
             "connection.test", "connection.test-result", "connection.discover-schema", "connection.schema",
             "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-            "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+            "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
             "pipeline.status", "pipeline.metrics",
             "pipeline.snapshot", "pipeline.logs",
             "data-browser.collections", "data-browser.find", "data-browser.stats");

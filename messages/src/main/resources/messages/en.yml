@@ -474,6 +474,9 @@ mcp.connector-spec-unavailable:
 mcp.environment-missing:
   message: "Environment variable {variable} is required by the Source config."
   solution: "Inject the variable into the MCP process environment and retry the connection operation."
+mcp.invalid-server-response:
+  message: "The Tapstate Server returned an invalid response for MCP operation {operation}."
+  solution: "Verify that the MCP sidecar and Server use compatible control contracts, then retry."
 mcp.server-rejected:
   message: "The Tapstate Server rejected the request with HTTP status {status} without a structured error code."
   solution: "Inspect the Server logs and verify that the MCP sidecar and Server use compatible control contracts."
