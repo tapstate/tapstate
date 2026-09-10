@@ -96,6 +96,7 @@ public final class JoinDriver {
     private final Map<String, Map<String, Object>> primed = new HashMap<>();
     private final int keysPerRead;
     private final JoinGauge gauge;
+    private final DimensionRowDisplacedAlert displaced;
 
     /**
      * @param plan           what to match on and what to publish
@@ -108,19 +109,37 @@ public final class JoinDriver {
      */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores) {
-        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ, JoinGauge.NONE);
+        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ, JoinGauge.NONE,
+                DimensionRowDisplacedAlert.NONE);
+    }
+
+    /** As above, saying to {@code displaced} which dimension rows this join loses to a shared key. */
+    public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
+            JoinStores stores, DimensionRowDisplacedAlert displaced) {
+        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ, JoinGauge.NONE,
+                displaced);
     }
 
     /** As above, with the size of one read named - which is what a case needs to be small. */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores, int keysPerRead) {
-        this(plan, factKeyColumns, outputStream, stores, keysPerRead, JoinGauge.NONE);
+        this(plan, factKeyColumns, outputStream, stores, keysPerRead, JoinGauge.NONE,
+                DimensionRowDisplacedAlert.NONE);
     }
 
     /** As above, reporting the widest bucket it walks to {@code gauge}. */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores, int keysPerRead, JoinGauge gauge) {
+        this(plan, factKeyColumns, outputStream, stores, keysPerRead, gauge,
+                DimensionRowDisplacedAlert.NONE);
+    }
+
+    /** As above, with both places this reports to named. */
+    public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
+            JoinStores stores, int keysPerRead, JoinGauge gauge,
+            DimensionRowDisplacedAlert displaced) {
         this.gauge = Objects.requireNonNull(gauge, "gauge");
+        this.displaced = Objects.requireNonNull(displaced, "displaced");
         if (keysPerRead < 1) {
             throw new IllegalArgumentException("a read carries at least one key");
         }
@@ -409,7 +428,20 @@ public final class JoinDriver {
             // can ever name.
             return;
         }
-        stores.putDimensionRow(dimension.source(), now, after);
+        Map<String, Object> replaced = stores.putDimensionRow(dimension.source(), now, after);
+        if (before == null && replaced != null && !replaced.equals(after)) {
+            // A second row under one key: the row just replaced is unreachable from here on, and every
+            // fact row under the key now joins to this one. Said rather than repaired - holding both
+            // would move dimension state, output cardinality and row identity together - so what this
+            // removes is only the silence, which is the half that makes a short target look correct.
+            //
+            // A null before image is what makes this discriminate. An edit of the row already filed
+            // under the key replaces it too and loses nothing, and it is the one arrival that carries
+            // the row it replaces; without that clause every dimension write would report itself.
+            // Comparing the two rows drops the other harmless replacement, a snapshot delivered twice,
+            // where every row arrives again as an insert against a mirror that already holds it.
+            displaced.displaced(dimension.source(), now);
+        }
         if (keyMoved || publishedValuesDiffer(dimension, before, after)) {
             queueRecompute(dimension, now, event.ts());
         }

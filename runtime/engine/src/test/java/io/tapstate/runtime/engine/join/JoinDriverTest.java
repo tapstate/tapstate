@@ -831,8 +831,9 @@ class JoinDriverTest {
         }
 
         @Override
-        public void putDimensionRow(String source, String dimensionKey, Map<String, Object> row) {
-            held.putDimensionRow(source, dimensionKey, row);
+        public Map<String, Object> putDimensionRow(String source, String dimensionKey,
+                Map<String, Object> row) {
+            return held.putDimensionRow(source, dimensionKey, row);
         }
 
         @Override

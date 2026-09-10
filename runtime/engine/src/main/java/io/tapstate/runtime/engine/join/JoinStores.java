@@ -49,8 +49,24 @@ public interface JoinStores {
     /** The current image of one row of one dimension source, or null where there is none. */
     Map<String, Object> dimensionRow(String source, String dimensionKey);
 
-    /** Records the current image of one dimension row, under the key it is matched by. */
-    void putDimensionRow(String source, String dimensionKey, Map<String, Object> row);
+    /**
+     * Records the current image of one dimension row, under the key it is matched by, and answers with
+     * whatever row that key already held - null where it held none.
+     *
+     * <p><b>The answer is what makes a lost row sayable at all.</b> One key holds one row, so a write
+     * under an occupied key replaces what was there; where the arrival is a different row rather than a
+     * newer image of the same one, the replaced row becomes unreachable and every fact row under that
+     * key joins to the arrival instead. Nothing downstream can tell - the target is merely short a row,
+     * and each row it does hold looks entirely ordinary - so the write is the only place it can be
+     * observed. Discarding what came back, which is what both implementations used to do, is what left
+     * it silent.
+     *
+     * <p>The one write here that carries a value back rather than sending one out. Over a distributed
+     * map that costs the replaced row a trip home, and where the key is not in memory it is a read of
+     * the layer behind the map as well - both inherent, because a key's occupant cannot be reported
+     * without being asked for.
+     */
+    Map<String, Object> putDimensionRow(String source, String dimensionKey, Map<String, Object> row);
 
     /** Forgets one dimension row. */
     void removeDimensionRow(String source, String dimensionKey);
