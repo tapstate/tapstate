@@ -69,7 +69,7 @@ class WorkbenchRendererTest {
         Rendered rendered = render(88, 24, accepted(snapshot));
 
         assertThat(rendered.text())
-                .contains("TapState", "ctx: dev", "connected", "auth: alice", "workspace: /work/catalog")
+                .contains("Tapstate", "ctx: dev", "connected", "auth: alice", "workspace: /work/catalog")
                 .contains("1 Overview", "2 Workspace", "3 Sources", "4 Pipelines", "0 More")
                 .contains("Resources")
                 .contains("source", "pipeline", "in sync 1", "local only 1")
@@ -103,7 +103,7 @@ class WorkbenchRendererTest {
 
         String header = lineOf(rendered.buffer(), 0);
         assertThat(header)
-                .contains("TapState", "ctx: dev", "connected", "workspace: /work/catalog", "auth: alice");
+                .contains("Tapstate", "ctx: dev", "connected", "workspace: /work/catalog", "auth: alice");
         assertThat(header.indexOf("ctx: dev")).isLessThan(header.indexOf("connected"));
         assertThat(header.indexOf("connected")).isLessThan(header.indexOf("workspace: /work/catalog"));
         assertThat(header.indexOf("workspace: /work/catalog")).isLessThan(header.indexOf("auth: alice"));

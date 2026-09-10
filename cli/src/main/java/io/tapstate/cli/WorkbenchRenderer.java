@@ -94,7 +94,7 @@ final class WorkbenchRenderer {
         int x = area.x();
         List<TabHit> hits = new ArrayList<>();
         List<ActionHit> actions = new ArrayList<>();
-        x += write(frame, x, area.y() + HEADER_Y, " TapState", theme.title(), area);
+        x += write(frame, x, area.y() + HEADER_Y, " Tapstate", theme.title(), area);
         x += write(frame, x, area.y() + HEADER_Y, "  ", theme.base(), area);
         int contextX = x;
         int contextWidth = write(frame, x, area.y() + HEADER_Y,

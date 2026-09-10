@@ -64,7 +64,7 @@ class WorkbenchTest {
 
         assertThat(textOf(tooSmall)).contains("Terminal size too small:");
         assertThat(textOf(recovered))
-                .contains("TapState")
+                .contains("Tapstate")
                 .doesNotContain("Terminal size too small:");
     }
 
