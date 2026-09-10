@@ -1,5 +1,6 @@
 package io.tapstate.adapters.transform;
 
+import io.tapstate.core.dsl.UnwindWriteKeys;
 import io.tapstate.core.model.TransformBody;
 import java.io.Serializable;
 import java.util.List;
@@ -20,7 +21,12 @@ import java.util.List;
  * <p>The element's own locator is <em>not</em> in that list, because it is not a column of the row
  * arriving here - it is either a field inside the element or the ordinal this expansion invents, and
  * both are things only the expansion can read. So the whole key of an output row is this list plus
- * whatever {@link #elementKey()} or {@link #includeArrayIndex()} yields for that element.
+ * {@link #locator()}, which the expansion writes as a column of every row it emits.
+ *
+ * <p><b>The locator is resolved once, where every consumer of the answer already looks.</b> The
+ * offline check that refuses a declaration naming none, the derivation that publishes the target's
+ * key, and this port all have to name the same column; a second answer here would not fail visibly,
+ * it would fill the target with rows nobody counted as overwritten.
  */
 public final class UnwindSpec implements Serializable {
 
@@ -30,14 +36,16 @@ public final class UnwindSpec implements Serializable {
     private final String includeArrayIndex;
     private final boolean preserveNullAndEmptyArrays;
     private final String elementKey;
+    private final String locator;
     private final List<String> parentKey;
 
     private UnwindSpec(String path, String includeArrayIndex, boolean preserveNullAndEmptyArrays,
-            String elementKey, List<String> parentKey) {
+            String elementKey, String locator, List<String> parentKey) {
         this.path = path;
         this.includeArrayIndex = includeArrayIndex;
         this.preserveNullAndEmptyArrays = preserveNullAndEmptyArrays;
         this.elementKey = elementKey;
+        this.locator = locator;
         this.parentKey = parentKey;
     }
 
@@ -49,7 +57,7 @@ public final class UnwindSpec implements Serializable {
     public static UnwindSpec from(TransformBody.Unwind unwind, List<String> parentKey) {
         return new UnwindSpec(unwind.path(), unwind.includeArrayIndex(),
                 Boolean.TRUE.equals(unwind.preserveNullAndEmptyArrays()),
-                unwind.elementKey(), List.copyOf(parentKey));
+                unwind.elementKey(), UnwindWriteKeys.elementLocator(unwind), List.copyOf(parentKey));
     }
 
     /** The field holding the list. */
@@ -70,6 +78,15 @@ public final class UnwindSpec implements Serializable {
     /** The field inside an element identifying the row it becomes, or null where none was named. */
     String elementKey() {
         return elementKey;
+    }
+
+    /**
+     * The column telling one of a parent's expanded rows from another - the ordinal, or the column
+     * the element's own identifying field is written into. Null only where the declaration named
+     * neither, which the offline check refuses.
+     */
+    String locator() {
+        return locator;
     }
 
     /** What the rows arriving here are keyed on, in order. */

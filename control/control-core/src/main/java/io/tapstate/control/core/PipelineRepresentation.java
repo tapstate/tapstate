@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
@@ -35,6 +36,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
@@ -174,6 +176,9 @@ public final class PipelineRepresentation {
         if (body.containsKey("root")) {
             return "nest";
         }
+        if (body.containsKey("path")) {
+            return "unwind";
+        }
         if (body.containsKey("sql") || body.containsKey("engine")) {
             return "join";
         }
@@ -190,6 +195,18 @@ public final class PipelineRepresentation {
                     fieldRules(requiredObject(payload, "fields", path), path + ".fields"));
             case "filter" -> new TransformBody.Filter(requiredText(payload, "expr", path));
             case "union" -> new TransformBody.Union();
+            // An expansion's four optional keys are read as absent when absent, never defaulted:
+            // this face round-trips what it wrote, and answering with a spelled-out false for a
+            // key nobody wrote turns reading a pipeline into editing it.
+            case "unwind" -> new TransformBody.Unwind(
+                    requiredText(payload, "path", path),
+                    textOrNull(value(payload, "include_array_index", "includeArrayIndex"),
+                            path + ".include_array_index"),
+                    booleanOrNull(value(payload, "preserve_null_and_empty_arrays",
+                            "preserveNullAndEmptyArrays"), path + ".preserve_null_and_empty_arrays"),
+                    textOrNull(value(payload, "element_key", "elementKey"), path + ".element_key"),
+                    elementType(value(payload, "element_type", "elementType"),
+                            path + ".element_type"));
             case "nest" -> new TransformBody.Nest(
                     textOrNull(value(payload, "primary_key", "primaryKey"), path + ".primary_key"),
                     enumValue(value(payload, "order"), NestOrder.values(), NestOrder::yaml, path + ".order"),
@@ -836,6 +853,19 @@ public final class PipelineRepresentation {
             throw malformed(path + " must be a boolean");
         }
         return result;
+    }
+
+    /**
+     * An expansion's declared element type, refused here rather than carried on as text. The
+     * declaration reaching this face has not been through the parser that checks it, so a word
+     * outside the shared vocabulary would otherwise be written down and only be noticed - if at
+     * all - as a target column nobody could build. Held as its lower-case spelling, the same as
+     * every other side writes it.
+     */
+    private static String elementType(Object value, String path) {
+        TapstateType declared = enumValue(
+                value, TapstateType.values(), t -> t.name().toLowerCase(Locale.ROOT), path);
+        return declared == null ? null : declared.name().toLowerCase(Locale.ROOT);
     }
 
     private static <E> E enumValue(Object value, E[] candidates, Function<E, String> spelling, String path) {

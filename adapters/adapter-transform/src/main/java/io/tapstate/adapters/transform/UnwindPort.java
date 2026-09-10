@@ -145,12 +145,31 @@ final class UnwindPort implements TransformPort {
         return out;
     }
 
-    /** The parent's row with the list's field replaced by one element, and the ordinal beside it. */
+    /**
+     * The parent's row with the list's field replaced by one element, and whatever this expansion
+     * writes beside it: the ordinal where one was asked for, and the element's own identifying
+     * field where the declaration named one.
+     *
+     * <p><b>Lifting that field is what makes the row addressable anywhere but here.</b> Inside the
+     * element it is reachable by this port and by nothing downstream - a key is matched at the
+     * target by column, and no store builds a column for a name that reaches into a value. Left
+     * there, every expanded row of one parent arrives keyed on the parent alone and the target
+     * keeps the last of them, which is the one failure this whole expansion has to not have.
+     *
+     * <p>The column is written whether or not the element carries the field, and whether or not
+     * there is an element at all. A row short of a column the published model declares is a write
+     * that fails on some stores and quietly takes a default on others, and neither is the answer
+     * for a row whose identity is simply empty.
+     */
     private Map<String, Object> rowWith(Map<String, Object> row, Object element, Long ordinal) {
         Map<String, Object> out = new LinkedHashMap<>(row);
         out.put(spec.path(), element);
         if (spec.includeArrayIndex() != null) {
             out.put(spec.includeArrayIndex(), ordinal);
+        }
+        if (spec.elementKey() != null) {
+            out.put(spec.elementKey(),
+                    element instanceof Map<?, ?> map ? map.get(spec.elementKey()) : null);
         }
         return out;
     }
@@ -159,27 +178,20 @@ final class UnwindPort implements TransformPort {
      * What tells this row from the others the same parent produced: what its rows were already keyed
      * on, plus the one thing that varies per element.
      *
-     * <p>The element's own field is read out of the element rather than off the row, because the
-     * expansion puts the element where the list was and does not lift its fields to the top. Every
-     * part is unwrapped, since this is a comparison and a carrier never equals the value inside it.
+     * <p>Both parts are read off the row as columns, because by the time a row is paired the
+     * expansion has already written its locator as one - so what is compared here is the same
+     * thing the target is keyed on rather than a second reading of it. Every part is unwrapped,
+     * since this is a comparison and a carrier never equals the value inside it.
      */
     private Object keyOf(Map<String, Object> row) {
         List<Object> key = new ArrayList<>(spec.parentKey().size() + 1);
         for (String column : spec.parentKey()) {
             key.add(ConvertedValue.unwrap(row.get(column)));
         }
-        key.add(ConvertedValue.unwrap(elementIdentity(row)));
-        return key;
-    }
-
-    private Object elementIdentity(Map<String, Object> row) {
-        if (spec.elementKey() != null) {
-            Object element = row.get(spec.path());
-            return element instanceof Map<?, ?> map ? map.get(spec.elementKey()) : null;
-        }
         // Nothing else can identify an element, and the offline check refuses a declaration naming
-        // neither - so reaching here with both absent is a wiring fault, not a row anyone wrote.
-        return row.get(spec.includeArrayIndex());
+        // neither - so a null locator here is a wiring fault, not a row anyone wrote.
+        key.add(ConvertedValue.unwrap(row.get(spec.locator())));
+        return key;
     }
 
     // What an event covers is stamped onto every output by the runtime that drives this port, so

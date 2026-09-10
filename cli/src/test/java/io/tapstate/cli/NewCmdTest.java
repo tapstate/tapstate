@@ -597,9 +597,30 @@ class NewCmdTest {
     }
 
     @Test
+    void newTransformNonInteractiveScaffoldsAnUnwindPlaceholder(@TempDir Path dir) throws Exception {
+        // an expansion scaffold carries a locator, because a declaration naming neither is refused
+        // when it is validated - a placeholder that fails the next command is worse than no command
+        Run r = run("new", "--non-interactive", "--kind", "transform", "--id", "t_unwind",
+                "--type", "unwind", "--out", dir.toString());
+
+        assertThat(r.code()).isZero();
+        assertThat(Files.readString(dir.resolve("t_unwind.tap.yml"))).isEqualTo(
+                """
+                version: tapstate/v1
+                kind: transform
+                id: t_unwind
+                type: unwind
+                path: items
+                include_array_index: item_no
+                """);
+    }
+
+    @Test
     void everyNonInteractiveTransformScaffoldValidatesAsAWorkspace(@TempDir Path dir) {
-        // each type's placeholder body must parse + load clean (the scaffold -> validate green contract)
-        for (String type : java.util.List.of("filter", "map", "js", "union", "nest", "join")) {
+        // each type's placeholder body must parse + load clean (the scaffold -> validate green
+        // contract). Read from the menu rather than a list written out here: a type the wizard
+        // offers and this list does not is exactly the one whose scaffold nobody checked.
+        for (String type : TransformBodyPrompter.TYPES) {
             assertThat(run("new", "--non-interactive", "--kind", "transform", "--id", "t_" + type,
                     "--type", type, "--out", dir.toString()).code())
                     .as("scaffold of type %s", type).isZero();

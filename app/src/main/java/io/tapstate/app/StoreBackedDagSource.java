@@ -7,7 +7,9 @@ import com.hazelcast.jet.core.Watermark;
 import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
+import io.tapstate.adapters.transform.UnwindSpec;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.UnwindWriteKeys;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.FromClause;
@@ -851,10 +853,20 @@ final class StoreBackedDagSource implements DagSource {
      * Where the source's copy cannot be read at all the column keeps its spelling, because an
      * unreadable copy is not evidence of a change.
      *
-     * <p>The key is whatever of the table's own key still travels, key columns leading, because that
-     * is the order the sink matches an upsert in. A projection that drops a key column publishes rows
-     * with nothing to match on; that reaches the sink as a key one column short and is reported there,
-     * against the table being written, rather than being invented back here.
+     * <p>The key starts as whatever of the table's own key still travels, key columns leading, because
+     * that is the order the sink matches an upsert in. A projection that drops a key column publishes
+     * rows with nothing to match on; that reaches the sink as a key one column short and is reported
+     * there, against the table being written, rather than being invented back here.
+     *
+     * <p><b>The table's own key is the default and no longer the whole rule</b>, because a node that
+     * expands a list emits several rows carrying one parent's key, and what tells them apart is a
+     * column that table never had - so no answer read off the source's key can reach it, and the
+     * table would be published keyed on the parent alone. An upsert target answers that by keeping
+     * the last of each parent's expanded rows and losing the rest, filling the table, reporting
+     * nothing, and reading exactly like a step that never ran. So the columns each node says it adds
+     * are appended here, after the table's own and in the order the nodes added them. A node that
+     * adds none - which is every node that emits one row per row it is given - leaves this the rule
+     * it has always been.
      */
     static TargetTable publishedAs(TargetTable base, NodeColumns produced, NodeColumns atTheSource) {
         Map<String, TargetField> declared = new LinkedHashMap<>();
@@ -867,6 +879,14 @@ final class StoreBackedDagSource implements DagSource {
             fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false));
             if (carried != null && carried.primaryKey()) {
                 key.add(column);
+            }
+        }
+        for (String added : produced.key()) {
+            // Only a column that is actually published: a key naming one that is not is dropped
+            // where the model is built, which turns a key short of a column into a key that reads
+            // whole.
+            if (produced.columns().containsKey(added) && !key.contains(added)) {
+                key.add(added);
             }
         }
         return TargetModelResolver.keyedOn(
@@ -1094,9 +1114,12 @@ final class StoreBackedDagSource implements DagSource {
             FrontierBinding frontier,
             Map<String, CompiledJoin> compiledJoins) {
         ChainAxes axes = frontier.axes();
+        Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
+        Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes),
-                StoreBackedDagSource::transformPort,
+                step -> transformPort(step, parentKeyReaching(step, stepsById,
+                        ref -> nestTable(ref, sourceIdByTable).primaryKey())),
                 element -> sinkWriter(pipeline, element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
@@ -1774,12 +1797,17 @@ final class StoreBackedDagSource implements DagSource {
 
     /**
      * The port factory for one linear transform step. The builder only asks this for an inline stateless
-     * step (filter / map / a scripted row transform); a union it merges itself and a stateful step it
-     * refuses, so neither reaches here. The returned factory captures only the step body's serializable
-     * shape - an expression string, a projection spec, a script - so it ships and rebuilds the port on the
-     * member.
+     * step (filter / map / an expansion / a scripted row transform); a union it merges itself and a
+     * stateful step it refuses, so neither reaches here. The returned factory captures only the step
+     * body's serializable shape - an expression string, a projection spec, an expansion's spec, a
+     * script - so it ships and rebuilds the port on the member.
+     *
+     * <p><b>An expansion is the one kind handed something the step body does not contain.</b> What
+     * the rows arriving at it are identified by is a property of the chain above it, and it needs
+     * that to tell one parent's expanded rows from another's when a change to a list arrives. Every
+     * other kind is a function of its own body alone.
      */
-    private static SupplierEx<? extends TransformPort> transformPort(Step step) {
+    static SupplierEx<? extends TransformPort> transformPort(Step step, List<String> parentKey) {
         if (!(step instanceof Step.Inline inline)) {
             throw new IllegalStateException("transform step '" + step.id() + "' is not inline");
         }
@@ -1793,6 +1821,10 @@ final class StoreBackedDagSource implements DagSource {
                 MapSpec spec = MapSpec.from(projection);
                 yield (SupplierEx<TransformPort>) () -> StatelessTransforms.map(spec);
             }
+            case TransformBody.Unwind unwind -> {
+                UnwindSpec spec = UnwindSpec.from(unwind, parentKey);
+                yield (SupplierEx<TransformPort>) () -> StatelessTransforms.unwind(spec);
+            }
             case TransformBody.Js js -> {
                 String script = js.script();
                 yield (SupplierEx<TransformPort>) () -> StatelessTransforms.js(script);
@@ -1800,6 +1832,80 @@ final class StoreBackedDagSource implements DagSource {
             default -> throw new IllegalStateException("transform step '" + step.id()
                     + "' has a body the linear builder does not carry: " + body.type());
         };
+    }
+
+    /**
+     * What the rows reaching one step are identified by: the discovered key of the table they come
+     * from, and the locator of every expansion between that table and here.
+     *
+     * <p><b>An expansion is why this exists.</b> It emits several rows carrying one parent's key, so
+     * the rows below it are told apart by the parent's key together with what each expansion added,
+     * and a second expansion under a first that fell back to the table's key alone would treat every
+     * row the first produced as one row. Nothing else in the chain changes the answer - a projection
+     * that renames or drops a key column changes what the target is keyed on, which is worked out
+     * where the target is published; what is wanted here is what identifies the row that arrived,
+     * and the port reads the columns it names off that row.
+     *
+     * <p>The table's key arrives as a function rather than being looked up here so that the walk is
+     * only the walk: what a table's key is comes from a discovered model this method has no business
+     * reading, and a walk that cannot be exercised without one is a walk nobody exercises.
+     */
+    static List<String> parentKeyReaching(Step step, Map<String, Step.Inline> stepsById,
+            Function<FromRef, List<String>> tableKey) {
+        return step instanceof Step.Inline inline
+                ? parentKeyReaching(inline.from(), stepsById, tableKey, new LinkedHashSet<>())
+                : List.of();
+    }
+
+    private static List<String> parentKeyReaching(FromClause from, Map<String, Step.Inline> stepsById,
+            Function<FromRef, List<String>> tableKey, Set<String> visiting) {
+        for (FromRef ref : refsOf(from)) {
+            List<String> declared = tableKey.apply(ref);
+            if (!declared.isEmpty()) {
+                return declared;
+            }
+            // A reference answering with no key is either a step or a table nothing was discovered
+            // for, and only the first has anything above it to ask.
+            if (!(ref instanceof FromRef.Literal literal)) {
+                continue;
+            }
+            Step.Inline upstream = stepsById.get(literal.ref());
+            if (upstream == null || !visiting.add(literal.ref())) {
+                continue;
+            }
+            List<String> above = parentKeyReaching(upstream.from(), stepsById, tableKey, visiting);
+            if (!(upstream.body() instanceof TransformBody.Unwind unwind)) {
+                if (!above.isEmpty()) {
+                    return above;
+                }
+                continue;
+            }
+            String locator = UnwindWriteKeys.elementLocator(unwind);
+            // An expansion adds to a key; it does not make one. Where nothing above could say what
+            // identifies the parent, appending the locator alone would answer with a key that has
+            // no parent in it - under which two parents whose lists share an element are one row -
+            // and it would answer confidently. Empty stays the single way of saying nobody could.
+            if (locator == null || above.isEmpty() || above.contains(locator)) {
+                return above;
+            }
+            List<String> key = new ArrayList<>(above);
+            key.add(locator);
+            return key;
+        }
+        return List.of();
+    }
+
+    /** Every inline step of a pipeline by its id, for walking a {@code from:} chain by reference. */
+    private static Map<String, Step.Inline> inlineStepsById(PipelineResource pipeline) {
+        Map<String, Step.Inline> byId = new LinkedHashMap<>();
+        if (pipeline.transforms() != null) {
+            for (Step step : pipeline.transforms()) {
+                if (step instanceof Step.Inline inline) {
+                    byId.put(inline.id(), inline);
+                }
+            }
+        }
+        return byId;
     }
 
     /**
