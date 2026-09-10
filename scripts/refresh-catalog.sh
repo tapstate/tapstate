@@ -112,7 +112,7 @@ for i in "${!connector_roots[@]}"; do
   [ -d "$connectors" ] || refuse "no such connectors checkout: $connectors"
   connectors="$(cd "$connectors" && pwd)"
   [ -d "$connectors/connectors" ] || refuse "$connectors has no connectors/ directory - is it the checkout root?"
-  connector_roots[$i]="$connectors"
+  connector_roots[i]="$connectors"
   checkout_args+=(--checkout "$connectors")
   if [ "$i" -eq 0 ]; then
     catalog_args+=("-Dtapstate.catalog.connectors=$connectors")
