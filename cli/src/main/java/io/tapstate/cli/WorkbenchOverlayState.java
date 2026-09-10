@@ -9,6 +9,7 @@ sealed interface WorkbenchOverlayState
         permits WorkbenchOverlayState.More,
                 WorkbenchOverlayState.ContextPicker,
                 WorkbenchOverlayState.ContextCreate,
+                WorkbenchOverlayState.ContextDeleteConfirm,
                 WorkbenchOverlayState.Login,
                 WorkbenchOverlayState.Help {
 
@@ -89,6 +90,18 @@ sealed interface WorkbenchOverlayState
             NAME,
             SERVER,
             VERIFY_TLS
+        }
+    }
+
+    record ContextDeleteConfirm(
+            String contextName,
+            boolean pending,
+            Optional<String> message,
+            Optional<WorkbenchOverlayState> previous) implements WorkbenchOverlayState {
+        public ContextDeleteConfirm {
+            Objects.requireNonNull(contextName, "contextName");
+            Objects.requireNonNull(message, "message");
+            Objects.requireNonNull(previous, "previous");
         }
     }
 

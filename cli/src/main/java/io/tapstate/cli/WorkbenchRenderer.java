@@ -162,8 +162,9 @@ final class WorkbenchRenderer {
         int contentRows = switch (overlay) {
             case WorkbenchOverlayState.More ignored -> 3;
             case WorkbenchOverlayState.ContextPicker picker ->
-                    Math.max(4, Math.min(10, picker.contexts().size()) + 3);
+                    Math.max(5, Math.min(10, picker.contexts().size()) + 4);
             case WorkbenchOverlayState.ContextCreate ignored -> 8;
+            case WorkbenchOverlayState.ContextDeleteConfirm ignored -> 5;
             case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
             case WorkbenchOverlayState.Help ignored -> 6;
         };
@@ -187,6 +188,8 @@ final class WorkbenchRenderer {
                     renderContexts(frame, area, box, picker, theme);
             case WorkbenchOverlayState.ContextCreate create ->
                     renderContextCreate(frame, area, box, create, theme);
+            case WorkbenchOverlayState.ContextDeleteConfirm confirm ->
+                    renderContextDeleteConfirm(frame, area, box, confirm, theme);
             case WorkbenchOverlayState.Login login -> renderLogin(frame, area, box, login, theme);
             case WorkbenchOverlayState.Help ignored -> renderHelp(frame, area, box, theme);
         };
@@ -197,6 +200,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.More ignored -> "More";
             case WorkbenchOverlayState.ContextPicker ignored -> "Choose Context";
             case WorkbenchOverlayState.ContextCreate ignored -> "New Context";
+            case WorkbenchOverlayState.ContextDeleteConfirm ignored -> "Delete Context";
             case WorkbenchOverlayState.Login login -> "Sign in to " + login.contextName();
             case WorkbenchOverlayState.Help ignored -> "Help";
         };
@@ -240,8 +244,10 @@ final class WorkbenchRenderer {
                 createIndex == picker.selectedIndex() ? theme.selection() : theme.accent(), area);
         hits.add(new OverlayHit(createIndex, new Rect(box.x() + 2, createY, createWidth, 1)));
         picker.message().ifPresent(message -> write(
-                frame, box.x() + 2, box.y() + box.height() - 2, message,
+                frame, box.x() + 2, box.y() + box.height() - 3, message,
                 picker.pending() ? theme.info() : theme.warning(), area));
+        write(frame, box.x() + 2, box.y() + box.height() - 2,
+                "Enter select  d delete  Esc back", theme.muted(), area);
         return List.copyOf(hits);
     }
 
@@ -266,6 +272,22 @@ final class WorkbenchRenderer {
         write(frame, box.x() + 2, box.y() + 5, hint, theme.muted(), area);
         create.message().ifPresent(message -> write(
                 frame, box.x() + 2, box.y() + 6, message, theme.error(), area));
+        return List.of();
+    }
+
+    private static List<OverlayHit> renderContextDeleteConfirm(
+            Frame frame,
+            Rect area,
+            Rect box,
+            WorkbenchOverlayState.ContextDeleteConfirm confirm,
+            WorkbenchTheme theme) {
+        write(frame, box.x() + 2, box.y() + 1, "Delete context " + confirm.contextName() + "?", theme.warning(), area);
+        write(frame, box.x() + 2, box.y() + 2,
+                "Workspace bindings will be removed; auth cache is kept.", theme.muted(), area);
+        String hint = confirm.pending() ? "Deleting context..." : "Enter delete  Esc cancel";
+        write(frame, box.x() + 2, box.y() + 3, hint, theme.muted(), area);
+        confirm.message().ifPresent(message -> write(
+                frame, box.x() + 2, box.y() + 4, message, theme.error(), area));
         return List.of();
     }
 

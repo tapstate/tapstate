@@ -274,6 +274,11 @@ final class Repl {
             }
 
             @Override
+            public ContextDeleteResult deleteContext(String name) {
+                return deleteWorkbenchContext(name);
+            }
+
+            @Override
             public LoginResult login(LoginRequest request, SecretBuffer password) {
                 return loginFromWorkbench(request, password);
             }
@@ -378,6 +383,22 @@ final class Repl {
             return new WorkbenchActionGateway.ContextResult.Ready(name, false);
         } catch (RuntimeException unavailable) {
             return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.ContextDeleteResult deleteWorkbenchContext(String name) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextDeleteResult.Unavailable();
+        }
+        try {
+            contextManager.delete(name);
+            if (namedContext != null && namedContext.name().equals(name)) {
+                session.disconnect();
+                namedContext = null;
+            }
+            return new WorkbenchActionGateway.ContextDeleteResult.Deleted(name);
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextDeleteResult.Unavailable();
         }
     }
 

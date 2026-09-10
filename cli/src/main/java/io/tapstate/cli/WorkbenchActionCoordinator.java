@@ -6,6 +6,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /** Runs one activation action at a time and returns only sanitized typed outcomes to the UI thread. */
@@ -32,8 +33,10 @@ final class WorkbenchActionCoordinator implements AutoCloseable {
                 new ThreadPoolExecutor.AbortPolicy());
     }
 
-    synchronized <T> void submit(Supplier<T> action, Consumer<T> completion) {
+    synchronized <T> void submit(
+            Supplier<T> action, Function<RuntimeException, T> failureResult, Consumer<T> completion) {
         Objects.requireNonNull(action, "action");
+        Objects.requireNonNull(failureResult, "failureResult");
         Objects.requireNonNull(completion, "completion");
         if (closed) {
             throw new IllegalStateException("Workbench action coordinator is closed");
@@ -42,7 +45,12 @@ final class WorkbenchActionCoordinator implements AutoCloseable {
             active.cancel(true);
         }
         active = worker.submit(() -> {
-            T result = action.get();
+            T result;
+            try {
+                result = action.get();
+            } catch (RuntimeException failure) {
+                result = failureResult.apply(failure);
+            }
             runtime.runLater(() -> completeIfOpen(result, completion));
         });
     }

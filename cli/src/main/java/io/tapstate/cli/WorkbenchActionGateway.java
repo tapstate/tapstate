@@ -15,6 +15,10 @@ interface WorkbenchActionGateway {
 
     ContextResult createContext(String name, URI server, boolean verifyTls);
 
+    default ContextDeleteResult deleteContext(String name) {
+        return new ContextDeleteResult.Unavailable();
+    }
+
     LoginResult login(LoginRequest request, SecretBuffer password);
 
     default FileReadResult readWorkspaceFile(Path relativePath) {
@@ -72,6 +76,17 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements LoginResult {
+        }
+    }
+
+    sealed interface ContextDeleteResult {
+        record Deleted(String contextName) implements ContextDeleteResult {
+            public Deleted {
+                Objects.requireNonNull(contextName, "contextName");
+            }
+        }
+
+        record Unavailable() implements ContextDeleteResult {
         }
     }
 

@@ -444,6 +444,7 @@ final class Workbench {
                         case WorkbenchOverlayState.ContextPicker picker -> runtime.updateState(state ->
                             state.withOverlay(picker.select(index)));
                         case WorkbenchOverlayState.ContextCreate ignored -> true;
+                        case WorkbenchOverlayState.ContextDeleteConfirm ignored -> true;
                         case WorkbenchOverlayState.Login ignored -> true;
                     case WorkbenchOverlayState.Help ignored -> true;
                 };
@@ -462,6 +463,7 @@ final class Workbench {
                 case WorkbenchOverlayState.More more -> handleMoreKey(more, key);
                 case WorkbenchOverlayState.ContextPicker picker -> handleContextKey(picker, key);
                 case WorkbenchOverlayState.ContextCreate create -> handleContextCreateKey(create, key);
+                case WorkbenchOverlayState.ContextDeleteConfirm confirm -> handleContextDeleteKey(confirm, key);
                 case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
                 case WorkbenchOverlayState.Help ignored -> true;
             };
@@ -496,6 +498,12 @@ final class Workbench {
                 runtime.updateState(state -> state.withOverlay(picker.select(selected)));
                 return true;
             }
+            if (key.isChar('d') && picker.selectedIndex() < picker.contexts().size()) {
+                String contextName = picker.contexts().get(picker.selectedIndex()).name();
+                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextDeleteConfirm(
+                        contextName, false, Optional.empty(), Optional.of(picker))));
+                return true;
+            }
             if ((key.isSelect() || key.isConfirm()) && picker.selectedIndex() >= 0) {
                 if (picker.selectedIndex() == picker.contexts().size()) {
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextCreate(
@@ -504,6 +512,17 @@ final class Workbench {
                 } else {
                     selectContext(picker);
                 }
+            }
+            return true;
+        }
+
+        private boolean handleContextDeleteKey(
+                WorkbenchOverlayState.ContextDeleteConfirm confirm, KeyEvent key) {
+            if (confirm.pending()) {
+                return true;
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                submitContextDelete(confirm);
             }
             return true;
         }
@@ -694,6 +713,7 @@ final class Workbench {
             actionCoordinator.submit(
                     () -> actionGateway.createContext(
                             create.name(), URI.create(create.server()), create.verifyTls()),
+                    failure -> new WorkbenchActionGateway.ContextResult.Unavailable(),
                     this::completeContextSelection);
         }
 
@@ -779,6 +799,7 @@ final class Workbench {
             runtime.updateState(state -> state.withOverlay(picker.asPending()));
             actionCoordinator.submit(
                     () -> actionGateway.selectContext(contextName),
+                    failure -> new WorkbenchActionGateway.ContextResult.Unavailable(),
                     this::completeContextSelection);
         }
 
@@ -830,8 +851,30 @@ final class Workbench {
             actionCoordinator.submit(
                     () -> actionGateway.login(
                             new WorkbenchActionGateway.LoginRequest(server, login.username()), login.password()),
+                    failure -> new WorkbenchActionGateway.LoginResult.Unavailable(),
                     result -> completeLogin(
                             login.contextName(), login.server(), login.username(), login.previous(), result));
+        }
+
+        private void submitContextDelete(WorkbenchOverlayState.ContextDeleteConfirm confirm) {
+            if (actionCoordinator == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextDeleteConfirm(
+                    confirm.contextName(), true, Optional.empty(), confirm.previous())));
+            actionCoordinator.submit(
+                    () -> actionGateway.deleteContext(confirm.contextName()),
+                    failure -> new WorkbenchActionGateway.ContextDeleteResult.Unavailable(),
+                    this::completeContextDelete);
+        }
+
+        private void completeContextDelete(WorkbenchActionGateway.ContextDeleteResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.ContextDeleteResult.Deleted ignored -> runtime.updateState(state ->
+                        state.withOverlay(contextMessage("Context deleted")));
+                case WorkbenchActionGateway.ContextDeleteResult.Unavailable ignored -> runtime.updateState(state ->
+                        state.withOverlay(contextMessage("Context could not be deleted")));
+            }
         }
 
         private void completeLogin(
@@ -887,6 +930,7 @@ final class Workbench {
             return switch (overlay) {
                 case WorkbenchOverlayState.ContextPicker picker -> picker.previous();
                 case WorkbenchOverlayState.ContextCreate create -> create.previous();
+                case WorkbenchOverlayState.ContextDeleteConfirm confirm -> confirm.previous();
                 case WorkbenchOverlayState.Login login -> login.previous();
                 case WorkbenchOverlayState.Help ignored -> Optional.of(new WorkbenchOverlayState.More(2));
                 case WorkbenchOverlayState.More ignored -> Optional.empty();

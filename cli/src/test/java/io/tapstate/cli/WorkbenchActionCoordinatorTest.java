@@ -24,7 +24,7 @@ class WorkbenchActionCoordinatorTest {
         coordinator.submit(() -> {
             actionCompleted.countDown();
             return "done";
-        }, result -> delivered.set(true));
+        }, failure -> "failed", result -> delivered.set(true));
         assertThat(actionCompleted.await(2, TimeUnit.SECONDS)).isTrue();
         Runnable callback = callbacks.poll(2, TimeUnit.SECONDS);
         assertThat(callback).isNotNull();
@@ -33,5 +33,28 @@ class WorkbenchActionCoordinatorTest {
         callback.run();
 
         assertThat(delivered).isFalse();
+    }
+
+    @Test
+    void deliversTypedFailureWhenAnActionThrows() throws Exception {
+        BlockingQueue<Runnable> callbacks = new LinkedBlockingQueue<>();
+        WorkbenchRuntime runtime = new WorkbenchRuntime(
+                WorkbenchState.initial(), callbacks::add, () -> true, event -> {
+                });
+        WorkbenchActionCoordinator coordinator = new WorkbenchActionCoordinator(runtime);
+        try {
+            coordinator.submit(
+                    () -> {
+                        throw new IllegalStateException("unavailable");
+                    },
+                    failure -> "unavailable",
+                    result -> assertThat(result).isEqualTo("unavailable"));
+
+            Runnable callback = callbacks.poll(2, TimeUnit.SECONDS);
+            assertThat(callback).isNotNull();
+            callback.run();
+        } finally {
+            coordinator.close();
+        }
     }
 }
