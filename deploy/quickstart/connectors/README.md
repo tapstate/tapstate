@@ -5,10 +5,37 @@ This directory is bind-mounted into the server as its connector seed directory. 
 startup, through the same register-if-absent path `tapstate register` uses. It is a convenience
 for staging jars offline or in bulk.
 
-This release registers **MySQL and MongoDB only**. A jar declaring any other connector is refused
-here exactly as it is refused over the wire — staging it in this directory is a different way to
-reach the same registration, not a way around what that registration accepts. The refusal is
-reported for that jar alone and the sweep carries on with the rest.
+This preview certifies the following database kinds, with certification scoped by direction:
+
+| Database | Connector kind | Certified use |
+|---|---|---|
+| MySQL | `mysql` | Read and write |
+| PostgreSQL | `postgres` | Read and write |
+| MongoDB | `mongodb` | Read and write |
+| Oracle | `oracle` | Source only |
+| SQL Server | `sqlserver` | Source only |
+
+The catalog may report write capability for Oracle and SQL Server; those write paths
+are not certified in this preview. The default accepted set contains 16 connector ids
+across these five database kinds, including existing managed variants of MySQL,
+PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+Other managed variants of Oracle and SQL Server are outside the default accepted set.
+
+`tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
+on this server. Configuring it puts that server outside the supported configuration;
+acceptance does not certify the added connectors. The setting is empty by default and
+is not configured in release or quickstart artifacts. A `connector.not-official` refusal
+reports the server's actual accepted set, including any additional ids configured there.
+Registration through an upload and registration through the seed directory use the same
+acceptance check.
+
+Oracle connector bytes, including the bundled `ojdbc8` driver under the Oracle Free Use
+Terms, are excluded from versioned releases, `connectors-preview`, and quickstart.
+They are retained only as CI artifacts for 7 days. This distribution boundary does not
+establish a license for the upstream enterprise connector repository, which has no
+LICENSE file.
+
+A refusal is reported for that jar alone and the seed sweep carries on with the rest.
 
 It is **not** how a connector is normally registered, and it is **not** a precondition for
 registration. The usual path is:
