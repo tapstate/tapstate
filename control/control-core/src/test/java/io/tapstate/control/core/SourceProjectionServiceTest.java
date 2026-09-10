@@ -50,7 +50,7 @@ class SourceProjectionServiceTest {
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
     private final SourceProjectionService sources = new SourceProjectionService(
             new ApplyService(() -> catalog, store, new AuditGate(record -> { }, Clock.systemUTC()),
-                    schemas, PlanAdvisories.none()),
+                    schemas, PlanAdvisories.none(), SchemaDerivation.none()),
             new ArtifactQueryService(store),
             new ArtifactMutationService(store, new EmptyDesiredStore(), new EmptyStateStore(),
                     new EmptyObservationStore(), new EmptySrsMetaStore(),
@@ -146,7 +146,7 @@ class SourceProjectionServiceTest {
                 """));
         schemas.save(new DiscoveredSourceModel(
                 "mysql_feynman", "mysql", 0L, new SourceModel(List.of(new SourceTable(
-                        "BB_0727", List.of(new SourceField("value", "varchar", null)),
+                        "BB_0727", List.of(new SourceField("value", "varchar")),
                         List.of(), List.of())))));
 
         SourceView created = sources.create("alice", input("test_1", "new source"));
@@ -179,7 +179,7 @@ class SourceProjectionServiceTest {
                 """));
         schemas.save(new DiscoveredSourceModel(
                 "mysql_feynman", "mysql", 0L, new SourceModel(List.of(new SourceTable(
-                        "orders", List.of(new SourceField("value", "varchar", null)),
+                        "orders", List.of(new SourceField("value", "varchar")),
                         List.of(), List.of())))));
 
         Throwable failure = catchThrowable(() -> sources.replace(

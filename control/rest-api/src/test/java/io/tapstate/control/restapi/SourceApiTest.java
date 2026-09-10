@@ -508,7 +508,7 @@ class SourceApiTest {
         }
         @Bean ApplyService applyService(ArtifactStore store, AuditGate auditGate) {
             return new ApplyService(TapstateCatalog::load, store, auditGate, new EmptySchemaStore(),
-                    PlanAdvisories.none());
+                    PlanAdvisories.none(), io.tapstate.control.core.SchemaDerivation.none());
         }
         @Bean ArtifactQueryService artifactQueryService(ArtifactStore store) {
             return new ArtifactQueryService(store);

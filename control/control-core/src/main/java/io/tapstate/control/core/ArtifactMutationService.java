@@ -96,6 +96,17 @@ public final class ArtifactMutationService {
             }
 
             @Override
+            public void pin(String pipelineId, String stepId, long version) {
+                throw new UnsupportedOperationException("derived schemas are not configured");
+            }
+
+            @Override
+            public java.util.Optional<io.tapstate.spi.store.DerivedSchema> pinned(
+                    String pipelineId, String stepId) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
             public void delete(String pipelineId) {
             }
         }, auditGate, follows);

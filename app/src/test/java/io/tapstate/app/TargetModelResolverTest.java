@@ -110,7 +110,40 @@ class TargetModelResolverTest {
         assertThat(target).isEqualTo(new TargetModelResolver.ResolvedTarget("orders", null));
     }
 
+    @Test
+    void resolves_every_table_of_a_source_from_one_read_of_its_discovery() {
+        // The discovery is stored per connection and holds every table of it, so resolving a source's
+        // tables is one read and a walk. Reading it again per table is the same answer at N times the
+        // cost, and it is invisible in every case that seeds one or two tables - the sizes this is
+        // written against are the ones a real connection has.
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(multiTableSource("src_mysql", "orders", "customers", "shipments"));
+        PipelineResource pipeline = pipeline("p", "src_mysql");
+        store.artifacts().save(pipeline);
+        store.schemas().save(new DiscoveredSourceModel("src_mysql", "mysql", 0L, new SourceModel(
+                List.of(oneColumnTable("orders"), oneColumnTable("customers"),
+                        oneColumnTable("shipments")))));
+        int before = store.schemaStore().reads();
+
+        Map<String, TargetTable> targets = new TargetModelResolver(store).resolveAll(pipeline);
+
+        // It really did resolve all three: a resolution that answered nothing would also read nothing,
+        // and the count below would be the count this is looking for.
+        assertThat(targets.keySet()).containsExactly("orders", "customers", "shipments");
+        assertThat(store.schemaStore().reads() - before).isEqualTo(1);
+    }
+
     // ---- fixtures ----------------------------------------------------------------------
+
+    private static SourceResource multiTableSource(String id, String... tables) {
+        return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
+                java.util.Arrays.stream(tables).map(t -> (TableRef) TableRef.literal(t)).toList(),
+                null, null);
+    }
+
+    private static SourceTable oneColumnTable(String name) {
+        return new SourceTable(name, List.of(new SourceField("id", "INT")), List.of("id"), List.of());
+    }
 
     private static SourceResource cdcSource(String id, String table) {
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,

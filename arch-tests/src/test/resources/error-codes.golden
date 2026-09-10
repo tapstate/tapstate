@@ -12,6 +12,7 @@ actuation.join-source-key-missing
 actuation.join-source-not-declared
 actuation.not-a-pipeline
 actuation.pipeline-not-found
+actuation.schema-sync-while-running
 actuation.source-schema-not-discovered
 actuation.source-table-ambiguous
 actuation.source-table-not-discovered
@@ -115,6 +116,7 @@ control.bootstrap-closed
 control.bootstrap-forbidden
 control.forbidden
 control.malformed-request
+control.schema-derivation-incomplete
 control.unauthenticated
 control.unreachable
 data-browser.connector-not-browsable
@@ -153,7 +155,9 @@ engine.frontier-order-not-encodable
 engine.frontier-pinned
 engine.job-failed
 engine.no-such-job
+io.document-too-large
 io.document-unreadable
+io.schema-read-contention
 io.store-unauthorized
 io.store-unavailable
 lifecycle.illegal-transition

@@ -75,7 +75,7 @@ final class Vocabulary {
     static final Set<String> SEED_KEYS = Set.of("rows", "values", "before_image");
 
     /** The keys a doc matcher body carries: how to find the document, and what to hold it to. */
-    static final Set<String> DOC_KEYS = Set.of("where", "expect", "size");
+    static final Set<String> DOC_KEYS = Set.of("where", "expect", "size", "absent");
 
     /**
      * The keys a valued cdc change carries, per operation. Both locate a row the same way the doc

@@ -84,6 +84,7 @@ public final class ApplyService {
     private final AuditGate auditGate;
     private final SchemaStore schemas;
     private final PlanAdvisories advisories;
+    private final SchemaDerivation derivation;
 
     /**
      * The reading of which pipelines are up, or null when the caller supplied none -- see the same field
@@ -96,13 +97,13 @@ public final class ApplyService {
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
-            PlanAdvisories advisories) {
-        this(catalog, store, auditGate, schemas, advisories, null);
+            PlanAdvisories advisories, SchemaDerivation derivation) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, null);
     }
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
-            PlanAdvisories advisories, LivePipelines live) {
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live) {
         this.live = live;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
@@ -112,6 +113,10 @@ public final class ApplyService {
         // would be indistinguishable from one whose rules all passed, so an assembly with no rules yet
         // states that by handing over PlanAdvisories.none().
         this.advisories = Objects.requireNonNull(advisories, "advisories");
+        // Named for the same reason the advisories are: an apply that quietly re-derived nothing reads
+        // exactly like one whose pipelines were all up to date, and the case this exists for is the one
+        // where nothing was written either.
+        this.derivation = Objects.requireNonNull(derivation, "derivation");
     }
 
     /**
@@ -423,13 +428,41 @@ public final class ApplyService {
             }
             outcomes.add(outcome);
         }
-        return auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
+        // The changed set is audited per artifact, then written as one atomic batch: all of it lands or,
+        // on a write failure, none does.
+        //
+        // The declared versions are handed to the write rather than only to plan(). plan()'s comparison
+        // happens before a whole workspace validation and a schema-store read, so a second author
+        // editing the same id inside that window passes the same comparison and both writes land — the
+        // first author's edit is gone, and nothing anywhere reports it. Passing them here makes the
+        // comparison and the write one store operation, which is the only form of the check that
+        // survives a concurrent writer.
+        ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
             String conflicted = store.saveAll(toWrite, enforced).orElse(null);
             if (conflicted != null) {
                 throw new TapstateException(ArtifactError.VERSION_CONFLICT, Map.of("id", conflicted), null);
             }
             return new ApplyResult(outcomes, plan.warnings());
         });
+        // Every pipeline in the batch, whether or not this apply wrote it. An unchanged pipeline is
+        // precisely the case that needs re-deriving: its content hash covers the pipeline document and
+        // nothing else, so a source that moved under it leaves the hash byte-identical and the write
+        // skipped. Keying this on the write would leave it silent in the one case it is here for.
+        List<ValidationDiagnostic> warnings = new ArrayList<>(result.warnings());
+        for (PreparedArtifact prepared : plan.artifacts()) {
+            if (prepared.resource() instanceof PipelineResource) {
+                try {
+                    derivation.derive(prepared.id());
+                } catch (TapstateException failure) {
+                    // The artifact transaction has committed. A skipped or partial model refresh must
+                    // not report that write as refused, or prevent later pipelines from refreshing.
+                    warnings.add(new ValidationDiagnostic(ControlError.SCHEMA_DERIVATION_INCOMPLETE.code(),
+                            Map.of("pipeline", prepared.id(), "causeCode", failure.code().code(),
+                                    "causeParams", failure.args())));
+                }
+            }
+        }
+        return new ApplyResult(result.outcomes(), warnings);
     }
 
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {

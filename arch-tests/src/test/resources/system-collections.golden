@@ -18,6 +18,6 @@ srs_meta | store | MongoSrsMetaStore | migrated | 0 | -
 system_meta | store | MongoConnection | migrated | 1 | -
 pipeline_layouts | store | MongoPipelineLayoutStore | migrated | 0 | -
 srs_log | store | MongoSrsLogStore | owned-elsewhere | 0 | -
-derived_schemas | store | MongoDerivedSchemaStore | owned-elsewhere | 0 | -
+derived_schemas | store | MongoDerivedSchemaStore | migrated | 0 | -
 operator_state | nest | MongoKeyedStateStore | nest-excluded | 0 | -
 nest_dead_letters | nest | MongoNestDeadLetterStore | nest-excluded | 0 | -

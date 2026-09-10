@@ -924,6 +924,7 @@ class ArtifactMutationServiceTest {
     private final class InMemoryDerivedSchemaStore implements DerivedSchemaStore {
 
         private final Map<String, DerivedSchema> byStep = new LinkedHashMap<>();
+        private final Map<String, Long> pins = new LinkedHashMap<>();
         private RuntimeException deleteFailure;
 
         void put(String pipelineId, String stepId) {
@@ -952,11 +953,26 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
+        public void pin(String pipelineId, String stepId, long version) {
+            pins.put(pipelineId + "/" + stepId, version);
+        }
+
+        @Override
+        public Optional<DerivedSchema> pinned(String pipelineId, String stepId) {
+            Long version = pins.get(pipelineId + "/" + stepId);
+            DerivedSchema recorded = byStep.get(pipelineId + "/" + stepId);
+            return version != null && recorded != null && recorded.version() == version
+                    ? Optional.of(recorded)
+                    : Optional.empty();
+        }
+
+        @Override
         public void delete(String pipelineId) {
             // Fail before mutating, so an armed failure leaves the record behind — the residue the
             // reporting is about.
             step("derived-schema", deleteFailure);
             byStep.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
+            pins.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
         }
     }
 

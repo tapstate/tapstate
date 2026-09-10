@@ -112,12 +112,12 @@ public enum SystemCollections {
     SRS_LOG(MongoStorePort.SRS_LOG, Database.STORE, MongoSrsLogStore.class, Strategy.OWNED_ELSEWHERE, 0),
 
     /**
-     * What a pipeline's steps worked out their own columns to be, one document per pipeline holding each
-     * step's version history. Both questions it is asked are answered by the id alone, so it adds no
-     * index. Another line owns how this one evolves.
+     * What a pipeline's steps worked out their own columns to be, one document per step holding its
+     * version history. Both questions it is asked are answered by the id alone, so it adds no index.
+     * Startup changesets preserve its history when the stored shape changes.
      */
     DERIVED_SCHEMAS(MongoStorePort.DERIVED_SCHEMAS, Database.STORE, MongoDerivedSchemaStore.class,
-            Strategy.OWNED_ELSEWHERE, 0),
+            Strategy.MIGRATED, 0),
 
     // ---- the operator-state database: not versioned here, but still taken from here ----
 

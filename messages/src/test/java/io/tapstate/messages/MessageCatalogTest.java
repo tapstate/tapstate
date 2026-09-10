@@ -73,6 +73,16 @@ class MessageCatalogTest {
     }
 
     @Test
+    void schemaReadContentionNamesTheConnectionAndExplainsWhenToRetry() {
+        MessageCatalog.Rendered rendered = EN.render("io.schema-read-contention",
+                Map.of("connectionId", "orders-db"));
+
+        assertThat(rendered.message()).contains("orders-db", "changed", "read attempt")
+                .doesNotContain("{");
+        assertThat(rendered.solution()).contains("re-discovery", "finish", "retry");
+    }
+
+    @Test
     void unknownCodeFallsBackToTheBareCanonicalCode() {
         TapstateErrorCode absent = new TapstateErrorCode() {
             @Override
