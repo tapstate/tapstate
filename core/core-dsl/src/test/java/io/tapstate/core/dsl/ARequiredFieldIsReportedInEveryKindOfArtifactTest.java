@@ -156,6 +156,7 @@ class ARequiredFieldIsReportedInEveryKindOfArtifactTest {
                 version: tapstate/v1
                 kind: view
                 id: customer_360
+                primary_key: customer_id
                 storage:
                   warm: {}
                 """));
@@ -163,6 +164,6 @@ class ARequiredFieldIsReportedInEveryKindOfArtifactTest {
         assertThat(thrown).isInstanceOf(DslException.class);
         DslException refusal = (DslException) thrown;
         assertThat(refusal.path()).isEqualTo("storage.warm.collection");
-        assertThat(refusal.args()).containsEntry("detail", "required field 'collection' is missing");
+        assertThat(refusal.args()).containsEntry("field", "collection");
     }
 }

@@ -1,6 +1,8 @@
 package io.tapstate.e2e;
 
 import io.tapstate.testsupport.DockerGate;
+import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -8,7 +10,10 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The two versions in play meeting: a CLI process asking a running server which version it is.
+ * The two versions in play meeting: a CLI process asking a running server what it is running.
+ * Three facts come back in one answer -- the server's own release, the authoring grammars it
+ * accepts, and the schema version of the system data behind it -- and all three have to survive
+ * the trip, not just the one the command is named after.
  *
  * <p>The CLI and the server are separate builds installed by separate paths, and the number each one
  * reports is derived separately - the CLI's is compiled in, the server's is filtered into a resource
@@ -28,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * verb would supply the server's answer from the test instead of fetching it, and fetching it is the
  * entire claim.
  */
-@DisplayName("a connected CLI reports the version the running server itself answered")
+@DisplayName("a connected CLI reports everything the running server itself answered about itself")
 class BothVersionsInPlayAreReportedIT {
 
     private static final String USER = "e2e";
@@ -61,6 +66,25 @@ class BothVersionsInPlayAreReportedIT {
             assertThat(run.stdout())
                     .contains("cli    " + reportedByTheServer)
                     .contains("server " + reportedByTheServer);
+
+            // The other two facts the same answer carries. They travel the same wire in the same body,
+            // and the failure they are here for is not a wrong value but a dropped one: for most of this
+            // command's life the client parsed all three and printed one, which no test with either end
+            // stubbed could see, because each end was right about its own half.
+            Map<?, ?> answered = control.versionAnswer();
+            List<String> grammars =
+                    ((List<?>) answered.get("dslVersions")).stream().map(String::valueOf).toList();
+            Object storeVersion = answered.get("dataVersion");
+            assertThat(grammars)
+                    .as("a server that accepts no grammar would make the printed line unfalsifiable")
+                    .isNotEmpty();
+            assertThat(storeVersion)
+                    .as("this run has a store, so the server has a schema version to report")
+                    .isNotNull();
+
+            assertThat(run.stdout())
+                    .contains("dsl    " + String.join(", ", grammars))
+                    .contains("data   " + storeVersion);
             // The control group for the mismatch advisory. A matched pair is the case that a comparison
             // written to warn unconditionally still passes every mismatch test it has, and fails only
             // here.

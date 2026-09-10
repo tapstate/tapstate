@@ -50,9 +50,9 @@ class StoreBackedDagSourceTargetModelTest {
         // right rows, silently in the wrong collection.
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
-                "mongodb", Map.of("uri", "u"), null, null, null, null, null));
+                "mongodb", Map.of("uri", "u"), null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
                 null, null, null));
@@ -72,9 +72,9 @@ class StoreBackedDagSourceTargetModelTest {
         // creates the collection creates its index in the same act.
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
-                "mongodb", Map.of("uri", "u"), null, null, null, null, null));
+                "mongodb", Map.of("uri", "u"), null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
                 null, null, null));
@@ -129,7 +129,7 @@ class StoreBackedDagSourceTargetModelTest {
     void follows_a_transform_chain_to_the_source_that_reaches_sync() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("keep_recent"),
                 Step.inline("keep_recent", FromClause.list(FromRef.literal("address_src")),
-                        new TransformBody.Filter("true"), null, null));
+                        new TransformBody.Filter("true"), null));
         store.schemas().save(discovered("address_src", "mysql", new SourceTable(
                 "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
 
@@ -141,7 +141,7 @@ class StoreBackedDagSourceTargetModelTest {
     void still_requires_every_source_that_reaches_sync_through_a_union() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("merged"),
                 Step.inline("merged", FromClause.list(FromRef.literal("orders"), FromRef.literal("PlayerAddress")),
-                        new TransformBody.Union(), null, null));
+                        new TransformBody.Union(), null));
         store.schemas().save(discovered("address_src", "mysql", new SourceTable(
                 "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
 
@@ -157,7 +157,7 @@ class StoreBackedDagSourceTargetModelTest {
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src"), SourceRef.bare("address_src")), null,
                 new ViewBlock.Inline("orders_view", FromRef.literal("orders_src"), "id", null, null),
                 new ServeBlock.Inline(null, FromRef.literal("address_src"), List.of(new SyncElement(
-                        "sync_1", "orders_dest", null, null, null, null)), null, null),
+                        "sync_1", "orders_dest", null, null, null)), null, null),
                 null, null));
         store.schemas().save(discovered("address_src", "mysql", new SourceTable(
                 "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
@@ -170,9 +170,9 @@ class StoreBackedDagSourceTargetModelTest {
     void leaves_a_view_only_pipeline_allowed_before_source_schema_discovery() {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
-                "mongodb", Map.of("uri", "u"), null, null, null, null, null));
+                "mongodb", Map.of("uri", "u"), null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src")), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
                 null, null, null));
@@ -184,9 +184,9 @@ class StoreBackedDagSourceTargetModelTest {
     void gives_each_sync_its_own_renamed_target_model() {
         InMemoryStorePort store = seededPipeline(
                 new SyncElement("mongo", "orders_dest", null,
-                        new RenameSpec(Map.of("orders", "player_address"), null, null, null), null, null),
+                        new RenameSpec(Map.of("orders", "player_address"), null, null, null), null),
                 new SyncElement("warehouse", "orders_dest", null,
-                        new RenameSpec(null, RenameCase.LOWER, "ods_", null), null, null));
+                        new RenameSpec(null, RenameCase.LOWER, "ods_", null), null));
         store.schemas().save(discovered("orders_src", "mysql", new SourceTable(
                 "orders", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
         List<TargetTable> bound = new ArrayList<>();
@@ -230,7 +230,7 @@ class StoreBackedDagSourceTargetModelTest {
     void renames_with_the_table_a_serve_block_reaches_through_a_transform_chain() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("keep_recent"),
                 Step.inline("keep_recent", FromClause.list(FromRef.literal("address_src")),
-                        new TransformBody.Filter("true"), null, null));
+                        new TransformBody.Filter("true"), null));
         store.schemas().save(discovered("address_src", "mysql", new SourceTable(
                 "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
         Map<String, TargetTable> bound = new LinkedHashMap<>();
@@ -271,7 +271,7 @@ class StoreBackedDagSourceTargetModelTest {
     void binds_target_models_for_all_sources_when_a_step_merges_several_upstreams() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("merged"),
                 Step.inline("merged", FromClause.list(FromRef.literal("orders"), FromRef.literal("PlayerAddress")),
-                        new TransformBody.Union(), null, null));
+                        new TransformBody.Union(), null));
         store.schemas().save(discovered("orders_src", "mysql", new SourceTable(
                 "orders", List.of(new SourceField("id", "INT"), new SourceField("total", "DECIMAL")),
                 List.of("id"), List.of())));
@@ -320,7 +320,7 @@ class StoreBackedDagSourceTargetModelTest {
      */
     @Test
     void a_sync_element_with_no_id_is_named_by_the_source_it_writes_to() {
-        InMemoryStorePort store = seededPipeline(new SyncElement(null, "orders_dest", null, null, null, null));
+        InMemoryStorePort store = seededPipeline(new SyncElement(null, "orders_dest", null, null, null));
         store.schemas().save(discovered("orders_src", "mysql", new SourceTable(
                 "orders",
                 List.of(new SourceField("id", "INT"), new SourceField("amount", "DECIMAL")),
@@ -338,9 +338,9 @@ class StoreBackedDagSourceTargetModelTest {
     void the_node_a_view_sink_is_names_the_pipeline_and_the_view() {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
-                "mongodb", Map.of("uri", "u"), null, null, null, null, null));
+                "mongodb", Map.of("uri", "u"), null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
                 null, null, null));
@@ -359,15 +359,15 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     private static InMemoryStorePort seededPipeline() {
-        return seededPipeline(new SyncElement("sync_1", "orders_dest", null, null, null, null));
+        return seededPipeline(new SyncElement("sync_1", "orders_dest", null, null, null));
     }
 
     private static InMemoryStorePort seededPipeline(SyncElement... syncElements) {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
         store.artifacts().save(new SourceResource("orders_dest", null, "mongodb", Map.of("uri", "u"),
-                null, null, null, null, null));
+                null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("orders_src"),
                         List.of(syncElements), null, null),
@@ -383,11 +383,11 @@ class StoreBackedDagSourceTargetModelTest {
     private static InMemoryStorePort seededMultiSourcePipeline(FromRef serveFrom, Step... transforms) {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
         store.artifacts().save(new SourceResource("address_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("PlayerAddress")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("PlayerAddress")), null, null));
         store.artifacts().save(new SourceResource("orders_dest", null, "mongodb", Map.of("uri", "u"),
-                null, null, null, null, null));
+                null, null, null, null));
         store.artifacts().save(pipelineOf(serveFrom, transforms));
         return store;
     }
@@ -398,7 +398,7 @@ class StoreBackedDagSourceTargetModelTest {
                 transforms.length == 0 ? null : List.of(transforms), null,
                 new ServeBlock.Inline(null, serveFrom, List.of(new SyncElement(
                         "sync_1", "orders_dest", null,
-                        new RenameSpec(Map.of("PlayerAddress", "player_address"), null, null, null), null, null)),
+                        new RenameSpec(Map.of("PlayerAddress", "player_address"), null, null, null), null)),
                         null, null),
                 null, null);
     }

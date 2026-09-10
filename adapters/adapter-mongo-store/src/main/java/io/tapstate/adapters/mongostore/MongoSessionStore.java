@@ -112,7 +112,8 @@ public final class MongoSessionStore implements SessionStore {
                     Instant.ofEpochMilli(createdAt), Instant.ofEpochMilli(lastUsedAt),
                     Instant.ofEpochMilli(idleExpiresAt), Instant.ofEpochMilli(absoluteExpiresAt));
         } catch (RuntimeException invalid) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), invalid);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "session"), invalid);
         }
     }
 

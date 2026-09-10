@@ -80,8 +80,7 @@ class PipelineRepresentationTest {
                         Map.of(
                                 "id", "shared_cleanup",
                                 "use", "cleanup",
-                                "from", "orders",
-                                "options", Map.of("strict", true)),
+                                "from", "orders"),
                         Map.of(
                                 "id", "scripted",
                                 "type", "js",
@@ -136,8 +135,7 @@ class PipelineRepresentationTest {
                                         "case", "upper",
                                         "prefix", "tap_",
                                         "suffix", "_archive"),
-                                "ddl", "apply",
-                                "options", Map.of("ordered", true))),
+                                "ddl", "apply")),
                         "query", List.of(
                                 Map.of("type", "rest", "backend", "warehouse"),
                                 Map.of("type", "MCP")),
@@ -146,8 +144,7 @@ class PipelineRepresentationTest {
                                         "id", "events",
                                         "source", "kafka_target",
                                         "topic", "orders",
-                                        "format", "=event.after",
-                                        "options", Map.of("acks", "all")),
+                                        "format", "=event.after"),
                                 Map.of(
                                         "source", "audit_target",
                                         "format", Map.of("id", "$order_id", "deleted", false)))),
@@ -166,21 +163,19 @@ class PipelineRepresentationTest {
         assertThat(model.sources()).containsExactly(
                 SourceRef.bare("mysql_orders"), SourceRef.bare("postgres_customers"));
         assertThat(model.transforms()).containsExactly(
-                Step.use("shared_cleanup", "cleanup", FromClause.list(FromRef.literal("orders")),
-                        Map.of("strict", true)),
+                Step.use("shared_cleanup", "cleanup", FromClause.list(FromRef.literal("orders"))),
                 Step.inline("scripted", FromClause.list(FromRef.literal("shared_cleanup")),
-                        new TransformBody.Js("return event;"), null, Map.of("preview", true)),
+                        new TransformBody.Js("return event;"), Map.of("preview", true)),
                 Step.inline("projected", FromClause.list(FromRef.literal("scripted")),
                         new TransformBody.MapProjection(Map.of(
                                 "removed", FieldRule.drop(),
                                 "customer_id", FieldRule.rename("id"),
                                 "total", FieldRule.computed("price * quantity"),
-                                "region", FieldRule.literal(Map.of("code", "EU", "priority", List.of(1, 2))))),
-                        null, null),
+                                "region", FieldRule.literal(Map.of("code", "EU", "priority", List.of(1, 2))))), null),
                 Step.inline("active", FromClause.list(FromRef.regex("orders_.*")),
-                        new TransformBody.Filter("status == 'active'"), null, null),
+                        new TransformBody.Filter("status == 'active'"), null),
                 Step.inline("combined", FromClause.list(FromRef.literal("active"), FromRef.regex("archive_.*")),
-                        new TransformBody.Union(), null, null),
+                        new TransformBody.Union(), null),
                 Step.inline("nested", FromClause.aliases(Map.of(
                                 "orders", FromRef.literal("combined"),
                                 "lines", FromRef.literal("order_lines"),
@@ -194,13 +189,11 @@ class PipelineRepresentationTest {
                                                 List.of("line_id"), false, true,
                                                 List.of(new Embed(
                                                         "products", Map.of("sku", "sku"), EmbedAs.OBJECT,
-                                                        "product", null, null, null, null)))))),
-                        null, null),
+                                                        "product", null, null, null, null)))))), null),
                 Step.inline("joined", FromClause.aliases(Map.of(
                                 "orders", FromRef.literal("nested"),
                                 "customers", FromRef.literal("customers"))),
-                        new TransformBody.Join(JoinEngine.BUILTIN, "select * from orders join customers"),
-                        null, null));
+                        new TransformBody.Join(JoinEngine.BUILTIN, "select * from orders join customers"), null));
         assertThat(model.view()).isEqualTo(new ViewBlock.Inline(
                 "view",
                 FromRef.literal("joined"),
@@ -219,21 +212,18 @@ class PipelineRepresentationTest {
                         WriteMode.APPEND,
                         new RenameSpec(
                                 Map.of("orders", "orders_v2"), RenameCase.UPPER, "tap_", "_archive"),
-                        DdlPolicy.APPLY,
-                        Map.of("ordered", true))),
+                        DdlPolicy.APPLY)),
                 List.of(new QueryElement(QueryType.REST, "warehouse"), new QueryElement(QueryType.MCP, null)),
                 List.of(
                         new PushElement(
-                                "events", "kafka_target", "orders", PushFormat.cel("event.after"),
-                                Map.of("acks", "all")),
+                                "events", "kafka_target", "orders", PushFormat.cel("event.after")),
                         new PushElement(
                                 null,
                                 "audit_target",
                                 null,
                                 PushFormat.fields(Map.of(
                                         "id", FieldRule.rename("order_id"),
-                                        "deleted", FieldRule.drop())),
-                                null))));
+                                        "deleted", FieldRule.drop()))))));
         assertThat(model.settings()).isEqualTo(new Settings(
                 ErrorPolicy.DEAD_LETTER, 500, 4, "0 2 * * *", ReadMode.CDC_ONLY, "earliest"));
         assertThat(model.experimental()).isEqualTo(Map.of("preview", List.of("orders")));
@@ -415,13 +405,11 @@ class PipelineRepresentationTest {
                                 "active_orders",
                                 FromClause.list(FromRef.literal("orders")),
                                 new TransformBody.Filter("status == 'active'"),
-                                null,
                                 null),
                         Step.inline(
                                 "orders_with_customer",
                                 FromClause.aliases(orderCustomerAliases()),
                                 new TransformBody.Join(JoinEngine.BUILTIN, "select * from order"),
-                                null,
                                 null)),
                 new ViewBlock.Use("warehouse_orders", "warehouse_orders", FromRef.literal("orders_with_customer")),
                 new ServeBlock.Use("orders_api", "orders_api", FromRef.literal("warehouse_orders")),
@@ -462,7 +450,6 @@ class PipelineRepresentationTest {
                         "all_orders",
                         FromClause.list(FromRef.regex("orders_.*")),
                         new TransformBody.Union(),
-                        null,
                         null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("all_orders"), null, null, null),
@@ -492,7 +479,7 @@ class PipelineRepresentationTest {
                 new ServeBlock.Inline(
                         "serve",
                         FromRef.literal("Player"),
-                        List.of(new SyncElement("mongodb_player", "mongodb_target", null, null, null, null)),
+                        List.of(new SyncElement("mongodb_player", "mongodb_target", null, null, null)),
                         null,
                         null),
                 null,
@@ -524,7 +511,7 @@ class PipelineRepresentationTest {
                         FromClause.list(
                                 FromRef.literal("mysql_feynman.Player"),
                                 FromRef.literal("mysql_feynman.PlayerAddress")),
-                        List.of(new SyncElement("mongodb_players", "mongodb_target", null, null, null, null)),
+                        List.of(new SyncElement("mongodb_players", "mongodb_target", null, null, null)),
                         null,
                         null),
                 null,
@@ -561,7 +548,7 @@ class PipelineRepresentationTest {
                         "serve",
                         FromRef.literal("Player"),
                         List.of(new SyncElement("mongodb_player", "mongodb_target", null,
-                                new RenameSpec(Map.of("Player", "players_v2"), null, null, null), null, null)),
+                                new RenameSpec(Map.of("Player", "players_v2"), null, null, null), null)),
                         null,
                         null),
                 null,
@@ -591,7 +578,7 @@ class PipelineRepresentationTest {
                 new ServeBlock.Inline(
                         "serve",
                         FromRef.literal("players_view"),
-                        List.of(new SyncElement("mongodb_player", "mongodb_target", null, null, null, null)),
+                        List.of(new SyncElement("mongodb_player", "mongodb_target", null, null, null)),
                         null,
                         null),
                 null,
@@ -622,7 +609,6 @@ class PipelineRepresentationTest {
                         "active_orders",
                         FromClause.list(FromRef.literal("orders")),
                         new TransformBody.Filter("status == 'active'"),
-                        Map.of("strict", true),
                         Map.of("preview", false))),
                 new ViewBlock.Use("orders_view", "warehouse_orders", FromRef.literal("active_orders")),
                 new ServeBlock.Use("orders_api", "warehouse_api", FromRef.literal("orders_view")),

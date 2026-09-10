@@ -201,7 +201,7 @@ public final class ApplyService {
             Resource recorded = resource instanceof PipelineResource pipeline
                     ? withOwnSrsSwitches(pipeline, batchSources) : resource;
             String canonicalForm = writer.write(recorded);
-            prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(canonicalForm)));
+            prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(recorded)));
         }
         return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
     }
@@ -493,8 +493,9 @@ public final class ApplyService {
         return new ArtifactOutcome(prepared.id(), prepared.kind(), change, prepared.contentHash());
     }
 
+    /** The content hash of a stored artifact, recomputed over its canonical structure. */
     private String storedHash(Resource stored) {
-        return CanonicalHash.of(writer.write(stored));
+        return CanonicalHash.of(stored);
     }
 
     private void requireCurrentVersion(ArtifactDraft draft, Resource parsed) {

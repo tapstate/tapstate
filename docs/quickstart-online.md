@@ -468,7 +468,7 @@ not put it in command arguments:
 
 `--server` wins over `TAPSTATE_SERVER_URL`; the final default is
 `http://127.0.0.1:8080`. There is intentionally no `--token` option. Without
-`--allow-write`, the sidecar exposes exactly the 10 read tools. With it, five write
+`--allow-write`, the sidecar exposes exactly the 17 read tools. With it, eight write
 tools are added, but the Server still enforces the token scope. A read token cannot
 write even when the tools are locally visible.
 

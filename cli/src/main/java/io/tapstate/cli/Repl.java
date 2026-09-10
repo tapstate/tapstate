@@ -1839,7 +1839,9 @@ final class Repl {
                     o -> o instanceof GetOutcome.Unreachable);
             switch (read) {
                 case GetOutcome.Found found -> {
-                    ifMatch = CanonicalHash.of(found.artifact().canonicalForm());
+                    // Taken from the response, not recomputed from the canonical form beside it: the
+                    // hash is over the resource's structure, so these bytes cannot produce it.
+                    ifMatch = found.artifact().contentHash();
                     kind = found.artifact().kind();
                 }
                 case GetOutcome.Absent ignored -> {
@@ -3779,15 +3781,35 @@ final class Repl {
      */
     private int version() {
         String serverLine;
+        String dslLine = null;
+        String dataLine = null;
         if (!session.isConnected()) {
             serverLine = "not connected";
         } else {
-            String reported = controlPlane.serverVersion(session.landingNode());
-            serverLine = (reported == null ? "not reported" : reported)
+            ControlPlaneClient.ServerVersion reported =
+                    controlPlane.serverVersionDetail(session.landingNode());
+            serverLine = (reported == null ? "not reported" : reported.version())
                     + " (" + hostPort(session.landingNode()) + ")";
+            dslLine = grammarLine(reported);
+            dataLine = reported == null || reported.dataVersion() == null
+                    ? "not reported"
+                    : String.valueOf(reported.dataVersion());
         }
-        VersionCmd.render(commandLine.getOut(), serverLine);
+        VersionCmd.render(commandLine.getOut(), serverLine, dslLine, dataLine);
         return Cli.EXIT_OK;
+    }
+
+    /**
+     * Three answers, kept apart because two of them would otherwise read as the third: a server that did
+     * not send the field, one that sent an empty list -- it accepts no authoring grammar at all, which is
+     * a fact and not a silence -- and one that named some. A blank after the label is the shape that
+     * reads as agreement, so nothing here ever prints one.
+     */
+    private static String grammarLine(ControlPlaneClient.ServerVersion reported) {
+        if (reported == null || reported.dslVersions() == null) {
+            return "not reported";
+        }
+        return reported.dslVersions().isEmpty() ? "none" : String.join(", ", reported.dslVersions());
     }
 
     /** Clears the connection back to offline; a benign line either way, never an error. */

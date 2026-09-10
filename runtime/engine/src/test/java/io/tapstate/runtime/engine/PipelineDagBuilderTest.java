@@ -378,7 +378,7 @@ class PipelineDagBuilderTest {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
                 List.of(SourceRef.bare("orders_src")),
-                List.of(Step.use("u", "shared_filter", FromClause.list(FromRef.literal("orders_src")), null)),
+                List.of(Step.use("u", "shared_filter", FromClause.list(FromRef.literal("orders_src")))),
                 null,
                 serve(FromRef.literal("u"), sync("sync_1", "orders_dest")),
                 null, null);
@@ -515,29 +515,29 @@ class PipelineDagBuilderTest {
     }
 
     private static SyncElement sync(String id, String dest) {
-        return new SyncElement(id, dest, null, null, null, null);
+        return new SyncElement(id, dest, null, null, null);
     }
 
     private static Step filter(String id, String expr, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null);
     }
 
     private static Step map(String id, FromRef... from) {
         TransformBody body = new TransformBody.MapProjection(Map.of("out", FieldRule.rename("in")));
-        return Step.inline(id, FromClause.list(from), body, null, null);
+        return Step.inline(id, FromClause.list(from), body, null);
     }
 
     private static Step js(String id, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Js("emit(row)"), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Js("emit(row)"), null);
     }
 
     private static Step union(String id, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Union(), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Union(), null);
     }
 
     private static Step joinStep(String id, FromRef from) {
         TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN, "SELECT 1");
-        return Step.inline(id, FromClause.aliases(Map.of("root", from)), body, null, null);
+        return Step.inline(id, FromClause.aliases(Map.of("root", from)), body, null);
     }
 
     /** A join step reading two sources, under the alias names the plan below calls them by. */
@@ -545,7 +545,7 @@ class PipelineDagBuilderTest {
         TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN,
                 "SELECT o.id FROM orders o JOIN customers c ON o.cust_id = c.id");
         return Step.inline(id, FromClause.aliases(new java.util.LinkedHashMap<>(
-                Map.of("o", fact, "c", dimension))), body, null, null);
+                Map.of("o", fact, "c", dimension))), body, null);
     }
 
     /**

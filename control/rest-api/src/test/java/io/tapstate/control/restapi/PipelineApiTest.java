@@ -634,7 +634,7 @@ class PipelineApiTest {
 
     /** The revision of a pipeline is the content hash of its canonical form — the value apply stamps. */
     private static String revisionOf(String dsl) {
-        return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+        return CanonicalHash.of(parse(dsl));
     }
 
     /** What an artifact's run is assembled from: the same canonical text, with whitelisted fields erased. */
@@ -692,11 +692,14 @@ class PipelineApiTest {
                   ddl: apply
             """;
 
+    // Read by the pipelines below, so it has to say how it is read. The write target under it
+    // deliberately does not: only a source a pipeline reads is asked for a mode.
     private static final String SOURCE_X = """
             version: tapstate/v1
             kind: source
             id: src_x
             connector: mysql
+            mode: cdc
             """;
 
     private static final String SOURCE_TARGET = """
@@ -1096,7 +1099,7 @@ class PipelineApiTest {
             for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
                 Resource current = byId.get(expected.getKey());
                 if (current == null
-                        || !CanonicalHash.of(new CanonicalWriter().write(current)).equals(expected.getValue())) {
+                        || !CanonicalHash.of(current).equals(expected.getValue())) {
                     return Optional.of(expected.getKey());
                 }
             }
@@ -1120,7 +1123,7 @@ class PipelineApiTest {
             if (current == null) {
                 return io.tapstate.spi.store.ArtifactMutation.NOT_FOUND;
             }
-            if (!CanonicalHash.of(new CanonicalWriter().write(current)).equals(expectedContentHash)) {
+            if (!CanonicalHash.of(current).equals(expectedContentHash)) {
                 return io.tapstate.spi.store.ArtifactMutation.VERSION_CONFLICT;
             }
             byId.put(id, replacement);

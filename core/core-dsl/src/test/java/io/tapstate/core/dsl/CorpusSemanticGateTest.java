@@ -90,11 +90,20 @@ class CorpusSemanticGateTest {
         //   UPSERT_NEEDS_KEY: whether a table has a key is a property of the table, which only a
         //   discovered model carries - a document names the table but cannot say what it declares
         //   (WriteKeyRulesTest).
+        //
+        // inexpressible - the corpus cannot hold the document that would witness it.
+        //   UNSUPPORTED_VERSION: CorpusSmokeTest requires every artifact here to declare the
+        //   supported version, so an artifact declaring another one cannot exist in this corpus. That
+        //   requirement is worth more than the witness -- it is what stops a fixture drifting onto a
+        //   stale grammar unnoticed -- so the code is proven directly instead (DslParserTest, which
+        //   covers an unreadable version, an absent one, and that a supported version leaves an
+        //   unknown kind reported as a kind problem).
         Set<DslError> requiresCorpusWitness = EnumSet.complementOf(EnumSet.of(
                 DslError.MALFORMED_YAML, DslError.UNDEFINED_VARIABLE, DslError.MALFORMED_INTERPOLATION,
                 DslError.CONFIG_REQUIRED,
                 DslError.ROW_EXPRESSION_NEEDS_DISCOVERY, DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED,
-                DslError.ROW_EXPRESSION_TYPE_UNKNOWN, DslError.UPSERT_NEEDS_KEY));
+                DslError.ROW_EXPRESSION_TYPE_UNKNOWN, DslError.UPSERT_NEEDS_KEY,
+                DslError.UNSUPPORTED_VERSION));
         assertThat(witnessed).containsExactlyInAnyOrderElementsOf(requiresCorpusWitness);
     }
 

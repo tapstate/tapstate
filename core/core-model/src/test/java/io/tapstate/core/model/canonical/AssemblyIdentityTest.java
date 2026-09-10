@@ -69,7 +69,7 @@ class AssemblyIdentityTest {
     }
 
     /**
-     * The assembly identity is a second reading of the same canonical text, not a rename of the content
+     * The assembly identity is a second reading of the same canonical structure, not a rename of the content
      * hash. Without this, an implementation that simply returned the content hash would pass every
      * "is not whitelisted" case above and only the two positive ones would catch it.
      */
@@ -78,10 +78,8 @@ class AssemblyIdentityTest {
     void itIsNotTheContentHash() {
         PipelineResource before = pipeline(null, SourceRef.spec("orders", true));
         PipelineResource after = pipeline(null, SourceRef.spec("orders", false));
-        CanonicalWriter writer = new CanonicalWriter();
 
-        assertThat(CanonicalHash.of(writer.write(after)))
-                .isNotEqualTo(CanonicalHash.of(writer.write(before)));
+        assertThat(CanonicalHash.of(after)).isNotEqualTo(CanonicalHash.of(before));
         assertThat(AssemblyIdentity.of(after)).isEqualTo(AssemblyIdentity.of(before));
     }
 
