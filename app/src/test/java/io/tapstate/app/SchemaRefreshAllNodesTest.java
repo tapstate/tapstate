@@ -93,8 +93,8 @@ class SchemaRefreshAllNodesTest {
         assertThat(store.derivedSchemas().latest("joined", "customer_orders")).get()
                 .satisfies(recorded -> assertThat(recorded.schema()).containsEntry("order_id", "DECIMAL NULL"));
         assertThat(store.derivedSchemas().pinned("joined", "customer_orders")).contains(baseline);
-        assertThat(schemas.compare("joined")).allSatisfy(step ->
-                assertThat(step.columns()).noneMatch(DerivedSchemas.ColumnReport::drifted));
+        assertThat(schemas.compare("joined")).hasSize(5).allSatisfy(step ->
+                assertThat(step.columns()).isNotEmpty().noneMatch(DerivedSchemas.ColumnReport::drifted));
     }
 
     @ParameterizedTest
@@ -175,7 +175,8 @@ class SchemaRefreshAllNodesTest {
                     Map.entry("id", "INT64 NULL"), Map.entry("region", "STRING NULL"));
         }
         assertThat(schemas.compare("orders_pipeline")).hasSize(NODES.size())
-                .allSatisfy(step -> assertThat(step.columns()).noneMatch(DerivedSchemas.ColumnReport::drifted));
+                .allSatisfy(step -> assertThat(step.columns()).isNotEmpty()
+                        .noneMatch(DerivedSchemas.ColumnReport::drifted));
 
         refresh(accept, schemas, apply);
         assertThat(records(store)).isEqualTo(refreshed);
@@ -186,6 +187,7 @@ class SchemaRefreshAllNodesTest {
             schemas.accept("alice", "orders_pipeline");
         } else {
             assertThat(apply.apply("alice", DRAFTS).outcomes())
+                    .hasSize(DRAFTS.size())
                     .allSatisfy(outcome -> assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.UNCHANGED));
         }
     }
