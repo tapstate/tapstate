@@ -92,21 +92,37 @@ def roots_from_effective(projects):
     if not projects:
         fail('effective POM contains no reactor projects')
     reactor = {(p.findtext('groupId'), p.findtext('artifactId'), p.findtext('version')) for p in projects}
+    def coordinate(dependency):
+        group, artifact, version = (dependency.findtext(field) or '' for field in ('groupId', 'artifactId', 'version'))
+        if group != 'io.tapdata' or (group, artifact, version) in reactor:
+            return None
+        if '${' in version or not version:
+            fail(f'unresolved external PDK dependency {artifact}: {version}')
+        kind = dependency.findtext('type') or 'jar'
+        classifier = dependency.findtext('classifier') or ''
+        if kind not in ('jar', 'pom', 'test-jar'):
+            fail(f'unsupported PDK snapshot artifact type: {kind}')
+        if kind == 'test-jar':
+            kind, classifier = 'jar', classifier or 'tests'
+        return group, artifact, version, kind, classifier
+
     roots = set()
     for project in projects:
         for dependency in project.findall('./dependencies/dependency') + project.findall('./build/plugins/plugin/dependencies/dependency'):
-            group, artifact, version = (dependency.findtext(field) or '' for field in ('groupId', 'artifactId', 'version'))
-            if group != 'io.tapdata' or (group, artifact, version) in reactor:
+            value = coordinate(dependency)
+            if value:
+                roots.add(value)
+    # The enterprise reactor can mediate a locally installed OSS prerequisite's
+    # transitive PDK version. Its effective direct dependencies do not expose that
+    # edge, so resolve managed variants of the reachable PDK artifacts as well.
+    reachable = {(entry[0], entry[1]) for entry in roots}
+    for project in projects:
+        for dependency in project.findall('./dependencyManagement/dependencies/dependency'):
+            if (dependency.findtext('groupId'), dependency.findtext('artifactId')) not in reachable:
                 continue
-            if '${' in version or not version:
-                fail(f'unresolved external PDK dependency {artifact}: {version}')
-            kind = dependency.findtext('type') or 'jar'
-            classifier = dependency.findtext('classifier') or ''
-            if kind not in ('jar', 'pom', 'test-jar'):
-                fail(f'unsupported PDK snapshot artifact type: {kind}')
-            if kind == 'test-jar':
-                kind, classifier = 'jar', classifier or 'tests'
-            roots.add((group, artifact, version, kind, classifier))
+            value = coordinate(dependency)
+            if value:
+                roots.add(value)
     if not roots:
         fail('selected reactor names no external PDK snapshot dependencies')
     return sorted(roots), sorted(reactor)

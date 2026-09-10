@@ -40,6 +40,10 @@ if any('effective-pom' in arg for arg in args):
     for field, text in [('groupId', 'io.tapdata'), ('artifactId', 'sql-core'), ('version', '1.0-SNAPSHOT')]: ET.SubElement(project, field).text = text
     dependency = ET.SubElement(ET.SubElement(projects.find('project'), 'dependencies'), 'dependency')
     for field, text in [('groupId', 'io.tapdata'), ('artifactId', 'sql-core'), ('version', '1.0-SNAPSHOT')]: ET.SubElement(dependency, field).text = text
+    managed = ET.SubElement(ET.SubElement(ET.SubElement(project, 'dependencyManagement'), 'dependencies'), 'dependency')
+    for field, text in [('groupId', 'io.tapdata'), ('artifactId', 'tapdata-pdk-api'), ('version', '2.2-SNAPSHOT')]: ET.SubElement(managed, field).text = text
+    unused = ET.SubElement(project.find('./dependencyManagement/dependencies'), 'dependency')
+    for field, text in [('groupId', 'io.tapdata'), ('artifactId', 'unused-unpublished'), ('version', '9.0-SNAPSHOT')]: ET.SubElement(unused, field).text = text
     ET.ElementTree(projects).write(value('-Doutput='))
 else:
     resolver = ET.parse(args[args.index('-f') + 1]).getroot()
@@ -90,6 +94,7 @@ else:
         ['io.tapdata', 'tapdata-pdk-api', '2.0-SNAPSHOT', 'jar', ''],
         ['io.tapdata', 'tapdata-pdk-api', '2.1-SNAPSHOT', 'jar', ''],
         ['io.tapdata', 'tapdata-pdk-api', '2.1-SNAPSHOT', 'jar', 'tests'],
+        ['io.tapdata', 'tapdata-pdk-api', '2.2-SNAPSHOT', 'jar', ''],
     ]
     evidence = json.loads(manifest.read_text())
     assert evidence['roots'] == expected_roots, 'effective POM root versions or classifiers lost'
@@ -100,6 +105,8 @@ else:
         'io/tapdata/tapdata-pdk-api/2.1-SNAPSHOT/tapdata-pdk-api-2.1-SNAPSHOT.jar',
         'io/tapdata/tapdata-pdk-api/2.1-SNAPSHOT/tapdata-pdk-api-2.1-SNAPSHOT-tests.jar',
         'io/tapdata/tapdata-pdk-api/2.1-SNAPSHOT/tapdata-pdk-api-2.1-SNAPSHOT.pom',
+        'io/tapdata/tapdata-pdk-api/2.2-SNAPSHOT/tapdata-pdk-api-2.2-SNAPSHOT.jar',
+        'io/tapdata/tapdata-pdk-api/2.2-SNAPSHOT/tapdata-pdk-api-2.2-SNAPSHOT.pom',
         'io/tapdata/pdk-error-code/2.0-SNAPSHOT/pdk-error-code-2.0-SNAPSHOT.jar',
         'io/tapdata/pdk-error-code/2.0-SNAPSHOT/pdk-error-code-2.0-SNAPSHOT.pom',
     }

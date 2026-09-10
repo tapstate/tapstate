@@ -24,12 +24,14 @@ public final class PdkApiLevels {
      * connector build lines that share its API contract; append a row per new upstream API version.
      * Append-only: an existing base version keeps its level (renumbering would silently re-judge every
      * connector). {@code 2.0.5} / {@code 2.0.7} / {@code 2.0.8} are one level because they are API-
-     * equivalent under PDK's {@code 2.0.x} backward-compatibility line.
+     * equivalent under PDK's {@code 2.0.x} backward-compatibility line. The audited
+     * {@code 2.0.9} PDK API artifact contains the same class bytes as the baseline.
      */
     private static final Map<String, Integer> LEVELS = Map.of(
             "2.0.5", 1,
             "2.0.7", 1,
-            "2.0.8", 1);
+            "2.0.8", 1,
+            "2.0.9", 1);
 
     /** The frozen baseline the bridge compiles and runs against. */
     private static final String ENGINE_VERSION = "2.0.8";
