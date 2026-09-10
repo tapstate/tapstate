@@ -3,6 +3,8 @@ package io.tapstate.archtests;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
 import io.tapstate.app.ConnectorPluginProperties;
 import io.tapstate.core.catalog.OfficialConnectors;
+import io.tapstate.core.catalog.ModeSource;
+import io.tapstate.core.catalog.TapstateCatalog;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -209,14 +211,14 @@ class ConnectorAcceptanceGatesTest {
     private static final Map<String, Integer> EXPECTED_IDS_PER_DATABASE_KIND = Map.of(
             "mysql", 5,
             "postgres", 5,
-            "mongodb", 5);
+            "mongodb", 4);
 
     /** Every id a shipped deployment accepts out of the box, in refusal-message order. */
     private static final List<String> ACCEPTED_OUT_OF_THE_BOX = List.of(
             "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
             "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
             "tencent-db-postgres",
-            "mongodb", "mongodb-atlas", "mongodb3", "aliyun-db-mongodb", "tencent-db-mongodb");
+            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb");
 
     @Test
     @DisplayName("what a shipped deployment accepts out of the box is exactly this set")
@@ -244,6 +246,27 @@ class ConnectorAcceptanceGatesTest {
         assertThat(declaredCounts)
                 .as("each database kind has an explicit support count; variants are not uniformly sized")
                 .isEqualTo(EXPECTED_IDS_PER_DATABASE_KIND);
+    }
+
+    @Test
+    @DisplayName("every offered mode of every official connector comes from a capability probe")
+    void everyOfficialConnectorModeIsDerived() {
+        TapstateCatalog catalog = TapstateCatalog.load();
+        assertThat(OfficialConnectors.IDS).as("the official connector scan must not be empty").isNotEmpty();
+        assertThat(catalog.ids())
+                .as("every official connector must resolve in the bundled catalog")
+                .containsAll(OfficialConnectors.IDS);
+        for (String id : OfficialConnectors.IDS) {
+            var entry = catalog.byId(id);
+            assertThat(entry.modes())
+                    .as("official connector %s must offer at least one mode", id)
+                    .isNotEmpty();
+            for (var mode : entry.modes()) {
+                assertThat(entry.provenance().modeSource().get(mode))
+                        .as("official connector %s mode %s must be derived from registered capabilities", id, mode)
+                        .isEqualTo(ModeSource.DERIVED);
+            }
+        }
     }
 
     @Test

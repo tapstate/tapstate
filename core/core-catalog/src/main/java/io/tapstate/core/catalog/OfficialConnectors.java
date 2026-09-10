@@ -44,7 +44,7 @@ public final class OfficialConnectors {
                 "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
                 "tencent-db-postgres"));
         kinds.put("mongodb", List.of(
-                "mongodb", "mongodb-atlas", "mongodb3", "aliyun-db-mongodb", "tencent-db-mongodb"));
+                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb"));
         return Collections.unmodifiableMap(kinds);
     }
 
