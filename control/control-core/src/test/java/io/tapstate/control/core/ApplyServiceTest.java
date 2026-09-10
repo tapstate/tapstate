@@ -128,7 +128,7 @@ class ApplyServiceTest {
         Resource replacement = new DslParser().parse(UNBUFFERED_SRC);
 
         assertThatThrownBy(() -> guarded.replace(
-                "author", replacement, CanonicalHash.of(stored("orders_src"))))
+                "author", replacement, CanonicalHash.of(store.get("orders_src").orElseThrow())))
                 .isInstanceOfSatisfying(TapstateException.class, refused ->
                         assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
     }
@@ -279,8 +279,8 @@ class ApplyServiceTest {
                 .as("the canonical form is the deterministic serializer's output")
                 .isEqualTo(expectedCanonical);
         assertThat(prepared.contentHash())
-                .as("the content hash is taken over the canonical form")
-                .isEqualTo(CanonicalHash.of(expectedCanonical));
+                .as("the content hash is taken over the resource's structure, not over the text beside it")
+                .isEqualTo(CanonicalHash.of(prepared.resource()));
     }
 
     @Test
@@ -1063,7 +1063,6 @@ class ApplyServiceTest {
                       username: cdc_user, password: Ora_2026 }
             mode: cdc
             tables: [ ORDERS, ORDER_ITEMS, CUSTOMERS ]
-            options: { include_ddl: true }
             """;
 
     // The same oracle source with no pipeline referencing it — a standalone resource for batch tests.
@@ -1136,7 +1135,7 @@ class ApplyServiceTest {
             for (ArtifactWrite write : writes) {
                 for (Map.Entry<String, String> precondition : write.readPreconditions().entrySet()) {
                     String canonical = byId.get(precondition.getKey());
-                    if (canonical == null || !CanonicalHash.of(canonical).equals(precondition.getValue())) {
+                    if (canonical == null || !storedHash(canonical).equals(precondition.getValue())) {
                         return ArtifactBatchWrite.refused(precondition.getKey(), ArtifactMutation.VERSION_CONFLICT);
                     }
                 }
@@ -1150,7 +1149,7 @@ class ApplyServiceTest {
                 if (canonical == null) {
                     return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.NOT_FOUND);
                 }
-                if (!CanonicalHash.of(canonical).equals(write.expectedContentHash())) {
+                if (!storedHash(canonical).equals(write.expectedContentHash())) {
                     return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.VERSION_CONFLICT);
                 }
             }
@@ -1174,7 +1173,7 @@ class ApplyServiceTest {
             // longer names the stored bytes refuses the whole batch and stages nothing.
             for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
                 String canonical = byId.get(expected.getKey());
-                if (canonical == null || !CanonicalHash.of(canonical).equals(expected.getValue())) {
+                if (canonical == null || !storedHash(canonical).equals(expected.getValue())) {
                     return Optional.of(expected.getKey());
                 }
             }
@@ -1191,6 +1190,15 @@ class ApplyServiceTest {
             saveCount += artifacts.size();
             saveAllBatches.add(artifacts.stream().map(Resource::id).toList());
             return Optional.empty();
+        }
+
+        /**
+         * The stored version identity for a stored body: taken over the structure the canonical text
+         * describes, not over the text. Hashing the text here would let the fake agree with a caller
+         * that also hashed text, and the store this fake stands in for would agree with neither.
+         */
+        private String storedHash(String canonical) {
+            return CanonicalHash.of(parser.parse(canonical));
         }
 
         /** Commits {@code canonical} for {@code id} directly, as another author's apply would. */

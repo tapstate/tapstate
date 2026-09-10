@@ -132,7 +132,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     @Test
     void aPipelineWhoseSwitchIsOffDerivesTheDirectTailAndAnExplicitKeyIsStillCarried() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null,
+                SourceMode.CDC, List.of(TableRef.literal("orders")),
                 new Srs("shared-key", null, null, null, false), null);
 
         CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
@@ -203,7 +203,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         Settings settings = new Settings(null, null, null, null, ReadMode.CDC_ONLY, binlogCoordinate);
         SourceResource buffered = cdcSource("orders_src", "orders", null);
         SourceResource direct = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null,
+                SourceMode.CDC, List.of(TableRef.literal("orders")),
                 new Srs(null, null, null, null, false), null);
 
         assertThat(buffered.srsEnabled()).as("the two sources really do take different paths").isTrue();
@@ -249,7 +249,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     @Test
     void thePipelinesOwnSwitchDecidesInTheOtherDirectionToo() {
         SourceResource direct = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null,
+                SourceMode.CDC, List.of(TableRef.literal("orders")),
                 new Srs(null, null, null, null, false), null);
         assertThat(direct.srsEnabled()).as("the source itself says direct").isFalse();
 
@@ -273,7 +273,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         artifacts.save(cdcSource("orders_src", "orders", null));
         artifacts.save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src")), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("orders_src"),
-                        List.of(new SyncElement("sync_1", "orders_src", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "orders_src", null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
         CaptureStarter starter = (spec, passthrough) -> {
             throw new AssertionError("capture must not start: no switch was ever recorded");
@@ -416,7 +416,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     void multiTableSnapshotProgressAndBufferRoutingStayPerTable() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null);
         artifacts.save(source);
         artifacts.save(pipelineWithReadMode("p", "multi_src", ReadMode.SNAPSHOT_AND_CDC));
         SnapshotBuffer buffer = new SnapshotBuffer();
@@ -442,7 +442,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     void rejects_a_snapshot_row_from_a_table_outside_the_source_selection() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("selected_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null);
         artifacts.save(source);
         artifacts.save(pipelineWithReadMode("p", "selected_src", ReadMode.SNAPSHOT_ONLY));
         CaptureStarter starter = (spec, passthrough) -> {
@@ -512,7 +512,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         artifacts.save(cdcSource("src_b", "orders", null));
         artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("src_a"),
-                        List.of(new SyncElement("sync_1", "src_a", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "src_a", null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
         java.util.Map<String, Long> countsBySource = Map.of("src_a", 100L, "src_b", 200L);
         CaptureStarter starter = (spec, passthrough) -> new CaptureRun(Optional.empty(), false,
@@ -640,7 +640,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource first = cdcSource("src_a", "orders", null);
         SourceResource second = new SourceResource("src_b", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null, null);
+                SourceMode.CDC, null, null, null);
         artifacts.save(first);
         artifacts.save(second);
         artifacts.save(twoSourcePipeline("p", "src_a", "src_b"));
@@ -673,10 +673,10 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         artifacts.save(cdcSource("src_a", "orders", null));
         artifacts.save(cdcSource("src_b", "customers", null));
         artifacts.save(new SourceResource("src_c", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null, null));
+                SourceMode.CDC, null, null, null));
         artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true), SourceRef.spec("src_c", true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("src_a"),
-                        List.of(new SyncElement("sync_1", "src_a", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "src_a", null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
         SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
         AtomicBoolean secondClosed = new AtomicBoolean(false);
@@ -721,7 +721,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     void aLoadIsDeliveredOnlyOnceTheRecordShowsEveryTableWrittenNotOnceItsReadReturned() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
+                List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
         artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
@@ -847,7 +847,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     private static SourceResource cdcSource(String id, String table, String srsKey) {
         Srs srs = srsKey == null ? null : new Srs(srsKey, null, null, null, null);
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, srs, null);
+                List.of(TableRef.literal(table)), srs, null);
     }
 
     private static PipelineResource pipeline(String id, String sourceId) {
@@ -857,14 +857,14 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     private static PipelineResource pipelineWithReadMode(String id, String sourceId, ReadMode readMode) {
         return new PipelineResource(id, null, List.of(SourceRef.spec(sourceId, true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal(sourceId),
-                        List.of(new SyncElement("sync_1", sourceId, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", sourceId, null, null, null)), null, null),
                 new Settings(null, null, null, null, readMode, "earliest"), null);
     }
 
     private static PipelineResource twoSourcePipeline(String id, String sourceA, String sourceB) {
         return new PipelineResource(id, null, List.of(SourceRef.spec(sourceA, true), SourceRef.spec(sourceB, true)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal(sourceA),
-                        List.of(new SyncElement("sync_1", sourceA, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", sourceA, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);
     }
 

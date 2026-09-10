@@ -473,7 +473,7 @@ class PipelineStreamApiTest {
             public Optional<Resource> get(String id) {
                 if (id.equals("views")) {
                     return Optional.of(new SourceResource(id, null, "mongodb",
-                            Map.of("uri", "mongodb://db.local"), null, null, null, null, null));
+                            Map.of("uri", "mongodb://db.local"), null, null, null, null));
                 }
                 return Optional.of(new PipelineResource(id, null, List.of(SourceRef.bare("src_x")), null, null, null, null, null));
             }

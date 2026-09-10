@@ -16,8 +16,6 @@ public record TransformResource(
         @Doc("Optional labels and free-text description.")
         Metadata metadata,
         @YamlFlatten TransformBody body,
-        @Doc("Transform-owned extension options.")
-        Map<String, Object> options,
         @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
         Map<String, Object> experimental)
         implements Resource {
@@ -25,8 +23,6 @@ public record TransformResource(
     public TransformResource {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(body, "body");
-        options = options == null ? null
-                : Collections.unmodifiableMap(new LinkedHashMap<>(options));
         experimental = experimental == null ? null
                 : Collections.unmodifiableMap(new LinkedHashMap<>(experimental));
     }

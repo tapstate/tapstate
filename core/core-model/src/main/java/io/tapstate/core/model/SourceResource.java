@@ -29,8 +29,6 @@ public record SourceResource(
         SourceMode mode,
         @Doc("Tables to read: bare names, /regex/ patterns, or per-table objects.")
         List<TableRef> tables,
-        @Doc("Connector-specific source options; the read mode and start position live in pipeline settings.")
-        Map<String, Object> options,
         @Doc("Shared Record Store configuration; only valid on cdc sources.")
         Srs srs,
         @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
@@ -42,8 +40,6 @@ public record SourceResource(
         config = config == null ? Map.of()
                 : Collections.unmodifiableMap(new LinkedHashMap<>(config));
         tables = tables == null ? null : List.copyOf(tables);
-        options = options == null ? null
-                : Collections.unmodifiableMap(new LinkedHashMap<>(options));
         experimental = experimental == null ? null
                 : Collections.unmodifiableMap(new LinkedHashMap<>(experimental));
     }

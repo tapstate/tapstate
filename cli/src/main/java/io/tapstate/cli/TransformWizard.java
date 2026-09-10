@@ -27,6 +27,6 @@ final class TransformWizard {
             // every other type always yields a body, and join (never null) is the exhausted default
             body = bodyPrompter.askBody(prompter.choose("Transform type?", TransformBodyPrompter.TYPES));
         } while (body == null);
-        return new TransformResource(id, null, body, null, null);
+        return new TransformResource(id, null, body, null);
     }
 }

@@ -6,6 +6,7 @@ import com.mongodb.MongoException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.core.common.TapstateException;
 
 import java.io.IOException;
@@ -16,6 +17,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -50,12 +52,32 @@ public final class MongoConnection implements AutoCloseable {
     }
 
     /**
-     * Opens the client and verifies the store is reachable and is a replica-set. Raises a
-     * {@code store.unreachable} coded diagnostic if the target cannot be reached within the
-     * configured server-selection timeout, or {@code store.not-replica-set} if it is reached but
-     * is a standalone server. On success the client is held open for the process lifetime.
+     * Opens the store and brings its system data to the shape this build expects, in that order, before
+     * the connection is handed to anybody. Everything that touches the store gets its handle from here,
+     * so putting the migration inside makes every one of those things come after it without any wiring
+     * having to say so — and a migration that cannot finish stops the process rather than letting half
+     * of it start.
      */
     public void verify() {
+        verifyConnectivity();
+        try {
+            MigrationRunner.migrate(database());
+        } catch (RuntimeException e) {
+            close();
+            throw e;
+        }
+    }
+
+    /**
+     * Opens the client and verifies the store is reachable and is a replica-set, and nothing further.
+     * Raises a {@code store.unreachable} coded diagnostic if the target cannot be reached within the
+     * configured server-selection timeout, or {@code store.not-replica-set} if it is reached but is a
+     * standalone server. On success the client is held open for the process lifetime.
+     *
+     * <p>Separate from {@link #verify()} for the read-only inspection commands, whose whole point is to
+     * work on a store a normal start refuses on: they have to reach it without changing it.
+     */
+    public void verifyConnectivity() {
         // A repeated verify() must not orphan a previously opened client (its pool and monitor threads).
         close();
 
@@ -87,6 +109,31 @@ public final class MongoConnection implements AutoCloseable {
             throw new TapstateException(StoreError.NOT_REPLICA_SET, Map.of("target", target), null);
         }
         this.client = opened;
+    }
+
+    /**
+     * What schema version the store says its system data is at, and what this build has that has not
+     * run against it. Read live rather than reported from the build's own highest changeset: after a
+     * successful start the two agree by construction, and if they ever do not, this shows it instead of
+     * asserting it.
+     */
+    public MigrationRunner.Status systemDataStatus() {
+        return MigrationRunner.inspect(database());
+    }
+
+    /** Every changeset this build carries, in the order they run. Named for the inspection commands. */
+    public List<String> knownChangeSets() {
+        return MigrationRunner.changeSets().stream().map(ChangeSet::changeSetName).toList();
+    }
+
+    /** What a changeset that has not run would do, without doing any of it. */
+    public List<String> systemDataDryRun() {
+        MongoDatabase database = database();
+        int installed = systemDataStatus().installed();
+        return MigrationRunner.changeSets().stream()
+                .filter(changeSet -> changeSet.version() > installed)
+                .map(changeSet -> changeSet.changeSetName() + ": " + changeSet.dryRunSummary(database))
+                .toList();
     }
 
     /**

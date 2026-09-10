@@ -41,6 +41,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 class ReplTest {
 
+    /**
+     * A hash the server sent and nothing local could have produced. The precondition the CLI sends must
+     * be this exact value: it is taken over the resource's structure, so a client holding only the
+     * canonical bytes beside it cannot derive it, and one that tried would send something the server has
+     * never stored — refused on every request, with the canonical text sitting right there looking right.
+     */
+    private static final String STORED_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     private static final UUID TEST_CONTEXT_ID =
             UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
     private static final UUID TEST_AUTH_REF =
@@ -124,6 +132,10 @@ class ReplTest {
         final List<URI> discovered = new ArrayList<>();
         /** What the server answers when asked its version; null is a server that does not say. */
         String serverVersion;
+        /** The grammars it accepts and the schema version of its store; null in either is a server
+         * that does not say, which is not the same as a server that reports none. */
+        List<String> dslVersions;
+        Integer dataVersion;
         /** The canned login outcome and a log of the login calls made ({@code user:pass@base}). */
         LoginOutcome loginOutcome = new LoginOutcome.Unreachable();
         final List<String> loginCalls = new ArrayList<>();
@@ -254,6 +266,13 @@ class ReplTest {
         @Override
         public String serverVersion(URI baseUrl) {
             return healthy.contains(baseUrl) ? serverVersion : null;
+        }
+
+        @Override
+        public ServerVersion serverVersionDetail(URI baseUrl) {
+            return healthy.contains(baseUrl) && serverVersion != null
+                    ? new ServerVersion(serverVersion, dslVersions, dataVersion)
+                    : null;
         }
 
         @Override
@@ -786,7 +805,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.serverVersion = "9.9.9";
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n")));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n")));
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         int mark = h.sink().toString().length();
@@ -881,6 +900,88 @@ class ReplTest {
         assertThat(out).contains("not reported").contains("node1:7900");
         // never its own number in the server's half -- that is the failure this shape exists to avoid
         assertThat(out).doesNotContain("server " + buildVersion());
+    }
+
+    /**
+     * The question an operator has straight after an upgrade is which system-data version they are on
+     * now, and the verb named after versions is where they go to ask it. The server sends the grammars
+     * and that number in the same body as its own version, so anything short of printing them is the
+     * CLI dropping what it already received and sending the reader to a second command for it.
+     */
+    @Test
+    void theVersionVerbAnswersWithTheGrammarsAndTheDataVersionTheServerSent() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = List.of("tapstate/v1", "tapstate/v2");
+        client.dataVersion = 4;
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList())
+                .contains("dsl    tapstate/v1, tapstate/v2")
+                .contains("data   4");
+    }
+
+    /**
+     * A server that answers with its own number and nothing else -- a build older than either field, or
+     * a run with no store behind it. Not knowing is printed as not knowing, the stance the server half
+     * already takes: a blank where a number belongs reads as agreement, and so does saying nothing.
+     */
+    @Test
+    void theVersionVerbSaysNotReportedForTheHalvesAServerLeavesOut() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = null;
+        client.dataVersion = null;
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList())
+                .contains("dsl    not reported")
+                .contains("data   not reported");
+    }
+
+    /**
+     * A server that sends an empty grammar list is saying it accepts none, which is a different answer
+     * from not sending the field at all -- and printing them alike would hide a server nothing can be
+     * authored against behind a word that means "we could not tell".
+     */
+    @Test
+    void aServerThatAcceptsNoGrammarSaysSoRatherThanReadingAsSilence() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = List.of();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList()).contains("dsl    none").doesNotContain("dsl    not reported");
+    }
+
+    /**
+     * Offline the two extra halves are left out entirely rather than reported as unknown. Nothing about
+     * a grammar set or a store is knowable without a server, and "not reported" there would describe a
+     * server that was never asked -- three lines of not-knowing where one already said it.
+     */
+    @Test
+    void theOfflineVerbLeavesOutTheHalvesOnlyAServerCanAnswer() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = harness(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out).contains("not connected");
+        assertThat(out.lines().toList()).noneMatch(line -> line.startsWith("dsl") || line.startsWith("data"));
     }
 
     /** The version the build was run at -- handed in by surefire, so it is not read back off the code. */
@@ -1607,7 +1708,7 @@ class ReplTest {
     void getWhileAuthenticatedFetchesTheArtifactFromTheServer() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "kind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();
@@ -1641,15 +1742,15 @@ class ReplTest {
 
     /**
      * Without {@code --if-match} the verb reads first and removes the version it read. The hash sent is
-     * asserted against the canonical bytes that came back: sending anything else — a blank, a literal
-     * null, a hash of something else — would make the removal unconditional in effect, which is the one
-     * property the precondition exists to provide.
+     * asserted against the one the read handed over: sending anything else — a blank, a literal null, a
+     * hash recomputed from the canonical bytes — would make the removal unconditional in effect, which is
+     * the one property the precondition exists to provide.
      */
     @Test
     void deleteWithoutAPreconditionReadsTheArtifactAndRemovesThatExactVersion() {
-        String canonical = "kind: source\nid: src_kfk\n";
+        String canonical = "version: tapstate/v1\nkind: source\nid: src_kfk\n";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical, STORED_HASH, true));
         client.deleteOutcome = new DeleteOutcome.Removed("src_kfk");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -1658,7 +1759,7 @@ class ReplTest {
 
         assertThat(h.sink().toString().substring(mark)).contains("deleted").contains("source").contains("src_kfk");
         assertThat(client.deleteCalls).containsExactly(
-                "jwt-tok@http://node1:7900/src_kfk#" + CanonicalHash.of(canonical));
+                "jwt-tok@http://node1:7900/src_kfk#" + STORED_HASH);
     }
 
     @Test
@@ -1692,9 +1793,9 @@ class ReplTest {
         // A script removing resources needs to know what it removed, and "deleted source src_kfk" is a
         // sentence, not a result. The precondition actually used is part of it: without --if-match the
         // verb picks the version itself, and the caller has no other way to learn which one went.
-        String canonical = "kind: source\nid: src_kfk\n";
+        String canonical = "version: tapstate/v1\nkind: source\nid: src_kfk\n";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical, STORED_HASH, true));
         client.deleteOutcome = new DeleteOutcome.Removed("src_kfk");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -1706,7 +1807,7 @@ class ReplTest {
                 .contains("\"id\": \"src_kfk\"")
                 .contains("\"kind\": \"source\"")
                 .contains("\"removed\": true")
-                .contains("\"expectedContentHash\": \"" + CanonicalHash.of(canonical) + "\"");
+                .contains("\"expectedContentHash\": \"" + STORED_HASH + "\"");
         assertThat(h.repl().lastExitCode()).isZero();
     }
 
@@ -2044,8 +2145,8 @@ class ReplTest {
     void lsWhileConnectedListsServerArtifactsNotTheLocalWorkspace() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n"),
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\n")));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"),
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\n")));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("ls")).isTrue();
@@ -2058,7 +2159,7 @@ class ReplTest {
     void lsWhileConnectedShowsUnreadableServerArtifactsWithoutFailingTheListing() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n"),
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"),
                 new RemoteArtifact("p1", "pipeline", "not: [valid", false)));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -2132,7 +2233,7 @@ class ReplTest {
     /** A stored source connection whose canonical form carries the connector id and its connection config. */
     private static GetOutcome.Found storedConnection() {
         return new GetOutcome.Found(new RemoteArtifact("my-mongo", "source",
-                "kind: source\nid: my-mongo\nconnector: mongodb\nconfig:\n  host: db.internal\n  username: cdc\n"));
+                "version: tapstate/v1\nkind: source\nid: my-mongo\nconnector: mongodb\nconfig:\n  host: db.internal\n  username: cdc\n"));
     }
 
     private static ConnectionTestOutcome.Tested passedReport() {
@@ -2435,7 +2536,7 @@ class ReplTest {
     void testOnANonSourceIdReportsNotATestableConnectionAndDoesNotProbe() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\nid: kfk2my\n"));
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\nid: kfk2my\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -2683,7 +2784,7 @@ class ReplTest {
     void discoverSchemaOnANonSourceIdReportsNotDiscoverableAndDoesNotDiscover() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\nid: kfk2my\n"));
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\nid: kfk2my\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -3353,7 +3454,7 @@ class ReplTest {
         copyWorkspace("/ws-valid", base);   // a real local source/src_kfk.tap.yml exists in the workspace
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact(
-                "src_kfk", "source", "kind: source\nid: src_kfk\nserver_marker: REMOTE\n"));
+                "src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\nserver_marker: REMOTE\n"));
         Harness h = onlineSession(base, client);
         int mark = h.sink().toString().length();
         h.repl().dispatch("get src_kfk");
@@ -3542,7 +3643,7 @@ class ReplTest {
         // a subdirectory that cannot be listed makes Files.walk raise UncheckedIOException mid-traversal;
         // apply must render a benign "cannot read" line, not let that escape and crash the REPL session
         Path locked = Files.createDirectory(base.resolve("source"));
-        Files.writeString(locked.resolve("s.tap.yml"), "kind: source\nid: x\n");
+        Files.writeString(locked.resolve("s.tap.yml"), "version: tapstate/v1\nkind: source\nid: x\n");
         assumeTrue(Files.getFileAttributeView(locked, PosixFileAttributeView.class) != null,
                 "POSIX permissions required to make a subdirectory unreadable");
         Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("---------"));
@@ -4518,7 +4619,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(
                 URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", "kind: source\n"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
         h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
@@ -4538,7 +4639,7 @@ class ReplTest {
     void anOnlineVerbWithNoReachableMemberLosesTheConnectionAndReportsItOnce() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("x", "source", "kind: source\n"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("x", "source", "version: tapstate/v1\nkind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
         h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
@@ -4558,7 +4659,7 @@ class ReplTest {
     void aSuccessfulOnlineVerbYieldsSuccess() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "kind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         h.repl().dispatch("get src_kfk");
         assertThat(h.repl().lastExitCode()).isZero();

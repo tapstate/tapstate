@@ -26,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ARequiredFieldLeftOutIsRefusedAtApplyIT {
 
-    private static final String COMPOSITION = "dsl.composition";
+    private static final String MISSING_FIELD = "dsl.missing-field";
 
     /** Complete but for the one field the join type requires; everything else is well formed. */
     private static final String JOIN_WITHOUT_SQL = """
@@ -53,7 +53,7 @@ class ARequiredFieldLeftOutIsRefusedAtApplyIT {
 
             assertThat(refusal.code())
                     .as("the code refusing a document that left out a field its type requires")
-                    .isEqualTo(COMPOSITION);
+                    .isEqualTo(MISSING_FIELD);
             assertThat(refusal.params())
                     .as("the field path is what sends the author to the line they have to edit")
                     .containsEntry("path", "sql");

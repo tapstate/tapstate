@@ -9,4 +9,3 @@ mode: api
 tables:
   - { name: issues, pk: [id] }
   - { name: pulls,  pk: [id] }
-options: { poll_interval: 5m, cursor: updated_at }
