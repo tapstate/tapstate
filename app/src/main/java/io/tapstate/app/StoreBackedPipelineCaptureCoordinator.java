@@ -115,8 +115,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
     }
 
-    /** One source run's snapshot: the chain that records its completion, and the tables it covers. */
-    private record SnapshotOnChain(String chainId, List<String> tables) {
+    /** One source run's snapshot: its completion chain, if any, and the tables it covers. */
+    private record SnapshotOnChain(Optional<String> chainId, List<String> tables) {
     }
 
     /**
@@ -124,15 +124,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      *
      * <p>A run whose read mode has no snapshot has no load to deliver. A run with no chain is a
      * snapshot-only read: it opens no tail, so nothing seeds a record and no completion is ever written
-     * for it. That one contributes nothing rather than counting as never delivered -- a question the
-     * record cannot answer must not be answered by guessing, and guessing that way round would re-read
-     * the whole source on every resume with no state that could ever end it.
+     * for it. Keep its tables with an absent chain so they remain owed: without delivery evidence, a
+     * resume must re-read the load rather than restart a vertex over an empty snapshot hand-off.
      */
     private static Optional<SnapshotOnChain> snapshotOnChain(CaptureRunSpec spec, CaptureRun run) {
         if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
             return Optional.empty();
         }
-        return run.chainId().map(chain -> new SnapshotOnChain(chain.value(), spec.config().streams()));
+        return Optional.of(new SnapshotOnChain(run.chainId().map(MiningChainId::value), spec.config().streams()));
     }
 
     /** One source's attributed snapshot load: which source, which table, and what it loaded. */
@@ -206,7 +205,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     @Override
     public boolean loadDelivered(String pipelineId) {
         for (SnapshotOnChain snapshot : snapshotTablesByPipeline.getOrDefault(pipelineId, List.of())) {
-            if (!SnapshotPhase.stillOwed(storePort.meta().read(snapshot.chainId()), pipelineId,
+            if (!SnapshotPhase.stillOwed(snapshot.chainId().flatMap(storePort.meta()::read), pipelineId,
                     snapshot.tables()).isEmpty()) {
                 return false;
             }
