@@ -22,11 +22,11 @@ import java.util.Set;
 /**
  * What one node of a pipeline works its own output columns out to be, or the reason nobody can say.
  *
- * <p><b>Three faces, three switches, and the count is why.</b> The nodes that change the shape of a row
- * do not all sit in one place: most are transform steps, but the one that publishes and the one that
- * stores are separate blocks of the pipeline beside the steps. Anything written as "walk the transforms"
- * therefore covers most of them and says nothing at all about the other two - which is how these were
- * last counted, and the miscount was invisible because a node nobody asked produces no error.
+ * <p>The derivation rules cover transforms, views, and push formats. Runtime model recording walks
+ * transforms and views. Push delivery is not assembled by the runtime, so its format rules and serve
+ * enumeration are exercised only by rule tests; push elements have no recorded model or comparison
+ * row. These exhaustive switches check coverage of the grammar, not runtime wiring. Adding push
+ * execution will also require wiring its model derivation, recording, and comparison into assembly.
  *
  * <p><b>Every switch here is exhaustive and carries no catch-all, deliberately.</b> A node kind added
  * later with no answer here does not fail: its columns go unknown, unknown is allowed through, and what
@@ -255,9 +255,8 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
     }
 
     /**
-     * What one push element publishes. Its shape is chosen by the format it carries, and carrying none
-     * is a choice of its own - the envelope - rather than a node that is not there, so it is a case here
-     * and not a guard above.
+     * The column rule for a push format, currently exercised only by rule tests because push delivery
+     * is not assembled. An omitted format selects the envelope rule.
      */
     static NodeColumns of(PushElement element, NodeColumns upstream) {
         return switch (element.format()) {
@@ -291,10 +290,9 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
     }
 
     /**
-     * The push nodes a serve block carries, and none when it carries no push at all. A serve block is
-     * not itself a node - it holds them - so this is the enumeration the two switches above are reached
-     * through, and it is a switch for the same reason they are: a serve block of a shape nobody listed
-     * here would contribute no nodes and say nothing about it.
+     * Enumerates the push definitions for the rule tests. This has no runtime caller: push delivery
+     * is not assembled and these definitions must not acquire placeholder model records. The switch
+     * remains exhaustive so a new serve shape requires an explicit enumeration rule.
      */
     static List<PushElement> pushNodesOf(ServeBlock serve) {
         return switch (serve) {

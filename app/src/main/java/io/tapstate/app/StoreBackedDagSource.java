@@ -665,6 +665,8 @@ final class StoreBackedDagSource implements DagSource {
                 recordable.put(view.id(), new Recordable(inputs, view, false));
             }
         }
+        // Push delivery is not assembled, so serve.push definitions have no executing node to record.
+        // Its format rules in NodeColumns do not imply runtime model coverage.
         return new StepDerivations(derived, recordable);
     }
 
