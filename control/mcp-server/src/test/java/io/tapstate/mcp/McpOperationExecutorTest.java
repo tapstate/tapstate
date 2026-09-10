@@ -132,7 +132,7 @@ class McpOperationExecutorTest {
             path.set(exchange.getRequestURI().toString());
             answer(exchange, 200, """
                     {"items":[{"id":"orders","metadata":{"labels":{"team":"sales"},
-                    "description":"Orders"},"connector":"mongodb",
+                    "description":null,"empty":false},"connector":"mongodb",
                     "config":{"uri":"mongodb://app:s3cr3t@db.internal/orders"},
                     "configuredSecrets":["password"],"mode":"snapshot","tables":[]}]}
                     """);
@@ -151,8 +151,9 @@ class McpOperationExecutorTest {
                     .containsExactlyInAnyOrder("id", "metadata", "connector");
             assertThat(item.get("id")).isEqualTo("orders");
             assertThat(item.get("connector")).isEqualTo("mongodb");
+            assertThat(item.get("metadata")).isEqualTo(Map.of("labels", Map.of("team", "sales")));
             assertThat(JsonWriter.write(result.body()))
-                    .doesNotContain("s3cr3t", "config", "configuredSecrets", "uri");
+                    .doesNotContain("s3cr3t", "config", "configuredSecrets", "uri", "empty");
         } finally {
             server.stop(0);
         }

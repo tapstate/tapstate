@@ -183,8 +183,20 @@ final class McpOperationExecutor {
             }
             Map<String, Object> summary = new LinkedHashMap<>();
             summary.put("id", id);
-            if (item.get("metadata") != null) {
-                summary.put("metadata", item.get("metadata"));
+            Object rawMetadata = item.get("metadata");
+            if (rawMetadata instanceof Map<?, ?> metadata) {
+                Map<String, Object> projectedMetadata = new LinkedHashMap<>();
+                Object labels = metadata.get("labels");
+                if (labels != null) {
+                    projectedMetadata.put("labels", labels);
+                }
+                Object description = metadata.get("description");
+                if (description instanceof String text && !text.isEmpty()) {
+                    projectedMetadata.put("description", text);
+                }
+                if (!projectedMetadata.isEmpty()) {
+                    summary.put("metadata", projectedMetadata);
+                }
             }
             summary.put("connector", connector);
             summaries.add(summary);
