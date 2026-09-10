@@ -3512,6 +3512,26 @@ class ReplTest {
     }
 
     @Test
+    void applyRefreshWarningExplainsCommittedArtifactsPartialModelsAndRetry(@TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.applyOutcome = new ApplyOutcome.Applied(
+                List.of(new ApplyOutcome.Item("kfk2my", "pipeline", "CREATED")),
+                List.of(new ApplyOutcome.Warning("control.schema-derivation-incomplete", Map.of(
+                        "pipeline", "kfk2my", "causeCode", "io.store-unavailable",
+                        "causeParams", Map.of("detail", "test outage")))));
+        SplitHarness h = onlineSplitStreamSession(base, client);
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(h.out().toString()).contains("created").contains("kfk2my").doesNotContain("warning:");
+        assertThat(h.err().toString()).contains("warning:").contains("artifacts were applied")
+                .contains("kfk2my").contains("io.store-unavailable").contains("test outage")
+                .contains("partially refreshed").contains("apply again").contains("Stop the pipeline");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
+    }
+
+    @Test
     void applyRendersAWarningWhoseCodeTheCatalogDoesNotKnowAsItsBareCode(@TempDir Path base) throws Exception {
         // A server one version ahead can send a code this CLI's catalog has never heard of. Rendering it
         // as its bare code keeps the finding visible and machine-greppable; dropping it would turn a

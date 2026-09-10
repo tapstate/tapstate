@@ -5,6 +5,8 @@ import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.schema.type.TapRaw;
 import io.tapstate.core.common.TapstateType;
 
+import io.tapdata.entity.schema.type.TapType;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -332,5 +334,56 @@ class PdkTypeMappingTest {
             connector.fillFieldTypes(table);
             return table.getNameFieldMap().get(column);
         }
+    }
+
+    @Test
+    void eachWayAColumnArrivesWithoutATypeIsAttributedToThatWay() {
+        // The four reach here by different routes and want different things done about them: a
+        // connector that declared no mapping at all, a shape this mapping has no member for, a scaled
+        // column the connector did not mark, and a number it named and said nothing else about. As one
+        // text they read as "the type did not resolve", which is the reading nobody acts on.
+        //
+        // Compared as a set rather than one at a time: any two of them collapsing into one text is the
+        // failure this exists to catch, and four separate assertions would not see it.
+        List<String> reasons = Stream.of(
+                        PdkTypeMapping.resolve(null),
+                        PdkTypeMapping.resolve(filled(BIGINT_SPEC, "amount", "decimal(18,4)").getTapType()),
+                        PdkTypeMapping.resolve(filled(UNMARKED_SCALED_SPEC, "amount", "FLOAT").getTapType()),
+                        PdkTypeMapping.resolve(filled(BARE_SPEC, "rate", "double").getTapType()))
+                .map(PdkTypeMapping.Resolved::unknownBecause)
+                .toList();
+
+        assertThat(reasons).doesNotContainNull();
+        assertThat(Set.copyOf(reasons)).as("four routes, four attributions").hasSize(4);
+        assertThat(reasons.get(1))
+                .as("which shape arrived is what says this mapping is short a case rather than the "
+                        + "connector being at fault, and it is not recoverable once the connector is shut")
+                .contains("TapRaw");
+    }
+
+    @Test
+    void aTypeThatResolvedIsAttributedToNothing() {
+        assertThat(PdkTypeMapping.resolve(filled(BIGINT_SPEC, "id", "bigint").getTapType()).unknownBecause())
+                .isNull();
+    }
+
+    @Test
+    void theTypeOnlyReadingIsTheSameSwitchAsTheAttributedOne() {
+        // of() reads resolve() rather than repeating the mapping, so the two cannot answer differently.
+        // Written as a case because the repetition is what a later simplification would put back.
+        List<TapType> types = List.of(
+                filled(BIGINT_SPEC, "id", "bigint").getTapType(),
+                filled(BIGINT_SPEC, "amount", "decimal(18,4)").getTapType(),
+                filled(UNMARKED_SCALED_SPEC, "amount", "FLOAT").getTapType(),
+                filled(BARE_SPEC, "rate", "double").getTapType(),
+                filled(VARCHAR_SPEC, "customer", "varchar(64)").getTapType());
+
+        for (TapType type : types) {
+            assertThat(PdkTypeMapping.of(type)).isEqualTo(PdkTypeMapping.resolve(type).type());
+            assertThat(PdkTypeMapping.of(type) == TapstateType.UNKNOWN)
+                    .as("an unknown is attributed and a resolved type is not, with nothing in between")
+                    .isEqualTo(PdkTypeMapping.resolve(type).unknownBecause() != null);
+        }
+        assertThat(PdkTypeMapping.of(null)).isEqualTo(PdkTypeMapping.resolve(null).type());
     }
 }

@@ -1183,7 +1183,7 @@
           "$ref": "#/$defs/Storage"
         },
         "schema": {
-          "description": "Field layout of the records held by this view.",
+          "description": "Schema policy for this view: whether its shape is enforced and how it may evolve.",
           "$ref": "#/$defs/ViewSchema"
         }
       },

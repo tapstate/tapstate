@@ -287,7 +287,52 @@ public final class E2eExecutor {
                 mismatches.add(doc.table() + " at " + path + " expected " + expected + " elements, found " + list.size());
             }
         });
+        // Read the other way round from the two above: here the path being there is the mismatch and
+        // its absence is the agreement. Nothing else this matcher can say fails on a document that
+        // carries more than it was asked about, which is exactly the shape of a target built one
+        // column too wide.
+        //
+        // Asked as "is the path there", never as "does it hold a value": a column a target was created
+        // with and no row ever filled reads as an empty value, and that is the very shape this exists
+        // to catch - a table built to a column the pipeline does not produce. Reading the value instead
+        // would call that column absent and agree with a target that has it.
+        doc.absent().forEach(path -> {
+            if (pathPresent(document, path)) {
+                mismatches.add(doc.table() + " carries " + path + " ("
+                        + valueAt(document, path).map(String::valueOf).orElse("empty")
+                        + "), and that path should not be there at all");
+            }
+        });
         return mismatches.isEmpty() ? Optional.empty() : Optional.of(String.join("; ", mismatches));
+    }
+
+    /**
+     * Whether a path is there at all, whatever it holds - the question {@link #valueAt} cannot answer,
+     * because a path present and empty and a path that does not exist are one answer to it.
+     */
+    private static boolean pathPresent(Map<String, Object> document, String path) {
+        Object current = document;
+        for (String segment : path.split("\\.")) {
+            int bracket = segment.indexOf('[');
+            String field = bracket < 0 ? segment : segment.substring(0, bracket);
+            if (!(current instanceof Map<?, ?> mapping) || !mapping.containsKey(field)) {
+                return false;
+            }
+            current = mapping.get(field);
+            while (bracket >= 0) {
+                int close = segment.indexOf(']', bracket);
+                if (close < 0) {
+                    throw new EnvelopeException("the path " + path + " leaves an index unclosed");
+                }
+                int index = Integer.parseInt(segment.substring(bracket + 1, close));
+                if (!(current instanceof List<?> list) || index >= list.size()) {
+                    return false;
+                }
+                current = list.get(index);
+                bracket = segment.indexOf('[', close);
+            }
+        }
+        return true;
     }
 
     /**

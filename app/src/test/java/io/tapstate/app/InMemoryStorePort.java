@@ -105,6 +105,11 @@ final class InMemoryStorePort implements StorePort {
         return schemas;
     }
 
+    /** The schema store as the double it is, for a case that counts how often a discovery is read. */
+    InMemorySchemaStore schemaStore() {
+        return schemas;
+    }
+
     @Override
     public ConnectorRegistry connectors() {
         throw new UnsupportedOperationException("connectors are not exercised by the convergence wiring test");

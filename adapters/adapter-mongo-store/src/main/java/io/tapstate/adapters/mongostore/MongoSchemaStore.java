@@ -1,7 +1,8 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoCollection;
-import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.FindOneAndReplaceOptions;
+import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.DiscoveredSourceModel;
@@ -14,15 +15,36 @@ import io.tapstate.spi.store.SourceTable;
 import org.bson.Document;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
- * The MongoDB discovered-schema store: stores the discovery envelope for a connection as one
- * structured document keyed by the connection's id — the connector id and discovery time it reports,
- * and the source model's tables (with their fields, primary key and indexes) as nested sub-documents.
+ * The MongoDB discovered-schema store: stores the discovery envelope for a connection as an envelope
+ * document keyed by the connection's id — the connector id and discovery time it reports — plus one
+ * document per table, keyed {@code <connectionId>.<generation>.<ordinal>}, carrying that table's
+ * fields, primary key and indexes.
+ *
+ * <p><b>Why a table per document.</b> The whole envelope used to be one document, which put every
+ * table a connection has under MongoDB's 16MB per-document limit. Measured 2026-09-08 the ceiling
+ * falls at roughly 150,000 columns summed across the connection - 1500 tables of 120 columns does not
+ * fit - and a connection over it cannot be discovered at all, which makes it unusable rather than
+ * slow. Neither dimension has to be remarkable, so no author looking at their own tables would see it
+ * coming.
+ *
+ * <p><b>Why a generation, and why the envelope is written last.</b> A re-discovery has to become
+ * visible all at once: a reader that saw half of one discovery and half of the previous one would be
+ * told a table has columns it does not have, and would refuse or accept an expression on that basis.
+ * With the tables spread over many documents there is no single write that replaces them, so each
+ * discovery writes its tables under a fresh generation - invisible, because nothing points at them -
+ * and then names that generation in the envelope. That last step is a one-document write, so a reader
+ * rechecks the envelope after loading its tables and retries if publication changed meanwhile.
+ * Publication atomically returns the displaced envelope: only that generation can be swept, never
+ * another writer's unpublished or newly current tables. A process lost before its sweep can leave
+ * unreachable documents; reclaiming those requires coordination with in-flight writers.
  *
  * <p>The envelope is a fixed shape of plain scalars and lists, so it is mapped field by field rather
  * than through a generic value normalization; on read the driver's {@code Document} / list values are
@@ -43,8 +65,20 @@ public final class MongoSchemaStore implements SchemaStore {
      */
     static final String MODEL_VERSION = "modelVersion";
 
-    /** The model this build writes and reads: source types resolved onto the tapstate namespace. */
-    static final int RESOLVED_TYPES = 1;
+    /**
+     * The model this build writes and reads: source types resolved onto the tapstate namespace, with
+     * the tables held as documents of their own rather than inline.
+     *
+     * <p>Bumped when the tables moved out of the envelope. A document written by the previous build
+     * carries its tables inline and names no generation, so reading it through the current path would
+     * find no tables and report an empty database - a wrong answer in the shape of a right one.
+     * Startup migration moves those inline observations into table documents before this reader is
+     * available. The stamp remains a read guard for callers that bypass verified startup.
+     */
+    static final int RESOLVED_TYPES = 2;
+
+    /** Maximum complete read attempts under publication contention, not a wall-clock timeout. */
+    static final int MAX_READ_ATTEMPTS = 8;
 
     private final MongoCollection<Document> collection;
 
@@ -52,66 +86,144 @@ public final class MongoSchemaStore implements SchemaStore {
         this.collection = Objects.requireNonNull(collection, "collection");
     }
 
+    /** The field naming which discovery a stored table belongs to; absent on the envelope itself. */
+    static final String GENERATION = "generation";
+
+    /**
+     * The one character separating the parts of a table key. A connection id cannot contain it, so the
+     * connection's own documents are exactly the keys in {@code [<id>., <id>/)} and no other
+     * connection's fall in that range. Table names are stored as values, so duplicate names and
+     * separator characters cannot collide in document keys.
+     */
+    private static final char SEPARATOR = '.';
+
     @Override
     public void save(DiscoveredSourceModel discovered) {
         Objects.requireNonNull(discovered, "discovered");
-        // Upsert by the connection id (the document _id): the stored form is a full replacement, so a
-        // re-discovery of the same connection overwrites in place rather than accumulating documents.
-        StoreIo.run(() -> collection.replaceOne(
-                new Document("_id", discovered.connectionId()),
-                toDocument(discovered),
-                new ReplaceOptions().upsert(true)));
+        String connectionId = discovered.connectionId();
+        String generation = UUID.randomUUID().toString();
+        List<Document> tables = new ArrayList<>();
+        List<SourceTable> model = discovered.model().tables();
+        for (int order = 0; order < model.size(); order++) {
+            SourceTable table = model.get(order);
+            tables.add(tableDocument(table)
+                    .append("_id", tableKey(connectionId, generation, order))
+                    .append(GENERATION, generation)
+                    // Discovery order is part of what was stored and read back, so it is carried
+                    // explicitly: document key order need not match numeric discovery order.
+                    .append("order", order));
+        }
+        if (!tables.isEmpty()) {
+            StoreIo.run(connectionId, () -> collection.insertMany(tables));
+        }
+        // Returning the displaced envelope in the same atomic operation establishes exactly which
+        // generation this writer owns the cleanup for, even when another process publishes next.
+        Document displaced = StoreIo.call(() -> collection.findOneAndReplace(
+                new Document("_id", connectionId),
+                envelope(discovered, generation),
+                new FindOneAndReplaceOptions().upsert(true).returnDocument(ReturnDocument.BEFORE)));
+        if (displaced != null && displaced.get(GENERATION) instanceof String previous) {
+            StoreIo.run(() -> collection.deleteMany(new Document("_id", ownedKeys(connectionId))
+                    .append(GENERATION, previous)));
+        }
     }
 
     @Override
     public Optional<DiscoveredSourceModel> get(String connectionId) {
         Objects.requireNonNull(connectionId, "connectionId");
-        Document document = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
-        // A model written before the types were resolved answers as no model at all. Its columns would
-        // all read as having no resolved type, which is refused wherever a resolved type is needed - and
-        // refused with a diagnostic about the columns, telling the author to change an expression that
-        // is not wrong. Answering "not discovered" instead gives them the one action that fixes it, and
-        // discovering is what makes it true.
-        if (document == null || !carriesResolvedTypes(document)) {
-            return Optional.empty();
+        for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt++) {
+            Document document = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
+            // Verified startup already moved legacy envelopes into the current shape.
+            if (document == null || !carriesResolvedTypes(document)) {
+                return Optional.empty();
+            }
+            List<Document> tables = storedTables(connectionId, document);
+            Document current = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
+            // The tables may have been reclaimed between these reads. A fresh UUID on every save
+            // prevents an intervening publication from returning to the generation we first saw.
+            if (current != null && Objects.equals(document.get(GENERATION), current.get(GENERATION))) {
+                return Optional.of(toDiscovered(document, tables));
+            }
         }
-        return Optional.of(toDiscovered(document));
+        // Continuous publication must not hold a caller indefinitely or masquerade as no discovery.
+        throw new TapstateException(IoError.SCHEMA_READ_CONTENTION,
+                Map.of("connectionId", connectionId), null);
+    }
+
+    /**
+     * The stored table documents of a connection's current discovery, in the order they were
+     * discovered. An envelope carrying the current stamp but naming no generation is corrupt: the two
+     * are written together.
+     */
+    private List<Document> storedTables(String connectionId, Document envelope) {
+        String generation = envelope.getString(GENERATION);
+        if (generation == null) {
+            throw unreadable(connectionId);
+        }
+        List<Document> tables = new ArrayList<>();
+        StoreIo.run(() -> collection
+                .find(new Document("_id", ownedKeys(connectionId)).append(GENERATION, generation))
+                .forEach(tables::add));
+        tables.sort(Comparator.comparingInt(table -> order(table, connectionId)));
+        return tables;
+    }
+
+    /** Where a stored table sat in the discovery; an unreadable position is corruption, not zero. */
+    private static int order(Document table, String connectionId) {
+        if (!(table.get("order") instanceof Number number)) {
+            throw unreadable(connectionId);
+        }
+        return number.intValue();
+    }
+
+    /** The half-open {@code _id} range holding every table document a connection owns. */
+    private static Document ownedKeys(String connectionId) {
+        if (connectionId.indexOf(SEPARATOR) >= 0) {
+            // Such an id would make one connection's range overlap another's. The parser refuses one,
+            // so arriving here with it is a defect in whatever built it rather than an author's doing.
+            throw new IllegalArgumentException(
+                    "connectionId must not contain '" + SEPARATOR + "': " + connectionId);
+        }
+        return new Document("$gte", connectionId + SEPARATOR)
+                .append("$lt", connectionId + (char) (SEPARATOR + 1));
+    }
+
+    private static String tableKey(String connectionId, String generation, int order) {
+        ownedKeys(connectionId);
+        return connectionId + SEPARATOR + generation + SEPARATOR + order;
     }
 
     /**
      * Whether a stored document is a discovery of the model this build reads — that is, one whose
-     * columns carry types resolved onto the tapstate namespace. A document without the stamp predates
-     * that resolution and is answered as no discovery at all, so the author is asked to discover rather
-     * than told that every column they read has no resolved type.
+     * columns carry types resolved onto the tapstate namespace. Startup migrates legacy envelopes
+     * before readers are exposed; direct callers still cannot mistake an old envelope for a new one.
      */
     static boolean carriesResolvedTypes(Document document) {
         return Integer.valueOf(RESOLVED_TYPES).equals(document.getInteger(MODEL_VERSION));
     }
 
     /**
-     * Maps a discovery envelope to its stored document: the connection id as {@code _id}, the model
-     * version stamp, the connector id and discovery time as scalars, and the model's tables as a field.
+     * Maps a discovery to its envelope document: the connection id as {@code _id}, the model version
+     * stamp, the connector id and discovery time as scalars, and the generation whose table documents
+     * make up this discovery. The tables themselves are documents of their own.
      */
-    static Document toDocument(DiscoveredSourceModel discovered) {
-        List<Document> tables = new ArrayList<>();
-        for (SourceTable table : discovered.model().tables()) {
-            tables.add(tableDocument(table));
-        }
+    static Document envelope(DiscoveredSourceModel discovered, String generation) {
         return new Document("_id", discovered.connectionId())
                 .append(MODEL_VERSION, RESOLVED_TYPES)
                 .append("connectorId", discovered.connectorId())
                 .append("discoveredAt", discovered.discoveredAt())
-                .append("tables", tables);
+                .append(GENERATION, generation);
     }
 
-    private static Document tableDocument(SourceTable table) {
+    static Document tableDocument(SourceTable table) {
         List<Document> fields = new ArrayList<>();
         for (SourceField field : table.fields()) {
             // The document holds both type namespaces, so each key names the one it carries. The declared
             // type is null when discovery could not resolve it; stored as a null value, read back as null.
             fields.add(new Document("name", field.name())
                     .append("type", field.dataType())
-                    .append("tapstateType", field.type().name()));
+                    .append("tapstateType", field.type().name())
+                    .append("unknownBecause", field.unknownBecause()));
         }
         List<Document> indexes = new ArrayList<>();
         for (SourceIndex index : table.indexes()) {
@@ -134,29 +246,63 @@ public final class MongoSchemaStore implements SchemaStore {
      * names a type this build does not know. An unreadable type is the absence of one, never a refusal of
      * the whole read: the model is a derived observation that re-discovery replaces.
      */
-    private static TapstateType tapstateType(Document field) {
-        String name = field.getString("tapstateType");
-        if (name == null) {
-            return TapstateType.UNKNOWN;
+    /**
+     * One stored column read back, with the reason it has no resolved type where it has none.
+     *
+     * <p><b>A reason written down at discovery wins over anything this could say.</b> The connector was
+     * open then and is not now, so the cause it recorded - a shape with no member in the namespace, a
+     * number described without a width - is not recoverable here; replacing it with a storage-side
+     * remark would turn every such column into "the stored type did not resolve", which says only that
+     * the record was read.
+     *
+     * <p>The three this side can attribute are its own: a record written before a resolved type was
+     * kept, a spelling that is not a type in this build (a constant that went away), and a record that
+     * stored the unknown without saying which one it was. They are different problems - the first is
+     * ordinary and needs a re-discovery, the second is a compatibility break, the third is a record
+     * from before this component existed.
+     */
+    private static SourceField field(String name, Document stored) {
+        String declared = stored.getString("type");
+        String spelling = stored.getString("tapstateType");
+        if (spelling == null) {
+            return new SourceField(name, declared, TapstateType.UNKNOWN,
+                    "the stored record was written before a resolved type was kept");
         }
+        TapstateType type = named(spelling);
+        if (type == null) {
+            return new SourceField(name, declared, TapstateType.UNKNOWN,
+                    "the stored type '" + spelling + "' is not a tapstate type in this build");
+        }
+        if (type != TapstateType.UNKNOWN) {
+            return new SourceField(name, declared, type);
+        }
+        String because = stored.getString("unknownBecause");
+        return new SourceField(name, declared, TapstateType.UNKNOWN,
+                because == null || because.isBlank()
+                        ? "the stored record says the type is unknown and does not say which unknown"
+                        : because);
+    }
+
+    /** The type a stored spelling names, or null where this build has no such type. */
+    private static TapstateType named(String spelling) {
         for (TapstateType candidate : TapstateType.values()) {
-            if (candidate.name().equals(name)) {
+            if (candidate.name().equals(spelling)) {
                 return candidate;
             }
         }
-        return TapstateType.UNKNOWN;
+        return null;
     }
 
-    /** Reconstructs a discovery envelope from its stored document, or fails coded when the shape is unreadable. */
-    static DiscoveredSourceModel toDiscovered(Document document) {
-        String id = document.getString("_id");
-        String connectorId = document.getString("connectorId");
+    /** Reconstructs a discovery from its envelope and its table documents, or fails coded when unreadable. */
+    static DiscoveredSourceModel toDiscovered(Document envelope, List<Document> storedTables) {
+        String id = envelope.getString("_id");
+        String connectorId = envelope.getString("connectorId");
         if (connectorId == null) {
             throw unreadable(id);
         }
-        long discoveredAt = discoveredAt(document, id);
+        long discoveredAt = discoveredAt(envelope, id);
         List<SourceTable> tables = new ArrayList<>();
-        for (Document table : documentList(document.get("tables"), id)) {
+        for (Document table : storedTables) {
             tables.add(toTable(table, id));
         }
         return new DiscoveredSourceModel(id, connectorId, discoveredAt, new SourceModel(tables));
@@ -182,7 +328,7 @@ public final class MongoSchemaStore implements SchemaStore {
             if (fieldName == null) {
                 throw unreadable(id);
             }
-            fields.add(new SourceField(fieldName, field.getString("type"), tapstateType(field)));
+            fields.add(field(fieldName, field));
         }
         List<SourceIndex> indexes = new ArrayList<>();
         for (Document index : documentList(table.get("indexes"), id)) {

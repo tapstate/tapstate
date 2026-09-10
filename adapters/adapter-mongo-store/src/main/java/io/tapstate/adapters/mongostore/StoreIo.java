@@ -4,6 +4,7 @@ import com.mongodb.MongoException;
 import com.mongodb.MongoSecurityException;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
+import org.bson.BsonMaximumSizeExceededException;
 
 import java.util.Map;
 import java.util.function.Supplier;
@@ -19,13 +20,26 @@ import java.util.function.Supplier;
  */
 final class StoreIo {
 
+    /**
+     * The id reported when a size failure happens on a call that did not name one. Every write that
+     * can plausibly reach the limit names its document; this keeps the rest coded rather than raw.
+     */
+    private static final String UNNAMED = "unknown";
+
     private StoreIo() {
     }
 
     /** Runs a store operation, translating a driver failure into a coded io diagnostic. */
     static <T> T call(Supplier<T> operation) {
+        return call(UNNAMED, operation);
+    }
+
+    /** As {@link #call(Supplier)}, naming the document the operation is for, for a size failure. */
+    static <T> T call(String id, Supplier<T> operation) {
         try {
             return operation.get();
+        } catch (BsonMaximumSizeExceededException e) {
+            throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), e);
         } catch (MongoException e) {
             throw coded(e);
         }
@@ -33,7 +47,12 @@ final class StoreIo {
 
     /** Runs a store operation with no result, translating a driver failure into a coded io diagnostic. */
     static void run(Runnable operation) {
-        call(() -> {
+        run(UNNAMED, operation);
+    }
+
+    /** As {@link #run(Runnable)}, naming the document written, so a size failure can point at it. */
+    static void run(String id, Runnable operation) {
+        call(id, () -> {
             operation.run();
             return null;
         });

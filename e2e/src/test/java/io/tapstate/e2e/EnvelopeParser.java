@@ -480,10 +480,14 @@ public final class EnvelopeParser {
                                 size.put(path, rowCount(length, at + ".size." + path));
                             });
         }
-        if (expect.isEmpty() && size.isEmpty()) {
-            throw new EnvelopeException(at + " holds the document to nothing: carry expect or size");
+        List<String> absent = stringList(body.get("absent"), at + ".absent");
+        absent.forEach(path -> requirePath(path, at + ".absent"));
+
+        if (expect.isEmpty() && size.isEmpty() && absent.isEmpty()) {
+            throw new EnvelopeException(
+                    at + " holds the document to nothing: carry expect, size or absent");
         }
-        return new Matcher.Doc(alias(only.getKey()), where, expect, size);
+        return new Matcher.Doc(alias(only.getKey()), where, expect, size, absent);
     }
 
     private static Matcher count(Object node) {

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -545,6 +546,48 @@ class E2eExecutorTest {
 
         execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
                 + "expect: { name: widget, \"items[1].sku\": b }, size: { items: 2 } } } }\n"));
+    }
+
+    /**
+     * A column that must not be there is the one thing the rest of this matcher cannot say. Every
+     * value a document is held to is satisfied by a document carrying extra fields beside them, so a
+     * target built one column too wide passes every expectation an author can otherwise write.
+     */
+    @Test
+    void holdsADocumentToAPathThatMustNotBeThere() {
+        binding.holdsDocument(TARGET, Map.of("id", 1L, "name", "widget"));
+
+        execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                + "expect: { name: widget }, absent: [amount] } } }\n"));
+    }
+
+    /** And it is the assertion, not a decoration on one: a doc may carry nothing but absent paths. */
+    @Test
+    void reportsAPathThatWasToBeAbsentAndIsNot() {
+        binding.holdsDocument(TARGET, Map.of("id", 1L, "name", "widget", "amount", 12L));
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: "
+                + "{ where: { id: 1 }, absent: [amount] } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("carries amount (12), and that path should not be there at all");
+    }
+
+    /**
+     * A column a target was created with and no row ever filled is still a column. That is the shape
+     * this word exists to catch - a table built one column wider than the pipeline produces - and
+     * reading the value instead of the path would call it absent and agree with the target that has it.
+     */
+    @Test
+    void readsAPathCarryingNothingAsStillBeingThere() {
+        Map<String, Object> withAnEmptyColumn = new LinkedHashMap<>();
+        withAnEmptyColumn.put("id", 1L);
+        withAnEmptyColumn.put("amount", null);
+        binding.holdsDocument(TARGET, withAnEmptyColumn);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: "
+                + "{ where: { id: 1 }, absent: [amount] } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("carries amount (empty), and that path should not be there at all");
     }
 
     /** Absence and disagreement send an author to different places, so they read differently. */

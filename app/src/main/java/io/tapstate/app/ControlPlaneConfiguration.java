@@ -45,6 +45,7 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.SourceConnectionResolver;
+import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
@@ -236,7 +237,8 @@ class ControlPlaneConfiguration {
     @Bean
     ApplyService applyService(
             ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
-            SchemaStore schemaStore, @Nullable NestSettings nestSettings, LivePipelines livePipelines) {
+            SchemaStore schemaStore, @Nullable NestSettings nestSettings,
+            SchemaDerivation derivation, LivePipelines livePipelines) {
         // The online apply validates against the live catalog view (the bundled snapshot union the
         // connectors registered so far), so a connector registered at runtime is honoured without a restart.
         // It also reads the schema store, which is what lets it judge a row expression against the columns
@@ -250,8 +252,11 @@ class ControlPlaneConfiguration {
         // wherever it does run, absent a deployment saying otherwise. Requiring the bean instead would
         // take the whole control plane down in exactly the shape that never nests anything locally.
         NestSettings settings = nestSettings == null ? NestSettings.defaults() : nestSettings;
+        // Applying re-derives every pipeline in the batch, whether or not it was written: a source that
+        // moved under a pipeline nobody edited leaves that pipeline's content hash byte-identical, so
+        // the write is skipped in exactly the case the model most needs refreshing.
         return new ApplyService(connectorCatalogView::merged, artifactStore, auditGate, schemaStore,
-                new NestSizingAdvisories(settings.entriesHeldInMemory()), livePipelines);
+                new NestSizingAdvisories(settings.entriesHeldInMemory()), derivation, livePipelines);
     }
 
     @Bean
@@ -282,7 +287,7 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    DerivedSchemas derivedSchemas(StorePort storePort, AuditGate auditGate) {
+    StoreBackedDerivedSchemas derivedSchemas(StorePort storePort, AuditGate auditGate) {
         // Wired on the control plane rather than beside the data plane on purpose: the read exists to be
         // available when a start has just been refused, which is exactly the moment a data plane may not
         // be running at all.
