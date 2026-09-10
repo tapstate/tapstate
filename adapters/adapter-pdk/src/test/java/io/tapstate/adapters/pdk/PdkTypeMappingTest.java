@@ -324,6 +324,38 @@ class PdkTypeMappingTest {
                 .isEqualTo(expected);
     }
 
+    @Test
+    void targetConversionUsesTheInferredTypeRatherThanASourceDatabaseToken() {
+        ConnectorRef ref = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)),
+                "synthetic.Discoverable", "2.0.8", null, BIGINT_SPEC);
+        try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of())) {
+            TapTable table = TargetTapTable.build(new io.tapstate.spi.sink.TargetTable("orders", List.of(
+                    new io.tapstate.spi.sink.TargetField("id", "NUMBER(19)", true, TapstateType.INT64))));
+            connector.resolveTargetTypes(table);
+            TapField id = table.getNameFieldMap().get("id");
+            assertThat(id.getDataType()).isEqualTo("bigint");
+            assertThat(id.getTapType()).isInstanceOf(io.tapdata.entity.schema.type.TapNumber.class);
+            assertThat(table.primaryKeys()).containsExactly("id");
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"decimal", "recommended_numeric"})
+    void theTargetConnectorsRecommendationIsUsedWithoutRepairingItsPrecision(String targetToken) {
+        String targetSpec = DECIMAL_SPEC.replace("decimal", targetToken);
+        ConnectorRef ref = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)),
+                "synthetic.Discoverable", "2.0.8", null, targetSpec);
+        try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of())) {
+            TapTable table = TargetTapTable.build(new io.tapstate.spi.sink.TargetTable("orders", List.of(
+                    new io.tapstate.spi.sink.TargetField("amount", "source_numeric(20,4)", false,
+                            TapstateType.DECIMAL))));
+            connector.resolveTargetTypes(table);
+            TapField amount = table.getNameFieldMap().get("amount");
+            assertThat(amount.getDataType()).isEqualTo(targetToken);
+            assertThat(amount.getTapType()).isInstanceOf(io.tapdata.entity.schema.type.TapNumber.class);
+        }
+    }
+
     /** Discovers one column of the given database type through a connector declaring {@code spec}. */
     private TapField filled(String spec, String column, String dataType) {
         ConnectorRef ref = new ConnectorRef(

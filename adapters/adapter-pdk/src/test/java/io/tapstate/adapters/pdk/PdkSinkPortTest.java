@@ -31,6 +31,36 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class PdkSinkPortTest {
 
+    @Test
+    void preparationFailuresAreCodedAndNoWriteIsAttempted(@TempDir Path dir) throws Throwable {
+        Path jar = Synthetic.countingSink(dir);
+        for (io.tapstate.spi.sink.OnFullLoad policy : List.of(
+                io.tapstate.spi.sink.OnFullLoad.CLEAR, io.tapstate.spi.sink.OnFullLoad.FAIL)) {
+            PdkConnector connector = PdkConnector.open("demo", provisioner(jar, "synthetic.CountingSink")
+                    .resolve("demo"), Map.of());
+            connector.functions().supportCreateTableV2((context, event) ->
+                    io.tapdata.pdk.apis.functions.connector.target.CreateTableOptions.create().tableExists(true));
+            connector.functions().supportClearTable((context, event) -> {
+                throw new IllegalStateException("cannot clear target " + event.getTableId());
+            });
+            connector.functions().supportCountByPartitionFilterFunction((context, table, filter) -> 1L);
+            AtomicInteger writes = new AtomicInteger();
+            SinkConfig config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL,
+                    target(), null, policy, true);
+            try (SinkWriter writer = new PdkSinkWriter(connector,
+                    (context, events, table, result) -> writes.incrementAndGet(), config,
+                    Map.of("t1", target()), null)) {
+                assertThatThrownBy(() -> await(writer, List.of(Envelope.insert(1L, "t1", Map.of("id", 1), null))))
+                        .isInstanceOf(ExecutionException.class)
+                        .cause().isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(ConnectorError.WRITE_FAILED);
+                            assertThat(failure.getMessage()).contains("t1");
+                        });
+                assertThat(writes).hasValue(0);
+            }
+        }
+    }
+
     private static ConnectorProvisioner provisioner(Path jar, String className) {
         ConnectorRef ref = new ConnectorRef(List.of(jar), className, "2.0.8", null);
         return connectorId -> ref;

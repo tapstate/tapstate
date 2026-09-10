@@ -25,6 +25,19 @@ import org.junit.jupiter.api.Test;
 class TargetModelResolverTest {
 
     @Test
+    void carriesInferredTypesThroughRenamesAndKeyChanges() {
+        SourceTable source = new SourceTable("orders", List.of(
+                new SourceField("id", "SOURCE_NUMBER", io.tapstate.core.common.TapstateType.INT64, null),
+                new SourceField("email", "SOURCE_TEXT", io.tapstate.core.common.TapstateType.STRING, null)),
+                List.of("id"), List.of());
+        TargetTable target = TargetModelResolver.keyedOn(TargetModelResolver.rename(
+                TargetModelResolver.toTargetTable(source),
+                new io.tapstate.core.model.RenameSpec(null, null, "archive_", null)), List.of("email"));
+        assertThat(target.fields()).extracting(TargetField::inferredType).containsExactly(
+                io.tapstate.core.common.TapstateType.STRING, io.tapstate.core.common.TapstateType.INT64);
+    }
+
+    @Test
     void maps_a_discovered_table_to_a_target_table_flagging_the_primary_key() {
         SourceTable orders = new SourceTable(
                 "orders",
@@ -36,8 +49,8 @@ class TargetModelResolverTest {
 
         assertThat(target.name()).isEqualTo("orders");
         assertThat(target.fields()).containsExactly(
-                new TargetField("id", "INT", true),
-                new TargetField("amount", "DECIMAL", false));
+                new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                new TargetField("amount", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN));
     }
 
     @Test
@@ -53,9 +66,9 @@ class TargetModelResolverTest {
         // The sink keys an upsert in target-field order, so the key columns must lead in key order (c, a);
         // the non-key fields follow in source order.
         assertThat(target.fields()).containsExactly(
-                new TargetField("c", "INT", true),
-                new TargetField("a", "INT", true),
-                new TargetField("b", "INT", false));
+                new TargetField("c", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                new TargetField("a", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                new TargetField("b", "INT", false, io.tapstate.core.common.TapstateType.UNKNOWN));
     }
 
     @Test
@@ -65,7 +78,7 @@ class TargetModelResolverTest {
 
         TargetTable target = TargetModelResolver.toTargetTable(logs);
 
-        assertThat(target.fields()).containsExactly(new TargetField("msg", "TEXT", false));
+        assertThat(target.fields()).containsExactly(new TargetField("msg", "TEXT", false, io.tapstate.core.common.TapstateType.UNKNOWN));
     }
 
     @Test
@@ -82,8 +95,8 @@ class TargetModelResolverTest {
         TargetModelResolver.ResolvedTarget target = new TargetModelResolver(store).resolve("src_mysql");
 
         assertThat(target).isEqualTo(new TargetModelResolver.ResolvedTarget("orders", new TargetTable("orders", List.of(
-                new TargetField("id", "INT", true),
-                new TargetField("amount", "DECIMAL", false)))));
+                new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                new TargetField("amount", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true)))));
     }
 
     @Test
@@ -131,6 +144,24 @@ class TargetModelResolverTest {
         // and the count below would be the count this is looking for.
         assertThat(targets.keySet()).containsExactly("orders", "customers", "shipments");
         assertThat(store.schemaStore().reads() - before).isEqualTo(1);
+    }
+
+    @Test
+    void preservesIndexesThroughRenameAndAddsTheChosenUpsertKey() {
+        SourceTable source = new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("email", "TEXT")),
+                List.of("id"), List.of(new io.tapstate.spi.store.SourceIndex(
+                        "email_lookup", List.of("email"), false)));
+        TargetTable resolved = TargetModelResolver.toTargetTable(source);
+        assertThat(resolved.indexes()).containsExactly(
+                new io.tapstate.spi.sink.TargetIndex(List.of("id"), true),
+                new io.tapstate.spi.sink.TargetIndex(List.of("email"), false));
+        TargetTable renamed = TargetModelResolver.rename(resolved,
+                new io.tapstate.core.model.RenameSpec(null, null, "archive_", null));
+        assertThat(renamed.indexes()).isEqualTo(resolved.indexes());
+        assertThat(TargetModelResolver.keyedOn(renamed, List.of("email")).indexes())
+                .containsAll(resolved.indexes())
+                .contains(new io.tapstate.spi.sink.TargetIndex(List.of("email"), true));
     }
 
     // ---- fixtures ----------------------------------------------------------------------

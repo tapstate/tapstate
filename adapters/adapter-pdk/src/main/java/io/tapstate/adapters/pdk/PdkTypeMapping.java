@@ -8,6 +8,7 @@ import io.tapdata.entity.schema.type.TapDateTime;
 import io.tapdata.entity.schema.type.TapJson;
 import io.tapdata.entity.schema.type.TapMap;
 import io.tapdata.entity.schema.type.TapNumber;
+import io.tapdata.entity.schema.type.TapRaw;
 import io.tapdata.entity.schema.type.TapString;
 import io.tapdata.entity.schema.type.TapTime;
 import io.tapdata.entity.schema.type.TapType;
@@ -77,6 +78,29 @@ final class PdkTypeMapping {
             default -> Resolved.unknown(
                     "the connector's " + type.getClass().getSimpleName()
                             + " has no member in the tapstate type namespace");
+        };
+    }
+
+    /** Projects the inferred portable type into the PDK vocabulary; database types remain PDK-owned. */
+    static TapType targetType(TapstateType type) {
+        return switch (type) {
+            case STRING -> new TapString();
+            case INT64 -> new TapNumber().bit(64).scale(0).minValue(SIGNED_64_MIN)
+                    .maxValue(BigDecimal.valueOf(Long.MAX_VALUE));
+            case DECIMAL -> new TapNumber().fixed(true)
+                    .minValue(BigDecimal.valueOf(-Double.MAX_VALUE)).maxValue(BigDecimal.valueOf(Double.MAX_VALUE));
+            case DOUBLE -> new TapNumber().fixed(false).bit(64)
+                    .minValue(BigDecimal.valueOf(-Double.MAX_VALUE)).maxValue(BigDecimal.valueOf(Double.MAX_VALUE));
+            case BOOLEAN -> new TapBoolean();
+            case DATE -> new TapDate();
+            case TIME -> new TapTime();
+            case DATETIME -> new TapDateTime();
+            case YEAR -> new TapYear();
+            case BINARY -> new TapBinary();
+            case JSON -> new TapJson();
+            case ARRAY -> new TapArray();
+            case MAP -> new TapMap();
+            case UNKNOWN -> new TapRaw();
         };
     }
 

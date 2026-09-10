@@ -21,6 +21,30 @@ import org.junit.jupiter.api.Test;
 class TargetTapTableTest {
 
     @Test
+    void inferredTypesReachTheConnectorAsPortableTypesBeforeDatabaseConversion() {
+        TapTable table = TargetTapTable.build(new TargetTable("orders", List.of(
+                new TargetField("id", "SOURCE_INTEGER", true,
+                        io.tapstate.core.common.TapstateType.INT64),
+                new TargetField("payload", "SOURCE_TEXT", false,
+                        io.tapstate.core.common.TapstateType.STRING))));
+        assertThat(table.getNameFieldMap().get("id").getTapType())
+                .isInstanceOf(io.tapdata.entity.schema.type.TapNumber.class);
+        assertThat(table.getNameFieldMap().get("payload").getTapType())
+                .isInstanceOf(io.tapdata.entity.schema.type.TapString.class);
+    }
+
+    @Test
+    void aNewTableDoesNotReceiveItsPrimaryKeyIndexTwice() {
+        TargetTable target = new TargetTable("orders", List.of(new TargetField("id", "bigint", true)),
+                List.of(new TargetIndex(List.of("id"), true),
+                        new TargetIndex(List.of("email"), false)));
+        assertThat(TargetTapTable.createIndexEvent(target, true).getIndexList()).singleElement()
+                .satisfies(index -> assertThat(index.getIndexFields()).singleElement()
+                        .satisfies(field -> assertThat(field.getName()).isEqualTo("email")));
+        assertThat(TargetTapTable.createIndexEvent(target, false).getIndexList()).hasSize(2);
+    }
+
+    @Test
     void projectsEachTargetIndexIntoTheCreateEventKeepingItsUniqueness() {
         TapCreateIndexEvent event = TargetTapTable.createIndexEvent(new TargetTable("orders",
                 List.of(new TargetField("id", "bigint", true)),

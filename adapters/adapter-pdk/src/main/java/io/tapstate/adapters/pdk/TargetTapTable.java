@@ -33,6 +33,9 @@ final class TargetTapTable {
         int keyPos = 1;
         for (TargetField field : target.fields()) {
             TapField column = new TapField(field.name(), field.type());
+            if (field.inferredType() != null) {
+                column.tapType(PdkTypeMapping.targetType(field.inferredType()));
+            }
             if (field.primaryKey()) {
                 column.primaryKeyPos(keyPos++);
             }
@@ -51,18 +54,27 @@ final class TargetTapTable {
      * picks the one order a range scan over a key can rely on rather than inventing a default per store.
      */
     static TapCreateIndexEvent createIndexEvent(TargetTable target) {
+        return createIndexEvent(target, false);
+    }
+
+    static TapCreateIndexEvent createIndexEvent(TargetTable target, boolean newlyCreated) {
+        List<String> primaryKey = target.fields().stream().filter(TargetField::primaryKey)
+                .map(TargetField::name).toList();
         if (target.indexes().isEmpty()) {
             return null;
         }
         List<TapIndex> indexes = new ArrayList<>();
         for (TargetIndex index : target.indexes()) {
+            if (newlyCreated && index.unique() && index.fields().equals(primaryKey)) {
+                continue;
+            }
             TapIndex tapIndex = new TapIndex().unique(index.unique());
             for (String field : index.fields()) {
                 tapIndex.indexField(new TapIndexField().name(field).fieldAsc(true));
             }
             indexes.add(tapIndex);
         }
-        return new TapCreateIndexEvent().indexList(indexes);
+        return indexes.isEmpty() ? null : new TapCreateIndexEvent().indexList(indexes);
     }
 
     /**

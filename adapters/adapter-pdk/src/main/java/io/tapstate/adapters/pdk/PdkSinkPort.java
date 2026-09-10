@@ -62,10 +62,7 @@ public final class PdkSinkPort implements SinkPort {
             connector.close();
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }
-        // Optional: a store that cannot create indexes simply is not asked to. The target model still
-        // states what the table should have, so nothing about the write path changes when it is absent.
-        return new PdkSinkWriter(connector, write, config.writeMode(), config.ddl(), targets,
-                connector.functions().getCreateIndexFunction());
+        return new PdkSinkWriter(connector, write, config, targets, stateStore);
     }
 
     private static WriteRecordFunction requireWriteFunction(WriteRecordFunction function) {

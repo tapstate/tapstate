@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.model.PipelineNode;
@@ -12,6 +13,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetField;
+import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.DiscoveredSourceModel;
@@ -51,6 +53,37 @@ class JoinOutputTargetTest {
         assertThat(namesOf(targets.get("widen"))).containsExactly("order_id", "customer_name");
     }
 
+    @Test
+    void publishedAliasesKeepInferredTypesAndDeclareTheFactKeyIndex() {
+        for (String pipeline : List.of(JOIN_PIPELINE, ALIASED_FROM_PIPELINE)) {
+            InMemoryStorePort store = validated(ORDERS_SRC, CUSTOMERS_SRC, TARGET, pipeline);
+            discovered(store, "orders_src", "orders", List.of("id"),
+                    new SourceField("id", "bigint", TapstateType.INT64),
+                    new SourceField("customer_ref", "bigint", TapstateType.INT64));
+            discovered(store, "customers_src", "customers", List.of("id"),
+                    new SourceField("id", "bigint", TapstateType.INT64),
+                    new SourceField("cust_ref", "bigint", TapstateType.INT64),
+                    new SourceField("name", "datetime", TapstateType.DATETIME));
+            Map<String, Map<String, TargetTable>> captured = new LinkedHashMap<>();
+            new StoreBackedDagSource(store, capturing(captured)).dagFor("wide");
+            TargetTable target = captured.get("mongodb").get("widen");
+            assertThat(target.fields()).containsExactly(
+                    new TargetField("order_id", "bigint", true, TapstateType.INT64),
+                    new TargetField("customer_name", "datetime", false, TapstateType.DATETIME));
+            assertThat(target.indexes()).containsExactly(new TargetIndex(List.of("order_id"), true));
+        }
+    }
+
+    @Test
+    void compositeFactKeyIndexesExcludePublishedDimensionKeys() {
+        TargetTable target = bind(pipeline(
+                "SELECT o.region AS region, o.id AS order_id, c.id AS customer_id"),
+                List.of("region", "id")).get("widen");
+        assertThat(target.indexes()).containsExactly(new TargetIndex(List.of("region", "order_id"), true));
+        assertThat(target.fields()).filteredOn(field -> field.name().equals("customer_id"))
+                .singleElement().satisfies(field -> assertThat(field.primaryKey()).isFalse());
+    }
+
     /** The widened rows are the fact table's, so they land in the fact table's name unless renamed. */
     @Test
     void theTargetTableIsTheFactTablesNameNotTheStepsAlias() {
@@ -69,6 +102,9 @@ class JoinOutputTargetTest {
 
         assertThat(typeOf(targets.get("widen"), "order_id")).isEqualTo("bigint");
         assertThat(typeOf(targets.get("widen"), "shout")).isNull();
+        assertThat(targets.get("widen").fields()).filteredOn(field -> field.name().equals("shout"))
+                .singleElement().satisfies(field -> assertThat(field.inferredType()).isNull());
+        assertThat(targets.get("widen").indexes()).containsExactly(new TargetIndex(List.of("order_id"), true));
     }
 
     /**
@@ -152,6 +188,7 @@ class JoinOutputTargetTest {
     void anAppendNeedsNoFactKeyWhileAnUpsertStillDoes() {
         Map<String, TargetTable> appended = bind(unkeyedInto("append"));
         assertThat(keyOf(appended.get("widen"))).isEmpty();
+        assertThat(appended.get("widen").indexes()).isEmpty();
         assertThat(namesOf(appended.get("widen"))).containsExactly("total", "customer_name");
 
         assertThatThrownBy(() -> bind(unkeyedInto("upsert")))

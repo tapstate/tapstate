@@ -101,8 +101,8 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
 
         assertThat(bound).containsExactly(new TargetTable("orders", List.of(
-                new TargetField("id", "INT", true),
-                new TargetField("amount", "DECIMAL", false))));
+                new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                new TargetField("amount", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -125,7 +125,7 @@ class StoreBackedDagSourceTargetModelTest {
         // The type is still the one the source declared for the column: what a projection changes is
         // which columns travel, and a target built to a type nobody discovered is a different change.
         assertThat(bound).containsExactly(new TargetTable("orders", List.of(
-                new TargetField("id", "INT", true))));
+                new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -217,8 +217,8 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
 
         assertThat(bound).containsExactly(
-                new TargetTable("player_address", List.of(new TargetField("id", "INT", true))),
-                new TargetTable("ods_orders", List.of(new TargetField("id", "INT", true))));
+                new TargetTable("player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))),
+                new TargetTable("ods_orders", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -231,7 +231,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -246,7 +246,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -261,7 +261,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -274,7 +274,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -287,7 +287,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -307,11 +307,11 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThat(bound)
                 .containsEntry("orders", new TargetTable("orders", List.of(
-                        new TargetField("id", "INT", true),
-                        new TargetField("total", "DECIMAL", false))))
+                        new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                        new TargetField("total", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))))
                 .containsEntry("PlayerAddress", new TargetTable("player_address", List.of(
-                        new TargetField("id", "INT", true),
-                        new TargetField("street", "VARCHAR", false))));
+                        new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                        new TargetField("street", "VARCHAR", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -339,9 +339,9 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThat(bound).containsOnlyKeys("orders", "PlayerAddress")
                 .containsEntry("orders", new TargetTable("orders", List.of(
-                        new TargetField("id", "INT", true), new TargetField("amount", "DECIMAL", false))))
+                        new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN), new TargetField("amount", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))))
                 .containsEntry("PlayerAddress", new TargetTable("player_address", List.of(
-                        new TargetField("id", "INT", true), new TargetField("city", "VARCHAR", false))));
+                        new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN), new TargetField("city", "VARCHAR", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -371,8 +371,8 @@ class StoreBackedDagSourceTargetModelTest {
         // The second fork contributes region, while neither fork carries obsolete. Keeping only the
         // first reference or restoring the wholesale physical model gives a different target shape.
         assertThat(bound).containsOnlyKeys("orders").containsEntry("orders", new TargetTable("orders", List.of(
-                new TargetField("id", "INT", true), new TargetField("amount", "DECIMAL", false),
-                new TargetField("region", "VARCHAR", false))));
+                new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN), new TargetField("amount", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN),
+                new TargetField("region", "VARCHAR", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     // ---- fixtures ----------------------------------------------------------------------

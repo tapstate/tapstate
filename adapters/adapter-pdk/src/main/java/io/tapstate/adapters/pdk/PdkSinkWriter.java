@@ -4,6 +4,10 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.sink.DdlPolicy;
+import io.tapstate.spi.sink.SinkConfig;
+import io.tapstate.spi.sink.OnFullLoad;
+import io.tapstate.spi.store.KeyedStateStore;
+import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapdata.pdk.apis.functions.connector.target.CreateIndexFunction;
@@ -11,16 +15,13 @@ import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapdata.entity.event.dml.TapRecordEvent;
 import io.tapdata.entity.schema.TapTable;
-import io.tapdata.entity.event.ddl.index.TapCreateIndexEvent;
 import io.tapdata.pdk.apis.entity.WriteListResult;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.HashSet;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -48,9 +49,8 @@ final class PdkSinkWriter implements SinkWriter {
     private final WriteMode mode;
     private final DdlPolicy ddl;
     private final Map<String, TargetTable> targets;
-    private final CreateIndexFunction createIndex;
-    /** Targets whose indexes have been created in this writer's life, so the request is made once. */
-    private final Set<String> indexed = new HashSet<>();
+    private final PdkTargetPreparation preparation;
+    private final Map<String, TapTable> tableModels = new LinkedHashMap<>();
     private boolean closed;
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl, TargetTable target) {
@@ -60,18 +60,31 @@ final class PdkSinkWriter implements SinkWriter {
     PdkSinkWriter(
             PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
             Map<String, TargetTable> targets) {
-        this(connector, write, mode, ddl, targets, null);
+        this(connector, write, mode, ddl, targets, (CreateIndexFunction) null);
     }
 
     PdkSinkWriter(
             PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
             Map<String, TargetTable> targets, CreateIndexFunction createIndex) {
+        this(connector, write, mode, ddl, targets, new PdkTargetPreparation(connector.context(),
+                new ConnectorFunctions().supportCreateIndex(createIndex), OnFullLoad.APPEND, true, null, null));
+    }
+
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore) {
+        this(connector, write, config.writeMode(), config.ddl(), targets,
+                new PdkTargetPreparation(connector.context(), connector.functions(), config.onFullLoad(),
+                        config.fullLoad(), config.node(), stateStore));
+    }
+
+    private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
+            Map<String, TargetTable> targets, PdkTargetPreparation preparation) {
         this.connector = connector;
         this.write = write;
         this.mode = mode;
         this.ddl = ddl;
         this.targets = targets == null ? Map.of() : Map.copyOf(targets);
-        this.createIndex = createIndex;
+        this.preparation = preparation;
     }
 
     /** The connector this writer drives, and the state scope it was opened under. */
@@ -84,7 +97,7 @@ final class PdkSinkWriter implements SinkWriter {
         return CompletableFuture.supplyAsync(() -> deliver(records));
     }
 
-    private WriteResult deliver(List<Envelope> records) {
+    private synchronized WriteResult deliver(List<Envelope> records) {
         Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
         for (Envelope env : records) {
             if (env.op() == Op.DDL) {
@@ -114,9 +127,13 @@ final class PdkSinkWriter implements SinkWriter {
                     List<TapRecordEvent> rows = entry.getValue();
                     TargetTable target = targets.get(entry.getKey());
                     TapTable table = target != null
-                            ? TargetTapTable.build(target)
+                            ? tableModels.computeIfAbsent(entry.getKey(), ignored -> {
+                                TapTable resolved = TargetTapTable.build(target);
+                                connector.resolveTargetTypes(resolved);
+                                return resolved;
+                            })
                             : TargetTapTable.bare(rows.get(0).getTableId());
-                    ensureIndexes(target, table);
+                    preparation.prepare(target, table);
                     // A connector may report the batch in several flushes, one callback each; accumulate.
                     write.writeRecord(connector.context(), rows, table,
                             result -> accepted[0] += accepted(result));
@@ -128,29 +145,6 @@ final class PdkSinkWriter implements SinkWriter {
         } catch (Throwable t) {
             throw writeFailed(connector.connectorId(), t);
         }
-    }
-
-    /**
-     * Creates the target's declared indexes the first time this writer writes to it. The table is created
-     * by the same descriptor on the same call path, so the index request rides with the write rather than
-     * needing a separate provisioning step - and asking once per writer keeps a per-batch call off the
-     * hot path without pretending to know what the store already has.
-     *
-     * <p>The memo is keyed by the table the index is created on, not by the stream that delivered the
-     * rows. A view maps many streams onto one collection, so keyed by stream the same create-index
-     * request would go out once per stream and the memo would never dedupe across them.
-     */
-    private void ensureIndexes(TargetTable target, TapTable table) throws Throwable {
-        if (createIndex == null || target == null || indexed.contains(target.name())) {
-            return;
-        }
-        TapCreateIndexEvent event = TargetTapTable.createIndexEvent(target);
-        if (event != null) {
-            createIndex.createIndex(connector.context(), table, event);
-        }
-        // Memoized only once creation has returned. Recorded before it, a failed first attempt would be
-        // remembered as done, and the collection would live on without the indexes it declared.
-        indexed.add(target.name());
     }
 
     private static long accepted(WriteListResult<TapRecordEvent> result) {

@@ -37,9 +37,12 @@ import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SrsSourceProcessor;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.sink.DdlPolicy;
+import io.tapstate.spi.sink.OnFullLoad;
+import io.tapstate.spi.sink.SinkPreparationNamespace;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.TargetField;
+import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
@@ -284,11 +287,16 @@ final class StoreBackedDagSource implements DagSource {
         pipeline.sources().forEach(source -> namespaces.add(
                 ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), source.id()))));
         if (pipeline.view() instanceof ViewBlock.Inline view) {
-            namespaces.add(ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), view.id())));
+            PipelineNode node = new PipelineNode(pipeline.id(), view.id());
+            namespaces.add(ConnectorStateNamespace.of(node));
+            namespaces.add(SinkPreparationNamespace.of(node));
         }
         if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
-            serve.sync().forEach(sync -> namespaces.add(
-                    ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), syncNodeId(sync)))));
+            serve.sync().forEach(sync -> {
+                PipelineNode node = new PipelineNode(pipeline.id(), syncNodeId(sync));
+                namespaces.add(ConnectorStateNamespace.of(node));
+                namespaces.add(SinkPreparationNamespace.of(node));
+            });
         }
         return namespaces;
     }
@@ -830,11 +838,8 @@ final class StoreBackedDagSource implements DagSource {
      * One published stream's target: the columns the pipeline produces, in that order, each carrying
      * what the source declared for it and nothing where the source has no such column.
      *
-     * <p><b>The type stays the source's own spelling.</b> A projection changes which columns travel,
-     * not what a column is; writing the shared type there instead would hand the connector a word its
-     * own DDL does not have. A column the source never had - a written-down value, a computed one -
-     * carries no type at all and is inferred by the connector, the way a join's computed columns and a
-     * view's unresolved ones already are.
+     * <p>The inferred portable type follows the produced model. Source spelling is carried separately
+     * for diagnostics; the PDK adapter converts the inferred type through the target connector.
      *
      * <p>The key is whatever of the table's own key still travels, key columns leading, because that
      * is the order the sink matches an upsert in. A projection that drops a key column publishes rows
@@ -848,13 +853,15 @@ final class StoreBackedDagSource implements DagSource {
         List<String> key = new ArrayList<>();
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
-            fields.add(new TargetField(column, carried == null ? null : carried.type(), false));
+            fields.add(new TargetField(column, carried == null ? null : carried.type(), false,
+                    JoinSchemaDrift.typeOf(produced.columns().get(column))));
             if (carried != null && carried.primaryKey()) {
                 key.add(column);
             }
         }
         return TargetModelResolver.keyedOn(
-                new TargetTable(base.name(), fields, base.indexes()), key);
+                new TargetTable(base.name(), fields, base.indexes().stream()
+                        .filter(index -> produced.columns().keySet().containsAll(index.fields())).toList()), key);
     }
 
     /**
@@ -872,9 +879,9 @@ final class StoreBackedDagSource implements DagSource {
      * rows rather than one, unbounded in the number of republications and indistinguishable from
      * ordinary output; the same column in a PRIMARY KEY is refused outright by both.
      *
-     * <p>The fields carry the type the source declared for a column published verbatim, and none for a
-     * column computed by an expression - the connector infers that one, the way the view path already
-     * treats a type it cannot resolve.
+     * <p>A column published verbatim carries both its source spelling and its inferred portable type,
+     * so the adapter can translate it through the target connector. A computed column keeps its
+     * unresolved type. The unique index covers only the complete published fact key.
      */
     private TargetTable joinTarget(Step step, CompiledJoin compiled,
             Map<String, TargetTable> bySourceTable) {
@@ -883,15 +890,15 @@ final class StoreBackedDagSource implements DagSource {
         List<String> key = publishedFactKey(compiled);
         List<TargetField> fields = new ArrayList<>();
         for (String name : key) {
-            fields.add(new TargetField(name, joinFieldType(compiled, name, bySourceTable), true));
+            fields.add(joinField(compiled, name, true, bySourceTable));
         }
         for (io.tapstate.core.sql.OutputField field : plan.outputFields()) {
             if (!key.contains(field.name())) {
-                fields.add(new TargetField(
-                        field.name(), joinFieldType(compiled, field.name(), bySourceTable), false));
+                fields.add(joinField(compiled, field.name(), false, bySourceTable));
             }
         }
-        return new TargetTable(factTable, fields);
+        List<TargetIndex> indexes = key.isEmpty() ? List.of() : List.of(new TargetIndex(key, true));
+        return new TargetTable(factTable, fields, indexes);
     }
 
     /**
@@ -972,8 +979,8 @@ final class StoreBackedDagSource implements DagSource {
     }
 
 
-    /** The declared type of the column one output field publishes verbatim, or null where it computes one. */
-    private static String joinFieldType(CompiledJoin compiled, String output,
+    /** Carries source metadata through a column alias; computed output keeps its unresolved type. */
+    private static TargetField joinField(CompiledJoin compiled, String output, boolean primaryKey,
             Map<String, TargetTable> bySourceTable) {
         for (io.tapstate.core.sql.OutputField field : compiled.plan().outputFields()) {
             if (!field.name().equals(output)
@@ -983,16 +990,16 @@ final class StoreBackedDagSource implements DagSource {
             TargetTable source =
                     bySourceTable.get(compiled.tableByName().get(reference.ref().source()));
             if (source == null) {
-                return null;
+                return new TargetField(output, null, primaryKey);
             }
             for (TargetField candidate : source.fields()) {
                 if (candidate.name().equals(reference.ref().column())) {
-                    return candidate.type();
+                    return new TargetField(output, candidate.type(), primaryKey, candidate.inferredType());
                 }
             }
-            return null;
+            return new TargetField(output, null, primaryKey);
         }
-        return null;
+        return new TargetField(output, null, primaryKey);
     }
 
     private Map<String, List<String>> sourceKeysById(Map<String, SourceVertex> sourceVertices) {
@@ -1389,7 +1396,7 @@ final class StoreBackedDagSource implements DagSource {
         fields.add(new TargetField(target.primaryKey(), typeOf(streamFields, target.primaryKey()), true));
         for (TargetField field : streamFields) {
             if (!field.name().equals(target.primaryKey())) {
-                fields.add(new TargetField(field.name(), field.type(), false));
+                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType()));
             }
         }
         return new TargetTable(target.collection(), fields, target.indexes());
@@ -1773,7 +1780,22 @@ final class StoreBackedDagSource implements DagSource {
         return sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
                 TargetModelResolver.renameAll(targets, serveStreams, element.rename()),
-                new PipelineNode(pipeline.id(), syncNodeId(element)));
+                new PipelineNode(pipeline.id(), syncNodeId(element)),
+                element.onFullLoad() == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(element.onFullLoad().name()),
+                freshFullLoad(pipeline));
+    }
+
+    /** A CDC-only read and any previously delivered load suppress destructive target preparation. */
+    private boolean freshFullLoad(PipelineResource pipeline) {
+        if (pipeline.settings() != null
+                && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.CDC_ONLY) {
+            return false;
+        }
+        return sourceVertices(pipeline).values().stream().noneMatch(vertex ->
+                storePort.meta().read(vertex.resolution().chainId().value())
+                        .map(meta -> meta.consumerOffsets().stream().anyMatch(
+                                consumer -> consumer.pipelineId().equals(pipeline.id())))
+                        .orElse(false));
     }
 
     /**
@@ -1911,6 +1933,11 @@ final class StoreBackedDagSource implements DagSource {
             return bind(connectorId, settings, writeMode, ddl,
                     targets.size() == 1 ? targets.values().iterator().next() : null, node);
         }
+        default SupplierEx<? extends SinkWriter> bind(
+                String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+                Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+            return bind(connectorId, settings, writeMode, ddl, targets, node);
+        }
     }
 
     static final class PdkSinkWriterBinder implements SinkWriterBinder {
@@ -1927,6 +1954,13 @@ final class StoreBackedDagSource implements DagSource {
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                 Map<String, TargetTable> targets, PipelineNode node) {
             return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, targets, node);
+        }
+        @Override
+        public SupplierEx<? extends SinkWriter> bind(
+                String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+                Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, targets, node,
+                    onFullLoad, fullLoad);
         }
     }
 }
