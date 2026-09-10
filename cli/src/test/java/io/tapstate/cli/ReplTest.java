@@ -539,6 +539,38 @@ class ReplTest {
     }
 
     @Test
+    void aSessionKeepsTheStatusOfItsFirstRefusalAndNotOfItsLastLine(@TempDir Path base) {
+        Harness h = harness(base);
+        // The two refusals are chosen to carry different codes -- `cd` to a missing directory is a usage
+        // refusal, `apply` with nothing naming a server is a verb that could not run -- so which of them
+        // the session keeps is visible rather than inferred. The successful line and the `exit` after
+        // them are the shape a script has, and the reason the end of a session cannot speak for it.
+        assertThat(h.repl().dispatch("cd nope")).isTrue();
+        assertThat(h.repl().dispatch("apply nope")).isTrue();
+        assertThat(h.repl().dispatch("pwd")).isTrue();
+        assertThat(h.repl().dispatch("exit")).isFalse();
+
+        // Reading the status off the end of the session would find this one, and call the run successful.
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().sessionExitCode())
+                .withFailMessage("the session kept %s: EXIT_USAGE is the first refusal, "
+                        + "EXIT_VERB_UNAVAILABLE the last one, and zero the last line",
+                        h.repl().sessionExitCode())
+                .isEqualTo(Cli.EXIT_USAGE);
+    }
+
+    @Test
+    void aSessionThatRefusedNothingEndsSuccessful(@TempDir Path base) {
+        // The other direction, so a session that had simply started failing everything could not pass
+        // the case above.
+        Harness h = harness(base);
+        assertThat(h.repl().dispatch("pwd")).isTrue();
+        assertThat(h.repl().dispatch("exit")).isFalse();
+
+        assertThat(h.repl().sessionExitCode()).isZero();
+    }
+
+    @Test
     void blankLineContinuesWithoutOutput() {
         Harness h = harness();
         assertThat(h.repl().dispatch("   ")).isTrue();
