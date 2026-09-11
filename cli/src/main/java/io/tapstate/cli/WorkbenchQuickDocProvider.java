@@ -7,6 +7,7 @@ import io.tapstate.core.schema.SchemaNode;
 
 import java.util.ArrayDeque;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 /** Builds an immutable current-line documentation projection from the bundled grammar schema. */
@@ -50,7 +51,7 @@ final class WorkbenchQuickDocProvider {
     record QuickDoc(String title, List<String> entries, Optional<String> validationError) {
         QuickDoc {
             entries = List.copyOf(entries);
-            validationError = Optional.copyOf(validationError);
+            validationError = Objects.requireNonNull(validationError, "validationError");
         }
 
         static QuickDoc from(SchemaNode node) {

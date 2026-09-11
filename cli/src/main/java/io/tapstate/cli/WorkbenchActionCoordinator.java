@@ -51,7 +51,8 @@ final class WorkbenchActionCoordinator implements AutoCloseable {
             } catch (RuntimeException failure) {
                 result = failureResult.apply(failure);
             }
-            runtime.runLater(() -> completeIfOpen(result, completion));
+            T completed = result;
+            runtime.runLater(() -> completeIfOpen(completed, completion));
         });
     }
 
