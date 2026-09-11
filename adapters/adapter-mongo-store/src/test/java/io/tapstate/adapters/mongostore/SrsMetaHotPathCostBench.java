@@ -67,8 +67,8 @@ class SrsMetaHotPathCostBench {
 
     /**
      * Schema versions in the record's history — one per DDL the source has emitted. This axis grows
-     * until the record's history bound is reached, so it is the one that decides what the read costs on
-     * a long-lived chain rather than on the day the chain was made.
+     * toward the bound the record keeps its history under, so it is the one that decides what the read
+     * costs on a long-lived chain rather than on the day the chain was made.
      */
     private static final List<Integer> DDLS = List.of(0, 50, 500);
 
@@ -154,9 +154,9 @@ class SrsMetaHotPathCostBench {
      * elsewhere that counts the calls rather than timing them.
      *
      * <p>Two shapes, and the pair is the point. A chain with no schema history is what a young one looks
-     * like; one with five hundred entries is what a long-lived one carries, the record's budget holding
-     * several times that many. If the projection is doing its job the two rates are close, and if it ever
-     * stops the second collapses.
+     * like; one with five hundred entries is what a long-lived one carries, a little over half the
+     * record's history budget at this entry size. If the projection is doing its job the two rates are
+     * close, and if it ever stops the second collapses.
      *
      * <p>What this does not include: any connector, any Jet vertex, any ring. It is the coordination
      * record's own ceiling -- the thing that has to be higher than the rate a source can deliver, not

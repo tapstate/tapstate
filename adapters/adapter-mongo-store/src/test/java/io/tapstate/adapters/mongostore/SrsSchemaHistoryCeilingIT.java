@@ -28,12 +28,13 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  * Witnesses where the coordination record's append-only schema history ends up: a chain whose history
  * has filled its document to the ceiling can no longer record a schema change at all.
  *
- * <p>The record carries one entry per DDL the source has ever emitted and nothing ever trims that
- * array, so the state this case holds it in is not one a chain leaves or an operator clears — it is
- * what a long-lived chain arrives at. The whole record is one MongoDB document, and growing that
- * document is the store's only way to record a schema change, so once it is at the ceiling there is no
- * write left that can land. That is the difference this case exists to hold down: the failure is not
- * slow reads, it is a chain that can no longer record that its source's schema moved.
+ * <p>The record carries one entry per DDL the source has ever emitted, and the append under witness
+ * now trims that array back to the newest entries its budget holds — so the state this case holds it
+ * in is not one a chain arrives at any more: it is the state a chain was left in before that trim,
+ * which is the state the trim exists to rescue. The whole record is one MongoDB document, and growing
+ * that document is the store's only way to record a schema change, so once it is at the ceiling there
+ * is no write left that can land. That is the difference this case exists to hold down: the failure is
+ * not slow reads, it is a chain that can no longer record that its source's schema moved.
  *
  * <p><strong>How the record is driven there.</strong> The record is seeded by the store, and every
  * history entry written into it is one the store's own mapping serialised — but the drive lays them
@@ -110,11 +111,11 @@ class SrsSchemaHistoryCeilingIT {
      * Grows the record's schema history to the largest number of entries that still fits inside the
      * ceiling, and returns that count, so the single append under witness is the one that crosses it.
      *
-     * <p>The growth operator is the one production grows with, a {@code $push} of the store's own
-     * serialised entries; only the count per write differs. Batches are used while a whole batch
-     * certainly fits, then entries go in one at a time while the record's own encoded bytes still leave
-     * room — which is what lands the record exactly where the next write cannot go, instead of at a
-     * number this case would have had to guess at.
+     * <p>The growth operator is a {@code $push} of the store's own serialised entries — the one
+     * production grew this array with before the change under witness; only the count per write
+     * differs. Batches are used while a whole batch certainly fits, then entries go in one at a time
+     * while the record's own encoded bytes still leave room — which is what lands the record exactly
+     * where the next write cannot go, instead of at a number this case would have had to guess at.
      */
     private static int driveHistoryToTheCeiling(MongoCollection<Document> collection) {
         int entries = 0;
