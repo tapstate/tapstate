@@ -277,6 +277,12 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
               <mainClass>${mainClass}</mainClass>
               <buildArgs>
                 <buildArg>--no-fallback</buildArg>
+                <!-- The CPU this binary may assume. Left alone, native-image compiles for x86-64-v3 on
+                     AMD64, which requires AVX, AVX2, BMI1, BMI2 and FMA, and an image that needs them
+                     refuses to start on a CPU that does not have them. `compatibility` is the lowest
+                     common denominator on every architecture, so this one flag stays correct for the
+                     arm64 builds too; install-smoke.sh checks the native profile still names it. -->
+                <buildArg>-march=compatibility</buildArg>
                 <!-- bundled resources read via getResourceAsStream, declared so the image keeps them -->
                 <buildArg>-H:IncludeResources=catalog/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=schema/.*\.json</buildArg>
