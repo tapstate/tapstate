@@ -52,14 +52,20 @@ final class WorkbenchActionCoordinator implements AutoCloseable {
                 result = failureResult.apply(failure);
             }
             T completed = result;
-            runtime.runLater(() -> completeIfOpen(completed, completion));
+            runtime.runLater(() -> {
+                if (completeIfOpen(completed, completion)) {
+                    runtime.requestRender();
+                }
+            });
         });
     }
 
-    private synchronized <T> void completeIfOpen(T result, Consumer<T> completion) {
+    private synchronized <T> boolean completeIfOpen(T result, Consumer<T> completion) {
         if (!closed) {
             completion.accept(result);
+            return true;
         }
+        return false;
     }
 
     @Override

@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import org.junit.jupiter.api.Test;
+import dev.tamboui.tui.event.Event;
 
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
@@ -38,9 +39,9 @@ class WorkbenchActionCoordinatorTest {
     @Test
     void deliversTypedFailureWhenAnActionThrows() throws Exception {
         BlockingQueue<Runnable> callbacks = new LinkedBlockingQueue<>();
+        BlockingQueue<Event> events = new LinkedBlockingQueue<>();
         WorkbenchRuntime runtime = new WorkbenchRuntime(
-                WorkbenchState.initial(), callbacks::add, () -> true, event -> {
-                });
+                WorkbenchState.initial(), callbacks::add, () -> true, events::add);
         WorkbenchActionCoordinator coordinator = new WorkbenchActionCoordinator(runtime);
         try {
             coordinator.submit(
@@ -53,6 +54,7 @@ class WorkbenchActionCoordinatorTest {
             Runnable callback = callbacks.poll(2, TimeUnit.SECONDS);
             assertThat(callback).isNotNull();
             callback.run();
+            assertThat(events.poll(2, TimeUnit.SECONDS)).isEqualTo(WorkbenchRedrawEvent.INSTANCE);
         } finally {
             coordinator.close();
         }

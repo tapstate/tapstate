@@ -61,6 +61,10 @@ final class WorkbenchRuntime {
         scheduler.runLater(callback);
     }
 
+    void requestRender() {
+        dispatch.accept(WorkbenchRedrawEvent.INSTANCE);
+    }
+
     private void reduce(WorkbenchEvent event) {
         requireOwnerThread();
         WorkbenchReducer.Reduction<WorkbenchState> reduction = reducer.reduce(state, event);
