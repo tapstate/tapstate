@@ -58,7 +58,7 @@ import java.util.function.UnaryOperator;
  */
 @Command(name = "new", mixinStandardHelpOptions = true,
         description = "Scaffold a new artifact (source, pipeline, transform, view or serve) as a canonical *.tap.yml.")
-final class NewCmd implements Callable<Integer> {
+final class NewCmd extends SingleResourceOptions implements Callable<Integer> {
 
     /** Exit code when a coded domain diagnostic is reported (e.g. the target already exists). */
     static final int EXIT_DIAGNOSTIC = 1;
@@ -75,10 +75,6 @@ final class NewCmd implements Callable<Integer> {
             description = "Recipe id from `new --list` (guided first run); omit to be asked at a terminal.")
     String recipe;
 
-    @Option(names = {"-y", "--yes", "--non-interactive"},
-            description = "Never prompt; take every answer from flags (scripting / AI).")
-    boolean nonInteractive;
-
     @Option(names = "--list",
             description = "Print the recipe catalog (id and title) instead of scaffolding; -o json|yaml for scripts.")
     boolean list;
@@ -86,38 +82,6 @@ final class NewCmd implements Callable<Integer> {
     @Option(names = "--kind", paramLabel = "KIND",
             description = "Deprecated alias for `add KIND`: source, pipeline, transform, view or serve.")
     String kind;
-
-    @Option(names = "--type", paramLabel = "TYPE",
-            description = "Transform type (transform kind): filter, map, js, union, nest or join.")
-    String type;
-
-    @Option(names = {"-c", "--connector"}, paramLabel = "ID",
-            description = "Connector id from the catalog (source kind).")
-    String connector;
-
-    @Option(names = "--id", paramLabel = "ID",
-            description = "Top-level id of the scaffolded resource.")
-    String id;
-
-    @Option(names = {"-m", "--mode"}, paramLabel = "MODE",
-            description = "Source read mode (cdc, snapshot, stream, file, api) — must suit the connector.")
-    SourceMode mode;
-
-    @Option(names = "--primary-key", paramLabel = "FIELD",
-            description = "Field that uniquely identifies a record in a view - required for --kind view.")
-    String primaryKey;
-
-    @Option(names = "--set", paramLabel = "KEY=VALUE",
-            description = "A connector config entry (repeatable).")
-    Map<String, String> config = new LinkedHashMap<>();
-
-    @Option(names = "--source", paramLabel = "ID",
-            description = "Source id the pipeline reads from (pipeline kind; repeatable).")
-    List<String> sources = new ArrayList<>();
-
-    @Option(names = "--sync-to", paramLabel = "ID",
-            description = "Target source id to sync the pipeline output to (pipeline kind; repeatable).")
-    List<String> syncTo = new ArrayList<>();
 
     @Option(names = "--table", paramLabel = "NAME",
             description = "The table to mirror (mirrored-table recipe).")
@@ -169,23 +133,6 @@ final class NewCmd implements Callable<Integer> {
     @Option(names = "--db", paramLabel = "CONNECTOR[,KEY=VALUE...]",
             description = "One database holding the table (consolidated-table recipe; repeatable, at least two).")
     List<String> databases = new ArrayList<>();
-
-    @Option(names = "--out", paramLabel = "DIR",
-            description = "Write the artifact flat into this exact directory, bypassing the workspace layout.")
-    String out;
-
-    @Option(names = "--force",
-            description = "Overwrite an existing artifact at the target path.")
-    boolean force;
-
-    @Option(names = "--dry-run",
-            description = "Preview the canonical artifact on stdout without writing any file.")
-    boolean dryRun;
-
-    @Option(names = {"-o", "--output"}, paramLabel = "FORMAT",
-            description = "Output format for the result report: text, json or yaml (default: text).",
-            defaultValue = "text", completionCandidates = OutputFormat.Candidates.class)
-    OutputFormat output;
 
     /** Test seam: an injected prompter forces the interactive path; production opens a JLine one. */
     Prompter prompter;
