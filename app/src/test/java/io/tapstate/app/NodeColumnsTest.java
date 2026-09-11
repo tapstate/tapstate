@@ -46,6 +46,22 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class NodeColumnsTest {
 
     @Test
+    void projectionsCarryOnlyUnchangedNumericDescriptorsAndMergesRequireAgreement() {
+        var number = new io.tapstate.core.common.NumericType(128, true, false, true, new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
+        var base = NodeColumns.known(Map.of("amount", JoinSchemaDrift.declaredType(TapstateType.DECIMAL, false),
+                "other", JoinSchemaDrift.declaredType(TapstateType.DECIMAL, false)))
+                .withNumericTypes(Map.of("amount", number, "other", number));
+        var renamed = NodeColumns.of(new TransformBody.MapProjection(Map.of("total", FieldRule.rename("amount"))),
+                Map.of("in", base), null);
+        assertThat(renamed.numericTypes()).containsExactlyInAnyOrderEntriesOf(Map.of("total", number, "other", number));
+        var computed = NodeColumns.of(new TransformBody.MapProjection(Map.of("amount", FieldRule.computed("after.amount + 1"))),
+                Map.of("in", base), null);
+        assertThat(computed.numericTypes()).containsOnlyKeys("other");
+        assertThat(NodeColumns.merged(List.of(base, base)).numericTypes()).containsEntry("amount", number);
+        assertThat(NodeColumns.merged(List.of(base, NodeColumns.known(base.columns()))).numericTypes()).isEmpty();
+    }
+
+    @Test
     @DisplayName("every kind of transform reaches an arm of its own")
     void everyKindOfTransformReachesAnArmOfItsOwn() {
         // One set of inputs the six kinds all answer over, chosen so that each arm's answer differs

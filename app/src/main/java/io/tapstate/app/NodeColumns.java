@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.common.NumericType;
+import java.util.Objects;
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.PushElement;
@@ -72,12 +74,22 @@ import java.util.Set;
  *                      nothing can be said
  * @param unknownBecause why the columns cannot be given, naming the node, or null when they are given
  */
-record NodeColumns(Map<String, String> columns, String unknownBecause) {
+record NodeColumns(Map<String, String> columns, String unknownBecause, Map<String, NumericType> numericTypes) {
+
+    NodeColumns(Map<String, String> columns, String unknownBecause) {
+        this(columns, unknownBecause, Map.of());
+    }
+
+    NodeColumns withNumericTypes(Map<String, NumericType> types) {
+        return new NodeColumns(columns, unknownBecause, types);
+    }
+
 
     NodeColumns {
         // Order-preserving rather than Map.copyOf: the declared order is the output order, and a copy
         // that loses it turns every rebuild of the same node into a differently ordered record.
         columns = Collections.unmodifiableMap(new LinkedHashMap<>(columns));
+        numericTypes = Collections.unmodifiableMap(new LinkedHashMap<>(numericTypes));
     }
 
     /** The columns a node produces, worked out. */
@@ -179,7 +191,15 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
         seen.forEach((name, declared) -> out.put(name, carriedBy.get(name) == inputs.size()
                 ? declared
                 : JoinSchemaDrift.declaredType(JoinSchemaDrift.typeOf(declared), true)));
-        return known(out);
+        Map<String, NumericType> numbers = new LinkedHashMap<>();
+        for (String column : out.keySet()) {
+            NumericType candidate = inputs.iterator().next().numericTypes().get(column);
+            if (candidate != null && inputs.stream().allMatch(input ->
+                    Objects.equals(candidate, input.numericTypes().get(column)))) {
+                numbers.put(column, candidate);
+            }
+        }
+        return known(out).withNumericTypes(numbers);
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
@@ -229,7 +249,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
             }
         }
         root.columns().forEach(out::putIfAbsent);
-        return known(out);
+        return known(out).withNumericTypes(root.numericTypes());
     }
 
     /**
@@ -320,6 +340,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
         }
         Map<String, TapstateType> upstreamTypes = typesOf(upstream);
         Map<String, String> out = new LinkedHashMap<>();
+        Map<String, NumericType> numbers = new LinkedHashMap<>();
         Set<String> consumed = new LinkedHashSet<>();
         Set<String> dropped = new LinkedHashSet<>();
         rules.forEach((output, rule) -> {
@@ -329,6 +350,9 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
                     String renamed = upstream.columns().get(rename.sourceField());
                     if (renamed != null) {
                         out.put(output, renamed);
+                        if (upstream.numericTypes().containsKey(rename.sourceField())) {
+                            numbers.put(output, upstream.numericTypes().get(rename.sourceField()));
+                        }
                     }
                 }
                 case FieldRule.Drop ignored -> dropped.add(output);
@@ -345,9 +369,12 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
         upstream.columns().forEach((name, type) -> {
             if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
                 out.put(name, type);
+                if (upstream.numericTypes().containsKey(name)) {
+                    numbers.put(name, upstream.numericTypes().get(name));
+                }
             }
         });
-        return known(out);
+        return known(out).withNumericTypes(numbers);
     }
 
     /**

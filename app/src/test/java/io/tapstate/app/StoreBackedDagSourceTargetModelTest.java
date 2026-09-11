@@ -43,6 +43,26 @@ import org.junit.jupiter.api.Test;
 class StoreBackedDagSourceTargetModelTest {
 
     @Test
+    void directProjectionRetainsNumericMetadataButRecomputedSameNameDoesNot() {
+        var number = new io.tapstate.core.common.NumericType(null, true, false, null,
+                new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
+        for (boolean computed : List.of(false, true)) {
+            InMemoryStorePort store = seededProjectingPipeline(computed
+                    ? Map.of("amount", io.tapstate.core.model.FieldRule.computed("after.amount + 1"))
+                    : Map.of("total", io.tapstate.core.model.FieldRule.rename("amount")));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT", io.tapstate.core.common.TapstateType.INT64),
+                    new SourceField("amount", "DECIMAL(18,4)", io.tapstate.core.common.TapstateType.DECIMAL, null, number)),
+                    List.of("id"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+            String output = computed ? "amount" : "total";
+            TargetField field = bound.getFirst().fields().stream().filter(f -> f.name().equals(output)).findFirst().orElseThrow();
+            assertThat(field.numericType()).isEqualTo(computed ? null : number);
+        }
+    }
+
+    @Test
     void a_view_target_is_keyed_by_the_source_tables_that_reach_it() {
         // The sink resolves a target by the table the row came from, so a view - which collapses every
         // upstream table into one collection - must answer to each of those table names. Keyed by the

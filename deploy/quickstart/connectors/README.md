@@ -12,11 +12,14 @@ This preview certifies the following database kinds, with certification scoped b
 | MySQL | `mysql` | Read and write |
 | PostgreSQL | `postgres` | Read and write |
 | MongoDB | `mongodb` | Read and write |
-| Oracle | `oracle` | Source only |
-| SQL Server | `sqlserver` | Source only |
+| Oracle | `oracle` | Read and write |
+| SQL Server | `sqlserver` | Read and write |
 
-The catalog may report write capability for Oracle and SQL Server; those write paths
-are not certified in this preview. The default accepted set contains 16 connector ids
+Oracle Free 23 and SQL Server 2022 targets are verified with MySQL snapshot and CDC
+inserts, updates and deletes, automatic table/index preparation, and full-load policies.
+Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+negative fractions and CDC updates. This is not an exhaustive cross-version or
+all-data-type matrix. The default accepted set contains 16 connector ids
 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
 Other managed variants of Oracle and SQL Server are outside the default accepted set.
@@ -28,6 +31,12 @@ is not configured in release or quickstart artifacts. A `connector.not-official`
 reports the server's actual accepted set, including any additional ids configured there.
 Registration through an upload and registration through the seed directory use the same
 acceptance check.
+
+Numeric source attributes, including precision, scale and value bounds, are preserved
+through schema storage and target preparation. Decimal columns whose metadata was
+stored by an older build need schema rediscovery before automatic target creation.
+Missing or inconsistent decimal metadata is refused before writing; computed decimal
+outputs without a declared numeric domain cannot be auto-created safely.
 
 Oracle connector bytes, including the bundled `ojdbc8` driver under the Oracle Free Use
 Terms, are excluded from versioned releases, `connectors-preview`, and quickstart.

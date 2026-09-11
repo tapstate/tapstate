@@ -25,6 +25,21 @@ import org.junit.jupiter.api.Test;
 class TargetModelResolverTest {
 
     @Test
+    void numericDescriptorSurvivesTableRenamingAndRekeying() throws Exception {
+        var number = new io.tapstate.core.common.NumericType(128, true, false, true, new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
+        var source = new SourceTable("orders", List.of(new SourceField("amount", "decimal(18,4)",
+                io.tapstate.core.common.TapstateType.DECIMAL, null, number)), List.of(), List.of());
+        var result = TargetModelResolver.keyedOn(TargetModelResolver.rename(TargetModelResolver.toTargetTable(source),
+                new io.tapstate.core.model.RenameSpec(null, null, "archive_", null)), List.of("amount"));
+        assertThat(result.fields().getFirst().numericType()).isEqualTo(number);
+        var bytes = new java.io.ByteArrayOutputStream();
+        try (var out = new java.io.ObjectOutputStream(bytes)) { out.writeObject(result); }
+        try (var in = new java.io.ObjectInputStream(new java.io.ByteArrayInputStream(bytes.toByteArray()))) {
+            assertThat(in.readObject()).isEqualTo(result);
+        }
+    }
+
+    @Test
     void carriesInferredTypesThroughRenamesAndKeyChanges() {
         SourceTable source = new SourceTable("orders", List.of(
                 new SourceField("id", "SOURCE_NUMBER", io.tapstate.core.common.TapstateType.INT64, null),

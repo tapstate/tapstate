@@ -16,6 +16,7 @@ import io.tapdata.entity.schema.type.TapYear;
 import io.tapstate.core.common.TapstateType;
 
 import java.math.BigDecimal;
+import io.tapstate.core.common.NumericType;
 
 /**
  * Maps a PDK type onto the tapstate type namespace: the normalization step that turns what a connector
@@ -81,14 +82,34 @@ final class PdkTypeMapping {
         };
     }
 
+    /** Copies every declared numeric attribute before the framework descriptor leaves discovery. */
+    static NumericType numericType(TapType type) {
+        if (!(type instanceof TapNumber number)) {
+            return null;
+        }
+        return new NumericType(number.getBit(), number.getFixed(), number.getUnsigned(), number.getZerofill(),
+                number.getMinValue(), number.getMaxValue(), number.getPrecision(), number.getScale());
+    }
+
+    /** Restores the source descriptor without inventing bounds or a destination SQL spelling. */
+    static TapType targetType(TapstateType type, NumericType number) {
+        if (number == null || (type != TapstateType.DECIMAL && type != TapstateType.INT64 && type != TapstateType.DOUBLE)) {
+            return targetType(type);
+        }
+        return new TapNumber().bit(number.bit()).fixed(number.fixed()).unsigned(number.unsigned())
+                .zerofill(number.zerofill()).minValue(number.minValue()).maxValue(number.maxValue())
+                .precision(number.precision()).scale(number.scale());
+    }
+
     /** Projects the inferred portable type into the PDK vocabulary; database types remain PDK-owned. */
     static TapType targetType(TapstateType type) {
         return switch (type) {
             case STRING -> new TapString();
             case INT64 -> new TapNumber().bit(64).scale(0).minValue(SIGNED_64_MIN)
                     .maxValue(BigDecimal.valueOf(Long.MAX_VALUE));
-            case DECIMAL -> new TapNumber().fixed(true)
-                    .minValue(BigDecimal.valueOf(-Double.MAX_VALUE)).maxValue(BigDecimal.valueOf(Double.MAX_VALUE));
+            case DECIMAL -> throw new IllegalArgumentException(
+                    "decimal target requires declared numeric attributes; rediscover the source schema. "
+                            + "Computed decimal columns have no declared numeric metadata");
             case DOUBLE -> new TapNumber().fixed(false).bit(64)
                     .minValue(BigDecimal.valueOf(-Double.MAX_VALUE)).maxValue(BigDecimal.valueOf(Double.MAX_VALUE));
             case BOOLEAN -> new TapBoolean();

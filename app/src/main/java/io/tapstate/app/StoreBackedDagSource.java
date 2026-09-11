@@ -525,7 +525,7 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, NodeColumns> inputs = new LinkedHashMap<>();
             for (FromRef ref : refsOf(from)) {
                 NodeColumns columns = streamColumnsAt(pipelineId, pipeline, ref, stream, sourceVertices,
-                        sourceKeyByTable, sourceKeysById, stepIds, new HashSet<>());
+                        sourceKeyByTable, sourceKeysById, stepIds, new HashSet<>(), base);
                 if (columns != null) {
                     inputs.put(Integer.toString(inputs.size()), columns);
                 }
@@ -534,6 +534,12 @@ final class StoreBackedDagSource implements DagSource {
                     : NodeColumns.of(new TransformBody.Union(), inputs, null);
             if (produced != null && produced.known()) {
                 published.put(stream, publishedAs(base, produced));
+            } else if (produced != null) {
+                // A script can replace values under their old names. Unknown lineage cannot reuse
+                // the source's numeric bounds merely because the output may keep the same spelling.
+                published.put(stream, new TargetTable(base.name(), base.fields().stream()
+                        .map(field -> new TargetField(field.name(), field.type(), field.primaryKey(), field.inferredType()))
+                        .toList(), base.indexes()));
             }
         }
         return published;
@@ -556,18 +562,22 @@ final class StoreBackedDagSource implements DagSource {
     private NodeColumns streamColumnsAt(
             String pipelineId, PipelineResource pipeline, FromRef from, String stream,
             Map<String, SourceVertex> sourceVertices, Map<String, String> sourceKeyByTable,
-            Map<String, List<String>> sourceKeysById, Set<String> stepIds, Set<String> visiting) {
+            Map<String, List<String>> sourceKeysById, Set<String> stepIds, Set<String> visiting, TargetTable base) {
         ViewBlock.Inline view = inlineViewNamed(pipeline, from);
         if (view != null) {
             NodeColumns upstream = streamColumnsAt(pipelineId, pipeline, view.from(), stream,
-                    sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting);
+                    sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base);
             return upstream == null ? null : NodeColumns.of(view, upstream);
         }
         for (String key : upstreams(from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
             SourceVertex vertex = sourceVertices.get(key);
             if (vertex != null) {
                 if (vertex.table().equals(stream)) {
-                    return copiedColumns(pipelineId, vertex);
+                    NodeColumns copied = copiedColumns(pipelineId, vertex);
+                    Map<String, io.tapstate.core.common.NumericType> numbers = new LinkedHashMap<>();
+                    base.fields().stream().filter(field -> field.numericType() != null)
+                            .forEach(field -> numbers.put(field.name(), field.numericType()));
+                    return copied == null ? null : copied.withNumericTypes(numbers);
                 }
                 continue;
             }
@@ -579,7 +589,7 @@ final class StoreBackedDagSource implements DagSource {
             }
             for (FromRef upstreamRef : refsOf(inline.from())) {
                 NodeColumns upstream = streamColumnsAt(pipelineId, pipeline, upstreamRef, stream,
-                        sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting);
+                        sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base);
                 if (upstream != null) {
                     return NodeColumns.of(inline.body(), Map.of("in", upstream), null);
                 }
@@ -854,7 +864,7 @@ final class StoreBackedDagSource implements DagSource {
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
             fields.add(new TargetField(column, carried == null ? null : carried.type(), false,
-                    JoinSchemaDrift.typeOf(produced.columns().get(column))));
+                    JoinSchemaDrift.typeOf(produced.columns().get(column)), produced.numericTypes().get(column)));
             if (carried != null && carried.primaryKey()) {
                 key.add(column);
             }
@@ -983,9 +993,13 @@ final class StoreBackedDagSource implements DagSource {
     private static TargetField joinField(CompiledJoin compiled, String output, boolean primaryKey,
             Map<String, TargetTable> bySourceTable) {
         for (io.tapstate.core.sql.OutputField field : compiled.plan().outputFields()) {
-            if (!field.name().equals(output)
-                    || !(field.from() instanceof io.tapstate.core.sql.Expr.Column reference)) {
+            if (!field.name().equals(output)) {
                 continue;
+            }
+            if (!(field.from() instanceof io.tapstate.core.sql.Expr.Column reference)) {
+                return field.type() == io.tapstate.core.common.TapstateType.DECIMAL
+                        ? new TargetField(output, null, primaryKey, field.type())
+                        : new TargetField(output, null, primaryKey);
             }
             TargetTable source =
                     bySourceTable.get(compiled.tableByName().get(reference.ref().source()));
@@ -994,7 +1008,7 @@ final class StoreBackedDagSource implements DagSource {
             }
             for (TargetField candidate : source.fields()) {
                 if (candidate.name().equals(reference.ref().column())) {
-                    return new TargetField(output, candidate.type(), primaryKey, candidate.inferredType());
+                    return new TargetField(output, candidate.type(), primaryKey, candidate.inferredType(), candidate.numericType());
                 }
             }
             return new TargetField(output, null, primaryKey);
@@ -1393,23 +1407,16 @@ final class StoreBackedDagSource implements DagSource {
         // The key first and always, carrying the stream's type for it when the stream declares one. A
         // view names its own key, so it has one to be matched on before any discovery has run - and a
         // type it could not resolve is left for the connector to infer rather than standing in the way.
-        fields.add(new TargetField(target.primaryKey(), typeOf(streamFields, target.primaryKey()), true));
+        TargetField streamKey = streamFields.stream().filter(field -> field.name().equals(target.primaryKey()))
+                .findFirst().orElse(null);
+        fields.add(streamKey == null ? new TargetField(target.primaryKey(), null, true)
+                : new TargetField(streamKey.name(), streamKey.type(), true, streamKey.inferredType(), streamKey.numericType()));
         for (TargetField field : streamFields) {
             if (!field.name().equals(target.primaryKey())) {
-                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType()));
+                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType(), field.numericType()));
             }
         }
         return new TargetTable(target.collection(), fields, target.indexes());
-    }
-
-    /** The stream's own type token for one column, or null when the stream does not declare it. */
-    private static String typeOf(List<TargetField> fields, String name) {
-        for (TargetField field : fields) {
-            if (field.name().equals(name)) {
-                return field.type();
-            }
-        }
-        return null;
     }
 
     /**

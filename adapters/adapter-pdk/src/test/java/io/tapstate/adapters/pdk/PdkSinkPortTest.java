@@ -32,6 +32,25 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PdkSinkPortTest {
 
     @Test
+    void missingDecimalMetadataIsCodedBeforeAnyWrite(@TempDir Path dir) throws Throwable {
+        Path jar = Synthetic.countingSink(dir);
+        PdkConnector connector = PdkConnector.open("demo", provisioner(jar, "synthetic.CountingSink").resolve("demo"), Map.of());
+        TargetTable table = new TargetTable("t1", List.of(new TargetField("amount", "decimal", false,
+                io.tapstate.core.common.TapstateType.DECIMAL)));
+        AtomicInteger writes = new AtomicInteger();
+        try (SinkWriter writer = new PdkSinkWriter(connector,
+                (context, events, target, result) -> writes.incrementAndGet(), configWithTarget(table), Map.of("t1", table), null)) {
+            assertThatThrownBy(() -> await(writer, List.of(Envelope.insert(1L, "t1", Map.of("amount", 1), null))))
+                    .isInstanceOf(ExecutionException.class)
+                    .cause().isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(ConnectorError.WRITE_FAILED);
+                        assertThat(failure.getMessage()).contains("amount", "t1", "rediscover");
+                    });
+            assertThat(writes).hasValue(0);
+        }
+    }
+
+    @Test
     void preparationFailuresAreCodedAndNoWriteIsAttempted(@TempDir Path dir) throws Throwable {
         Path jar = Synthetic.countingSink(dir);
         for (io.tapstate.spi.sink.OnFullLoad policy : List.of(

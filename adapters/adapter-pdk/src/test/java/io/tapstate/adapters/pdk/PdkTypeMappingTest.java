@@ -348,10 +348,12 @@ class PdkTypeMappingTest {
         try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of())) {
             TapTable table = TargetTapTable.build(new io.tapstate.spi.sink.TargetTable("orders", List.of(
                     new io.tapstate.spi.sink.TargetField("amount", "source_numeric(20,4)", false,
-                            TapstateType.DECIMAL))));
+                            TapstateType.DECIMAL, PdkTypeMapping.numericType(
+                                    filled(DECIMAL_SPEC, "amount", "decimal(18,4)").getTapType())))));
+
             connector.resolveTargetTypes(table);
             TapField amount = table.getNameFieldMap().get("amount");
-            assertThat(amount.getDataType()).isEqualTo(targetToken);
+            assertThat(amount.getDataType()).isEqualTo(targetToken + "(18,4)");
             assertThat(amount.getTapType()).isInstanceOf(io.tapdata.entity.schema.type.TapNumber.class);
         }
     }
