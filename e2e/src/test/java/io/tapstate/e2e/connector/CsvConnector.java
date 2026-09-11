@@ -590,7 +590,15 @@ public class CsvConnector implements TapConnector {
         }
         try {
             Files.createDirectories(file.getParent());
-            Files.writeString(file, text.toString());
+            Path replacement = Files.createTempFile(file.getParent(), "." + file.getFileName(), ".tmp");
+            try {
+                Files.writeString(replacement, text.toString());
+                // Readers in another process must see either complete generation, never truncation.
+                Files.move(replacement, file, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } finally {
+                Files.deleteIfExists(replacement);
+            }
         } catch (IOException e) {
             throw new UncheckedIOException("cannot write the table at " + file, e);
         }
