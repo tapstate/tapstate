@@ -2,8 +2,12 @@
 # Assemble the install site into a directory ready to deploy.
 #
 # The site is two scripts that live elsewhere in this repo, served under the names a user types:
-#   /      -> the full-stack quickstart (deploy/quickstart/quickstart.sh)
-#   /cli   -> the CLI-only installer   (install/install.sh)
+#   /      -> the CLI-only installer   (install/install.sh)
+#   /cli   -> the same installer, kept as an alias for the address already in circulation
+#   /demo  -> the full-stack quickstart (deploy/quickstart/quickstart.sh)
+#
+# The root used to serve the quickstart. It now installs the CLI and nothing else, so that the first
+# command a reader meets does one thing; the disposable demo has its own name.
 #
 # Copying rather than symlinking is deliberate: the deployment uploads file contents, and a symlink
 # would upload as a link nobody can follow. The routing itself is vercel.json, checked in beside this
@@ -31,6 +35,7 @@ cp "$here/api/event.js"                    "$out/api/event.js"
 "$here/check-site.sh" "$out" >/dev/null
 
 echo "assembled into $out:"
-echo "  /     <- deploy/quickstart/quickstart.sh"
-echo "  /cli  <- install/install.sh"
+echo "  /     <- install/install.sh"
+echo "  /cli  <- install/install.sh (alias)"
+echo "  /demo <- deploy/quickstart/quickstart.sh"
 echo "  /e    <- deploy/install-site/api/event.js (install event receiver)"

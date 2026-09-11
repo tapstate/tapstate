@@ -13,5 +13,9 @@
       { "name" : "workdir" },
       { "name" : "command" }
     ]
+  },
+  {
+    "name" : "org.apache.calcite.sql.parser.impl.SqlParserImpl",
+    "allDeclaredMethods" : true
   }
 ]

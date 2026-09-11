@@ -111,6 +111,12 @@ cli.demo-workspace-exists:
 cli.workspace-not-writable:
   message: "Could not write {path}: {reason}"
   solution: "Check that the directory exists, is writable, and that no plain file is sitting where a directory is needed. Demo files this run wrote were removed and any it overwrote were put back, though empty directories it created can remain."
+cli.workspace-unreadable:
+  message: "Could not read the workspace at {path}: {reason}"
+  solution: "Check that the workspace directory and every directory and *.tap.yml file under it can be read, then run `tapstate up` again."
+cli.workspace-has-no-pipeline:
+  message: "The workspace at {path} holds no pipeline (a *.tap.yml with kind: pipeline), so there is nothing to bring up."
+  solution: "Run `tapstate new` to write one, or point -w at a workspace that holds a pipeline."
 cli.unknown-connector:
   message: "No connector '{connector}' in the catalog."
   solution: "Pick a connector id from the catalog; run `tapstate new` interactively to choose one."
@@ -126,6 +132,15 @@ cli.resource-not-found:
 cli.connect-failed:
   message: "Could not reach any Tapstate server among the seeds: {seeds}."
   solution: "Check the addresses are correct and that a Tapstate server is running there, then try connect again."
+cli.docker-unavailable:
+  message: "The local development stack cannot be run in Docker: {reason}."
+  solution: "Install Docker with the Compose v2 plugin and make sure it is running, then run `tapstate up` again - or point the workspace at a server you already run with --server."
+cli.server-not-named:
+  message: "This workspace is not bound to a server, and there is nothing to ask."
+  solution: "Pass --server <url> to name the server to use, or --start-local to start the local development stack on {server}."
+cli.password-required:
+  message: "Signing in to {server} needs a password, and there is nothing to ask."
+  solution: "Set {variable} in the environment, or pass --server for a server you are already signed in to."
 cli.request-timed-out:
   message: "The request to {server} timed out before the server answered."
   solution: "The server may be busy or the upload large. It may have completed there anyway — re-running a register is safe (it is idempotent). Wait and retry, or check the server logs."
@@ -360,6 +375,9 @@ connector.load-failed:
 connector.class-not-found:
   message: "Connector '{connector}' entry class '{class}' was not found or is not a connector."
   solution: "Check the connector id resolves to a connector jar that declares this entry class."
+connector.config-type-mismatch:
+  message: "Connection setting '{field}' of connector '{connector}' must be a {expected}, but its value is '{value}'."
+  solution: "Give '{field}' a {expected} the connector can read, or remove it if the connection does not need it."
 connector.no-connector-class:
   message: "No connector class found in artifact '{artifact}'."
   solution: "Check the jar is a PDK connector: it must contain a class annotated with @TapConnectorClass."

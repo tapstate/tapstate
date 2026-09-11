@@ -73,8 +73,18 @@ class CliTest {
     void connectedVerbsAreRegisteredNotMissing() {
         // connect is a REPL builtin (session-scoped), not a one-shot subcommand
         assertThat(Cli.newCommandLine().getSubcommands().keySet())
-                .contains("apply", "run")
+                .contains("apply", "up")
                 .doesNotContain("connect");
+    }
+
+    @Test
+    void theCompositeVerbIsUpAndNoLongerAReservedRun() {
+        // `run` was the placeholder for apply-then-start; the verb shipped as `up`, so the placeholder
+        // is gone rather than kept beside the real thing, and `up` is a real command on the table
+        assertThat(Cli.UNIMPLEMENTED_COMPOSITE_VERBS).doesNotContain("run", "up");
+        assertThat(Cli.COMPOSITE_VERBS).contains("up");
+        assertThat(Cli.newCommandLine().getSubcommands().keySet()).contains("up").doesNotContain("run");
+        assertThat(Cli.VERB_BY_OPERATION.values()).doesNotContain("up");
     }
 
     @Test

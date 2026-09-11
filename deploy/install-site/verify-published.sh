@@ -6,9 +6,10 @@
 # published one-liner install 0.2.0 for an entire release cycle while every checked-in pin said 0.2.1,
 # and nothing went red. A digest cannot be stale-but-plausible.
 #
-# Both entry points are checked, never just one. They are two different files -- / is the full-stack
-# quickstart and /cli is the CLI-only installer -- and each carries its own version pin, so a deploy
-# that refreshed one and missed the other is a real and observed shape.
+# Every entry point is checked, never just one. They are two different files -- / and its alias /cli
+# are the CLI-only installer, /demo is the full-stack quickstart -- and each carries its own version
+# pin, so a deploy that refreshed one and missed the other is a real and observed shape. The alias is
+# checked as its own route: a rewrite that points it at the wrong file is a deploy defect too.
 #
 # Cache is bypassed on purpose: the edge serves these with a 300s max-age, so a check that accepts a
 # cached body can report success about content the origin no longer has.
@@ -86,8 +87,9 @@ check() {
     failed=1
 }
 
-check "/"    quickstart.sh
-check "/cli" install.sh
+check "/"     install.sh
+check "/cli"  install.sh
+check "/demo" quickstart.sh
 
 [ "$failed" -eq 0 ] || exit 1
-echo "both entry points match the tree"
+echo "all entry points match the tree"

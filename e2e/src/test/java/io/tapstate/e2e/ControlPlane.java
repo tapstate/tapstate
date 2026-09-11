@@ -322,6 +322,16 @@ final class ControlPlane {
                 string(map, "contentHash", response.body())));
     }
 
+    /** A stored Source as the API projects it, including its secret-free configuration. */
+    Map<String, Object> source(String sourceId) {
+        HttpResponse<String> response = send(authedGet("/api/sources/" + urlSegment(sourceId)));
+        expect(response, 200, "read the source " + sourceId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("the source read was not an object: " + response.body());
+        }
+        return asObject(map);
+    }
+
     /**
      * The content hash of the stored artifact {@code id}, failing when the server holds none.
      *
