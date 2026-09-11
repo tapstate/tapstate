@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import io.tapstate.e2e.connector.CsvConnector;
 
+import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapRecordEvent;
 import io.tapdata.entity.schema.TapField;
@@ -18,7 +19,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -48,10 +49,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * asked what the table holds while that is going on. Every answer must be the count that is in the file:
  * the reader is never entitled to see the write, only the table.
  *
- * <p>Nothing here is timing-dependent in the direction that matters. A passing run cannot pass by luck -
- * the assertions below only hold if no read ever saw the emptied file - and a failing run cannot fail
- * because a wait was too short: there is no wait, and the sink is driven directly rather than through a
- * pipeline, so what is under test is one write and one read.
+ * <p>Nothing here is timing-dependent in the direction that matters. The sink is driven for a counted
+ * number of passes and the reader reads until the last of them has been applied, so the reader's readings
+ * span the sink's writes rather than running ahead of or around them, and a passing run cannot have passed
+ * by never looking while the sink was working. A failing run cannot fail because a wait was too short
+ * either: there is no wait, and the sink is driven directly rather than through a pipeline.
  */
 class TheFileTargetIsNeverReadHalfWrittenTest {
 
@@ -62,11 +64,11 @@ class TheFileTargetIsNeverReadHalfWrittenTest {
     private static final long ROWS = 4;
 
     /**
-     * How many times the harness's reader is asked what the table holds while the sink keeps applying the
-     * same rows. Enough that a window entered once per batch cannot be missed: the write is entered on
-     * every pass, and a reader that never stops reading samples it on most of them.
+     * How many times the sink is driven to apply the same rows. The reader reads until the last of them
+     * has been applied, so it cannot finish around the sink: the sink is still working through its passes
+     * while the reader reads, and a window entered once per pass is a window a reading can land in.
      */
-    private static final int READINGS = 2000;
+    private static final int PASSES = 300;
 
     @TempDir
     private Path target;
@@ -88,12 +90,13 @@ class TheFileTargetIsNeverReadHalfWrittenTest {
         apply(sink, connection, batch, table);
         assertThat(count()).isEqualTo(ROWS);
 
+        AtomicInteger applied = new AtomicInteger();
         AtomicReference<Throwable> writerFailed = new AtomicReference<>();
-        AtomicBoolean writing = new AtomicBoolean(true);
         Thread writer = new Thread(() -> {
             try {
-                while (writing.get()) {
+                for (int pass = 0; pass < PASSES; pass++) {
                     apply(sink, connection, batch, table);
+                    applied.incrementAndGet();
                 }
             } catch (Throwable failed) {
                 writerFailed.set(failed);
@@ -101,17 +104,20 @@ class TheFileTargetIsNeverReadHalfWrittenTest {
         }, "sink-reapplying-the-same-rows");
         writer.start();
 
+        int readings = 0;
         try {
-            for (int reading = 0; reading < READINGS; reading++) {
+            // Reading until the sink has applied its last pass is what holds the two together: the loop
+            // cannot end while a write is still to come, so a green run is one taken through the writes.
+            do {
+                readings++;
                 long rows = count();
                 assertThat(rows)
                         .as("the table at %s holds %s rows and the sink is applying those same rows again; "
-                                + "reading %s of %s found %s of them, so the target is being written where it "
-                                + "can be read rather than replaced", target, ROWS, reading + 1, READINGS, rows)
+                                + "reading %s found %s of them, so the target is being written where it can "
+                                + "be read rather than replaced", target, ROWS, readings, rows)
                         .isEqualTo(ROWS);
-            }
+            } while (applied.get() < PASSES && writerFailed.get() == null);
         } finally {
-            writing.set(false);
             writer.join();
         }
         assertThat(writerFailed.get())
@@ -128,10 +134,14 @@ class TheFileTargetIsNeverReadHalfWrittenTest {
      * The write path the product's batches reach the store through: the connector's registered write
      * function, registered here the way the product asks for it rather than through a pipeline, so the
      * case is about the write and the read and nothing else.
+     *
+     * <p>The registry is the live one the product hands over rather than nothing at all: this connector
+     * registers no codec today, so either would do, and the day it registers one a null here would fail
+     * the case inside registration, where the reason is not the write path it is about.
      */
     private static WriteRecordFunction theProductsWritePath() {
         ConnectorFunctions functions = new ConnectorFunctions();
-        new CsvConnector().registerCapabilities(functions, null);
+        new CsvConnector().registerCapabilities(functions, new TapCodecsRegistry());
         return functions.getWriteRecordFunction();
     }
 
@@ -143,7 +153,7 @@ class TheFileTargetIsNeverReadHalfWrittenTest {
     /** The rows the example settles on, in the shape the connector writes them from. */
     private static List<TapRecordEvent> theSettledRows() {
         List<TapRecordEvent> events = new ArrayList<>();
-        for (Map<String, Object> row : SeedRows.generated((int) ROWS)) {
+        for (Map<String, Object> row : SeedRows.generated(ROWS)) {
             Map<String, Object> after = new LinkedHashMap<>(row);
             events.add(TapInsertRecordEvent.create().table(TABLE).after(after));
         }
