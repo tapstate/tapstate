@@ -87,15 +87,18 @@ final class UnwindPort implements TransformPort {
      */
     private List<Envelope> pairUpdate(Envelope event) {
         Map<Object, Map<String, Object>> was = keyed(expand(event.before()));
-        Map<Object, Map<String, Object>> now = keyed(expand(event.after()));
+        List<Map<String, Object>> rows = expand(event.after());
+        Map<Object, Map<String, Object>> now = keyed(rows);
         List<Envelope> out = new ArrayList<>();
         was.forEach((key, row) -> {
             if (!now.containsKey(key)) {
                 out.add(asDelete(event, row));
             }
         });
-        now.forEach((key, row) -> {
-            Map<String, Object> earlier = was.get(key);
+        // The key index decides membership, not cardinality. Duplicate elements still travel to
+        // the sink in order, just as they do for inserts, after the collision has been reported.
+        rows.forEach(row -> {
+            Map<String, Object> earlier = was.get(keyOf(row));
             out.add(earlier == null
                     ? asRow(event, Op.INSERT, row)
                     : new Envelope(Op.UPDATE, event.ts(), event.src(), earlier, row, event.schema())

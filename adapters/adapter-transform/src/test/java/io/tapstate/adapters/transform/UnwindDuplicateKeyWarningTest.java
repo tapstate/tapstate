@@ -80,6 +80,22 @@ class UnwindDuplicateKeyWarningTest {
         assertThat(said).isEmpty();
     }
 
+    @Test
+    void anUpdateStillSendsBothRowsWhenItsNewElementsShareAKey() {
+        Envelope before = insert(List.of(element("a", 0)));
+        Envelope after = insert(List.of(element("a", 1), element("a", 2)));
+        List<Envelope> out = port("sku", null).transform(new Envelope(
+                Op.UPDATE, 2L, "orders", before.after(), after.after(), null));
+
+        assertThat(out).hasSize(2);
+        assertThat(out).extracting(row -> row.after().get("items"))
+                .containsExactly(element("a", 1), element("a", 2));
+        assertThat(said).singleElement().satisfies(coded -> {
+            assertThat(coded.code()).isEqualTo(TransformError.UNWIND_ROWS_SHARE_A_KEY);
+            assertThat(coded.code().severity()).isEqualTo(Severity.WARNING);
+        });
+    }
+
     /**
      * Numbering the elements gives every one of them a different key by construction, so the same
      * two elements stop clashing. Held here because it is the fix the message recommends, and a
