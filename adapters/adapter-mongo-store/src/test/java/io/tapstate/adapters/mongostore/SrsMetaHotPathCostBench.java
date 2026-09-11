@@ -37,10 +37,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * the source reads nothing further while they are outstanding: their sum is the run's floor, and the
  * reciprocal of that sum is the ceiling on how fast changes can be taken.
  *
- * <p>Two axes grow the document, and they grow it for reasons nothing trims: a consumer offset per
- * pipeline sharing the chain, and a schema version per DDL the source has ever emitted. Both are
- * walked here rather than assumed, because a read whose cost does not move with the document is a
- * different problem from one that does, and only the second gets worse in a long-lived deployment.
+ * <p>Two axes grow the document: a consumer offset per pipeline sharing the chain, and a schema
+ * version per DDL the source has emitted — the second until the record's history reaches the bound it
+ * keeps its entries under, the first for as long as the pipelines exist. Both are walked here rather
+ * than assumed, because a read whose cost does not move with the document is a different problem from
+ * one that does, and both move it in a long-lived deployment.
  *
  * <p>The absent read is the floor every other number sits on: it carries no document back, so what is
  * left is the round trip and the lookup. Reading a real number as the record's own cost without taking
@@ -65,9 +66,9 @@ class SrsMetaHotPathCostBench {
     private static final List<Integer> CONSUMERS = List.of(1, 4, 16);
 
     /**
-     * Schema versions in the record's append-only history — one per DDL the source has emitted. This
-     * axis only ever grows, so it is the one that decides what the read costs after a year rather than
-     * on the day the chain was made.
+     * Schema versions in the record's history — one per DDL the source has emitted. This axis grows
+     * until the record's history bound is reached, so it is the one that decides what the read costs on
+     * a long-lived chain rather than on the day the chain was made.
      */
     private static final List<Integer> DDLS = List.of(0, 50, 500);
 
@@ -153,9 +154,9 @@ class SrsMetaHotPathCostBench {
      * elsewhere that counts the calls rather than timing them.
      *
      * <p>Two shapes, and the pair is the point. A chain with no schema history is what a young one looks
-     * like; one with five hundred entries is what a long-lived one becomes, since nothing trims that
-     * history. If the projection is doing its job the two rates are close, and if it ever stops the
-     * second collapses.
+     * like; one with five hundred entries is what a long-lived one carries, the record's budget holding
+     * several times that many. If the projection is doing its job the two rates are close, and if it ever
+     * stops the second collapses.
      *
      * <p>What this does not include: any connector, any Jet vertex, any ring. It is the coordination
      * record's own ceiling -- the thing that has to be higher than the rate a source can deliver, not

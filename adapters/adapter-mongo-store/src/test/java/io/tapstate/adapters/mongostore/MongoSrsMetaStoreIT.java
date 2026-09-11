@@ -9,7 +9,11 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.BsonBinaryWriter;
 import org.bson.Document;
+import org.bson.codecs.DocumentCodec;
+import org.bson.codecs.EncoderContext;
+import org.bson.io.BasicOutputBuffer;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -18,6 +22,8 @@ import org.testcontainers.utility.DockerImageName;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -38,6 +44,16 @@ class MongoSrsMetaStoreIT {
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final String CHAIN = "orders@mysql-1";
     private static final Instant WRITTEN_AT = Instant.parse("2026-09-03T10:12:44Z");
+
+    /** The hard ceiling on one stored document: 16 MiB. What fits under it is derived, never assumed. */
+    private static final long DOCUMENT_CEILING = 16L * 1024 * 1024;
+
+    /**
+     * Columns of the wide table the history case drives: as wide as a table gets, so that a few hundred
+     * versions of it weigh past what one document carries and the case reaches that size in writes a test
+     * can afford rather than in thousands of them.
+     */
+    private static final int WIDE_COLUMNS = 1_000;
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
@@ -377,6 +393,53 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * A chain keeps recording schema changes after its history has passed what one document can carry, and
+     * what survives is the newest run of versions.
+     *
+     * <p>The record is one document and the schema history is the only facet of it that grows for the life
+     * of a chain, so the write that records a schema change is the write that has to make room for itself —
+     * there is nothing else in the record to give up. This drives the store's own mutator past the point
+     * where every version appended would fit in one document, and holds the shape of what is left: the
+     * newest versions, contiguous, and more than the one just appended. A bound that kept only that one
+     * would leave every change already read unresolvable, and a bound that dropped entries from anywhere
+     * else would leave versions that never were adjacent looking as though they were.
+     */
+    @Test
+    void aChainKeepsRecordingSchemaChangesPastTheCeilingItsWholeHistoryWouldHaveReached() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            // Measured, not assumed: what one entry costs is a function of the table's width, so the count
+            // that reaches the ceiling is derived from the entry's own stored bytes and the case keeps
+            // meaning what it says if that shape ever moves.
+            long entryBytes = bsonSize(MongoSrsMetaStore.toDocument(new SrsMeta(CHAIN, null, List.of(),
+                    null, List.of(new SchemaVersion(1, wideSchema(), 1)), null, 0L, 0L, null)));
+            int appended = (int) (3 * DOCUMENT_CEILING / (2 * entryBytes));
+            assertThat(entryBytes * appended)
+                    .as("the premise: %d versions of this shape are %d bytes of history between them, past "
+                                    + "the %d-byte ceiling one document may take, so a chain that kept them "
+                                    + "all would have stopped recording schema changes partway through",
+                            appended, entryBytes * appended, DOCUMENT_CEILING)
+                    .isGreaterThan(DOCUMENT_CEILING);
+
+            for (int version = 1; version <= appended; version++) {
+                store.appendSchemaVersion(CHAIN, new SchemaVersion(version, wideSchema(), version));
+            }
+
+            List<SchemaVersion> retained = store.read(CHAIN).orElseThrow().schemaHistory();
+            List<Long> versions = retained.stream().map(SchemaVersion::version).toList();
+
+            assertThat(versions)
+                    .as("the oldest versions are dropped -- %d of the %d appended survive -- and what "
+                                    + "survives is the newest run of them: a contiguous window of the "
+                                    + "history, ending at the version just appended",
+                            versions.size(), appended)
+                    .hasSizeGreaterThan(1)
+                    .hasSizeLessThan(appended)
+                    .isEqualTo(newestRun(versions.size(), appended));
+        });
+    }
+
     @Test
     void mutateOnAnUnminedChainIsAnOrderingError() {
         // every mutator requires the chain to have been seeded by create first; a mutate on an unseeded
@@ -556,6 +619,32 @@ class MongoSrsMetaStoreIT {
             assertThat(store.read(CHAIN).orElseThrow().sourceRead())
                     .isEqualTo(new ChainPosition(null, "gtid:aaa-1:77"));
         });
+    }
+
+    /** The newest {@code kept} of the {@code appended} versions, in the order they were appended. */
+    private static List<Long> newestRun(int kept, int appended) {
+        List<Long> versions = new ArrayList<>();
+        for (int version = appended - kept + 1; version <= appended; version++) {
+            versions.add((long) version);
+        }
+        return versions;
+    }
+
+    /** A table's field schema at the width the history case drives. */
+    private static Map<String, Object> wideSchema() {
+        Map<String, Object> schema = new LinkedHashMap<>();
+        for (int i = 0; i < WIDE_COLUMNS; i++) {
+            schema.put("column_" + i, Map.of("type", "varchar", "length", 255, "nullable", true));
+        }
+        return schema;
+    }
+
+    /** Encodes a document to BSON to get its stored size, which is the size the ceiling is counted in. */
+    private static long bsonSize(Document document) {
+        BasicOutputBuffer buffer = new BasicOutputBuffer();
+        new DocumentCodec().encode(
+                new BsonBinaryWriter(buffer), document, EncoderContext.builder().build());
+        return buffer.getPosition();
     }
 
     /** The single consumer cursor on the test chain — the shape the per-consumer advance tests read back. */

@@ -17,12 +17,13 @@ import java.util.List;
  * {@link ConsumerOffset} — carrying that pipeline's cursor, its acked position and which tables it has
  * finished loading), {@code cdcStartPosition} (the opaque position the cdc tail starts from,
  * recorded at the snapshot-to-cdc seam; absent until a snapshot seam or start point resolves it),
- * {@code schemaHistory} (the append-only versioned schema), {@code retention} (the retention
- * configuration passed through from the source; a config value only — the change ring is bounded by
- * its capacity and backpressure, not trimmed by this), {@code epoch} (the change ring's current
- * generation, zero until one is opened), {@code snapshotEpoch} (the generation the recorded snapshot
- * began in, zero until a snapshot records its seam) and {@code sourceReadAt} (when {@code sourceRead} was
- * last written, absent on a record whose offset predates the stamp).
+ * {@code schemaHistory} (the versioned schema, appended to on a schema change and bounded by what the
+ * store retains of it), {@code retention} (the retention configuration passed through from the source; a
+ * config value only — the change ring is bounded by its capacity and backpressure, not trimmed by this),
+ * {@code epoch} (the change ring's current generation, zero until one is opened), {@code snapshotEpoch}
+ * (the generation the recorded snapshot began in, zero until a snapshot records its seam) and
+ * {@code sourceReadAt} (when {@code sourceRead} was last written, absent on a record whose offset
+ * predates the stamp).
  *
  * <p>{@code sourceReadAt} is here for the reader, not for the run: nothing branches on it. What it answers
  * is how old the recorded position is, which is the one thing that decides whether resuming from it is
