@@ -92,6 +92,14 @@ class AddCmdTest {
         assertThat(r.err()).contains("add: --kind must");
     }
 
+    @Test
+    void addRejectsAnEmptyResourceKind() {
+        Run r = run("add", "");
+
+        assertThat(r.code()).isEqualTo(NewCmd.EXIT_USAGE);
+        assertThat(r.err()).contains("add: provide a resource kind");
+    }
+
     private static String[] concat(String[] first, String[] second) {
         String[] result = new String[first.length + second.length];
         System.arraycopy(first, 0, result, 0, first.length);
