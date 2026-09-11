@@ -480,5 +480,19 @@ final class WorkbenchShellPanel {
                 delegate.write(values, offset, length);
             }
         }
+
+        @Override
+        public void flush() throws IOException {
+            if (delegate != null) {
+                delegate.flush();
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (delegate != null) {
+                delegate.close();
+            }
+        }
     }
 }
