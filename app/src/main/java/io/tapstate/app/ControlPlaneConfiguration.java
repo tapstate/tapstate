@@ -443,8 +443,9 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SourceConnectionResolver sourceConnectionResolver(ArtifactStore artifactStore) {
-        return new SourceConnectionResolver(artifactStore);
+    SourceConnectionResolver sourceConnectionResolver(
+            ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView) {
+        return new SourceConnectionResolver(artifactStore, connectorCatalogView::merged);
     }
 
     @Bean
