@@ -15,10 +15,11 @@ import org.jline.reader.LineReaderBuilder;
 import org.jline.reader.UserInterruptException;
 import org.jline.builtins.InteractiveCommandGroup;
 import org.jline.builtins.PosixCommandGroup;
-import org.jline.picocli.PicocliCommandRegistry;
+import org.jline.shell.Command;
 import org.jline.shell.Shell;
 import org.jline.shell.ShellBuilder;
 import org.jline.shell.impl.DefaultCommandDispatcher;
+import org.jline.shell.impl.SimpleCommandGroup;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.utils.AttributedStringBuilder;
@@ -37,6 +38,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -4223,16 +4225,10 @@ final class Repl {
     }
 
     private Shell buildEmbeddedShell(Terminal terminal) throws IOException {
-        PicocliCommandRegistry registry = new PicocliCommandRegistry(commandLine) {
-            @Override
-            public String name() {
-                return "Tapstate";
-            }
-        };
         return Shell.builder()
                 .terminal(terminal)
                 .prompt(Repl::embeddedPrompt)
-                .groups(registry, new PosixCommandGroup(), new InteractiveCommandGroup())
+                .groups(tapstateCommandGroup(), new PosixCommandGroup(), new InteractiveCommandGroup())
                 .helpCommands(true)
                 .commandHighlighter(false)
                 .variable(LineReader.LIST_MAX, 50)
@@ -4243,6 +4239,45 @@ final class Repl {
                     terminal.handle(Terminal.Signal.INT, signal -> cancelStream());
                 })
                 .build();
+    }
+
+    private SimpleCommandGroup tapstateCommandGroup() {
+        LinkedHashSet<String> names = new LinkedHashSet<>(commandLine.getSubcommands().keySet());
+        names.addAll(List.of("connect", "disconnect", "login", "logout", ":ctx", "version"));
+        names.removeAll(Set.of(
+                "help", "exit", "quit", "cd", "pwd", "echo", "cat", "ls", "grep", "head", "tail", "wc",
+                "sort", "date", "sleep", "clear", "nano", "less", "more", "history"));
+        List<Command> commands = names.stream().map(this::tapstateCommand).toList();
+        return new SimpleCommandGroup("Tapstate", commands);
+    }
+
+    private Command tapstateCommand(String name) {
+        return new Command() {
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            public String description() {
+                CommandLine child = commandLine.getSubcommands().get(name);
+                if (child == null) {
+                    return "Tapstate interactive command";
+                }
+                String[] description = child.getCommandSpec().usageMessage().description();
+                return description.length == 0 ? "Tapstate command" : description[0];
+            }
+
+            @Override
+            public Object execute(org.jline.shell.CommandSession session, String[] arguments) {
+                List<String> words = new ArrayList<>(arguments.length + 1);
+                words.add(name);
+                words.addAll(List.of(arguments));
+                dispatch(words);
+                session.setLastExitCode(lastExitCode);
+                return null;
+            }
+        };
     }
 
     private static String embeddedPrompt() {
