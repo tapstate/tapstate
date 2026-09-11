@@ -10,6 +10,7 @@ enum McpError implements TapstateErrorCode {
 
     CONNECTOR_SPEC_UNAVAILABLE("mcp.connector-spec-unavailable", Set.of("connector")),
     ENVIRONMENT_MISSING("mcp.environment-missing", Set.of("variable")),
+    INVALID_SERVER_RESPONSE("mcp.invalid-server-response", Set.of("operation")),
     SERVER_REJECTED("mcp.server-rejected", Set.of("status"));
 
     private final String code;

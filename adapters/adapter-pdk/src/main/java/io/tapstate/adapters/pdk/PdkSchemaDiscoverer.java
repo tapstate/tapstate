@@ -3,6 +3,8 @@ package io.tapstate.adapters.pdk;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.SchemaDiscoverer;
+import io.tapstate.core.common.TapstateType;
+import io.tapdata.entity.schema.type.TapType;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
@@ -171,11 +173,21 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
         return new SourceModel(mapped);
     }
 
+    /**
+     * One discovered column, carrying what the connector declared, what that resolved to, and - where
+     * nothing did - the mapping's own attribution rather than a restatement of it. This is the point at
+     * which the connector is still open, and afterwards nobody can tell the several unknowns apart.
+     */
+    private static SourceField field(String name, String dataType, TapType declared) {
+        PdkTypeMapping.Resolved resolved = PdkTypeMapping.resolve(declared);
+        return new SourceField(name, dataType, resolved.type(), resolved.unknownBecause());
+    }
+
     private static List<SourceField> fields(TapTable table) {
         List<SourceField> fields = new ArrayList<>();
         if (table.getNameFieldMap() != null) {
             table.getNameFieldMap().forEach((name, field) ->
-                    fields.add(new SourceField(name, field.getDataType(), PdkTypeMapping.of(field.getTapType()))));
+                    fields.add(field(name, field.getDataType(), field.getTapType())));
         }
         return fields;
     }

@@ -12,6 +12,11 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
+import com.hazelcast.jet.core.test.TestInbox;
+import com.hazelcast.jet.core.test.TestOutbox;
+import com.hazelcast.jet.core.test.TestProcessorContext;
+import com.hazelcast.jet.core.test.TestProcessorMetaSupplierContext;
+import com.hazelcast.jet.core.test.TestProcessorSupplierContext;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.Embed;
@@ -105,6 +110,72 @@ class TheSendWindowAPipelineRunsOnIsTheOneItWasGivenTest {
                 .describedAs("the control: with the window taken out, the sends are the changes - so the "
                         + "run below is measuring the window rather than how the source happened to batch")
                 .hasSize(CHANGES);
+    }
+
+    @Test
+    void withNoWindowEveryChangeReachesTheSinkWhenTheAssemblerMissesTwoSourceTurns() throws Exception {
+        DAG dag = job(NestSettings.defaults().withSendWindow(documentNamespace(false), 0), false);
+        var assemblerSpec = NestTopology.compile("p", "order_doc", body(false), tables()::get).assembler();
+        Processor source = resolve(dag.getVertex("orders").getMetaSupplier());
+        Processor assembler = resolve(dag.getVertex(assemblerSpec.name()).getMetaSupplier());
+        Processor sink = resolve(dag.getVertex("serve.sync_1").getMetaSupplier());
+        TestOutbox sourceOut = new TestOutbox(128);
+        TestOutbox assemblerOut = new TestOutbox(128);
+        source.init(sourceOut, new TestProcessorContext());
+        assembler.init(assemblerOut, new TestProcessorContext());
+        sink.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext());
+        TestInbox pending = new TestInbox();
+        List<Envelope> emitted = new ArrayList<>();
+        int rootOrdinal = assemblerSpec.inbound().indexOf(assemblerSpec.inboundFor(List.of()));
+        try {
+            for (int seq = 0; seq < CHANGES; seq++) {
+                // Use the control's actual source: one emission per turn, still 20 ms apart.
+                assertThat(source.complete()).isEqualTo(seq == CHANGES - 1);
+                List<Envelope> turn = new ArrayList<>();
+                sourceOut.drainQueueAndReset(0, turn, false);
+                assertThat(turn).hasSize(1);
+                emitted.addAll(turn);
+                pending.addAll(turn);
+                // Model a descheduled assembler while the second and third source turns run.
+                // Source pacing does not guarantee a downstream drain between those turns.
+                if (seq == 1) {
+                    continue;
+                }
+                assembler.process(rootOrdinal, pending);
+                assertThat(pending.isEmpty()).isTrue();
+                assertThat(assembler.tryProcess()).isTrue();
+                TestInbox documents = new TestInbox();
+                assemblerOut.drainQueueAndReset(0, documents.queue(), false);
+                sink.process(0, documents);
+                assertThat(documents.isEmpty()).isTrue();
+            }
+            assertThat(assembler.complete()).isTrue();
+            TestInbox tail = new TestInbox();
+            assemblerOut.drainQueueAndReset(0, tail.queue(), false);
+            sink.process(0, tail);
+            assertThat(tail.isEmpty()).isTrue();
+            assertThat(sink.complete()).isTrue();
+
+            assertThat(emitted).extracting(event -> event.after().get("name"))
+                    .containsExactly("name-0", "name-1", "name-2", "name-3", "name-4", "name-5");
+            assertThat(WRITTEN)
+                    .describedAs("the no-window control must count all six changes even when the assembler "
+                            + "misses two paced source turns; every processor has completed, so this is not a late tail")
+                    .hasSize(CHANGES);
+        } finally {
+            source.close();
+            assembler.close();
+            sink.close();
+        }
+    }
+
+    private Processor resolve(ProcessorMetaSupplier meta) throws Exception {
+        var address = member.getCluster().getLocalMember().getAddress();
+        meta.init(new TestProcessorMetaSupplierContext()
+                .setHazelcastInstance(member).setTotalParallelism(1).setLocalParallelism(1));
+        ProcessorSupplier supplier = meta.get(List.of(address)).apply(address);
+        supplier.init(new TestProcessorSupplierContext().setHazelcastInstance(member));
+        return supplier.get(1).iterator().next();
     }
 
     @Test

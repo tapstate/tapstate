@@ -7,6 +7,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.SchemaDiscoverer;
+import io.tapdata.entity.schema.type.TapRaw;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
@@ -74,6 +75,34 @@ class PdkSchemaDiscovererTest {
         assertThat(model.tables().get(0).fields())
                 .extracting(SourceField::type)
                 .containsExactly(TapstateType.INT64, TapstateType.DECIMAL);
+    }
+
+    /** A spec that declares one of the two columns, so the other reaches the mapping unresolved. */
+    private static final String PARTIAL_SPEC = """
+            {"dataTypes": {"int": {"to": "TapNumber", "bit": 32}}}""";
+
+    @Test
+    void carriesTheMappingsOwnAttributionForAColumnThatResolvedToNothing(@TempDir Path dir) {
+        // The connector is open exactly here and nowhere after, so which unknown a column is has to
+        // leave with it. A discoverer that answered with a remark of its own instead - "the type did not
+        // resolve" - would be discarding the only fact that says whether the mapping is short a case,
+        // and the connector it came from cannot be asked again.
+        ConnectorRef ref = new ConnectorRef(
+                List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null,
+                PARTIAL_SPEC);
+        SchemaDiscoverer discoverer = new PdkSchemaDiscoverer(connectorId -> ref);
+
+        SourceModel model = discoverer.discover(config());
+
+        SourceField unresolved = model.tables().get(0).fields().get(1);
+        assertThat(unresolved.type()).isEqualTo(TapstateType.UNKNOWN);
+        assertThat(unresolved.unknownBecause())
+                .as("the attribution is the mapping's own, not a restatement made after the fact")
+                .isEqualTo(PdkTypeMapping.resolve(new TapRaw()).unknownBecause())
+                .contains("TapRaw");
+        assertThat(model.tables().get(0).fields().get(0).unknownBecause())
+                .as("a column that did resolve is attributed to nothing")
+                .isNull();
     }
 
     @Test

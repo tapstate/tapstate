@@ -30,6 +30,10 @@ public enum ControlError implements TapstateErrorCode {
      */
     AUDIT_BLOCKED("control.audit-blocked", Set.of("op")),
 
+    /** Artifacts committed, but one pipeline's model refresh was skipped or only partly completed. */
+    SCHEMA_DERIVATION_INCOMPLETE("control.schema-derivation-incomplete",
+            Set.of("pipeline", "causeCode", "causeParams")),
+
     /**
      * The zero-user bootstrap channel was reached from a non-loopback caller and refused. It carries no
      * placeholder on purpose: a remote caller is refused before the user table is consulted, so this
@@ -89,7 +93,7 @@ public enum ControlError implements TapstateErrorCode {
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return this == SCHEMA_DERIVATION_INCOMPLETE ? Severity.WARNING : Severity.ERROR;
     }
 
     @Override

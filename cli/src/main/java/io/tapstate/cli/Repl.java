@@ -3442,7 +3442,14 @@ final class Repl {
 
     /**
      * What a pipeline's join steps derive their output columns to be, three sides at a time, and — with
-     * {@code --accept} — the one act that takes today's answer as the shape to hold them to from here.
+     * {@code --accept} — the one act that re-reads the sources and takes today's answer as the shape to
+     * hold them to from here.
+     *
+     * <p><b>{@code --accept} is the whole of "the database is the truth".</b> A pipeline holds its own
+     * copy of what its sources were discovered to be, so that the shape of a run's input cannot move
+     * under a run already using it; this is the act that re-takes that copy and works every step below
+     * it out again. Refused while a job is carrying the pipeline: the run is safe either way, but a
+     * record that no longer describes the job going on is not.
      *
      * <p>The accept is a flag on this verb rather than one on {@code start} deliberately. What makes the
      * check worth having is the one moment a person looks at the difference and decides; a flag on the
@@ -3476,7 +3483,7 @@ final class Repl {
                     found.steps().forEach(step -> renderDerivedStep(out, step));
                 }
                 if (accept) {
-                    out.println("accepted: the columns above are what the next start is held to");
+                    out.println("accepted: the sources were re-read, and the columns above are what the next start is held to");
                 }
                 out.flush();
                 yield Cli.EXIT_OK;
@@ -4496,15 +4503,35 @@ final class Repl {
      */
     private int version() {
         String serverLine;
+        String dslLine = null;
+        String dataLine = null;
         if (!session.isConnected()) {
             serverLine = "not connected";
         } else {
-            String reported = controlPlane.serverVersion(session.landingNode());
-            serverLine = (reported == null ? "not reported" : reported)
+            ControlPlaneClient.ServerVersion reported =
+                    controlPlane.serverVersionDetail(session.landingNode());
+            serverLine = (reported == null ? "not reported" : reported.version())
                     + " (" + hostPort(session.landingNode()) + ")";
+            dslLine = grammarLine(reported);
+            dataLine = reported == null || reported.dataVersion() == null
+                    ? "not reported"
+                    : String.valueOf(reported.dataVersion());
         }
-        VersionCmd.render(commandLine.getOut(), serverLine);
+        VersionCmd.render(commandLine.getOut(), serverLine, dslLine, dataLine);
         return Cli.EXIT_OK;
+    }
+
+    /**
+     * Three answers, kept apart because two of them would otherwise read as the third: a server that did
+     * not send the field, one that sent an empty list -- it accepts no authoring grammar at all, which is
+     * a fact and not a silence -- and one that named some. A blank after the label is the shape that
+     * reads as agreement, so nothing here ever prints one.
+     */
+    private static String grammarLine(ControlPlaneClient.ServerVersion reported) {
+        if (reported == null || reported.dslVersions() == null) {
+            return "not reported";
+        }
+        return reported.dslVersions().isEmpty() ? "none" : String.join(", ", reported.dslVersions());
     }
 
     /** Clears the connection back to offline; a benign line either way, never an error. */

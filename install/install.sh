@@ -255,7 +255,8 @@ install_bundle() {
        && [ ! -f "$bundle_root/libexec/tapstate-mcp.jar" ]; then
         die "the downloaded bundle did not contain an MCP sidecar."
     fi
-    mkdir -p "$install_dir"
+    # Newly created parents include ~/.tapstate, which the context and auth stores require owner-only.
+    (umask 077; mkdir -p "$install_dir")
     mkdir -p "$install_dir/versions"
     staged="$install_dir/versions/.tapstate-$version.$$"
     mkdir "$staged"
@@ -280,6 +281,11 @@ install_bundle() {
     mv -f "$staged_link" "$install_dir/tapstate"
     staged_link=""
     install_alias "$install_dir" "$version"
+    # Prune old bundles only after both command links have moved to the complete new bundle.
+    for old_bundle in "$install_dir/versions"/*; do
+        [ -d "$old_bundle" ] || continue
+        [ "$old_bundle" = "$final" ] || rm -rf "$old_bundle"
+    done
 }
 
 # `tap` is a convenience shortcut, never a second command: `tapstate` is what every document, message

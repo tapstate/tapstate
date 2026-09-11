@@ -361,18 +361,27 @@ final class SpecGenerator {
         size.put("description", "List lengths by path.");
         size.put("additionalProperties", length);
 
+        Map<String, Object> absent = new LinkedHashMap<>();
+        absent.put("type", "array");
+        absent.put("description", "Paths that must not be there at all - the only thing here a wider "
+                + "document fails, since every value and length is satisfied by a document carrying "
+                + "extra fields beside them.");
+        absent.put("minItems", 1);
+        absent.put("items", scalar("string", "A path that must not be present."));
+
         // LinkedHashMap on purpose: Map.of iterates in a per-JVM salted order, and a generated
         // artifact whose key order changes between runs can never match its checked-in copy.
         Map<String, Object> docProperties = new LinkedHashMap<>();
         docProperties.put("where", where);
         docProperties.put("expect", expect);
         docProperties.put("size", size);
+        docProperties.put("absent", absent);
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("type", "object");
         body.put("additionalProperties", false);
         body.put("required", List.of("where"));
-        body.put("description", "One document, located and read at the endpoint itself. Carry expect or "
-                + "size - a doc that expects nothing checks nothing.");
+        body.put("description", "One document, located and read at the endpoint itself. Carry expect, "
+                + "size or absent - a doc that expects nothing checks nothing.");
         body.put("properties", docProperties);
         // Said in the description above and enforced here too, because the two are read by different
         // readers: an author reads the description, and everything that completes or validates a
@@ -380,7 +389,8 @@ final class SpecGenerator {
         // schema admits is the schema telling that reader the document is fine right up until the run.
         body.put(
                 "anyOf",
-                List.of(Map.of("required", List.of("expect")), Map.of("required", List.of("size"))));
+                List.of(Map.of("required", List.of("expect")), Map.of("required", List.of("size")),
+                        Map.of("required", List.of("absent"))));
 
         Map<String, Object> keyedByTable = new LinkedHashMap<>();
         keyedByTable.put("type", "object");
@@ -497,8 +507,10 @@ final class SpecGenerator {
                     + "these rows were never going to appear in any document, so a pipeline discarding all "
                     + "of them and one discarding none have the same counts, state and code.";
             case DOC -> "One document at an endpoint, located by equality settings and held to scalar "
-                    + "values by path and list lengths by path - what makes 'the right rows crossed' "
-                    + "assertable rather than only 'rows crossed'.";
+                    + "values by path, list lengths by path, and paths that must not be there at all - "
+                    + "what makes 'the right rows crossed' assertable rather than only 'rows crossed'. "
+                    + "The last of the three is the only one a wider document fails: every value and "
+                    + "length is satisfied by a document carrying extra fields beside them.";
             case ERROR_COUNT -> "The pipeline's published error count, read from the metrics face: one "
                     + "while it is FAILED, zero otherwise.";
             case FAILURE_CODE -> "The canonical code of the failure the pipeline published, read from the "

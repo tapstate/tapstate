@@ -155,7 +155,15 @@ enum ActuationError implements TapstateErrorCode {
      * written into: the store is resolved by its id alone, and materializing a view into a database an
      * author is capturing from writes into one the deployment does not own.
      */
-    VIEW_STORE_IS_A_CAPTURE_SOURCE("actuation.view-store-is-a-capture-source", Set.of("store"));
+    VIEW_STORE_IS_A_CAPTURE_SOURCE("actuation.view-store-is-a-capture-source", Set.of("store")),
+
+    /**
+     * A model refresh was requested before the pipeline was at rest. Both actual and desired states
+     * matter: an actual run may still be stopping, or a new run may already have been requested.
+     * A paused run also retains its assembly, which a resume with an unchanged artifact may reuse.
+     */
+    SCHEMA_SYNC_WHILE_RUNNING("actuation.schema-sync-while-running",
+            Set.of("pipeline", "state", "desired"));
 
     private final String code;
     private final Set<String> placeholders;

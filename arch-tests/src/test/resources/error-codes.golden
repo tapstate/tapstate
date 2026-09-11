@@ -12,6 +12,7 @@ actuation.join-source-key-missing
 actuation.join-source-not-declared
 actuation.not-a-pipeline
 actuation.pipeline-not-found
+actuation.schema-sync-while-running
 actuation.source-schema-not-discovered
 actuation.source-table-ambiguous
 actuation.source-table-not-discovered
@@ -121,6 +122,7 @@ control.bootstrap-closed
 control.bootstrap-forbidden
 control.forbidden
 control.malformed-request
+control.schema-derivation-incomplete
 control.unauthenticated
 control.unreachable
 data-browser.connector-not-browsable
@@ -159,7 +161,9 @@ engine.frontier-order-not-encodable
 engine.frontier-pinned
 engine.job-failed
 engine.no-such-job
+io.document-too-large
 io.document-unreadable
+io.schema-read-contention
 io.store-unauthorized
 io.store-unavailable
 lifecycle.illegal-transition
@@ -169,6 +173,7 @@ lifecycle.purge-state-not-stated
 lifecycle.unknown-pipeline
 mcp.connector-spec-unavailable
 mcp.environment-missing
+mcp.invalid-server-response
 mcp.server-rejected
 migration.changeset-failed
 migration.data-newer-than-binary
@@ -209,6 +214,7 @@ position.field-not-editable
 position.nothing-to-write
 position.write-back-while-live
 role.unsupported
+schema.column-name-reads-as-a-path
 source.already-exists
 source.id-mismatch
 source.in-use

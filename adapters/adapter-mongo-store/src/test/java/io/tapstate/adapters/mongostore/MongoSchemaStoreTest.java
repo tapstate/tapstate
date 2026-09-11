@@ -11,7 +11,10 @@ import io.tapstate.spi.store.SourceTable;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Stream;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
@@ -49,14 +52,37 @@ class MongoSchemaStoreTest {
         return new DiscoveredSourceModel(connectionId, "mysql", 1783998000000L, model);
     }
 
+    /** The envelope this build writes for a discovery, under a generation the test fixes. */
+    private static Document envelopeOf(DiscoveredSourceModel discovered) {
+        return MongoSchemaStore.envelope(discovered, "gen-1");
+    }
+
+    /** The table documents this build writes for a discovery, in discovery order. */
+    private static List<Document> tableDocsOf(DiscoveredSourceModel discovered) {
+        List<Document> tables = new ArrayList<>();
+        for (SourceTable table : discovered.model().tables()) {
+            tables.add(MongoSchemaStore.tableDocument(table));
+        }
+        return tables;
+    }
+
+    /** A discovery encoded and read straight back, the way a save and a get carry it between them. */
+    private static DiscoveredSourceModel roundTrip(DiscoveredSourceModel discovered) {
+        return MongoSchemaStore.toDiscovered(envelopeOf(discovered), tableDocsOf(discovered));
+    }
+
     @Test
     void documentCarriesIdConnectorIdDiscoveredAtAndTables() {
-        Document document = MongoSchemaStore.toDocument(discovered("orders-db", ordersModel()));
+        DiscoveredSourceModel envelope = discovered("orders-db", ordersModel());
+        Document document = envelopeOf(envelope);
 
         assertThat(document.getString("_id")).isEqualTo("orders-db");
         assertThat(document.getString("connectorId")).isEqualTo("mysql");
         assertThat(document.getLong("discoveredAt")).isEqualTo(1783998000000L);
-        List<Document> tables = document.getList("tables", Document.class);
+        assertThat(document.getString(MongoSchemaStore.GENERATION)).isEqualTo("gen-1");
+        // The tables are documents of their own now, so the envelope must not carry them as well.
+        assertThat(document.get("tables")).isNull();
+        List<Document> tables = tableDocsOf(envelope);
         assertThat(tables).extracting(t -> t.getString("name")).containsExactly("orders", "customers");
 
         Document orders = tables.get(0);
@@ -75,14 +101,14 @@ class MongoSchemaStoreTest {
     void roundTripReconstructsTheSameEnvelope() {
         DiscoveredSourceModel envelope = discovered("orders-db", ordersModel());
 
-        assertThat(MongoSchemaStore.toDiscovered(MongoSchemaStore.toDocument(envelope))).isEqualTo(envelope);
+        assertThat(roundTrip(envelope)).isEqualTo(envelope);
     }
 
     @Test
     void emptyModelRoundTrips() {
         DiscoveredSourceModel envelope = discovered("bare", new SourceModel(List.of()));
 
-        assertThat(MongoSchemaStore.toDiscovered(MongoSchemaStore.toDocument(envelope))).isEqualTo(envelope);
+        assertThat(roundTrip(envelope)).isEqualTo(envelope);
     }
 
     @Test
@@ -90,7 +116,7 @@ class MongoSchemaStoreTest {
         DiscoveredSourceModel envelope = discovered("x", new SourceModel(List.of(
                 new SourceTable("t", List.of(new SourceField("c", null)), List.of(), List.of()))));
 
-        DiscoveredSourceModel read = MongoSchemaStore.toDiscovered(MongoSchemaStore.toDocument(envelope));
+        DiscoveredSourceModel read = roundTrip(envelope);
 
         SourceField field = read.model().tables().get(0).fields().get(0);
         assertThat(field.dataType()).isNull();
@@ -106,7 +132,7 @@ class MongoSchemaStoreTest {
                 List.of(),
                 List.of()))));
 
-        DiscoveredSourceModel read = MongoSchemaStore.toDiscovered(MongoSchemaStore.toDocument(envelope));
+        DiscoveredSourceModel read = roundTrip(envelope);
 
         assertThat(read.model().tables().get(0).fields().get(0).type())
                 .as("the resolution happens once, at discovery, so the store has to carry it")
@@ -118,15 +144,58 @@ class MongoSchemaStoreTest {
         // A document written before discovery resolved types carries the declared type and no resolved one.
         // The model is a derived observation a re-discovery replaces, so an older document is read, not
         // refused - and what it is read as must be unknown rather than any type that would be acted on.
-        Document stored = MongoSchemaStore.toDocument(discovered("x", new SourceModel(List.of(
-                new SourceTable("t", List.of(new SourceField("amount", "decimal(18,4)")), List.of(), List.of())))));
-        List<Document> tables = stored.getList("tables", Document.class);
+        DiscoveredSourceModel stored = discovered("x", new SourceModel(List.of(
+                new SourceTable("t", List.of(new SourceField("amount", "decimal(18,4)")), List.of(), List.of()))));
+        List<Document> tables = tableDocsOf(stored);
         tables.get(0).getList("fields", Document.class).get(0).remove("tapstateType");
 
-        DiscoveredSourceModel read = MongoSchemaStore.toDiscovered(stored);
+        DiscoveredSourceModel read = MongoSchemaStore.toDiscovered(envelopeOf(stored), tables);
 
         assertThat(read.model().tables().get(0).fields().get(0).type()).isEqualTo(TapstateType.UNKNOWN);
         assertThat(read.model().tables().get(0).fields().get(0).dataType()).isEqualTo("decimal(18,4)");
+    }
+
+    @Test
+    void theThreeWaysAStoredFieldComesBackWithoutATypeAreToldApart() {
+        // Three different problems arriving as one value: a record from before types were kept needs a
+        // re-discovery, a spelling this build has no type for is a compatibility break, and a stored
+        // unknown that never said which unknown it was is a record from before the reason existed.
+        // Read as one text they all say "the type did not resolve", which is the one nobody acts on.
+        DiscoveredSourceModel stored = discovered("x", new SourceModel(List.of(
+                new SourceTable("t", List.of(new SourceField("amount", "decimal(18,4)")), List.of(), List.of()))));
+
+        List<Document> beforeTypes = tableDocsOf(stored);
+        beforeTypes.get(0).getList("fields", Document.class).get(0).remove("tapstateType");
+        List<Document> notAType = tableDocsOf(stored);
+        notAType.get(0).getList("fields", Document.class).get(0).append("tapstateType", "GEOGRAPHY");
+        List<Document> unattributed = tableDocsOf(stored);
+        unattributed.get(0).getList("fields", Document.class).get(0).remove("unknownBecause");
+
+        List<String> reasons = Stream.of(beforeTypes, notAType, unattributed)
+                .map(tables -> MongoSchemaStore.toDiscovered(envelopeOf(stored), tables))
+                .map(read -> read.model().tables().get(0).fields().get(0).unknownBecause())
+                .toList();
+
+        assertThat(reasons).doesNotContainNull();
+        assertThat(Set.copyOf(reasons)).as("three routes, three attributions").hasSize(3);
+        assertThat(reasons.get(1)).as("the spelling is what names the break").contains("GEOGRAPHY");
+    }
+
+    @Test
+    void theReasonWrittenAtDiscoveryOutlivesTheRecordRatherThanBeingReplaced() {
+        // The connector was open when the reason was worked out and is not now, so nothing here could
+        // arrive at it again. Overwriting it with a storage-side remark turns every such column into
+        // "the record was read", which is the fact of least use to whoever has to fix something.
+        DiscoveredSourceModel stored = discovered("x", new SourceModel(List.of(
+                new SourceTable("t", List.of(new SourceField("shape", "geometry", TapstateType.UNKNOWN,
+                        "the connector's TapRaw has no member in the tapstate type namespace")),
+                        List.of(), List.of()))));
+
+        DiscoveredSourceModel read =
+                MongoSchemaStore.toDiscovered(envelopeOf(stored), tableDocsOf(stored));
+
+        assertThat(read.model().tables().get(0).fields().get(0).unknownBecause())
+                .isEqualTo("the connector's TapRaw has no member in the tapstate type namespace");
     }
 
     @Test
@@ -134,7 +203,7 @@ class MongoSchemaStoreTest {
         DiscoveredSourceModel envelope = discovered("x", new SourceModel(List.of(
                 new SourceTable("orders", List.of(), List.of(), List.of(), 4_200_000L))));
 
-        DiscoveredSourceModel read = MongoSchemaStore.toDiscovered(MongoSchemaStore.toDocument(envelope));
+        DiscoveredSourceModel read = roundTrip(envelope);
 
         assertThat(read.model().tables().get(0).approximateRowCount()).isEqualTo(4_200_000L);
         assertThat(read).isEqualTo(envelope);
@@ -145,18 +214,19 @@ class MongoSchemaStoreTest {
         // A document written before discovery counted rows carries no count at all. Read as zero it
         // would describe every table discovered until now as empty, which is the one answer a reader
         // sizing something off it would act on.
-        Document stored = MongoSchemaStore.toDocument(discovered("x", new SourceModel(List.of(
-                new SourceTable("orders", List.of(), List.of(), List.of(), 4_200_000L)))));
-        stored.getList("tables", Document.class).get(0).remove("approximateRowCount");
+        DiscoveredSourceModel stored = discovered("x", new SourceModel(List.of(
+                new SourceTable("orders", List.of(), List.of(), List.of(), 4_200_000L))));
+        List<Document> tables = tableDocsOf(stored);
+        tables.get(0).remove("approximateRowCount");
 
-        DiscoveredSourceModel read = MongoSchemaStore.toDiscovered(stored);
+        DiscoveredSourceModel read = MongoSchemaStore.toDiscovered(envelopeOf(stored), tables);
 
         assertThat(read.model().tables().get(0).approximateRowCount()).isNull();
     }
 
     @Test
     void aStoredDocumentCarriesTheStampThatSaysItsTypesAreResolved() {
-        Document document = MongoSchemaStore.toDocument(
+        Document document = envelopeOf(
                 new DiscoveredSourceModel("conn_1", "mysql", 1000L, ordersModel()));
 
         assertThat(MongoSchemaStore.carriesResolvedTypes(document)).isTrue();
@@ -185,7 +255,7 @@ class MongoSchemaStoreTest {
         // cannot tell it from a document that predates the resolution. Read that way, an empty source
         // would stay undiscoverable however often it is discovered - and "discovered nothing" has to
         // stay a different answer from "not discovered".
-        Document document = MongoSchemaStore.toDocument(
+        Document document = envelopeOf(
                 new DiscoveredSourceModel("conn_1", "mysql", 1000L, new SourceModel(List.of())));
 
         assertThat(MongoSchemaStore.carriesResolvedTypes(document)).isTrue();
@@ -194,7 +264,8 @@ class MongoSchemaStoreTest {
     @Test
     void toDiscoveredWithAnAbsentTablesFieldReadsBackEmpty() {
         DiscoveredSourceModel read = MongoSchemaStore.toDiscovered(
-                new Document("_id", "bare").append("connectorId", "mysql").append("discoveredAt", 1L));
+                new Document("_id", "bare").append("connectorId", "mysql").append("discoveredAt", 1L),
+                List.of());
 
         assertThat(read.model().tables()).isEmpty();
     }
@@ -203,7 +274,7 @@ class MongoSchemaStoreTest {
     void toDiscoveredOnADocumentMissingItsConnectorIdIsDocumentUnreadable() {
         Document corrupt = new Document("_id", "orders-db").append("discoveredAt", 1L);
 
-        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(corrupt));
+        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(corrupt, List.of()));
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         TapstateException coded = (TapstateException) thrown;
@@ -215,7 +286,7 @@ class MongoSchemaStoreTest {
     void toDiscoveredOnADocumentWithoutANumericDiscoveredAtIsDocumentUnreadable() {
         Document corrupt = new Document("_id", "orders-db").append("connectorId", "mysql").append("discoveredAt", "oops");
 
-        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(corrupt));
+        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(corrupt, List.of()));
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
@@ -225,10 +296,10 @@ class MongoSchemaStoreTest {
     void toDiscoveredOnATableMissingItsNameIsDocumentUnreadable() {
         Document corrupt = new Document("_id", "orders-db")
                 .append("connectorId", "mysql")
-                .append("discoveredAt", 1L)
-                .append("tables", List.of(new Document("fields", List.of())));
+                .append("discoveredAt", 1L);
 
-        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(corrupt));
+        Throwable thrown = catchThrowable(() ->
+                MongoSchemaStore.toDiscovered(corrupt, List.of(new Document("fields", List.of()))));
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         TapstateException coded = (TapstateException) thrown;
@@ -237,13 +308,15 @@ class MongoSchemaStoreTest {
     }
 
     @Test
-    void toDiscoveredOnATablesFieldThatIsNotAListIsDocumentUnreadable() {
+    void toDiscoveredOnATablesFieldsThatAreNotAListIsDocumentUnreadable() {
+        // The tables themselves arrive already separated, so the array-shaped guard is now reachable
+        // through what a table document holds rather than through the envelope.
         Document corrupt = new Document("_id", "orders-db")
                 .append("connectorId", "mysql")
-                .append("discoveredAt", 1L)
-                .append("tables", "oops");
+                .append("discoveredAt", 1L);
 
-        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(corrupt));
+        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(
+                corrupt, List.of(new Document("name", "orders").append("fields", "oops"))));
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
@@ -253,11 +326,10 @@ class MongoSchemaStoreTest {
     void toDiscoveredOnAnIndexMissingItsNameIsDocumentUnreadable() {
         Document corrupt = new Document("_id", "orders-db")
                 .append("connectorId", "mysql")
-                .append("discoveredAt", 1L)
-                .append("tables", List.of(
-                        new Document("name", "orders").append("indexes", List.of(new Document("unique", true)))));
+                .append("discoveredAt", 1L);
 
-        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(corrupt));
+        Throwable thrown = catchThrowable(() -> MongoSchemaStore.toDiscovered(corrupt, List.of(
+                new Document("name", "orders").append("indexes", List.of(new Document("unique", true))))));
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);

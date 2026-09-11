@@ -32,6 +32,9 @@ actuation.join-output-schema-source-changed:
 actuation.join-output-schema-engine-changed:
   message: "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and neither the query nor the source columns changed - what changed is how we work them out ({recordedBy} -> {nowBy}). Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}."
   solution: "Please report this - it is a compatibility break on our side that our own release checks should have caught before you ever saw it. To carry on, run `derived-schema {pipeline}` to see what moved, rebuild the target table for the new column types, then `derived-schema {pipeline} --accept`. Read the difference first: a type that narrowed loses data on the next write, which is a deliberate decision and not a formality. Staying on the version you were running is the other way out."
+actuation.schema-sync-while-running:
+  message: "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now."
+  solution: "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."
 actuation.view-key-missing:
   message: "View `{view}` declares no primary key."
   solution: "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."
@@ -348,6 +351,12 @@ io.store-unauthorized:
 io.document-unreadable:
   message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."
+io.schema-read-contention:
+  message: "The schema for connection '{connectionId}' changed during every read attempt."
+  solution: "Wait for re-discovery to finish, then retry."
+io.document-too-large:
+  message: "The record for '{id}' no longer fits in one stored document."
+  solution: "The store is healthy and retrying will not help. Reduce what is held under this one id."
 connector.not-official:
   message: "Runtime registration supports these connectors today: {official}. '{connector}' is not among them yet."
   solution: "Register one of the connectors listed above. The supported set grows as connectors complete certification, so an artifact refused here is not necessarily faulty."
@@ -435,6 +444,9 @@ connector.state-unreadable:
 connector.state-value-unsupported:
   message: "This connector tried to keep a value of type {type}, which cannot be stored."
   solution: "Report this against the connector: it is the connector's own state that cannot be held, not anything in your pipeline."
+control.schema-derivation-incomplete:
+  message: "The artifacts were applied, but the model refresh for pipeline `{pipeline}` did not finish: {causeCode} {causeParams}. Its models may be unchanged or partially refreshed."
+  solution: "Resolve the reported cause, then apply again, even if the artifact content is unchanged. Stop the pipeline and wait until it is at rest if a live run blocked the refresh. Inspect `derived-schema {pipeline}` before starting, and use `derived-schema {pipeline} --accept` only after reviewing any remaining drift."
 control.audit-blocked:
   message: "Operation '{op}' was refused because its required audit record could not be written."
   solution: "An audited operation must leave an audit record before it runs; check the store is reachable and healthy, then retry."
@@ -486,6 +498,9 @@ mcp.connector-spec-unavailable:
 mcp.environment-missing:
   message: "Environment variable {variable} is required by the Source config."
   solution: "Inject the variable into the MCP process environment and retry the connection operation."
+mcp.invalid-server-response:
+  message: "The Tapstate Server returned an invalid response for MCP operation {operation}."
+  solution: "Verify that the MCP sidecar and Server use compatible control contracts, then retry."
 mcp.server-rejected:
   message: "The Tapstate Server rejected the request with HTTP status {status} without a structured error code."
   solution: "Inspect the Server logs and verify that the MCP sidecar and Server use compatible control contracts."
@@ -660,6 +675,9 @@ nest.state-far-exceeds-memory-budget:
 nest.capacity-estimate-incomplete:
   message: "Nest level {embedPath} of pipeline {pipeline} could be sized from {counted} of the {total} inputs feeding it; the rest report no row count, so what was estimated is a floor."
   solution: "Discover the sources feeding that level so their tables report row counts, then apply again to have it sized on all of them."
+schema.column-name-reads-as-a-path:
+  message: "Pipeline {pipeline} writes column {column} of table {table} to {target}, which reads a dot in a key as a step into a nested document rather than as part of a name."
+  solution: "The rows cross correctly and the key is really written, but a read for {column} on {target} answers nothing unless the dot is escaped, and no index can be declared over it at all, because an index key is written in that same path syntax. If it is a column you will query or index, rename it in {source}, or give it a name without a dot in a map step before it is written."
 # Connector-supplied connection-test diagnostics.
 #
 # The connector API's typed test exceptions carry translation keys rather than sentences, and the

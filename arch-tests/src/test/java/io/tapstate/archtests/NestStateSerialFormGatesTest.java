@@ -1,5 +1,7 @@
 package io.tapstate.archtests;
 
+import io.tapstate.runtime.engine.nest.NestBinding;
+import io.tapstate.runtime.engine.nest.NestStore;
 import io.tapstate.runtime.engine.nest.ParkedSubtree;
 import io.tapstate.runtime.engine.nest.ResolverState;
 import io.tapstate.runtime.engine.nest.RootAssembly;
@@ -22,6 +24,7 @@ import java.util.Comparator;
 import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -59,18 +62,40 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class NestStateSerialFormGatesTest {
 
-    /** The two values a state map holds. Everything the stored bytes contain is reached from one of them. */
-    // Three roots, not two: a subtree between documents is written to a store of its own and read back by
-    // whatever build is running when the document that was owed it takes it, which is every reason the other
-    // two are here. Left out, the next change to it would go unnoticed until a hand-over that had outlived a
-    // deploy came back unreadable - from inside a read of state, reported as something else entirely.
+    /** The value roots of every state store, plus the address used to store parked subtrees. */
+    // Lookup rows and reverse references currently hold only JDK containers and business values. Keep
+    // their roots here so replacing either with a state class cannot leave that class outside the gate.
     private static final List<Class<?>> WHAT_IS_STORED =
-            List.of(RootAssembly.class, ResolverState.class, ParkedSubtree.class, ParkedSubtree.At.class);
+            List.of(RootAssembly.class, ResolverState.class, ParkedSubtree.class, ParkedSubtree.At.class,
+                    Map.class, Set.class);
 
     /** Ours to pin; anything outside it is a JDK type or user data that carries its own identity. */
     private static final String OURS = "io.tapstate.";
 
     private static final Path GOLDEN = Path.of("src", "test", "resources", "nest-state-shape.golden");
+
+    @Test
+    @DisplayName("every nest store declares a root covered by the state shape gate")
+    void everyNestStoreHasARootInTheShapeGate() {
+        var stores = Arrays.stream(NestBinding.NestStores.class.getDeclaredMethods())
+                .filter(method -> method.getReturnType() == NestStore.class)
+                .toList();
+        assertThat(stores).as("the store binding must expose persisted state to this check").isNotEmpty();
+        List<String> uncovered = stores.stream()
+                .filter(method -> {
+                    Type value = ((ParameterizedType) method.getGenericReturnType()).getActualTypeArguments()[0];
+                    Type root = value instanceof ParameterizedType parameterized ? parameterized.getRawType() : value;
+                    return !WHAT_IS_STORED.contains(root);
+                })
+                .map(method -> method.getName() + " -> "
+                        + ((ParameterizedType) method.getGenericReturnType()).getActualTypeArguments()[0].getTypeName())
+                .sorted()
+                .toList();
+        assertThat(uncovered)
+                .as("every state namespace needs a root even when its value is currently a JDK container; "
+                        + "otherwise replacing that container with a state class can leave its shape unpinned")
+                .isEmpty();
+    }
 
     @Test
     @DisplayName("positive control: a type that has not pinned its serial identity is still detected")
@@ -135,7 +160,8 @@ class NestStateSerialFormGatesTest {
      */
     private static Set<Class<?>> whatTheStoredBytesReach() {
         Set<Class<?>> reached = new LinkedHashSet<>();
-        Deque<Class<?>> toVisit = new ArrayDeque<>(WHAT_IS_STORED);
+        Deque<Class<?>> toVisit = new ArrayDeque<>();
+        WHAT_IS_STORED.forEach(root -> collect(root, toVisit));
         while (!toVisit.isEmpty()) {
             Class<?> type = toVisit.removeFirst();
             if (!reached.add(type)) {

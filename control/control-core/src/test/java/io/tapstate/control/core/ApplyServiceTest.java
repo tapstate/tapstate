@@ -52,7 +52,7 @@ class ApplyServiceTest {
     private final RecordingAuditStore auditStore = new RecordingAuditStore();
     private final ApplyService service = new ApplyService(
             TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
-            PlanAdvisories.none());
+            PlanAdvisories.none(), SchemaDerivation.none());
 
     /** An audit store that captures every record it is asked to write. */
     private static final class RecordingAuditStore implements AuditStore {
@@ -97,7 +97,7 @@ class ApplyServiceTest {
         actual.put("p1", PipelineState.RUNNING);
         ApplyService guarded = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
-                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), new LivePipelines(desired, actual));
 
         assertThatThrownBy(() -> guarded.apply("author", List.of(draft(UNBUFFERED_SRC))))
                 .isInstanceOfSatisfying(TapstateException.class, refused ->
@@ -114,7 +114,7 @@ class ApplyServiceTest {
         actual.put("p1", PipelineState.STOPPED);
         ApplyService guarded = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
-                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), new LivePipelines(desired, actual));
 
         guarded.apply("author", List.of(draft(UNBUFFERED_SRC)));
 
@@ -218,7 +218,7 @@ class ApplyServiceTest {
         actual.put("p1", state);
         return new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
-                new EmptySchemaStore(), PlanAdvisories.none(), new LivePipelines(desired, actual));
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), new LivePipelines(desired, actual));
     }
 
     /** A pipeline reading that source, in the minimal valid shape. */
@@ -407,7 +407,7 @@ class ApplyServiceTest {
         registered.add(CatalogEntryReader.read(acmeRow("cdc")));
         Supplier<TapstateCatalog> live = () -> TapstateCatalog.merged(TapstateCatalog.load(), List.copyOf(registered));
         ApplyService liveService = new ApplyService(
-                live, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), PlanAdvisories.none());
+                live, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
 
         assertThatCode(() -> liveService.plan(List.of(draft(ACME_CDC_SOURCE)))).doesNotThrowAnyException();
 
@@ -492,7 +492,7 @@ class ApplyServiceTest {
     @Test
     void aNullCatalogIsRejected() {
         assertThatThrownBy(() -> new ApplyService(
-                null, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), PlanAdvisories.none()))
+                null, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -500,7 +500,7 @@ class ApplyServiceTest {
     void aNullStoreIsRejected() {
         assertThatThrownBy(() -> new ApplyService(
                 TapstateCatalog::load, null, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
-                PlanAdvisories.none()))
+                PlanAdvisories.none(), SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -531,6 +531,94 @@ class ApplyServiceTest {
         assertThat(second.outcomes()).singleElement()
                 .extracting(ArtifactOutcome::change).isEqualTo(ArtifactOutcome.Change.UNCHANGED);
         assertThat(store.saveCount).as("re-applying unchanged content performs no second write").isEqualTo(1);
+    }
+
+    @Test
+    void aNullDerivationIsRejected() {
+        assertThatThrownBy(() -> new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void everyPipelineInTheBatchIsRederivedEvenWhenTheApplyWroteNothing() {
+        // The whole reason this hangs off the batch rather than off the write. A pipeline holds its own
+        // copy of what its sources were discovered to be, and the case that most needs refreshing is a
+        // source moving under a pipeline nobody edited - which leaves the pipeline's content hash
+        // byte-identical, so the write is skipped. Keyed on the write, the refresh would be silent in
+        // exactly that case. The second apply below writes nothing and must still derive.
+        List<String> derived = new ArrayList<>();
+        ApplyService deriving = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), derived::add);
+        List<ArtifactDraft> batch = List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY));
+        deriving.apply("alice", batch);
+        derived.clear();
+
+        ApplyResult second = deriving.apply("alice", batch);
+
+        assertThat(second.outcomes()).extracting(ArtifactOutcome::change)
+                .containsOnly(ArtifactOutcome.Change.UNCHANGED);
+        // The pipeline, and only the pipeline: a source and a target have no derived model of their own,
+        // and deriving one would file a record under an id that is not a pipeline's.
+        assertThat(derived).containsExactly("ora2my_ods");
+    }
+
+    @Test
+    void aPostCommitRefreshFailureWarnsAndStillRefreshesLaterPipelines() {
+        List<String> attempted = new ArrayList<>();
+        List<String> refreshed = new ArrayList<>();
+        boolean[] fail = {true};
+        ValidationDiagnostic advisory = new ValidationDiagnostic("control.unreachable", Map.of());
+        ApplyService deriving = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                (resources, discovered) -> List.of(advisory), pipeline -> {
+                    attempted.add(pipeline);
+                    if (fail[0] && pipeline.equals("ora2my_ods")) {
+                        throw new TapstateException(ArtifactError.NOT_FOUND, Map.of("id", "missing_model"), null);
+                    }
+                    refreshed.add(pipeline);
+                });
+        List<ArtifactDraft> batch = List.of(draft(SRC_ORA), draft(PIPELINE),
+                draft(PIPELINE.replace("ora2my_ods", "second_pipeline")), draft(TGT_MY));
+
+        ApplyResult first = deriving.apply("alice", batch);
+
+        assertThat(first.outcomes()).hasSize(4).allSatisfy(outcome ->
+                assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
+        assertThat(store.list()).hasSize(4);
+        assertThat(attempted).containsExactly("ora2my_ods", "second_pipeline");
+        assertThat(refreshed).containsExactly("second_pipeline");
+        assertThat(first.warnings()).hasSize(2).contains(advisory);
+        assertThat(first.warnings().get(1)).satisfies(warning -> {
+            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.params()).containsEntry("pipeline", "ora2my_ods")
+                    .containsEntry("causeCode", ArtifactError.NOT_FOUND.code())
+                    .containsEntry("causeParams", Map.of("id", "missing_model"));
+        });
+
+        fail[0] = false;
+        attempted.clear();
+        refreshed.clear();
+        ApplyResult retried = deriving.apply("alice", batch);
+
+        assertThat(retried.outcomes()).hasSize(4).allSatisfy(outcome ->
+                assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.UNCHANGED));
+        assertThat(retried.warnings()).containsExactly(advisory);
+        assertThat(refreshed).containsExactly("ora2my_ods", "second_pipeline");
+        assertThat(store.saveCount).isEqualTo(4);
+    }
+
+    @Test
+    void aProgrammerFailureDuringRefreshIsNotConvertedToAnAdvisory() {
+        IllegalStateException bug = new IllegalStateException("broken derivation invariant");
+        ApplyService deriving = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), pipeline -> { throw bug; });
+
+        assertThatThrownBy(() -> deriving.apply("alice",
+                List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY)))).isSameAs(bug);
     }
 
     @Test
@@ -734,7 +822,7 @@ class ApplyServiceTest {
         // control.audit-blocked and nothing reaches the artifact store.
         ApplyService refusing = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(new FailingAuditStore(), FIXED_CLOCK),
-                new EmptySchemaStore(), PlanAdvisories.none());
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
 
         Throwable t = catchThrowable(() -> refusing.apply("alice", List.of(draft(TGT_MY))));
 
@@ -747,7 +835,7 @@ class ApplyServiceTest {
     @Test
     void aNullAuditGateIsRejected() {
         assertThatThrownBy(() -> new ApplyService(
-                TapstateCatalog::load, store, null, new EmptySchemaStore(), PlanAdvisories.none()))
+                TapstateCatalog::load, store, null, new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -756,7 +844,7 @@ class ApplyServiceTest {
         // The row-expression type check is not optional: a service built without a schema store would
         // silently skip it, and skipping it is exactly the state the check exists to end.
         assertThatThrownBy(() -> new ApplyService(
-                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), null, PlanAdvisories.none()))
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), null, PlanAdvisories.none(), SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -858,7 +946,7 @@ class ApplyServiceTest {
         // A service built without one would silently answer "nothing to report" for every batch, which
         // is indistinguishable from a clean batch — the assembly must name the no-op pass to get it.
         assertThatThrownBy(() -> new ApplyService(
-                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), null))
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), null, SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -871,7 +959,7 @@ class ApplyServiceTest {
     private ApplyService advisedBy(PlanAdvisories advisories) {
         return new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
-                advisories);
+                advisories, SchemaDerivation.none());
     }
 
     // ---- optimistic concurrency: an optional per-draft precondition on apply ----

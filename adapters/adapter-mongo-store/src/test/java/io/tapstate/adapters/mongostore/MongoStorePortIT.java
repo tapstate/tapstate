@@ -120,7 +120,9 @@ class MongoStorePortIT {
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_LAYOUTS).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.CONNECTIONS).countDocuments()).isEqualTo(1);
-                assertThat(database.getCollection(MongoStorePort.SOURCE_SCHEMAS).countDocuments()).isEqualTo(1);
+                // Two, not one: a discovery is an envelope naming the generation plus a document per table it
+                // found - the single table saved above. It still says the model landed here and nowhere else.
+                assertThat(database.getCollection(MongoStorePort.SOURCE_SCHEMAS).countDocuments()).isEqualTo(2);
                 assertThat(database.getCollection(MongoStorePort.CONNECTOR_ARTIFACTS + ".files").countDocuments())
                         .isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.CONNECTOR_SPECS).countDocuments()).isEqualTo(1);

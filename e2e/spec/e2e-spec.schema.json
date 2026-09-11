@@ -422,7 +422,7 @@
                 "required": [
                   "where"
                 ],
-                "description": "One document, located and read at the endpoint itself. Carry expect or size - a doc that expects nothing checks nothing.",
+                "description": "One document, located and read at the endpoint itself. Carry expect, size or absent - a doc that expects nothing checks nothing.",
                 "properties": {
                   "where": {
                     "type": "object",
@@ -455,6 +455,15 @@
                       "description": "How many elements the list at this path holds.",
                       "minimum": 0
                     }
+                  },
+                  "absent": {
+                    "type": "array",
+                    "description": "Paths that must not be there at all - the only thing here a wider document fails, since every value and length is satisfied by a document carrying extra fields beside them.",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "description": "A path that must not be present."
+                    }
                   }
                 },
                 "anyOf": [
@@ -466,6 +475,11 @@
                   {
                     "required": [
                       "size"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "absent"
                     ]
                   }
                 ]

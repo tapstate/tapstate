@@ -18,6 +18,7 @@ import java.util.Optional;
 final class InMemoryDerivedSchemaStore implements DerivedSchemaStore {
 
     private final Map<String, List<DerivedSchema>> byStep = new LinkedHashMap<>();
+    private final Map<String, Long> pins = new LinkedHashMap<>();
 
     @Override
     public Optional<DerivedSchema> latest(String pipelineId, String stepId) {
@@ -43,8 +44,24 @@ final class InMemoryDerivedSchemaStore implements DerivedSchemaStore {
     }
 
     @Override
+    public void pin(String pipelineId, String stepId, long version) {
+        pins.put(key(pipelineId, stepId), version);
+    }
+
+    @Override
+    public Optional<DerivedSchema> pinned(String pipelineId, String stepId) {
+        Long version = pins.get(key(pipelineId, stepId));
+        if (version == null) {
+            return Optional.empty();
+        }
+        List<DerivedSchema> versions = byStep.getOrDefault(key(pipelineId, stepId), List.of());
+        return versions.stream().filter(recorded -> recorded.version() == version).findFirst();
+    }
+
+    @Override
     public void delete(String pipelineId) {
         byStep.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
+        pins.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
     }
 
     private static String key(String pipelineId, String stepId) {
