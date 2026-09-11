@@ -276,11 +276,10 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
               <buildArgs>
                 <buildArg>--no-fallback</buildArg>
                 <!-- The CPU this binary may assume. Left alone, native-image compiles for x86-64-v3 on
-                     AMD64, which requires AVX, AVX2, BMI1, BMI2 and FMA: no x86-64 machine older than
-                     Haswell (2013) has them, and there the image refuses to start before main() runs,
-                     so there is no exit code the CLI chose and no message it wrote for a caller to
-                     turn into an explanation. `compatibility` is the lowest common denominator on
-                     every architecture, so this one flag stays correct for the arm64 builds too. -->
+                     AMD64, which requires AVX, AVX2, BMI1, BMI2 and FMA, and an image that needs them
+                     refuses to start on a CPU that does not have them. `compatibility` is the lowest
+                     common denominator on every architecture, so this one flag stays correct for the
+                     arm64 builds too; install-smoke.sh checks the native profile still names it. -->
                 <buildArg>-march=compatibility</buildArg>
                 <!-- bundled resources read via getResourceAsStream, declared so the image keeps them -->
                 <buildArg>-H:IncludeResources=catalog/.*\.json</buildArg>
