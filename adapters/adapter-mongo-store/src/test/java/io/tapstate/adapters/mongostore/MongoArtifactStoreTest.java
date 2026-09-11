@@ -59,6 +59,13 @@ class MongoArtifactStoreTest {
               read_mode: cdc_only
             """;
 
+    private static final String EMPTY_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: blank
+            source: []
+            """;
+
     private static final String TRANSFORM = """
             version: tapstate/v1
             kind: transform
@@ -97,6 +104,7 @@ class MongoArtifactStoreTest {
     private static final List<Fixture> FIXTURES = List.of(
             new Fixture("source", "orders", "source", SOURCE),
             new Fixture("pipeline", "orders_sync", "pipeline", PIPELINE),
+            new Fixture("blank pipeline", "blank", "pipeline", EMPTY_PIPELINE),
             new Fixture("transform", "normalize", "transform", TRANSFORM),
             new Fixture("view", "customer_view", "view", VIEW),
             new Fixture("serve", "orders_api", "serve", SERVE));
