@@ -49,11 +49,17 @@ In the CLI session:
 ```text
 connect http://127.0.0.1:8080
 login admin
-apply
+apply src_mysql.tap.yml
+apply tgt_mongo.tap.yml
 discover-schema src_mysql
+apply pipeline.tap.yml
 start unwind_snapshot
 status unwind_snapshot
 ```
+
+Apply the connection resources first, then discover the source before applying the
+pipeline. Its map expression reads `revision`, so applying the entire workspace
+before discovery is refused with `dsl.row-expression-needs-discovery`.
 
 Use the server address and account from your setup. In a MongoDB shell connected
 to the target database, wait for four rows, then inspect both identity and data:
