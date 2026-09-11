@@ -93,6 +93,9 @@ public class CsvConnector implements TapConnector {
      */
     private static final String FAIL_CDC = "fail_cdc";
 
+    /** A test affordance for a saved-source witness: discovery fails when persistence loses this secret. */
+    private static final String REQUIRE_PASSWORD = "require_password";
+
     private static final String SUFFIX = ".csv";
 
     /**
@@ -185,6 +188,9 @@ public class CsvConnector implements TapConnector {
     @Override
     public void discoverSchema(
             TapConnectionContext context, List<String> tables, int tableSize, Consumer<List<TapTable>> consumer) {
+        if (passwordRequired(context) && !passwordPresent(context)) {
+            throw new IllegalArgumentException("this connector requires the 'password' setting");
+        }
         List<TapTable> discovered = new ArrayList<>();
         for (String name : tables.isEmpty() ? tableNames(context) : tables) {
             List<String> header = header(file(context, name));
@@ -638,6 +644,20 @@ public class CsvConnector implements TapConnector {
                 ? null
                 : context.getConnectionConfig().getObject(FAIL_CDC);
         return flag != null && Boolean.parseBoolean(String.valueOf(flag));
+    }
+
+    private static boolean passwordRequired(TapConnectionContext context) {
+        Object flag = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(REQUIRE_PASSWORD);
+        return flag != null && Boolean.parseBoolean(String.valueOf(flag));
+    }
+
+    private static boolean passwordPresent(TapConnectionContext context) {
+        Object password = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject("password");
+        return password != null && !String.valueOf(password).isBlank();
     }
 
     private static Path directory(TapConnectionContext context) {
