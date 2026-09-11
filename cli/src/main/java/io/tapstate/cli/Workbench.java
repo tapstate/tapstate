@@ -239,6 +239,9 @@ final class Workbench {
                 return false;
             }
             if (event instanceof KeyEvent key) {
+                if (key.isKey(dev.tamboui.tui.event.KeyCode.F2)) {
+                    return openActions();
+                }
                 if (key.isKey(dev.tamboui.tui.event.KeyCode.F6) && shellPanel != null) {
                     shellPanel.open();
                     return true;
@@ -482,6 +485,8 @@ final class Workbench {
                         case WorkbenchOverlayState.ContextCreate ignored -> true;
                         case WorkbenchOverlayState.Confirm ignored -> true;
                         case WorkbenchOverlayState.Login ignored -> true;
+                        case WorkbenchOverlayState.Actions actions -> runtime.updateState(state ->
+                                state.withOverlay(actions.select(index)));
                     case WorkbenchOverlayState.Help ignored -> true;
                 };
             }
@@ -499,7 +504,47 @@ final class Workbench {
                 case WorkbenchOverlayState.ContextCreate create -> handleContextCreateKey(create, key);
                 case WorkbenchOverlayState.Confirm confirm -> handleConfirmKey(confirm, key);
                 case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
+                case WorkbenchOverlayState.Actions actions -> handleActionsKey(actions, key);
                 case WorkbenchOverlayState.Help ignored -> true;
+            };
+        }
+
+        private boolean openActions() {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Actions(
+                    List.of(
+                            WorkbenchOverlayState.Actions.Action.CONTEXT,
+                            WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
+                            WorkbenchOverlayState.Actions.Action.REFRESH,
+                            WorkbenchOverlayState.Actions.Action.SHELL),
+                    0)));
+        }
+
+        private boolean handleActionsKey(WorkbenchOverlayState.Actions actions, KeyEvent key) {
+            if (key.isUp() || key.isDown()) {
+                return runtime.updateState(state -> state.withOverlay(actions.select(
+                        actions.selectedIndex() + (key.isUp() ? -1 : 1))));
+            }
+            if (!(key.isSelect() || key.isConfirm())) {
+                return true;
+            }
+            WorkbenchOverlayState.Actions.Action action = actions.actions().get(actions.selectedIndex());
+            return switch (action) {
+                case CONTEXT -> openContextEntry();
+                case AUTHENTICATION -> openAuthEntry();
+                case REFRESH -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    if (refreshCoordinator != null) {
+                        refresh();
+                    }
+                    yield true;
+                }
+                case SHELL -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    if (shellPanel != null) {
+                        shellPanel.open();
+                    }
+                    yield true;
+                }
             };
         }
 
@@ -1029,6 +1074,7 @@ final class Workbench {
                 case WorkbenchOverlayState.ContextCreate create -> create.previous();
                 case WorkbenchOverlayState.Confirm confirm -> confirm.previous();
                 case WorkbenchOverlayState.Login login -> login.previous();
+                case WorkbenchOverlayState.Actions ignored -> Optional.empty();
                 case WorkbenchOverlayState.Help ignored -> Optional.of(new WorkbenchOverlayState.More(2));
                 case WorkbenchOverlayState.More ignored -> Optional.empty();
             };

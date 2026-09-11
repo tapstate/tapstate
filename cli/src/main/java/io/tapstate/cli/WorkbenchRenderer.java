@@ -172,6 +172,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextCreate ignored -> 8;
             case WorkbenchOverlayState.Confirm ignored -> 4;
             case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
+            case WorkbenchOverlayState.Actions actions -> actions.actions().size() + 1;
             case WorkbenchOverlayState.Help ignored -> 6;
         };
         int height = contentRows + 2;
@@ -196,6 +197,7 @@ final class WorkbenchRenderer {
                     renderContextCreate(frame, area, box, create, theme);
             case WorkbenchOverlayState.Confirm confirm -> renderConfirm(frame, area, box, confirm, theme);
             case WorkbenchOverlayState.Login login -> renderLogin(frame, area, box, login, theme);
+            case WorkbenchOverlayState.Actions actions -> renderActions(frame, area, box, actions, theme);
             case WorkbenchOverlayState.Help ignored -> renderHelp(frame, area, box, theme);
         };
     }
@@ -207,6 +209,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextCreate ignored -> "New Context";
             case WorkbenchOverlayState.Confirm confirm -> confirm.title();
             case WorkbenchOverlayState.Login login -> "Sign in to " + login.contextName();
+            case WorkbenchOverlayState.Actions ignored -> "Actions";
             case WorkbenchOverlayState.Help ignored -> "Help";
         };
     }
@@ -329,6 +332,21 @@ final class WorkbenchRenderer {
         login.message().ifPresent(message -> write(
                 frame, box.x() + 2, messageY, message, theme.error(), area));
         return List.of();
+    }
+
+    private static List<OverlayHit> renderActions(
+            Frame frame, Rect area, Rect box, WorkbenchOverlayState.Actions actions, WorkbenchTheme theme) {
+        List<OverlayHit> hits = new ArrayList<>();
+        for (int index = 0; index < actions.actions().size(); index++) {
+            WorkbenchOverlayState.Actions.Action action = actions.actions().get(index);
+            int rowY = box.y() + 1 + index;
+            boolean selected = index == actions.selectedIndex();
+            String line = (selected ? "> " : "  ") + action.label() + "  " + action.description();
+            int width = write(frame, box.x() + 2, rowY, line,
+                    selected ? theme.selection() : theme.base(), area);
+            hits.add(new OverlayHit(index, new Rect(box.x() + 2, rowY, width, 1)));
+        }
+        return List.copyOf(hits);
     }
 
     private static void renderLoginField(
@@ -998,6 +1016,10 @@ final class WorkbenchRenderer {
                     new FooterHint("↑↓", "fields", Optional.empty()),
                     new FooterHint("Enter", login.pending() ? "wait" : "next", Optional.empty()),
                     new FooterHint("Esc", "cancel", Optional.empty()));
+            case WorkbenchOverlayState.Actions ignored -> List.of(
+                    new FooterHint("↑↓", "navigate", Optional.empty()),
+                    new FooterHint("Enter", "run", Optional.empty()),
+                    new FooterHint("Esc", "back", Optional.empty()));
             case WorkbenchOverlayState.Help ignored -> List.of(
                     new FooterHint("Esc", "back", Optional.empty()));
         };

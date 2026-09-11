@@ -11,6 +11,7 @@ sealed interface WorkbenchOverlayState
                 WorkbenchOverlayState.ContextCreate,
                 WorkbenchOverlayState.Confirm,
                 WorkbenchOverlayState.Login,
+                WorkbenchOverlayState.Actions,
                 WorkbenchOverlayState.Help {
 
     record More(int selectedIndex) implements WorkbenchOverlayState {
@@ -157,6 +158,43 @@ sealed interface WorkbenchOverlayState
             SERVER,
             USERNAME,
             PASSWORD
+        }
+    }
+
+    record Actions(List<Action> actions, int selectedIndex) implements WorkbenchOverlayState {
+        public Actions {
+            actions = List.copyOf(actions);
+            if (actions.isEmpty() || selectedIndex < 0 || selectedIndex >= actions.size()) {
+                throw new IllegalArgumentException("Action selection is outside the menu");
+            }
+        }
+
+        Actions select(int index) {
+            int selected = Math.clamp(index, 0, actions.size() - 1);
+            return selected == selectedIndex ? this : new Actions(actions, selected);
+        }
+
+        enum Action {
+            CONTEXT("Context", "Choose or create a context"),
+            AUTHENTICATION("Authentication", "Sign in to the selected server"),
+            REFRESH("Refresh", "Load the latest workspace snapshot"),
+            SHELL("Shell", "Open the embedded command session");
+
+            private final String label;
+            private final String description;
+
+            Action(String label, String description) {
+                this.label = label;
+                this.description = description;
+            }
+
+            String label() {
+                return label;
+            }
+
+            String description() {
+                return description;
+            }
         }
     }
 
