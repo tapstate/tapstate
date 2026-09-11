@@ -167,7 +167,7 @@ class WorkbenchRendererTest {
     }
 
     @Test
-    void overviewGuidesActivationAndAnEmptyWorkspace() {
+    void overviewMakesTheDemoAndExistingServerPathsLegibleForFirstRun() {
         WorkbenchSessionSnapshot session = new WorkbenchSessionSnapshot(
                 Path.of("/work/empty"),
                 Optional.empty(),
@@ -180,8 +180,9 @@ class WorkbenchRendererTest {
         WorkbenchSnapshot snapshot = snapshot(session, new WorkbenchRemoteState.NotConfigured(), List.of());
 
         assertThat(render(100, 28, accepted(snapshot)).text())
-                .contains("Getting started", "Press c to add or choose a Tapstate Server",
-                        "Press a to sign in", "Add a *.tap.yml file to this workspace");
+                .contains("Your first pipeline starts here", "Recommended: run the guided demo",
+                        "tapstate demo -w demo", "cd demo && tapstate", "Or connect an existing Tapstate Server",
+                        "create or choose a context", "sign in when the context is selected");
     }
 
     @Test

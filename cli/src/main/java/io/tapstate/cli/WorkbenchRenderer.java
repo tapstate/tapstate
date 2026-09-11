@@ -674,25 +674,15 @@ final class WorkbenchRenderer {
 
     private static void renderOverview(
             Frame frame, Rect area, WorkbenchSnapshot snapshot, WorkbenchTheme theme) {
+        if (isFirstRun(snapshot)) {
+            renderFirstRunOverview(frame, area, theme);
+            return;
+        }
         WorkbenchOverviewSnapshot overview = snapshot.overview();
         int summaryY = area.bottom() - 4;
         int y = area.y();
-        List<String> guidance = onboardingGuidance(snapshot);
-        if (!guidance.isEmpty()) {
-            write(frame, area.x(), y++, "Getting started", theme.label().bold(), area);
-            for (String step : guidance) {
-                if (y >= summaryY) {
-                    break;
-                }
-                write(frame, area.x(), y++, step, theme.base(), area);
-            }
-            if (y < summaryY) {
-                y++;
-            }
-        }
-        if (y < summaryY) {
-            write(frame, area.x(), y++, "Resources", theme.label().bold(), area);
-        }
+        write(frame, area.x(), y++, "Workspace at a glance", theme.title(), area);
+        write(frame, area.x(), y++, "Resources", theme.label().bold(), area);
         int rowsY = y;
         int kindCapacity = Math.max(0, summaryY - rowsY);
         boolean overflow = overview.kinds().size() > kindCapacity;
@@ -727,19 +717,40 @@ final class WorkbenchRenderer {
                 theme.base(), area);
     }
 
-    private static List<String> onboardingGuidance(WorkbenchSnapshot snapshot) {
-        List<String> guidance = new ArrayList<>();
+    private static boolean isFirstRun(WorkbenchSnapshot snapshot) {
         WorkbenchSessionSnapshot session = snapshot.session();
-        if (session.connection() == WorkbenchConnection.NO_CONTEXT) {
-            guidance.add("Press c to add or choose a Tapstate Server");
-            guidance.add("Press a to sign in after choosing a server");
-        } else if (session.authentication() == WorkbenchAuthentication.SIGNED_OUT) {
-            guidance.add("Press a to sign in");
-        }
-        if (snapshot.workspace().rows().isEmpty()) {
-            guidance.add("Add a *.tap.yml file to this workspace");
-        }
-        return List.copyOf(guidance);
+        return session.connection() == WorkbenchConnection.NO_CONTEXT
+                && snapshot.workspace().rows().isEmpty();
+    }
+
+    private static void renderFirstRunOverview(Frame frame, Rect area, WorkbenchTheme theme) {
+        int x = area.x() + Math.min(4, Math.max(1, area.width() / 16));
+        int y = area.y() + 1;
+        write(frame, x, y++, "○ source   ─────▶   ◉ pipeline", theme.accent(), area);
+        write(frame, x, y++, "Your first pipeline starts here", theme.title(), area);
+        y += 2;
+
+        write(frame, x, y++, "Choose a first route", theme.label().bold(), area);
+        write(frame, x, y++, "▶ Recommended: run the guided demo", theme.label().bold(), area);
+        write(frame, x + 3, y++, "tapstate demo -w demo", theme.success(), area);
+        write(frame, x + 3, y++, "cd demo && tapstate", theme.success(), area);
+        write(frame, x + 3, y++, "It writes a readable workspace for the Workbench to inspect.", theme.muted(), area);
+        y++;
+
+        write(frame, x, y++, "○ Or connect an existing Tapstate Server", theme.base().bold(), area);
+        y = writeKeyInstruction(frame, area, x + 3, y, "c", "create or choose a context", theme);
+        y = writeKeyInstruction(frame, area, x + 3, y, "a", "sign in when the context is selected", theme);
+        y++;
+
+        write(frame, x, y, "The Workspace tab will show local *.tap.yml files when they exist.", theme.muted(), area);
+    }
+
+    private static int writeKeyInstruction(
+            Frame frame, Rect area, int x, int y, String key, String instruction, WorkbenchTheme theme) {
+        int next = x + write(frame, x, y, "Press ", theme.base(), area);
+        next += write(frame, next, y, " " + key + " ", theme.hintKey(), area);
+        write(frame, next, y, " " + instruction, theme.base(), area);
+        return y + 1;
     }
 
     private static List<RowHit> renderTable(
