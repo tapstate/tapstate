@@ -52,14 +52,16 @@ login admin
 apply src_mysql.tap.yml
 apply tgt_mongo.tap.yml
 discover-schema src_mysql
-apply pipeline.tap.yml
+apply
 start unwind_snapshot
 status unwind_snapshot
 ```
 
 Apply the connection resources first, then discover the source before applying the
-pipeline. Its map expression reads `revision`, so applying the entire workspace
-before discovery is refused with `dsl.row-expression-needs-discovery`.
+whole workspace. Its map expression reads `revision`, so applying the entire workspace
+before discovery is refused with `dsl.row-expression-needs-discovery`. After discovery,
+use bare `apply` to submit the pipeline together with both connection definitions;
+applying the pipeline file alone cannot resolve those references in its batch.
 
 Use the server address and account from your setup. In a MongoDB shell connected
 to the target database, wait for four rows, then inspect both identity and data:
