@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.dsl.DiscoveredTable;
 import io.tapstate.core.model.Resource;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -38,5 +39,23 @@ public interface PlanAdvisories {
     /** The pass that finds nothing — what an assembly carrying no advisory rules is wired with. */
     static PlanAdvisories none() {
         return (resources, tablesBySource) -> List.of();
+    }
+
+    /**
+     * Every one of {@code passes} over the same batch, their findings in the order the passes are
+     * named. Composing here rather than at the assembly is what keeps the apply verb holding one
+     * advisory pass however many rules a deployment wires: a second field for a second rule would have
+     * to be added again for the third, and every caller that builds the service would have to be
+     * changed each time.
+     */
+    static PlanAdvisories all(PlanAdvisories... passes) {
+        List<PlanAdvisories> ordered = List.of(passes);
+        return (resources, tablesBySource) -> {
+            List<ValidationDiagnostic> findings = new ArrayList<>();
+            for (PlanAdvisories pass : ordered) {
+                findings.addAll(pass.review(resources, tablesBySource));
+            }
+            return List.copyOf(findings);
+        };
     }
 }

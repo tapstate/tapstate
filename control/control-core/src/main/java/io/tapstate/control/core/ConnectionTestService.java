@@ -26,6 +26,7 @@ public final class ConnectionTestService {
     private final ConnectionTestResultStore resultStore;
     private final AuditGate auditGate;
     private final ConnectorConfigValidator configValidator;
+    private final SourceConnectionResolver sourceConnections;
 
     public ConnectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate) {
@@ -35,10 +36,17 @@ public final class ConnectionTestService {
     public ConnectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator) {
+        this(probe, resultStore, auditGate, configValidator, null);
+    }
+
+    public ConnectionTestService(
+            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
         this.probe = Objects.requireNonNull(probe, "probe");
         this.resultStore = Objects.requireNonNull(resultStore, "resultStore");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.configValidator = configValidator;
+        this.sourceConnections = sourceConnections;
     }
 
     /**
@@ -51,10 +59,12 @@ public final class ConnectionTestService {
      */
     public ConnectionTestReport test(
             String connectionId, String connectorId, Map<String, Object> settings, String principal) {
+        ConnectionConfig config = sourceConnections == null
+                ? new ConnectionConfig(connectionId, connectorId, settings)
+                : sourceConnections.resolve(connectionId, connectorId, settings);
         if (configValidator != null) {
-            configValidator.validate(connectorId, settings);
+            configValidator.validate(config.connectorId(), config.settings());
         }
-        ConnectionConfig config = new ConnectionConfig(connectionId, connectorId, settings);
         return auditGate.dispatch(
                 ControlOperations.CONNECTION_TEST,
                 new AuditContext(principal, config.id()),

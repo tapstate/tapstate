@@ -17,6 +17,8 @@ import java.util.List;
  * from an exhausted script, so it spins forever: no output, no allocation, no timeout. Measured once
  * at nine hours before anyone looked. Past {@link #EXHAUSTED_LIMIT} answers the script cannot supply,
  * this fails instead, naming the question that kept coming back.
+ * The default-carrying choice is the exception: exhausted, it returns the default the caller marked,
+ * which is what an empty reply means there.
  */
 final class ScriptedPrompter implements Prompter {
 
@@ -41,6 +43,9 @@ final class ScriptedPrompter implements Prompter {
     /** The option lists passed to each {@link #choose} call, in order — for asserting what was offered. */
     final List<List<String>> offered = new ArrayList<>();
 
+    /** The questions routed through {@link #ask}, in order — for asserting a question was (not) asked. */
+    final List<String> asked = new ArrayList<>();
+
     /** The questions routed through {@link #secret} — for asserting masked prompting was used. */
     final List<String> secretQuestions = new ArrayList<>();
 
@@ -58,6 +63,7 @@ final class ScriptedPrompter implements Prompter {
     @Override
     public String ask(String question, String defaultValue) {
         questions.add(question);
+        asked.add(question);
         return answers.isEmpty() ? whenExhausted(question, "") : answers.removeFirst();
     }
 
@@ -73,6 +79,12 @@ final class ScriptedPrompter implements Prompter {
         return answers.isEmpty()
                 ? whenExhausted(question, options.get(options.size() - 1))
                 : answers.removeFirst();
+    }
+
+    @Override
+    public String choose(String question, List<String> options, String defaultOption) {
+        offered.add(options);
+        return answers.isEmpty() ? defaultOption : answers.removeFirst();
     }
 
     @Override

@@ -27,24 +27,33 @@ import picocli.CommandLine.Help.Ansi;
 import picocli.CommandLine.Mixin;
 import picocli.CommandLine.Model.CommandSpec;
 import picocli.CommandLine.Option;
+import picocli.CommandLine.Parameters;
 import picocli.CommandLine.Spec;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.function.UnaryOperator;
 
 /**
  * {@code new} — the catalog-driven scaffolding wizard. One entry, two paths that produce the same
- * canonical artifact: an interactive prompt flow (bare {@code new} at a terminal) and a
+ * canonical artifact: an interactive prompt flow ({@code new --kind} at a terminal) and a
  * non-interactive flag-supplied flow (scripting / AI). Both feed a shared output contract: write
  * {@code <id>.tap.yml}, refuse to clobber unless {@code --force}, {@code --dry-run} previews on
  * stdout, and {@code -o json|yaml} reports a structured result envelope.
+ *
+ * <p>Bare {@code new} at a terminal, and {@code new <recipe>}, are the guided first run instead
+ * ({@code docs/first-run/README.md}): which server, then which outcome, then the recipe's own
+ * questions and its files. {@link GuidedNew} carries the two questions and {@link RecipeRun} the
+ * recipe; this class only decides which of the two entries a given invocation is, and reports.
  */
 @Command(name = "new", mixinStandardHelpOptions = true,
         description = "Scaffold a new artifact (source, pipeline, transform, view or serve) as a canonical *.tap.yml.")
@@ -61,9 +70,17 @@ final class NewCmd implements Callable<Integer> {
     @Mixin
     WorkspaceOption workspace;
 
-    @Option(names = {"-y", "--non-interactive"},
+    @Parameters(index = "0", arity = "0..1", paramLabel = "RECIPE",
+            description = "Recipe id from `new --list` (guided first run); omit to be asked at a terminal.")
+    String recipe;
+
+    @Option(names = {"-y", "--yes", "--non-interactive"},
             description = "Never prompt; take every answer from flags (scripting / AI).")
     boolean nonInteractive;
+
+    @Option(names = "--list",
+            description = "Print the recipe catalog (id and title) instead of scaffolding; -o json|yaml for scripts.")
+    boolean list;
 
     @Option(names = "--kind", paramLabel = "KIND",
             description = "Resource kind to scaffold: source, pipeline, transform, view or serve.")
@@ -101,6 +118,57 @@ final class NewCmd implements Callable<Integer> {
             description = "Target source id to sync the pipeline output to (pipeline kind; repeatable).")
     List<String> syncTo = new ArrayList<>();
 
+    @Option(names = "--table", paramLabel = "NAME",
+            description = "The table to mirror (mirrored-table recipe).")
+    String table;
+
+    @Option(names = "--view", paramLabel = "ID",
+            description = "Id of the view the recipe writes (default: the table name).")
+    String view;
+
+    @Option(names = "--keep", paramLabel = "COLS",
+            description = "Columns to put first, comma-separated (reshaped-table recipe; other columns still pass through).")
+    String keep;
+
+    @Option(names = "--rename", paramLabel = "OLD=NEW[,...]",
+            description = "Columns to rename, old=new comma-separated (reshaped-table recipe).")
+    String rename;
+
+    @Option(names = "--drop", paramLabel = "COLS",
+            description = "Columns to drop, comma-separated (reshaped-table recipe).")
+    String drop;
+
+    @Option(names = "--where", paramLabel = "EXPR",
+            description = "Row filter as a CEL expression, e.g. after.region == 'US' (reshaped-table recipe).")
+    String where;
+
+    @Option(names = "--root", paramLabel = "TABLE",
+            description = "The root table (nested-json recipe).")
+    String root;
+
+    @Option(names = "--key", paramLabel = "COL",
+            description = "Key column of the root table (nested-json recipe; default: id).")
+    String key;
+
+    @Option(names = "--child", paramLabel = "SPEC",
+            description = "A child table as <table>:<childcol>=<rootcol>[:array|object][:<path>] "
+                    + "(nested-json recipe; repeatable).")
+    List<String> children = new ArrayList<>();
+
+    @Option(names = "--child-connector", paramLabel = "ID",
+            description = "Connector of the database the child tables sit in, when it is not the root's "
+                    + "(nested-json recipe).")
+    String childConnector;
+
+    @Option(names = "--child-set", paramLabel = "KEY=VALUE",
+            description = "A connection entry of the child tables' database, when it is not the root's "
+                    + "(nested-json recipe; repeatable).")
+    Map<String, String> childSet = new LinkedHashMap<>();
+
+    @Option(names = "--db", paramLabel = "CONNECTOR[,KEY=VALUE...]",
+            description = "One database holding the table (consolidated-table recipe; repeatable, at least two).")
+    List<String> databases = new ArrayList<>();
+
     @Option(names = "--out", paramLabel = "DIR",
             description = "Write the artifact flat into this exact directory, bypassing the workspace layout.")
     String out;
@@ -124,6 +192,23 @@ final class NewCmd implements Callable<Integer> {
     @Override
     public Integer call() {
         PrintWriter err = CliIo.err(spec);
+        if (list) {
+            return callList(err);
+        }
+        if (isGuided()) {
+            return callGuided(err);
+        }
+        if (table != null || view != null) {
+            err.println("new: --table/--view are only valid for the guided first run (new <recipe>)");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        if (hasRecipeShapeFlags()) {
+            err.println("new: --keep/--rename/--drop/--where/--root/--key/--child/--child-connector/--child-set/--db"
+                    + " are only valid for the guided first run (new <recipe>)");
+            err.flush();
+            return EXIT_USAGE;
+        }
         String resolved = kind == null ? "source" : kind;
         if (type != null && !"transform".equals(resolved)) {
             err.println("new: --type is only valid for --kind transform");
@@ -142,6 +227,141 @@ final class NewCmd implements Callable<Integer> {
                 yield EXIT_USAGE;
             }
         };
+    }
+
+    /**
+     * {@code --list} prints the recipe catalog and scaffolds nothing, so every flag that shapes an
+     * artifact is a contradiction rather than an ignorable extra: refused, the way the kind checks refuse.
+     */
+    private int callList(PrintWriter err) {
+        boolean scaffolding = kind != null || type != null || connector != null || id != null || mode != null
+                || primaryKey != null || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty() || out != null
+                || force || dryRun;
+        boolean guided = recipe != null || table != null || view != null || hasRecipeShapeFlags();
+        if (scaffolding || guided) {
+            err.println("new: --list cannot be combined with --kind/--type/--connector/--id/--mode/--set"
+                    + "/--primary-key/--source/--sync-to/--out/--force/--dry-run, a recipe id, or guided flags");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        PrintWriter o = CliIo.out(spec);
+        switch (output) {
+            case JSON -> o.println(JsonOut.write(Recipe.catalogTree()));
+            case YAML -> o.println(YamlOut.write(Recipe.catalogTree()));
+            default -> {
+                // plain text, no colour: this rendering is held to a golden
+                int width = Recipe.CATALOG.stream().mapToInt(r -> r.id().length()).max().orElse(0);
+                for (Recipe recipe : Recipe.CATALOG) {
+                    o.println(String.format("%-" + width + "s  %s", recipe.id(), recipe.title()));
+                }
+            }
+        }
+        o.flush();
+        return 0;
+    }
+
+    /**
+     * The guided first run is what a recipe id names, and what bare {@code new} means when there is
+     * someone to ask and no artifact flag has already picked the single-resource wizard. Bare {@code new}
+     * with nobody to ask keeps falling through to the source wizard's usage message, so a script that
+     * forgot its flags is told which ones.
+     */
+    private boolean isGuided() {
+        if (recipe != null) {
+            return true;
+        }
+        return kind == null && !hasScaffoldingFlags() && guidedInteractive();
+    }
+
+    /** Whether any flag that only one of the shaped recipes reads was given. */
+    private boolean hasRecipeShapeFlags() {
+        return keep != null || rename != null || drop != null || where != null || root != null || key != null
+                || !children.isEmpty() || childConnector != null || !childSet.isEmpty() || !databases.isEmpty();
+    }
+
+    /** Whether any flag that shapes a single artifact was given; {@code -w} and {@code -o} are not ones. */
+    private boolean hasScaffoldingFlags() {
+        return type != null || connector != null || id != null || mode != null || primaryKey != null || !config.isEmpty()
+                || !sources.isEmpty() || !syncTo.isEmpty() || out != null || force || dryRun;
+    }
+
+    /**
+     * Unlike the wizards, an injected prompter does not force questions here: {@code --yes} means never
+     * prompt, whatever is available to prompt with, because a script's promise is exactly that.
+     */
+    private boolean guidedInteractive() {
+        return !nonInteractive && (prompter != null || System.console() != null);
+    }
+
+    /**
+     * A recipe takes {@code --connector}, {@code --set} and {@code --force} in their ordinary meanings;
+     * the flags that shape a single artifact by kind have no reading here and are refused.
+     */
+    private int callGuided(PrintWriter err) {
+        if (kind != null || type != null || id != null || mode != null || !sources.isEmpty() || !syncTo.isEmpty()
+                || primaryKey != null || out != null || dryRun) {
+            err.println("new: a recipe cannot be combined with --kind/--type/--id/--mode"
+                    + "/--primary-key/--source/--sync-to/--out/--dry-run");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        if (recipe != null && Recipe.byId(recipe).isEmpty()) {
+            err.println("new: unknown recipe '" + recipe + "'; run 'new --list' to see the catalog");
+            err.flush();
+            return EXIT_USAGE;
+        }
+        // prose goes to the terminal only when a person is reading it; the machine envelopes stay clean
+        PrintWriter prose = output == OutputFormat.TEXT && guidedInteractive() ? CliIo.out(spec) : null;
+        RecipeRun.Flags flags = new RecipeRun.Flags(connector, config, table, view,
+                new RecipeRun.Flags.Reshape(keep, rename, drop, where),
+                new RecipeRun.Flags.Nested(root, key, children, childConnector, childSet), databases);
+        try {
+            RecipeRun.Result result = guidedInteractive()
+                    ? runGuided(prose, flags)
+                    : runRecipe(new GuidedNew(null, prose).chooseRecipe(recipe), null, flags);
+            emitResult(result);
+            return 0;
+        } catch (RecipeRun.Usage e) {
+            err.println("new: " + e.getMessage());
+            err.flush();
+            return EXIT_USAGE;
+        } catch (TapstateException e) {
+            return emitDiagnostic(e);
+        } catch (IOException e) {
+            // only the terminal the picker is read from can raise this; the recipe itself writes later
+            err.println("new: cannot read from the terminal: " + e.getMessage());
+            err.flush();
+            return EXIT_USAGE;
+        }
+    }
+
+    private RecipeRun.Result runGuided(PrintWriter prose, RecipeRun.Flags flags) throws IOException {
+        if (prompter != null) {
+            return runRecipe(new GuidedNew(prompter, prose).chooseRecipe(recipe), prompter, flags);
+        }
+        try (JLinePrompter jline = JLinePrompter.system()) {
+            return runRecipe(new GuidedNew(jline, prose).chooseRecipe(recipe), jline, flags);
+        }
+    }
+
+    /** The chosen recipe, run. */
+    private RecipeRun.Result runRecipe(String chosen, Prompter asker, RecipeRun.Flags flags) {
+        return RecipeRun.run(chosen, workspace.root(), asker, flags, force);
+    }
+
+    /**
+     * What {@code new} says once the recipe has written: the files and what each is for, the state, the
+     * next steps against the server the directory is now bound to, and the handover line. The server is
+     * read back from the binding rather than from the answer, so the two cannot disagree.
+     */
+    private void emitResult(RecipeRun.Result result) {
+        PrintWriter o = CliIo.out(spec);
+        switch (output) {
+            case JSON -> o.println(JsonOut.write(FirstRunSummary.envelope(result)));
+            case YAML -> o.println(YamlOut.write(FirstRunSummary.envelope(result)));
+            default -> FirstRunSummary.text(o, result);
+        }
+        o.flush();
     }
 
     private int callSource(PrintWriter err) {
