@@ -223,6 +223,12 @@ final class Workbench {
                 if (event instanceof KeyEvent key) {
                     return shellPanel.handle(key);
                 }
+                if (event instanceof MouseEvent mouse) {
+                    return shellPanel.handle(mouse);
+                }
+                if (event instanceof PasteEvent paste) {
+                    return shellPanel.paste(paste.text());
+                }
                 return true;
             }
             if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
