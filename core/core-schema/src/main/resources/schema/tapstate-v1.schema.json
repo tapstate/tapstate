@@ -1138,7 +1138,7 @@
           "default": false
         },
         "element_key": {
-          "description": "Field inside each element that identifies the row that element becomes.",
+          "description": "Field inside each element that identifies its row; also copied into a top-level column of the same name, which joins the parent key at the target.",
           "type": "string"
         },
         "element_type": {

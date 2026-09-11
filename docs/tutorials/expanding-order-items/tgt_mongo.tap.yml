@@ -1,0 +1,5 @@
+version: tapstate/v1
+kind: source
+id: tgt_mongo
+connector: mongodb
+config: { uri: "mongodb://127.0.0.1:27017/unwind_target" }

@@ -94,7 +94,8 @@ public sealed interface TransformBody {
             @Doc(value = "Whether a row whose array is null, missing or empty still produces one "
                     + "output row, that field left empty. Absent drops such rows.", def = "false")
             Boolean preserveNullAndEmptyArrays,
-            @Doc("Field inside each element that identifies the row that element becomes.")
+            @Doc("Field inside each element that identifies its row; also copied into a top-level "
+                    + "column of the same name, which joins the parent key at the target.")
             String elementKey,
             @Doc("Declared type of the expanded column; absent leaves the connector to infer one.")
             String elementType) implements TransformBody {
