@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import dev.tamboui.terminal.Frame;
+import dev.tamboui.layout.Rect;
 import dev.tamboui.tui.TuiConfig;
 import dev.tamboui.tui.TuiRunner;
 import dev.tamboui.tui.event.Event;
@@ -44,7 +45,7 @@ final class Workbench {
             TuiRunner runner = createRunner(backend);
             try {
                 Session workbench = new Session(
-                        runner, session.workbenchDataSource(), session.workbenchActionGateway());
+                        runner, session, session.workbenchDataSource(), session.workbenchActionGateway());
                 try {
                     runner.runLater(workbench::refresh);
                     runner.run(workbench::handleEvent, workbench::render);
@@ -153,11 +154,13 @@ final class Workbench {
         private final WorkbenchActionGateway actionGateway;
         private final RefreshCoordinator refreshCoordinator;
         private final WorkbenchActionCoordinator actionCoordinator;
+        private final WorkbenchShellPanel shellPanel;
         private volatile WorkbenchSnapshot lastSuccessfulSnapshot;
         private WorkbenchRenderer.RenderLayout layout = WorkbenchRenderer.RenderLayout.forTooSmallFrame();
 
         private Session(
                 TuiRunner runner,
+                Repl repl,
                 WorkbenchDataSource dataSource,
                 WorkbenchActionGateway actionGateway) {
             this(new WorkbenchRuntime(
@@ -166,7 +169,8 @@ final class Workbench {
                             runner::isRenderThread,
                             runner::dispatch),
                     dataSource,
-                    actionGateway);
+                    actionGateway,
+                    repl);
         }
 
         Session(WorkbenchRuntime runtime) {
@@ -175,6 +179,7 @@ final class Workbench {
             this.actionGateway = null;
             this.refreshCoordinator = null;
             this.actionCoordinator = null;
+            this.shellPanel = null;
         }
 
         Session(WorkbenchRuntime runtime, WorkbenchDataSource dataSource) {
@@ -185,11 +190,21 @@ final class Workbench {
                 WorkbenchRuntime runtime,
                 WorkbenchDataSource dataSource,
                 WorkbenchActionGateway actionGateway) {
+            this(runtime, dataSource, actionGateway, null);
+        }
+
+        private Session(
+                WorkbenchRuntime runtime,
+                WorkbenchDataSource dataSource,
+                WorkbenchActionGateway actionGateway,
+                Repl repl) {
             this.runtime = Objects.requireNonNull(runtime, "runtime");
             this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
             this.actionGateway = actionGateway;
             this.refreshCoordinator = new RefreshCoordinator(this::publishRefreshResult);
             this.actionCoordinator = actionGateway == null ? null : new WorkbenchActionCoordinator(runtime);
+            this.shellPanel = repl == null ? null : new WorkbenchShellPanel(
+                    repl, runtime::requestRender, runtime::runLater);
         }
 
         boolean handleEvent(Event event, TuiRunner runner) {
@@ -204,6 +219,12 @@ final class Workbench {
                 }
                 return handleOverlayEvent(event, runner);
             }
+            if (shellPanel != null && shellPanel.isOpen()) {
+                if (event instanceof KeyEvent key) {
+                    return shellPanel.handle(key);
+                }
+                return true;
+            }
             if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
                     && runtime.state().workspaceView().editing()) {
                 return handleWorkspaceEditorEvent(event, runner);
@@ -212,6 +233,10 @@ final class Workbench {
                 return false;
             }
             if (event instanceof KeyEvent key) {
+                if (key.isKey(dev.tamboui.tui.event.KeyCode.F6) && shellPanel != null) {
+                    shellPanel.open();
+                    return true;
+                }
                 if (key.isCharIgnoreCase('q') || key.isCtrlC()) {
                     runner.quit();
                     return true;
@@ -317,6 +342,13 @@ final class Workbench {
                         yield false;
                     }
                     runner.quit();
+                    yield true;
+                }
+                case SHELL -> {
+                    if (shellPanel == null) {
+                        yield false;
+                    }
+                    shellPanel.open();
                     yield true;
                 }
                 case BACK -> runtime.updateState(state -> state.selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
@@ -1044,12 +1076,27 @@ final class Workbench {
         }
 
         void render(Frame frame) {
-            layout = WorkbenchRenderer.render(frame, runtime.state());
+            if (shellPanel == null || !shellPanel.isOpen() || runtime.state().overlay().isPresent()
+                    || frame.area().height() < 24) {
+                layout = WorkbenchRenderer.render(frame, runtime.state());
+                return;
+            }
+            int panelHeight = shellPanel.heightFor(frame.area());
+            int mainHeight = frame.area().height() - panelHeight - 1;
+            Rect mainArea = new Rect(frame.area().x(), frame.area().y(), frame.area().width(), mainHeight);
+            layout = WorkbenchRenderer.render(frame, runtime.state(), WorkbenchTheme.dark(), mainArea, false, false);
+            Rect shellArea = new Rect(frame.area().x(), mainArea.bottom(), frame.area().width(), panelHeight);
+            shellPanel.render(frame, shellArea, WorkbenchTheme.dark());
+            shellPanel.renderFooter(frame, new Rect(frame.area().x(), frame.area().bottom() - 1,
+                    frame.area().width(), 1), WorkbenchTheme.dark());
         }
 
         @Override
         public void close() {
             clearOverlaySecret();
+            if (shellPanel != null) {
+                shellPanel.close();
+            }
             if (actionCoordinator != null) {
                 actionCoordinator.close();
             }
