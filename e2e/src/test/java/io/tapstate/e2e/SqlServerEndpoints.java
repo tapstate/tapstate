@@ -54,11 +54,50 @@ final class SqlServerEndpoints extends EnterpriseJdbcEndpoints {
 
     @Override
     void enableChanges(Connection connection, EndpointAddress address, String table) throws SQLException {
+        enableChanges(connection, address, table, Duration.ofSeconds(60));
+    }
+
+    void enableChanges(Connection connection, EndpointAddress address, String table, Duration bound) throws SQLException {
+        long deadline = System.nanoTime() + bound.toNanos();
         try (PreparedStatement statement = connection.prepareStatement(
                 "EXEC sys.sp_cdc_enable_table @source_schema=?, @source_name=?, @role_name=NULL, @supports_net_changes=0")) {
             statement.setString(1, schema(address));
             statement.setString(2, table);
-            statement.execute();
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                statement.setQueryTimeout((int) Math.max(1, (remaining + 999_999_999L) / 1_000_000_000L));
+                try {
+                    statement.execute();
+                    return;
+                } catch (SQLException error) {
+                    if (!agentStarting(error) || System.nanoTime() - deadline >= 0) {
+                        throw error;
+                    }
+                    // CDC job creation can precede Agent readiness even after JDBC accepts connections.
+                    try {
+                        Thread.sleep(Math.min(100, Math.max(1,
+                                Duration.ofNanos(deadline - System.nanoTime()).toMillis())));
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new EnvelopeException("interrupted waiting for SQL Server Agent for " + table, interrupted);
+                    }
+                    if (System.nanoTime() - deadline >= 0) {
+                        throw error;
+                    }
+                }
+            }
         }
+    }
+
+    private static boolean agentStarting(SQLException error) {
+        for (SQLException current = error; current != null; current = current.getNextException()) {
+            if (current.getErrorCode() == 14258
+                    || ((current.getErrorCode() == 22832 || current.getErrorCode() == 22836)
+                    && current.getMessage() != null
+                    && current.getMessage().contains("14258: 'Cannot perform this operation while SQLServerAgent is starting."))) {
+                return true;
+            }
+        }
+        return false;
     }
 }
