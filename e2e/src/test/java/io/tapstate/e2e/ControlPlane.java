@@ -139,12 +139,42 @@ final class ControlPlane {
      * per file: the product resolves references within the submitted set, so resources that name each
      * other have to be submitted together.
      */
-    void apply(Map<String, String> contentBySource) {
+    List<Warning> apply(Map<String, String> contentBySource) {
         List<Map<String, String>> drafts = contentBySource.entrySet().stream()
                 .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
                 .toList();
         String body = JsonWriter.write(Map.of("drafts", drafts));
-        expect(send(authed("/api/artifacts:apply", body)), 200, "apply " + contentBySource.keySet());
+        HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
+        expect(response, 200, "apply " + contentBySource.keySet());
+        return warningsOf(response.body());
+    }
+
+    /**
+     * One advisory finding an apply carried: something worth telling the author about a batch that was
+     * applied rather than refused. A refusal travels in its own shape and its own status, so a caller
+     * that meant to read advice can never be handed a reason for rejection instead.
+     */
+    record Warning(String code, Map<String, Object> params) {}
+
+    /**
+     * The findings a 200 apply body carried. A body with no {@code warnings} array decodes to none
+     * rather than failing: the array is what a server with something to say sends, and a batch nobody
+     * had anything to say about is the ordinary case.
+     */
+    private static List<Warning> warningsOf(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("warnings") instanceof List<?> found)) {
+            return List.of();
+        }
+        List<Warning> warnings = new ArrayList<>(found.size());
+        for (Object entry : found) {
+            if (!(entry instanceof Map<?, ?> row)) {
+                throw new AssertionError("a warning entry was not an object: " + body);
+            }
+            Object params = row.get("params");
+            warnings.add(new Warning(String.valueOf(row.get("code")),
+                    params instanceof Map<?, ?> named ? asObject(named) : Map.of()));
+        }
+        return warnings;
     }
 
     /**
@@ -428,6 +458,27 @@ final class ControlPlane {
     List<String> connectionSchemaTables(String connectionId) {
         return schemaTables(
                 "/api/connections/" + urlSegment(connectionId) + "/schema", "connection " + connectionId);
+    }
+
+    /** The field names one discovered table carries, in discovery order - the source's own spelling. */
+    List<String> sourceSchemaFields(String sourceId, String table) {
+        HttpResponse<String> response =
+                send(authedGet("/api/sources/" + urlSegment(sourceId) + "/schema"));
+        expect(response, 200, "read the schema of Source " + sourceId);
+        List<String> names = new ArrayList<>();
+        for (Map<String, Object> each : entriesOf(response.body(), "tables")) {
+            if (!table.equals(String.valueOf(each.get("name")))
+                    || !(each.get("fields") instanceof List<?> fields)) {
+                continue;
+            }
+            for (Object field : fields) {
+                if (!(field instanceof Map<?, ?> row)) {
+                    throw new AssertionError("a discovered field was not an object: " + response.body());
+                }
+                names.add(String.valueOf(row.get("name")));
+            }
+        }
+        return List.copyOf(names);
     }
 
     private List<String> schemaTables(String path, String subject) {
