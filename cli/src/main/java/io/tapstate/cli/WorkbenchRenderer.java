@@ -164,7 +164,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextPicker picker ->
                     Math.max(5, Math.min(10, picker.contexts().size()) + 4);
             case WorkbenchOverlayState.ContextCreate ignored -> 8;
-            case WorkbenchOverlayState.ContextDeleteConfirm ignored -> 5;
+            case WorkbenchOverlayState.Confirm ignored -> 4;
             case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
             case WorkbenchOverlayState.Help ignored -> 6;
         };
@@ -188,8 +188,7 @@ final class WorkbenchRenderer {
                     renderContexts(frame, area, box, picker, theme);
             case WorkbenchOverlayState.ContextCreate create ->
                     renderContextCreate(frame, area, box, create, theme);
-            case WorkbenchOverlayState.ContextDeleteConfirm confirm ->
-                    renderContextDeleteConfirm(frame, area, box, confirm, theme);
+            case WorkbenchOverlayState.Confirm confirm -> renderConfirm(frame, area, box, confirm, theme);
             case WorkbenchOverlayState.Login login -> renderLogin(frame, area, box, login, theme);
             case WorkbenchOverlayState.Help ignored -> renderHelp(frame, area, box, theme);
         };
@@ -200,7 +199,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.More ignored -> "More";
             case WorkbenchOverlayState.ContextPicker ignored -> "Choose Context";
             case WorkbenchOverlayState.ContextCreate ignored -> "New Context";
-            case WorkbenchOverlayState.ContextDeleteConfirm ignored -> "Delete Context";
+            case WorkbenchOverlayState.Confirm confirm -> confirm.title();
             case WorkbenchOverlayState.Login login -> "Sign in to " + login.contextName();
             case WorkbenchOverlayState.Help ignored -> "Help";
         };
@@ -246,8 +245,6 @@ final class WorkbenchRenderer {
         picker.message().ifPresent(message -> write(
                 frame, box.x() + 2, box.y() + box.height() - 3, message,
                 picker.pending() ? theme.info() : theme.warning(), area));
-        write(frame, box.x() + 2, box.y() + box.height() - 2,
-                "Enter select  d delete  Esc back", theme.muted(), area);
         return List.copyOf(hits);
     }
 
@@ -275,19 +272,16 @@ final class WorkbenchRenderer {
         return List.of();
     }
 
-    private static List<OverlayHit> renderContextDeleteConfirm(
+    private static List<OverlayHit> renderConfirm(
             Frame frame,
             Rect area,
             Rect box,
-            WorkbenchOverlayState.ContextDeleteConfirm confirm,
+            WorkbenchOverlayState.Confirm confirm,
             WorkbenchTheme theme) {
-        write(frame, box.x() + 2, box.y() + 1, "Delete context " + confirm.contextName() + "?", theme.warning(), area);
-        write(frame, box.x() + 2, box.y() + 2,
-                "Workspace bindings will be removed; auth cache is kept.", theme.muted(), area);
-        String hint = confirm.pending() ? "Deleting context..." : "Enter delete  Esc cancel";
-        write(frame, box.x() + 2, box.y() + 3, hint, theme.muted(), area);
-        confirm.message().ifPresent(message -> write(
-                frame, box.x() + 2, box.y() + 4, message, theme.error(), area));
+        write(frame, box.x() + 2, box.y() + 1, confirm.message(), theme.warning(), area);
+        if (confirm.pending()) {
+            write(frame, box.x() + 2, box.y() + 2, "Working...", theme.muted(), area);
+        }
         return List.of();
     }
 
@@ -486,9 +480,6 @@ final class WorkbenchRenderer {
                     writeNotification(frame, viewerInner.x(), viewerInner.bottom() - 1,
                             state, theme, viewerInner);
                 });
-        state.workspaceView().document()
-                .filter(WorkbenchWorkspaceState.Document::pendingDiscard)
-                .ifPresent(ignored -> renderDiscardPopup(frame, viewerArea, theme));
         return new ContentLayout(List.copyOf(hits), capacity);
     }
 
@@ -674,29 +665,6 @@ final class WorkbenchRenderer {
                 styles[index] = style;
             }
         }
-    }
-
-    private static void renderDiscardPopup(Frame frame, Rect area, WorkbenchTheme theme) {
-        int width = Math.min(44, Math.max(40, area.width() - 4));
-        width = Math.min(width, area.width() - 2);
-        int height = 6;
-        Rect popup = new Rect(
-                area.x() + Math.max(0, (area.width() - width) / 2),
-                area.y() + Math.max(0, (area.height() - height) / 2),
-                width,
-                height);
-        renderOpaquePopupSurface(frame, popup, theme);
-        Block block = Block.builder()
-                .borderType(BorderType.ROUNDED)
-                .borders(Borders.ALL)
-                .borderStyle(theme.warning())
-                .title(Title.from(Line.from(Span.styled(
-                        " Discard Changes? ", theme.warning().bold()))))
-                .build();
-        frame.renderWidget(block, popup);
-        Rect inner = block.inner(popup);
-        writeCentered(frame, inner, inner.y() + 1, "Unsaved changes will be lost.", theme.base());
-        writeCentered(frame, inner, inner.y() + 3, "Enter confirm    Esc cancel", theme.base());
     }
 
     private static void renderOpaquePopupSurface(Frame frame, Rect area, WorkbenchTheme theme) {
@@ -897,7 +865,11 @@ final class WorkbenchRenderer {
                 && state.snapshot()
                         .map(snapshot -> !rows(snapshot, state.selectedTab()).isEmpty())
                         .orElse(false);
-        List<FooterHint> hints = switch (state.selectedTab()) {
+        List<FooterHint> hints;
+        if (state.overlay().isPresent()) {
+            hints = overlayFooter(state.overlay().orElseThrow());
+        } else {
+            hints = switch (state.selectedTab()) {
             case OVERVIEW -> List.of(
                     new FooterHint("1-4", "views", Optional.empty()),
                     new FooterHint("c", "context", Optional.of(FooterAction.CONTEXT)),
@@ -922,7 +894,8 @@ final class WorkbenchRenderer {
                             new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
                             new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
                             new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
-        };
+            };
+        }
         int x = area.x();
         List<FooterHit> hits = new ArrayList<>();
         for (FooterHint hint : hints) {
@@ -973,6 +946,35 @@ final class WorkbenchRenderer {
             hints.add(new FooterHint("Tab", "viewer", Optional.of(FooterAction.TOGGLE_FOCUS)));
         }
         return List.copyOf(hints);
+    }
+
+    private static List<FooterHint> overlayFooter(WorkbenchOverlayState overlay) {
+        return switch (overlay) {
+            case WorkbenchOverlayState.More ignored -> List.of(
+                    new FooterHint("↑↓", "navigate", Optional.empty()),
+                    new FooterHint("Enter", "select", Optional.empty()),
+                    new FooterHint("Esc", "back", Optional.empty()));
+            case WorkbenchOverlayState.ContextPicker ignored -> List.of(
+                    new FooterHint("↑↓", "navigate", Optional.empty()),
+                    new FooterHint("Enter", "select", Optional.empty()),
+                    new FooterHint("d", "delete", Optional.empty()),
+                    new FooterHint("Esc", "back", Optional.empty()));
+            case WorkbenchOverlayState.ContextCreate create -> List.of(
+                    new FooterHint("↑↓", "fields", Optional.empty()),
+                    new FooterHint("Enter", create.pending() ? "wait" : "next", Optional.empty()),
+                    new FooterHint("Esc", "cancel", Optional.empty()));
+            case WorkbenchOverlayState.Confirm confirm -> confirm.pending()
+                    ? List.of(new FooterHint("…", "working", Optional.empty()))
+                    : List.of(
+                            new FooterHint("Enter", "confirm", Optional.of(FooterAction.CONFIRM)),
+                            new FooterHint("Esc", "cancel", Optional.of(FooterAction.CANCEL_CONFIRM)));
+            case WorkbenchOverlayState.Login login -> List.of(
+                    new FooterHint("↑↓", "fields", Optional.empty()),
+                    new FooterHint("Enter", login.pending() ? "wait" : "next", Optional.empty()),
+                    new FooterHint("Esc", "cancel", Optional.empty()));
+            case WorkbenchOverlayState.Help ignored -> List.of(
+                    new FooterHint("Esc", "back", Optional.empty()));
+        };
     }
 
     private static String tabLabel(WorkbenchState.WorkbenchTab tab) {
@@ -1268,7 +1270,9 @@ final class WorkbenchRenderer {
         SAVE_AND_CLOSE,
         CANCEL_EDIT,
         DISCARD,
-        CANCEL_DISCARD
+        CANCEL_DISCARD,
+        CONFIRM,
+        CANCEL_CONFIRM
     }
 
     record FooterHit(FooterAction action, Rect area) {

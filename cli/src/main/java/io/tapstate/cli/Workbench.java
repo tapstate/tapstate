@@ -202,7 +202,7 @@ final class Workbench {
                     runner.quit();
                     return true;
                 }
-                return handleOverlayEvent(event);
+                return handleOverlayEvent(event, runner);
             }
             if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
                     && runtime.state().workspaceView().editing()) {
@@ -333,12 +333,13 @@ final class Workbench {
                         state.workspaceView().toggleFocus()));
                 case SAVE -> saveWorkspaceFile(false);
                 case SAVE_AND_CLOSE -> saveWorkspaceFile(true);
-                case CANCEL_EDIT -> runtime.updateState(state -> state.withWorkspaceView(
-                        state.workspaceView().requestCancelEdit()));
+                case CANCEL_EDIT -> requestWorkspaceEditCancel();
                 case DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
                         state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER))));
                 case CANCEL_DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
                         state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE))));
+                case CONFIRM -> confirmOverlay();
+                case CANCEL_CONFIRM -> cancelConfirmOverlay();
             };
         }
 
@@ -354,15 +355,8 @@ final class Workbench {
                 runner.quit();
                 return true;
             }
-            if (runtime.state().workspaceView().document()
-                    .map(WorkbenchWorkspaceState.Document::pendingDiscard)
-                    .orElse(false)) {
-                return runtime.updateState(state -> state.withWorkspaceView(
-                        state.workspaceView().edit(key)));
-            }
             if (key.isCancel()) {
-                return runtime.updateState(state -> state.withWorkspaceView(
-                        state.workspaceView().requestCancelEdit()));
+                return requestWorkspaceEditCancel();
             }
             if (key.hasCtrl() && key.isCharIgnoreCase('s')) {
                 return saveWorkspaceFile(false);
@@ -427,12 +421,16 @@ final class Workbench {
             };
         }
 
-        private boolean handleOverlayEvent(Event event) {
+        private boolean handleOverlayEvent(Event event, TuiRunner runner) {
             WorkbenchOverlayState overlay = runtime.state().overlay().orElseThrow();
             if (event instanceof PasteEvent paste) {
                 return handleOverlayPaste(overlay, paste.text());
             }
             if (event instanceof MouseEvent mouse && mouse.isClick()) {
+                Optional<WorkbenchRenderer.FooterAction> footerAction = layout.footerActionAt(mouse.x(), mouse.y());
+                if (footerAction.isPresent()) {
+                    return handleFooterAction(footerAction.orElseThrow(), runner);
+                }
                 OptionalInt clicked = layout.overlayIndexAt(mouse.x(), mouse.y());
                 if (clicked.isEmpty()) {
                     return true;
@@ -444,7 +442,7 @@ final class Workbench {
                         case WorkbenchOverlayState.ContextPicker picker -> runtime.updateState(state ->
                             state.withOverlay(picker.select(index)));
                         case WorkbenchOverlayState.ContextCreate ignored -> true;
-                        case WorkbenchOverlayState.ContextDeleteConfirm ignored -> true;
+                        case WorkbenchOverlayState.Confirm ignored -> true;
                         case WorkbenchOverlayState.Login ignored -> true;
                     case WorkbenchOverlayState.Help ignored -> true;
                 };
@@ -453,17 +451,15 @@ final class Workbench {
                 return true;
             }
             if (key.isCancel()) {
-                clearOverlaySecret();
-                runtime.updateState(state -> previousOverlay(overlay)
-                        .map(state::withOverlay)
-                        .orElseGet(state::closeOverlay));
-                return true;
+                return overlay instanceof WorkbenchOverlayState.Confirm confirm
+                        ? cancelConfirm(confirm)
+                        : closeOverlay(overlay);
             }
             return switch (overlay) {
                 case WorkbenchOverlayState.More more -> handleMoreKey(more, key);
                 case WorkbenchOverlayState.ContextPicker picker -> handleContextKey(picker, key);
                 case WorkbenchOverlayState.ContextCreate create -> handleContextCreateKey(create, key);
-                case WorkbenchOverlayState.ContextDeleteConfirm confirm -> handleContextDeleteKey(confirm, key);
+                case WorkbenchOverlayState.Confirm confirm -> handleConfirmKey(confirm, key);
                 case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
                 case WorkbenchOverlayState.Help ignored -> true;
             };
@@ -500,8 +496,7 @@ final class Workbench {
             }
             if (key.isChar('d') && picker.selectedIndex() < picker.contexts().size()) {
                 String contextName = picker.contexts().get(picker.selectedIndex()).name();
-                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextDeleteConfirm(
-                        contextName, false, Optional.empty(), Optional.of(picker))));
+                runtime.updateState(state -> state.withOverlay(contextDeleteConfirm(contextName, picker)));
                 return true;
             }
             if ((key.isSelect() || key.isConfirm()) && picker.selectedIndex() >= 0) {
@@ -516,15 +511,75 @@ final class Workbench {
             return true;
         }
 
-        private boolean handleContextDeleteKey(
-                WorkbenchOverlayState.ContextDeleteConfirm confirm, KeyEvent key) {
+        private boolean handleConfirmKey(WorkbenchOverlayState.Confirm confirm, KeyEvent key) {
             if (confirm.pending()) {
                 return true;
             }
             if (key.isSelect() || key.isConfirm()) {
-                submitContextDelete(confirm);
+                confirmOverlay();
             }
             return true;
+        }
+
+        private boolean confirmOverlay() {
+            Optional<WorkbenchOverlayState> overlay = runtime.state().overlay();
+            if (overlay.isEmpty() || !(overlay.orElseThrow() instanceof WorkbenchOverlayState.Confirm confirm)
+                    || confirm.pending()) {
+                return false;
+            }
+            return switch (confirm.intent()) {
+                case WorkbenchOverlayState.Confirm.Intent.DeleteContext ignored -> {
+                    submitContextDelete(confirm);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.DiscardChanges ignored -> runtime.updateState(state ->
+                        state.withWorkspaceView(state.workspaceView().cancelEdit()).closeOverlay());
+            };
+        }
+
+        private boolean cancelConfirmOverlay() {
+            return runtime.state().overlay()
+                    .filter(WorkbenchOverlayState.Confirm.class::isInstance)
+                    .map(WorkbenchOverlayState.Confirm.class::cast)
+                    .map(this::cancelConfirm)
+                    .orElse(false);
+        }
+
+        private boolean cancelConfirm(WorkbenchOverlayState.Confirm confirm) {
+            return confirm.pending() ? true : closeOverlay(confirm);
+        }
+
+        private boolean closeOverlay(WorkbenchOverlayState overlay) {
+            clearOverlaySecret();
+            return runtime.updateState(state -> previousOverlay(overlay)
+                    .map(state::withOverlay)
+                    .orElseGet(state::closeOverlay));
+        }
+
+        private boolean requestWorkspaceEditCancel() {
+            return runtime.updateState(state -> state.workspaceView().document()
+                    .filter(document -> document.editing() && document.dirty())
+                    .map(ignored -> state.withOverlay(discardChangesConfirm()))
+                    .orElseGet(() -> state.withWorkspaceView(state.workspaceView().cancelEdit())));
+        }
+
+        private static WorkbenchOverlayState.Confirm contextDeleteConfirm(
+                String contextName, WorkbenchOverlayState.ContextPicker previous) {
+            return new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.DeleteContext(contextName),
+                    "Delete Context",
+                    "Delete context " + contextName + "? Workspace bindings will be removed; auth cache is kept.",
+                    false,
+                    Optional.of(previous));
+        }
+
+        private static WorkbenchOverlayState.Confirm discardChangesConfirm() {
+            return new WorkbenchOverlayState.Confirm(
+                    WorkbenchOverlayState.Confirm.Intent.DiscardChanges.INSTANCE,
+                    "Discard Changes?",
+                    "Unsaved changes will be lost.",
+                    false,
+                    Optional.empty());
         }
 
         private boolean handleContextCreateKey(
@@ -856,14 +911,15 @@ final class Workbench {
                             login.contextName(), login.server(), login.username(), login.previous(), result));
         }
 
-        private void submitContextDelete(WorkbenchOverlayState.ContextDeleteConfirm confirm) {
+        private void submitContextDelete(WorkbenchOverlayState.Confirm confirm) {
             if (actionCoordinator == null) {
                 return;
             }
-            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextDeleteConfirm(
-                    confirm.contextName(), true, Optional.empty(), confirm.previous())));
+            WorkbenchOverlayState.Confirm.Intent.DeleteContext delete =
+                    (WorkbenchOverlayState.Confirm.Intent.DeleteContext) confirm.intent();
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
             actionCoordinator.submit(
-                    () -> actionGateway.deleteContext(confirm.contextName()),
+                    () -> actionGateway.deleteContext(delete.contextName()),
                     failure -> new WorkbenchActionGateway.ContextDeleteResult.Unavailable(),
                     this::completeContextDelete);
         }
@@ -933,7 +989,7 @@ final class Workbench {
             return switch (overlay) {
                 case WorkbenchOverlayState.ContextPicker picker -> picker.previous();
                 case WorkbenchOverlayState.ContextCreate create -> create.previous();
-                case WorkbenchOverlayState.ContextDeleteConfirm confirm -> confirm.previous();
+                case WorkbenchOverlayState.Confirm confirm -> confirm.previous();
                 case WorkbenchOverlayState.Login login -> login.previous();
                 case WorkbenchOverlayState.Help ignored -> Optional.of(new WorkbenchOverlayState.More(2));
                 case WorkbenchOverlayState.More ignored -> Optional.empty();

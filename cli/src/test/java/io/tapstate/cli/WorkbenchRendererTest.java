@@ -382,12 +382,17 @@ class WorkbenchRendererTest {
         WorkbenchWorkspaceState workspace = WorkbenchWorkspaceState.empty()
                 .open(Path.of("source/orders.tap.yml"), "apiVersion: tapstate/v1\nmetadata:\n  name: orders\n")
                 .edit()
-                .edit(KeyEvent.ofChar('#'))
-                .requestCancelEdit();
+                .edit(KeyEvent.ofChar('#'));
         WorkbenchState state = accepted(snapshot(
                         new WorkbenchRemoteState.Available(1), List.of(source)))
                 .select(WorkbenchState.WorkbenchTab.WORKSPACE)
-                .withWorkspaceView(workspace);
+                .withWorkspaceView(workspace)
+                .withOverlay(new WorkbenchOverlayState.Confirm(
+                        WorkbenchOverlayState.Confirm.Intent.DiscardChanges.INSTANCE,
+                        "Discard Changes?",
+                        "Unsaved changes will be lost.",
+                        false,
+                        Optional.empty()));
 
         Rendered rendered = render(120, 30, state);
 

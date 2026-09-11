@@ -9,7 +9,7 @@ sealed interface WorkbenchOverlayState
         permits WorkbenchOverlayState.More,
                 WorkbenchOverlayState.ContextPicker,
                 WorkbenchOverlayState.ContextCreate,
-                WorkbenchOverlayState.ContextDeleteConfirm,
+                WorkbenchOverlayState.Confirm,
                 WorkbenchOverlayState.Login,
                 WorkbenchOverlayState.Help {
 
@@ -93,15 +93,33 @@ sealed interface WorkbenchOverlayState
         }
     }
 
-    record ContextDeleteConfirm(
-            String contextName,
+    record Confirm(
+            Intent intent,
+            String title,
+            String message,
             boolean pending,
-            Optional<String> message,
             Optional<WorkbenchOverlayState> previous) implements WorkbenchOverlayState {
-        public ContextDeleteConfirm {
-            Objects.requireNonNull(contextName, "contextName");
+        public Confirm {
+            Objects.requireNonNull(intent, "intent");
+            Objects.requireNonNull(title, "title");
             Objects.requireNonNull(message, "message");
             Objects.requireNonNull(previous, "previous");
+        }
+
+        Confirm asPending() {
+            return new Confirm(intent, title, message, true, previous);
+        }
+
+        sealed interface Intent permits Intent.DeleteContext, Intent.DiscardChanges {
+            record DeleteContext(String contextName) implements Intent {
+                public DeleteContext {
+                    Objects.requireNonNull(contextName, "contextName");
+                }
+            }
+
+            enum DiscardChanges implements Intent {
+                INSTANCE
+            }
         }
     }
 
