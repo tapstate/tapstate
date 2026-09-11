@@ -70,6 +70,10 @@ default-selection-reaches-every-discovered-table on IN_PROCESS
 default-selection-reaches-every-discovered-table on REAL_PROCESS
 holding-one-stream-does-not-stop-the-other on IN_PROCESS
 holding-one-stream-does-not-stop-the-other on REAL_PROCESS
+mysql-rows-land-in-a-sqlserver-target on IN_PROCESS
+mysql-rows-land-in-a-sqlserver-target on REAL_PROCESS
+mysql-rows-land-in-an-oracle-target on IN_PROCESS
+mysql-rows-land-in-an-oracle-target on REAL_PROCESS
 negative-lookahead-source-regex-roundtrip on IN_PROCESS
 negative-lookahead-source-regex-roundtrip on REAL_PROCESS
 one-select-covers-the-snapshot-and-the-changes-after-it on IN_PROCESS
