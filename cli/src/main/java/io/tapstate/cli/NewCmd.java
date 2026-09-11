@@ -235,10 +235,12 @@ final class NewCmd implements Callable<Integer> {
      */
     private int callList(PrintWriter err) {
         boolean scaffolding = kind != null || type != null || connector != null || id != null || mode != null
-                || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty() || out != null || force || dryRun;
-        if (scaffolding) {
+                || primaryKey != null || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty() || out != null
+                || force || dryRun;
+        boolean guided = recipe != null || table != null || view != null || hasRecipeShapeFlags();
+        if (scaffolding || guided) {
             err.println("new: --list cannot be combined with --kind/--type/--connector/--id/--mode/--set"
-                    + "/--source/--sync-to/--out/--force/--dry-run");
+                    + "/--primary-key/--source/--sync-to/--out/--force/--dry-run, a recipe id, or guided flags");
             err.flush();
             return EXIT_USAGE;
         }
@@ -279,7 +281,7 @@ final class NewCmd implements Callable<Integer> {
 
     /** Whether any flag that shapes a single artifact was given; {@code -w} and {@code -o} are not ones. */
     private boolean hasScaffoldingFlags() {
-        return type != null || connector != null || id != null || mode != null || !config.isEmpty()
+        return type != null || connector != null || id != null || mode != null || primaryKey != null || !config.isEmpty()
                 || !sources.isEmpty() || !syncTo.isEmpty() || out != null || force || dryRun;
     }
 
@@ -297,9 +299,9 @@ final class NewCmd implements Callable<Integer> {
      */
     private int callGuided(PrintWriter err) {
         if (kind != null || type != null || id != null || mode != null || !sources.isEmpty() || !syncTo.isEmpty()
-                || out != null || dryRun) {
+                || primaryKey != null || out != null || dryRun) {
             err.println("new: a recipe cannot be combined with --kind/--type/--id/--mode"
-                    + "/--source/--sync-to/--out/--dry-run");
+                    + "/--primary-key/--source/--sync-to/--out/--dry-run");
             err.flush();
             return EXIT_USAGE;
         }

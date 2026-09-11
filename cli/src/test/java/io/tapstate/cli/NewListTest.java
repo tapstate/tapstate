@@ -145,6 +145,24 @@ class NewListTest {
     }
 
     @Test
+    void listRefusesRecipeAndGuidedInputs() {
+        List<String[]> invocations = List.of(
+                new String[] {"new", "--list", "mirrored-table"},
+                new String[] {"new", "--list", "--table", "orders"},
+                new String[] {"new", "--list", "--view", "orders_view"},
+                new String[] {"new", "--list", "--primary-key", "id"},
+                new String[] {"new", "--list", "--keep", "id"});
+
+        for (String[] invocation : invocations) {
+            Run r = run(invocation);
+            String command = String.join(" ", invocation);
+            assertThat(r.code()).as(command).isEqualTo(NewCmd.EXIT_USAGE);
+            assertThat(r.out()).as(command).isEmpty();
+            assertThat(r.err()).as(command).startsWith("new: --list");
+        }
+    }
+
+    @Test
     void catalogIdsMatchTheFirstRunPage() throws IOException {
         List<String> onPage = catalogIdsOnPage(Files.readString(firstRunPage()));
 
