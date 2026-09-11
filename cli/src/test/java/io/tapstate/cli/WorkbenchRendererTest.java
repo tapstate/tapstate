@@ -571,6 +571,8 @@ class WorkbenchRendererTest {
                 .style().effectiveModifiers()).contains(Modifier.BOLD);
         assertThat(rendered.buffer().get(findColumn(rendered.buffer(), nameY, "Name:"), nameY)
                 .style().effectiveModifiers()).doesNotContain(Modifier.BOLD);
+        assertThat(rendered.buffer().get(50, 15).style().bg())
+                .isEqualTo(WorkbenchTheme.dark().base().bg());
     }
 
     @Test

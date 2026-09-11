@@ -172,7 +172,7 @@ final class WorkbenchRenderer {
         int x = area.x() + (area.width() - width) / 2;
         int y = area.y() + (area.height() - height) / 2;
         Rect box = new Rect(x, y, width, height);
-        frame.renderWidget(Clear.INSTANCE, box);
+        renderOpaquePopupSurface(frame, box, theme);
         Block block = Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
@@ -685,7 +685,7 @@ final class WorkbenchRenderer {
                 area.y() + Math.max(0, (area.height() - height) / 2),
                 width,
                 height);
-        frame.renderWidget(Clear.INSTANCE, popup);
+        renderOpaquePopupSurface(frame, popup, theme);
         Block block = Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
@@ -697,6 +697,11 @@ final class WorkbenchRenderer {
         Rect inner = block.inner(popup);
         writeCentered(frame, inner, inner.y() + 1, "Unsaved changes will be lost.", theme.base());
         writeCentered(frame, inner, inner.y() + 3, "Enter confirm    Esc cancel", theme.base());
+    }
+
+    private static void renderOpaquePopupSurface(Frame frame, Rect area, WorkbenchTheme theme) {
+        frame.renderWidget(Clear.INSTANCE, area);
+        frame.buffer().setStyle(area, theme.base());
     }
 
     private static void renderOverview(
