@@ -1,0 +1,13 @@
+# This is refused during apply, before start can create a job. The matching Java integration
+# witness checks the named validation code and the absence of all submitted artifacts.
+version: tapstate/v1
+kind: pipeline
+id: append_unwind
+source: src_file
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - { id: expanded, from: [orders], type: unwind, path: items, element_key: sku }
+serve:
+  from: expanded
+  sync:
+    - { source: tgt_file, write_mode: append }
