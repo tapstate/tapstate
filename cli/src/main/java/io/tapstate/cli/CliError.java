@@ -36,6 +36,22 @@ enum CliError implements TapstateErrorCode {
     WORKSPACE_NOT_WRITABLE("cli.workspace-not-writable", Set.of("path", Names.REASON)),
 
     /**
+     * A workspace {@code up} was asked to bring up could not be read; {@code path} is the workspace and
+     * {@code reason} is what the filesystem said - typically the directory or file under it that refused.
+     * Its own code rather than the write one above: the two ask for opposite fixes (grant reading,
+     * grant writing), and a reader who is told "could not write" about a command that writes nothing
+     * goes looking in the wrong place.
+     */
+    WORKSPACE_UNREADABLE("cli.workspace-unreadable", Set.of("path", Names.REASON)),
+
+    /**
+     * A workspace {@code up} was asked to bring up holds no pipeline, so there is nothing to start;
+     * {@code path} is the workspace. A refusal rather than a quiet no-op: an empty or half-written
+     * workspace is the state a first run most often gets stuck in, and the way out is a scaffold.
+     */
+    WORKSPACE_HAS_NO_PIPELINE("cli.workspace-has-no-pipeline", Set.of("path")),
+
+    /**
      * The optional {@code tap} shortcut cannot be managed because that name belongs to something else;
      * {@code path} is where it sits. Refused rather than replaced or deleted: the name is a working
      * command on that machine, and a convenience shortcut does not get to remove one.
@@ -55,6 +71,30 @@ enum CliError implements TapstateErrorCode {
      * anyone's file, the link simply could not be made.
      */
     ALIAS_LINK_FAILED("cli.alias-link-failed", Set.of("path", Names.REASON)),
+
+    /**
+     * The local development stack the guided first run starts in Docker could not be started, or was
+     * started and never answered; {@code reason} says which - no {@code docker} on the PATH, no Compose
+     * plugin, what {@code docker compose} said, or where the stack is and how to stop it when it came
+     * up and stayed silent. One code for the whole route rather than one per step: what a reader does
+     * about any of them is the same - fix Docker, or point the workspace at a server they already run.
+     */
+    DOCKER_UNAVAILABLE("cli.docker-unavailable", Set.of(Names.REASON)),
+
+    /**
+     * {@code up} was asked to bring up a workspace that names no server, with nobody to ask which one;
+     * {@code server} is the default it declined to assume. Refused rather than defaulted: adopting the
+     * loopback address would bind a script to whatever happens to be listening on that machine, which
+     * is a different server on every machine the script runs on.
+     */
+    SERVER_NOT_NAMED("cli.server-not-named", Set.of("server")),
+
+    /**
+     * Signing in to {@code server} needs a password that was neither asked for nor supplied;
+     * {@code variable} names the environment variable a script puts it in. Its own code rather than a
+     * login refusal: nothing was sent, so the credential was never wrong - it was never given.
+     */
+    PASSWORD_REQUIRED("cli.password-required", Set.of("server", "variable")),
 
     /** A connector id supplied to the wizard that is not in the bundled catalog. */
     UNKNOWN_CONNECTOR("cli.unknown-connector", Set.of("connector")),
