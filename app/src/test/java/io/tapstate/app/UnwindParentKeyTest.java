@@ -1,7 +1,9 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -83,6 +85,52 @@ class UnwindParentKeyTest {
         Step.Inline expand = step("expand", "keep", unwind("item_no", null));
 
         assertThat(keyReaching(expand, pick, keep, expand)).containsExactly("o_id");
+    }
+
+    @Test
+    void aRenamedParentKeyReachesThePortUnderItsCurrentName() {
+        Step.Inline rename = step("rename", "orders", new TransformBody.MapProjection(
+                Map.of("order_id", FieldRule.rename("o_id"))));
+        Step.Inline expand = step("expand", "rename", unwind(null, "sku"));
+        List<String> keys = keyReaching(expand, rename, expand);
+
+        assertThat(keys).containsExactly("order_id");
+        TransformPort port = StoreBackedDagSource.transformPort(expand, keys).get();
+        List<Envelope> out = port.transform(new Envelope(Op.UPDATE, 1L, "orders",
+                Map.of("order_id", 7L, "items", List.of(Map.of("sku", "a"))),
+                Map.of("order_id", 8L, "items", List.of(Map.of("sku", "a"))), null));
+        assertThat(out).extracting(Envelope::op).containsExactly(Op.DELETE, Op.INSERT);
+        assertThat(out.getFirst().before()).containsEntry("order_id", 7L);
+        assertThat(out.getLast().after()).containsEntry("order_id", 8L);
+    }
+
+    @Test
+    void aSecondExpansionUsesRenamedParentAndEarlierLocatorColumns() {
+        Step.Inline outer = step("outer", "orders", unwind("item_no", null));
+        Step.Inline rename = step("rename", "outer", new TransformBody.MapProjection(
+                Map.of("order_id", FieldRule.rename("o_id"),
+                        "line_no", FieldRule.rename("item_no"))));
+        Step.Inline inner = step("inner", "rename",
+                new TransformBody.Unwind("tags", "tag_no", false, null, null));
+
+        assertThat(keyReaching(inner, outer, rename, inner)).containsExactly("order_id", "line_no");
+    }
+
+    @Test
+    void droppingARenamedParentKeyDoesNotSilentlyRemoveItsRequirement() {
+        Step.Inline rename = step("rename", "orders", new TransformBody.MapProjection(
+                Map.of("order_id", FieldRule.rename("o_id"))));
+        Step.Inline drop = step("drop", "rename", new TransformBody.MapProjection(
+                Map.of("order_id", FieldRule.drop())));
+        Step.Inline expand = step("expand", "drop", unwind(null, "sku"));
+        List<String> keys = keyReaching(expand, rename, drop, expand);
+
+        assertThat(keys).containsExactly("order_id");
+        TransformPort port = StoreBackedDagSource.transformPort(expand, keys).get();
+        assertThatThrownBy(() -> port.transform(new Envelope(Op.DELETE, 1L, "orders",
+                Map.of("region", "east", "items", List.of(Map.of("sku", "a"))), null, null)))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
     }
 
     /**

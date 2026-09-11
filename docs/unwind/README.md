@@ -76,9 +76,10 @@ A declaration with neither locator fails validation with
 `dsl.unwind-needs-an-upsert-target`: appending a delete would add a row instead of
 removing the old one. One-time expansion into an append target is also unsupported.
 
-A following `map` can project the expanded element or rename non-key columns.
-Projection applies to both previous and current images, including deletes. Retain
-the parent and element key columns with their existing names so target rows remain
-addressable.
+A `map` before or after `unwind` can rename parent key columns; their identity follows
+those renames into the target key. A following `map` can also rename the element key
+column. Projection applies to both previous and current images, including deletes.
+Keep the parent and element key values available: dropping or replacing them does
+not preserve row identity.
 
 Run the [MySQL to MongoDB walkthrough](../tutorials/expanding-order-items/) to see snapshot expansion and parent deletion.

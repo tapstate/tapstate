@@ -89,24 +89,36 @@ import java.util.Set;
  *                      whatever of the table's own key still travels; empty for every node that adds
  *                      none, which is every node that emits one row per row
  * @param unknownBecause why the columns cannot be given, naming the node, or null when they are given
+ * @param origins       surviving source identity, output column to its original name; replacement
+ *                      values have no origin even if their output name matches a source column
+ * @param expanded      whether rows passed through an expansion; only these outputs use source
+ *                      identity through renames when publishing their parent key
  */
-record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause) {
+record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
+        Map<String, String> origins, boolean expanded) {
 
     NodeColumns {
         // Order-preserving rather than Map.copyOf: the declared order is the output order, and a copy
         // that loses it turns every rebuild of the same node into a differently ordered record.
         columns = Collections.unmodifiableMap(new LinkedHashMap<>(columns));
         key = List.copyOf(key);
+        origins = Collections.unmodifiableMap(new LinkedHashMap<>(origins));
     }
 
     /** The columns a node produces, worked out; it adds nothing to what tells its rows apart. */
     static NodeColumns known(Map<String, String> columns) {
-        return new NodeColumns(columns, List.of(), null);
+        return new NodeColumns(columns, List.of(), null, identityOrigins(columns), false);
     }
 
     /** The columns a node produces, and the ones of them it adds to the key of its output rows. */
     static NodeColumns keyed(Map<String, String> columns, List<String> key) {
-        return new NodeColumns(columns, key, null);
+        return new NodeColumns(columns, key, null, identityOrigins(columns), !key.isEmpty());
+    }
+
+    private static Map<String, String> identityOrigins(Map<String, String> columns) {
+        Map<String, String> origins = new LinkedHashMap<>();
+        columns.keySet().forEach(column -> origins.put(column, column));
+        return origins;
     }
 
     /**
@@ -115,7 +127,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
      * it can walk nothing.
      */
     static NodeColumns unknown(String because) {
-        return new NodeColumns(Map.of(), List.of(), because);
+        return new NodeColumns(Map.of(), List.of(), because, Map.of(), false);
     }
 
     /** Whether the columns are the answer, as opposed to the reason there is none. */
@@ -208,13 +220,20 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         // rows from each input as they arrive. So the claim survives only where every input makes
         // the same one: one branch that expanded a list and one that did not produce rows told apart
         // by different things, and keying on either branch's answer describes the other's wrongly.
-        List<String> agreed = inputs.iterator().next().key();
+        NodeColumns first = inputs.iterator().next();
+        List<String> agreed = first.key();
+        Map<String, String> origins = new LinkedHashMap<>(first.origins());
+        boolean expanded = false;
         for (NodeColumns input : inputs) {
             if (!input.key().equals(agreed)) {
-                return known(out);
+                agreed = List.of();
             }
+            origins.entrySet().removeIf(entry ->
+                    !entry.getValue().equals(input.origins().get(entry.getKey())));
+            expanded |= input.expanded();
         }
-        return keyed(out, agreed.stream().filter(out::containsKey).toList());
+        return new NodeColumns(out, agreed.stream().filter(out::containsKey).toList(), null,
+                origins, expanded);
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
@@ -289,7 +308,11 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         if (locator != null && !key.contains(locator)) {
             key.add(locator);
         }
-        return keyed(out, key);
+        Map<String, String> origins = new LinkedHashMap<>(upstream.origins());
+        origins.remove(unwind.path());
+        origins.remove(unwind.includeArrayIndex());
+        origins.remove(unwind.elementKey());
+        return new NodeColumns(out, key, null, origins, true);
     }
 
     /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
@@ -460,7 +483,25 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                 out.put(name, type);
             }
         });
-        return keyed(out, projectedKey(rules, upstream.key(), out));
+        Map<String, String> origins = new LinkedHashMap<>();
+        for (String output : out.keySet()) {
+            FieldRule rule = rules.get(output);
+            // A rename with no source emits nothing. The original output-named column can still
+            // pass through, so its identity must follow that actual value rather than the rule.
+            if (rule instanceof FieldRule.Rename rename
+                    && !upstream.columns().containsKey(rename.sourceField())) {
+                rule = null;
+            }
+            String source = rule instanceof FieldRule.Rename rename ? rename.sourceField() : output;
+            if (rule == null || rule instanceof FieldRule.Rename) {
+                String origin = upstream.origins().get(source);
+                if (origin != null) {
+                    origins.put(output, origin);
+                }
+            }
+        }
+        return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
+                origins, upstream.expanded());
     }
 
     /**
@@ -476,20 +517,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         if (upstreamKey.isEmpty()) {
             return List.of();
         }
-        Map<String, String> renamedTo = new LinkedHashMap<>();
-        rules.forEach((output, rule) -> {
-            if (rule instanceof FieldRule.Rename rename) {
-                renamedTo.put(rename.sourceField(), output);
-            }
-        });
-        List<String> key = new ArrayList<>(upstreamKey.size());
-        for (String column : upstreamKey) {
-            String now = renamedTo.getOrDefault(column, column);
-            if (out.containsKey(now) && !key.contains(now)) {
-                key.add(now);
-            }
-        }
-        return key;
+        return KeyProjection.renamed(upstreamKey, rules).stream().filter(out::containsKey).toList();
     }
 
     /**

@@ -864,20 +864,28 @@ final class StoreBackedDagSource implements DagSource {
      * table would be published keyed on the parent alone. An upsert target answers that by keeping
      * the last of each parent's expanded rows and losing the rest, filling the table, reporting
      * nothing, and reading exactly like a step that never ran. So the columns each node says it adds
-     * are appended here, after the table's own and in the order the nodes added them. A node that
-     * adds none - which is every node that emits one row per row it is given - leaves this the rule
-     * it has always been.
+     * are appended here, after the table's own and in the order the nodes added them. For rows that
+     * passed through an expansion, source origins follow pure renames so the parent identity does
+     * not disappear when its column gets another name. Other streams retain the name-intersection
+     * rule. If a projection copies a source column into several aliases, its last alias identifies
+     * the parent, matching the key passed to the expansion port. A stream that has not passed
+     * through an expansion keeps the rule it has always used.
      */
     static TargetTable publishedAs(TargetTable base, NodeColumns produced, NodeColumns atTheSource) {
         Map<String, TargetField> declared = new LinkedHashMap<>();
         base.fields().forEach(field -> declared.put(field.name(), field));
         List<TargetField> fields = new ArrayList<>(produced.columns().size());
         List<String> key = new ArrayList<>();
+        Map<String, String> parentNames = new LinkedHashMap<>();
+        produced.origins().forEach((output, origin) -> parentNames.put(origin, output));
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
             boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource);
             fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false));
-            if (carried != null && carried.primaryKey()) {
+            TargetField identity = produced.expanded()
+                    ? declared.get(produced.origins().get(column)) : carried;
+            if (identity != null && identity.primaryKey()
+                    && (!produced.expanded() || column.equals(parentNames.get(identity.name())))) {
                 key.add(column);
             }
         }
@@ -1841,10 +1849,10 @@ final class StoreBackedDagSource implements DagSource {
      * <p><b>An expansion is why this exists.</b> It emits several rows carrying one parent's key, so
      * the rows below it are told apart by the parent's key together with what each expansion added,
      * and a second expansion under a first that fell back to the table's key alone would treat every
-     * row the first produced as one row. Nothing else in the chain changes the answer - a projection
-     * that renames or drops a key column changes what the target is keyed on, which is worked out
-     * where the target is published; what is wanted here is what identifies the row that arrived,
-     * and the port reads the columns it names off that row.
+     * row the first produced as one row. A projection can rename those columns, so their current
+     * names have to follow the projection too: the port reads the row after that projection ran.
+     * A dropped required column remains required rather than making the parent key incomplete
+     * silently; the port's before-image check reports its absence.
      *
      * <p>The table's key arrives as a function rather than being looked up here so that the walk is
      * only the walk: what a table's key is comes from a discovered model this method has no business
@@ -1874,6 +1882,9 @@ final class StoreBackedDagSource implements DagSource {
                 continue;
             }
             List<String> above = parentKeyReaching(upstream.from(), stepsById, tableKey, visiting);
+            if (upstream.body() instanceof TransformBody.MapProjection projection) {
+                above = KeyProjection.renamed(above, projection.fields());
+            }
             if (!(upstream.body() instanceof TransformBody.Unwind unwind)) {
                 if (!above.isEmpty()) {
                     return above;

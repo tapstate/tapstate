@@ -95,6 +95,59 @@ class UnwindDerivedKeyTest {
         assertThat(publishedKey(produced)).containsExactly("o_id", "sku");
     }
 
+    @Test
+    void aParentKeyRenamedBeforeExpansionReachesTheTarget() {
+        NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("order_id", FieldRule.rename("o_id"))), one(atTheSource()), null);
+        NodeColumns expanded = NodeColumns.of(unwind(null, "sku"), one(renamed), null);
+
+        assertThat(publishedKey(expanded)).containsExactly("order_id", "sku");
+        // Ordinary projections retain their established target-key behavior.
+        assertThat(publishedKey(renamed)).isEmpty();
+    }
+
+    @Test
+    void aParentKeyRenamedAfterExpansionReachesTheTarget() {
+        NodeColumns expanded = NodeColumns.of(unwind(null, "sku"), one(atTheSource()), null);
+        NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("order_id", FieldRule.rename("o_id"))), one(expanded), null);
+
+        assertThat(publishedKey(renamed)).containsExactly("order_id", "sku");
+    }
+
+    @Test
+    void aRenameWithNoSourcePreservesTheColumnThatPassesThrough() {
+        NodeColumns projected = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.rename("absent"))), one(atTheSource()), null);
+
+        assertThat(publishedKey(NodeColumns.of(unwind(null, "sku"), one(projected), null)))
+                .containsExactly("o_id", "sku");
+    }
+
+    @Test
+    void multipleAliasesUseTheSameLastNameAsTheExpansionPort() {
+        Map<String, FieldRule> rules = new LinkedHashMap<>();
+        rules.put("first_id", FieldRule.rename("o_id"));
+        rules.put("last_id", FieldRule.rename("o_id"));
+        NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(rules),
+                one(atTheSource()), null);
+
+        assertThat(publishedKey(NodeColumns.of(unwind(null, "sku"), one(renamed), null)))
+                .containsExactly("last_id", "sku");
+    }
+
+    @Test
+    void successiveRenamesKeepTheParentIdentityThroughAFilter() {
+        NodeColumns first = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("order_id", FieldRule.rename("o_id"))), one(atTheSource()), null);
+        NodeColumns kept = NodeColumns.of(new TransformBody.Filter("true"), one(first), null);
+        NodeColumns second = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("parent_id", FieldRule.rename("order_id"))), one(kept), null);
+
+        assertThat(publishedKey(NodeColumns.of(unwind("item_no", null), one(second), null)))
+                .containsExactly("parent_id", "item_no");
+    }
+
     /**
      * Declaring both is not a conflict and not two key columns: the element's own field is the
      * identity, the ordinal is an ordinary column beside it. Keying on the ordinal too would undo

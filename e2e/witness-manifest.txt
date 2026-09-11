@@ -88,3 +88,5 @@ two-engines-reach-one-target on IN_PROCESS
 two-engines-reach-one-target on REAL_PROCESS
 two-tables-become-one-document-in-the-managed-store on IN_PROCESS
 two-tables-become-one-document-in-the-managed-store on REAL_PROCESS
+renamed-parent-keys-keep-expanded-rows-distinct on IN_PROCESS
+renamed-parent-keys-keep-expanded-rows-distinct on REAL_PROCESS
