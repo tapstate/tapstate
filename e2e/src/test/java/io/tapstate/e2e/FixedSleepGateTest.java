@@ -111,6 +111,9 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/DataBrowserDottedFieldIT.java", 1L),
             entry("test/java/io/tapstate/e2e/TailIT.java", 1L),
             entry("test/java/io/tapstate/e2e/WatchRedrawsIT.java", 1L),
+            // The guided first run's own bounded read of the view its recipe materializes into: one
+            // named sleep() called from a deadline loop whose count condition decides the outcome.
+            entry("test/java/io/tapstate/e2e/GuidedFirstRunIT.java", 1L),
             // The restart witnesses: one bounded read each, and both of them poll something that
             // outlives the server they are watching, so the loop's condition is the whole point.
             // Each is a single named sleep() called from a `while (nanoTime - deadline < 0)` loop -
