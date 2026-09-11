@@ -19,8 +19,8 @@ import java.util.function.Supplier;
  * The Tapstate CLI: the surface-ring product front-end. Dual-mode — bare {@code tapstate} opens the
  * offline REPL; one-shot subcommands share the same verb table for scripting / AI.
  *
- * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code explain} / {@code ls} /
- * {@code desc} run fully without any server. The server-state verbs are registered too, so they are
+ * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code add} / {@code explain} /
+ * {@code ls} / {@code desc} run fully without any server. The server-state verbs are registered too, so they are
  * discoverable and report a coded "not connected" diagnostic rather than going missing; they reach a
  * service through the REPL, where a connection is established and held — the CLI talks to a running
  * Tapstate over HTTP only (rule R6).
