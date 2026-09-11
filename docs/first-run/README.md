@@ -47,9 +47,17 @@ server's own lifecycle is managed outside this CLI.
 which server those files are brought up against is `up`'s question, asked the first time you run
 it. Nothing here probes, starts, signs in or binds.
 
-Bare `new` at a terminal runs the guided flow. `new --kind <kind>` keeps its existing
-meaning — scaffold one resource — and is unchanged. The bare form used to enter the
-single-resource wizard; from this release it enters the recipe picker. That is a deliberate
+Bare `new` at a terminal runs the guided flow. To scaffold one resource in an existing workspace,
+use `add <kind>`:
+
+```sh
+tapstate add source --connector mysql --id orders
+tapstate add pipeline --id orders_pipeline --source orders --sync-to orders_target
+```
+
+`new --kind <kind>` remains a working deprecated alias and prints a migration warning; it is kept
+for compatibility and will not be removed in the same release as `add`. The bare form used to enter
+the single-resource wizard; from this release it enters the recipe picker. That is a deliberate
 change to a released command and is called out in the release note.
 
 ### Step 1 — which outcome

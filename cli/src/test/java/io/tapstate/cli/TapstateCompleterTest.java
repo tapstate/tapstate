@@ -109,6 +109,14 @@ class TapstateCompleterTest {
     }
 
     @Test
+    void completesAddKindValuesAndOptions() {
+        assertThat(completer.candidates(List.of("add", ""), 1))
+                .containsExactlyInAnyOrder("pipeline", "serve", "source", "transform", "view");
+        assertThat(completer.candidates(List.of("add", "--connector", ""), 2))
+                .contains("mysql", "mongodb");
+    }
+
+    @Test
     void completesTransformTypeValues() {
         assertThat(completer.candidates(List.of("new", "--type", ""), 2))
                 .containsExactlyInAnyOrder("filter", "map", "js", "union", "nest", "join");
