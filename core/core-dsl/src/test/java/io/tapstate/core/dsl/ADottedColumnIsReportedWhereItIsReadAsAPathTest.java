@@ -57,6 +57,51 @@ class ADottedColumnIsReportedWhereItIsReadAsAPathTest {
                 .isEmpty();
     }
 
+    /**
+     * A source that addresses keys by path reports a nested field as the path leading to it, so the dot
+     * in {@code address.city} is the document's own shape rather than a name somebody wrote a dot into.
+     * The nesting crosses to the target unchanged and a read for that same path answers, so there is
+     * nothing here to report - and the discovered model cannot tell such a name from a chosen one,
+     * which is why the whole upstream is left alone rather than each of its columns guessed at.
+     */
+    @Test
+    void aNestedFieldOfADocumentSourceIsNothingToReport() {
+        Map<String, TapstateType> columns = new LinkedHashMap<>();
+        columns.put("_id", TapstateType.STRING);
+        columns.put("address.city", TapstateType.STRING);
+        List<Resource> batch = List.of(
+                parser.parse("""
+                        version: tapstate/v1
+                        kind: source
+                        id: orders_src
+                        connector: mongodb
+                        config: { uri: "s" }
+                        mode: cdc
+                        tables: [ orders ]
+                        """),
+                parser.parse("""
+                        version: tapstate/v1
+                        kind: source
+                        id: orders_dest
+                        connector: mongodb
+                        config: { uri: "x" }
+                        """),
+                parser.parse("""
+                        version: tapstate/v1
+                        kind: pipeline
+                        id: orders_sync
+                        source: orders_src
+                        serve:
+                          from: orders
+                          sync: [ { id: sync_1, source: orders_dest } ]
+                        """));
+
+        assertThat(DocumentKeyRules.review(batch,
+                        Map.of("orders_src", List.of(new DiscoveredTable("orders", columns, List.of("_id"), 1L)))))
+                .as("every nested field of every document source would be reported, on every apply")
+                .isEmpty();
+    }
+
     /** The same batch throughout: only the connector the sync writes to differs. */
     private List<Resource> batch(String targetConnector) {
         return List.of(

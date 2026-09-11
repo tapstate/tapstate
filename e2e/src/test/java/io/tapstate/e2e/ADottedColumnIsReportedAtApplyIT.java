@@ -2,19 +2,14 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.tapstate.testsupport.DockerGate;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.Statement;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.utility.DockerImageName;
 
 /**
  * A column whose own name holds a dot is applied, and applying it says so - on a real database.
@@ -41,22 +36,14 @@ class ADottedColumnIsReportedAtApplyIT {
 
     private static final String READS_AS_A_PATH = "schema.column-name-reads-as-a-path";
 
-    private static MySQLContainer<?> mysql;
+    /** A database of this run's own on the server every specification here shares. */
+    private static Map<String, Object> mysql;
 
     @BeforeAll
     static void startTheDatabase() throws Exception {
-        DockerGate.require();
         RealConnectorGate.require("mysql", "mongodb");
-        mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
-        mysql.start();
+        mysql = SharedMySql.settings("dotted_column");
         seed(mysql);
-    }
-
-    @AfterAll
-    static void stopTheDatabase() {
-        if (mysql != null) {
-            mysql.stop();
-        }
     }
 
     @Test
@@ -64,7 +51,7 @@ class ADottedColumnIsReportedAtApplyIT {
     void aColumnWhoseNameHoldsADotIsAppliedAndReportedOn() throws Exception {
         try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("dotted_column"))) {
             ControlPlane control = NumericSource.connected(server);
-            Map<String, Object> config = NumericSource.config(mysql);
+            Map<String, Object> config = mysql;
             String target = SharedMongo.replicaSetUrl("dotted_column_target");
 
             // Discovered first, or the batch would be judged against a source nobody has looked at and
@@ -96,9 +83,8 @@ class ADottedColumnIsReportedAtApplyIT {
     }
 
     /** One table carrying an ordinary column beside the one under test, so only the dot differs. */
-    private static void seed(MySQLContainer<?> mysql) throws Exception {
-        try (Connection connection =
-                        DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword());
+    private static void seed(Map<String, Object> settings) throws Exception {
+        try (Connection connection = SharedMySql.connect(settings);
                 Statement statement = connection.createStatement()) {
             statement.execute("CREATE TABLE " + TABLE + " (id INT PRIMARY KEY, price_usd DECIMAL(18,4), "
                     + "`" + DOTTED_COLUMN + "` DECIMAL(18,4))");

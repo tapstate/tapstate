@@ -92,7 +92,7 @@ public final class DocumentKeyRules {
             case ServeBlock.Inline inline -> inline.from();
             case ServeBlock.Use use -> use.from();
         };
-        Set<Upstream> upstream = new Wiring(pipeline, byId).reaching(from);
+        Set<Upstream> upstream = named(new Wiring(pipeline, byId).reaching(from), byId);
         for (SyncElement element : sync) {
             if (!(byId.get(element.source()) instanceof SourceResource target)
                     || !KEYS_READ_AS_PATHS.contains(target.connector())) {
@@ -104,6 +104,27 @@ public final class DocumentKeyRules {
                 }
             }
         }
+    }
+
+    /**
+     * The upstreams whose discovered column names are names. A source that addresses a key by path
+     * reports a nested field as the path leading to it, so {@code address.city} arriving from one is a
+     * document shape the connector flattened, not a column somebody named with a dot in it — the
+     * nesting crosses to the target unchanged and a read for that same path answers. Nothing in the
+     * discovered model tells the two apart, so an upstream that addresses keys by path contributes
+     * none: reporting there would say "unreachable" about every nested field of every document source,
+     * on every apply, which is the noise that stops the channel being read at all.
+     */
+    private static Set<Upstream> named(Set<Upstream> upstream, Map<String, Resource> byId) {
+        Set<Upstream> kept = new LinkedHashSet<>();
+        for (Upstream up : upstream) {
+            if (byId.get(up.source()) instanceof SourceResource origin
+                    && KEYS_READ_AS_PATHS.contains(origin.connector())) {
+                continue;
+            }
+            kept.add(up);
+        }
+        return kept;
     }
 
     /**
