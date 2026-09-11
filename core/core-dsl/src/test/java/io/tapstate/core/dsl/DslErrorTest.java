@@ -56,6 +56,8 @@ class DslErrorTest {
                 // document, so both are witnessed by an ordinary corpus case
                 "dsl.unwind-needs-an-element-key",
                 "dsl.unwind-needs-an-upsert-target",
+                // Source columns are available during assembly, not offline corpus validation.
+                "dsl.unwind-column-already-exists",
                 // the join SQL gate: both are raised while reading the artifact, so both are
                 // witnessed by an ordinary corpus case
                 "dsl.join-sql-not-parsable",

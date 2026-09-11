@@ -249,6 +249,9 @@ dsl.upsert-needs-key:
 dsl.unwind-needs-an-element-key:
   message: "The unwind step `{step}` at {path} names nothing that varies from one element to the next, so every row it expands out of a row would carry that row's own key and the target would keep only the last of them."
   solution: "Add `element_key` naming a field inside each element that identifies the row it becomes, or `include_array_index` to carry each element's position in the array and be told apart by that."
+dsl.unwind-column-already-exists:
+  message: "Unwind option `{option}` generates column `{column}`, but that name is already in use."
+  solution: "Choose a name distinct from the parent columns, the array path, and the other generated column. Rename a parent column in an earlier map if necessary."
 dsl.unwind-needs-an-upsert-target:
   message: "The unwind step `{step}` is written by sync `{sync}`, whose {path} appends rows instead of matching them, so deleting a row would append the elements it used to hold instead of taking their rows away."
   solution: "Write that sync with `write_mode: upsert`, the default, so the expanded rows can be matched and removed; or serve the unwind to a sync that upserts and keep the append target on output that does not expand."

@@ -1,5 +1,7 @@
 package io.tapstate.adapters.transform;
 
+import io.tapstate.core.dsl.UnwindRules;
+
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
@@ -140,6 +142,8 @@ final class UnwindPort implements TransformPort {
         if (row == null) {
             return List.of();
         }
+        UnwindRules.refuseColumnCollisions(spec.path(), spec.includeArrayIndex(),
+                spec.elementKey(), row.keySet());
         Object value = row.get(spec.path());
         if (value == null || value instanceof List<?> list && list.isEmpty()) {
             return spec.preserveNullAndEmptyArrays() ? List.of(rowWith(row, null, null)) : List.of();

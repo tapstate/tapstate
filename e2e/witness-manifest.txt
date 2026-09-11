@@ -90,3 +90,7 @@ two-tables-become-one-document-in-the-managed-store on IN_PROCESS
 two-tables-become-one-document-in-the-managed-store on REAL_PROCESS
 renamed-parent-keys-keep-expanded-rows-distinct on IN_PROCESS
 renamed-parent-keys-keep-expanded-rows-distinct on REAL_PROCESS
+an-unwind-index-cannot-overwrite-a-parent-column on IN_PROCESS
+an-unwind-index-cannot-overwrite-a-parent-column on REAL_PROCESS
+an-unwind-element-key-cannot-overwrite-a-parent-column on IN_PROCESS
+an-unwind-element-key-cannot-overwrite-a-parent-column on REAL_PROCESS

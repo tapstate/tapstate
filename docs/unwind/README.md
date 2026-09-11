@@ -34,8 +34,12 @@ Given `{id: 10, items: [{sku: "a"}, {sku: "b"}]}`, this produces:
 If both locator options are present, `element_key` supplies identity and
 `include_array_index` only records order. To expand scalar elements, omit
 `element_key` and use `include_array_index`; the key becomes `(id, item_no)`.
-At least one locator is required. Choose locator column names that do not already
-exist on the parent: a generated column currently overwrites a same-named field.
+At least one locator is required. Generated column names must differ from parent
+column names, the array path, and each other. Assembly refuses a known collision with
+`dsl.unwind-column-already-exists` before the job runs. If an extra field absent from
+the discovered model appears in a row, the same check stops expansion before that
+row can overwrite it. Choose another generated name or rename the parent field in
+an earlier `map`.
 
 | Option | Meaning |
 |---|---|

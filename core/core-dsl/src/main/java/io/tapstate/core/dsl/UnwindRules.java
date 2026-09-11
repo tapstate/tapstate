@@ -18,9 +18,9 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * The two things an unwind has to settle before it may run, both answerable from the document
- * alone. Expanding a row is the first operation here that changes how many rows there are, and both
- * rules exist because the ways that goes wrong are silent: the pipeline is green, the target holds
+ * Declaration and column checks for an unwind. Locator and sink-mode rules can be answered from
+ * the document alone; generated-column collisions also need the upstream schema or actual row.
+ * These rules prevent silent data loss: the pipeline is green, the target holds
  * rows, and nothing counts the ones that were overwritten or the ones that should have gone away.
  *
  * <ul>
@@ -33,14 +33,32 @@ import java.util.Set;
  *       cannot deliver what it promises, so it is refused rather than promised.</li>
  * </ul>
  *
- * <p>Sibling of {@link WriteKeyRules} and answering the same question about the same write, but on
- * the other side of the discovery boundary: that one asks what a table declares, which only a
- * discovered model carries, while both of these are properties of the document and so are judged
- * offline, where an author still has the file open.
+ * <p>Sibling of {@link WriteKeyRules}. The document rules run offline, while the column check runs
+ * where the upstream shape is known and again on incoming rows for fields discovery did not report.
  */
 public final class UnwindRules {
 
     private UnwindRules() {
+    }
+
+    /**
+     * Refuses generated columns that would replace a parent value. Assembly supplies the derived
+     * columns; the port supplies actual row columns to cover fields absent from discovery.
+     * The array path is reserved even when the input model does not name it.
+     */
+    public static void refuseColumnCollisions(String path, String ordinal, String elementKey,
+            Collection<String> parentColumns) {
+        Set<String> occupied = new LinkedHashSet<>(parentColumns);
+        occupied.add(path);
+        refuseOccupied(occupied, ordinal, "include_array_index");
+        refuseOccupied(occupied, elementKey, "element_key");
+    }
+
+    private static void refuseOccupied(Set<String> occupied, String column, String option) {
+        if (column != null && !occupied.add(column)) {
+            throw new DslException(DslError.UNWIND_COLUMN_ALREADY_EXISTS, option, 0, 0, null,
+                    Map.of("column", column, "option", option));
+        }
     }
 
     /** Refuses every unwind in {@code batch} that cannot key its rows or cannot converge. */

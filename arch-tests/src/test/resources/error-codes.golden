@@ -150,6 +150,7 @@ dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode
 dsl.unsupported-version
+dsl.unwind-column-already-exists
 dsl.unwind-needs-an-element-key
 dsl.unwind-needs-an-upsert-target
 dsl.upsert-needs-key

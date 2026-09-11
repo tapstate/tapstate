@@ -136,6 +136,9 @@ public enum DslError implements TapstateErrorCode {
      */
     UNWIND_NEEDS_AN_UPSERT_TARGET(
             "dsl.unwind-needs-an-upsert-target", Set.of("step", "sync", "path")),
+    /** A generated unwind column would overwrite a parent column or another generated column. */
+    UNWIND_COLUMN_ALREADY_EXISTS(
+            "dsl.unwind-column-already-exists", Set.of("column", "option")),
     /** A join's {@code sql:} is not SQL at all. {@code detail} carries the parser's own diagnosis,
      *  which already names the line and column it stopped at. Kept apart from
      *  {@link #JOIN_SQL_UNSUPPORTED} because the two send a reader in opposite directions: one to

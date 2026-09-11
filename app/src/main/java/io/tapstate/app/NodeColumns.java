@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.dsl.UnwindWriteKeys;
+import io.tapstate.core.dsl.UnwindRules;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.PushFormat;
@@ -276,6 +277,8 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
      * not a quiet substitution for a type the author asked for.
      */
     private static NodeColumns expanded(TransformBody.Unwind unwind, NodeColumns upstream) {
+        UnwindRules.refuseColumnCollisions(unwind.path(), unwind.includeArrayIndex(),
+                unwind.elementKey(), upstream.columns().keySet());
         if (!upstream.known()) {
             return upstream;
         }
