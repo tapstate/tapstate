@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -97,6 +98,13 @@ public class CsvConnector implements TapConnector {
     private static final String REQUIRE_PASSWORD = "require_password";
 
     private static final String SUFFIX = ".csv";
+
+    /**
+     * What a table's content is staged under while the table is being replaced. The format's suffix is
+     * absent from it on purpose: a staging file that outlived a crash is then not a table by the same
+     * reading that lists the tables, and no lookup resolves to it.
+     */
+    private static final String STAGING_SUFFIX = ".staging";
 
     /**
      * The one command the read face dispatches. It is pinned on both sides on purpose: the caller sends
@@ -578,6 +586,20 @@ public class CsvConnector implements TapConnector {
         return columns;
     }
 
+    /**
+     * Replaces the table's file with the given rows in one step.
+     *
+     * <p>The content is staged beside the file it replaces and moved into place, rather than written over
+     * it. A file opened for writing is emptied before the text lands, so an in-place rewrite is a table
+     * that observably holds nothing for the length of the write while every row it holds is still there -
+     * and that reading is the one a count taken by anyone else cannot tell apart from a run that wrote
+     * nothing at all. A move is the one step a reader cannot land inside.
+     *
+     * <p>The staged name deliberately does not end in the format's suffix, and is not where a table is
+     * looked for: a directory listing made mid-write sees exactly the tables that have been written,
+     * never a half-written one being called a table. A staging file left behind by a crash is therefore
+     * not a table either, and the next write of that table does not collide with it.
+     */
     private static void write(Path file, List<String> header, List<Map<String, Object>> rows) {
         StringBuilder text = new StringBuilder(String.join(",", header)).append('\n');
         for (Map<String, Object> row : rows) {
@@ -590,7 +612,9 @@ public class CsvConnector implements TapConnector {
         }
         try {
             Files.createDirectories(file.getParent());
-            Files.writeString(file, text.toString());
+            Path staged = Files.createTempFile(file.getParent(), file.getFileName() + ".", STAGING_SUFFIX);
+            Files.writeString(staged, text.toString());
+            Files.move(staged, file, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot write the table at " + file, e);
         }
