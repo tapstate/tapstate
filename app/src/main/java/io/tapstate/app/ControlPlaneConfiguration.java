@@ -46,6 +46,7 @@ import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DerivedSchemas;
+import io.tapstate.control.core.SourceConnectionResolver;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
@@ -415,8 +416,8 @@ class ControlPlaneConfiguration {
     @Bean
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
-            ConnectorConfigValidator configValidator) {
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator);
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections);
     }
 
     @Bean
@@ -445,8 +446,15 @@ class ControlPlaneConfiguration {
     @Bean
     SchemaDiscoveryService schemaDiscoveryService(
             SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock,
-            ConnectorConfigValidator configValidator) {
-        return new SchemaDiscoveryService(probe, schemaStore, auditGate, clock, configValidator);
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        return new SchemaDiscoveryService(
+                probe, schemaStore, auditGate, clock, configValidator, sourceConnections);
+    }
+
+    @Bean
+    SourceConnectionResolver sourceConnectionResolver(
+            ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView) {
+        return new SourceConnectionResolver(artifactStore, connectorCatalogView::merged);
     }
 
     @Bean
