@@ -144,11 +144,12 @@ final class UnwindPort implements TransformPort {
         }
         UnwindRules.refuseColumnCollisions(spec.path(), spec.includeArrayIndex(),
                 spec.elementKey(), row.keySet());
-        Object value = row.get(spec.path());
+        Object original = row.get(spec.path());
+        Object value = containerValue(original);
         if (value == null || value instanceof List<?> list && list.isEmpty()) {
             return spec.preserveNullAndEmptyArrays() ? List.of(rowWith(row, null, null)) : List.of();
         }
-        List<?> elements = value instanceof List<?> list ? list : List.of(value);
+        List<?> elements = value instanceof List<?> list ? list : List.of(original);
         List<Map<String, Object>> out = new ArrayList<>(elements.size());
         for (int i = 0; i < elements.size(); i++) {
             out.add(rowWith(row, elements.get(i), (long) i));
@@ -179,10 +180,23 @@ final class UnwindPort implements TransformPort {
             out.put(spec.includeArrayIndex(), ordinal);
         }
         if (spec.elementKey() != null) {
+            Object value = containerValue(element);
             out.put(spec.elementKey(),
-                    element instanceof Map<?, ?> map ? map.get(spec.elementKey()) : null);
+                    value instanceof Map<?, ?> map ? map.get(spec.elementKey()) : null);
         }
         return out;
+    }
+
+    /**
+     * Reads a container's shape without stripping the carriers of its members. The source may
+     * convert an entire array or document; its outer carrier is not itself a scalar element.
+     * Nested values and unchanged row fields retain the type names the sink needs.
+     */
+    private static Object containerValue(Object value) {
+        while (value instanceof ConvertedValue carrier) {
+            value = carrier.value();
+        }
+        return value;
     }
 
     /**
