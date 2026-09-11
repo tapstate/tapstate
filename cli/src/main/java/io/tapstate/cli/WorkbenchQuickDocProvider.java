@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import io.tapstate.core.dsl.DslException;
+import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.schema.SchemaNavigator;
 import io.tapstate.core.schema.SchemaNode;
@@ -38,6 +39,12 @@ final class WorkbenchQuickDocProvider {
     }
 
     private Optional<String> validationAt(String content, int line, String localPath) {
+        if (!YamlPath.hasSemanticIdentity(content)) {
+            return schema.navigate(YamlPath.schemaPath(content, line).orElse("")).isEmpty()
+                            && !localPath.startsWith("config.")
+                    ? Optional.of(DslError.UNKNOWN_FIELD.code())
+                    : Optional.empty();
+        }
         try {
             parser.parse(content);
             return Optional.empty();
@@ -114,6 +121,19 @@ final class WorkbenchQuickDocProvider {
             return Optional.empty();
         }
 
+        static Optional<String> schemaPath(String content, int targetLine) {
+            return at(content, targetLine).map(PathAtLine::schemaPath);
+        }
+
+        static boolean hasSemanticIdentity(String content) {
+            String[] lines = content.split("\\n", -1);
+            String kind = resourceKind(lines);
+            if (kind == null || topLevelValue(lines, "id") == null) {
+                return false;
+            }
+            return !kind.equals("source") || topLevelValue(lines, "connector") != null;
+        }
+
         private static String resourceKind(String[] lines) {
             for (String line : lines) {
                 Field field = Field.parse(line);
@@ -121,6 +141,16 @@ final class WorkbenchQuickDocProvider {
                     String value = field.value();
                     return List.of("source", "pipeline", "transform", "view", "serve").contains(value)
                             ? value : null;
+                }
+            }
+            return null;
+        }
+
+        private static String topLevelValue(String[] lines, String name) {
+            for (String line : lines) {
+                Field field = Field.parse(line);
+                if (field != null && field.indent() == 0 && field.name().equals(name) && !field.value().isEmpty()) {
+                    return field.value();
                 }
             }
             return null;

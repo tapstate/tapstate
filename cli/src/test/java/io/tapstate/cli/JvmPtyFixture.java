@@ -136,6 +136,28 @@ final class JvmPtyFixture implements AutoCloseable {
         }
     }
 
+    int transcriptLength() {
+        return transcript().length();
+    }
+
+    void awaitTextAfter(String expected, int offset, Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        synchronized (transcriptChanged) {
+            while (!transcriptAfter(offset).contains(expected)
+                    && System.nanoTime() < deadline
+                    && process.isAlive()) {
+                long remainingMillis = Math.max(1,
+                        TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()));
+                transcriptChanged.wait(Math.min(remainingMillis, 50));
+            }
+        }
+        if (!transcriptAfter(offset).contains(expected)) {
+            throw new AssertionError(
+                    "PTY transcript after offset " + offset + " did not contain '" + expected + "': "
+                            + visibleTranscript());
+        }
+    }
+
     void send(String value) throws IOException {
         input.write(value.getBytes(StandardCharsets.UTF_8));
         input.flush();
@@ -187,6 +209,11 @@ final class JvmPtyFixture implements AutoCloseable {
         synchronized (transcript) {
             return transcript.toString(StandardCharsets.UTF_8);
         }
+    }
+
+    private String transcriptAfter(int offset) {
+        String current = transcript();
+        return current.substring(Math.min(offset, current.length()));
     }
 
     String visibleTranscript() {

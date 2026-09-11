@@ -16,6 +16,8 @@ class WorkbenchPtyLifecycleTest {
     private static final String LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
     private static final String HIDE_CURSOR = "\u001b[?25l";
     private static final String SHOW_CURSOR = "\u001b[?25h";
+    private static final String F6 = "\u001b[17~";
+    private static final String SHIFT_F6 = "\u001b[17;2~";
 
     @Test
     void sigwinchFrom83By53To88By24RendersTheShellWithoutReplacingTheRunner(@TempDir Path home) throws Exception {
@@ -52,6 +54,25 @@ class WorkbenchPtyLifecycleTest {
         try (JvmPtyFixture pty = startBare(home)) {
             pty.send("q");
 
+            assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
+            assertThat(pty.childExitStatus()).isZero();
+            assertTerminalRecovered(pty);
+        }
+    }
+
+    @Test
+    void shellPanelUsesCamelF6AndShiftF6SemanticsInARealPty(@TempDir Path home) throws Exception {
+        try (JvmPtyFixture pty = startBare(home)) {
+            pty.send(F6);
+            pty.awaitText("Shell", SCREEN_TIMEOUT);
+            pty.awaitText("(50%)", SCREEN_TIMEOUT);
+
+            int transcriptLengthBeforeResize = pty.transcriptLength();
+            pty.send(SHIFT_F6);
+            pty.awaitTextAfter("75", transcriptLengthBeforeResize, SCREEN_TIMEOUT);
+
+            pty.send(F6);
+            pty.send("q");
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
             assertThat(pty.childExitStatus()).isZero();
             assertTerminalRecovered(pty);
@@ -112,7 +133,7 @@ class WorkbenchPtyLifecycleTest {
             pty.signal("TERM");
 
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
-            assertThat(pty.childExitStatus()).isNotZero();
+            assertThat(pty.childExitStatus()).isZero();
             assertTerminalRecoveredExactlyOnce(pty);
         }
     }

@@ -744,7 +744,19 @@ final class WorkbenchRenderer {
     private static boolean isFirstRun(WorkbenchSnapshot snapshot) {
         WorkbenchSessionSnapshot session = snapshot.session();
         return session.connection() == WorkbenchConnection.NO_CONTEXT
-                && snapshot.workspace().rows().isEmpty();
+                && snapshot.workspace().rows().isEmpty()
+                && snapshot.overview().kinds().stream()
+                        .allMatch(count -> count.localCount() == 0 && count.remoteCount().orElse(0) == 0)
+                && isEmpty(snapshot.overview().alignment());
+    }
+
+    private static boolean isEmpty(WorkbenchAlignmentCounts counts) {
+        return counts.localOnly() == 0
+                && counts.remoteOnly() == 0
+                && counts.inSync() == 0
+                && counts.drifted() == 0
+                && counts.invalidLocal() == 0
+                && counts.unknown() == 0;
     }
 
     private static void renderFirstRunOverview(Frame frame, Rect area, WorkbenchTheme theme) {

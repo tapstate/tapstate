@@ -79,6 +79,7 @@ final class Workbench {
             runner = TuiRunner.create(runnerConfig(backend));
             backend.quitOnEof(runner::quit);
             backend.quitOnInterrupt(runner::quit);
+            backend.quitOnTerminate(runner::quit);
             return runner;
         } catch (Exception | Error failure) {
             closeAfterFailure(runner, backend, failure);
@@ -221,6 +222,10 @@ final class Workbench {
             }
             if (shellPanel != null && shellPanel.isOpen()) {
                 if (event instanceof KeyEvent key) {
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.F6) && key.hasShift()) {
+                        shellPanel.cycleHeight();
+                        return true;
+                    }
                     return shellPanel.handle(key);
                 }
                 if (event instanceof MouseEvent mouse) {
@@ -1147,7 +1152,7 @@ final class Workbench {
         public void close() {
             clearOverlaySecret();
             if (shellPanel != null) {
-                shellPanel.close();
+                shellPanel.destroy();
             }
             if (actionCoordinator != null) {
                 actionCoordinator.close();

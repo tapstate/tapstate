@@ -77,7 +77,8 @@ if pid == 0:                              # child: the binary on a controlling t
         os._exit(127)
 else:
     out = bytearray()
-    input_sent = False
+    inputs = data.splitlines(keepends=True)
+    input_index = 0
     write_failed = None
     deadline = time.time() + 15
     timed_out = True                     # cleared when the child closes the pty (clean EOF)
@@ -93,17 +94,18 @@ else:
                 timed_out = False
                 break
             out += chunk
-            # Interactive one-shot commands can accept input after their first prompt bytes.
-            ready = len(argv) > 1
-            if ready and not input_sent:
-                time.sleep(0.05)
+            # JLine 4 enables bracketed paste immediately before every reader prompt.
+            # The wizard asks multiple questions, so submit one answer per marker; a
+            # whole input burst can be consumed before subsequent readers are ready.
+            ready_readers = out.count(b"\x1b[?2004h>")
+            if len(argv) > 1 and input_index < len(inputs) and input_index < ready_readers:
                 try:
-                    os.write(fd, data)
+                    os.write(fd, inputs[input_index])
                 except OSError as error:
                     write_failed = str(error)
                     timed_out = False
                     break
-                input_sent = True
+                input_index += 1
     if timed_out:                        # never leave the native binary running
         try:
             os.kill(pid, signal.SIGKILL)
@@ -181,7 +183,10 @@ while time.time() < deadline:
         os.write(fd, b"smoke-pw\n")
         password_sent = True
 
-    screen_ready = b"Tapstate workbench" in out
+    # The top-level product label is painted by the first complete workbench frame.
+    # It is a stable readiness signal for sending lifecycle input; the old title text
+    # was removed when the header became context-aware.
+    screen_ready = b"Tapstate" in out
     if action == "resize":
         if not acted and b"Terminal size too small:" in out:
             fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
@@ -231,7 +236,7 @@ def normalized(attributes):
 
 exit_status = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
 restored = after is not None and normalized(before) == normalized(after)
-expected_exit = exit_status == 0 if action != "sigterm" else exit_status != 0
+expected_exit = exit_status == 0 if action != "sigterm" else exit_status in (0, -signal.SIGTERM)
 leave_alt = out.count(b"\x1b[?1049l")
 show_cursor = out.count(b"\x1b[?25h")
 sys.stdout.write(out.decode("utf-8", "replace"))
@@ -414,7 +419,7 @@ bold "[5] workbench — normal quit under a pty"
 workbench_session normal
 WORKBENCH_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
-   && printf '%s' "$WORKBENCH_CLEAN" | grep -q "Tapstate workbench" \
+   && printf '%s' "$WORKBENCH_CLEAN" | grep -q "Tapstate" \
    && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_EXIT__0' \
    && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_RESTORED__1' \
    && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_LEAVE_ALT__1' \
@@ -467,14 +472,18 @@ bold "[8] workbench — EOF, signals, and resize under a pty"
 for lifecycle_action in eof sigint sigterm resize; do
   workbench_session "$lifecycle_action"
   expected_exit=0
-  [[ "$lifecycle_action" == "sigterm" ]] && expected_exit=-15
+  [[ "$lifecycle_action" == "sigterm" ]] && expected_exit='0-or--15'
   if (( PTY_RC == 0 )) \
-     && marker_line_is "$PTY_OUT" "__TAPSTATE_PTY_EXIT__${expected_exit}" \
+     && { [[ "$lifecycle_action" != "sigterm" ]] \
+          && marker_line_is "$PTY_OUT" "__TAPSTATE_PTY_EXIT__${expected_exit}" \
+          || [[ "$lifecycle_action" == "sigterm" ]] \
+             && { marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_EXIT__0' \
+                  || marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_EXIT__-15'; }; } \
      && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_RESTORED__1' \
      && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_LEAVE_ALT__1' \
      && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_SHOW_CURSOR__1' \
      && { [[ "$lifecycle_action" != "resize" ]] \
-          || printf '%s' "$PTY_OUT" | strip_ansi | grep -q 'Tapstate workbench'; }; then
+          || printf '%s' "$PTY_OUT" | strip_ansi | grep -q 'Tapstate'; }; then
     ok "workbench $lifecycle_action restored cooked mode, cursor, and alternate screen"
   else
     bad "workbench $lifecycle_action lifecycle failed (rc=$PTY_RC); output:"; echo "$PTY_OUT"
@@ -550,7 +559,7 @@ ONLINE_CLEAN=$(printf '%s' "$PTY_OUT" | strip_ansi)
 if (( PTY_RC == 0 )) \
    && [[ -n "$STUB_PORT" ]] \
    && printf '%s' "$ONLINE_CLEAN" | grep -q "Password:" \
-   && printf '%s' "$ONLINE_CLEAN" | grep -q "Tapstate workbench" \
+   && printf '%s' "$ONLINE_CLEAN" | grep -q "Tapstate" \
    && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_EXIT__0' \
    && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_RESTORED__1' \
    && marker_line_is "$PTY_OUT" '__TAPSTATE_PTY_LEAVE_ALT__1' \

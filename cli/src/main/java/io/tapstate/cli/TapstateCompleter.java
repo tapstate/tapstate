@@ -9,9 +9,10 @@ import org.jline.reader.Candidate;
 import org.jline.reader.Completer;
 import org.jline.reader.LineReader;
 import org.jline.reader.ParsedLine;
-import org.jline.reader.impl.completer.FileNameCompleter;
+import org.jline.builtins.Completers.FileNameCompleter;
 import picocli.CommandLine;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
@@ -134,8 +135,13 @@ final class TapstateCompleter implements Completer {
 
     @Override
     public void complete(LineReader reader, ParsedLine line, List<Candidate> out) {
-        List<String> words = line.words();
+        List<String> words = new ArrayList<>(line.words());
         int wordIndex = line.wordIndex();
+        if (endsInWhitespace(line)) {
+            // JLine 4 keeps wordIndex on the preceding word after a separator.
+            words.add("");
+            wordIndex = words.size() - 1;
+        }
         String verb = words.isEmpty() ? "" : words.get(0);
         if ("validate".equals(verb) && isFirstPositional(words, wordIndex)) {
             files.complete(reader, line, out);
@@ -144,6 +150,12 @@ final class TapstateCompleter implements Completer {
         for (String value : candidates(words, wordIndex)) {
             out.add(new Candidate(value));
         }
+    }
+
+    private static boolean endsInWhitespace(ParsedLine line) {
+        return line.cursor() > 0
+                && line.cursor() == line.line().length()
+                && Character.isWhitespace(line.line().charAt(line.cursor() - 1));
     }
 
     /**

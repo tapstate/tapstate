@@ -617,9 +617,9 @@ class WorkbenchRendererTest {
         assertThat(CharWidth.of(arabicSymbol)).isEqualTo(1);
         assertThat(CharWidth.of(hangulLeadingConsonant)).isEqualTo(1);
 
-        assertUnicodeColumnBoundary("a".repeat(41) + arabicSymbol + "X", arabicSymbol);
+        assertUnicodeColumnBoundary("a".repeat(39) + arabicSymbol + "X", arabicSymbol);
         assertUnicodeColumnBoundary(
-                "a".repeat(41) + hangulLeadingConsonant + "X", hangulLeadingConsonant);
+                "a".repeat(39) + hangulLeadingConsonant + "X", hangulLeadingConsonant);
     }
 
     @Test

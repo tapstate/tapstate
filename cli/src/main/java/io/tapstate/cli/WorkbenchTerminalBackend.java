@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import dev.tamboui.backend.jline3.JLineBackend;
 import org.jline.terminal.Attributes.ControlChar;
 import org.jline.terminal.Terminal;
+import org.jline.utils.Signals;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -28,6 +29,7 @@ final class WorkbenchTerminalBackend extends JLineBackend {
     private boolean closed;
     private Throwable cleanupFailure;
     private Terminal.SignalHandler previousInterruptHandler;
+    private Object previousTerminateHandler;
     private Terminal.SignalHandler previousResizeHandler;
 
     WorkbenchTerminalBackend(Terminal terminal) {
@@ -49,6 +51,14 @@ final class WorkbenchTerminalBackend extends JLineBackend {
             throw new IllegalStateException("Interrupt handler is already installed");
         }
         previousInterruptHandler = terminal.handle(Terminal.Signal.INT, ignored -> quit.run());
+    }
+
+    synchronized void quitOnTerminate(Runnable handler) {
+        Runnable quit = Objects.requireNonNull(handler, "handler");
+        if (previousTerminateHandler != null) {
+            throw new IllegalStateException("terminate handler is already installed");
+        }
+        previousTerminateHandler = Signals.register("TERM", quit);
     }
 
     @Override
@@ -211,6 +221,10 @@ final class WorkbenchTerminalBackend extends JLineBackend {
         if (previousInterruptHandler != null) {
             terminal.handle(Terminal.Signal.INT, previousInterruptHandler);
             previousInterruptHandler = null;
+        }
+        if (previousTerminateHandler != null) {
+            Signals.unregister("TERM", previousTerminateHandler);
+            previousTerminateHandler = null;
         }
         if (previousResizeHandler != null) {
             terminal.handle(Terminal.Signal.WINCH, previousResizeHandler);
