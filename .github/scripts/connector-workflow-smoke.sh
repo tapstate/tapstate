@@ -39,7 +39,10 @@ def check(text):
     assert "if: steps.pdk.outputs.cache-hit != 'true'" in jars
     assert 'connector-cache.sh prepare' in jars and 'connector-cache.sh seal' in jars and 'connector-cache.sh verify' in jars
     assert '-nsu -Dmaven.repo.local=' in jars
-    assert 'https://github.com/tapdata/tapdata-connectors-enterprise.git' in jars
+    assert 'repository: tapdata/tapdata-connectors-enterprise' in jars
+    assert 'token: ${{ secrets.ENTERPRISE_CONNECTORS_READ_TOKEN }}' in jars
+    assert 'persist-credentials: false' in jars
+    assert 'mv "$GITHUB_WORKSPACE/.connector-enterprise-source" "$RUNNER_TEMP/connector-enterprise-source"' in jars
     for line in jars.splitlines():
         if 'connector-cache.sh prepare ' in line or 'connector-cache.sh seal ' in line or 'scripts/build-real-connectors.sh --checkout ' in line:
             assert '--checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source"' in line

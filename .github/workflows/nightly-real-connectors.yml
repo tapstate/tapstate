@@ -44,11 +44,18 @@ jobs:
         run: |
           mkdir -p "$HOME/.m2/repository" "$RUNNER_TEMP/connector-m2"
           rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$HOME/.m2/repository/" "$RUNNER_TEMP/connector-m2/"
+      - name: Read enterprise connector source
+        uses: actions/checkout@v4
+        with:
+          repository: tapdata/tapdata-connectors-enterprise
+          token: ${{ secrets.ENTERPRISE_CONNECTORS_READ_TOKEN }}
+          path: .connector-enterprise-source
+          persist-credentials: false
       - name: Resolve current upstream source
         id: source
         run: |
           git clone --depth 1 https://github.com/tapdata/tapdata-connectors.git "$RUNNER_TEMP/connector-source"
-          git clone --depth 1 https://github.com/tapdata/tapdata-connectors-enterprise.git "$RUNNER_TEMP/connector-enterprise-source"
+          mv "$GITHUB_WORKSPACE/.connector-enterprise-source" "$RUNNER_TEMP/connector-enterprise-source"
           echo "enterprise_sha=$(git -C "$RUNNER_TEMP/connector-enterprise-source" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "oss_sha=$(git -C "$RUNNER_TEMP/connector-source" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       # These are remote dependencies only. prepare always refreshes their snapshot
