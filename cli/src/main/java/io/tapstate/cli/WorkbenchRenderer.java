@@ -726,23 +726,24 @@ final class WorkbenchRenderer {
     private static void renderFirstRunOverview(Frame frame, Rect area, WorkbenchTheme theme) {
         int x = area.x() + Math.min(4, Math.max(1, area.width() / 16));
         int y = area.y() + 1;
-        write(frame, x, y++, "○ source   ─────▶   ◉ pipeline", theme.accent(), area);
-        write(frame, x, y++, "Your first pipeline starts here", theme.title(), area);
+        write(frame, x + 4, y++, "╭────────╮       ╭──────────╮", theme.accent(), area);
+        write(frame, x + 4, y++, "│ source │ ───▶  │ pipeline │", theme.accent(), area);
+        write(frame, x + 4, y++, "╰────────╯       ╰──────────╯", theme.accent(), area);
+        write(frame, x, y++, "No Pipeline Activity Found", theme.title(), area);
         y += 2;
 
-        write(frame, x, y++, "Choose a first route", theme.label().bold(), area);
-        write(frame, x, y++, "▶ Recommended: run the guided demo", theme.label().bold(), area);
-        write(frame, x + 3, y++, "tapstate demo -w demo", theme.success(), area);
-        write(frame, x + 3, y++, "cd demo && tapstate", theme.success(), area);
-        write(frame, x + 3, y++, "It writes a readable workspace for the Workbench to inspect.", theme.muted(), area);
+        write(frame, x, y++, "💡 How to get started:", theme.label().bold(), area);
+        write(frame, x, y++, "🚀 Run the guided demo workspace:", theme.base().bold(), area);
+        write(frame, x + 3, y++, "> tapstate demo -w demo", theme.success(), area);
+        write(frame, x + 3, y++, "> cd demo && tapstate", theme.success(), area);
         y++;
 
-        write(frame, x, y++, "○ Or connect an existing Tapstate Server", theme.base().bold(), area);
+        write(frame, x, y++, "🖥️ Or connect an existing Tapstate Server:", theme.base().bold(), area);
         y = writeKeyInstruction(frame, area, x + 3, y, "c", "create or choose a context", theme);
         y = writeKeyInstruction(frame, area, x + 3, y, "a", "sign in when the context is selected", theme);
         y++;
 
-        write(frame, x, y, "The Workspace tab will show local *.tap.yml files when they exist.", theme.muted(), area);
+        write(frame, x, y, "💻 Local *.tap.yml files appear in the Workspace tab.", theme.muted(), area);
     }
 
     private static int writeKeyInstruction(

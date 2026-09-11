@@ -180,8 +180,9 @@ class WorkbenchRendererTest {
         WorkbenchSnapshot snapshot = snapshot(session, new WorkbenchRemoteState.NotConfigured(), List.of());
 
         assertThat(render(100, 28, accepted(snapshot)).text())
-                .contains("Your first pipeline starts here", "Recommended: run the guided demo",
-                        "tapstate demo -w demo", "cd demo && tapstate", "Or connect an existing Tapstate Server",
+                .contains("No Pipeline Activity Found", "How to get started:",
+                        "Run the guided demo workspace:", "> tapstate demo -w demo", "> cd demo && tapstate",
+                        "Or connect an existing Tapstate Server:",
                         "create or choose a context", "sign in when the context is selected");
     }
 
