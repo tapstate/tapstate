@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class AnAppendOnlyTargetIsRefusedIT {
 
-    private static final Path WORKSPACE = Examples.ROOT.resolve("an-append-only-target-is-refused");
+    private static final Path WORKSPACE = Path.of("src/test/resources/unwind-append");
 
     @BeforeAll
     static void requireDocker() {
