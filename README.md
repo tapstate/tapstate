@@ -34,15 +34,30 @@ For how this compares with a streaming stack you assemble yourself, see
 
 ## Try it
 
-Run the Alpha locally:
+Install the CLI, then let it walk you through the first run:
 
 ```sh
 curl -sSL https://install.tapstate.dev | sh
+tapstate new
+tapstate up
 ```
 
-The demo starts MySQL, PostgreSQL, Tapstate, and MongoDB, then maintains a live order
-object assembled from both source databases. Change the source data and watch the
-state update.
+`tapstate new` asks what the workspace is for, from a short catalog of outcomes: try it
+with sample data, mirror one table as it changes, assemble several tables into one
+object. It writes that workspace to disk as ordinary `.tap.yml` files you can read and
+edit, and it reaches nothing while doing so — you can author offline, with no server in
+existence. `tapstate up` asks which server to bring it up against the first time — the
+default starts a local development stack in Docker on this machine — then checks the
+server and the sources, applies the workspace, and starts the pipeline.
+
+To see the whole thing running before you touch a database of your own, there is a
+disposable demo: it starts MySQL, PostgreSQL, Tapstate, and MongoDB, then maintains a
+live order object assembled from both source databases. Change the source data and
+watch the state update.
+
+```sh
+curl -sSL https://install.tapstate.dev/demo | sh
+```
 
 → [Follow the quickstart](https://tapstate.dev/docs/overview/quickstart-online)
 

@@ -120,7 +120,12 @@ jobs:
             # still pins the release before it, and a leg that reads both from the tag runs an older
             # release consistently and passes. It announced "the published release v0.4.1" and ran
             # 0.3.0, on the same run, two lines apart, while the published one-liner could not log in.
-            curl -fsSL https://install.tapstate.dev/ -o "$script"
+            #
+            # /demo, not the root: the root installs the CLI and nothing else, and the demo has its
+            # own name. The CLI_VERSION read below is what refuses the installer if a deploy ever
+            # routes the root here again -- the installer pins PINNED_VERSION, so the read comes back
+            # empty and the leg stops rather than running the wrong script.
+            curl -fsSL https://install.tapstate.dev/demo -o "$script"
             curl -fsSL "$raw/deploy/quickstart/docker-compose.yml" -o "$RUNNER_TEMP/script/compose.yml"
             compose="$RUNNER_TEMP/script/compose.yml"
             echo "leg: the published release $tag -- script from the install site, assets from that tag"
@@ -137,6 +142,10 @@ jobs:
           # broken. The store database below is already read off the script for the same reason.
           ver="$(sed -n 's/^CLI_VERSION="\(.*\)"$/\1/p' "$script" | head -1)"
           [ -n "$ver" ] || { echo "no CLI_VERSION found in the script under test" >&2; exit 1; }
+          if [ "$LEG" = published ] && [ "v$ver" != "$tag" ]; then
+            echo "published install script declares v$ver, but the newest release is $tag" >&2
+            exit 1
+          fi
           ref="ghcr.io/tapstate/tapstate:$ver"
           grep -q "image: ghcr.io/tapstate/tapstate:" "$compose" \
             || { echo "no server image reference found in $compose" >&2; exit 1; }

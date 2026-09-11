@@ -122,8 +122,12 @@ final class LsCmd implements Callable<Integer> {
         out.flush();
     }
 
-    /** The human one-line summary for an entry's kind; empty when the kind carries no summary fields. */
-    private static String summary(WorkspaceScan.Artifact e) {
+    /**
+     * The human one-line summary for an entry's kind; empty when the kind carries no summary fields.
+     * Shared with the guided first run, which describes each file it wrote in these same words: one
+     * place holds the wording, so what {@code new} says a file is for is what {@code ls} then shows.
+     */
+    static String summary(WorkspaceScan.Artifact e) {
         if (e.resource() == null) {
             return "(unreadable)";
         }

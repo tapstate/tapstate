@@ -3,10 +3,10 @@
 # Native smoke suite for the Tapstate CLI (poc1 D5).
 #
 # Exercises the GraalVM native-image binary as a black box: it must do the same offline work the
-# JVM build does, with every bundled resource (connector catalog / grammar schema / message catalog)
-# reachable inside the image and startup under the acceptance budget. JVM unit tests cannot catch a
-# missing resource or a reflection gap — only the produced binary can — so this script is the
-# executable spec for native packaging. A final check drives one loopback online round-trip
+# JVM build does, with every bundled resource (connector catalog / grammar schema / message catalog /
+# workspace recipes) reachable inside the image and startup under the acceptance budget. JVM unit
+# tests cannot catch a missing resource or a reflection gap — only the produced binary can — so this
+# script is the executable spec for native packaging. A final check drives one loopback online round-trip
 # (connect / login / register) so the authenticated HTTP path is proven reachable in the image too.
 #
 # Usage:
@@ -275,6 +275,27 @@ if echo "$NEW_OUT" | grep -q 'id: smoke_src' \
 else
   bad "new non-interactive did not render the expected artifact; output: $NEW_OUT"
 fi
+
+# The guided recipes copy their templates with getResourceAsStream. This has to run against the image
+# rather than the JAR: missing IncludeResources entries are invisible to unit tests and fail only for a
+# person running the distributed native binary. The sample recipe is deliberately included because it
+# is the default `tapstate new` path.
+RECIPE_DIR="$REPO_ROOT/cli/target/native-smoke-recipes"
+rm -rf "$RECIPE_DIR" && mkdir -p "$RECIPE_DIR"
+SAMPLE_DIR="$RECIPE_DIR/sample"
+BLANK_DIR="$RECIPE_DIR/blank"
+if "$BINARY" new sample --yes -w "$SAMPLE_DIR" >/dev/null 2>&1 \
+   && [[ -f "$SAMPLE_DIR/source/orders_db.tap.yml" ]] \
+   && [[ -f "$SAMPLE_DIR/source/fulfillment_db.tap.yml" ]] \
+   && [[ -f "$SAMPLE_DIR/pipeline/order_pipeline.tap.yml" ]] \
+   && "$BINARY" new blank --yes -w "$BLANK_DIR" >/dev/null 2>&1 \
+   && [[ -f "$BLANK_DIR/source/example_source.tap.yml" ]] \
+   && [[ -f "$BLANK_DIR/pipeline/example_pipeline.tap.yml" ]]; then
+  ok "sample and blank recipes copied their bundled templates from the native image"
+else
+  bad "a guided recipe could not read its bundled template from the native image"
+fi
+rm -rf "$RECIPE_DIR"
 
 # --- 4. explain — schema navigation (schema resource) ------------------------------------------
 bold "[4] explain — field documentation (schema resource)"
