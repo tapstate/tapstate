@@ -8,17 +8,22 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.schema.SchemaNavigator;
 import io.tapstate.messages.MessageCatalog;
-import org.jline.reader.EndOfFileException;
 import org.jline.reader.Completer;
 import org.jline.reader.LineReader;
 import org.jline.reader.LineReaderBuilder;
-import org.jline.reader.UserInterruptException;
+import org.jline.builtins.InteractiveCommandGroup;
+import org.jline.builtins.PosixCommandGroup;
+import org.jline.picocli.PicocliCommandRegistry;
+import org.jline.shell.Shell;
+import org.jline.shell.ShellBuilder;
+import org.jline.shell.impl.DefaultCommandDispatcher;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
+import org.jline.utils.AttributedStringBuilder;
+import org.jline.utils.AttributedStyle;
 import picocli.CommandLine;
 import picocli.CommandLine.Help.Ansi;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
@@ -27,12 +32,9 @@ import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.format.DateTimeFormatter;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.ZonedDateTime;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -4204,23 +4206,11 @@ final class Repl {
         this.terminal = () -> true;
         this.screenWidth = () -> terminal.getWidth() > 0 ? terminal.getWidth() : DEFAULT_SCREEN_WIDTH;
         this.prompter = new JLinePrompter(terminal, false);
-        try {
-            LineReader reader = readerFor(terminal,
-                    TapstateCompleter.forRepl(commandLine, SchemaNavigator.bundled()));
-            terminal.handle(Terminal.Signal.INT, signal -> cancelStream());
-            while (true) {
-                String line;
-                try {
-                    line = reader.readLine("tapstate> ");
-                } catch (UserInterruptException ignored) {
-                    continue;
-                } catch (EndOfFileException ignored) {
-                    break;
-                }
-                if (!dispatchEmbeddedLine(line)) {
-                    break;
-                }
-            }
+        try (Shell shell = buildEmbeddedShell(terminal)) {
+            shell.run();
+        } catch (Exception failure) {
+            terminal.writer().println("Shell crashed: " + failure.getClass().getSimpleName() + ": " + failure.getMessage());
+            terminal.writer().flush();
         } finally {
             commandLine.setOut(previousOut);
             commandLine.setErr(previousErr);
@@ -4230,137 +4220,34 @@ final class Repl {
         }
     }
 
-    private boolean dispatchEmbeddedLine(String line) {
-        List<String> words = tokenize(line == null ? "" : line.trim());
-        if (dispatchPosixBuiltin(words)) {
-            lastExitCode = Cli.EXIT_OK;
-            return true;
-        }
-        return dispatch(line);
-    }
-
-    /** JLine 3 has no general POSIX builtin group, so the embedded panel supplies its process-free equivalent. */
-    private boolean dispatchPosixBuiltin(List<String> words) {
-        if (words.isEmpty()) {
-            return true;
-        }
-        PrintWriter out = commandLine.getOut();
-        PrintWriter err = commandLine.getErr();
-        try {
-            switch (words.getFirst()) {
-                case "echo" -> out.println(String.join(" ", words.subList(1, words.size())));
-                case "clear" -> out.print("\u001b[2J\u001b[H");
-                case "date" -> out.println(DateTimeFormatter.RFC_1123_DATE_TIME.format(ZonedDateTime.now()));
-                case "sleep" -> sleep(words, err);
-                case "ls" -> listDirectory(words, out, err);
-                case "cat" -> cat(words, out, err);
-                case "head" -> lines(words, out, err, true);
-                case "tail" -> lines(words, out, err, false);
-                case "wc" -> wordCount(words, out, err);
-                case "sort" -> sort(words, out, err);
-                case "grep" -> grep(words, out, err);
-                default -> {
-                    return false;
-                }
+    private Shell buildEmbeddedShell(Terminal terminal) throws IOException {
+        PicocliCommandRegistry registry = new PicocliCommandRegistry(commandLine) {
+            @Override
+            public String name() {
+                return "Tapstate";
             }
-            out.flush();
-            err.flush();
-        } catch (IOException failure) {
-            err.println(words.getFirst() + ": " + failure.getMessage());
-            err.flush();
-        }
-        return true;
-    }
-
-    private void sleep(List<String> words, PrintWriter err) {
-        if (words.size() != 2) {
-            err.println("sleep: expected one duration in seconds");
-            return;
-        }
-        try {
-            Thread.sleep(Math.max(0L, (long) (Double.parseDouble(words.get(1)) * 1000)));
-        } catch (NumberFormatException failure) {
-            err.println("sleep: invalid duration: " + words.get(1));
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    private void listDirectory(List<String> words, PrintWriter out, PrintWriter err) throws IOException {
-        Path directory = words.size() > 1 ? resolveShellPath(words.get(1)) : workdir;
-        if (!Files.isDirectory(directory)) {
-            err.println("ls: not a directory: " + directory);
-            return;
-        }
-        try (var paths = Files.list(directory)) {
-            paths.sorted(Comparator.comparing(path -> path.getFileName().toString()))
-                    .forEach(path -> out.println(path.getFileName() + (Files.isDirectory(path) ? "/" : "")));
-        }
-    }
-
-    private void cat(List<String> words, PrintWriter out, PrintWriter err) throws IOException {
-        forEachFile("cat", words, err, path -> Files.readAllLines(path, StandardCharsets.UTF_8).forEach(out::println));
-    }
-
-    private void lines(List<String> words, PrintWriter out, PrintWriter err, boolean first) throws IOException {
-        if (words.size() < 2) {
-            err.println((first ? "head" : "tail") + ": missing file operand");
-            return;
-        }
-        List<String> values = Files.readAllLines(resolveShellPath(words.get(1)), StandardCharsets.UTF_8);
-        int count = Math.min(10, values.size());
-        (first ? values.subList(0, count) : values.subList(values.size() - count, values.size())).forEach(out::println);
-    }
-
-    private void wordCount(List<String> words, PrintWriter out, PrintWriter err) throws IOException {
-        forEachFile("wc", words, err, path -> {
-            String value = Files.readString(path, StandardCharsets.UTF_8);
-            long wordsCount = value.isBlank() ? 0 : value.trim().split("\\s+").length;
-            out.println(value.lines().count() + " " + wordsCount + " "
-                    + value.getBytes(StandardCharsets.UTF_8).length + " " + path.getFileName());
-        });
-    }
-
-    private void sort(List<String> words, PrintWriter out, PrintWriter err) throws IOException {
-        forEachFile("sort", words, err, path -> Files.readAllLines(path, StandardCharsets.UTF_8)
-                .stream().sorted().forEach(out::println));
-    }
-
-    private void grep(List<String> words, PrintWriter out, PrintWriter err) throws IOException {
-        if (words.size() < 3) {
-            err.println("grep: expected a pattern and file");
-            return;
-        }
-        for (int index = 2; index < words.size(); index++) {
-            try (BufferedReader reader = Files.newBufferedReader(
-                    resolveShellPath(words.get(index)), StandardCharsets.UTF_8)) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (line.contains(words.get(1))) {
-                        out.println(line);
+        };
+        return Shell.builder()
+                .terminal(terminal)
+                .prompt(Repl::embeddedPrompt)
+                .groups(registry, new PosixCommandGroup(), new InteractiveCommandGroup())
+                .helpCommands(true)
+                .commandHighlighter(false)
+                .variable(LineReader.LIST_MAX, 50)
+                .onReaderReady((reader, dispatcher) -> {
+                    if (dispatcher instanceof DefaultCommandDispatcher commandDispatcher) {
+                        commandDispatcher.session().setWorkingDirectory(workdir);
                     }
-                }
-            }
-        }
+                    terminal.handle(Terminal.Signal.INT, signal -> cancelStream());
+                })
+                .build();
     }
 
-    private void forEachFile(String command, List<String> words, PrintWriter err, FileAction action) throws IOException {
-        if (words.size() < 2) {
-            err.println(command + ": missing file operand");
-            return;
-        }
-        for (int index = 1; index < words.size(); index++) {
-            action.run(resolveShellPath(words.get(index)));
-        }
-    }
-
-    private Path resolveShellPath(String value) {
-        return workdir.resolve(value).normalize();
-    }
-
-    @FunctionalInterface
-    private interface FileAction {
-        void run(Path path) throws IOException;
+    private static String embeddedPrompt() {
+        return new AttributedStringBuilder()
+                .append("tapstate", AttributedStyle.DEFAULT.bold().foregroundRgb(0x4FACBC))
+                .append("> ", AttributedStyle.DEFAULT)
+                .toAnsi();
     }
 
     /** The command table's diagnostic stream, shared with the workbench startup boundary. */

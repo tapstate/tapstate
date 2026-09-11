@@ -464,7 +464,7 @@ final class WorkbenchShellPanel {
         }
     }
 
-    private static final class DelegateOutputStream extends OutputStream {
+    private final class DelegateOutputStream extends OutputStream {
         private volatile OutputStream delegate;
 
         @Override
@@ -472,6 +472,7 @@ final class WorkbenchShellPanel {
             if (delegate != null) {
                 delegate.write(value);
             }
+            requestRedraw();
         }
 
         @Override
@@ -479,6 +480,7 @@ final class WorkbenchShellPanel {
             if (delegate != null) {
                 delegate.write(values, offset, length);
             }
+            requestRedraw();
         }
 
         @Override
@@ -486,6 +488,7 @@ final class WorkbenchShellPanel {
             if (delegate != null) {
                 delegate.flush();
             }
+            requestRedraw();
         }
 
         @Override

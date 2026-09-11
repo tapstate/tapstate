@@ -228,6 +228,11 @@
         <version>${jline.version}</version>
       </dependency>
       <dependency>
+        <groupId>org.jline</groupId>
+        <artifactId>jline-picocli</artifactId>
+        <version>${jline.version}</version>
+      </dependency>
+      <dependency>
         <groupId>dev.tamboui</groupId>
         <artifactId>tamboui-tui</artifactId>
         <version>${tamboui.version}</version>
