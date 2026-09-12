@@ -1,6 +1,9 @@
 package io.tapstate.core.catalog;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The connectors this release officially supports — the one place that set is written down.
@@ -19,21 +22,33 @@ import java.util.List;
 public final class OfficialConnectors {
 
     /**
-     * The supported ids, in the order a message naming them should read.
+     * The supported ids grouped by database kind, in refusal-message order.
      *
-     * <p>Three engines, each with its managed variants. The variants are enumerated one by one rather
-     * than matched by prefix, because nothing in a connector's identity says which engine it belongs
-     * to: membership is a decision somebody made about a named connector, and a prefix rule would
-     * silently admit every future product whose id happens to begin the same way. Being listed here
-     * means the register path accepts the connector, which is not the same as the release having
-     * verified it — accepting a variant rests on it being the same engine underneath, and only the
-     * three engines themselves are exercised.
+     * <p>Variants are enumerated rather than matched by prefix: membership is an explicit support
+     * decision, and a prefix rule would silently admit future products. Accepting a managed variant
+     * rests on it being the same database kind underneath; verification exercises the database kind
+     * itself. Both the grouping and each id list are immutable.
      */
-    public static final List<String> IDS = List.of(
-            "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
-            "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
-            "tencent-db-postgres",
-            "mongodb", "mongodb-atlas", "mongodb3", "aliyun-db-mongodb", "tencent-db-mongodb");
+    public static final Map<String, List<String>> IDS_BY_DATABASE_KIND = databaseKinds();
+
+    /** The supported ids, in the order a message naming them should read. */
+    public static final List<String> IDS = IDS_BY_DATABASE_KIND.values().stream()
+            .flatMap(List::stream)
+            .toList();
+
+    private static Map<String, List<String>> databaseKinds() {
+        Map<String, List<String>> kinds = new LinkedHashMap<>();
+        kinds.put("mysql", List.of(
+                "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc"));
+        kinds.put("postgres", List.of(
+                "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
+                "tencent-db-postgres"));
+        kinds.put("mongodb", List.of(
+                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb"));
+        kinds.put("oracle", List.of("oracle"));
+        kinds.put("sqlserver", List.of("sqlserver"));
+        return Collections.unmodifiableMap(kinds);
+    }
 
     private OfficialConnectors() {
     }

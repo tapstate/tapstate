@@ -30,6 +30,7 @@ import io.tapstate.core.model.ViewResource;
 import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 import io.tapstate.core.model.DdlPolicy;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.ErrorPolicy;
 
 import java.math.BigDecimal;
@@ -489,6 +490,9 @@ public final class CanonicalWriter {
         }
         if (e.ddl() != null && e.ddl() != DdlPolicy.FAIL) {
             b.scalar("ddl", e.ddl().yaml());
+        }
+        if (e.onFullLoad() != null && e.onFullLoad() != OnFullLoad.APPEND) {
+            b.scalar("on_full_load", e.onFullLoad().yaml());
         }
         return b.build();
     }

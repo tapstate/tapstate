@@ -1,0 +1,14 @@
+version: tapstate/v1
+kind: pipeline
+id: breadth_crossing
+source: src_store
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: all_orders
+    from: [orders]
+    type: filter
+    expr: "true"
+serve:
+  from: all_orders
+  sync:
+    - source: tgt_db

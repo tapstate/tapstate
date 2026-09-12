@@ -1,0 +1,27 @@
+# PostgreSQL starts without the target table: the product creates it from Mongo discovery.
+# Keeping the source _id in the unprojected feed exercises its target primary key too.
+# Snapshot, insert, update and delete are separate delivery witnesses.
+# The changed sequence is read back: counts alone cannot detect a discarded update.
+name: a-mongo-collection-lands-in-a-postgres-table
+setup:
+  databases:
+    src_store: { kind: mongo }
+    tgt_db: { kind: postgres }
+  connectors: [mongodb, postgres]
+  apply: [src_store.tap.yml, tgt_db.tap.yml, pipeline.tap.yml]
+  discover: [src_store]
+pipeline: pipeline.tap.yml
+seed:
+  src_store.orders: { rows: 12 }
+steps:
+  - start
+  - await: { count: { tgt_db.orders: 12 } }
+  - await: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 5 } } } }
+  - cdc: { src_store.orders: insert 3 }
+  - await: { count: { tgt_db.orders: 15 } }
+  - await: { doc: { tgt_db.orders: { where: { id: 15 }, expect: { seq: 15 } } } }
+  - cdc: { src_store.orders: { update: { where: { id: 5 }, set: { seq: 505 } } } }
+  - await: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 505 } } } }
+  - cdc: { src_store.orders: { delete: { where: { id: 1 } } } }
+  - await: { count: { tgt_db.orders: 14 } }
+  - assert: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 505 } } } }

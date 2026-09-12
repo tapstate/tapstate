@@ -1,0 +1,362 @@
+{
+  "id": "sqlserver",
+  "name": "SQL Server",
+  "displayName": "SQL Server",
+  "icon": "icons/mssql.png",
+  "group": "database",
+  "modes": [
+    "cdc",
+    "snapshot"
+  ],
+  "discovery": "catalog",
+  "sink": {
+    "capable": true,
+    "writeSemantics": [
+      "upsert",
+      "append"
+    ]
+  },
+  "pushOut": false,
+  "config": [
+    {
+      "name": "host",
+      "type": "string",
+      "label": {
+        "en_US": "DB Address"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "port",
+      "type": "string",
+      "label": {
+        "en_US": "Port"
+      },
+      "required": true,
+      "default": "1433",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "database",
+      "type": "string",
+      "label": {
+        "en_US": "DB Name"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "user",
+      "type": "string",
+      "label": {
+        "en_US": "User"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "password",
+      "type": "string",
+      "label": {
+        "en_US": "Password"
+      },
+      "required": false,
+      "default": null,
+      "secret": true,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "schema",
+      "type": "string",
+      "label": {
+        "en_US": "Schema"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "cdcSolution",
+      "type": "string",
+      "label": {
+        "en_US": "CDC Solution"
+      },
+      "required": false,
+      "default": "CT",
+      "secret": false,
+      "options": [
+        {
+          "value": "CT",
+          "label": {
+            "en_US": "CT"
+          }
+        },
+        {
+          "value": "LogParser",
+          "label": {
+            "en_US": "LogParser"
+          }
+        }
+      ],
+      "visibleWhen": null
+    },
+    {
+      "name": "extParams",
+      "type": "string",
+      "label": {
+        "en_US": "Other connection string parameters"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "timezone",
+      "type": "string",
+      "label": {
+        "en_US": "Timezone for Datetime"
+      },
+      "required": false,
+      "default": "",
+      "secret": false,
+      "options": [
+        {
+          "value": "",
+          "label": {
+            "en_US": ""
+          }
+        },
+        {
+          "value": "-11:00",
+          "label": {
+            "en_US": "UTC -11"
+          }
+        },
+        {
+          "value": "-10:00",
+          "label": {
+            "en_US": "UTC -10"
+          }
+        },
+        {
+          "value": "-09:00",
+          "label": {
+            "en_US": "UTC -09"
+          }
+        },
+        {
+          "value": "-08:00",
+          "label": {
+            "en_US": "UTC -08"
+          }
+        },
+        {
+          "value": "-07:00",
+          "label": {
+            "en_US": "UTC -07"
+          }
+        },
+        {
+          "value": "-06:00",
+          "label": {
+            "en_US": "UTC -06"
+          }
+        },
+        {
+          "value": "-05:00",
+          "label": {
+            "en_US": "UTC -05"
+          }
+        },
+        {
+          "value": "-04:00",
+          "label": {
+            "en_US": "UTC -04"
+          }
+        },
+        {
+          "value": "-03:00",
+          "label": {
+            "en_US": "UTC -03"
+          }
+        },
+        {
+          "value": "-02:00",
+          "label": {
+            "en_US": "UTC -02"
+          }
+        },
+        {
+          "value": "-01:00",
+          "label": {
+            "en_US": "UTC -01"
+          }
+        },
+        {
+          "value": "+00:00",
+          "label": {
+            "en_US": "UTC"
+          }
+        },
+        {
+          "value": "+01:00",
+          "label": {
+            "en_US": "UTC +01"
+          }
+        },
+        {
+          "value": "+02:00",
+          "label": {
+            "en_US": "UTC +02"
+          }
+        },
+        {
+          "value": "+03:00",
+          "label": {
+            "en_US": "UTC +03"
+          }
+        },
+        {
+          "value": "+04:00",
+          "label": {
+            "en_US": "UTC +04"
+          }
+        },
+        {
+          "value": "+05:00",
+          "label": {
+            "en_US": "UTC +05"
+          }
+        },
+        {
+          "value": "+06:00",
+          "label": {
+            "en_US": "UTC +06"
+          }
+        },
+        {
+          "value": "+07:00",
+          "label": {
+            "en_US": "UTC +07"
+          }
+        },
+        {
+          "value": "+08:00",
+          "label": {
+            "en_US": "UTC +08"
+          }
+        },
+        {
+          "value": "+09:00",
+          "label": {
+            "en_US": "UTC +09"
+          }
+        },
+        {
+          "value": "+10:00",
+          "label": {
+            "en_US": "UTC +10"
+          }
+        },
+        {
+          "value": "+11:00",
+          "label": {
+            "en_US": "UTC +11"
+          }
+        },
+        {
+          "value": "+12:00",
+          "label": {
+            "en_US": "UTC +12"
+          }
+        },
+        {
+          "value": "+13:00",
+          "label": {
+            "en_US": "UTC +13"
+          }
+        },
+        {
+          "value": "+14:00",
+          "label": {
+            "en_US": "UTC +14"
+          }
+        }
+      ],
+      "visibleWhen": null
+    },
+    {
+      "name": "useSSL",
+      "type": "boolean",
+      "label": {
+        "en_US": "Use SSL/TLS"
+      },
+      "required": false,
+      "default": "false",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "sslKeyPassword",
+      "type": "string",
+      "label": {
+        "en_US": "SSL/TLS Certificate Password"
+      },
+      "required": true,
+      "default": null,
+      "secret": true,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "useSSL",
+        "equalsAnyOf": [
+          "true"
+        ]
+      }
+    },
+    {
+      "name": "hostNameInCertificate",
+      "type": "string",
+      "label": {
+        "en_US": "Server hostname"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "useSSL",
+        "equalsAnyOf": [
+          "true"
+        ]
+      }
+    }
+  ],
+  "provenance": {
+    "specPath": "connectors/mssql-connector/src/main/resources/mssql-spec.json",
+    "specContentHash": "d31913c44fb5bb34",
+    "pdkApiVersion": null,
+    "requiredLevel": null,
+    "modeSource": {
+      "cdc": "derived",
+      "snapshot": "derived"
+    }
+  }
+}

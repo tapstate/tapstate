@@ -40,7 +40,14 @@ for arg in "$@"; do
   next=""
   case "$arg" in -f) next=f ;; -pl) next=pl ;; -s) next=s ;; esac
 done
-echo "$modules" > "$SMOKE_MODULES_SEEN"
+case "$modules" in connectors-common/*) ;; *) echo "$modules" >> "$SMOKE_MODULES_SEEN" ;; esac
+if [ -n "${SMOKE_BUILD_TRACE:-}" ]; then
+  repository=""
+  for arg in "$@"; do
+    case "$arg" in -Dmaven.repo.local=*) repository="${arg#*=}" ;; esac
+  done
+  printf '%s\t%s\t%s\t%s\n' "$checkout" "$modules" "${!#}" "$repository" >> "$SMOKE_BUILD_TRACE"
+fi
 echo "${JAVA_HOME:-}" > "$SMOKE_JAVA_HOME_SEEN"
 echo "$settings" > "${SMOKE_SETTINGS_SEEN:-/dev/null}"
 case " $* " in *" clean "*) cleans=yes ;; *) cleans=no ;; esac
@@ -71,7 +78,9 @@ STUB
 # A checkout with the three default modules plus one extra, so a case can ask for something outside
 # the default list and be seen to get it.
 fresh_checkout() {
-  rm -rf "${scratch:?}/checkout" "${scratch:?}/dest"
+  rm -rf "${scratch:?}/checkout" "${scratch:?}/enterprise" "${scratch:?}/dest"
+  mkdir -p "$scratch/enterprise/connectors/oracle-connector" "$scratch/enterprise/connectors/mssql-connector"
+  : > "$scratch/enterprise/pom.xml"
   for module in mysql-connector mongodb-connector postgres-connector redis-connector; do
     mkdir -p "$scratch/checkout/connectors/$module/src/main/resources"
   done
@@ -195,9 +204,9 @@ expect "a checkout that is not one" 2 "no connectors/ directory" \
 # order: this is the one input whose regression the lane that uses it cannot report.
 fresh_checkout
 expect "the default list still builds the witness lane's connectors" 0 "Connector jars staged" \
-  --checkout "$scratch/checkout" "$scratch/dest"
+  --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
 expect_modules "the default list, by name and in order" \
-  "connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector"
+  $'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector\nconnectors/oracle-connector,connectors/mssql-connector'
 
 fresh_checkout
 expect "a named list is built instead of the default" 0 "Connector jars staged" \
@@ -248,7 +257,13 @@ fresh_checkout
 mkdir -p "$scratch/checkout/connectors/aliyun-mongodb-connector/src/main/resources"
 expect "an id that is not its module's file prefix" 0 "Connector jars staged" \
   --modules "aliyun-db-mongodb=connectors/aliyun-mongodb-connector" \
-  --checkout "$scratch/checkout" "$scratch/dest"
+  --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
+
+# The public SQL Server id differs from the upstream Maven artifact.
+fresh_checkout
+expect "SQL Server stages by connector id" 0 "Staged sqlserver-connector-v1.0.0.jar" \
+  --modules "sqlserver=connectors/mssql-connector" \
+  --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
 
 # The other rule still has to hold for the lane that uses it: the witnesses take the default list and
 # resolve by id, so a sibling sharing an id's prefix makes their lookup ambiguous.
@@ -256,7 +271,7 @@ fresh_checkout
 mkdir -p "$scratch/dest"
 : > "$scratch/dest/mysql-pxc-connector-v1.0.0.jar"
 expect "a sibling jar makes the witnesses' id lookup ambiguous" 1 "require exactly one" \
-  --checkout "$scratch/checkout" "$scratch/dest"
+  --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
 
 # The destination is not cleared, so a jar left there by an earlier run with a different version can
 # sit beside the one just staged - and derive's rule fails loud on two, which is a refusal this
@@ -341,6 +356,39 @@ elif printf '%s' "$out" | grep -qF "settings file is missing"; then
 else
   printf '  FAIL  %s: refused for some other reason:\n' "a missing settings file is refused"
   printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
+
+# Cross-repository prerequisites are not available from remote Maven repositories.
+# Require the OSS install before enterprise package and the same isolated repository.
+fresh_checkout
+mkdir -p "$scratch/enterprise/connectors/oracle-connector" "$scratch/enterprise/connectors/mssql-connector"
+: > "$scratch/enterprise/pom.xml"
+: > "$scratch/build-trace"
+expect "both source reactors build into one dist" 0 "Staged sqlserver-connector-v1.0.0.jar" \
+  "SMOKE_BUILD_TRACE=$scratch/build-trace" MAVEN_ARGS= \
+  --modules "mysql=connectors/mysql-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector" \
+  --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
+if python3 - "$scratch" <<'CHECK'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+rows = [line.split('\t') for line in (root / 'build-trace').read_text().splitlines()]
+assert [(Path(row[0]).name, row[1], row[2]) for row in rows] == [
+    ('checkout', 'connectors/mysql-connector', 'package'),
+    ('checkout', 'connectors-common/sql-core,connectors-common/read-partition', 'install'),
+    ('enterprise', 'connectors/oracle-connector,connectors/mssql-connector', 'package'),
+], rows
+assert len({row[3] for row in rows}) == 1 and rows[0][3], rows
+assert rows[0][3] != str(Path.home() / '.m2/repository'), rows
+assert sorted(path.name for path in (root / 'dest').glob('*.jar')) == [
+    'mysql-connector-v1.0.0.jar', 'oracle-connector-v1.0.0.jar', 'sqlserver-connector-v1.0.0.jar']
+CHECK
+then
+  echo "  ok    prerequisites, build order, shared isolated repository and canonical jar ids"
+  passed=$((passed + 1))
+else
+  echo "  FAIL  dual-source build order or provenance"
   failed=$((failed + 1))
 fi
 

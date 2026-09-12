@@ -43,6 +43,106 @@ import org.junit.jupiter.api.Test;
 class StoreBackedDagSourceTargetModelTest {
 
     @Test
+    void boundedStringMetadataReachesTheSinkOnlyForDirectSourceValues() {
+        var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
+        for (boolean computed : List.of(false, true)) {
+            InMemoryStorePort store = seededProjectingPipeline(computed
+                    ? Map.of("code", io.tapstate.core.model.FieldRule.computed("after.code + 'x'"))
+                    : Map.of("renamed", io.tapstate.core.model.FieldRule.rename("code")));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "varchar(36)", io.tapstate.core.common.TapstateType.STRING, null, null, string),
+                    new SourceField("code", "varchar(36)", io.tapstate.core.common.TapstateType.STRING, null, null, string)),
+                    List.of("id"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+            assertThat(bound.getFirst().fields().stream().filter(TargetField::primaryKey).findFirst().orElseThrow().stringType())
+                    .isEqualTo(string);
+            String output = computed ? "code" : "renamed";
+            assertThat(bound.getFirst().fields().stream().filter(field -> field.name().equals(output)).findFirst().orElseThrow().stringType())
+                    .isEqualTo(computed ? null : string);
+        }
+    }
+
+    @Test
+    void unionChecksEveryForkBeforeInheritingSourceUniqueness() {
+        for (boolean changedFirst : List.of(false, true)) {
+            InMemoryStorePort store = seededPipeline();
+            store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                    List.of(Step.inline("shared", FromClause.list(FromRef.literal("orders_src")),
+                                    new TransformBody.Filter("true"), null),
+                            Step.inline("unchanged", FromClause.list(FromRef.literal("shared")),
+                                    new TransformBody.Filter("true"), null),
+                            Step.inline("changed", FromClause.list(FromRef.literal("shared")),
+                                    new TransformBody.MapProjection(Map.of("code", io.tapstate.core.model.FieldRule.literal(0))), null),
+                            Step.inline("merged", FromClause.list(FromRef.literal(changedFirst ? "changed" : "unchanged"),
+                                            FromRef.literal(changedFirst ? "unchanged" : "changed")),
+                                    new TransformBody.Union(), null)),
+                    null, new ServeBlock.Inline(null, FromRef.literal("merged"),
+                            List.of(new SyncElement("sync_1", "orders_dest", null, null, null)), null, null), null, null));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("code", "INT")), List.of("id"),
+                    List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true)))));
+            List<TargetTable> bound = new ArrayList<>();
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+            assertThat(bound.getFirst().indexes()).as("changed fork first: %s", changedFirst)
+                    .containsExactly(new TargetIndex(List.of("id"), true));
+        }
+    }
+
+    @Test
+    void changingASecondaryUniqueColumnDoesNotConstrainDistinctOutputRows() {
+        for (var rule : List.of(io.tapstate.core.model.FieldRule.literal(0),
+                io.tapstate.core.model.FieldRule.computed("after.code % 2"),
+                io.tapstate.core.model.FieldRule.rename("other"))) {
+            InMemoryStorePort store = seededProjectingPipeline(Map.of("code", rule));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("code", "INT"),
+                    new SourceField("other", "INT")), List.of("id"),
+                    List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true),
+                            new io.tapstate.spi.store.SourceIndex("composite_unique", List.of("code", "id"), true),
+                            new io.tapstate.spi.store.SourceIndex("code_search", List.of("code"), false)))));
+            List<TargetTable> bound = new ArrayList<>();
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+            assertThat(bound.getFirst().indexes()).as("projection %s", rule)
+                    .containsExactly(new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), false));
+        }
+    }
+
+    @Test
+    void unchangedSecondaryUniqueColumnsRemainConstrained() {
+        InMemoryStorePort store = seededProjectingPipeline(Map.of("other",
+                io.tapstate.core.model.FieldRule.literal(0)));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("code", "INT"),
+                new SourceField("other", "INT")), List.of("id"),
+                List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true)))));
+        List<TargetTable> bound = new ArrayList<>();
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+        assertThat(bound.getFirst().indexes()).containsExactly(
+                new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), true));
+    }
+
+    @Test
+    void directProjectionRetainsNumericMetadataButRecomputedSameNameDoesNot() {
+        var number = new io.tapstate.core.common.NumericType(null, true, false, null,
+                new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
+        for (boolean computed : List.of(false, true)) {
+            InMemoryStorePort store = seededProjectingPipeline(computed
+                    ? Map.of("amount", io.tapstate.core.model.FieldRule.computed("after.amount + 1"))
+                    : Map.of("total", io.tapstate.core.model.FieldRule.rename("amount")));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT", io.tapstate.core.common.TapstateType.INT64),
+                    new SourceField("amount", "DECIMAL(18,4)", io.tapstate.core.common.TapstateType.DECIMAL, null, number)),
+                    List.of("id"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+            String output = computed ? "amount" : "total";
+            TargetField field = bound.getFirst().fields().stream().filter(f -> f.name().equals(output)).findFirst().orElseThrow();
+            assertThat(field.numericType()).isEqualTo(computed ? null : number);
+        }
+    }
+
+    @Test
     void a_view_target_is_keyed_by_the_source_tables_that_reach_it() {
         // The sink resolves a target by the table the row came from, so a view - which collapses every
         // upstream table into one collection - must answer to each of those table names. Keyed by the
@@ -101,8 +201,8 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
 
         assertThat(bound).containsExactly(new TargetTable("orders", List.of(
-                new TargetField("id", "INT", true),
-                new TargetField("amount", "DECIMAL", false))));
+                new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                new TargetField("amount", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -125,7 +225,7 @@ class StoreBackedDagSourceTargetModelTest {
         // The type is still the one the source declared for the column: what a projection changes is
         // which columns travel, and a target built to a type nobody discovered is a different change.
         assertThat(bound).containsExactly(new TargetTable("orders", List.of(
-                new TargetField("id", "INT", true))));
+                new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -217,8 +317,8 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
 
         assertThat(bound).containsExactly(
-                new TargetTable("player_address", List.of(new TargetField("id", "INT", true))),
-                new TargetTable("ods_orders", List.of(new TargetField("id", "INT", true))));
+                new TargetTable("player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))),
+                new TargetTable("ods_orders", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -231,7 +331,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -246,7 +346,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -261,7 +361,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -274,7 +374,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -287,7 +387,7 @@ class StoreBackedDagSourceTargetModelTest {
         new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("p");
 
         assertThat(bound).containsEntry("PlayerAddress", new TargetTable(
-                "player_address", List.of(new TargetField("id", "INT", true))));
+                "player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -307,11 +407,11 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThat(bound)
                 .containsEntry("orders", new TargetTable("orders", List.of(
-                        new TargetField("id", "INT", true),
-                        new TargetField("total", "DECIMAL", false))))
+                        new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                        new TargetField("total", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))))
                 .containsEntry("PlayerAddress", new TargetTable("player_address", List.of(
-                        new TargetField("id", "INT", true),
-                        new TargetField("street", "VARCHAR", false))));
+                        new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN),
+                        new TargetField("street", "VARCHAR", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -339,9 +439,9 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThat(bound).containsOnlyKeys("orders", "PlayerAddress")
                 .containsEntry("orders", new TargetTable("orders", List.of(
-                        new TargetField("id", "INT", true), new TargetField("amount", "DECIMAL", false))))
+                        new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN), new TargetField("amount", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))))
                 .containsEntry("PlayerAddress", new TargetTable("player_address", List.of(
-                        new TargetField("id", "INT", true), new TargetField("city", "VARCHAR", false))));
+                        new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN), new TargetField("city", "VARCHAR", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     @Test
@@ -371,8 +471,8 @@ class StoreBackedDagSourceTargetModelTest {
         // The second fork contributes region, while neither fork carries obsolete. Keeping only the
         // first reference or restoring the wholesale physical model gives a different target shape.
         assertThat(bound).containsOnlyKeys("orders").containsEntry("orders", new TargetTable("orders", List.of(
-                new TargetField("id", "INT", true), new TargetField("amount", "DECIMAL", false),
-                new TargetField("region", "VARCHAR", false))));
+                new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN), new TargetField("amount", "DECIMAL", false, io.tapstate.core.common.TapstateType.UNKNOWN),
+                new TargetField("region", "VARCHAR", false, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
     }
 
     // ---- fixtures ----------------------------------------------------------------------

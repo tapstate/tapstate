@@ -68,7 +68,7 @@ final class FailureScene {
             scene.append("  ").append(table).append(" = ");
             try {
                 scene.append(binding.count(table));
-            } catch (RuntimeException couldNotRead) {
+            } catch (RuntimeException | AssertionError couldNotRead) {
                 scene.append("unreadable (").append(couldNotRead.getClass().getSimpleName()).append(": ")
                         .append(scrubbed(couldNotRead.getMessage())).append(')');
             }
@@ -107,7 +107,7 @@ final class FailureScene {
         try {
             Optional<Map<String, Object>> found = binding.fetch(table, doc.where());
             scene.append(found.map(FailureScene::scrubbed).orElse("no document matches"));
-        } catch (RuntimeException couldNotRead) {
+        } catch (RuntimeException | AssertionError couldNotRead) {
             scene.append("unreadable (").append(scrubbed(couldNotRead.getMessage())).append(')');
         }
         scene.append('\n');
@@ -144,7 +144,7 @@ final class FailureScene {
         scene.append("  ").append(what).append(" = ");
         try {
             scene.append(reading.take().map(FailureScene::scrubbed).orElse("nothing published yet"));
-        } catch (RuntimeException couldNotRead) {
+        } catch (RuntimeException | AssertionError couldNotRead) {
             scene.append("unreadable (").append(scrubbed(couldNotRead.getMessage())).append(')');
         }
         scene.append('\n');

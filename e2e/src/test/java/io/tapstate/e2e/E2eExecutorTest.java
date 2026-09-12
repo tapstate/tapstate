@@ -3,6 +3,8 @@ package io.tapstate.e2e;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -471,6 +473,20 @@ class E2eExecutorTest {
         assertThat(binding.calls).contains("redeliver:src_mongo.orders");
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"{ update: { where: { id: 5 }, set: { seq: 505 } } }", "update 1"})
+    void aDroppedUpdateCannotPassBecauseRedeliveryReinsertsItsNewValue(String change) {
+        binding.holdsDocument(TARGET, Map.of("id", 5L, "seq", 5L));
+        binding.onRedeliverDocumentBecomes(TARGET, Map.of("id", 5L, "seq", 505L));
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - cdc: { src_mongo.orders: " + change + " }\n"
+                + "  - await: { doc: { tgt_mongo.orders: { where: { id: 5 }, expect: { seq: 505 } } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("expected 505, found 5");
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
     /** Redelivery exists for lost changes; an await with no change before it has nothing to redeliver. */
     @Test
     void aStalledAwaitWithNoPrecedingChangeNeverRedelivers() {
@@ -802,6 +818,13 @@ class E2eExecutorTest {
 
         private TableAlias redeliverMovesTable;
         private long redeliverMovesTo;
+        private TableAlias redeliverDocumentTable;
+        private Map<String, Object> redeliverDocument;
+
+        void onRedeliverDocumentBecomes(TableAlias table, Map<String, Object> document) {
+            redeliverDocumentTable = table;
+            redeliverDocument = document;
+        }
 
         /** Arranges for a redelivery to unblock a count, the way a re-emitted batch reaches a target. */
         void onRedeliverCountBecomes(TableAlias table, long value) {
@@ -812,6 +835,9 @@ class E2eExecutorTest {
         @Override
         public void redeliver(TableAlias table) {
             calls.add("redeliver:" + table);
+            if (redeliverDocumentTable != null) {
+                holdsDocument(redeliverDocumentTable, redeliverDocument);
+            }
             if (redeliverMovesTable != null) {
                 countsOverTime(redeliverMovesTable, redeliverMovesTo);
             }

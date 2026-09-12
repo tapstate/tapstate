@@ -33,11 +33,84 @@ into a single object and kept fresh: snapshot first, then live change-data-captu
 
 The worked example is **MySQL + PostgreSQL → one materialized object**. An order lives in
 MySQL, its shipments live in PostgreSQL, and neither database can see the other — so no
-view and no join can produce the result. The runtime itself is connector-agnostic (every
-connector is loaded through the same plugin interface), but this release **registers
-MySQL, PostgreSQL and MongoDB only**: they are the connectors it supports end to end
-today, and registering any other one is refused. The set grows as connectors are
-certified.
+view and no join can produce the result. The runtime itself is connector-agnostic: every
+connector is loaded through the same plugin interface.
+
+## Connector support boundary
+
+This preview certifies the following database kinds, with certification scoped by direction:
+
+| Database | Connector kind | Certified use |
+|---|---|---|
+| MySQL | `mysql` | Read and write |
+| PostgreSQL | `postgres` | Read and write |
+| MongoDB | `mongodb` | Read and write |
+| Oracle | `oracle` | Read and write |
+| SQL Server | `sqlserver` | Read and write |
+
+Oracle Free 23 and SQL Server 2022 targets are verified with MySQL snapshot and CDC
+inserts, updates and deletes, automatic table/index preparation, and full-load policies.
+Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+negative fractions and CDC updates. This is not an exhaustive cross-version or
+all-data-type matrix. The default accepted set contains 16 connector ids
+across these five database kinds, including existing managed variants of MySQL,
+PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+Other managed variants of Oracle and SQL Server are outside the default accepted set.
+
+`tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
+on this server. Configuring it puts that server outside the supported configuration;
+acceptance does not certify the added connectors. The setting is empty by default and
+is not configured in release or quickstart artifacts. A `connector.not-official` refusal
+reports the server's actual accepted set, including any additional ids configured there.
+Registration through an upload and registration through the seed directory use the same
+acceptance check.
+
+Numeric source attributes, including precision, scale and value bounds, are preserved
+through schema storage and target preparation. Decimal columns whose metadata was
+stored by an older build need schema rediscovery before automatic target creation.
+Missing or inconsistent decimal metadata is refused before writing; computed decimal
+outputs without a declared numeric domain cannot be auto-created safely.
+
+Oracle connector bytes, including the bundled `ojdbc8` driver under the Oracle Free Use
+Terms, are excluded from versioned releases, `connectors-preview`, and quickstart.
+They are retained only as CI artifacts for 7 days. This distribution boundary does not
+establish a license for the upstream enterprise connector repository, which has no
+LICENSE file.
+
+The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
+miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
+mined schema, table and column identifiers within 30 characters. A 63-character
+schema passed snapshot reads in the live check, but Oracle LogMiner marked its
+changes unsupported, so CDC delivered no rows. Tapstate does not yet reject that
+schema configuration before starting.
+
+## Preparing a relational target
+
+A relational target table is created from the source model when it is absent. The
+runtime also prepares the unique index needed by the chosen upsert key. Existing
+target rows are governed by `on_full_load` on each `serve.sync` element:
+
+| Policy | Before a new full load |
+|---|---|
+| `append` (default) | Keep existing rows and use the configured `write_mode`. |
+| `clear` | Clear existing rows before writing the new full load. |
+| `fail` | Refuse to start writing if the target table is not empty. |
+
+For example, a sync to the `warehouse` connection can request a clean full load:
+
+```yaml
+serve:
+  from: orders
+  sync:
+    - source: warehouse
+      on_full_load: clear
+```
+
+An empty or newly created table is allowed with `fail`. Resume, failure recovery,
+and `cdc_only` runs never clear the target, even when `clear` is declared.
+`restart --rerun` resets the pipeline's progress and starts a new full load; it
+still follows `on_full_load`, so use `clear` explicitly when existing target rows
+should be removed. A failed clear stops the pipeline before it writes rows.
 
 ## The one-command demo
 
@@ -205,12 +278,12 @@ curl -fL -O "$base/postgres-connector.jar"
 curl -fL -O "$base/mongodb-connector.jar"
 ```
 
-These three are what this release registers, and they are published so this page runs
-without building the connector repositories first. A jar declaring any other connector
-is refused with `connector.not-official`, whether it is uploaded with `register` or
-staged in the seed directory. They are shaded and carry their own drivers on an
-isolated loader; `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0
-with the Universal FOSS Exception (see [`NOTICE`](../NOTICE)).
+These three jars are published so this walkthrough runs without building the connector
+repositories first. The download list is the demo's selection; the full accepted set and
+certification directions are described in [Connector support boundary](#connector-support-boundary).
+The jars are shaded and carry their own drivers on an isolated loader;
+`mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
+FOSS Exception (see [`NOTICE`](../NOTICE)).
 
 ## 5. Author the resources
 

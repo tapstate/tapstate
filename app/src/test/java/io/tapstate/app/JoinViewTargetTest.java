@@ -38,6 +38,30 @@ import org.junit.jupiter.api.Test;
 class JoinViewTargetTest {
 
     @Test
+    void directJoinColumnsCarryNumericDescriptorsIntoTheView() {
+        var number = new io.tapstate.core.common.NumericType(null, true, false, null,
+                new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
+        for (boolean computed : List.of(false, true)) {
+        String pipeline = computed ? VIEW_PIPELINE.replace("o.region AS region", "o.region + o.region AS region") : VIEW_PIPELINE;
+        InMemoryStorePort store = validated(ORDERS_SRC, CUSTOMERS_SRC, STATE_STORE, pipeline);
+        discovered(store, "orders_src", "orders", List.of("id"),
+                new SourceField("id", "bigint"),
+                new SourceField("region", "decimal(18,4)", io.tapstate.core.common.TapstateType.DECIMAL, null, number),
+                new SourceField("customer_ref", "bigint"));
+        discovered(store, "customers_src", "customers", List.of("id"),
+                new SourceField("id", "bigint"), new SourceField("cust_ref", "bigint"), new SourceField("name", "varchar"));
+        List<TargetTable> captured = new ArrayList<>();
+        new StoreBackedDagSource(store, (connector, settings, mode, ddl, target, node) -> {
+            captured.add(target);
+            return (SupplierEx<SinkWriter>) () -> null;
+        }).dagFor("cust_stats");
+        assertThat(captured).singleElement().satisfies(target ->
+                assertThat(target.fields().stream().filter(field -> field.name().equals("region")).findFirst().orElseThrow()
+                        .numericType()).isEqualTo(computed ? null : number));
+        }
+    }
+
+    @Test
     void aJoinFeedingAViewIsOneFeedAndBuilds() {
         assertThat(build(VIEW_PIPELINE, List.of("id"))).isTrue();
     }
