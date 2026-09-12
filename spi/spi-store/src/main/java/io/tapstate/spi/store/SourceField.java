@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
 
 import java.util.Objects;
 
@@ -27,7 +28,12 @@ import java.util.Objects;
  * investigates. So the reason is a component rather than a convention, and a resolved type may not
  * carry one: a reason beside a known type is a caller that has confused the two.
  */
-public record SourceField(String name, String dataType, TapstateType type, String unknownBecause, NumericType numericType) {
+public record SourceField(String name, String dataType, TapstateType type, String unknownBecause, NumericType numericType, StringType stringType) {
+
+    /** Compatibility constructor for observations without string attributes. */
+    public SourceField(String name, String dataType, TapstateType type, String unknownBecause, NumericType numericType) {
+        this(name, dataType, type, unknownBecause, numericType, null);
+    }
 
     /** Compatibility constructor for observations that do not carry numeric attributes. */
     public SourceField(String name, String dataType, TapstateType type, String unknownBecause) {

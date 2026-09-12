@@ -583,6 +583,23 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.BadRow", source("BadRow", "", register));
     }
 
+    /** Records target preparation independently of record delivery. */
+    static Path preparationSink(Path dir, Path trace, boolean exists) {
+        String register = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\"); });"
+                + "functions.supportCreateTableV2((c, e) -> { mark(\"create:\" + e.getTableId());"
+                + "return io.tapdata.pdk.apis.functions.connector.target.CreateTableOptions.create().tableExists("
+                + exists + "); });"
+                + "functions.supportClearTable((c, e) -> mark(\"clear:\" + e.getTableId()));"
+                + "functions.supportCountByPartitionFilterFunction((c, t, f) -> { mark(\"count:\" + t.getId()); return 1L; });";
+        String members = "private void mark(String value) throws Exception {"
+                + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
+                + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
+        String code = source("PreparationSink", "", register, members)
+                .replace("public void stop(TapConnectionContext c) {}",
+                        "public void stop(TapConnectionContext c) throws Throwable { mark(\"stop\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.PreparationSink", code);
+    }
+
     /** A sink connector whose writeRecord counts events and reports them all inserted. */
     static Path countingSink(Path dir) {
         String register = "functions.supportWriteRecord((context, events, table, consumer) -> {"

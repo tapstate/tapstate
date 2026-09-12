@@ -53,6 +53,9 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 return null;
             });
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore);
+            writer.prepareTargets();
+            return writer;
         } catch (TapstateException e) {
             connector.stopQuietly();
             connector.close();
@@ -62,7 +65,6 @@ public final class PdkSinkPort implements SinkPort {
             connector.close();
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }
-        return new PdkSinkWriter(connector, write, config, targets, stateStore);
     }
 
     private static WriteRecordFunction requireWriteFunction(WriteRecordFunction function) {

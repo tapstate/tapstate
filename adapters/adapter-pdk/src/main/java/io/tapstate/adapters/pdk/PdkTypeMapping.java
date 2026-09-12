@@ -17,6 +17,7 @@ import io.tapstate.core.common.TapstateType;
 
 import java.math.BigDecimal;
 import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
 
 /**
  * Maps a PDK type onto the tapstate type namespace: the normalization step that turns what a connector
@@ -89,6 +90,21 @@ final class PdkTypeMapping {
         }
         return new NumericType(number.getBit(), number.getFixed(), number.getUnsigned(), number.getZerofill(),
                 number.getMinValue(), number.getMaxValue(), number.getPrecision(), number.getScale());
+    }
+
+    /** Copies all declared string attributes, including the source's character width. */
+    static StringType stringType(TapType type) {
+        return type instanceof TapString string
+                ? new StringType(string.getBytes(), string.getFixed(), string.getDoubleBytes(),
+                        string.getDefaultValue(), string.getByteRatio()) : null;
+    }
+
+    static TapType targetType(TapstateType type, NumericType number, StringType string) {
+        if (type == TapstateType.STRING && string != null) {
+            return new TapString().bytes(string.bytes()).fixed(string.fixed()).doubleBytes(string.doubleBytes())
+                    .defaultValue(string.defaultValue()).byteRatio(string.byteRatio());
+        }
+        return targetType(type, number);
     }
 
     /** Restores the source descriptor without inventing bounds or a destination SQL spelling. */

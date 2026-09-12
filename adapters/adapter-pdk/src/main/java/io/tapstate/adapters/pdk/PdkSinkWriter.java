@@ -87,6 +87,24 @@ final class PdkSinkWriter implements SinkWriter {
         this.preparation = preparation;
     }
 
+    /** Prepare selected tables even when their source snapshot contains no rows. */
+    void prepareTargets() throws Throwable {
+        connector.underLoader(() -> {
+            for (Map.Entry<String, TargetTable> entry : targets.entrySet()) {
+                preparation.prepare(entry.getValue(), tableModel(entry.getKey(), entry.getValue()));
+            }
+            return null;
+        });
+    }
+
+    private TapTable tableModel(String stream, TargetTable target) {
+        return tableModels.computeIfAbsent(stream, ignored -> {
+            TapTable resolved = TargetTapTable.build(target);
+            connector.resolveTargetTypes(resolved);
+            return resolved;
+        });
+    }
+
     /** The connector this writer drives, and the state scope it was opened under. */
     PdkConnector connector() {
         return connector;
@@ -127,11 +145,7 @@ final class PdkSinkWriter implements SinkWriter {
                     List<TapRecordEvent> rows = entry.getValue();
                     TargetTable target = targets.get(entry.getKey());
                     TapTable table = target != null
-                            ? tableModels.computeIfAbsent(entry.getKey(), ignored -> {
-                                TapTable resolved = TargetTapTable.build(target);
-                                connector.resolveTargetTypes(resolved);
-                                return resolved;
-                            })
+                            ? tableModel(entry.getKey(), target)
                             : TargetTapTable.bare(rows.get(0).getTableId());
                     preparation.prepare(target, table);
                     // A connector may report the batch in several flushes, one callback each; accumulate.

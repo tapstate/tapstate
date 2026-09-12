@@ -134,11 +134,11 @@ final class TargetModelResolver {
         List<TargetField> fields = new ArrayList<>(source.fields().size());
         for (String keyColumn : primaryKey) {
             SourceField field = field(source, keyColumn);
-            fields.add(new TargetField(field.name(), field.dataType(), true, field.type(), field.numericType()));
+            fields.add(new TargetField(field.name(), field.dataType(), true, field.type(), field.numericType(), field.stringType()));
         }
         for (SourceField field : source.fields()) {
             if (!primaryKey.contains(field.name())) {
-                fields.add(new TargetField(field.name(), field.dataType(), false, field.type(), field.numericType()));
+                fields.add(new TargetField(field.name(), field.dataType(), false, field.type(), field.numericType(), field.stringType()));
             }
         }
         List<TargetIndex> indexes = new ArrayList<>();
@@ -183,14 +183,14 @@ final class TargetModelResolver {
         for (String column : key) {
             for (TargetField field : model.fields()) {
                 if (field.name().equals(column)) {
-                    fields.add(new TargetField(field.name(), field.type(), true, field.inferredType(), field.numericType()));
+                    fields.add(new TargetField(field.name(), field.type(), true, field.inferredType(), field.numericType(), field.stringType()));
                     break;
                 }
             }
         }
         for (TargetField field : model.fields()) {
             if (!key.contains(field.name())) {
-                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType(), field.numericType()));
+                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType(), field.numericType(), field.stringType()));
             }
         }
         List<TargetIndex> indexes = new ArrayList<>(model.indexes());

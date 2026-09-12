@@ -43,6 +43,86 @@ import org.junit.jupiter.api.Test;
 class StoreBackedDagSourceTargetModelTest {
 
     @Test
+    void boundedStringMetadataReachesTheSinkOnlyForDirectSourceValues() {
+        var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
+        for (boolean computed : List.of(false, true)) {
+            InMemoryStorePort store = seededProjectingPipeline(computed
+                    ? Map.of("code", io.tapstate.core.model.FieldRule.computed("after.code + 'x'"))
+                    : Map.of("renamed", io.tapstate.core.model.FieldRule.rename("code")));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "varchar(36)", io.tapstate.core.common.TapstateType.STRING, null, null, string),
+                    new SourceField("code", "varchar(36)", io.tapstate.core.common.TapstateType.STRING, null, null, string)),
+                    List.of("id"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+            assertThat(bound.getFirst().fields().stream().filter(TargetField::primaryKey).findFirst().orElseThrow().stringType())
+                    .isEqualTo(string);
+            String output = computed ? "code" : "renamed";
+            assertThat(bound.getFirst().fields().stream().filter(field -> field.name().equals(output)).findFirst().orElseThrow().stringType())
+                    .isEqualTo(computed ? null : string);
+        }
+    }
+
+    @Test
+    void unionChecksEveryForkBeforeInheritingSourceUniqueness() {
+        for (boolean changedFirst : List.of(false, true)) {
+            InMemoryStorePort store = seededPipeline();
+            store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                    List.of(Step.inline("shared", FromClause.list(FromRef.literal("orders_src")),
+                                    new TransformBody.Filter("true"), null),
+                            Step.inline("unchanged", FromClause.list(FromRef.literal("shared")),
+                                    new TransformBody.Filter("true"), null),
+                            Step.inline("changed", FromClause.list(FromRef.literal("shared")),
+                                    new TransformBody.MapProjection(Map.of("code", io.tapstate.core.model.FieldRule.literal(0))), null),
+                            Step.inline("merged", FromClause.list(FromRef.literal(changedFirst ? "changed" : "unchanged"),
+                                            FromRef.literal(changedFirst ? "unchanged" : "changed")),
+                                    new TransformBody.Union(), null)),
+                    null, new ServeBlock.Inline(null, FromRef.literal("merged"),
+                            List.of(new SyncElement("sync_1", "orders_dest", null, null, null)), null, null), null, null));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("code", "INT")), List.of("id"),
+                    List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true)))));
+            List<TargetTable> bound = new ArrayList<>();
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+            assertThat(bound.getFirst().indexes()).as("changed fork first: %s", changedFirst)
+                    .containsExactly(new TargetIndex(List.of("id"), true));
+        }
+    }
+
+    @Test
+    void changingASecondaryUniqueColumnDoesNotConstrainDistinctOutputRows() {
+        for (var rule : List.of(io.tapstate.core.model.FieldRule.literal(0),
+                io.tapstate.core.model.FieldRule.computed("after.code % 2"),
+                io.tapstate.core.model.FieldRule.rename("other"))) {
+            InMemoryStorePort store = seededProjectingPipeline(Map.of("code", rule));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("code", "INT"),
+                    new SourceField("other", "INT")), List.of("id"),
+                    List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true),
+                            new io.tapstate.spi.store.SourceIndex("composite_unique", List.of("code", "id"), true),
+                            new io.tapstate.spi.store.SourceIndex("code_search", List.of("code"), false)))));
+            List<TargetTable> bound = new ArrayList<>();
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+            assertThat(bound.getFirst().indexes()).as("projection %s", rule)
+                    .containsExactly(new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), false));
+        }
+    }
+
+    @Test
+    void unchangedSecondaryUniqueColumnsRemainConstrained() {
+        InMemoryStorePort store = seededProjectingPipeline(Map.of("other",
+                io.tapstate.core.model.FieldRule.literal(0)));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("code", "INT"),
+                new SourceField("other", "INT")), List.of("id"),
+                List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true)))));
+        List<TargetTable> bound = new ArrayList<>();
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+        assertThat(bound.getFirst().indexes()).containsExactly(
+                new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), true));
+    }
+
+    @Test
     void directProjectionRetainsNumericMetadataButRecomputedSameNameDoesNot() {
         var number = new io.tapstate.core.common.NumericType(null, true, false, null,
                 new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);

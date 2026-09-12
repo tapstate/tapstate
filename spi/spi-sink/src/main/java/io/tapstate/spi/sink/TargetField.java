@@ -3,6 +3,7 @@ package io.tapstate.spi.sink;
 import java.io.Serializable;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
 
 /**
  * One field of the resolved target table a sink writes to: its name, its type, and whether it is part
@@ -18,7 +19,12 @@ import io.tapstate.core.common.NumericType;
  *
  * <p>Serializable so a resolved model travels with the sink factory the engine ships onto the DAG.
  */
-public record TargetField(String name, String type, boolean primaryKey, TapstateType inferredType, NumericType numericType) implements Serializable {
+public record TargetField(String name, String type, boolean primaryKey, TapstateType inferredType, NumericType numericType, StringType stringType) implements Serializable {
+
+    /** Compatibility constructor for observations without string attributes. */
+    public TargetField(String name, String type, boolean primaryKey, TapstateType inferredType, NumericType numericType) {
+        this(name, type, primaryKey, inferredType, numericType, null);
+    }
 
     /** Compatibility constructor for target fields without declared numeric attributes. */
     public TargetField(String name, String type, boolean primaryKey, TapstateType inferredType) {

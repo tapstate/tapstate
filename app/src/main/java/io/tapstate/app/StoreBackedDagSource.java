@@ -536,10 +536,11 @@ final class StoreBackedDagSource implements DagSource {
                 published.put(stream, publishedAs(base, produced));
             } else if (produced != null) {
                 // A script can replace values under their old names. Unknown lineage cannot reuse
-                // the source's numeric bounds merely because the output may keep the same spelling.
-                published.put(stream, new TargetTable(base.name(), base.fields().stream()
+                // source type attributes or secondary uniqueness merely because names remain unchanged.
+                published.put(stream, TargetModelResolver.keyedOn(new TargetTable(base.name(), base.fields().stream()
                         .map(field -> new TargetField(field.name(), field.type(), field.primaryKey(), field.inferredType()))
-                        .toList(), base.indexes()));
+                        .toList(), List.of()), base.fields().stream().filter(TargetField::primaryKey)
+                        .map(TargetField::name).toList()));
             }
         }
         return published;
@@ -569,15 +570,21 @@ final class StoreBackedDagSource implements DagSource {
                     sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base);
             return upstream == null ? null : NodeColumns.of(view, upstream);
         }
+        List<NodeColumns> reached = new ArrayList<>();
         for (String key : upstreams(from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
             SourceVertex vertex = sourceVertices.get(key);
             if (vertex != null) {
                 if (vertex.table().equals(stream)) {
                     NodeColumns copied = copiedColumns(pipelineId, vertex);
-                    Map<String, io.tapstate.core.common.NumericType> numbers = new LinkedHashMap<>();
-                    base.fields().stream().filter(field -> field.numericType() != null)
-                            .forEach(field -> numbers.put(field.name(), field.numericType()));
-                    return copied == null ? null : copied.withNumericTypes(numbers);
+                    if (copied != null) {
+                        Map<String, io.tapstate.core.common.NumericType> numbers = new LinkedHashMap<>();
+                        base.fields().stream().filter(field -> field.numericType() != null)
+                                .forEach(field -> numbers.put(field.name(), field.numericType()));
+                        Map<String, io.tapstate.core.common.StringType> strings = new LinkedHashMap<>();
+                        base.fields().stream().filter(field -> field.stringType() != null)
+                                .forEach(field -> strings.put(field.name(), field.stringType()));
+                        reached.add(copied.withNumericTypes(numbers).withStringTypes(strings));
+                    }
                 }
                 continue;
             }
@@ -587,15 +594,25 @@ final class StoreBackedDagSource implements DagSource {
                     || !visiting.add(key)) {
                 continue;
             }
-            for (FromRef upstreamRef : refsOf(inline.from())) {
-                NodeColumns upstream = streamColumnsAt(pipelineId, pipeline, upstreamRef, stream,
-                        sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base);
-                if (upstream != null) {
-                    return NodeColumns.of(inline.body(), Map.of("in", upstream), null);
+            try {
+                Map<String, NodeColumns> inputs = new LinkedHashMap<>();
+                for (FromRef upstreamRef : refsOf(inline.from())) {
+                    NodeColumns upstream = streamColumnsAt(pipelineId, pipeline, upstreamRef, stream,
+                            sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base);
+                    if (upstream != null) {
+                        inputs.put(Integer.toString(inputs.size()), upstream);
+                    }
                 }
+                if (!inputs.isEmpty()) {
+                    reached.add(NodeColumns.of(inline.body(), inputs, null));
+                }
+            } finally {
+                // A shared ancestor must be visited again from another fork. Only cycles on the
+                // current path are excluded, otherwise a later branch can silently lose its model.
+                visiting.remove(key);
             }
         }
-        return null;
+        return reached.isEmpty() ? null : NodeColumns.merged(reached);
     }
 
     /**
@@ -864,14 +881,17 @@ final class StoreBackedDagSource implements DagSource {
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
             fields.add(new TargetField(column, carried == null ? null : carried.type(), false,
-                    JoinSchemaDrift.typeOf(produced.columns().get(column)), produced.numericTypes().get(column)));
+                    JoinSchemaDrift.typeOf(produced.columns().get(column)), produced.numericTypes().get(column), produced.stringTypes().get(column)));
             if (carried != null && carried.primaryKey()) {
                 key.add(column);
             }
         }
         return TargetModelResolver.keyedOn(
                 new TargetTable(base.name(), fields, base.indexes().stream()
-                        .filter(index -> produced.columns().keySet().containsAll(index.fields())).toList()), key);
+                        .filter(index -> produced.columns().keySet().containsAll(index.fields()))
+                        // A same-named computed value does not inherit source uniqueness.
+                        .filter(index -> !index.unique() || produced.unchangedFields().containsAll(index.fields()))
+                        .toList()), key);
     }
 
     /**
@@ -1008,7 +1028,7 @@ final class StoreBackedDagSource implements DagSource {
             }
             for (TargetField candidate : source.fields()) {
                 if (candidate.name().equals(reference.ref().column())) {
-                    return new TargetField(output, candidate.type(), primaryKey, candidate.inferredType(), candidate.numericType());
+                    return new TargetField(output, candidate.type(), primaryKey, candidate.inferredType(), candidate.numericType(), candidate.stringType());
                 }
             }
             return new TargetField(output, null, primaryKey);
@@ -1410,10 +1430,10 @@ final class StoreBackedDagSource implements DagSource {
         TargetField streamKey = streamFields.stream().filter(field -> field.name().equals(target.primaryKey()))
                 .findFirst().orElse(null);
         fields.add(streamKey == null ? new TargetField(target.primaryKey(), null, true)
-                : new TargetField(streamKey.name(), streamKey.type(), true, streamKey.inferredType(), streamKey.numericType()));
+                : new TargetField(streamKey.name(), streamKey.type(), true, streamKey.inferredType(), streamKey.numericType(), streamKey.stringType()));
         for (TargetField field : streamFields) {
             if (!field.name().equals(target.primaryKey())) {
-                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType(), field.numericType()));
+                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType(), field.numericType(), field.stringType()));
             }
         }
         return new TargetTable(target.collection(), fields, target.indexes());

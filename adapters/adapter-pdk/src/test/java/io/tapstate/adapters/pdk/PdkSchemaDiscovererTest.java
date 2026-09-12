@@ -45,6 +45,28 @@ class PdkSchemaDiscovererTest {
     }
 
     @Test
+    void boundedStringSurvivesDiscoveryAndTargetReconstruction() throws Exception {
+        var declared = new io.tapdata.entity.schema.type.TapString().bytes(36L).fixed(false)
+                .doubleBytes(true).defaultValue(1L).byteRatio(2);
+        var field = PdkSchemaDiscoverer.class.getDeclaredMethod("field", String.class, String.class,
+                io.tapdata.entity.schema.type.TapType.class);
+        field.setAccessible(true);
+        SourceField normalized = (SourceField) field.invoke(null, "id", "varchar(36)", declared);
+        var table = TargetTapTable.build(new io.tapstate.spi.sink.TargetTable("orders", List.of(
+                new io.tapstate.spi.sink.TargetField(normalized.name(), normalized.dataType(), true,
+                        normalized.type(), normalized.numericType(), normalized.stringType()))));
+        var restored = (io.tapdata.entity.schema.type.TapString) table.getNameFieldMap().get("id").getTapType();
+        assertThat(restored.getBytes()).isEqualTo(36L);
+        assertThat(restored.getFixed()).isFalse();
+        assertThat(restored.getDoubleBytes()).isTrue();
+        assertThat(restored.getDefaultValue()).isEqualTo(1L);
+        assertThat(restored.getByteRatio()).isEqualTo(2);
+        declared.bytes(1000L);
+        assertThat(normalized.stringType().bytes()).isEqualTo(36L);
+        assertThat(table.primaryKeys()).containsExactly("id");
+    }
+
+    @Test
     void normalizationRetainsAllDeclaredNumericAttributes() throws Exception {
         var declared = new io.tapdata.entity.schema.type.TapNumber().bit(128).fixed(true).unsigned(false).zerofill(true)
                 .precision(18).scale(4).minValue(new java.math.BigDecimal("-99999999999999.9999"))

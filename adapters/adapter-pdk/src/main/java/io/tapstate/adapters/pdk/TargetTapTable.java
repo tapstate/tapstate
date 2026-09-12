@@ -42,7 +42,7 @@ final class TargetTapTable {
                         + "Computed decimal columns have no declared numeric metadata");
             }
             if (field.inferredType() != null) {
-                var restored = PdkTypeMapping.targetType(field.inferredType(), field.numericType());
+                var restored = PdkTypeMapping.targetType(field.inferredType(), field.numericType(), field.stringType());
                 if (field.numericType() != null && restored instanceof io.tapdata.entity.schema.type.TapNumber
                         && PdkTypeMapping.resolve(restored).type() != field.inferredType()) {
                     throw new IllegalArgumentException("numeric metadata for field '" + field.name() + "' in table '"

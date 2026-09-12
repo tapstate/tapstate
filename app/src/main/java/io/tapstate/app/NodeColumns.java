@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
 import java.util.Objects;
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.model.FieldRule;
@@ -74,14 +75,27 @@ import java.util.Set;
  *                      nothing can be said
  * @param unknownBecause why the columns cannot be given, naming the node, or null when they are given
  */
-record NodeColumns(Map<String, String> columns, String unknownBecause, Map<String, NumericType> numericTypes) {
+record NodeColumns(Map<String, String> columns, String unknownBecause, Map<String, NumericType> numericTypes,
+        Set<String> unchangedFields, Map<String, StringType> stringTypes) {
 
     NodeColumns(Map<String, String> columns, String unknownBecause) {
         this(columns, unknownBecause, Map.of());
     }
 
+    NodeColumns(Map<String, String> columns, String unknownBecause, Map<String, NumericType> numericTypes) {
+        this(columns, unknownBecause, numericTypes, columns.keySet(), Map.of());
+    }
+
+    NodeColumns withStringTypes(Map<String, StringType> types) {
+        return new NodeColumns(columns, unknownBecause, numericTypes, unchangedFields, types);
+    }
+
+    NodeColumns withUnchangedFields(Set<String> fields) {
+        return new NodeColumns(columns, unknownBecause, numericTypes, fields, stringTypes);
+    }
+
     NodeColumns withNumericTypes(Map<String, NumericType> types) {
-        return new NodeColumns(columns, unknownBecause, types);
+        return new NodeColumns(columns, unknownBecause, types, unchangedFields, stringTypes);
     }
 
 
@@ -90,6 +104,8 @@ record NodeColumns(Map<String, String> columns, String unknownBecause, Map<Strin
         // that loses it turns every rebuild of the same node into a differently ordered record.
         columns = Collections.unmodifiableMap(new LinkedHashMap<>(columns));
         numericTypes = Collections.unmodifiableMap(new LinkedHashMap<>(numericTypes));
+        stringTypes = Collections.unmodifiableMap(new LinkedHashMap<>(stringTypes));
+        unchangedFields = Collections.unmodifiableSet(new LinkedHashSet<>(unchangedFields));
     }
 
     /** The columns a node produces, worked out. */
@@ -192,6 +208,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause, Map<Strin
                 ? declared
                 : JoinSchemaDrift.declaredType(JoinSchemaDrift.typeOf(declared), true)));
         Map<String, NumericType> numbers = new LinkedHashMap<>();
+        Map<String, StringType> strings = new LinkedHashMap<>();
         for (String column : out.keySet()) {
             NumericType candidate = inputs.iterator().next().numericTypes().get(column);
             if (candidate != null && inputs.stream().allMatch(input ->
@@ -199,7 +216,16 @@ record NodeColumns(Map<String, String> columns, String unknownBecause, Map<Strin
                 numbers.put(column, candidate);
             }
         }
-        return known(out).withNumericTypes(numbers);
+        for (String column : out.keySet()) {
+            StringType candidate = inputs.iterator().next().stringTypes().get(column);
+            if (candidate != null && inputs.stream().allMatch(input ->
+                    Objects.equals(candidate, input.stringTypes().get(column)))) {
+                strings.put(column, candidate);
+            }
+        }
+        Set<String> unchanged = new LinkedHashSet<>(out.keySet());
+        inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
+        return known(out).withNumericTypes(numbers).withStringTypes(strings).withUnchangedFields(unchanged);
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
@@ -249,7 +275,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause, Map<Strin
             }
         }
         root.columns().forEach(out::putIfAbsent);
-        return known(out).withNumericTypes(root.numericTypes());
+        return known(out).withNumericTypes(root.numericTypes()).withStringTypes(root.stringTypes()).withUnchangedFields(root.unchangedFields());
     }
 
     /**
@@ -341,6 +367,8 @@ record NodeColumns(Map<String, String> columns, String unknownBecause, Map<Strin
         Map<String, TapstateType> upstreamTypes = typesOf(upstream);
         Map<String, String> out = new LinkedHashMap<>();
         Map<String, NumericType> numbers = new LinkedHashMap<>();
+        Map<String, StringType> strings = new LinkedHashMap<>();
+        Set<String> unchanged = new LinkedHashSet<>();
         Set<String> consumed = new LinkedHashSet<>();
         Set<String> dropped = new LinkedHashSet<>();
         rules.forEach((output, rule) -> {
@@ -350,6 +378,12 @@ record NodeColumns(Map<String, String> columns, String unknownBecause, Map<Strin
                     String renamed = upstream.columns().get(rename.sourceField());
                     if (renamed != null) {
                         out.put(output, renamed);
+                        if (output.equals(rename.sourceField()) && upstream.unchangedFields().contains(output)) {
+                            unchanged.add(output);
+                        }
+                        if (upstream.stringTypes().containsKey(rename.sourceField())) {
+                            strings.put(output, upstream.stringTypes().get(rename.sourceField()));
+                        }
                         if (upstream.numericTypes().containsKey(rename.sourceField())) {
                             numbers.put(output, upstream.numericTypes().get(rename.sourceField()));
                         }
@@ -369,12 +403,18 @@ record NodeColumns(Map<String, String> columns, String unknownBecause, Map<Strin
         upstream.columns().forEach((name, type) -> {
             if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
                 out.put(name, type);
+                if (upstream.unchangedFields().contains(name)) {
+                    unchanged.add(name);
+                }
+                if (upstream.stringTypes().containsKey(name)) {
+                    strings.put(name, upstream.stringTypes().get(name));
+                }
                 if (upstream.numericTypes().containsKey(name)) {
                     numbers.put(name, upstream.numericTypes().get(name));
                 }
             }
         });
-        return known(out).withNumericTypes(numbers);
+        return known(out).withNumericTypes(numbers).withStringTypes(strings).withUnchangedFields(unchanged);
     }
 
     /**

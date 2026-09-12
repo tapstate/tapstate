@@ -200,6 +200,34 @@ class EnterpriseTargetPreparationIT {
 
     @ParameterizedTest
     @EnumSource(Database.class)
+    void boundedStringPrimaryKeyCreatesAnIndexableTarget(Database db) throws Exception {
+        Map<String, Object> settings = db.settings("string_key");
+        TargetTable typed = new TargetTable("orders", List.of(
+                new TargetField("id", "varchar(36)", true, TapstateType.STRING, null,
+                        new io.tapstate.core.common.StringType(36L, false, false, null, 1)),
+                new TargetField("seq", "source_integer", false, TapstateType.INT64)),
+                List.of(new TargetIndex(List.of("id"), true)));
+        String id = "12345678-1234-1234-1234-123456789012";
+        try (SinkWriter writer = new PdkSinkPort(connectors::get, new State()).open(new SinkConfig(
+                db.connector, settings, WriteMode.UPSERT, DdlPolicy.FAIL, typed, NODE, OnFullLoad.FAIL, true))) {
+            for (long seq : List.of(1L, 505L)) {
+                assertThat(writer.write(List.of(Envelope.insert(seq, "orders", Map.of("id", id, "seq", seq), null)))
+                        .toCompletableFuture().get(30, TimeUnit.SECONDS).written()).isEqualTo(1);
+            }
+        }
+        try (Connection connection = db.connect(settings); var statement = connection.createStatement();
+             var result = statement.executeQuery("SELECT \"id\", \"seq\" FROM " + db.table(settings))) {
+            assertUniqueKey(db, settings, connection);
+            assertThat(result.next()).isTrue();
+            assertThat(result.getString(1)).isEqualTo(id);
+            assertThat(result.getLong(2)).isEqualTo(505L);
+            assertThat(result.getMetaData().getPrecision(1)).isBetween(36, 8000);
+            assertThat(result.next()).isFalse();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(Database.class)
     void recommendedDecimalTypePreservesFractionalValues(Database db) throws Exception {
         Map<String, Object> settings = db.settings("decimal");
         TargetTable typed = new TargetTable("orders", List.of(

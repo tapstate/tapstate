@@ -180,7 +180,7 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
      */
     private static SourceField field(String name, String dataType, TapType declared) {
         PdkTypeMapping.Resolved resolved = PdkTypeMapping.resolve(declared);
-        return new SourceField(name, dataType, resolved.type(), resolved.unknownBecause(), PdkTypeMapping.numericType(declared));
+        return new SourceField(name, dataType, resolved.type(), resolved.unknownBecause(), PdkTypeMapping.numericType(declared), PdkTypeMapping.stringType(declared));
     }
 
     private static List<SourceField> fields(TapTable table) {
