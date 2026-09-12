@@ -150,7 +150,7 @@ sealed interface WorkbenchOverlayState
                 }
             }
 
-            record CreateSource(SourceDraft draft) implements Intent {
+            record CreateSource(WorkbenchActionGateway.SourceDraft draft) implements Intent {
                 public CreateSource {
                     Objects.requireNonNull(draft, "draft");
                 }
