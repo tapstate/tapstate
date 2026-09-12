@@ -54,6 +54,16 @@ class PdkSinkWriterFactorySerializationTest {
         assertThat(((PdkSinkWriterFactory) restored).node()).isEqualTo(new PipelineNode("p1", "to_mongo"));
     }
 
+    @Test
+    void preparationPolicyAndExecutionContextSurviveTheTrip() throws Exception {
+        PdkSinkWriterFactory factory = new PdkSinkWriterFactory("mysql", Map.of(), WriteMode.UPSERT,
+                DdlPolicy.FAIL, Map.of(), new PipelineNode("p1", "sink"),
+                io.tapstate.spi.sink.OnFullLoad.CLEAR, false);
+        PdkSinkWriterFactory restored = (PdkSinkWriterFactory) roundTrip(factory);
+        assertThat(restored.onFullLoad()).isEqualTo(io.tapstate.spi.sink.OnFullLoad.CLEAR);
+        assertThat(restored.fullLoad()).isFalse();
+    }
+
     private static Object roundTrip(Object value) throws Exception {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {

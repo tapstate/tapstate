@@ -100,7 +100,7 @@ class CapabilityHarnessRealJarTest {
 
         List<String> reconciled = new ArrayList<>();
         for (ManifestRow row : readManifest(Path.of(manifestPath))) {
-            Optional<Path> jar = distJar(dist, row.module());
+            Optional<Path> jar = distJar(dist, row.id());
             if (jar.isEmpty()) {
                 continue;
             }
@@ -149,12 +149,12 @@ class CapabilityHarnessRealJarTest {
     }
 
     /**
-     * The module's jar in the dist, or empty when it was not built - the same prefix rule and the
+     * The connector id's jar in the dist, or empty when it was not built - the same prefix rule and the
      * same treatment of an ambiguous match the offline derivation resolves jars by, so the two sides
      * cannot end up comparing answers read out of two different jars.
      */
-    private static Optional<Path> distJar(Path dist, String module) {
-        String prefix = module + "-";
+    private static Optional<Path> distJar(Path dist, String connectorId) {
+        String prefix = connectorId + "-connector-";
         try (Stream<Path> files = Files.list(dist)) {
             List<Path> matches = files
                     .filter(path -> {
@@ -165,7 +165,7 @@ class CapabilityHarnessRealJarTest {
                     .toList();
             if (matches.size() > 1) {
                 throw new IllegalStateException(
-                        "ambiguous dist jars for module " + module + " under " + dist + ": " + matches);
+                        "ambiguous dist jars for connector " + connectorId + " under " + dist + ": " + matches);
             }
             return matches.stream().findFirst();
         } catch (IOException e) {
@@ -173,7 +173,7 @@ class CapabilityHarnessRealJarTest {
         }
     }
 
-    /** One connector on the probe worklist: the catalog id, the module its jar is named after, the class to load. */
+    /** One connector on the probe worklist: the catalog id, the upstream module, the class to load. */
     private record ManifestRow(String id, String module, String connectorClass) {
     }
 

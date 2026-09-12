@@ -74,6 +74,12 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/E2eExecutor.java", 1L),
             entry("test/java/io/tapstate/e2e/RealProcessServer.java", 1L),
             entry("test/java/io/tapstate/e2e/connector/CsvConnector.java", 1L),
+            // SQL Agent startup errors during CDC enablement and the non-null initial LSN each
+            // have a 60-second deadline. Enablement uses the remaining query budget; LSN reads use
+            // five-second query timeouts. Both waits observe readiness.
+            entry("test/java/io/tapstate/e2e/SqlServerEndpoints.java", 2L),
+            // Poll independent target DDL and decimal row readback within a fixed deadline.
+            entry("test/java/io/tapstate/e2e/RealMysqlToEnterpriseDecimalIT.java", 2L),
             // One bounded read of its own target per witness class, each a poll inside a deadline loop.
             entry("test/java/io/tapstate/e2e/LosslessNumericTypeIsAcceptedIT.java", 1L),
             entry("test/java/io/tapstate/e2e/RealMysqlToMongoSnapshotIT.java", 1L),

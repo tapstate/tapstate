@@ -46,6 +46,51 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class NodeColumnsTest {
 
     @Test
+    void boundedStringsFollowOnlyDirectValuesAndCompatibleMerges() {
+        var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
+        NodeColumns source = known("id", "STRING NOT NULL", "code", "STRING NOT NULL")
+                .withStringTypes(Map.of("id", string, "code", string));
+        NodeColumns renamed = NodeColumns.of(map(rules("key", FieldRule.rename("id"))), one(source), null);
+        assertThat(renamed.stringTypes()).containsExactlyInAnyOrderEntriesOf(Map.of("key", string, "code", string));
+        for (FieldRule rule : List.of(FieldRule.literal("x"), FieldRule.computed("after.code + 'x'"))) {
+            NodeColumns changed = NodeColumns.of(map(rules("code", rule)), one(source), null);
+            assertThat(changed.stringTypes()).containsOnlyKeys("id");
+            assertThat(NodeColumns.merged(List.of(source, changed)).stringTypes()).containsOnlyKeys("id");
+        }
+        assertThat(NodeColumns.merged(List.of(source, source)).stringTypes()).isEqualTo(source.stringTypes());
+        assertThat(NodeColumns.merged(List.of(source, NodeColumns.known(source.columns()))).stringTypes()).isEmpty();
+    }
+
+    @Test
+    void sourceValueIdentityCannotReappearAfterAnotherProjectionOrMergedFork() {
+        NodeColumns source = known("id", "INT64 NOT NULL", "code", "INT64 NOT NULL");
+        NodeColumns changed = NodeColumns.of(map(rules("code", FieldRule.literal(0))), one(source), null);
+        NodeColumns filtered = NodeColumns.of(new TransformBody.Filter("true"), one(changed), null);
+        NodeColumns renamedBack = NodeColumns.of(map(rules("code", FieldRule.rename("code"))), one(filtered), null);
+        assertThat(renamedBack.unchangedFields()).containsExactly("id");
+        assertThat(NodeColumns.merged(List.of(source, changed)).unchangedFields()).containsExactly("id");
+        assertThat(NodeColumns.merged(List.of(changed, source)).unchangedFields()).containsExactly("id");
+        assertThat(NodeColumns.of(new TransformBody.Js("emit(record)"), one(source), null).unchangedFields())
+                .isEmpty();
+    }
+
+    @Test
+    void projectionsCarryOnlyUnchangedNumericDescriptorsAndMergesRequireAgreement() {
+        var number = new io.tapstate.core.common.NumericType(128, true, false, true, new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
+        var base = NodeColumns.known(Map.of("amount", JoinSchemaDrift.declaredType(TapstateType.DECIMAL, false),
+                "other", JoinSchemaDrift.declaredType(TapstateType.DECIMAL, false)))
+                .withNumericTypes(Map.of("amount", number, "other", number));
+        var renamed = NodeColumns.of(new TransformBody.MapProjection(Map.of("total", FieldRule.rename("amount"))),
+                Map.of("in", base), null);
+        assertThat(renamed.numericTypes()).containsExactlyInAnyOrderEntriesOf(Map.of("total", number, "other", number));
+        var computed = NodeColumns.of(new TransformBody.MapProjection(Map.of("amount", FieldRule.computed("after.amount + 1"))),
+                Map.of("in", base), null);
+        assertThat(computed.numericTypes()).containsOnlyKeys("other");
+        assertThat(NodeColumns.merged(List.of(base, base)).numericTypes()).containsEntry("amount", number);
+        assertThat(NodeColumns.merged(List.of(base, NodeColumns.known(base.columns()))).numericTypes()).isEmpty();
+    }
+
+    @Test
     @DisplayName("every kind of transform reaches an arm of its own")
     void everyKindOfTransformReachesAnArmOfItsOwn() {
         // One set of inputs the six kinds all answer over, chosen so that each arm's answer differs

@@ -3,6 +3,10 @@ package io.tapstate.adapters.pdk;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.JsonReader;
 import io.tapdata.entity.codec.TapCodecsRegistry;
+import io.tapdata.entity.codec.filter.TapCodecsFilterManager;
+import io.tapdata.entity.conversion.impl.TargetTypesGeneratorImpl;
+import io.tapdata.entity.schema.TapField;
+import io.tapdata.entity.schema.type.TapRaw;
 import io.tapdata.entity.conversion.impl.TableFieldTypesGeneratorImpl;
 import io.tapdata.entity.mapping.DefaultExpressionMatchingMap;
 import io.tapdata.entity.schema.TapTable;
@@ -269,6 +273,30 @@ final class PdkConnector implements AutoCloseable {
             return;
         }
         new TableFieldTypesGeneratorImpl().autoFill(table.getNameFieldMap(), dataTypesMap);
+    }
+
+    /** Converts inferred portable types through the target connector's own declared type mapping. */
+    void resolveTargetTypes(TapTable table) {
+        DefaultExpressionMatchingMap dataTypes = context.getSpecification().getDataTypesMap();
+        LinkedHashMap<String, TapField> inferred = new LinkedHashMap<>();
+        for (TapField field : table.getNameFieldMap().values()) {
+            if (field.getTapType() != null) {
+                inferred.put(field.getName(), field);
+            } else if (dataTypes != null && field.getDataType() != null) {
+                new TableFieldTypesGeneratorImpl().autoFill(field, dataTypes);
+            }
+            if (field.getTapType() == null) {
+                field.tapType(new TapRaw());
+            }
+        }
+        if (!inferred.isEmpty() && dataTypes != null) {
+            var converted = new TargetTypesGeneratorImpl().convert(
+                    inferred, dataTypes, new TapCodecsFilterManager(codecs));
+            if (converted == null || converted.getData() == null) {
+                throw new IllegalStateException("target type conversion returned no fields for table " + table.getId());
+            }
+            converted.getData().forEach(table.getNameFieldMap()::put);
+        }
     }
 
     /**

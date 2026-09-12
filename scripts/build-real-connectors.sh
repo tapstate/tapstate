@@ -37,6 +37,7 @@
 #   --checkout <path>                   build from an existing checkout instead of cloning; a refresh
 #                                       already has one, and cloning a second copy of a 469MB
 #                                       repository to build the same commit is pure cost
+#   --checkout <enterprise-path>        repeat after the OSS checkout to build enterprise modules
 #   MAVEN_ARGS                          env var: read by Maven itself. Naming a settings file in it
 #                                       keeps this script from supplying the connectors' own, which
 #                                       it otherwise does without being asked - they need a public
@@ -48,6 +49,7 @@
 
 set -euo pipefail
 
+readonly ENTERPRISE_REPOSITORY="https://github.com/tapdata/tapdata-connectors-enterprise.git"
 readonly SOURCE_REPOSITORY="https://github.com/tapdata/tapdata-connectors.git"
 
 # The connectors resolve io.confluent artifacts. Maven Central does not carry them, and the
@@ -65,15 +67,20 @@ readonly CONNECTOR_SETTINGS
 
 # The witness lane's connectors, as the specifications name them, paired with the module that builds
 # each one. This is the default rather than the only option - see --modules above.
-readonly DEFAULT_MODULES="mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector"
+readonly DEFAULT_MODULES="mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector"
 
 modules_arg=""
 checkout=""
+enterprise_checkout=""
 positional=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --modules)  modules_arg="${2:?--modules needs a value}"; shift 2 ;;
-        --checkout) checkout="${2:?--checkout needs a value}"; shift 2 ;;
+        --checkout)
+            if [ -z "$checkout" ]; then checkout="${2:?--checkout needs a value}"
+            elif [ -z "$enterprise_checkout" ]; then enterprise_checkout="${2:?--checkout needs a value}"
+            else echo "at most two --checkout arguments are supported" >&2; exit 2; fi
+            shift 2 ;;
         -h|--help)  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         --*)        echo "unrecognised option: $1" >&2; exit 2 ;;
         *)          positional+=("$1"); shift ;;
@@ -158,6 +165,30 @@ else
     git clone --depth 1 --quiet "$SOURCE_REPOSITORY" "$checkout"
 fi
 
+# A module belongs to exactly one checkout. Keep source selection explicit even when
+# its public connector id differs from the Maven artifact name.
+CONNECTOR_CHECKOUTS=()
+oss_modules=()
+enterprise_modules=()
+for module in "${CONNECTOR_MODULES[@]}"; do
+    if [ ! -d "$checkout/$module" ] && [ -z "$enterprise_checkout" ]; then
+        enterprise_checkout="$workspace/tapdata-connectors-enterprise"
+        git clone --depth 1 --quiet "$ENTERPRISE_REPOSITORY" "$enterprise_checkout"
+    fi
+    if [ -d "$checkout/$module" ]; then
+        if [ -n "$enterprise_checkout" ] && [ -d "$enterprise_checkout/$module" ]; then
+            echo "module exists in both checkouts: $module" >&2; exit 2
+        fi
+        CONNECTOR_CHECKOUTS+=("$checkout")
+        oss_modules+=("$module")
+    elif [ -n "$enterprise_checkout" ] && [ -d "$enterprise_checkout/$module" ]; then
+        CONNECTOR_CHECKOUTS+=("$enterprise_checkout")
+        enterprise_modules+=("$module")
+    else
+        echo "module missing from connector checkouts: $module" >&2; exit 2
+    fi
+done
+
 # The protoc this build compiles with, on a host the pinned protoc was never published for.
 #
 # One module in this set - the vendored PostgreSQL Debezium connector - compiles a .proto during the
@@ -238,10 +269,28 @@ echo "Building $modules with the JDK at $connector_java_home (Java $major)"
 # holds two different connectors under two names, and provenance is stamped per revision, so the one
 # that gets staged decides what the catalog says. A runner clones fresh and never sees either; the
 # developer running a refresh locally sees both.
-JAVA_HOME="$connector_java_home" \
-    mvn -B -f "$checkout/pom.xml" -pl "$modules" -am -DskipTests \
-    ${settings_flags[@]+"${settings_flags[@]}"} \
-    ${protoc_flags[@]+"${protoc_flags[@]}"} clean package
+# The two reactors share their local repository. Enterprise dependencies sql-core
+# and read-partition are unpublished and must be installed from the OSS source first.
+repository_flags=()
+case " ${MAVEN_ARGS:-} " in
+    *-Dmaven.repo.local=*) ;;
+    *) mkdir -p "$workspace/m2"; repository_flags=(-Dmaven.repo.local="$workspace/m2") ;;
+esac
+build_modules() {
+    local source="$1" selected="$2" goal="$3"
+    JAVA_HOME="$connector_java_home" \
+        mvn -B -f "$source/pom.xml" -pl "$selected" -am -DskipTests \
+        ${settings_flags[@]+"${settings_flags[@]}"} \
+        ${repository_flags[@]+"${repository_flags[@]}"} \
+        ${protoc_flags[@]+"${protoc_flags[@]}"} clean "$goal"
+}
+if [ "${#oss_modules[@]}" -gt 0 ]; then
+    build_modules "$checkout" "$(IFS=,; echo "${oss_modules[*]}")" package
+fi
+if [ "${#enterprise_modules[@]}" -gt 0 ]; then
+    build_modules "$checkout" "connectors-common/sql-core,connectors-common/read-partition" install
+    build_modules "$enterprise_checkout" "$(IFS=,; echo "${enterprise_modules[*]}")" package
+fi
 
 # Stage one jar per connector, and insist on exactly one.
 #
@@ -258,24 +307,24 @@ for index in "${!CONNECTOR_IDS[@]}"; do
     artifact="$(basename "$module")"
     built=()
     while IFS= read -r jar; do built+=("$jar"); done < <(
-        find "$checkout/$module/target" -maxdepth 1 -name "$artifact-v*.jar" -type f | sort
+        find "${CONNECTOR_CHECKOUTS[$index]}/$module/target" -maxdepth 1 -name "$artifact-v*.jar" -type f | sort
     )
     if [ "${#built[@]}" -ne 1 ]; then
         echo "expected exactly one shaded $artifact jar in $module/target, found ${#built[@]}: ${built[*]-}" >&2
         exit 1
     fi
-    cp "${built[0]}" "$destination/"
-    echo "Staged $(basename "${built[0]}") for connector '$id'"
+    staged_name="$id-connector-${built[0]##*/$artifact-}"
+    cp "${built[0]}" "$destination/$staged_name"
+    echo "Staged $staged_name for connector '$id'"
 done
 
 # What the destination has to satisfy, asserted here rather than left to fail later as something
 # that reads like a product bug. Two consumers read this directory by two different rules, so both
 # are checked, each against the list it applies to.
 #
-# catalog-derive resolves a jar by module name. That rule holds for every caller, because it is the
-# one staging above just satisfied.
-for module in "${CONNECTOR_MODULES[@]}"; do
-    artifact="$(basename "$module")"
+# Both derive and the live catalog harness resolve the exact public id prefix.
+for id in "${CONNECTOR_IDS[@]}"; do
+    artifact="$id-connector"
     staged="$(find "$destination" -maxdepth 1 -name "$artifact-*.jar" -type f | wc -l | tr -d ' ')"
     if [ "$staged" -ne 1 ]; then
         echo "$destination resolves $staged jars for module '$artifact', and derive requires exactly one" >&2
@@ -283,12 +332,8 @@ for module in "${CONNECTOR_MODULES[@]}"; do
     fi
 done
 
-# The witnesses resolve by connector id instead, and an id is only its jar's prefix for some
-# connectors: the three this lane drives, yes; most of the catalog, no - 'aliyun-db-mongodb' is built
-# by aliyun-mongodb-connector. So this half is asserted for the lane it belongs to, which is the one
-# taking the default list. A catalog refresh names its own list and is read by derive, not by the
-# witnesses; over its dist the id rule is ambiguous by construction, since siblings that share a
-# prefix (mysql, mysql-pxc) are all staged on purpose.
+# Witnesses use a broader id prefix. Refuse sibling ambiguity in the default
+# witness dist; a catalog refresh deliberately stages such siblings together.
 if [ -z "$modules_arg" ]; then
     for id in "${CONNECTOR_IDS[@]}"; do
         staged="$(find "$destination" -maxdepth 1 -name "$id*.jar" -type f | wc -l | tr -d ' ')"
