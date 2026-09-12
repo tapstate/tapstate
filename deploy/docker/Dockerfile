@@ -11,6 +11,28 @@
 # Connector jars are deliberately NOT baked in. They are registered at runtime by uploading their
 # bytes, which keeps a connector's lifecycle independent of this image's version.
 
+# The boot jar is resolved in a throwaway stage rather than copied straight onto its final path.
+# The wildcard tolerates the version in the artifact name without pinning it here, but a glob onto a
+# single destination is copied match by match over that one file, so two candidates are decided by
+# name order rather than by intent -- and silently: the build neither errors nor warns. app/target is
+# not cleaned between revisions, so a working copy that has built more than once holds a jar per
+# revision, and a leftover whose version string sorts above the current one would ship in place of
+# the build being verified. Copying into a directory keeps every match, so the step below can refuse
+# anything but exactly one. The stage shares the final base image, so it downloads nothing extra, and
+# none of its layers reach the shipped image.
+FROM eclipse-temurin:21-jre AS boot-jar
+COPY app/target/app-*-boot.jar /jars/
+RUN set -eu; \
+    cd /jars; \
+    set -- app-*-boot.jar; \
+    if [ "$#" -ne 1 ]; then \
+      echo "app/target/app-*-boot.jar matched $# files in the build context; it must match exactly one:" >&2; \
+      printf '  app/target/%s\n' "$@" >&2; \
+      echo "Delete the jars you do not want shipped, or rebuild with 'mvn -pl app -am clean package -DskipTests', then build the image again." >&2; \
+      exit 1; \
+    fi; \
+    mv "$1" tapstate.jar
+
 FROM eclipse-temurin:21-jre
 
 # Image self-description (OCI). The source label connects this package to its repository, so the
@@ -41,9 +63,8 @@ WORKDIR /var/lib/tapstate
 RUN mkdir -p /var/lib/tapstate/plugins /var/lib/tapstate/logs /var/lib/tapstate/connectors \
  && chown -R tapstate:tapstate /var/lib/tapstate
 
-# The wildcard tolerates the version in the artifact name without pinning it here; the build fails
-# loudly if it matches anything other than exactly one file.
-COPY --chown=tapstate:tapstate app/target/app-*-boot.jar /opt/tapstate/tapstate.jar
+# Already resolved to exactly one file by the stage above, so this names it outright.
+COPY --from=boot-jar --chown=tapstate:tapstate /jars/tapstate.jar /opt/tapstate/tapstate.jar
 
 USER tapstate
 
