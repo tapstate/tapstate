@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -33,6 +35,12 @@ final class FileEndpoints implements Endpoints {
 
     private static final String HEADER = "id,seq";
     private static final String SUFFIX = ".csv";
+
+    /**
+     * What a table is staged under while it is being replaced. The format's suffix is absent from it on
+     * purpose, so a staging file nobody moved is not read as a table by anything that reads this format.
+     */
+    private static final String STAGING_SUFFIX = ".staging";
 
     /** The setting this store is addressed by: the directory holding one file per table. */
     private static final String DIRECTORY = "uri";
@@ -283,16 +291,52 @@ final class FileEndpoints implements Endpoints {
         return rows;
     }
 
+    /**
+     * Replaces the table's file with the given rows in one step: the text is staged beside the file and
+     * moved into place, never written over it.
+     *
+     * <p>This driver is seeded and driven while the connector reads the same files, and both read a file
+     * whole. Writing in place empties the file before the new text lands, so for the length of the write
+     * the table reads as holding nothing while every row is still there - a reading that cannot be told
+     * apart from an empty table. A move is a single step, so no reader is ever shown a table mid-write.
+     */
     private static void write(Path file, List<Row> rows) {
         StringBuilder text = new StringBuilder(HEADER).append('\n');
         for (Row row : rows) {
             text.append(row.id()).append(',').append(row.seq()).append('\n');
         }
         try {
-            Files.writeString(file, text.toString());
+            Path staged = Files.createTempFile(file.getParent(), file.getFileName() + ".", STAGING_SUFFIX);
+            try {
+                Files.writeString(staged, text.toString());
+                publish(staged, file);
+            } finally {
+                // Nothing reads a staging file, so one a failed write leaves behind is one nothing ever
+                // collects. After the move it is already gone, and this call does nothing.
+                Files.deleteIfExists(staged);
+            }
         } catch (IOException e) {
             throw new UncheckedIOException("cannot write the table at " + file, e);
         }
+    }
+
+    /**
+     * Puts the staged content where the table is, in one step, with the mode a reader other than this
+     * process needs.
+     *
+     * <p>A temp file is created readable by its owner alone, and a move carries that mode onto the table.
+     * The write this replaces left the mode the process's umask gives instead - readable by anyone. These
+     * directories are read across users: a build running in a container and a harness running out here
+     * share one, each reading what the other wrote. So the staged file is given that mode back before it
+     * is moved into place, or a table this process wrote is one the other user cannot open.
+     */
+    private static void publish(Path staged, Path file) throws IOException {
+        try {
+            Files.setPosixFilePermissions(staged, PosixFilePermissions.fromString("rw-r--r--"));
+        } catch (UnsupportedOperationException noPosixPermissions) {
+            // A filesystem that carries no POSIX permissions has nothing to widen.
+        }
+        Files.move(staged, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     /** One row of the format: an id and a sequence, both whole numbers. */
