@@ -164,6 +164,7 @@ engine.no-such-job
 io.document-too-large
 io.document-unreadable
 io.schema-read-contention
+io.schema-write-contention
 io.store-unauthorized
 io.store-unavailable
 lifecycle.illegal-transition
