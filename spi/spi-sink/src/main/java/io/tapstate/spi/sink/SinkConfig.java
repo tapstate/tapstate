@@ -32,13 +32,20 @@ import java.util.Objects;
  */
 public record SinkConfig(
         String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-        TargetTable target, PipelineNode node) {
+        TargetTable target, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
 
     public SinkConfig {
         Objects.requireNonNull(connectorId, "connectorId");
         Objects.requireNonNull(writeMode, "writeMode");
         Objects.requireNonNull(ddl, "ddl");
+        Objects.requireNonNull(onFullLoad, "onFullLoad");
         settings = settings == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(settings));
+    }
+
+    /** Existing callers append to the target and declare no destructive preparation policy. */
+    public SinkConfig(String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+            TargetTable target, PipelineNode node) {
+        this(connectorId, settings, writeMode, ddl, target, node, OnFullLoad.APPEND, true);
     }
 
     /** A config naming no node — a write driven outside any pipeline. */

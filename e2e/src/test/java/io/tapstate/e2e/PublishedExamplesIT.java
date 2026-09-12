@@ -213,7 +213,7 @@ class PublishedExamplesIT {
                             + "it handed out: the resource is not pointing where the run put its endpoint",
                             specification, seed.table(), address.settings())
                     .isTrue();
-            holder.ifPresent(seeded::add);
+            recordSeededStore(seeded, seed, holder);
         }
         settled.forEach((alias, rows) -> {
             Optional<String> holder = stores.storeHolding(binding.addressOf(alias));
@@ -300,6 +300,13 @@ class PublishedExamplesIT {
             }
         }
         return Map.of();
+    }
+
+    /** Empty seeds create table structure, but cannot account for any delivered target row. */
+    static void recordSeededStore(Set<String> seeded, Seed seed, Optional<String> holder) {
+        if (!seed.rows().isEmpty()) {
+            holder.ifPresent(seeded::add);
+        }
     }
 
     /**

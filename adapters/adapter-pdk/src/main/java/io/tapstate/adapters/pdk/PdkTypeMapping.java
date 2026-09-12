@@ -8,6 +8,7 @@ import io.tapdata.entity.schema.type.TapDateTime;
 import io.tapdata.entity.schema.type.TapJson;
 import io.tapdata.entity.schema.type.TapMap;
 import io.tapdata.entity.schema.type.TapNumber;
+import io.tapdata.entity.schema.type.TapRaw;
 import io.tapdata.entity.schema.type.TapString;
 import io.tapdata.entity.schema.type.TapTime;
 import io.tapdata.entity.schema.type.TapType;
@@ -15,6 +16,8 @@ import io.tapdata.entity.schema.type.TapYear;
 import io.tapstate.core.common.TapstateType;
 
 import java.math.BigDecimal;
+import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
 
 /**
  * Maps a PDK type onto the tapstate type namespace: the normalization step that turns what a connector
@@ -77,6 +80,64 @@ final class PdkTypeMapping {
             default -> Resolved.unknown(
                     "the connector's " + type.getClass().getSimpleName()
                             + " has no member in the tapstate type namespace");
+        };
+    }
+
+    /** Copies every declared numeric attribute before the framework descriptor leaves discovery. */
+    static NumericType numericType(TapType type) {
+        if (!(type instanceof TapNumber number)) {
+            return null;
+        }
+        return new NumericType(number.getBit(), number.getFixed(), number.getUnsigned(), number.getZerofill(),
+                number.getMinValue(), number.getMaxValue(), number.getPrecision(), number.getScale());
+    }
+
+    /** Copies all declared string attributes, including the source's character width. */
+    static StringType stringType(TapType type) {
+        return type instanceof TapString string
+                ? new StringType(string.getBytes(), string.getFixed(), string.getDoubleBytes(),
+                        string.getDefaultValue(), string.getByteRatio()) : null;
+    }
+
+    static TapType targetType(TapstateType type, NumericType number, StringType string) {
+        if (type == TapstateType.STRING && string != null) {
+            return new TapString().bytes(string.bytes()).fixed(string.fixed()).doubleBytes(string.doubleBytes())
+                    .defaultValue(string.defaultValue()).byteRatio(string.byteRatio());
+        }
+        return targetType(type, number);
+    }
+
+    /** Restores the source descriptor without inventing bounds or a destination SQL spelling. */
+    static TapType targetType(TapstateType type, NumericType number) {
+        if (number == null || (type != TapstateType.DECIMAL && type != TapstateType.INT64 && type != TapstateType.DOUBLE)) {
+            return targetType(type);
+        }
+        return new TapNumber().bit(number.bit()).fixed(number.fixed()).unsigned(number.unsigned())
+                .zerofill(number.zerofill()).minValue(number.minValue()).maxValue(number.maxValue())
+                .precision(number.precision()).scale(number.scale());
+    }
+
+    /** Projects the inferred portable type into the PDK vocabulary; database types remain PDK-owned. */
+    static TapType targetType(TapstateType type) {
+        return switch (type) {
+            case STRING -> new TapString();
+            case INT64 -> new TapNumber().bit(64).scale(0).minValue(SIGNED_64_MIN)
+                    .maxValue(BigDecimal.valueOf(Long.MAX_VALUE));
+            case DECIMAL -> throw new IllegalArgumentException(
+                    "decimal target requires declared numeric attributes; rediscover the source schema. "
+                            + "Computed decimal columns have no declared numeric metadata");
+            case DOUBLE -> new TapNumber().fixed(false).bit(64)
+                    .minValue(BigDecimal.valueOf(-Double.MAX_VALUE)).maxValue(BigDecimal.valueOf(Double.MAX_VALUE));
+            case BOOLEAN -> new TapBoolean();
+            case DATE -> new TapDate();
+            case TIME -> new TapTime();
+            case DATETIME -> new TapDateTime();
+            case YEAR -> new TapYear();
+            case BINARY -> new TapBinary();
+            case JSON -> new TapJson();
+            case ARRAY -> new TapArray();
+            case MAP -> new TapMap();
+            case UNKNOWN -> new TapRaw();
         };
     }
 

@@ -1,0 +1,28 @@
+# Both endpoints are MySQL; the empty target seed supplies only the (id, seq) table.
+# Every counted target row must cross the product JDBC sink.
+# Snapshot, insert, update and delete are separate delivery witnesses.
+# The changed sequence is read back: counts alone cannot detect a discarded update.
+name: rows-cross-from-mysql-into-another-mysql
+setup:
+  databases:
+    src_db: { kind: mysql }
+    tgt_db: { kind: mysql }
+  connectors: [mysql]
+  apply: [src_db.tap.yml, tgt_db.tap.yml, pipeline.tap.yml]
+  discover: [src_db]
+pipeline: pipeline.tap.yml
+seed:
+  src_db.orders: { rows: 12 }
+  tgt_db.orders: { rows: 0 }
+steps:
+  - start
+  - await: { count: { tgt_db.orders: 12 } }
+  - await: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 5 } } } }
+  - cdc: { src_db.orders: insert 3 }
+  - await: { count: { tgt_db.orders: 15 } }
+  - await: { doc: { tgt_db.orders: { where: { id: 15 }, expect: { seq: 15 } } } }
+  - cdc: { src_db.orders: { update: { where: { id: 5 }, set: { seq: 505 } } } }
+  - await: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 505 } } } }
+  - cdc: { src_db.orders: { delete: { where: { id: 1 } } } }
+  - await: { count: { tgt_db.orders: 14 } }
+  - assert: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 505 } } } }

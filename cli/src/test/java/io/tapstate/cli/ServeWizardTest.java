@@ -18,6 +18,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ServeWizardTest {
 
+    @Test
+    void recordsExplicitFullLoadClearAndOffersAppendAsSafeDefault() {
+        ScriptedPrompter p = new ScriptedPrompter("target", "sync", "warehouse", "upsert", "fail", "clear");
+        ServeResource serve = new ServeWizard(p, List.of()).run();
+        assertThat(yaml(serve)).contains("on_full_load: clear");
+        assertThat(p.offered).contains(List.of("clear", "fail", "append"));
+    }
+
     private static String yaml(ServeResource s) {
         return new CanonicalWriter().write(s);
     }
@@ -74,7 +82,7 @@ class ServeWizardTest {
     void wiresAQueryBackendToAnEarlierSyncId() {
         // sync first, then a query whose backend names that sync's auto id (the API-on-sink shape)
         ScriptedPrompter p = new ScriptedPrompter(
-                "std_api", "sync", "tgt_b", "upsert", "fail", "query", "rest", "sync_1");
+                "std_api", "sync", "tgt_b", "upsert", "fail", "append", "query", "rest", "sync_1");
         ServeResource serve = new ServeWizard(p, List.of()).run();
         assertThat(yaml(serve)).isEqualTo(
                 """
@@ -126,8 +134,8 @@ class ServeWizardTest {
         // two syncs (sync_1, sync_2), a backed query, and a push (push_1) all in one serve
         ScriptedPrompter p = new ScriptedPrompter(
                 "std_sink",
-                "sync", "tgt_b", "upsert", "fail",
-                "sync", "tgt_c", "append", "fail",
+                "sync", "tgt_b", "upsert", "fail", "append",
+                "sync", "tgt_c", "append", "fail", "append",
                 "query", "rest", "sync_2",
                 "push", "tgt_kfk", "orders_events",
                 "(done)");
@@ -182,7 +190,7 @@ class ServeWizardTest {
     void omitsTheQueryBackendWhenNoneIsChosenWithASyncPresent() {
         // a sync exists, so the backend menu offers it plus (none); choosing (none) is a parallel egress
         ScriptedPrompter p = new ScriptedPrompter(
-                "std_api", "sync", "tgt_b", "upsert", "fail", "query", "rest", "(none)");
+                "std_api", "sync", "tgt_b", "upsert", "fail", "append", "query", "rest", "(none)");
         ServeResource serve = new ServeWizard(p, List.of()).run();
         assertThat(yaml(serve)).isEqualTo(
                 """

@@ -72,6 +72,28 @@ class MongoSchemaStoreTest {
     }
 
     @Test
+    void numericAttributesRoundTripBeyondDecimal128AndLegacyRecordsStayAbsent() {
+        var number = new io.tapstate.core.common.NumericType(256, true, null, false,
+                new java.math.BigDecimal("-1.23456789012345678901234567890123456789E+1000"),
+                new java.math.BigDecimal("1.23456789012345678901234567890123456789E+1000"), 40, -5);
+        SourceField amount = new SourceField("amount", "source_number", TapstateType.DECIMAL, null, number);
+        var envelope = discovered("numeric", new SourceModel(List.of(
+                new SourceTable("orders", List.of(amount), List.of(), List.of()))));
+        assertThat(roundTrip(envelope)).isEqualTo(envelope);
+        var field = tableDocsOf(envelope).getFirst().getList("fields", Document.class).getFirst();
+        assertThat(field.get("numericType", Document.class).getString("maxValue"))
+                .isEqualTo(number.maxValue().toString());
+        field.remove("numericType");
+        var legacy = new Document("name", "orders").append("fields", List.of(field))
+                .append("primaryKey", List.of()).append("indexes", List.of());
+        assertThat(MongoSchemaStore.toDiscovered(envelopeOf(envelope), List.of(legacy))
+                .model().tables().getFirst().fields().getFirst().numericType()).isNull();
+        field.append("numericType", new Document("precision", "corrupt"));
+        assertThat(catchThrowable(() -> MongoSchemaStore.toDiscovered(envelopeOf(envelope), List.of(legacy))))
+                .isInstanceOf(TapstateException.class);
+    }
+
+    @Test
     void documentCarriesIdConnectorIdDiscoveredAtAndTables() {
         DiscoveredSourceModel envelope = discovered("orders-db", ordersModel());
         Document document = envelopeOf(envelope);

@@ -110,8 +110,16 @@
       "description": "Provides a mysql store."
     },
     {
+      "word": "oracle",
+      "description": "Provides a oracle store."
+    },
+    {
       "word": "postgres",
       "description": "Provides a postgres store."
+    },
+    {
+      "word": "sqlserver",
+      "description": "Provides a sqlserver store."
     }
   ]
 }
