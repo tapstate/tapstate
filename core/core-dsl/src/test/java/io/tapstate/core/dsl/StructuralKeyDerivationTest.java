@@ -198,6 +198,7 @@ class StructuralKeyDerivationTest {
         assertRequired(DslParser.requiredPayloadKeys("js"), TransformBody.Js.class);
         assertRequired(DslParser.requiredPayloadKeys("map"), TransformBody.MapProjection.class);
         assertRequired(DslParser.requiredPayloadKeys("filter"), TransformBody.Filter.class);
+        assertRequired(DslParser.requiredPayloadKeys("unwind"), TransformBody.Unwind.class);
         assertRequired(DslParser.requiredPayloadKeys("nest"), TransformBody.Nest.class);
         assertRequired(DslParser.requiredPayloadKeys("join"), TransformBody.Join.class);
         assertRequired(DslParser.requiredPayloadKeys("union"), TransformBody.Union.class);
@@ -210,7 +211,8 @@ class StructuralKeyDerivationTest {
             NestRoot.class, Embed.class, ViewResource.class, ServeResource.class,
             ViewBlock.Inline.class,
             TransformResource.class, TransformBody.Js.class, TransformBody.MapProjection.class,
-            TransformBody.Filter.class, TransformBody.Nest.class, TransformBody.Join.class);
+            TransformBody.Filter.class, TransformBody.Unwind.class, TransformBody.Nest.class,
+            TransformBody.Join.class);
 
     /**
      * Records with a required component that the parser answers for rather than demanding of the
@@ -245,8 +247,8 @@ class StructuralKeyDerivationTest {
             PushElement.class, QueryElement.class, NestRoot.class, Embed.class, Step.Inline.class,
             Step.Use.class, ViewBlock.Inline.class, ViewBlock.Use.class, ServeBlock.Inline.class,
             ServeBlock.Use.class, TransformBody.Js.class, TransformBody.MapProjection.class,
-            TransformBody.Filter.class, TransformBody.Union.class, TransformBody.Nest.class,
-            TransformBody.Join.class);
+            TransformBody.Filter.class, TransformBody.Unwind.class, TransformBody.Union.class,
+            TransformBody.Nest.class, TransformBody.Join.class);
 
     @Test
     @DisplayName("every record with a required component is demanded of the document or named as answered")

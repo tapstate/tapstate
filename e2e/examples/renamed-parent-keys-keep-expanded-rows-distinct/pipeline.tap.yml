@@ -1,0 +1,17 @@
+version: tapstate/v1
+kind: pipeline
+id: unwind_renamed_parent
+source: src_mysql
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: listed
+    from: [orders]
+    type: map
+    fields:
+      order_id: $id
+      items: "=[{'sku': 'a'}, {'sku': 'b'}]"
+  - { id: expanded, from: listed, type: unwind, path: items, element_key: sku }
+serve:
+  from: expanded
+  sync:
+    - source: tgt_mongo

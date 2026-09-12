@@ -8,12 +8,13 @@ import org.junit.jupiter.api.Test;
 class NodeTypeTest {
 
     @Test
-    void nodeTypesAreTheClosedSetOfSix() {
+    void nodeTypesAreTheClosedSetOfSeven() {
         assertThat(NodeType.values())
                 .containsExactly(
                         NodeType.FILTER,
                         NodeType.MAP,
                         NodeType.JS,
+                        NodeType.UNWIND,
                         NodeType.UNION,
                         NodeType.NEST,
                         NodeType.JOIN);

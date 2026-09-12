@@ -22,7 +22,8 @@ import java.util.Map;
 final class TransformBodyPrompter {
 
     /** The transform type names, in menu order: streaming bodies first, then the multi-input ones. */
-    static final List<String> TYPES = List.of("filter", "map", "js", "union", "nest", "join");
+    static final List<String> TYPES =
+            List.of("filter", "map", "unwind", "js", "union", "nest", "join");
 
     /** The embed-loop sentinel that ends the (possibly nested) child-adding loop. */
     private static final String DONE = "(done)";
@@ -42,6 +43,7 @@ final class TransformBodyPrompter {
         return switch (type) {
             case "filter" -> new TransformBody.Filter(prompter.ask("Filter expression (CEL)", null));
             case "map" -> askMap();
+            case "unwind" -> askUnwind();
             case "js" -> new TransformBody.Js(blockText(prompter.lines("Script (JS)")));
             case "union" -> new TransformBody.Union();
             case "nest" -> askNest();
@@ -75,6 +77,39 @@ final class TransformBodyPrompter {
             return FieldRule.computed(r.substring(1));
         }
         return FieldRule.literal(r);
+    }
+
+    /**
+     * An expansion: the array field, then how its output rows are told apart, then the two optional
+     * refinements.
+     *
+     * <p><b>Both locators are asked for, in this order, and the first is asked first because it is
+     * the one worth having.</b> A field of the element identifies the row it becomes whatever the
+     * list is reordered to; a position identifies it only until an element is inserted ahead of it,
+     * at which point every later row moves to a key that belonged to its neighbour. An author who
+     * answers neither has written a declaration that is refused when it is validated, with a reason
+     * naming both - the wizard does not re-ask, because the two questions cannot say which of them
+     * the author meant to answer.
+     */
+    private TransformBody askUnwind() {
+        String path = prompter.ask("Array field to expand", null);
+        String elementKey =
+                blankToNull(prompter.ask("Field inside each element that identifies its row", null));
+        String indexColumn =
+                blankToNull(prompter.ask("Column carrying each element's position (blank for none)", null));
+        // Absent is the default and is written as absent, not as a spelled-out false: a scaffold
+        // carrying every default is one an author has to read past to find what they chose.
+        Boolean preserve = "yes".equals(prompter.choose(
+                "Keep a row whose array is empty, null or absent?", List.of("yes", "no")))
+                ? Boolean.TRUE
+                : null;
+        String elementType =
+                blankToNull(prompter.ask("Declared type of the expanded field (blank to infer)", null));
+        return new TransformBody.Unwind(path, indexColumn, preserve, elementKey, elementType);
+    }
+
+    private static String blankToNull(String answer) {
+        return answer == null || answer.isBlank() ? null : answer.trim();
     }
 
     /** A flat join: the SQL block alone, since this release runs joins on one engine. */

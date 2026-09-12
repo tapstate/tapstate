@@ -313,7 +313,7 @@ class NodeColumnsTest {
         // case covers the one way that guarantee is lost without the build ever going red: a catch-all
         // added to make the error go away. The counts are the arms; a variant absorbed by a catch-all
         // moves the count and not the arms.
-        assertThat(TransformBody.class.getPermittedSubclasses()).hasSize(6);
+        assertThat(TransformBody.class.getPermittedSubclasses()).hasSize(7);
         assertThat(PushFormat.class.getPermittedSubclasses()).hasSize(2);
         assertThat(ViewBlock.class.getPermittedSubclasses()).hasSize(2);
         assertThat(ServeBlock.class.getPermittedSubclasses()).hasSize(2);

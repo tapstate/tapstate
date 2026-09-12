@@ -1,0 +1,16 @@
+version: tapstate/v1
+kind: pipeline
+id: unwind_collision
+source: src_file
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: listed
+    from: [orders]
+    type: map
+    fields:
+      items: "=[{'seq': 'a'}, {'seq': 'b'}]"
+  - { id: expanded, from: listed, type: unwind, path: items, element_key: seq }
+serve:
+  from: expanded
+  sync:
+    - source: tgt_file

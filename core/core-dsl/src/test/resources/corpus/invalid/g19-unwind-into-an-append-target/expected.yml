@@ -1,0 +1,3 @@
+rule: unwind-needs-an-upsert-target
+path: serve.sync[0].write_mode
+note: "append writes a delete as another row, so removing a parent would append the elements it held instead of removing their rows"

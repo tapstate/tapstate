@@ -58,7 +58,12 @@ class CorpusSmokeTest {
             "config-type-mismatch", // connector config value of the wrong declared type (C3)
             "invalid-config-value", // connector config value outside the declared enum choices (C3)
             "join-sql-not-parsable", // a join's sql: is not SQL at all (SS2)
-            "join-sql-unsupported");// a join's sql: uses a construct this release does not run (SS2)
+            "join-sql-unsupported",// a join's sql: uses a construct this release does not run (SS2)
+            // an unwind naming nothing that varies per element, so every row it makes carries the
+            // key of the row it came from
+            "unwind-needs-an-element-key",
+            // an unwind whose rows reach a sync that appends, where a delete is another row
+            "unwind-needs-an-upsert-target");
 
     private static final Set<String> KINDS = Set.of("source", "pipeline", "transform", "view", "serve");
 

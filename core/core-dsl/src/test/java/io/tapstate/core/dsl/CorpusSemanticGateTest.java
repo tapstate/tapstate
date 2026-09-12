@@ -90,6 +90,9 @@ class CorpusSemanticGateTest {
         //   UPSERT_NEEDS_KEY: whether a table has a key is a property of the table, which only a
         //   discovered model carries - a document names the table but cannot say what it declares
         //   (WriteKeyRulesTest).
+        //   UNWIND_COLUMN_ALREADY_EXISTS: parent columns come from discovery or actual rows, not
+        //   the offline artifact (UnwindColumnCollisionTest and UnwindRuntimeCollisionTest, plus
+        //   the two published startup-refusal cases).
         //
         // inexpressible - the corpus cannot hold the document that would witness it.
         //   UNSUPPORTED_VERSION: CorpusSmokeTest requires every artifact here to declare the
@@ -103,7 +106,7 @@ class CorpusSemanticGateTest {
                 DslError.CONFIG_REQUIRED,
                 DslError.ROW_EXPRESSION_NEEDS_DISCOVERY, DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED,
                 DslError.ROW_EXPRESSION_TYPE_UNKNOWN, DslError.UPSERT_NEEDS_KEY,
-                DslError.UNSUPPORTED_VERSION));
+                DslError.UNWIND_COLUMN_ALREADY_EXISTS, DslError.UNSUPPORTED_VERSION));
         assertThat(witnessed).containsExactlyInAnyOrderElementsOf(requiresCorpusWitness);
     }
 

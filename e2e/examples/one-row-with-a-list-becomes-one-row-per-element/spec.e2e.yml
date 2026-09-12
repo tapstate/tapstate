@@ -1,0 +1,26 @@
+# The seed vocabulary carries scalar columns. This map constructs a list from the source revision
+# on both event images; changing that revision changes the actual list reaching unwind. The real
+# MySQL change stream supplies full before images, and Mongo reads verify the resulting write keys.
+name: one-row-with-a-list-becomes-one-row-per-element
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mysql]
+pipeline: pipeline.tap.yml
+seed:
+  src_mysql.orders:
+    values:
+      - { id: 1, customer: ada, revision: 0 }
+      - { id: 2, customer: grace, revision: 1 }
+steps:
+  - start
+  - await: { count: { tgt_mongo.orders: 4 } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 1, sku: a }, expect: { customer: ada, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 1, sku: b }, expect: { customer: ada, items.sku: b } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 1, sku: c }, expect: { customer: ada, items.sku: c } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 2, sku: d }, expect: { customer: grace, items.sku: d } } } }
+  # Every expected key is present; the exact count leaves no room for stale rows.
+  - assert: { state: RUNNING }

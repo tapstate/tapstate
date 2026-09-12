@@ -1,0 +1,5 @@
+version: tapstate/v1
+kind: source
+id: tgt_lines
+connector: postgres
+config: { host: 10.30.0.9, database: dw, username: writer, password: Dw_2026 }

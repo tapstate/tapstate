@@ -65,6 +65,50 @@ public sealed interface TransformBody {
         }
     }
 
+    /**
+     * {@code type: unwind} — one output row per element of an array field; stateless and row-level,
+     * and the only one of that family that changes how many rows travel on.
+     *
+     * <p><b>Three of the five keys are not this project's invention.</b> A document store's own
+     * unwind stage carries a path, an ordinal-column name and a keep-the-empty-ones flag, and those
+     * three arrive here under the same names, spelled the way every key here is spelled. An author
+     * who already knows that stage does not have to learn a second vocabulary for the same three
+     * things, and the camelCase spellings they may arrive with are refused by name rather than
+     * ignored - an ignored option expands without the column that was asked for, and the rows look
+     * right until somebody counts them.
+     *
+     * <p><b>The other two exist because that stage never writes anywhere.</b> It hands rows to the
+     * next stage of a query; this hands them to a table that has a key and column types. So one key
+     * says which field inside an element identifies the row it becomes, and one says what the
+     * expanded column is declared as. Both are optional, and both carry the {@code element_} prefix
+     * so that which half of the vocabulary a key belongs to is visible without looking it up.
+     */
+    @YamlType("unwind")
+    @Doc("Expands one row into one row per element of an array field.")
+    record Unwind(
+            @Doc(value = "The array field to expand; one output row is produced per element of it.",
+                    required = true)
+            String path,
+            @Doc("Name of a column carrying each element's ordinal within the array; absent adds none.")
+            String includeArrayIndex,
+            @Doc(value = "Whether a row whose array is null, missing or empty still produces one "
+                    + "output row, that field left empty. Absent drops such rows.", def = "false")
+            Boolean preserveNullAndEmptyArrays,
+            @Doc("Field inside each element that identifies its row; also copied into a top-level "
+                    + "column of the same name, which joins the parent key at the target.")
+            String elementKey,
+            @Doc("Declared type of the expanded column; absent leaves the connector to infer one.")
+            String elementType) implements TransformBody {
+        public Unwind {
+            Objects.requireNonNull(path, "path");
+        }
+
+        @Override
+        public String type() {
+            return "unwind";
+        }
+    }
+
     /** {@code type: union} — explicit multi-stream merge. */
     @YamlType("union")
     @Doc("Explicit merge of multiple input streams into one.")

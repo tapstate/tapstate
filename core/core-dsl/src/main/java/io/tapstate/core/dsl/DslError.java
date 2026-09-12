@@ -118,6 +118,27 @@ public enum DslError implements TapstateErrorCode {
      *  carries, only a discovered model does. */
     UPSERT_NEEDS_KEY(
             "dsl.upsert-needs-key", Set.of("table", "source", "path")),
+    /**
+     * An unwind naming nothing that varies from one element to the next, so every row it produces
+     * carries the same key as the row it came from. {@code step} names the unwind. Unlike
+     * {@link #UPSERT_NEEDS_KEY}, which asks what a table declares, this one is answered by the
+     * document alone: whether the elements can be told apart is the author's to state, and an
+     * expansion that does not state it collapses back into a single row at the target with nothing
+     * reporting how many were overwritten.
+     */
+    UNWIND_NEEDS_AN_ELEMENT_KEY(
+            "dsl.unwind-needs-an-element-key", Set.of("step", "path")),
+    /**
+     * An unwind whose rows reach a sync writing in append mode, where a delete is written as another
+     * row rather than removing one. {@code step} names the unwind and {@code sync} the element it
+     * reaches. Refused rather than run: the expansion is correct there and still cannot converge, so
+     * deleting a parent appends the elements it used to hold instead of taking their rows away.
+     */
+    UNWIND_NEEDS_AN_UPSERT_TARGET(
+            "dsl.unwind-needs-an-upsert-target", Set.of("step", "sync", "path")),
+    /** A generated unwind column would overwrite a parent column or another generated column. */
+    UNWIND_COLUMN_ALREADY_EXISTS(
+            "dsl.unwind-column-already-exists", Set.of("column", "option")),
     /** A join's {@code sql:} is not SQL at all. {@code detail} carries the parser's own diagnosis,
      *  which already names the line and column it stopped at. Kept apart from
      *  {@link #JOIN_SQL_UNSUPPORTED} because the two send a reader in opposite directions: one to

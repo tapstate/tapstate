@@ -51,6 +51,13 @@ class DslErrorTest {
                 // post-semantic too - whether a table declares a key is a property of the table,
                 // carried only by a discovered model and never by the document naming it
                 "dsl.upsert-needs-key",
+                // the unwind gate, and the other way round from the one above: what an expansion
+                // says about its own rows, and which sync those rows reach, are both written in the
+                // document, so both are witnessed by an ordinary corpus case
+                "dsl.unwind-needs-an-element-key",
+                "dsl.unwind-needs-an-upsert-target",
+                // Source columns are available during assembly, not offline corpus validation.
+                "dsl.unwind-column-already-exists",
                 // the join SQL gate: both are raised while reading the artifact, so both are
                 // witnessed by an ordinary corpus case
                 "dsl.join-sql-not-parsable",
@@ -100,6 +107,12 @@ class DslErrorTest {
                 .containsExactlyInAnyOrder("expr", "column", "table", "path");
         assertThat(DslError.UPSERT_NEEDS_KEY.placeholders())
                 .containsExactlyInAnyOrder("table", "source", "path");
+        // the step is the whole diagnosis: which expansion cannot tell its own rows apart
+        assertThat(DslError.UNWIND_NEEDS_AN_ELEMENT_KEY.placeholders())
+                .containsExactlyInAnyOrder("step", "path");
+        // both ends are named, because either one is a legitimate thing to change
+        assertThat(DslError.UNWIND_NEEDS_AN_UPSERT_TARGET.placeholders())
+                .containsExactlyInAnyOrder("step", "sync", "path");
     }
 
     @Test

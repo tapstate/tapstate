@@ -1,0 +1,30 @@
+# Both parents carry the same element keys. Renaming their source key must preserve parent
+# identity at the target and in the complete previous image used to expand a delete.
+name: renamed-parent-keys-keep-expanded-rows-distinct
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mysql]
+pipeline: pipeline.tap.yml
+seed:
+  src_mysql.orders:
+    values:
+      - { id: 1, customer: ada, revision: 0 }
+      - { id: 2, customer: grace, revision: 1 }
+steps:
+  - start
+  - await: { count: { tgt_mongo.orders: 4 } }
+  - await: { doc: { tgt_mongo.orders: { where: { order_id: 1, sku: a }, expect: { customer: ada, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { order_id: 1, sku: b }, expect: { customer: ada, items.sku: b } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { order_id: 2, sku: a }, expect: { customer: grace, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { order_id: 2, sku: b }, expect: { customer: grace, items.sku: b } } } }
+  # A complete before image uses the renamed parent key; the other parent must survive.
+  - cdc: { src_mysql.orders: { delete: { where: { id: 1 } } } }
+  - await: { count: { tgt_mongo.orders: 2 } }
+  - await: { doc: { tgt_mongo.orders: { where: { order_id: 2, sku: a }, expect: { customer: grace, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { order_id: 2, sku: b }, expect: { customer: grace, items.sku: b } } } }
+  # Every expected key is present; the exact count leaves no room for stale rows.
+  - assert: { state: RUNNING }

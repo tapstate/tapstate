@@ -3,6 +3,7 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.model.FromClause;
@@ -126,6 +127,35 @@ class StoreBackedDagSourceTargetModelTest {
         // which columns travel, and a target built to a type nobody discovered is a different change.
         assertThat(bound).containsExactly(new TargetTable("orders", List.of(
                 new TargetField("id", "INT", true))));
+    }
+
+    @Test
+    void an_expansion_puts_the_column_that_tells_its_rows_apart_into_the_targets_key() {
+        // The end of the chain this whole rule runs along. An expansion emits several rows carrying
+        // one parent's key, so a target keyed on the parent alone keeps the last of each parent's
+        // rows and loses the rest - filling the table, reporting nothing, and reading exactly like a
+        // step that never ran. The column that does tell them apart is one the source table has not
+        // got, so it can only get into the key by the node saying so.
+        InMemoryStorePort store = seededExpandingPipeline();
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable(
+                "orders",
+                List.of(new SourceField("id", "INT"), new SourceField("items", "JSON")),
+                List.of("id"),
+                List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        // Key columns lead, because that is the order the sink matches an upsert in. Names and key
+        // flags only: whether a column keeps the word the source declared for it is a separate rule
+        // with its own cases, and pinning it here would make this one fail for a reason that has
+        // nothing to do with what it is about.
+        assertThat(bound).singleElement().satisfies(target -> {
+            assertThat(target.name()).isEqualTo("orders");
+            assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                    .containsExactly(
+                            tuple("id", true), tuple("item_no", true), tuple("items", false));
+        });
     }
 
     @Test
@@ -458,6 +488,25 @@ class StoreBackedDagSourceTargetModelTest {
                 new ServeBlock.Inline(null, FromRef.literal("project"),
                         List.of(new SyncElement("sync_1", "orders_dest", null, null, null)),
                         null, null),
+                null, null));
+        OpenRingGenerations.forSources(store, "orders_src");
+        return store;
+    }
+
+    /** The same one-source, one-sink pipeline with an expansion between them. */
+    private static InMemoryStorePort seededExpandingPipeline() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
+        store.artifacts().save(new SourceResource("orders_dest", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null));
+        store.artifacts().save(new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("explode", FromClause.list(FromRef.literal("orders_src")),
+                        new TransformBody.Unwind("items", "item_no", null, null, null), null)),
+                null,
+                new ServeBlock.Inline(null, FromRef.literal("explode"),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)), null, null),
                 null, null));
         OpenRingGenerations.forSources(store, "orders_src");
         return store;

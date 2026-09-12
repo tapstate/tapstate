@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.RowExpressions;
+import io.tapstate.core.dsl.UnwindWriteKeys;
+import io.tapstate.core.dsl.UnwindRules;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.PushFormat;
@@ -11,10 +13,12 @@ import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.OutputField;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -68,21 +72,54 @@ import java.util.Set;
  * which is the one other thing handed in here, and it is the only node whose answer does not follow
  * from what reaches it.
  *
+ * <p><b>A node may also say which of its columns tell its output rows apart.</b> Until one node
+ * changed how many rows there are, nothing had to: every node emitted one row per row it was given,
+ * so the rows a target received were identified by whatever of that table's own key still travelled,
+ * and one rule where the target is published answered it for every kind at once. A node that expands
+ * a list breaks that - the parent's key is the same value on every row it produces - and the column
+ * that does tell them apart is one the source table never had, so no rule reading only the source's
+ * key can reach it. <b>What is recorded here is what the node adds, never the whole key</b>: this
+ * vocabulary has never carried which of a table's own columns are its key, so a node saying "the key
+ * is these" would be saying it without being able to name the part it did not invent, and the two
+ * would have to be reconciled somewhere anyway. Adding is also what makes the answer for every kind
+ * that expands nothing the empty list, and therefore the published rule exactly what it always was.
+ *
  * @param columns       the node's output columns, name to declared type, in output order; empty when
  *                      nothing can be said
+ * @param key           the columns this node adds to the key of the rows it emits, in order, beyond
+ *                      whatever of the table's own key still travels; empty for every node that adds
+ *                      none, which is every node that emits one row per row
  * @param unknownBecause why the columns cannot be given, naming the node, or null when they are given
+ * @param origins       surviving source identity, output column to its original name; replacement
+ *                      values have no origin even if their output name matches a source column
+ * @param expanded      whether rows passed through an expansion; only these outputs use source
+ *                      identity through renames when publishing their parent key
  */
-record NodeColumns(Map<String, String> columns, String unknownBecause) {
+record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
+        Map<String, String> origins, boolean expanded) {
 
     NodeColumns {
         // Order-preserving rather than Map.copyOf: the declared order is the output order, and a copy
         // that loses it turns every rebuild of the same node into a differently ordered record.
         columns = Collections.unmodifiableMap(new LinkedHashMap<>(columns));
+        key = List.copyOf(key);
+        origins = Collections.unmodifiableMap(new LinkedHashMap<>(origins));
     }
 
-    /** The columns a node produces, worked out. */
+    /** The columns a node produces, worked out; it adds nothing to what tells its rows apart. */
     static NodeColumns known(Map<String, String> columns) {
-        return new NodeColumns(columns, null);
+        return new NodeColumns(columns, List.of(), null, identityOrigins(columns), false);
+    }
+
+    /** The columns a node produces, and the ones of them it adds to the key of its output rows. */
+    static NodeColumns keyed(Map<String, String> columns, List<String> key) {
+        return new NodeColumns(columns, key, null, identityOrigins(columns), !key.isEmpty());
+    }
+
+    private static Map<String, String> identityOrigins(Map<String, String> columns) {
+        Map<String, String> origins = new LinkedHashMap<>();
+        columns.keySet().forEach(column -> origins.put(column, column));
+        return origins;
     }
 
     /**
@@ -91,7 +128,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
      * it can walk nothing.
      */
     static NodeColumns unknown(String because) {
-        return new NodeColumns(Map.of(), because);
+        return new NodeColumns(Map.of(), List.of(), because, Map.of(), false);
     }
 
     /** Whether the columns are the answer, as opposed to the reason there is none. */
@@ -101,7 +138,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
 
     /**
      * What a transform step produces, given what reaches it and, where it has one, what it compiled to.
-     * Six kinds, and the switch is exhaustive over all of them: a seventh cannot be added to the
+     * Seven kinds, and the switch is exhaustive over all of them: an eighth cannot be added to the
      * grammar without this stopping the build.
      *
      * <p><b>A script is the one kind that cannot be answered for, and the answer is final rather than
@@ -124,6 +161,7 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
             // reached it back unchanged is the whole of it - including when that answer is an unknown,
             // which then keeps naming the step that actually went dark.
             case TransformBody.Filter ignored -> merged(inputs.values());
+            case TransformBody.Unwind unwind -> expanded(unwind, merged(inputs.values()));
             // The merge itself, and nothing besides. It computes what the arm above does, and is
             // written out separately all the same: the two coincide only because a predicate happens
             // not to touch a column, so folding them together would make a later change to one of
@@ -179,7 +217,24 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
         seen.forEach((name, declared) -> out.put(name, carriedBy.get(name) == inputs.size()
                 ? declared
                 : JoinSchemaDrift.declaredType(JoinSchemaDrift.typeOf(declared), true)));
-        return known(out);
+        // An added key column is a claim about every row leaving this node, and a merge forwards
+        // rows from each input as they arrive. So the claim survives only where every input makes
+        // the same one: one branch that expanded a list and one that did not produce rows told apart
+        // by different things, and keying on either branch's answer describes the other's wrongly.
+        NodeColumns first = inputs.iterator().next();
+        List<String> agreed = first.key();
+        Map<String, String> origins = new LinkedHashMap<>(first.origins());
+        boolean expanded = false;
+        for (NodeColumns input : inputs) {
+            if (!input.key().equals(agreed)) {
+                agreed = List.of();
+            }
+            origins.entrySet().removeIf(entry ->
+                    !entry.getValue().equals(input.origins().get(entry.getKey())));
+            expanded |= input.expanded();
+        }
+        return new NodeColumns(out, agreed.stream().filter(out::containsKey).toList(), null,
+                origins, expanded);
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
@@ -189,6 +244,90 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
                 : TapstateType.UNKNOWN;
         return JoinSchemaDrift.declaredType(type,
                 JoinSchemaDrift.nullableOf(seen) || JoinSchemaDrift.nullableOf(declared));
+    }
+
+    /**
+     * What an expansion produces: the row it was handed, with the expanded column re-declared as one
+     * element instead of the list it was, and an ordinal column beside it where the author asked for
+     * one. <b>The expanded column keeps its position</b> - the row is the parent's, one field
+     * replaced, so a reader comparing this against the row that arrived sees one column change type
+     * rather than a column vanish and another appear at the end.
+     *
+     * <p><b>A column the row does not carry is not conjured.</b> An expansion naming a field that is
+     * not there produces nothing here, the same answer a rename whose source is missing produces:
+     * inventing it would describe a target column no write ever fills. Whether that declaration
+     * should have been refused in the first place is the validator's question, not this one's.
+     *
+     * <p><b>The element column is nullable whatever it is declared as.</b> A list may hold a null
+     * among its elements, and a row kept for an empty list carries nothing there at all - neither is
+     * visible in any declaration, so the only honest answer is the one that allows both. The ordinal
+     * is the other way round: every expanded row has a position, so it is only nullable where empty
+     * lists are kept and a row without an element can reach the target.
+     *
+     * <p><b>An element type nobody declared comes out unknown, and that is the answer rather than a
+     * failure.</b> The type of what sits inside a list is not something a source's schema carries -
+     * the connector framework's own array type has no field for it - so there is nothing here to
+     * read and nothing to infer from. Unknown then travels to the write side as a column with no
+     * declared type, which is the existing way of saying "the connector decides", not a new one.
+     * <b>The declared name is not judged here, because the validator already refused it</b>: a name
+     * outside the shared vocabulary is rejected where the author wrote it, with a reason, rather
+     * than resolved leniently into the same unknown that declaring nothing produces. What is left
+     * here is a fallback for a body that reached this far without passing through that check, and
+     * unknown is the right answer for one - it is what a column nobody resolved a type for gets,
+     * not a quiet substitution for a type the author asked for.
+     */
+    private static NodeColumns expanded(TransformBody.Unwind unwind, NodeColumns upstream) {
+        UnwindRules.refuseColumnCollisions(unwind.path(), unwind.includeArrayIndex(),
+                unwind.elementKey(), upstream.columns().keySet());
+        if (!upstream.known()) {
+            return upstream;
+        }
+        boolean mayBeEmpty = Boolean.TRUE.equals(unwind.preserveNullAndEmptyArrays());
+        Map<String, String> out = new LinkedHashMap<>(upstream.columns());
+        if (out.containsKey(unwind.path())) {
+            out.put(unwind.path(),
+                    JoinSchemaDrift.declaredType(elementType(unwind.elementType()), true));
+        }
+        if (unwind.includeArrayIndex() != null) {
+            out.put(unwind.includeArrayIndex(),
+                    JoinSchemaDrift.declaredType(TapstateType.INT64, mayBeEmpty));
+        }
+        // The element's own identifying field is written beside the element as a column of its own,
+        // because a key is addressed at the target by column and this one would otherwise be a name
+        // only reachable inside the value sitting in the expanded column - which is not a column any
+        // store builds, and which the published rule passes over in silence, leaving the rows keyed
+        // on the parent alone. Its type is the same nothing the expanded column itself gets: what
+        // sits inside a list is not something a source's schema carries, so there is no word for a
+        // field of it either.
+        if (unwind.elementKey() != null) {
+            out.put(unwind.elementKey(),
+                    JoinSchemaDrift.declaredType(TapstateType.UNKNOWN, mayBeEmpty));
+        }
+        // Whatever the nodes above added stays added: a second expansion identifies its rows by its
+        // own locator and the first one's together, and falling back to the table's own key would be
+        // claiming the first expansion's rows are one row.
+        List<String> key = new ArrayList<>(upstream.key());
+        String locator = UnwindWriteKeys.elementLocator(unwind);
+        if (locator != null && !key.contains(locator)) {
+            key.add(locator);
+        }
+        Map<String, String> origins = new LinkedHashMap<>(upstream.origins());
+        origins.remove(unwind.path());
+        origins.remove(unwind.includeArrayIndex());
+        origins.remove(unwind.elementKey());
+        return new NodeColumns(out, key, null, origins, true);
+    }
+
+    /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
+    private static TapstateType elementType(String declared) {
+        if (declared == null) {
+            return TapstateType.UNKNOWN;
+        }
+        try {
+            return TapstateType.valueOf(declared.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException outsideTheVocabulary) {
+            return TapstateType.UNKNOWN;
+        }
     }
 
     /**
@@ -347,7 +486,41 @@ record NodeColumns(Map<String, String> columns, String unknownBecause) {
                 out.put(name, type);
             }
         });
-        return known(out);
+        Map<String, String> origins = new LinkedHashMap<>();
+        for (String output : out.keySet()) {
+            FieldRule rule = rules.get(output);
+            // A rename with no source emits nothing. The original output-named column can still
+            // pass through, so its identity must follow that actual value rather than the rule.
+            if (rule instanceof FieldRule.Rename rename
+                    && !upstream.columns().containsKey(rename.sourceField())) {
+                rule = null;
+            }
+            String source = rule instanceof FieldRule.Rename rename ? rename.sourceField() : output;
+            if (rule == null || rule instanceof FieldRule.Rename) {
+                String origin = upstream.origins().get(source);
+                if (origin != null) {
+                    origins.put(output, origin);
+                }
+            }
+        }
+        return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
+                origins, upstream.expanded());
+    }
+
+    /**
+     * What an upstream node's added key columns are called after a projection, and which of them
+     * still exist. A rename is followed rather than treated as a loss: the column is the same column
+     * under another name, and dropping the claim would leave rows an expansion made distinct looking
+     * like one row again - the failure the claim exists to remove, arriving through a rule that only
+     * renamed something. A column the projection does not carry at all is a loss, and is dropped:
+     * naming a column the target has not got reads as a key that is complete.
+     */
+    private static List<String> projectedKey(
+            Map<String, FieldRule> rules, List<String> upstreamKey, Map<String, String> out) {
+        if (upstreamKey.isEmpty()) {
+            return List.of();
+        }
+        return KeyProjection.renamed(upstreamKey, rules).stream().filter(out::containsKey).toList();
     }
 
     /**

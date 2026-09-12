@@ -14,6 +14,7 @@ Tapstate itself rather than using it.
 
 | Tutorial | What you build | Time |
 |---|---|---|
+| [Expanding order items](expanding-order-items/) | Four MongoDB rows from two MySQL parents, followed by CDC deletion of a parent and its expanded rows. | ~15 min |
 | [Assembling one document out of many tables](nest-document-assembly/) | Three live documents - order, customer and product - assembled from the same nine relational tables with a `nest` transform and kept current by change data capture. Includes the rule that decides which document shapes a nest can express. | ~30 min |
 | [Browsing live data by hand](browsing-live-data-by-hand/) | Nothing - it reads. The five read verbs and the three MCP read tools, run against a source you already have. Written to be run by a person: four of its checks - how `watch` redraws, what closing a window releases, what an agent discovers mid-session - are ones no test can make. | ~30 min |
 | [Running the server and CLI from an IDE](running-from-an-ide/) | The server out of IntelliJ IDEA against a MongoDB you supply, and the CLI driving it from a terminal, ending at a connected and authenticated CLI. Carries no sample data: it stops before anything moves, and hands over to [the nest tutorial](nest-document-assembly/). | ~20 min |
