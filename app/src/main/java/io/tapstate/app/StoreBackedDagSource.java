@@ -1151,7 +1151,7 @@ final class StoreBackedDagSource implements DagSource {
                 && guardedPath == null) {
             return transformPort(step, List.of());
         }
-        Map<String, List<String>> keys = parentKeysReaching(step, steps, ref -> {
+        Function<FromRef, Map<String, List<String>>> sourceKeys = ref -> {
             Map<String, List<String>> byStream = new LinkedHashMap<>();
             for (String key : upstreams(ref, keysByTable, keysBySource, vertices, stepIds)) {
                 SourceVertex vertex = vertices.get(key);
@@ -1164,13 +1164,21 @@ final class StoreBackedDagSource implements DagSource {
                 }
             }
             return byStream;
-        });
-        return transformPortByStream(step, keys, guardedPath);
+        };
+        Map<String, List<String>> keys = parentKeysReaching(step, steps, sourceKeys);
+        Set<String> guardedStreams = guardedPath == null ? Set.of()
+                : unmodifiedStreamsReaching((Step.Inline) step, steps, sourceKeys);
+        return transformPortByStream(step, keys, guardedPath, guardedStreams);
     }
 
     /** Capture a serializable factory per logical stream; input tables need not share their key names. */
     static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
             Map<String, List<String>> parentKeys, String guardedPath) {
+        return transformPortByStream(step, parentKeys, guardedPath, Set.copyOf(parentKeys.keySet()));
+    }
+
+    private static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
+            Map<String, List<String>> parentKeys, String guardedPath, Set<String> guardedStreams) {
         Map<String, SupplierEx<? extends TransformPort>> factories = new LinkedHashMap<>();
         parentKeys.forEach((stream, key) -> factories.put(stream, transformPort(step, key)));
         if (parentKeys.isEmpty()) {
@@ -1185,7 +1193,7 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, TransformPort> ports = new LinkedHashMap<>();
             for (var entry : factories.entrySet()) {
                 TransformPort port = entry.getValue().get();
-                if (guardedPath != null) {
+                if (guardedPath != null && guardedStreams.contains(entry.getKey())) {
                     port = StatelessTransforms.requireCompleteBeforeImage(
                             port, guardedPath, parentKeys.get(entry.getKey()));
                 }
@@ -1193,7 +1201,8 @@ final class StoreBackedDagSource implements DagSource {
             }
             return event -> {
                 if (event.op() == io.tapstate.core.event.Op.DDL) {
-                    return List.of(event);
+                    // A script sees DDL too; parent identity is irrelevant for this non-row event.
+                    return ports.values().iterator().next().transform(event);
                 }
                 TransformPort port = ports.get(event.src());
                 if (port == null) {
@@ -1202,6 +1211,55 @@ final class StoreBackedDagSource implements DagSource {
                 return port.transform(event);
             };
         };
+    }
+
+    /** Check the physical earlier row once, before the first projection can change its shape. */
+    private static Set<String> unmodifiedStreamsReaching(Step.Inline step, Map<String, Step.Inline> steps,
+            Function<FromRef, Map<String, List<String>>> sourceKeys) {
+        Map<String, Set<Boolean>> states = mutationStatesReaching(step.from(), steps, sourceKeys, new HashSet<>());
+        Set<String> unmodified = new LinkedHashSet<>();
+        states.forEach((stream, checked) -> {
+            if (checked.size() > 1) {
+                throw unresolvedParentKey(step.id(), stream,
+                        "unmodified and already projected rows of the same stream merge before this step");
+            }
+            if (checked.contains(false)) {
+                unmodified.add(stream);
+            }
+        });
+        return Set.copyOf(unmodified);
+    }
+
+    private static Map<String, Set<Boolean>> mutationStatesReaching(FromClause from,
+            Map<String, Step.Inline> steps, Function<FromRef, Map<String, List<String>>> sourceKeys,
+            Set<String> visiting) {
+        Map<String, Set<Boolean>> states = new LinkedHashMap<>();
+        for (FromRef ref : refsOf(from)) {
+            sourceKeys.apply(ref).keySet().forEach(stream ->
+                    states.computeIfAbsent(stream, ignored -> new LinkedHashSet<>()).add(false));
+            for (Step.Inline upstream : referencedSteps(ref, steps)) {
+                if (!visiting.add(upstream.id())) {
+                    continue;
+                }
+                TransformBody body = upstream.body();
+                boolean mutates = body instanceof TransformBody.MapProjection || body instanceof TransformBody.Js
+                        || body instanceof TransformBody.Unwind;
+                if (mutates || body instanceof TransformBody.Filter || body instanceof TransformBody.Union) {
+                    mutationStatesReaching(upstream.from(), steps, sourceKeys, visiting).forEach((stream, checked) ->
+                            states.computeIfAbsent(stream, ignored -> new LinkedHashSet<>())
+                                    .addAll(mutates ? Set.of(true) : checked));
+                }
+                visiting.remove(upstream.id());
+            }
+        }
+        return states;
+    }
+
+    private static List<Step.Inline> referencedSteps(FromRef ref, Map<String, Step.Inline> steps) {
+        return ref instanceof FromRef.Literal literal
+                ? steps.containsKey(literal.ref()) ? List.of(steps.get(literal.ref())) : List.of()
+                : steps.values().stream().filter(candidate ->
+                        Pattern.matches(((FromRef.Regex) ref).pattern(), candidate.id())).toList();
     }
 
     private static String downstreamUnwindPath(String id, Map<String, Step.Inline> steps, Set<String> visiting) {
@@ -1240,11 +1298,7 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, List<String>> keys = new LinkedHashMap<>();
         for (FromRef ref : refsOf(from)) {
             sourceKeys.apply(ref).forEach((stream, key) -> mergeParentKey(stepId, keys, stream, key));
-            List<Step.Inline> upstreamSteps = ref instanceof FromRef.Literal literal
-                    ? steps.containsKey(literal.ref()) ? List.of(steps.get(literal.ref())) : List.of()
-                    : steps.values().stream().filter(candidate ->
-                            Pattern.matches(((FromRef.Regex) ref).pattern(), candidate.id())).toList();
-            for (Step.Inline upstream : upstreamSteps) {
+            for (Step.Inline upstream : referencedSteps(ref, steps)) {
                 if (!visiting.add(upstream.id())) {
                     continue;
                 }

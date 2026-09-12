@@ -276,6 +276,17 @@ class UnwindParentKeyTest {
         }
     }
 
+    @Test
+    void guardingAJsStepPreservesItsDdlProcessing() throws Exception {
+        Step.Inline script = step("script", "orders", new TransformBody.Js(
+                "function process(r, ctx) { r.schema.touched = true; return r; }"));
+        TransformPort port = StoreBackedDagSource.transformPortByStream(
+                script, Map.of("orders", List.of("o_id")), "items").get();
+        Envelope ddl = Envelope.ddl(1L, "schema", Map.of("change", "add"));
+        assertThat(port.transform(ddl)).singleElement()
+                .satisfies(row -> assertThat(row.schema()).containsEntry("touched", true));
+    }
+
     /** One order carrying one element, under whichever key it is given. */
     private static Map<String, Object> orderRow(long id) {
         Map<String, Object> row = new LinkedHashMap<>();
