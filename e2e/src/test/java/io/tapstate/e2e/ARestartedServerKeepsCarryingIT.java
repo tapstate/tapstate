@@ -78,18 +78,39 @@ class ARestartedServerKeepsCarryingIT {
             assertThat(control.state(running.pipelineId()))
                     .as("the pipeline the restarted server adopted from the store it read")
                     .contains(PipelineState.RUNNING);
-            assertThat(running.rowsAtTarget())
-                    .as("the target before anything new is laid down - the wait below has to be earned")
-                    .isEqualTo(carriedBeforeTheRestart);
+            awaitExactly(
+                    running,
+                    carriedBeforeTheRestart,
+                    "the target to be restored before anything new is laid down");
 
             running.insertAtSource(1);
             awaitAtLeast(running, carriedBeforeTheRestart + 1, "a change made after the restart");
         }
     }
 
-    /** Waits for the target to hold at least {@code rows}, and answers what it held once it did. */
+    /** Waits for the target to hold at least {@code rows}, and answers the reading that satisfied the wait. */
     private static long awaitAtLeast(RunningPipeline running, long rows, String what) {
-        Await.until(what, () -> running.rowsAtTarget() >= rows, () -> running.rowsAtTarget() + " rows");
-        return running.rowsAtTarget();
+        long[] reading = {0};
+        Await.until(
+                what,
+                () -> (reading[0] = running.rowsAtTarget()) >= rows,
+                () -> reading[0] + " rows");
+        return reading[0];
+    }
+
+    /** Waits for two consecutive reads of the restarted target to hold exactly the first server's row count. */
+    private static void awaitExactly(RunningPipeline running, long rows, String what) {
+        long[] reading = {0};
+        boolean[] matchedLastPoll = {false};
+        Await.until(
+                what,
+                () -> {
+                    reading[0] = running.rowsAtTarget();
+                    boolean matches = reading[0] == rows;
+                    boolean stableMatch = matches && matchedLastPoll[0];
+                    matchedLastPoll[0] = matches;
+                    return stableMatch;
+                },
+                () -> reading[0] + " rows");
     }
 }
