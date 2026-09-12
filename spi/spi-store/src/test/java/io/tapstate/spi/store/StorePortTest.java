@@ -768,6 +768,25 @@ class StorePortTest {
         assertThat(history.get(1).ddlSeq()).isEqualTo(12L);
     }
 
+    @Test
+    void metaAppendSchemaVersionRecordsTheVersionItWasGiven() {
+        SrsMetaStore meta = new InMemoryStore().meta();
+        meta.create("chain", null);
+
+        // The one thing the contract promises whatever a store retains: a store may bound the history and
+        // drop its oldest versions, but the version an append was given is recorded, because recording a
+        // schema change is the whole of what the call is for. This implementation retains everything, so
+        // what is pinned here is the shape of that promise -- the history ends at the version just handed
+        // over, after every append -- and not a bound, which only a store that has one can be made to show.
+        for (long version = 0; version < 5; version++) {
+            meta.appendSchemaVersion("chain", new SchemaVersion(version, Map.of("id", "int"), version));
+
+            List<SchemaVersion> history = meta.read("chain").orElseThrow().schemaHistory();
+            assertThat(history).isNotEmpty();
+            assertThat(history.get(history.size() - 1).version()).isEqualTo(version);
+        }
+    }
+
     // --- the removal side of the per-pipeline stores, and the detach that frees a shared chain ---
 
     @Test

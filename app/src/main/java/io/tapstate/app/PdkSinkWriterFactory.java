@@ -7,6 +7,7 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkSinkPort;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.DdlPolicy;
+import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetTable;
@@ -56,6 +57,8 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     private final Map<String, Object> settings;
     private final WriteMode writeMode;
     private final DdlPolicy ddl;
+    private final OnFullLoad onFullLoad;
+    private final boolean fullLoad;
     private final Map<String, TargetTable> targets;
     private final PipelineNode node;
 
@@ -69,6 +72,14 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
             Map<String, TargetTable> targets, PipelineNode node) {
+        this(connectorId, settings, writeMode, ddl, targets, node, OnFullLoad.APPEND, true);
+    }
+
+    PdkSinkWriterFactory(
+            String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+            Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+        this.onFullLoad = onFullLoad;
+        this.fullLoad = fullLoad;
         this.connectorId = connectorId;
         this.settings = settings;
         this.writeMode = writeMode;
@@ -87,11 +98,15 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
         return node;
     }
 
+    OnFullLoad onFullLoad() { return onFullLoad; }
+
+    boolean fullLoad() { return fullLoad; }
+
     @Override
     public SinkWriter getEx() {
         HazelcastInstance member = localMember();
         return new PdkSinkPort(provisioner(member), stateStore(member))
-                .open(new SinkConfig(connectorId, settings, writeMode, ddl, null, node), targets);
+                .open(new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad), targets);
     }
 
     /**

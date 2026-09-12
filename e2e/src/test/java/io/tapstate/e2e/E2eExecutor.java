@@ -35,7 +35,7 @@ public final class E2eExecutor {
     private final Duration timeout;
     private final Duration pollInterval;
 
-    /** The table the last cdc step changed, until an await confirms the change arrived. */
+    /** The last replay-eligible changed table, until an await confirms the change arrived. */
     private TableAlias lastChanged;
 
     /**
@@ -186,7 +186,12 @@ public final class E2eExecutor {
                     case Step.Change.Delete delete -> binding.delete(cdc.table(), delete.where());
                     case Step.Change.Insert insert -> binding.insert(cdc.table(), insert.values());
                 }
-                lastChanged = cdc.table();
+                // A delete-and-insert replay would replace an update with different operations,
+                // making a sink that discards every update satisfy the changed-value assertion.
+                boolean update = cdc.change() instanceof Step.Change.Update
+                        || cdc.change() instanceof Step.Change.Generated generated
+                        && generated.op() == CdcOp.UPDATE;
+                lastChanged = update ? null : cdc.table();
             }
             case Step.Assertion assertion -> check(assertion.matcher(), pipelineId);
             case Step.Await await -> {

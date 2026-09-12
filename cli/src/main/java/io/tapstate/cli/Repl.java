@@ -3,7 +3,10 @@ package io.tapstate.cli;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
+import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -33,6 +36,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.OptionalInt;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -42,6 +46,7 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * The offline REPL: a JLine read loop over the same command table the one-shot mode uses, so a verb
@@ -198,6 +203,12 @@ final class Repl {
      */
     private final UnaryOperator<String> env;
 
+    /** Where the context store, the saved sessions and the local development stack live. */
+    Path homeDir = Path.of(System.getProperty("user.home"));
+
+    /** Test seam: the local development stack {@code up} may start; built under {@link #homeDir} when null. */
+    LocalStack localStack;
+
     /**
      * Set by the terminal's interrupt handler to stop an in-flight {@code --watch} / {@code --follow}
      * stream; reset at the start of each stream. Volatile because the interrupt handler runs on another
@@ -255,7 +266,7 @@ final class Repl {
     /** Whether this verb can be routed to the control plane when a context resolves. */
     static boolean isOnlineVerb(String verb) {
         return ONLINE_VERBS.contains(verb) || Cli.LIVE_VIEW_VERBS.contains(verb)
-                || verb.equals("auth") || verb.equals("context");
+                || Cli.COMPOSITE_VERBS.contains(verb) || verb.equals("auth") || verb.equals("context");
     }
 
     /** The live-view verb this line opens with, or null when it opens with something else. */
@@ -581,6 +592,14 @@ final class Repl {
                     DataBrowserCall.parseLive(verb, String.join(" ", words.subList(1, words.size()))), verb);
             return true;
         }
+        // The composite verb establishes its own target: it takes --server as an override for the run,
+        // which the shared resolution below cannot see, and the help is the one thing it answers offline.
+        if (words.get(0).equals("up")) {
+            boolean help = words.stream().anyMatch(word -> word.equals("-h") || word.equals("--help")
+                    || word.equals("-V") || word.equals("--version"));
+            lastExitCode = help ? commandLine.execute(words.toArray(new String[0])) : up(words);
+            return true;
+        }
         if (!session.isConnected() && ONLINE_VERBS.contains(words.get(0)) && contextResolver != null) {
             int resolved = resolveTarget(words);
             if (resolved != Cli.EXIT_OK) {
@@ -625,10 +644,17 @@ final class Repl {
 
     /** Resolves and reaches a target only after dispatch has established that the verb is online. */
     private int resolveTarget(List<String> words) {
-        String verb = words.get(0);
+        return resolveTarget(words.get(0), null, workspaceFor(words));
+    }
+
+    /**
+     * The same, with the pieces named: the verb the diagnostic names, an explicit seed list to reach
+     * instead of any saved target (a temporary target, resolved the way {@code --connect} is and never
+     * written anywhere), and the workspace whose binding is consulted when there is none.
+     */
+    private int resolveTarget(String verb, String connect, Path workspace) {
         try {
-            Optional<ResolvedContext> resolution = contextResolver.resolve(null, explicitContext,
-                    workspaceFor(words));
+            Optional<ResolvedContext> resolution = contextResolver.resolve(connect, explicitContext, workspace);
             if (resolution.isEmpty()) {
                 Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
                 return Cli.EXIT_VERB_UNAVAILABLE;
@@ -1717,7 +1743,7 @@ final class Repl {
         Path target = operand != null ? workdir.resolve(operand).normalize() : workdir;
         List<LocalDraft> drafts;
         try {
-            drafts = collectDrafts(target);
+            drafts = collectDrafts(target, env);
         } catch (IOException e) {
             err.println("apply: cannot read " + target + ": " + e.getMessage());
             err.flush();
@@ -1751,10 +1777,7 @@ final class Repl {
             LocalDraft only = drafts.get(0);
             drafts = List.of(new LocalDraft(only.source(), only.content(), ifMatch));
         }
-        List<LocalDraft> submitted = drafts;
-        ApplyOutcome outcome = withFailover(() ->
-                controlPlane.apply(session.landingNode(), session.credential(), submitted),
-                o -> o instanceof ApplyOutcome.Unreachable);
+        ApplyOutcome outcome = applyDrafts(drafts);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case ApplyOutcome.Applied applied -> {
@@ -2101,11 +2124,8 @@ final class Repl {
             return Cli.EXIT_DIAGNOSTIC;
         }
 
-        final String connectionId = parsed.id();
         OutputFormat chosen = parsed.format();
-        ConnectionTestOutcome outcome = withFailover(() -> controlPlane.test(
-                session.landingNode(), session.credential(), connectionId, source.connector(), source.config()),
-                o -> o instanceof ConnectionTestOutcome.Unreachable);
+        ConnectionTestOutcome outcome = testConnectionFor(parsed.id(), source.connector(), source.config());
         return switch (outcome) {
             case ConnectionTestOutcome.Tested tested -> {
                 renderReport(tested.report(), chosen);
@@ -2183,10 +2203,7 @@ final class Repl {
             return Cli.EXIT_DIAGNOSTIC;
         }
 
-        final String connectionId = parsed.id();
-        ConnectionDiscoverSchemaOutcome outcome = withFailover(() -> controlPlane.discoverSchema(
-                session.landingNode(), session.credential(), connectionId, source.connector(), source.config()),
-                o -> o instanceof ConnectionDiscoverSchemaOutcome.Unreachable);
+        ConnectionDiscoverSchemaOutcome outcome = discoverSchemaFor(parsed.id(), source.connector(), source.config());
         return switch (outcome) {
             case ConnectionDiscoverSchemaOutcome.Discovered discovered -> {
                 renderSchema(discovered.schema(), parsed.format());
@@ -2212,9 +2229,7 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         final String connectionId = parsed.id();
-        ConnectionSchemaOutcome outcome = withFailover(() ->
-                controlPlane.schema(session.landingNode(), session.credential(), connectionId),
-                o -> o instanceof ConnectionSchemaOutcome.Unreachable);
+        ConnectionSchemaOutcome outcome = readSchema(connectionId);
         return switch (outcome) {
             case ConnectionSchemaOutcome.Found found -> {
                 ConnectionSchema schema = found.schema();
@@ -2697,9 +2712,7 @@ final class Repl {
         if (format == null) {
             return Cli.EXIT_USAGE;
         }
-        ConnectorListOutcome outcome = withFailover(() ->
-                controlPlane.connectorList(session.landingNode(), session.credential()),
-                o -> o instanceof ConnectorListOutcome.Unreachable);
+        ConnectorListOutcome outcome = listConnectors();
         return switch (outcome) {
             case ConnectorListOutcome.Listed listed -> {
                 renderConnectors(listed.connectors(), format);
@@ -3143,9 +3156,7 @@ final class Repl {
         if (id == null) {
             return Cli.EXIT_USAGE;
         }
-        StatusOutcome outcome = withFailover(() ->
-                controlPlane.status(session.landingNode(), session.credential(), id),
-                o -> o instanceof StatusOutcome.Unreachable);
+        StatusOutcome outcome = readStatus(id);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case StatusOutcome.Found found -> {
@@ -3566,7 +3577,7 @@ final class Repl {
      * author's own: this side loads the files, so this side resolves them, and only values cross the
      * wire. The drafts stay raw text otherwise — the server remains the only parser.
      */
-    private List<LocalDraft> collectDrafts(Path target) throws IOException {
+    private List<LocalDraft> collectDrafts(Path target, UnaryOperator<String> lookup) throws IOException {
         List<LocalDraft> drafts = new ArrayList<>();
         if (Files.isDirectory(target)) {
             try (var files = Files.walk(target)) {
@@ -3575,7 +3586,7 @@ final class Repl {
                         .sorted()
                         .toList();
                 for (Path f : yamls) {
-                    drafts.add(draft(target.relativize(f).toString(), f));
+                    drafts.add(draft(target.relativize(f).toString(), f, lookup));
                 }
             } catch (UncheckedIOException e) {
                 // Files.walk surfaces a mid-traversal access error (an unreadable or concurrently-removed
@@ -3585,19 +3596,723 @@ final class Repl {
                 throw e.getCause() != null ? e.getCause() : new IOException(e.getMessage(), e);
             }
         } else if (Files.isRegularFile(target)) {
-            drafts.add(draft(target.getFileName().toString(), target));
+            drafts.add(draft(target.getFileName().toString(), target, lookup));
         }
         return drafts;
     }
 
     /** Reads one artifact and resolves its references, naming the file on whatever it refuses. */
-    private LocalDraft draft(String source, Path file) throws IOException {
+    private LocalDraft draft(String source, Path file, UnaryOperator<String> lookup) throws IOException {
         String text = Files.readString(file);
         try {
-            return new LocalDraft(source, Interpolator.interpolate(text, env));
+            return new LocalDraft(source, Interpolator.interpolate(text, lookup));
         } catch (DslException e) {
             throw e.withSource(source);
         }
+    }
+
+    // ---- up: the composite that brings a workspace to running -----------------------------------------
+
+    /**
+     * The server's own code for a connector that is not registered. Checked on this side before anything
+     * is applied, because the server would refuse the same way later — after the sources were written.
+     * Carried as the canonical code string, the way every server code reaches this ring.
+     */
+    private static final String CONNECTOR_NOT_REGISTERED = "connector.not-registered";
+    /**
+     * The server's code for a connector that could not complete its connection test, carried as a
+     * string for the same reason: it is the server's word, and a preflight that reports a check the
+     * connector failed without a code of its own reports it under the code the server would have used.
+     */
+    private static final String CONNECTOR_TEST_FAILED = "connector.test-failed";
+
+    /** The pipeline state under which there is nothing left to start, as the server spells it. */
+    private static final String RUNNING = "RUNNING";
+
+    /** The apply change under which a resource was already what the workspace says. */
+    private static final String UNCHANGED = "UNCHANGED";
+
+    /** What {@code up}'s words asked for. */
+    private record UpOptions(String server, Path workdir, OutputFormat format, boolean startLocal, String user,
+                             boolean yes) {
+    }
+
+    /**
+     * {@code up [--server <url>] [--yes] [-o text|json|yaml] [-w <dir>]} — brings the bound workspace to
+     * running through the same calls the individual verbs make, in a fixed order: reach and check the
+     * server, apply the sources, discover each source the pipelines read, apply the workspace,
+     * start every pipeline. It stops at the first stage that fails and names the stage, the resource and
+     * the code. Run on a workspace that is already up it changes nothing and says so.
+     *
+     * <p>The target is reached the way every online verb reaches one — the workspace's binding, or the
+     * explicit {@code --server} resolved as a temporary target and never written back — and the credential
+     * is the saved session, resumed the same way. {@code --yes} is accepted for scripts; there is nothing
+     * to ask.
+     */
+    private int up(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        UpOptions options = parseUpOptions(words);
+        if (options == null) {
+            return Cli.EXIT_USAGE;
+        }
+        Path workspace = options.workdir() != null ? workdir.resolve(options.workdir()).normalize() : workdir;
+        boolean connectedHere = false;
+        if (options.server() != null || !session.isConnected()) {
+            if (contextResolver == null) {
+                Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", "up"), session.versions());
+                return Cli.EXIT_VERB_UNAVAILABLE;
+            }
+            // The workspace's first up is where the server question is asked - and the only place. All
+            // contact with a server belongs to this verb; `new` wrote files and learned nothing. On a
+            // workspace that is already bound, --server keeps its old meaning: an override for this run.
+            boolean bindHere = contextManager != null && !boundAlready(workspace);
+            if (bindHere) {
+                int bound = bindWorkspace(workspace, options);
+                if (bound != Cli.EXIT_OK) {
+                    return bound;
+                }
+            }
+            int resolved = resolveTarget("up", bindHere ? null : options.server(), workspace);
+            if (resolved != Cli.EXIT_OK) {
+                return resolved;
+            }
+            connectedHere = true;
+        }
+        int prepared = prepareCredential();
+        if (prepared != Cli.EXIT_OK) {
+            return prepared;
+        }
+        if (!session.isAuthenticated()) {
+            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", "up"), session.versions());
+            return Cli.EXIT_VERB_UNAVAILABLE;
+        }
+        return new UpRun(workspace, options.format(), connectedHere).run();
+    }
+
+    /**
+     * Binds {@code workspace} to the server {@code --server} names, or to the one asked for at a
+     * terminal. Reached only while the directory is unbound, so the question is asked once per
+     * workspace rather than once per run. A script that named neither a server nor {@code --start-local}
+     * is refused rather than bound to whatever happens to be listening on this machine.
+     *
+     * @return {@link Cli#EXIT_OK} when the workspace is bound, or the code the failure is reported with
+     */
+    /** Whether the workspace already names a server, which is what makes the question a first-run one. */
+    private boolean boundAlready(Path workspace) {
+        return java.nio.file.Files.isDirectory(workspace)
+                && contextManager.contextBoundExactlyTo(workspace).isPresent();
+    }
+
+    private int bindWorkspace(Path workspace, UpOptions options) {
+        ControlPlaneClient probe = controlPlane;
+        AuthService auth = authService != null ? authService
+                : HomeStores.auth(homeDir, probe, java.time.Clock.systemUTC());
+        LocalStack stack = localStack != null ? localStack : LocalStack.under(homeDir, probe, env);
+        PrintWriter out = commandLine.getOut();
+        ServerBinding binding = new ServerBinding(contextManager, probe, auth, stack, env,
+                options.yes() ? null : prompter, quiet ? null : out);
+        URI named = options.server() == null ? null : ServerBinding.serverUrl(options.server());
+        if (options.server() != null && named == null) {
+            commandLine.getErr().println("up: --server must be an http(s) URL, e.g. "
+                    + ServerBinding.DEFAULT_SERVER_TEXT);
+            commandLine.getErr().flush();
+            return Cli.EXIT_USAGE;
+        }
+        try {
+            binding.bind(workspace, named, options.startLocal(), options.user());
+            return Cli.EXIT_OK;
+        } catch (io.tapstate.core.common.TapstateException refused) {
+            // Reported as preflight: binding is what "the server is reachable" means before there is a
+            // server to reach, and the run has five stages by contract - this is not a sixth.
+            return reportBindFailure(options.format(), workspace, refused.code(), refused.args());
+        } catch (java.io.IOException unreadable) {
+            return reportBindFailure(options.format(), workspace, CliError.WORKSPACE_UNREADABLE,
+                    Map.of("path", workspace.toString(), "reason", String.valueOf(unreadable.getMessage())));
+        }
+    }
+
+    /** One binding failure, rendered in whichever form the run asked for, the way a stage failure is. */
+    private int reportBindFailure(OutputFormat format, Path workspace, TapstateErrorCode code,
+            Map<String, Object> args) {
+        MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(code, args);
+        String solution = rendered.solution();
+        List<String> remedy = present(solution) && !hasUnboundName(solution) ? List.of(solution) : List.of();
+        return reportUpFailure(format, UpCmd.STAGE_PREFLIGHT, workspace.toString(), code.code(),
+                rendered.message(), args, remedy);
+    }
+
+    /** Parses {@code up}'s flags; a usage line and {@code null} on anything else. It takes no operand. */
+    private UpOptions parseUpOptions(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        String server = null;
+        Path target = null;
+        OutputFormat format = OutputFormat.TEXT;
+        boolean startLocal = false;
+        String user = null;
+        boolean yes = false;
+        for (int i = 1; i < words.size(); i++) {
+            String word = words.get(i);
+            if (word.equals("--server")) {
+                if (i + 1 >= words.size()) {
+                    return upUsage("--server needs a URL");
+                }
+                server = words.get(++i);
+            } else if (word.startsWith("--server=")) {
+                server = word.substring("--server=".length());
+            } else if (word.equals("-w") || word.equals("--workdir")) {
+                if (i + 1 >= words.size()) {
+                    return upUsage(word + " needs a directory");
+                }
+                target = Path.of(words.get(++i));
+            } else if (word.startsWith("-w=") || word.startsWith("--workdir=")) {
+                target = Path.of(word.substring(word.indexOf('=') + 1));
+            } else if (word.equals("-o") || word.equals("--output")) {
+                if (i + 1 >= words.size()) {
+                    return upUsage(word + " needs a format (text|json|yaml)");
+                }
+                OutputFormat chosen = outputFormat(words.get(++i));
+                if (chosen == null) {
+                    return upUsage("unknown output format '" + words.get(i) + "' (expected text|json|yaml)");
+                }
+                format = chosen;
+            } else if (word.equals("--start-local")) {
+                startLocal = true;
+            } else if (word.equals("-u") || word.equals("--user")) {
+                if (i + 1 >= words.size()) {
+                    return upUsage(word + " needs a name");
+                }
+                user = words.get(++i);
+            } else if (word.startsWith("-u=") || word.startsWith("--user=")) {
+                user = word.substring(word.indexOf('=') + 1);
+            } else if (word.equals("-y") || word.equals("--yes")) {
+                yes = true;
+            } else if (word.startsWith("-")) {
+                return upUsage("unknown option '" + word + "'");
+            } else {
+                return upUsage("unexpected operand '" + word + "'");
+            }
+        }
+        return new UpOptions(server, target, format, startLocal, user, yes);
+    }
+
+    private UpOptions upUsage(String reason) {
+        PrintWriter err = commandLine.getErr();
+        err.println("up: " + reason
+                + " (usage: up [--server <url>] [-u <name>] [--start-local] [--yes] [-o text|json|yaml] [-w <dir>])");
+        err.flush();
+        return null;
+    }
+
+    /** One workspace artifact as {@code up} read it: the draft it will send, and what it declares. */
+    private record UpDraft(LocalDraft draft, Resource resource) {
+        String id() {
+            return resource.id();
+        }
+
+        String kind() {
+            return resource.kind();
+        }
+    }
+
+    /**
+     * One run of {@code up}: the drafts it read, what each stage found, and the summary. The stages run
+     * in order and each answers a status; the first that is not success ends the run, already reported.
+     *
+     * <p>Convergence is decided from what the server answers, never assumed: an apply item that comes
+     * back unchanged, a source whose model is already stored, a pipeline whose status is already running
+     * — each is noted on its line, and a run in which every stage found its work done says so in the
+     * state line. Nothing is re-started, re-discovered or forced.
+     */
+    private final class UpRun {
+        private final Path workspace;
+        private final OutputFormat format;
+        /** Whether this run made the connection, in which case the connect's probe was the reachability check. */
+        private final boolean connectedHere;
+        private List<UpDraft> drafts = List.of();
+        /** Each applied resource's change, as the server reported it. */
+        private final Map<String, String> changes = new LinkedHashMap<>();
+        /** What the stages had to say about each resource they left alone. */
+        private final Map<String, List<String>> notes = new LinkedHashMap<>();
+        /** Each pipeline's state after the start stage, as the server reports it. */
+        private final Map<String, String> states = new LinkedHashMap<>();
+        private boolean nothingToDo = true;
+
+        UpRun(Path workspace, OutputFormat format, boolean connectedHere) {
+            this.workspace = workspace;
+            this.format = format;
+            this.connectedHere = connectedHere;
+        }
+
+        int run() {
+            int status = preflight();
+            if (status == Cli.EXIT_OK) {
+                status = apply(UpCmd.STAGE_APPLY_SOURCES, sources());
+            }
+            if (status == Cli.EXIT_OK) {
+                status = discover();
+            }
+            if (status == Cli.EXIT_OK) {
+                status = apply(UpCmd.STAGE_APPLY_WORKSPACE, workspaceBatch(), rest());
+            }
+            if (status == Cli.EXIT_OK) {
+                status = start();
+            }
+            if (status != Cli.EXIT_OK) {
+                return status;
+            }
+            summary();
+            return Cli.EXIT_OK;
+        }
+
+        /**
+         * Everything that can be found wrong before anything is written: the workspace reads and holds
+         * a pipeline whose sources it also holds, the server answers, every connector those sources need
+         * is registered on that server, and every source's own database answers the connector's test.
+         *
+         * <p>The workspace is read before the server is asked anything: it is local, and a workspace
+         * that cannot be read or has nothing to start needs no server to be refused.
+         */
+        private int preflight() {
+            int read = readWorkspace();
+            if (read != Cli.EXIT_OK) {
+                return read;
+            }
+            if (!connectedHere && !landingAnswers()) {
+                return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()), CliError.CONNECT_FAILED,
+                        Map.of("seeds", hostPort(session.landingNode())));
+            }
+            Set<String> local = sources().stream().map(UpDraft::id).collect(Collectors.toSet());
+            for (UpDraft pipeline : pipelines()) {
+                for (SourceRef sourceRef : ((PipelineResource) pipeline.resource()).sources()) {
+                    String source = sourceRef.id();
+                    if (!local.contains(source)) {
+                        return failure(UpCmd.STAGE_PREFLIGHT, source, CliError.RESOURCE_NOT_FOUND, Map.of("id", source));
+                    }
+                }
+            }
+            Set<String> registered;
+            switch (listConnectors()) {
+                case ConnectorListOutcome.Listed listed -> registered = listed.connectors().stream()
+                        .filter(connector -> "registered".equals(connector.origin()))
+                        .map(CatalogConnector::id).collect(Collectors.toSet());
+                case ConnectorListOutcome.Rejected rejected -> {
+                    return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()),
+                            rejected.code(), rejected.message(), Map.of());
+                }
+                case ConnectorListOutcome.Unreachable ignored -> {
+                    return unreachable(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()));
+                }
+            }
+            for (UpDraft source : sources()) {
+                String connector = ((SourceResource) source.resource()).connector();
+                if (!registered.contains(connector)) {
+                    Map<String, Object> params = Map.of("connector", connector);
+                    return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CONNECTOR_NOT_REGISTERED,
+                            MessageCatalog.bundled().render(CONNECTOR_NOT_REGISTERED, params).message(), params);
+                }
+            }
+            for (UpDraft source : sources()) {
+                int reachable = reachable(source);
+                if (reachable != Cli.EXIT_OK) {
+                    return reachable;
+                }
+            }
+            return Cli.EXIT_OK;
+        }
+
+        /**
+         * Asks the connector, through the same call {@code test} makes, whether one source's database
+         * answers with the settings the workspace declares. Every source is tested on every run,
+         * converged ones included: the database is the one thing in the workspace that can go away
+         * between two runs without any file changing, and the stages after this one all knock on it.
+         *
+         * <p>A report that did not pass is reported from its first failing check: the connector's own
+         * code when it gave one, else the catalog's connector-test code, with the check's message as
+         * the message and the check's reason and remedy as the next action. Passing is decided the way
+         * {@code test} decides its exit status - any outcome but {@code FAILED} - so the two verbs can
+         * never disagree about the same report.
+         */
+        private int reachable(UpDraft source) {
+            SourceResource declared = (SourceResource) source.resource();
+            switch (testConnectionFor(source.id(), declared.connector(), declared.config())) {
+                case ConnectionTestOutcome.Tested tested -> {
+                    ConnectionReport report = tested.report();
+                    if (reportStatus(report) == Cli.EXIT_OK) {
+                        return Cli.EXIT_OK;
+                    }
+                    ConnectionReport.Check failed = report.checks().stream()
+                            .filter(c -> "FAILED".equalsIgnoreCase(c.status()))
+                            .findFirst().orElse(null);
+                    if (failed == null) {
+                        Map<String, Object> params = Map.of("connector", declared.connector(),
+                                "detail", "the report names no failing check");
+                        return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CONNECTOR_TEST_FAILED,
+                                MessageCatalog.bundled().render(CONNECTOR_TEST_FAILED, params).message(), params);
+                    }
+                    String headline = readable(failed.message());
+                    String message = headline != null ? headline : failed.name();
+                    List<String> remedy = Stream.of(readable(failed.reason()), readable(failed.solution()))
+                            .filter(Objects::nonNull).toList();
+                    if (present(failed.connectorErrorCode())) {
+                        return failure(UpCmd.STAGE_PREFLIGHT, source.id(), failed.connectorErrorCode().trim(), message,
+                                Map.of("check", failed.name()), remedy);
+                    }
+                    Map<String, Object> params = Map.of("connector", declared.connector(), "detail", message);
+                    return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CONNECTOR_TEST_FAILED, message, params, remedy);
+                }
+                case ConnectionTestOutcome.Rejected rejected -> {
+                    return failure(UpCmd.STAGE_PREFLIGHT, source.id(), rejected.code(), rejected.message(), Map.of());
+                }
+                case ConnectionTestOutcome.TimedOut ignored -> {
+                    return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CliError.REQUEST_TIMED_OUT,
+                            Map.of("server", hostPort(session.landingNode())));
+                }
+                case ConnectionTestOutcome.Unreachable ignored -> {
+                    return unreachable(UpCmd.STAGE_PREFLIGHT, source.id());
+                }
+            }
+        }
+
+        /**
+         * Reads the workspace into drafts — references resolved from its {@code .env} first, then the
+         * environment — and parses each so the stages know what is a source, what is a pipeline, and
+         * what each reads. The server stays the parser of record: what it is sent is the draft text.
+         */
+        private int readWorkspace() {
+            List<LocalDraft> read;
+            try {
+                read = collectDrafts(workspace, DotEnv.layered(workspace, env));
+            } catch (IOException e) {
+                String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.WORKSPACE_UNREADABLE,
+                        Map.of("path", workspace.toString(), "reason", reason));
+            } catch (DslException e) {
+                return failure(UpCmd.STAGE_PREFLIGHT, e.source(), e.code(), e.args());
+            }
+            List<UpDraft> parsed = new ArrayList<>();
+            DslParser parser = new DslParser();
+            for (LocalDraft draft : read) {
+                try {
+                    parsed.add(new UpDraft(draft, parser.parse(draft.content())));
+                } catch (DslException e) {
+                    return failure(UpCmd.STAGE_PREFLIGHT, draft.source(), e.code(), e.args());
+                }
+            }
+            drafts = parsed;
+            if (pipelines().isEmpty()) {
+                return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.WORKSPACE_HAS_NO_PIPELINE,
+                        Map.of("path", workspace.toString()));
+            }
+            return Cli.EXIT_OK;
+        }
+
+        private List<UpDraft> sources() {
+            return drafts.stream().filter(d -> d.kind().equals("source")).toList();
+        }
+
+        private List<UpDraft> pipelines() {
+            return drafts.stream().filter(d -> d.kind().equals("pipeline")).toList();
+        }
+
+        /** What the workspace apply stage answers for: everything the apply-sources stage did not. */
+        private List<UpDraft> rest() {
+            return drafts.stream().filter(d -> !d.kind().equals("source")).toList();
+        }
+
+        /**
+         * What that stage sends, which is the whole workspace. An apply batch is one closure - every
+         * reference in it resolves inside it - so a batch of pipelines alone is refused: their
+         * {@code source:} references name resources that are stored but are not in the batch. The sources
+         * were applied a stage earlier so discovery could run, and they ride along here unchanged.
+         */
+        private List<UpDraft> workspaceBatch() {
+            return drafts;
+        }
+
+        /** Applies one batch as {@code apply} would, recording each item's change; an empty batch is skipped. */
+        private int apply(String stage, List<UpDraft> batch) {
+            return apply(stage, batch, batch);
+        }
+
+        /**
+         * The same, for a stage whose batch is wider than what the stage is about: {@code subjects} are
+         * the resources the stage answers for, and a refusal that names none of its own is reported
+         * against them rather than against everything the batch had to carry.
+         */
+        private int apply(String stage, List<UpDraft> batch, List<UpDraft> subjects) {
+            if (batch.isEmpty()) {
+                return Cli.EXIT_OK;
+            }
+            List<String> ids = subjects.stream().map(UpDraft::id).toList();
+            switch (applyDrafts(batch.stream().map(UpDraft::draft).toList())) {
+                case ApplyOutcome.Applied applied -> {
+                    for (ApplyOutcome.Item item : applied.items()) {
+                        // A resource an earlier stage already applied keeps that stage's verdict: it is
+                        // carried again only to close this batch's references, and the echo would report
+                        // the source that was just created as unchanged.
+                        if (changes.containsKey(item.id())) {
+                            continue;
+                        }
+                        changes.put(item.id(), item.change());
+                        if (item.change().equalsIgnoreCase(UNCHANGED)) {
+                            note(item.id(), "apply: unchanged");
+                        } else {
+                            nothingToDo = false;
+                        }
+                    }
+                    renderApplyWarnings(applied.warnings());
+                    return Cli.EXIT_OK;
+                }
+                case ApplyOutcome.Rejected rejected -> {
+                    return failure(stage, refusedId(rejected.params(), ids), rejected.code(), rejected.message(),
+                            rejected.params());
+                }
+                case ApplyOutcome.Unreachable ignored -> {
+                    return unreachable(stage, String.join(", ", ids));
+                }
+            }
+        }
+
+        /**
+         * Discovers each source the pipelines read, once each, in the order they are first read. A
+         * source the apply left unchanged is discovered only when the server holds no model for it yet:
+         * discovery runs against the source's database, and a converged workspace must not keep
+         * knocking on it.
+         */
+        private int discover() {
+            Map<String, UpDraft> byId = new LinkedHashMap<>();
+            for (UpDraft source : sources()) {
+                byId.put(source.id(), source);
+            }
+            List<String> referenced = new ArrayList<>();
+            for (UpDraft pipeline : pipelines()) {
+                for (SourceRef sourceRef : ((PipelineResource) pipeline.resource()).sources()) {
+                    String source = sourceRef.id();
+                    if (!referenced.contains(source)) {
+                        referenced.add(source);
+                    }
+                }
+            }
+            for (String id : referenced) {
+                SourceResource source = (SourceResource) byId.get(id).resource();
+                if (UNCHANGED.equalsIgnoreCase(changes.get(id))
+                        && readSchema(id) instanceof ConnectionSchemaOutcome.Found) {
+                    note(id, "discover: already discovered");
+                    continue;
+                }
+                switch (discoverSchemaFor(id, source.connector(), source.config())) {
+                    case ConnectionDiscoverSchemaOutcome.Discovered ignored -> nothingToDo = false;
+                    case ConnectionDiscoverSchemaOutcome.Rejected rejected -> {
+                        return failure(UpCmd.STAGE_DISCOVER, id, rejected.code(), rejected.message(), Map.of());
+                    }
+                    case ConnectionDiscoverSchemaOutcome.TimedOut ignored -> {
+                        return failure(UpCmd.STAGE_DISCOVER, id, CliError.REQUEST_TIMED_OUT,
+                                Map.of("server", hostPort(session.landingNode())));
+                    }
+                    case ConnectionDiscoverSchemaOutcome.Unreachable ignored -> {
+                        return unreachable(UpCmd.STAGE_DISCOVER, id);
+                    }
+                }
+            }
+            return Cli.EXIT_OK;
+        }
+
+        /**
+         * Starts every pipeline that is not already running. One the apply left unchanged is asked its
+         * status first and left alone when it is running; one that was created or updated is started
+         * without asking, since its running copy is not the one just applied. The state each line
+         * reports is read back after, from the server.
+         */
+        private int start() {
+            for (UpDraft pipeline : pipelines()) {
+                String id = pipeline.id();
+                if (UNCHANGED.equalsIgnoreCase(changes.get(id))
+                        && readStatus(id) instanceof StatusOutcome.Found found
+                        && RUNNING.equalsIgnoreCase(found.state())) {
+                    note(id, "start: already running");
+                    states.put(id, found.state().toLowerCase(Locale.ROOT));
+                    continue;
+                }
+                String target;
+                switch (lifecycleFor(id, "start")) {
+                    case LifecycleOutcome.Accepted accepted -> target = accepted.targetState();
+                    case LifecycleOutcome.Rejected rejected -> {
+                        return failure(UpCmd.STAGE_START, id, rejected.code(), rejected.message(), Map.of());
+                    }
+                    case LifecycleOutcome.Unreachable ignored -> {
+                        return unreachable(UpCmd.STAGE_START, id);
+                    }
+                }
+                nothingToDo = false;
+                // The state a start was accepted into is what the server will publish; until it has, the
+                // desired state is the truest word available.
+                String state = readStatus(id) instanceof StatusOutcome.Found found ? found.state() : target;
+                states.put(id, state.toLowerCase(Locale.ROOT));
+            }
+            return Cli.EXIT_OK;
+        }
+
+        private void note(String id, String note) {
+            notes.computeIfAbsent(id, ignored -> new ArrayList<>()).add(note);
+        }
+
+        private void summary() {
+            List<FirstRunSummary.UpPipeline> pipelines = pipelines().stream()
+                    .map(p -> new FirstRunSummary.UpPipeline(p.id(), states.get(p.id()),
+                            notes.getOrDefault(p.id(), List.of())))
+                    .toList();
+            List<FirstRunSummary.UpSource> sources = sources().stream()
+                    .map(s -> new FirstRunSummary.UpSource(s.id(), notes.getOrDefault(s.id(), List.of())))
+                    .toList();
+            PrintWriter out = commandLine.getOut();
+            switch (format) {
+                case TEXT -> FirstRunSummary.upText(out, workspace, pipelines, sources, nothingToDo);
+                case JSON -> out.println(JsonOut.write(FirstRunSummary.upEnvelope(workspace, pipelines, sources, nothingToDo)));
+                case YAML -> out.println(YamlOut.write(FirstRunSummary.upEnvelope(workspace, pipelines, sources, nothingToDo)));
+            }
+            out.flush();
+        }
+
+        /** The resource a refusal is about: the one it names, else the whole batch it was about. */
+        private static String refusedId(Map<String, Object> params, List<String> batch) {
+            Object named = params.get("id");
+            return named instanceof String id && !id.isBlank() ? id : String.join(", ", batch);
+        }
+
+        /** A stage that could not reach the server, after failover had its say. */
+        private int unreachable(String stage, String on) {
+            return failure(stage, on, CliError.CONNECT_FAILED, Map.of("seeds", hostPort(session.landingNode())));
+        }
+
+        /** A stage failed on a code raised on this side, rendered from the catalog. */
+        private int failure(String stage, String on, TapstateErrorCode code, Map<String, Object> args) {
+            return failure(stage, on, code.code(), MessageCatalog.bundled().render(code, args).message(), args);
+        }
+
+        /**
+         * Reports the stage that failed, on what, and why, then stops: the message says what is wrong
+         * and the catalog's remedy for that code — when it renders with the parameters in hand — says
+         * what to do next. The machine forms carry the same fields as every coded diagnostic, plus the
+         * stage and the resource.
+         */
+        private int failure(String stage, String on, String code, String message, Map<String, Object> params) {
+            return failure(stage, on, code, message, params, List.of());
+        }
+
+        /**
+         * The same report, with the next action supplied by the caller — a connector's own reason and
+         * remedy for a check it failed — ahead of the catalog's. The catalog is asked only when the
+         * caller had none: the connector was there and the catalog was not.
+         */
+        private int failure(String stage, String on, String code, String message, Map<String, Object> params,
+                List<String> nextAction) {
+            List<String> remedyLines = nextAction;
+            if (remedyLines.isEmpty()) {
+                String solution = MessageCatalog.bundled().render(code, params).solution();
+                remedyLines = present(solution) && !hasUnboundName(solution) ? List.of(solution) : List.of();
+            }
+            return reportUpFailure(format, stage, on, code, message, params, remedyLines);
+        }
+    }
+
+    /**
+     * One {@code up} failure, in whichever form the run asked for: the machine forms carry the same
+     * fields as every coded diagnostic plus the stage and the resource, and the text form names the
+     * stage first because that is what a reader searches the help for. Held outside {@code UpRun}
+     * because the stage that binds the workspace runs before there is an {@code UpRun} to report it,
+     * and a failure there owes a caller reading {@code -o json} the same envelope as any other.
+     */
+    private int reportUpFailure(OutputFormat format, String stage, String on, String code, String message,
+            Map<String, Object> params, List<String> remedyLines) {
+        if (format != OutputFormat.TEXT) {
+            Map<String, Object> document = new LinkedHashMap<>();
+            document.put("code", code);
+            document.put("severity", "ERROR");
+            document.put("message", message);
+            if (!remedyLines.isEmpty()) {
+                document.put("solution", String.join(" ", remedyLines));
+            }
+            if (!params.isEmpty()) {
+                document.put("params", new TreeMap<>(params));
+            }
+            document.put("stage", stage);
+            document.put("on", on);
+            PrintWriter out = commandLine.getOut();
+            out.println(format == OutputFormat.JSON ? JsonOut.write(document) : YamlOut.write(document));
+            out.flush();
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+        PrintWriter err = commandLine.getErr();
+        err.println(Ansi.AUTO.string("@|bold,red error:|@") + " up: " + stage + " failed on " + on
+                + ": " + code + " — " + message);
+        for (String line : remedyLines) {
+            err.println("  " + line);
+        }
+        err.println("  (" + session.versions() + ")");
+        err.flush();
+        return Cli.EXIT_DIAGNOSTIC;
+    }
+
+    // ---- the calls the online verbs share --------------------------------------------------------------
+    //
+    // Each is one server call behind failover, taking typed arguments and answering the sealed outcome
+    // untouched. The individual verb parses its words and renders the outcome around one of these; the
+    // composite verb chains them. There is one way to apply, discover, start or read a pipeline from
+    // here, whichever verb asked.
+
+    /** Applies one batch of drafts. */
+    private ApplyOutcome applyDrafts(List<LocalDraft> drafts) {
+        return withFailover(() -> controlPlane.apply(session.landingNode(), session.credential(), drafts),
+                o -> o instanceof ApplyOutcome.Unreachable);
+    }
+
+    /** Runs a schema discovery for a connection with the connector and settings it declares. */
+    private ConnectionDiscoverSchemaOutcome discoverSchemaFor(
+            String connectionId, String connector, Map<String, Object> config) {
+        return withFailover(() -> controlPlane.discoverSchema(
+                session.landingNode(), session.credential(), connectionId, connector, config),
+                o -> o instanceof ConnectionDiscoverSchemaOutcome.Unreachable);
+    }
+
+    /** Runs the connector's connection test for a connection with the connector and settings it declares. */
+    private ConnectionTestOutcome testConnectionFor(String connectionId, String connector, Map<String, Object> config) {
+        return withFailover(() -> controlPlane.test(
+                session.landingNode(), session.credential(), connectionId, connector, config),
+                o -> o instanceof ConnectionTestOutcome.Unreachable);
+    }
+
+    /** Reads a connection's stored discovered model, without running a discovery. */
+    private ConnectionSchemaOutcome readSchema(String connectionId) {
+        return withFailover(() -> controlPlane.schema(session.landingNode(), session.credential(), connectionId),
+                o -> o instanceof ConnectionSchemaOutcome.Unreachable);
+    }
+
+    /** Lists the connectors the server's catalog exposes. */
+    private ConnectorListOutcome listConnectors() {
+        return withFailover(() -> controlPlane.connectorList(session.landingNode(), session.credential()),
+                o -> o instanceof ConnectorListOutcome.Unreachable);
+    }
+
+    /** Issues one lifecycle verb to one pipeline. */
+    private LifecycleOutcome lifecycleFor(String pipelineId, String verb) {
+        return withFailover(() -> controlPlane.lifecycle(
+                        session.landingNode(), session.credential(), pipelineId, verb, null),
+                o -> o instanceof LifecycleOutcome.Unreachable);
+    }
+
+    /** Reads one pipeline's lifecycle state. */
+    /**
+     * Whether the node this session landed on answers its health probe. The one reachability check a
+     * composite stage may make, held here with the other shared calls so that no verb dials the
+     * control plane on its own.
+     */
+    private boolean landingAnswers() {
+        return controlPlane.isHealthy(session.landingNode());
+    }
+
+    private StatusOutcome readStatus(String pipelineId) {
+        return withFailover(() -> controlPlane.status(session.landingNode(), session.credential(), pipelineId),
+                o -> o instanceof StatusOutcome.Unreachable);
     }
 
     /**

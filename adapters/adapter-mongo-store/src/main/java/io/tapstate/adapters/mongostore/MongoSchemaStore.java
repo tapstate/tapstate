@@ -9,6 +9,9 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
+import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
+import java.math.BigDecimal;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -223,7 +226,9 @@ public final class MongoSchemaStore implements SchemaStore {
             fields.add(new Document("name", field.name())
                     .append("type", field.dataType())
                     .append("tapstateType", field.type().name())
-                    .append("unknownBecause", field.unknownBecause()));
+                    .append("unknownBecause", field.unknownBecause())
+                    .append("numericType", numericDocument(field.numericType()))
+                    .append("stringType", stringDocument(field.stringType())));
         }
         List<Document> indexes = new ArrayList<>();
         for (SourceIndex index : table.indexes()) {
@@ -241,11 +246,41 @@ public final class MongoSchemaStore implements SchemaStore {
                 .append("approximateRowCount", table.approximateRowCount());
     }
 
-    /**
-     * The resolved type a stored field carries, or unknown when the document predates the resolution or
-     * names a type this build does not know. An unreadable type is the absence of one, never a refusal of
-     * the whole read: the model is a derived observation that re-discovery replaces.
-     */
+    /** Nullable descriptor attributes retain the distinction between undeclared and zero. */
+    private static Document stringDocument(StringType string) {
+        return string == null ? null : new Document("bytes", string.bytes()).append("fixed", string.fixed())
+                .append("doubleBytes", string.doubleBytes()).append("defaultValue", string.defaultValue())
+                .append("byteRatio", string.byteRatio());
+    }
+
+    private static StringType stringType(Document field) {
+        Document string = field.get("stringType", Document.class);
+        return string == null ? null : new StringType(string.getLong("bytes"), string.getBoolean("fixed"),
+                string.getBoolean("doubleBytes"), string.getLong("defaultValue"), string.getInteger("byteRatio"));
+    }
+
+    private static Document numericDocument(NumericType number) {
+        return number == null ? null : new Document("bit", number.bit()).append("fixed", number.fixed())
+                .append("unsigned", number.unsigned()).append("zerofill", number.zerofill())
+                .append("minValue", number.minValue() == null ? null : number.minValue().toString())
+                .append("maxValue", number.maxValue() == null ? null : number.maxValue().toString())
+                .append("precision", number.precision()).append("scale", number.scale());
+    }
+
+    private static NumericType numericType(Document field) {
+        Document number = field.get("numericType", Document.class);
+        if (number == null) {
+            return null;
+        }
+        return new NumericType(number.getInteger("bit"), number.getBoolean("fixed"), number.getBoolean("unsigned"),
+                number.getBoolean("zerofill"), decimal(number.getString("minValue")),
+                decimal(number.getString("maxValue")), number.getInteger("precision"), number.getInteger("scale"));
+    }
+
+    private static BigDecimal decimal(String value) {
+        return value == null ? null : new BigDecimal(value);
+    }
+
     /**
      * One stored column read back, with the reason it has no resolved type where it has none.
      *
@@ -274,13 +309,13 @@ public final class MongoSchemaStore implements SchemaStore {
                     "the stored type '" + spelling + "' is not a tapstate type in this build");
         }
         if (type != TapstateType.UNKNOWN) {
-            return new SourceField(name, declared, type);
+            return new SourceField(name, declared, type, null, numericType(stored), stringType(stored));
         }
         String because = stored.getString("unknownBecause");
         return new SourceField(name, declared, TapstateType.UNKNOWN,
                 because == null || because.isBlank()
                         ? "the stored record says the type is unknown and does not say which unknown"
-                        : because);
+                        : because, numericType(stored), stringType(stored));
     }
 
     /** The type a stored spelling names, or null where this build has no such type. */
@@ -328,7 +363,11 @@ public final class MongoSchemaStore implements SchemaStore {
             if (fieldName == null) {
                 throw unreadable(id);
             }
-            fields.add(field(fieldName, field));
+            try {
+                fields.add(field(fieldName, field));
+            } catch (IllegalArgumentException | ClassCastException error) {
+                throw unreadable(id);
+            }
         }
         List<SourceIndex> indexes = new ArrayList<>();
         for (Document index : documentList(table.get("indexes"), id)) {

@@ -398,6 +398,21 @@ else
   failed=$((failed + 1))
 fi
 
+# Both checkout properties must reach both assembler runs, and both build roots must survive.
+fresh_tree
+mkdir -p "$scratch/enterprise/connectors/hazelcast-connector"
+expect "two checkouts refresh in one invocation" 0 "step 4 (derivation agreement) ok" \
+  --connectors "$scratch/connectors" --connectors "$scratch/enterprise"
+if [ "$(grep -cF -- "-Dtapstate.catalog.connectors=$scratch/connectors -Dtapstate.catalog.connectors.1=$scratch/enterprise" "$scratch/tree/.mvn-args")" = 2 ] \
+  && grep -qF -- "--checkout $scratch/connectors --checkout $scratch/enterprise" "$scratch/tree/.stub-build" \
+  && grep -qF -- "hazelcast=connectors/hazelcast-connector" "$scratch/tree/.stub-build"; then
+  printf '  ok    both checkouts reach manifest, assembly, and build module resolution\n'
+  passed=$((passed + 1))
+else
+  printf '  FAIL  both checkouts must reach manifest, assembly, and build module resolution\n'
+  failed=$((failed + 1))
+fi
+
 help_prints_no_shell "--help prints documentation, not source" bash "$driver"
 
 # --- the two lanes that open catalog pull requests -----------------------------------------------

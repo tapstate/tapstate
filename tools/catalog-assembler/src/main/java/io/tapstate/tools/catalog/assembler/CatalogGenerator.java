@@ -27,17 +27,25 @@ final class CatalogGenerator {
 
     static GeneratedCatalog generate(Path connectorsRoot, String specSha, String capabilitySha,
                                      Map<String, Set<String>> bitmap) {
-        WalkResult walk = ConnectorWalker.walk(connectorsRoot);
-        // Read once for the whole run: it is the same handful of files every time, and a run that
-        // cannot read them must fail before it writes a snapshot rather than midway through one.
-        Assembly assembly = CatalogAssembler.assemble(walk, specSha, capabilitySha, bitmap,
-                ConnectorOverlay.load(), relativePath -> read(connectorsRoot.resolve(relativePath)));
+        return generate(List.of(connectorsRoot), specSha, capabilitySha, bitmap);
+    }
+
+    static GeneratedCatalog generate(List<Path> roots, String specSha, String capabilitySha,
+                                     Map<String, Set<String>> bitmap) {
+        List<Assembly> assemblies = new ArrayList<>();
+        ConnectorOverlay overlay = ConnectorOverlay.load();
+        for (Path root : roots) {
+            assemblies.add(CatalogAssembler.assemble(ConnectorWalker.walk(root), specSha, capabilitySha,
+                    bitmap, overlay, relativePath -> read(root.resolve(relativePath))));
+        }
+        List<ConnectorCatalogEntry> ordered = assemblies.stream().flatMap(value -> value.entries().stream())
+                .sorted(java.util.Comparator.comparing(ConnectorCatalogEntry::id)).toList();
 
         JsonWriter writer = new JsonWriter();
         List<String> ids = new ArrayList<>();
         Map<String, String> seenLowercase = new LinkedHashMap<>();
         Map<String, String> entries = new LinkedHashMap<>();
-        for (ConnectorCatalogEntry entry : assembly.entries()) {
+        for (ConnectorCatalogEntry entry : ordered) {
             // Entry files are <id>.json, which collapse on a case-insensitive filesystem; reject ids
             // that differ only in case so one entry is never silently overwritten by another.
             String prior = seenLowercase.put(entry.id().toLowerCase(java.util.Locale.ROOT), entry.id());
@@ -51,13 +59,35 @@ final class CatalogGenerator {
         // The index carries the two revisions once for the whole catalog. Per entry they were the
         // same value copied once per connector, so a refresh that changed one connector rewrote every
         // file - and the spec-face refresh opens a pull request daily.
+        String index = index(specSha, capabilitySha, ids);
+        List<IngestReport> reports = assemblies.stream().map(Assembly::report).toList();
+        IngestReport report = new IngestReport(specSha, capabilitySha,
+                collect(reports, IngestReport::ingestedIds),
+                collect(reports, IngestReport::unclassified),
+                collect(reports, IngestReport::notDerived),
+                collect(reports, IngestReport::notBuilt),
+                collect(reports, IngestReport::unverifiedModes),
+                collect(reports, IngestReport::overlayAlone),
+                collect(reports, IngestReport::overlayDivergences),
+                collect(reports, IngestReport::overlayNotDerivable),
+                collect(reports, IngestReport::sinkDefaultedNoSignal),
+                collect(reports, IngestReport::unknownTypeFields),
+                collect(reports, IngestReport::unresolvedLabelRefs),
+                collect(reports, IngestReport::exemptions));
+        return new GeneratedCatalog(index, entries, ReportRenderer.render(report));
+    }
+
+    static String index(String specSha, String capabilitySha, List<String> ids) {
         Map<String, Object> head = new LinkedHashMap<>();
         head.put("specSha", specSha);
         head.put("capabilitySha", capabilitySha);
         head.put("entries", new ArrayList<Object>(ids));
-        String index = writer.write(head);
-        String report = ReportRenderer.render(assembly.report());
-        return new GeneratedCatalog(index, entries, report);
+        return new JsonWriter().write(head);
+    }
+
+    private static <T> List<T> collect(List<IngestReport> reports,
+                                      java.util.function.Function<IngestReport, List<T>> values) {
+        return reports.stream().flatMap(report -> values.apply(report).stream()).toList();
     }
 
     private static String read(Path file) {

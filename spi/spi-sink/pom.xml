@@ -17,6 +17,12 @@
     (rule R2: the port depends on the core ring only).</description>
 
   <dependencies>
+    <!-- Portable inferred column types are core vocabulary (rule R2: core only). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-common</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The standard event envelope is the currency the write side accepts (rule R2: core only). -->
     <dependency>
       <groupId>io.tapstate</groupId>

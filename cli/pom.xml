@@ -248,10 +248,12 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
 
       The bundled resources read at runtime via getResourceAsStream are not reachable in a native
       image unless declared: the connector catalog (/catalog/*.json), the grammar JSON Schema
-      (/schema/*.json) and the message catalog (/messages/*.yml). They are declared here as
-      IncludeResources globs. Reflection config for the picocli command tree comes from the
-      picocli-codegen processor (see the compiler plugin above); JLine / CEL / snakeyaml config
-      comes from the GraalVM reachability-metadata repository.
+      (/schema/*.json), the message catalog (/messages/*.yml) and the local development stack's
+      compose file (/local-stack/*.yml), demo recipes (/demo/*.tap.yml) and blank recipes
+      (/blank/*.tap.yml). They are declared here as IncludeResources globs.
+      Reflection config for the picocli command tree comes from the picocli-codegen processor
+      (see the compiler plugin above); JLine / CEL / snakeyaml config comes from the GraalVM
+      reachability-metadata repository.
     -->
     <profile>
       <id>native</id>
@@ -275,10 +277,19 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
               <mainClass>${mainClass}</mainClass>
               <buildArgs>
                 <buildArg>--no-fallback</buildArg>
+                <!-- The CPU this binary may assume. Left alone, native-image compiles for x86-64-v3 on
+                     AMD64, which requires AVX, AVX2, BMI1, BMI2 and FMA, and an image that needs them
+                     refuses to start on a CPU that does not have them. `compatibility` is the lowest
+                     common denominator on every architecture, so this one flag stays correct for the
+                     arm64 builds too; install-smoke.sh checks the native profile still names it. -->
+                <buildArg>-march=compatibility</buildArg>
                 <!-- bundled resources read via getResourceAsStream, declared so the image keeps them -->
                 <buildArg>-H:IncludeResources=catalog/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=schema/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=messages/.*\.yml</buildArg>
+                <buildArg>-H:IncludeResources=local-stack/.*\.yml</buildArg>
+                <buildArg>-H:IncludeResources=demo/.*\.tap\.yml</buildArg>
+                <buildArg>-H:IncludeResources=blank/.*\.tap\.yml</buildArg>
               </buildArgs>
               <metadataRepository>
                 <enabled>true</enabled>

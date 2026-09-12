@@ -216,6 +216,24 @@
       ],
       "additionalProperties": false
     },
+    "OnFullLoad": {
+      "type": "string",
+      "description": "Treatment of existing target rows before a new full load; recovery and CDC-only runs never clear rows.",
+      "oneOf": [
+        {
+          "const": "clear",
+          "description": "Clear existing target rows before a new full load."
+        },
+        {
+          "const": "append",
+          "description": "Keep existing target rows and write the full load using the configured write mode."
+        },
+        {
+          "const": "fail",
+          "description": "Refuse a new full load when the target table is not empty."
+        }
+      ]
+    },
     "PipelineResource": {
       "type": "object",
       "description": "Composing runnable unit that references pre-created sources by id and wires transforms, view and serve into a task.",
@@ -920,6 +938,11 @@
           "description": "Policy controlling how schema changes are applied to the target store.",
           "$ref": "#/$defs/DdlPolicy",
           "default": "fail"
+        },
+        "on_full_load": {
+          "description": "Treatment of existing target rows before a new full load; resume, recovery and CDC-only never clear rows.",
+          "$ref": "#/$defs/OnFullLoad",
+          "default": "append"
         }
       },
       "required": [

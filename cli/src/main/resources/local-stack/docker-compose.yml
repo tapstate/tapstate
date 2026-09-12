@@ -1,0 +1,87 @@
+# The local development stack the guided first run starts: the server and its managed store, and
+# nothing else. The CLI writes this file and rewrites it on every start, so edits do not survive;
+# the .env beside it is written once and kept. No sample data and no sample databases live here -
+# that is what the demo is for.
+#
+# Single-node, for development: the server keeps pipeline position in memory, so a restart
+# replays rather than resumes.
+services:
+  mongo:
+    image: mongo:7.0
+    # A single-member replica set rather than a standalone: the store commits a batch as one
+    # transaction, and MongoDB offers transactions only on a replica set.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      # Initiate the set on first boot, then hold the check red until a primary has actually been
+      # elected: rs.initiate() returns before the election completes. The member is registered
+      # under the service name, the address every client inside this network dials it by.
+      test: >
+        mongosh --quiet --eval
+        "try { rs.status().ok } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }) };
+         if (!db.hello().isWritablePrimary) { quit(1) }"
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 20s
+    volumes:
+      # A named volume, so registered connectors and applied artifacts outlive `down`. Only
+      # `down -v` discards them.
+      - tapstate-local-mongo:/data/db
+
+  server:
+    # The same version as the CLI that wrote this file: the two are installed by different paths
+    # and would drift silently otherwise.
+    image: ghcr.io/tapstate/tapstate:@TAPSTATE_VERSION@
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      # Addressed directly rather than through topology discovery: the set has exactly one
+      # member, and its advertised address is not resolvable from outside the set's own network.
+      TAPSTATE_STORE_MONGO_URI: mongodb://mongo:27017/tapstate?directConnection=true
+      # The connector jars staged in ./connectors are registered once at boot, through the same
+      # register-if-absent path `tapstate register` uploads to. An absolute path, so it stays
+      # fixed to the mount below whatever the image's working directory is.
+      TAPSTATE_CONNECTORS_SEED_DIR: /var/lib/tapstate/connectors
+    volumes:
+      - ./connectors:/var/lib/tapstate/connectors:ro
+    ports:
+      # Loopback only: an unauthenticated first run must not be reachable from other machines.
+      - "127.0.0.1:8080:8080"
+    # The orderly stop closes the cluster member and the store client before halting, which
+    # Docker's default 10s grace can cut short.
+    stop_grace_period: 30s
+
+  # Creates the first administrator, then exits. The endpoint accepts loopback callers only, so
+  # this container shares the server's network namespace - its loopback is the server's. The
+  # credentials come from the .env beside this file, and there is no default: a stack cannot
+  # come up with a password nobody chose.
+  bootstrap:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      server:
+        condition: service_healthy
+    network_mode: "service:server"
+    restart: "no"
+    environment:
+      TAPSTATE_ADMIN_USER: ${TAPSTATE_ADMIN_USER:?set in .env}
+      TAPSTATE_ADMIN_PASSWORD: ${TAPSTATE_ADMIN_PASSWORD:?set in .env}
+    entrypoint: ["/bin/sh", "-c"]
+    # The doubled $$ keeps the values out of Compose interpolation so the container's own shell
+    # reads them. A fresh store answers 204 and a bootstrapped one 409; both mean an admin now
+    # exists, so a re-run never fails here.
+    command:
+      - |
+        set -eu
+        code=$$(curl -s -o /dev/null -w '%{http_code}' \
+          -X POST http://127.0.0.1:8080/auth/bootstrap \
+          -H 'Content-Type: application/json' \
+          -d "{\"username\":\"$${TAPSTATE_ADMIN_USER}\",\"password\":\"$${TAPSTATE_ADMIN_PASSWORD}\"}")
+        case "$$code" in
+          204) echo "bootstrap: first admin created" ;;
+          409) echo "bootstrap: an admin already exists, nothing to do" ;;
+          *)   echo "bootstrap: failed with HTTP $$code" >&2; exit 1 ;;
+        esac
+
+volumes:
+  tapstate-local-mongo:

@@ -14,7 +14,9 @@ import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
+import io.tapstate.control.core.DocumentKeyAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
+import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactQueryService;
@@ -44,6 +46,7 @@ import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DerivedSchemas;
+import io.tapstate.control.core.SourceConnectionResolver;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
@@ -254,8 +257,15 @@ class ControlPlaneConfiguration {
         // Applying re-derives every pipeline in the batch, whether or not it was written: a source that
         // moved under a pipeline nobody edited leaves that pipeline's content hash byte-identical, so
         // the write is skipped in exactly the case the model most needs refreshing.
+        // Beside the sizing, the columns the batch would write: a column whose own name holds a dot
+        // lands in a document store as a key that store reads as a path, so the ordinary read for it
+        // answers nothing and no index can be declared over it. Nothing downstream of apply says this,
+        // and the discovered model already holds the name, so this is the one moment it can be said.
         return new ApplyService(connectorCatalogView::merged, artifactStore, auditGate, schemaStore,
-                new NestSizingAdvisories(settings.entriesHeldInMemory()), derivation, livePipelines);
+                PlanAdvisories.all(
+                        new NestSizingAdvisories(settings.entriesHeldInMemory()),
+                        new DocumentKeyAdvisories()),
+                derivation, livePipelines);
     }
 
     @Bean
@@ -406,8 +416,8 @@ class ControlPlaneConfiguration {
     @Bean
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
-            ConnectorConfigValidator configValidator) {
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator);
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections);
     }
 
     @Bean
@@ -436,8 +446,15 @@ class ControlPlaneConfiguration {
     @Bean
     SchemaDiscoveryService schemaDiscoveryService(
             SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock,
-            ConnectorConfigValidator configValidator) {
-        return new SchemaDiscoveryService(probe, schemaStore, auditGate, clock, configValidator);
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        return new SchemaDiscoveryService(
+                probe, schemaStore, auditGate, clock, configValidator, sourceConnections);
+    }
+
+    @Bean
+    SourceConnectionResolver sourceConnectionResolver(
+            ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView) {
+        return new SourceConnectionResolver(artifactStore, connectorCatalogView::merged);
     }
 
     @Bean

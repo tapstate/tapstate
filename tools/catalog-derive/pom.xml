@@ -30,6 +30,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>21</maven.compiler.release>
     <pdk-api.version>2.0.8-SNAPSHOT</pdk-api.version>
+    <pdk-entity.version>2.0.9-SNAPSHOT</pdk-entity.version>
     <pdk-runner.version>2.8-SNAPSHOT</pdk-runner.version>
     <junit.version>5.11.4</junit.version>
     <assertj.version>3.26.3</assertj.version>
@@ -45,6 +46,12 @@
       <groupId>io.tapdata</groupId>
       <artifactId>tapdata-pdk-api</artifactId>
       <version>${pdk-api.version}</version>
+    </dependency>
+    <!-- Match the host's compatible entity companion when loading real connector classes. -->
+    <dependency>
+      <groupId>io.tapdata</groupId>
+      <artifactId>tapdata-api</artifactId>
+      <version>${pdk-entity.version}</version>
     </dependency>
     <!-- pdk-runner provides TapRuntime, which the PDK's InstanceFactory bootstraps reflectively
          when a connector's base class initializes. Connector dist jars are thin plugins (they do

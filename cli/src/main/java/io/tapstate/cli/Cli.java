@@ -165,12 +165,13 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.accept-derived-schema", "derived-schema"));
 
     /**
-     * Verbs that chain several registered operations rather than projecting one ({@code run} is apply
-     * then start), and are not implemented yet. They are registered so they stay discoverable, but they
-     * report that they do not exist yet — not that a connection is missing, which would be false in both
-     * states: connecting does not implement them.
+     * Verbs that chain several registered operations rather than projecting one, and are not
+     * implemented yet. They are registered so they stay discoverable, but they report that they do not
+     * exist yet — not that a connection is missing, which would be false in both states: connecting
+     * does not implement them. A composite that ships leaves this list for {@link #COMPOSITE_VERBS}
+     * under its final name; the placeholder is not kept beside it.
      */
-    static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("run", "export", "diff", "edit");
+    static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("export", "diff", "edit");
 
     /**
      * Verbs this face composes out of registered operations rather than projecting one. They need a
@@ -179,7 +180,7 @@ public final class Cli implements Runnable {
      * operation of its own to be checked against, and putting one there to satisfy the check is exactly
      * the thing composing it was meant to avoid.
      */
-    static final List<String> COMPOSITE_VERBS = List.of("restart");
+    static final List<String> COMPOSITE_VERBS = List.of("up", "restart");
 
     /**
      * The live views over a collection. They project no registered operation and never will: each is a
@@ -285,10 +286,13 @@ public final class Cli implements Runnable {
                     "Watch one row in place until Ctrl-C; needs a terminal.")),
             Map.entry("tail", new VerbHelp("<source>.<collection> [<filter>]",
                     "Follow a whole collection's changes until Ctrl-C; pipes fine.")),
+            // The composite that ships. The operands are the flags it takes, since it names no resource:
+            // the bound workspace is the operand.
+            Map.entry("up", new VerbHelp(
+                    "[--server <url>] [-u <name>] [--start-local] [--yes] [-o text|json|yaml] [-w <dir>]",
+                    "Bring the bound workspace to running: apply, discover, apply, start.")),
             // The reserved verbs. Each says what it is reserved for: "not implemented yet" answers the
             // question only once the reader knows what was going to be there.
-            Map.entry("run", new VerbHelp("[<path>]",
-                    "Apply a workspace and start its pipelines in one step.")),
             Map.entry("export", new VerbHelp("<id>",
                     "Write a stored artifact back out as canonical YAML.")),
             Map.entry("diff", new VerbHelp("<file>",
@@ -357,11 +361,14 @@ public final class Cli implements Runnable {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
         for (String verb : COMPOSITE_VERBS) {
-            commandLine.addSubcommand(verb, new ConnectedVerb());
+            if (!verb.equals("up")) {
+                commandLine.addSubcommand(verb, new ConnectedVerb());
+            }
         }
         for (String verb : UNIMPLEMENTED_COMPOSITE_VERBS) {
             commandLine.addSubcommand(verb, new UnimplementedVerb());
         }
+        commandLine.addSubcommand(new UpCmd());
         // The version belongs to the binary, not to any one verb, so every verb reports the same one.
         // Set centrally rather than annotated per class: the standard help mixin registers -V wherever
         // it is applied, and a spec with no version answers that advertised option with an empty line
@@ -514,9 +521,8 @@ public final class Cli implements Runnable {
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, BooleanSupplier terminal) {
         Path home = Path.of(System.getProperty("user.home"));
-        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
-        AuthService authService = new AuthService(
-                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        ContextResolver resolver = HomeStores.resolver(home, launch::environment);
+        AuthService authService = HomeStores.auth(home, controlPlane, java.time.Clock.systemUTC());
         return runSession(launch, controlPlane, prompter, resolver, authService, terminal);
     }
 
@@ -529,10 +535,33 @@ public final class Cli implements Runnable {
     private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                                   Supplier<Prompter> prompter, ContextResolver resolver,
                                   AuthService authService, BooleanSupplier terminal) {
+        return runSession(launch, controlPlane, prompter, resolver, authService, terminal, newCommandLine(),
+                Path.of(System.getProperty("user.home")));
+    }
+
+    /** The injected command table keeps one-shot output observable without redirecting process streams. */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver,
+                          AuthService authService, CommandLine commandLine) {
+        return runSession(launch, controlPlane, prompter, resolver, authService,
+                () -> System.console() != null, commandLine, Path.of(System.getProperty("user.home")));
+    }
+
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver,
+                          AuthService authService, CommandLine commandLine, Path home) {
+        return runSession(launch, controlPlane, prompter, resolver, authService,
+                () -> System.console() != null, commandLine, home);
+    }
+
+    private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                                  Supplier<Prompter> prompter, ContextResolver resolver,
+                                  AuthService authService, BooleanSupplier terminal, CommandLine commandLine,
+                                  Path home) {
         Prompter oneShotPrompter = null;
         try {
             if (launch.hasConflictingTargets()) {
-                Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
+                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
                 return EXIT_USAGE;
             }
             if (launch.isOneShot() && launch.command().size() >= 2
@@ -546,9 +575,17 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
-            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
+            // `up` asks which server the first time a workspace is brought up, so a one-shot run of it at
+            // a terminal needs a prompter too; without a terminal it asks nothing and refuses instead.
+            if (launch.isOneShot() && !launch.command().isEmpty()
+                    && launch.command().get(0).equals("up")
+                    && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
+            Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
-                    new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
+                    HomeStores.contexts(home));
+            repl.homeDir = home;
             repl.terminalCheck(terminal);
             repl.prompterSource(prompter);
             String machineToken = launch.machineToken();

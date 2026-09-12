@@ -21,12 +21,14 @@ code and is read by running it.
 
 | Start here | |
 |---|---|
-| [Quickstart](quickstart-online.md) | Bring up the stack and run a real MySQL to MongoDB sync, snapshot then CDC. |
+| [First run](first-run/) | The guided path: install the CLI, answer a few questions, and bring a workspace to running - the contract every step is held to. |
+| [Quickstart](quickstart-online.md) | The full demo (`install.tapstate.dev/demo`): sample databases, the server, and a live object assembled from two engines - and the same flow by hand, verb by verb, as the reference for what the guided path does. |
 | [Running on your own databases](running-on-your-own-databases.md) | Run the server as a process on your machine, against a MySQL and a MongoDB you already have. |
 | [Tutorials](tutorials/) | Worked scenarios, each with its own sample data, run end to end. |
 
 | Features | |
 |---|---|
+| [Join](join/) | SQL subset, dimension-key uniqueness, output keys, and usage requirements. |
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |
 | [Connectors](connectors/) | How the bundled connector catalog is generated, what has to be rebuilt when something moves upstream, and how this repository declares what a connector can do. |
 
