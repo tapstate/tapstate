@@ -59,7 +59,14 @@ public final class SnapshotBuffer {
      */
     public List<Envelope> drain(String ringName) {
         Objects.requireNonNull(ringName, "ringName");
-        Queue<Envelope> rows = byRing.remove(ringName);
-        return rows == null ? List.of() : new ArrayList<>(rows);
+        // Keep the queue attached: an append may already hold it but not yet have inserted its row.
+        Queue<Envelope> rows = byRing.get(ringName);
+        if (rows == null) return List.of();
+        List<Envelope> drained = new ArrayList<>();
+        Envelope row;
+        while ((row = rows.poll()) != null) {
+            drained.add(row);
+        }
+        return drained;
     }
 }
