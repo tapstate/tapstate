@@ -846,8 +846,8 @@ final class Workbench {
                     case ID -> updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(),
                             source.mode(), source.tables(), deleteLastCodePoint(source.id()), Optional.empty(), false,
                             Optional.empty());
-                    case CONFIG -> updateSourceConfig(source, source.selectedIndex(), sourceConfigText(source,
-                            deleteLastCodePoint(sourceConfigText(source, source.selectedIndex()))), Optional.empty());
+                    case CONFIG -> updateSourceConfig(source, source.selectedIndex(),
+                            deleteLastCodePoint(sourceConfigText(source, source.selectedIndex())), Optional.empty());
                     default -> true;
                 };
             }
@@ -1050,8 +1050,10 @@ final class Workbench {
             return source.catalog().connectors().stream()
                     .filter(connector -> connector.id().equals(source.connector()))
                     .findFirst().map(WorkbenchActionGateway.SourceConnector::configFields).orElse(List.of()).stream()
-                    .filter(field -> field.visibleWhen().map(visibility -> visibility.equalsAnyOf().contains(
-                            source.config().get(visibility.controllingField()))).orElse(true))
+                    .filter(field -> field.visibleWhen().map(visibility -> {
+                        String controller = source.config().get(visibility.controllingField());
+                        return controller != null && visibility.equalsAnyOf().contains(controller);
+                    }).orElse(true))
                     .toList();
         }
 

@@ -478,8 +478,10 @@ final class WorkbenchRenderer {
         return source.catalog().connectors().stream()
                 .filter(connector -> connector.id().equals(source.connector()))
                 .findFirst().map(WorkbenchActionGateway.SourceConnector::configFields).orElse(List.of()).stream()
-                .filter(field -> field.visibleWhen().map(visibility -> visibility.equalsAnyOf().contains(
-                        source.config().get(visibility.controllingField()))).orElse(true))
+                .filter(field -> field.visibleWhen().map(visibility -> {
+                    String controller = source.config().get(visibility.controllingField());
+                    return controller != null && visibility.equalsAnyOf().contains(controller);
+                }).orElse(true))
                 .toList();
     }
 
