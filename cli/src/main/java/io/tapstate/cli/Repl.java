@@ -3,9 +3,11 @@ package io.tapstate.cli;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
+import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.schema.SchemaNavigator;
 import io.tapstate.messages.MessageCatalog;
 import org.jline.reader.EndOfFileException;
@@ -314,7 +316,56 @@ final class Repl {
                     return new FileWriteResult.Unavailable();
                 }
             }
+
+            @Override
+            public SourceCatalogResult sourceCatalog() {
+                try {
+                    TapstateCatalog catalog = TapstateCatalog.load();
+                    List<SourceConnector> connectors = SourceScaffold.connectors(catalog).stream()
+                            .map(id -> new SourceConnector(id, SourceScaffold.modes(catalog.byId(id))))
+                            .toList();
+                    return new SourceCatalogResult.Ready(new SourceCatalog(connectors));
+                } catch (RuntimeException unavailable) {
+                    return new SourceCatalogResult.Unavailable();
+                }
+            }
+
+            @Override
+            public SourcePreviewResult previewSource(SourceDraft draft) {
+                try {
+                    return new SourcePreviewResult.Ready(canonicalSource(draft));
+                } catch (RuntimeException rejected) {
+                    return new SourcePreviewResult.Rejected("Source draft is not valid");
+                }
+            }
+
+            @Override
+            public SourceCreateResult createSource(SourceDraft draft) {
+                try {
+                    String yaml = canonicalSource(draft);
+                    Path relativePath = Path.of("source", draft.id() + ".tap.yml");
+                    Path target = resolveWorkbenchNewFile(relativePath);
+                    try {
+                        Files.writeString(target, yaml, java.nio.file.StandardOpenOption.CREATE_NEW);
+                    } catch (java.nio.file.FileAlreadyExistsException exists) {
+                        return new SourceCreateResult.Exists(relativePath);
+                    }
+                    return new SourceCreateResult.Created(relativePath, yaml);
+                } catch (IllegalArgumentException rejected) {
+                    return new SourceCreateResult.Rejected("Source draft is not valid");
+                } catch (IOException unavailable) {
+                    return new SourceCreateResult.Unavailable();
+                }
+            }
         };
+    }
+
+    private String canonicalSource(WorkbenchActionGateway.SourceDraft draft) {
+        TapstateCatalog catalog = TapstateCatalog.load();
+        var mode = SourceScaffold.resolveMode(catalog, draft.connector(), draft.mode());
+        SourceResource source = SourceScaffold.build(catalog, draft.connector(), draft.mode(),
+                SourceScaffold.tableRefs(draft.tables(), mode), draft.id(), Map.of());
+        return new CanonicalWriter().write(source);
     }
 
     private Path resolveWorkbenchFile(Path relativePath) throws IOException {
@@ -329,6 +380,22 @@ final class Repl {
             throw new IOException("Workspace file path is outside the workspace");
         }
         return file;
+    }
+
+    private Path resolveWorkbenchNewFile(Path relativePath) throws IOException {
+        Objects.requireNonNull(relativePath, "relativePath");
+        Path normalized = relativePath.normalize();
+        if (normalized.isAbsolute() || normalized.startsWith("..") || normalized.getNameCount() != 2) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        Path root = workdir.toRealPath();
+        Path parent = root.resolve(normalized.getParent());
+        Files.createDirectories(parent);
+        Path realParent = parent.toRealPath();
+        if (!realParent.startsWith(root)) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        return realParent.resolve(normalized.getFileName());
     }
 
     private synchronized List<WorkbenchActionGateway.ContextOption> workbenchContextOptions() {

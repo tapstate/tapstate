@@ -1,7 +1,6 @@
 package io.tapstate.cli;
 
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
-import io.tapstate.core.catalog.OfficialConnectors;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
@@ -19,9 +18,6 @@ import java.util.Map;
  */
 final class SourceWizard {
 
-    /** The sentinel mode choice meaning "no read mode" — a pure connection supplier / sink target. */
-    private static final String NO_MODE = "(none)";
-
     private final Prompter prompter;
     private final TapstateCatalog catalog;
 
@@ -31,13 +27,14 @@ final class SourceWizard {
     }
 
     SourceResource run() {
-        String connector = prompter.choose("Which connector?", OfficialConnectors.presentIn(catalog));
+        String connector = prompter.choose("Which connector?", SourceScaffold.connectors(catalog));
         ConnectorCatalogEntry entry = catalog.byId(connector);
         SourceMode mode = askMode(entry);
         List<TableRef> tables = askTables(mode);
         String id = askId(connector);
         Map<String, Object> config = new ConfigPrompter().collect(entry.config(), prompter);
-        return new SourceResource(id, null, connector, config, mode, tables, null, null, null);
+        return SourceScaffold.build(catalog, connector,
+                mode == null ? SourceScaffold.NO_MODE : mode.yaml(), tables, id, config);
     }
 
     /**
@@ -72,7 +69,7 @@ final class SourceWizard {
     }
 
     private String askId(String connector) {
-        String suggested = "src_" + connector;
+        String suggested = SourceScaffold.suggestedId(connector);
         String answer = prompter.ask("Resource id", suggested);
         return answer == null || answer.isBlank() ? suggested : answer;
     }
@@ -81,10 +78,8 @@ final class SourceWizard {
         if (entry.modes().isEmpty()) {
             return null; // no capability signal — a connection supplier, no read mode
         }
-        List<String> options = new ArrayList<>(entry.modes().stream().map(SourceMode::yaml).toList());
-        options.add(NO_MODE);
-        String chosen = prompter.choose("Read mode", options);
-        if (NO_MODE.equals(chosen)) {
+        String chosen = prompter.choose("Read mode", SourceScaffold.modes(entry));
+        if (SourceScaffold.NO_MODE.equals(chosen)) {
             return null;
         }
         for (SourceMode m : entry.modes()) {

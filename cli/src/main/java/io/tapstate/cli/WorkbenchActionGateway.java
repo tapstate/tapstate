@@ -29,6 +29,18 @@ interface WorkbenchActionGateway {
         return new FileWriteResult.Unavailable();
     }
 
+    default SourceCatalogResult sourceCatalog() {
+        return new SourceCatalogResult.Unavailable();
+    }
+
+    default SourcePreviewResult previewSource(SourceDraft draft) {
+        return new SourcePreviewResult.Unavailable();
+    }
+
+    default SourceCreateResult createSource(SourceDraft draft) {
+        return new SourceCreateResult.Unavailable();
+    }
+
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
             Objects.requireNonNull(name, "name");
@@ -107,6 +119,80 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements FileWriteResult {
+        }
+    }
+
+    record SourceConnector(String id, List<String> modes) {
+        public SourceConnector {
+            Objects.requireNonNull(id, "id");
+            modes = List.copyOf(modes);
+        }
+    }
+
+    record SourceCatalog(List<SourceConnector> connectors) {
+        public SourceCatalog {
+            connectors = List.copyOf(connectors);
+        }
+    }
+
+    record SourceDraft(String connector, String mode, String tables, String id) {
+        public SourceDraft {
+            Objects.requireNonNull(connector, "connector");
+            Objects.requireNonNull(mode, "mode");
+            Objects.requireNonNull(tables, "tables");
+            Objects.requireNonNull(id, "id");
+        }
+    }
+
+    sealed interface SourceCatalogResult {
+        record Ready(SourceCatalog catalog) implements SourceCatalogResult {
+            public Ready {
+                Objects.requireNonNull(catalog, "catalog");
+            }
+        }
+
+        record Unavailable() implements SourceCatalogResult {
+        }
+    }
+
+    sealed interface SourcePreviewResult {
+        record Ready(String canonicalYaml) implements SourcePreviewResult {
+            public Ready {
+                Objects.requireNonNull(canonicalYaml, "canonicalYaml");
+            }
+        }
+
+        record Rejected(String message) implements SourcePreviewResult {
+            public Rejected {
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unavailable() implements SourcePreviewResult {
+        }
+    }
+
+    sealed interface SourceCreateResult {
+        record Created(Path relativePath, String canonicalYaml) implements SourceCreateResult {
+            public Created {
+                Objects.requireNonNull(relativePath, "relativePath");
+                Objects.requireNonNull(canonicalYaml, "canonicalYaml");
+            }
+        }
+
+        record Exists(Path relativePath) implements SourceCreateResult {
+            public Exists {
+                Objects.requireNonNull(relativePath, "relativePath");
+            }
+        }
+
+        record Rejected(String message) implements SourceCreateResult {
+            public Rejected {
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unavailable() implements SourceCreateResult {
         }
     }
 }

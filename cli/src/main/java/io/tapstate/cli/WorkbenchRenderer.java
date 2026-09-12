@@ -170,6 +170,8 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextPicker picker ->
                     Math.max(5, Math.min(10, picker.contexts().size()) + 4);
             case WorkbenchOverlayState.ContextCreate ignored -> 8;
+            case WorkbenchOverlayState.SourceCreate source -> source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
+                    ? 12 : 9;
             case WorkbenchOverlayState.Confirm ignored -> 4;
             case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
             case WorkbenchOverlayState.Actions actions -> actions.actions().size() + 1;
@@ -195,6 +197,7 @@ final class WorkbenchRenderer {
                     renderContexts(frame, area, box, picker, theme);
             case WorkbenchOverlayState.ContextCreate create ->
                     renderContextCreate(frame, area, box, create, theme);
+            case WorkbenchOverlayState.SourceCreate source -> renderSourceCreate(frame, area, box, source, theme);
             case WorkbenchOverlayState.Confirm confirm -> renderConfirm(frame, area, box, confirm, theme);
             case WorkbenchOverlayState.Login login -> renderLogin(frame, area, box, login, theme);
             case WorkbenchOverlayState.Actions actions -> renderActions(frame, area, box, actions, theme);
@@ -207,6 +210,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.More ignored -> "More";
             case WorkbenchOverlayState.ContextPicker ignored -> "Choose Context";
             case WorkbenchOverlayState.ContextCreate ignored -> "New Context";
+            case WorkbenchOverlayState.SourceCreate ignored -> "New Source";
             case WorkbenchOverlayState.Confirm confirm -> confirm.title();
             case WorkbenchOverlayState.Login login -> "Sign in to " + login.contextName();
             case WorkbenchOverlayState.Actions ignored -> "Actions";
@@ -278,6 +282,66 @@ final class WorkbenchRenderer {
         write(frame, box.x() + 2, box.y() + 5, hint, theme.muted(), area);
         create.message().ifPresent(message -> write(
                 frame, box.x() + 2, box.y() + 6, message, theme.error(), area));
+        return List.of();
+    }
+
+    private static List<OverlayHit> renderSourceCreate(
+            Frame frame,
+            Rect area,
+            Rect box,
+            WorkbenchOverlayState.SourceCreate source,
+            WorkbenchTheme theme) {
+        if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
+            write(frame, box.x() + 2, box.y() + 1, "Canonical YAML preview", theme.label().bold(), area);
+            String[] lines = source.canonicalYaml().orElse("").split("\\R");
+            for (int index = 0; index < Math.min(7, lines.length); index++) {
+                write(frame, box.x() + 2, box.y() + 2 + index, lines[index], theme.base(), area);
+            }
+            write(frame, box.x() + 2, box.y() + box.height() - 3,
+                    source.pending() ? "Creating source..." : "Enter create  Esc back", theme.muted(), area);
+            source.message().ifPresent(message -> write(
+                    frame, box.x() + 2, box.y() + box.height() - 2, message, theme.error(), area));
+            return List.of();
+        }
+        String label = switch (source.stage()) {
+            case CONNECTOR -> "Connector";
+            case MODE -> "Read mode";
+            case TABLES -> "Tables";
+            case ID -> "Resource id";
+            case PREVIEW -> throw new IllegalStateException("preview handled above");
+        };
+        String value = switch (source.stage()) {
+            case CONNECTOR -> source.connector();
+            case MODE -> source.mode();
+            case TABLES -> source.tables();
+            case ID -> source.id();
+            case PREVIEW -> "";
+        };
+        renderFormField(frame, area, box.x() + 2, box.y() + 1, label, value, true, theme);
+        if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) {
+            List<String> options = source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                    ? source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id).toList()
+                    : source.catalog().connectors().stream()
+                            .filter(connector -> connector.id().equals(source.connector()))
+                            .findFirst().map(WorkbenchActionGateway.SourceConnector::modes).orElse(List.of());
+            for (int index = 0; index < Math.min(4, options.size()); index++) {
+                boolean selected = index == source.selectedIndex();
+                write(frame, box.x() + 4, box.y() + 3 + index,
+                        (selected ? "> " : "  ") + options.get(index),
+                        selected ? theme.selection() : theme.base(), area);
+            }
+        } else {
+            write(frame, box.x() + 2, box.y() + 3,
+                    source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES
+                            ? "Comma-separated names; /regex/ is supported; blank means all."
+                            : "Choose a stable local identifier.", theme.muted(), area);
+        }
+        write(frame, box.x() + 2, box.y() + box.height() - 3,
+                source.pending() ? "Loading source catalog..." : "Up/Down navigate  Enter next  Esc cancel",
+                theme.muted(), area);
+        source.message().ifPresent(message -> write(
+                frame, box.x() + 2, box.y() + box.height() - 2, message, theme.error(), area));
         return List.of();
     }
 
@@ -1019,6 +1083,16 @@ final class WorkbenchRenderer {
                     new FooterHint("↑↓", "fields", Optional.empty()),
                     new FooterHint("Enter", create.pending() ? "wait" : "next", Optional.empty()),
                     new FooterHint("Esc", "cancel", Optional.empty()));
+            case WorkbenchOverlayState.SourceCreate source -> List.of(
+                    new FooterHint(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                            || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE ? "↑↓" : "type",
+                            source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW ? "preview" : "choose",
+                            Optional.empty()),
+                    new FooterHint("Enter", source.pending() ? "wait"
+                            : source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW ? "create" : "next",
+                            Optional.empty()),
+                    new FooterHint("Esc", source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
+                            ? "back" : "cancel", Optional.empty()));
             case WorkbenchOverlayState.Confirm confirm -> confirm.pending()
                     ? List.of(new FooterHint("…", "working", Optional.empty()))
                     : List.of(

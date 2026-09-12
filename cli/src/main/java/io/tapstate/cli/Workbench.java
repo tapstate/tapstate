@@ -488,6 +488,7 @@ final class Workbench {
                         case WorkbenchOverlayState.ContextPicker picker -> runtime.updateState(state ->
                             state.withOverlay(picker.select(index)));
                         case WorkbenchOverlayState.ContextCreate ignored -> true;
+                        case WorkbenchOverlayState.SourceCreate ignored -> true;
                         case WorkbenchOverlayState.Confirm ignored -> true;
                         case WorkbenchOverlayState.Login ignored -> true;
                         case WorkbenchOverlayState.Actions actions -> runtime.updateState(state ->
@@ -507,6 +508,7 @@ final class Workbench {
                 case WorkbenchOverlayState.More more -> handleMoreKey(more, key);
                 case WorkbenchOverlayState.ContextPicker picker -> handleContextKey(picker, key);
                 case WorkbenchOverlayState.ContextCreate create -> handleContextCreateKey(create, key);
+                case WorkbenchOverlayState.SourceCreate source -> handleSourceCreateKey(source, key);
                 case WorkbenchOverlayState.Confirm confirm -> handleConfirmKey(confirm, key);
                 case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
                 case WorkbenchOverlayState.Actions actions -> handleActionsKey(actions, key);
@@ -519,6 +521,7 @@ final class Workbench {
                     List.of(
                             WorkbenchOverlayState.Actions.Action.CONTEXT,
                             WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
+                            WorkbenchOverlayState.Actions.Action.NEW_SOURCE,
                             WorkbenchOverlayState.Actions.Action.REFRESH,
                             WorkbenchOverlayState.Actions.Action.SHELL),
                     0)));
@@ -536,6 +539,7 @@ final class Workbench {
             return switch (action) {
                 case CONTEXT -> openContextEntry();
                 case AUTHENTICATION -> openAuthEntry();
+                case NEW_SOURCE -> openSourceCreate();
                 case REFRESH -> {
                     runtime.updateState(WorkbenchState::closeOverlay);
                     if (refreshCoordinator != null) {
@@ -618,6 +622,10 @@ final class Workbench {
             return switch (confirm.intent()) {
                 case WorkbenchOverlayState.Confirm.Intent.DeleteContext ignored -> {
                     submitContextDelete(confirm);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.CreateSource create -> {
+                    submitSourceCreate(confirm, create);
                     yield true;
                 }
                 case WorkbenchOverlayState.Confirm.Intent.DiscardChanges ignored -> runtime.updateState(state ->
@@ -712,6 +720,242 @@ final class Workbench {
             return true;
         }
 
+        private boolean openSourceCreate() {
+            if (actionCoordinator == null) {
+                return false;
+            }
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                    new WorkbenchActionGateway.SourceCatalog(List.of()),
+                    WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR,
+                    0,
+                    "",
+                    "",
+                    "",
+                    "",
+                    Optional.empty(),
+                    true,
+                    Optional.empty())));
+            actionCoordinator.submit(
+                    actionGateway::sourceCatalog,
+                    failure -> new WorkbenchActionGateway.SourceCatalogResult.Unavailable(),
+                    this::completeSourceCatalog);
+            return true;
+        }
+
+        private void completeSourceCatalog(WorkbenchActionGateway.SourceCatalogResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.SourceCatalogResult.Ready ready -> {
+                    if (ready.catalog().connectors().isEmpty()) {
+                        runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Actions(
+                                List.of(WorkbenchOverlayState.Actions.Action.CONTEXT,
+                                        WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
+                                        WorkbenchOverlayState.Actions.Action.NEW_SOURCE,
+                                        WorkbenchOverlayState.Actions.Action.REFRESH,
+                                        WorkbenchOverlayState.Actions.Action.SHELL), 2)));
+                        return;
+                    }
+                    String connector = ready.catalog().connectors().getFirst().id();
+                    String mode = ready.catalog().connectors().getFirst().modes().getFirst();
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                            ready.catalog(), WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR, 0,
+                            connector, mode, "", SourceScaffold.suggestedId(connector),
+                            Optional.empty(), false, Optional.empty())));
+                }
+                case WorkbenchActionGateway.SourceCatalogResult.Unavailable ignored -> runtime.updateState(state ->
+                        state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                                new WorkbenchActionGateway.SourceCatalog(List.of()),
+                                WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR,
+                                0,
+                                "",
+                                "",
+                                "",
+                                "",
+                                Optional.empty(),
+                                false,
+                                Optional.of("Source catalog is unavailable"))));
+            }
+        }
+
+        private boolean handleSourceCreateKey(WorkbenchOverlayState.SourceCreate source, KeyEvent key) {
+            if (source.pending()) {
+                return true;
+            }
+            if (key.isCancel()) {
+                if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
+                    return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0,
+                            source.connector(), source.mode(), source.tables(), source.id(), Optional.empty(), false,
+                            Optional.empty());
+                }
+                return runtime.updateState(WorkbenchState::closeOverlay);
+            }
+            if ((source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                    || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) && (key.isUp() || key.isDown())) {
+                List<String> choices = sourceChoices(source);
+                int next = Math.floorMod(source.selectedIndex() + (key.isUp() ? -1 : 1), choices.size());
+                return updateSourceCreate(source, source.stage(), next, source.connector(), source.mode(),
+                        source.tables(), source.id(), Optional.empty(), false, Optional.empty());
+            }
+            if (key.isDeleteBackward()) {
+                return switch (source.stage()) {
+                    case TABLES -> updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(),
+                            source.mode(), deleteLastCodePoint(source.tables()), source.id(), Optional.empty(), false,
+                            Optional.empty());
+                    case ID -> updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(),
+                            source.mode(), source.tables(), deleteLastCodePoint(source.id()), Optional.empty(), false,
+                            Optional.empty());
+                    default -> true;
+                };
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                return advanceSourceCreate(source);
+            }
+            if (key.code() == dev.tamboui.tui.event.KeyCode.CHAR) {
+                return appendSourceCreateText(source, key.string());
+            }
+            return true;
+        }
+
+        private boolean appendSourceCreateText(WorkbenchOverlayState.SourceCreate source, String text) {
+            if (source.pending() || (source.stage() != WorkbenchOverlayState.SourceCreate.Stage.TABLES
+                    && source.stage() != WorkbenchOverlayState.SourceCreate.Stage.ID)) {
+                return true;
+            }
+            StringBuilder value = new StringBuilder(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES
+                    ? source.tables() : source.id());
+            text.codePoints().filter(codePoint -> !Character.isISOControl(codePoint)).forEach(value::appendCodePoint);
+            return source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES
+                    ? updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(), source.mode(),
+                            value.toString(), source.id(), Optional.empty(), false, Optional.empty())
+                    : updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(), source.mode(),
+                            source.tables(), value.toString(), Optional.empty(), false, Optional.empty());
+        }
+
+        private boolean advanceSourceCreate(WorkbenchOverlayState.SourceCreate source) {
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR) {
+                String connector = sourceChoices(source).get(source.selectedIndex());
+                String mode = source.catalog().connectors().stream().filter(item -> item.id().equals(connector))
+                        .findFirst().orElseThrow().modes().getFirst();
+                return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.MODE, 0, connector, mode,
+                        source.tables(), SourceScaffold.suggestedId(connector), Optional.empty(), false, Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) {
+                return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.TABLES, 0, source.connector(),
+                        sourceChoices(source).get(source.selectedIndex()), source.tables(), source.id(), Optional.empty(),
+                        false, Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES) {
+                return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0, source.connector(),
+                        source.mode(), source.tables(), source.id(), Optional.empty(), false, Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.ID) {
+                if (source.id().isBlank()) {
+                    return updateSourceCreate(source, source.stage(), 0, source.connector(), source.mode(), source.tables(),
+                            source.id(), Optional.empty(), false, Optional.of("Resource id is required"));
+                }
+                previewSource(source);
+                return true;
+            }
+            return sourceCreateConfirm(source);
+        }
+
+        private boolean sourceCreateConfirm(WorkbenchOverlayState.SourceCreate source) {
+            WorkbenchActionGateway.SourceDraft draft = new WorkbenchActionGateway.SourceDraft(
+                    source.connector(), source.mode(), source.tables(), source.id());
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.CreateSource(draft),
+                    "Create Source",
+                    "Create source/" + source.id() + ".tap.yml?",
+                    false,
+                    Optional.of(source))));
+        }
+
+        private List<String> sourceChoices(WorkbenchOverlayState.SourceCreate source) {
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR) {
+                return source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id).toList();
+            }
+            return source.catalog().connectors().stream().filter(item -> item.id().equals(source.connector()))
+                    .findFirst().orElseThrow().modes();
+        }
+
+        private boolean updateSourceCreate(
+                WorkbenchOverlayState.SourceCreate source,
+                WorkbenchOverlayState.SourceCreate.Stage stage,
+                int selectedIndex,
+                String connector,
+                String mode,
+                String tables,
+                String id,
+                Optional<String> yaml,
+                boolean pending,
+                Optional<String> message) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), stage, selectedIndex, connector, mode, tables, id, yaml, pending, message)));
+        }
+
+        private void previewSource(WorkbenchOverlayState.SourceCreate source) {
+            WorkbenchActionGateway.SourceDraft draft = new WorkbenchActionGateway.SourceDraft(
+                    source.connector(), source.mode(), source.tables(), source.id());
+            updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(), source.mode(),
+                    source.tables(), source.id(), Optional.empty(), true, Optional.empty());
+            actionCoordinator.submit(() -> actionGateway.previewSource(draft),
+                    failure -> new WorkbenchActionGateway.SourcePreviewResult.Unavailable(),
+                    result -> completeSourcePreview(source, result));
+        }
+
+        private void completeSourcePreview(WorkbenchOverlayState.SourceCreate source,
+                WorkbenchActionGateway.SourcePreviewResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.SourcePreviewResult.Ready ready -> updateSourceCreate(source,
+                        WorkbenchOverlayState.SourceCreate.Stage.PREVIEW, 0, source.connector(), source.mode(),
+                        source.tables(), source.id(), Optional.of(ready.canonicalYaml()), false, Optional.empty());
+                case WorkbenchActionGateway.SourcePreviewResult.Rejected rejected -> updateSourceCreate(source,
+                        WorkbenchOverlayState.SourceCreate.Stage.ID, 0, source.connector(), source.mode(), source.tables(),
+                        source.id(), Optional.empty(), false, Optional.of(rejected.message()));
+                case WorkbenchActionGateway.SourcePreviewResult.Unavailable ignored -> updateSourceCreate(source,
+                        WorkbenchOverlayState.SourceCreate.Stage.ID, 0, source.connector(), source.mode(), source.tables(),
+                        source.id(), Optional.empty(), false, Optional.of("Source preview is unavailable"));
+            }
+        }
+
+        private void submitSourceCreate(
+                WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.CreateSource create) {
+            WorkbenchOverlayState.SourceCreate source = confirm.previous()
+                    .filter(WorkbenchOverlayState.SourceCreate.class::isInstance)
+                    .map(WorkbenchOverlayState.SourceCreate.class::cast)
+                    .orElseThrow();
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.createSource(create.draft()),
+                    failure -> new WorkbenchActionGateway.SourceCreateResult.Unavailable(),
+                    result -> completeSourceCreate(source, result));
+        }
+
+        private void completeSourceCreate(
+                WorkbenchOverlayState.SourceCreate source,
+                WorkbenchActionGateway.SourceCreateResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.SourceCreateResult.Created created -> {
+                    runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.WORKSPACE)
+                            .withWorkspaceView(state.workspaceView().open(created.relativePath(), created.canonicalYaml()))
+                            .closeOverlay());
+                    refresh();
+                }
+                case WorkbenchActionGateway.SourceCreateResult.Exists exists -> restoreSourceCreate(source,
+                        Optional.of("File already exists: " + exists.relativePath()));
+                case WorkbenchActionGateway.SourceCreateResult.Rejected rejected -> restoreSourceCreate(source,
+                        Optional.of(rejected.message()));
+                case WorkbenchActionGateway.SourceCreateResult.Unavailable ignored -> restoreSourceCreate(source,
+                        Optional.of("Source creation is unavailable"));
+            }
+        }
+
+        private void restoreSourceCreate(
+                WorkbenchOverlayState.SourceCreate source, Optional<String> message) {
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(source.catalog(),
+                    source.stage(), source.selectedIndex(), source.connector(), source.mode(), source.tables(), source.id(),
+                    source.canonicalYaml(), false, message)));
+        }
+
         private boolean handleLoginKey(WorkbenchOverlayState.Login login, KeyEvent key) {
             if (login.pending()) {
                 return true;
@@ -789,6 +1033,9 @@ final class Workbench {
             if (overlay instanceof WorkbenchOverlayState.ContextCreate create && !create.pending()
                     && create.stage() != WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS) {
                 return appendContextCreateText(create, text);
+            }
+            if (overlay instanceof WorkbenchOverlayState.SourceCreate source && !source.pending()) {
+                return appendSourceCreateText(source, text);
             }
             return true;
         }
@@ -1077,6 +1324,7 @@ final class Workbench {
             return switch (overlay) {
                 case WorkbenchOverlayState.ContextPicker picker -> picker.previous();
                 case WorkbenchOverlayState.ContextCreate create -> create.previous();
+                case WorkbenchOverlayState.SourceCreate ignored -> Optional.empty();
                 case WorkbenchOverlayState.Confirm confirm -> confirm.previous();
                 case WorkbenchOverlayState.Login login -> login.previous();
                 case WorkbenchOverlayState.Actions ignored -> Optional.empty();

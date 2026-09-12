@@ -9,6 +9,7 @@ sealed interface WorkbenchOverlayState
         permits WorkbenchOverlayState.More,
                 WorkbenchOverlayState.ContextPicker,
                 WorkbenchOverlayState.ContextCreate,
+                WorkbenchOverlayState.SourceCreate,
                 WorkbenchOverlayState.Confirm,
                 WorkbenchOverlayState.Login,
                 WorkbenchOverlayState.Actions,
@@ -94,6 +95,37 @@ sealed interface WorkbenchOverlayState
         }
     }
 
+    record SourceCreate(
+            WorkbenchActionGateway.SourceCatalog catalog,
+            Stage stage,
+            int selectedIndex,
+            String connector,
+            String mode,
+            String tables,
+            String id,
+            Optional<String> canonicalYaml,
+            boolean pending,
+            Optional<String> message) implements WorkbenchOverlayState {
+        public SourceCreate {
+            Objects.requireNonNull(catalog, "catalog");
+            Objects.requireNonNull(stage, "stage");
+            Objects.requireNonNull(connector, "connector");
+            Objects.requireNonNull(mode, "mode");
+            Objects.requireNonNull(tables, "tables");
+            Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(canonicalYaml, "canonicalYaml");
+            Objects.requireNonNull(message, "message");
+        }
+
+        enum Stage {
+            CONNECTOR,
+            MODE,
+            TABLES,
+            ID,
+            PREVIEW
+        }
+    }
+
     record Confirm(
             Intent intent,
             String title,
@@ -111,10 +143,16 @@ sealed interface WorkbenchOverlayState
             return new Confirm(intent, title, message, true, previous);
         }
 
-        sealed interface Intent permits Intent.DeleteContext, Intent.DiscardChanges {
+        sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource, Intent.DiscardChanges {
             record DeleteContext(String contextName) implements Intent {
                 public DeleteContext {
                     Objects.requireNonNull(contextName, "contextName");
+                }
+            }
+
+            record CreateSource(SourceDraft draft) implements Intent {
+                public CreateSource {
+                    Objects.requireNonNull(draft, "draft");
                 }
             }
 
@@ -177,6 +215,7 @@ sealed interface WorkbenchOverlayState
         enum Action {
             CONTEXT("Context", "Choose or create a context"),
             AUTHENTICATION("Authentication", "Sign in to the selected server"),
+            NEW_SOURCE("New Source", "Create a local source artifact"),
             REFRESH("Refresh", "Load the latest workspace snapshot"),
             SHELL("Shell", "Open the embedded command session");
 
