@@ -46,12 +46,24 @@ final class CliOnce {
     }
 
     /**
+     * The same run with a script on its standard input, which is how something other than a person
+     * drives a whole session: the lines arrive as if typed, and the process ends when they run out.
+     */
+    static Run runSession(String password, String script, String... args) {
+        return launch(password, script, List.of(), args);
+    }
+
+    /**
      * The same, with options for the JVM the CLI runs in, placed ahead of the class name so they are
      * the JVM's and never the CLI's. What a test mostly needs here is {@code -Duser.home}: the saved
      * servers, the saved sign-ins and the local stack all live under the home directory, and a test
      * that lets the CLI find the real one reads and writes whoever is running the build.
      */
     static Run runWithPassword(String password, List<String> jvmArgs, String... args) {
+        return launch(password, null, jvmArgs, args);
+    }
+
+    private static Run launch(String password, String script, List<String> jvmArgs, String... args) {
         List<String> command = new ArrayList<>();
         command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
         command.addAll(jvmArgs);
@@ -70,6 +82,14 @@ final class CliOnce {
                     .redirectError(errFile.toFile());
             if (password != null) {
                 builder.environment().put("TAPSTATE_PASSWORD", password);
+            }
+            if (script != null) {
+                // a file rather than writing down the pipe: the session reads its lines whenever it gets
+                // to them, and a writer racing the reader can fill the buffer and hold both processes
+                Path inFile = Files.createTempFile("cli-in", ".txt");
+                inFile.toFile().deleteOnExit();
+                Files.writeString(inFile, script, StandardCharsets.UTF_8);
+                builder.redirectInput(inFile.toFile());
             }
             Process process = builder.start();
             if (!process.waitFor(2, TimeUnit.MINUTES)) {
