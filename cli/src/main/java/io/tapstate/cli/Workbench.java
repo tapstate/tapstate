@@ -823,7 +823,8 @@ final class Workbench {
                 return runtime.updateState(WorkbenchState::closeOverlay);
             }
             if ((source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
-                    || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) && (key.isUp() || key.isDown())) {
+                    || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE
+                    || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) && (key.isUp() || key.isDown())) {
                 List<String> choices = sourceChoices(source);
                 if (choices.isEmpty()) {
                     return true;
@@ -831,6 +832,10 @@ final class Workbench {
                 int next = Math.floorMod(source.selectedIndex() + (key.isUp() ? -1 : 1), choices.size());
                 return updateSourceCreate(source, source.stage(), next, source.connector(), source.mode(),
                         source.tables(), source.id(), Optional.empty(), false, Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG
+                    && (key.isLeft() || key.isRight())) {
+                return cycleSourceConfigOption(source, key.isLeft() ? -1 : 1);
             }
             if (key.isDeleteBackward()) {
                 return switch (source.stage()) {
@@ -841,6 +846,8 @@ final class Workbench {
                     case ID -> updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(),
                             source.mode(), source.tables(), deleteLastCodePoint(source.id()), Optional.empty(), false,
                             Optional.empty());
+                    case CONFIG -> updateSourceConfig(source, source.selectedIndex(), sourceConfigText(source,
+                            deleteLastCodePoint(sourceConfigText(source, source.selectedIndex()))), Optional.empty());
                     default -> true;
                 };
             }
@@ -861,6 +868,14 @@ final class Workbench {
                 StringBuilder filter = new StringBuilder(source.filter());
                 text.codePoints().filter(codePoint -> !Character.isISOControl(codePoint)).forEach(filter::appendCodePoint);
                 return updateSourceFilter(source, filter.toString());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
+                WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, source.selectedIndex());
+                if (!field.options().isEmpty()) {
+                    return true;
+                }
+                return updateSourceConfig(source, source.selectedIndex(),
+                        sourceConfigText(source, source.selectedIndex()) + printableText(text), Optional.empty());
             }
             if (source.stage() != WorkbenchOverlayState.SourceCreate.Stage.TABLES
                     && source.stage() != WorkbenchOverlayState.SourceCreate.Stage.ID) {
@@ -894,6 +909,12 @@ final class Workbench {
                         false, Optional.empty());
             }
             if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES) {
+                WorkbenchOverlayState.SourceCreate.Stage next = sourceConfigFields(source).isEmpty()
+                        ? WorkbenchOverlayState.SourceCreate.Stage.ID : WorkbenchOverlayState.SourceCreate.Stage.CONFIG;
+                return updateSourceCreate(source, next, 0, source.connector(),
+                        source.mode(), source.tables(), source.id(), Optional.empty(), false, Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
                 return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0, source.connector(),
                         source.mode(), source.tables(), source.id(), Optional.empty(), false, Optional.empty());
             }
@@ -909,10 +930,10 @@ final class Workbench {
         }
 
         private boolean sourceCreateConfirm(WorkbenchOverlayState.SourceCreate source) {
-            WorkbenchActionGateway.SourceDraft draft = new WorkbenchActionGateway.SourceDraft(
-                    source.connector(), source.mode(), source.tables(), source.id());
+            String yaml = source.canonicalYaml().orElseThrow();
             return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
-                    new WorkbenchOverlayState.Confirm.Intent.CreateSource(draft),
+                    new WorkbenchOverlayState.Confirm.Intent.CreateSource(
+                            new WorkbenchActionGateway.SourceCreateRequest(source.id(), yaml)),
                     "Create Source",
                     "Create source/" + source.id() + ".tap.yml?",
                     false,
@@ -924,6 +945,9 @@ final class Workbench {
                 String filter = source.filter().toLowerCase(java.util.Locale.ROOT);
                 return source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id)
                         .filter(id -> id.toLowerCase(java.util.Locale.ROOT).contains(filter)).toList();
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
+                return sourceConfigFields(source).stream().map(WorkbenchActionGateway.SourceConfigField::name).toList();
             }
             return source.catalog().connectors().stream().filter(item -> item.id().equals(source.connector()))
                     .findFirst().orElseThrow().modes();
@@ -941,7 +965,8 @@ final class Workbench {
                 boolean pending,
                 Optional<String> message) {
             return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
-                    source.catalog(), stage, selectedIndex, source.filter(), connector, mode, tables, id, yaml, pending, message)));
+                    source.catalog(), stage, selectedIndex, source.filter(), connector, mode, tables, id,
+                    source.config(), yaml, pending, message)));
         }
 
         private boolean updateSourceFilter(WorkbenchOverlayState.SourceCreate source, String filter) {
@@ -952,13 +977,13 @@ final class Workbench {
                     .toList();
             return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
                     source.catalog(), source.stage(), choices.isEmpty() ? 0 : Math.min(source.selectedIndex(), choices.size() - 1),
-                    filter, source.connector(), source.mode(), source.tables(), source.id(), source.canonicalYaml(),
+                    filter, source.connector(), source.mode(), source.tables(), source.id(), source.config(), source.canonicalYaml(),
                     false, choices.isEmpty() ? Optional.of("No connectors match this filter") : Optional.empty())));
         }
 
         private void previewSource(WorkbenchOverlayState.SourceCreate source) {
             WorkbenchActionGateway.SourceDraft draft = new WorkbenchActionGateway.SourceDraft(
-                    source.connector(), source.mode(), source.tables(), source.id());
+                    source.connector(), source.mode(), source.tables(), source.id(), sourceConfig(source));
             updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(), source.mode(),
                     source.tables(), source.id(), Optional.empty(), true, Optional.empty());
             actionCoordinator.submit(() -> actionGateway.previewSource(draft),
@@ -989,7 +1014,7 @@ final class Workbench {
                     .map(WorkbenchOverlayState.SourceCreate.class::cast)
                     .orElseThrow();
             runtime.updateState(state -> state.withOverlay(confirm.asPending()));
-            actionCoordinator.submit(() -> actionGateway.createSource(create.draft()),
+            actionCoordinator.submit(() -> actionGateway.createSource(create.request()),
                     failure -> new WorkbenchActionGateway.SourceCreateResult.Unavailable(),
                     result -> completeSourceCreate(source, result));
         }
@@ -1017,7 +1042,70 @@ final class Workbench {
                 WorkbenchOverlayState.SourceCreate source, Optional<String> message) {
             runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(source.catalog(),
                     source.stage(), source.selectedIndex(), source.filter(), source.connector(), source.mode(),
-                    source.tables(), source.id(), source.canonicalYaml(), false, message)));
+                    source.tables(), source.id(), source.config(), source.canonicalYaml(), false, message)));
+        }
+
+        private List<WorkbenchActionGateway.SourceConfigField> sourceConfigFields(
+                WorkbenchOverlayState.SourceCreate source) {
+            return source.catalog().connectors().stream()
+                    .filter(connector -> connector.id().equals(source.connector()))
+                    .findFirst().map(WorkbenchActionGateway.SourceConnector::configFields).orElse(List.of()).stream()
+                    .filter(field -> field.visibleWhen().map(visibility -> visibility.equalsAnyOf().contains(
+                            source.config().get(visibility.controllingField()))).orElse(true))
+                    .toList();
+        }
+
+        private WorkbenchActionGateway.SourceConfigField sourceConfigField(
+                WorkbenchOverlayState.SourceCreate source, int index) {
+            List<WorkbenchActionGateway.SourceConfigField> fields = sourceConfigFields(source);
+            return fields.get(Math.clamp(index, 0, fields.size() - 1));
+        }
+
+        private String sourceConfigText(WorkbenchOverlayState.SourceCreate source, int index) {
+            WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, index);
+            return source.config().getOrDefault(field.name(), "");
+        }
+
+        private boolean updateSourceConfig(WorkbenchOverlayState.SourceCreate source, int index, String value,
+                Optional<String> message) {
+            WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, index);
+            Map<String, String> config = new java.util.LinkedHashMap<>(source.config());
+            if (value.isBlank()) {
+                config.remove(field.name());
+            } else {
+                config.put(field.name(), value);
+            }
+            List<WorkbenchActionGateway.SourceConfigField> fields = sourceConfigFields(source);
+            int selected = fields.isEmpty() ? 0 : Math.min(index, fields.size() - 1);
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), source.stage(), selected, source.filter(), source.connector(), source.mode(),
+                    source.tables(), source.id(), config, Optional.empty(), false, message)));
+        }
+
+        private boolean cycleSourceConfigOption(WorkbenchOverlayState.SourceCreate source, int direction) {
+            WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, source.selectedIndex());
+            List<String> options = new java.util.ArrayList<>(field.options());
+            options.add("");
+            int current = options.indexOf(source.config().getOrDefault(field.name(), ""));
+            int next = Math.floorMod(current + direction, options.size());
+            return updateSourceConfig(source, source.selectedIndex(), options.get(next), Optional.empty());
+        }
+
+        private Map<String, Object> sourceConfig(WorkbenchOverlayState.SourceCreate source) {
+            Map<String, Object> config = new java.util.LinkedHashMap<>();
+            for (WorkbenchActionGateway.SourceConfigField field : sourceConfigFields(source)) {
+                String raw = source.config().get(field.name());
+                if (raw != null && !raw.isBlank()) {
+                    config.put(field.name(), SourceScaffold.coerce(field.type(), raw.trim()));
+                }
+            }
+            return Map.copyOf(config);
+        }
+
+        private static String printableText(String text) {
+            StringBuilder value = new StringBuilder(text.length());
+            text.codePoints().filter(codePoint -> !Character.isISOControl(codePoint)).forEach(value::appendCodePoint);
+            return value.toString();
         }
 
         private boolean handleLoginKey(WorkbenchOverlayState.Login login, KeyEvent key) {

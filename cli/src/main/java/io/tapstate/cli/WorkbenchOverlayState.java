@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -104,6 +105,7 @@ sealed interface WorkbenchOverlayState
             String mode,
             String tables,
             String id,
+            Map<String, String> config,
             Optional<String> canonicalYaml,
             boolean pending,
             Optional<String> message) implements WorkbenchOverlayState {
@@ -115,8 +117,24 @@ sealed interface WorkbenchOverlayState
             Objects.requireNonNull(mode, "mode");
             Objects.requireNonNull(tables, "tables");
             Objects.requireNonNull(id, "id");
+            config = Map.copyOf(config);
             Objects.requireNonNull(canonicalYaml, "canonicalYaml");
             Objects.requireNonNull(message, "message");
+        }
+
+        SourceCreate(
+                WorkbenchActionGateway.SourceCatalog catalog,
+                Stage stage,
+                int selectedIndex,
+                String filter,
+                String connector,
+                String mode,
+                String tables,
+                String id,
+                Optional<String> canonicalYaml,
+                boolean pending,
+                Optional<String> message) {
+            this(catalog, stage, selectedIndex, filter, connector, mode, tables, id, Map.of(), canonicalYaml, pending, message);
         }
 
         SourceCreate(
@@ -130,13 +148,14 @@ sealed interface WorkbenchOverlayState
                 Optional<String> canonicalYaml,
                 boolean pending,
                 Optional<String> message) {
-            this(catalog, stage, selectedIndex, "", connector, mode, tables, id, canonicalYaml, pending, message);
+            this(catalog, stage, selectedIndex, "", connector, mode, tables, id, Map.of(), canonicalYaml, pending, message);
         }
 
         enum Stage {
             CONNECTOR,
             MODE,
             TABLES,
+            CONFIG,
             ID,
             PREVIEW
         }
@@ -166,9 +185,9 @@ sealed interface WorkbenchOverlayState
                 }
             }
 
-            record CreateSource(WorkbenchActionGateway.SourceDraft draft) implements Intent {
+            record CreateSource(WorkbenchActionGateway.SourceCreateRequest request) implements Intent {
                 public CreateSource {
-                    Objects.requireNonNull(draft, "draft");
+                    Objects.requireNonNull(request, "request");
                 }
             }
 

@@ -65,28 +65,7 @@ final class ConfigPrompter {
      * {@code "1521"}). A value that does not parse is kept verbatim and left for validate to flag.
      */
     private static Object coerce(ConfigType type, String raw) {
-        switch (type) {
-            case NUMBER:
-                try {
-                    return Integer.valueOf(raw);
-                } catch (NumberFormatException notInt) {
-                    try {
-                        return Double.valueOf(raw);
-                    } catch (NumberFormatException notNumber) {
-                        return raw;
-                    }
-                }
-            case BOOLEAN:
-                if (raw.equalsIgnoreCase("true")) {
-                    return Boolean.TRUE;
-                }
-                if (raw.equalsIgnoreCase("false")) {
-                    return Boolean.FALSE;
-                }
-                return raw;
-            default:
-                return raw;
-        }
+        return SourceScaffold.coerce(type, raw);
     }
 
     private static String label(ConfigField field) {

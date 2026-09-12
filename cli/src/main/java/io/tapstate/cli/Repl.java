@@ -4,6 +4,7 @@ import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -322,7 +323,8 @@ final class Repl {
                 try {
                     TapstateCatalog catalog = TapstateCatalog.load();
                     List<SourceConnector> connectors = SourceScaffold.connectors(catalog).stream()
-                            .map(id -> new SourceConnector(id, SourceScaffold.modes(catalog.byId(id))))
+                            .map(id -> new SourceConnector(id, SourceScaffold.modes(catalog.byId(id)),
+                                    catalog.byId(id).config().stream().map(Repl::sourceConfigField).toList()))
                             .toList();
                     return new SourceCatalogResult.Ready(new SourceCatalog(connectors));
                 } catch (RuntimeException unavailable) {
@@ -340,17 +342,16 @@ final class Repl {
             }
 
             @Override
-            public SourceCreateResult createSource(SourceDraft draft) {
+            public SourceCreateResult createSource(SourceCreateRequest request) {
                 try {
-                    String yaml = canonicalSource(draft);
-                    Path relativePath = Path.of("source", draft.id() + ".tap.yml");
+                    Path relativePath = Path.of("source", request.id() + ".tap.yml");
                     Path target = resolveWorkbenchNewFile(relativePath);
                     try {
-                        Files.writeString(target, yaml, java.nio.file.StandardOpenOption.CREATE_NEW);
+                        Files.writeString(target, request.canonicalYaml(), java.nio.file.StandardOpenOption.CREATE_NEW);
                     } catch (java.nio.file.FileAlreadyExistsException exists) {
                         return new SourceCreateResult.Exists(relativePath);
                     }
-                    return new SourceCreateResult.Created(relativePath, yaml);
+                    return new SourceCreateResult.Created(relativePath, request.canonicalYaml());
                 } catch (IllegalArgumentException rejected) {
                     return new SourceCreateResult.Rejected("Source draft is not valid");
                 } catch (IOException unavailable) {
@@ -364,8 +365,19 @@ final class Repl {
         TapstateCatalog catalog = TapstateCatalog.load();
         var mode = SourceScaffold.resolveMode(catalog, draft.connector(), draft.mode());
         SourceResource source = SourceScaffold.build(catalog, draft.connector(), draft.mode(),
-                SourceScaffold.tableRefs(draft.tables(), mode), draft.id(), Map.of());
+                SourceScaffold.tableRefs(draft.tables(), mode), draft.id(), draft.config());
         return new CanonicalWriter().write(source);
+    }
+
+    private static WorkbenchActionGateway.SourceConfigField sourceConfigField(ConfigField field) {
+        String label = field.label().getOrDefault("en_US", field.name());
+        Optional<WorkbenchActionGateway.SourceConfigVisibility> visibleWhen = field.visibleWhen() == null
+                ? Optional.empty()
+                : Optional.of(new WorkbenchActionGateway.SourceConfigVisibility(
+                        field.visibleWhen().controllingField(), field.visibleWhen().equalsAnyOf()));
+        return new WorkbenchActionGateway.SourceConfigField(
+                field.name(), field.type(), label, field.defaultValue(), field.secret(),
+                field.options().stream().map(option -> option.value()).toList(), visibleWhen);
     }
 
     private Path resolveWorkbenchFile(Path relativePath) throws IOException {

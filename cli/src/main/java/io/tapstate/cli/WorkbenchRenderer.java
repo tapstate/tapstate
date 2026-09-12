@@ -321,6 +321,7 @@ final class WorkbenchRenderer {
             case CONNECTOR -> "Connector";
             case MODE -> "Read mode";
             case TABLES -> "Tables";
+            case CONFIG -> "Configuration";
             case ID -> "Resource id";
             case PREVIEW -> throw new IllegalStateException("preview handled above");
         };
@@ -328,6 +329,7 @@ final class WorkbenchRenderer {
             case CONNECTOR -> source.connector();
             case MODE -> source.mode();
             case TABLES -> source.tables();
+            case CONFIG -> "";
             case ID -> source.id();
             case PREVIEW -> "";
         };
@@ -354,6 +356,8 @@ final class WorkbenchRenderer {
             write(frame, box.x() + 2, box.y() + 3,
                     source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES
                             ? "Comma-separated names; /regex/ is supported; blank means all."
+                            : source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG
+                                    ? "Up/Down fields  Left/Right choices  Enter next"
                             : "Choose a stable local identifier.", theme.muted(), area);
         }
         write(frame, box.x() + 2, box.y() + box.height() - 3,
@@ -390,7 +394,11 @@ final class WorkbenchRenderer {
                 source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE, theme);
         renderSourcePageField(frame, formArea, y++, "3", "Tables", source.tables().isBlank() ? "All tables" : source.tables(),
                 source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES, theme);
-        renderSourcePageField(frame, formArea, y++, "4", "Resource id", source.id(),
+        List<WorkbenchActionGateway.SourceConfigField> configFields = sourceConfigFields(source);
+        renderSourcePageField(frame, formArea, y++, "4", "Configuration",
+                configFields.isEmpty() ? "No connector fields" : configFields.size() + " fields",
+                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG, theme);
+        renderSourcePageField(frame, formArea, y++, "5", "Resource id", source.id(),
                 source.stage() == WorkbenchOverlayState.SourceCreate.Stage.ID, theme);
         y++;
         if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
@@ -416,11 +424,14 @@ final class WorkbenchRenderer {
             }
             write(frame, formArea.x(), formArea.bottom() - 1,
                     source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
-                            ? "Filter: " + source.filter() + "  ↑↓ navigate"
+                            ? source.catalog().connectors().size() + " connectors  Filter: " + source.filter() + "  ↑↓ navigate"
                             : "↑↓ navigate", theme.muted(), formArea);
+        } else if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
+            renderSourceConfigFields(frame, formArea, y, source, configFields, theme);
         } else {
             String hint = switch (source.stage()) {
                 case TABLES -> "Comma-separated names, /regex/, or leave blank for all.";
+                case CONFIG -> "Configure the selected connector field.";
                 case ID -> "Choose a stable local identifier.";
                 case PREVIEW -> "Review the canonical artifact before creating it.";
                 default -> "";
@@ -460,6 +471,44 @@ final class WorkbenchRenderer {
         x += write(frame, x, y, step + " ", active ? theme.accent() : theme.muted(), area);
         x += write(frame, x, y, label + ": ", labelStyle, area);
         write(frame, x, y, value, active ? theme.base().bold() : theme.base(), area);
+    }
+
+    private static List<WorkbenchActionGateway.SourceConfigField> sourceConfigFields(
+            WorkbenchOverlayState.SourceCreate source) {
+        return source.catalog().connectors().stream()
+                .filter(connector -> connector.id().equals(source.connector()))
+                .findFirst().map(WorkbenchActionGateway.SourceConnector::configFields).orElse(List.of()).stream()
+                .filter(field -> field.visibleWhen().map(visibility -> visibility.equalsAnyOf().contains(
+                        source.config().get(visibility.controllingField()))).orElse(true))
+                .toList();
+    }
+
+    private static void renderSourceConfigFields(
+            Frame frame, Rect area, int y, WorkbenchOverlayState.SourceCreate source,
+            List<WorkbenchActionGateway.SourceConfigField> fields, WorkbenchTheme theme) {
+        if (fields.isEmpty()) {
+            write(frame, area.x() + 2, y, "No visible connector fields.", theme.muted(), area);
+            return;
+        }
+        int visible = Math.max(1, Math.min(fields.size(), area.bottom() - y - 2));
+        int selected = Math.clamp(source.selectedIndex(), 0, fields.size() - 1);
+        int first = Math.clamp(selected - visible / 2, 0, Math.max(0, fields.size() - visible));
+        for (int offset = 0; offset < visible; offset++) {
+            WorkbenchActionGateway.SourceConfigField field = fields.get(first + offset);
+            String value = source.config().getOrDefault(field.name(), "");
+            if (field.secret() && !value.isBlank()) {
+                value = "*".repeat(value.codePointCount(0, value.length()));
+            }
+            if (value.isBlank() && field.defaultValue() != null && !field.defaultValue().isBlank()) {
+                value = "[default: " + field.defaultValue() + "]";
+            } else if (value.isBlank() && !field.options().isEmpty()) {
+                value = "[skip]";
+            }
+            write(frame, area.x() + 2, y + offset, pad(field.label() + ": " + value, area.width() - 2),
+                    first + offset == selected ? theme.selection() : theme.base(), area);
+        }
+        write(frame, area.x(), area.bottom() - 1,
+                "↑↓ fields  ←→ choices  type value  " + (selected + 1) + "/" + fields.size(), theme.muted(), area);
     }
 
     private static List<OverlayHit> renderConfirm(
@@ -1191,6 +1240,26 @@ final class WorkbenchRenderer {
         return List.copyOf(hints);
     }
 
+    private static List<FooterHint> sourceCreateFooter(WorkbenchOverlayState.SourceCreate source) {
+        List<FooterHint> hints = new ArrayList<>();
+        if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
+            hints.add(new FooterHint("↑↓", "fields", Optional.empty()));
+            hints.add(new FooterHint("←→", "choices", Optional.empty()));
+            hints.add(new FooterHint("type", "value", Optional.empty()));
+        } else {
+            hints.add(new FooterHint(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                    || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE ? "↑↓" : "type",
+                    source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW ? "preview" : "choose",
+                    Optional.empty()));
+        }
+        hints.add(new FooterHint("Enter", source.pending() ? "wait"
+                : source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW ? "create" : "next",
+                Optional.empty()));
+        hints.add(new FooterHint("Esc", source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
+                ? "back" : "cancel", Optional.empty()));
+        return List.copyOf(hints);
+    }
+
     private static List<FooterHint> overlayFooter(WorkbenchOverlayState overlay) {
         return switch (overlay) {
             case WorkbenchOverlayState.More ignored -> List.of(
@@ -1206,16 +1275,7 @@ final class WorkbenchRenderer {
                     new FooterHint("↑↓", "fields", Optional.empty()),
                     new FooterHint("Enter", create.pending() ? "wait" : "next", Optional.empty()),
                     new FooterHint("Esc", "cancel", Optional.empty()));
-            case WorkbenchOverlayState.SourceCreate source -> List.of(
-                    new FooterHint(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
-                            || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE ? "↑↓" : "type",
-                            source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW ? "preview" : "choose",
-                            Optional.empty()),
-                    new FooterHint("Enter", source.pending() ? "wait"
-                            : source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW ? "create" : "next",
-                            Optional.empty()),
-                    new FooterHint("Esc", source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
-                            ? "back" : "cancel", Optional.empty()));
+            case WorkbenchOverlayState.SourceCreate source -> sourceCreateFooter(source);
             case WorkbenchOverlayState.Confirm confirm -> confirm.pending()
                     ? List.of(new FooterHint("…", "working", Optional.empty()))
                     : List.of(

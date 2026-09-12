@@ -2,7 +2,9 @@ package io.tapstate.cli;
 
 import java.net.URI;
 import java.nio.file.Path;
+import io.tapstate.core.catalog.ConfigType;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -37,7 +39,7 @@ interface WorkbenchActionGateway {
         return new SourcePreviewResult.Unavailable();
     }
 
-    default SourceCreateResult createSource(SourceDraft draft) {
+    default SourceCreateResult createSource(SourceCreateRequest request) {
         return new SourceCreateResult.Unavailable();
     }
 
@@ -122,10 +124,39 @@ interface WorkbenchActionGateway {
         }
     }
 
-    record SourceConnector(String id, List<String> modes) {
+    record SourceConfigField(
+            String name,
+            ConfigType type,
+            String label,
+            String defaultValue,
+            boolean secret,
+            List<String> options,
+            Optional<SourceConfigVisibility> visibleWhen) {
+        public SourceConfigField {
+            Objects.requireNonNull(name, "name");
+            Objects.requireNonNull(type, "type");
+            Objects.requireNonNull(label, "label");
+            options = List.copyOf(options);
+            Objects.requireNonNull(visibleWhen, "visibleWhen");
+        }
+    }
+
+    record SourceConfigVisibility(String controllingField, List<String> equalsAnyOf) {
+        public SourceConfigVisibility {
+            Objects.requireNonNull(controllingField, "controllingField");
+            equalsAnyOf = List.copyOf(equalsAnyOf);
+        }
+    }
+
+    record SourceConnector(String id, List<String> modes, List<SourceConfigField> configFields) {
         public SourceConnector {
             Objects.requireNonNull(id, "id");
             modes = List.copyOf(modes);
+            configFields = List.copyOf(configFields);
+        }
+
+        SourceConnector(String id, List<String> modes) {
+            this(id, modes, List.of());
         }
     }
 
@@ -135,12 +166,24 @@ interface WorkbenchActionGateway {
         }
     }
 
-    record SourceDraft(String connector, String mode, String tables, String id) {
+    record SourceDraft(String connector, String mode, String tables, String id, Map<String, Object> config) {
         public SourceDraft {
             Objects.requireNonNull(connector, "connector");
             Objects.requireNonNull(mode, "mode");
             Objects.requireNonNull(tables, "tables");
             Objects.requireNonNull(id, "id");
+            config = Map.copyOf(config);
+        }
+
+        SourceDraft(String connector, String mode, String tables, String id) {
+            this(connector, mode, tables, id, Map.of());
+        }
+    }
+
+    record SourceCreateRequest(String id, String canonicalYaml) {
+        public SourceCreateRequest {
+            Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(canonicalYaml, "canonicalYaml");
         }
     }
 

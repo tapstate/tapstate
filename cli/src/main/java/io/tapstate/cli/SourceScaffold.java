@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
+import io.tapstate.core.catalog.ConfigType;
 import io.tapstate.core.catalog.OfficialConnectors;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.SourceMode;
@@ -73,5 +74,24 @@ final class SourceScaffold {
             }
         }
         return values.isEmpty() ? null : List.copyOf(values);
+    }
+
+    static Object coerce(ConfigType type, String raw) {
+        return switch (type) {
+            case NUMBER -> {
+                try {
+                    yield Integer.valueOf(raw);
+                } catch (NumberFormatException notInt) {
+                    try {
+                        yield Double.valueOf(raw);
+                    } catch (NumberFormatException notNumber) {
+                        yield raw;
+                    }
+                }
+            }
+            case BOOLEAN -> raw.equalsIgnoreCase("true") ? Boolean.TRUE
+                    : raw.equalsIgnoreCase("false") ? Boolean.FALSE : raw;
+            default -> raw;
+        };
     }
 }
