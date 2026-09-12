@@ -19,15 +19,15 @@ import java.util.function.Supplier;
  * The Tapstate CLI: the surface-ring product front-end. Dual-mode — bare {@code tapstate} opens the
  * offline REPL; one-shot subcommands share the same verb table for scripting / AI.
  *
- * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code explain} / {@code ls} /
- * {@code desc} run fully without any server. The server-state verbs are registered too, so they are
+ * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code add} / {@code explain} /
+ * {@code ls} / {@code desc} run fully without any server. The server-state verbs are registered too, so they are
  * discoverable and report a coded "not connected" diagnostic rather than going missing; they reach a
  * service through the REPL, where a connection is established and held — the CLI talks to a running
  * Tapstate over HTTP only (rule R6).
  */
 @Command(name = "tapstate", mixinStandardHelpOptions = true, version = Cli.VERSION,
         subcommands = {
-                ValidateCmd.class, NewCmd.class, DemoCmd.class, ExplainCmd.class, LsCmd.class,
+                ValidateCmd.class, NewCmd.class, AddCmd.class, DemoCmd.class, ExplainCmd.class, LsCmd.class,
                 DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class},
         // the second line is indented by hand under the "Usage: " heading picocli prints before the first
         customSynopsis = {
@@ -106,7 +106,7 @@ public final class Cli implements Runnable {
      * so the declared list can never drift from the verbs actually wired up.
      */
     static final List<String> OFFLINE_VERBS =
-            List.of("validate", "new", "demo", "explain", "ls", "desc", "version");
+            List.of("validate", "new", "add", "demo", "explain", "ls", "desc", "version");
 
     /**
      * How this face spells each operation it projects: operation id → verb name. The spelling is not

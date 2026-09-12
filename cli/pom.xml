@@ -3,7 +3,7 @@
   cli — the surface ring: Tapstate's offline CLI product front-end.
 
   Dual-mode: bare `tapstate` opens an offline REPL; one-shot subcommands share the same verb
-  table for scripting / AI. Offline verbs are a whitelist (validate / new / explain); server
+  table for scripting / AI. Offline verbs are a whitelist (validate / new / add / explain); server
   verbs are registered too but report "requires a connection" rather than going missing.
 
   Ring rule R6: the CLI talks to services over HTTP only. Its dependency surface is allowlisted

@@ -45,8 +45,9 @@ import java.util.function.UnaryOperator;
 
 /**
  * {@code new} — the catalog-driven scaffolding wizard. One entry, two paths that produce the same
- * canonical artifact: an interactive prompt flow ({@code new --kind} at a terminal) and a
- * non-interactive flag-supplied flow (scripting / AI). Both feed a shared output contract: write
+ * canonical artifact: an interactive prompt flow ({@code add KIND} at a terminal) and a
+ * non-interactive flag-supplied flow (scripting / AI). The deprecated {@code new --kind} alias
+ * enters the same path. Both feed a shared output contract: write
  * {@code <id>.tap.yml}, refuse to clobber unless {@code --force}, {@code --dry-run} previews on
  * stdout, and {@code -o json|yaml} reports a structured result envelope.
  *
@@ -57,7 +58,7 @@ import java.util.function.UnaryOperator;
  */
 @Command(name = "new", mixinStandardHelpOptions = true,
         description = "Scaffold a new artifact (source, pipeline, transform, view or serve) as a canonical *.tap.yml.")
-final class NewCmd implements Callable<Integer> {
+final class NewCmd extends SingleResourceOptions implements Callable<Integer> {
 
     /** Exit code when a coded domain diagnostic is reported (e.g. the target already exists). */
     static final int EXIT_DIAGNOSTIC = 1;
@@ -74,49 +75,13 @@ final class NewCmd implements Callable<Integer> {
             description = "Recipe id from `new --list` (guided first run); omit to be asked at a terminal.")
     String recipe;
 
-    @Option(names = {"-y", "--yes", "--non-interactive"},
-            description = "Never prompt; take every answer from flags (scripting / AI).")
-    boolean nonInteractive;
-
     @Option(names = "--list",
             description = "Print the recipe catalog (id and title) instead of scaffolding; -o json|yaml for scripts.")
     boolean list;
 
     @Option(names = "--kind", paramLabel = "KIND",
-            description = "Resource kind to scaffold: source, pipeline, transform, view or serve.")
+            description = "Deprecated alias for `add KIND`: source, pipeline, transform, view or serve.")
     String kind;
-
-    @Option(names = "--type", paramLabel = "TYPE",
-            description = "Transform type (transform kind): filter, map, js, union, nest or join.")
-    String type;
-
-    @Option(names = {"-c", "--connector"}, paramLabel = "ID",
-            description = "Connector id from the catalog (source kind).")
-    String connector;
-
-    @Option(names = "--id", paramLabel = "ID",
-            description = "Top-level id of the scaffolded resource.")
-    String id;
-
-    @Option(names = {"-m", "--mode"}, paramLabel = "MODE",
-            description = "Source read mode (cdc, snapshot, stream, file, api) — must suit the connector.")
-    SourceMode mode;
-
-    @Option(names = "--primary-key", paramLabel = "FIELD",
-            description = "Field that uniquely identifies a record in a view - required for --kind view.")
-    String primaryKey;
-
-    @Option(names = "--set", paramLabel = "KEY=VALUE",
-            description = "A connector config entry (repeatable).")
-    Map<String, String> config = new LinkedHashMap<>();
-
-    @Option(names = "--source", paramLabel = "ID",
-            description = "Source id the pipeline reads from (pipeline kind; repeatable).")
-    List<String> sources = new ArrayList<>();
-
-    @Option(names = "--sync-to", paramLabel = "ID",
-            description = "Target source id to sync the pipeline output to (pipeline kind; repeatable).")
-    List<String> syncTo = new ArrayList<>();
 
     @Option(names = "--table", paramLabel = "NAME",
             description = "The table to mirror (mirrored-table recipe).")
@@ -169,23 +134,6 @@ final class NewCmd implements Callable<Integer> {
             description = "One database holding the table (consolidated-table recipe; repeatable, at least two).")
     List<String> databases = new ArrayList<>();
 
-    @Option(names = "--out", paramLabel = "DIR",
-            description = "Write the artifact flat into this exact directory, bypassing the workspace layout.")
-    String out;
-
-    @Option(names = "--force",
-            description = "Overwrite an existing artifact at the target path.")
-    boolean force;
-
-    @Option(names = "--dry-run",
-            description = "Preview the canonical artifact on stdout without writing any file.")
-    boolean dryRun;
-
-    @Option(names = {"-o", "--output"}, paramLabel = "FORMAT",
-            description = "Output format for the result report: text, json or yaml (default: text).",
-            defaultValue = "text", completionCandidates = OutputFormat.Candidates.class)
-    OutputFormat output;
-
     /** Test seam: an injected prompter forces the interactive path; production opens a JLine one. */
     Prompter prompter;
 
@@ -199,21 +147,25 @@ final class NewCmd implements Callable<Integer> {
             return callGuided(err);
         }
         if (table != null || view != null) {
-            err.println("new: --table/--view are only valid for the guided first run (new <recipe>)");
+            err.println(prefix() + ": --table/--view are only valid for the guided first run (new <recipe>)");
             err.flush();
             return EXIT_USAGE;
         }
         if (hasRecipeShapeFlags()) {
-            err.println("new: --keep/--rename/--drop/--where/--root/--key/--child/--child-connector/--child-set/--db"
+            err.println(prefix() + ": --keep/--rename/--drop/--where/--root/--key/--child/--child-connector/--child-set/--db"
                     + " are only valid for the guided first run (new <recipe>)");
             err.flush();
             return EXIT_USAGE;
         }
         String resolved = kind == null ? "source" : kind;
         if (type != null && !"transform".equals(resolved)) {
-            err.println("new: --type is only valid for --kind transform");
+            err.println(prefix() + ": --type is only valid for --kind transform");
             err.flush();
             return EXIT_USAGE;
+        }
+        if (kind != null && "new".equals(spec.name())) {
+            err.println("warning: `new --kind` is deprecated; use `tapstate add " + kind + "` instead.");
+            err.flush();
         }
         return switch (resolved) {
             case "source" -> callSource(err);
@@ -222,7 +174,7 @@ final class NewCmd implements Callable<Integer> {
             case "view" -> callView(err);
             case "serve" -> callServe(err);
             default -> {
-                err.println("new: --kind must be 'source', 'pipeline', 'transform', 'view' or 'serve'");
+                err.println(prefix() + ": --kind must be 'source', 'pipeline', 'transform', 'view' or 'serve'");
                 err.flush();
                 yield EXIT_USAGE;
             }
@@ -239,7 +191,7 @@ final class NewCmd implements Callable<Integer> {
                 || force || dryRun;
         boolean guided = recipe != null || table != null || view != null || hasRecipeShapeFlags();
         if (scaffolding || guided) {
-            err.println("new: --list cannot be combined with --kind/--type/--connector/--id/--mode/--set"
+            err.println(prefix() + ": --list cannot be combined with --kind/--type/--connector/--id/--mode/--set"
                     + "/--primary-key/--source/--sync-to/--out/--force/--dry-run, a recipe id, or guided flags");
             err.flush();
             return EXIT_USAGE;
@@ -293,6 +245,11 @@ final class NewCmd implements Callable<Integer> {
         return !nonInteractive && (prompter != null || System.console() != null);
     }
 
+    /** The same implementation is used by {@code add}; diagnostics must name the verb the user typed. */
+    private String prefix() {
+        return spec.name();
+    }
+
     /**
      * A recipe takes {@code --connector}, {@code --set} and {@code --force} in their ordinary meanings;
      * the flags that shape a single artifact by kind have no reading here and are refused.
@@ -300,13 +257,13 @@ final class NewCmd implements Callable<Integer> {
     private int callGuided(PrintWriter err) {
         if (kind != null || type != null || id != null || mode != null || !sources.isEmpty() || !syncTo.isEmpty()
                 || primaryKey != null || out != null || dryRun) {
-            err.println("new: a recipe cannot be combined with --kind/--type/--id/--mode"
+            err.println(prefix() + ": a recipe cannot be combined with --kind/--type/--id/--mode"
                     + "/--primary-key/--source/--sync-to/--out/--dry-run");
             err.flush();
             return EXIT_USAGE;
         }
         if (recipe != null && Recipe.byId(recipe).isEmpty()) {
-            err.println("new: unknown recipe '" + recipe + "'; run 'new --list' to see the catalog");
+            err.println(prefix() + ": unknown recipe '" + recipe + "'; run 'new --list' to see the catalog");
             err.flush();
             return EXIT_USAGE;
         }
@@ -322,14 +279,14 @@ final class NewCmd implements Callable<Integer> {
             emitResult(result);
             return 0;
         } catch (RecipeRun.Usage e) {
-            err.println("new: " + e.getMessage());
+            err.println(prefix() + ": " + e.getMessage());
             err.flush();
             return EXIT_USAGE;
         } catch (TapstateException e) {
             return emitDiagnostic(e);
         } catch (IOException e) {
             // only the terminal the picker is read from can raise this; the recipe itself writes later
-            err.println("new: cannot read from the terminal: " + e.getMessage());
+            err.println(prefix() + ": cannot read from the terminal: " + e.getMessage());
             err.flush();
             return EXIT_USAGE;
         }
@@ -369,14 +326,14 @@ final class NewCmd implements Callable<Integer> {
             return EXIT_USAGE;
         }
         if (!sources.isEmpty() || !syncTo.isEmpty()) {
-            err.println("new: --source/--sync-to are not valid for --kind source");
+            err.println(prefix() + ": --source/--sync-to are not valid for --kind source");
             err.flush();
             return EXIT_USAGE;
         }
         boolean interactive = prompter != null
                 || (!nonInteractive && connector == null && System.console() != null);
         if (!interactive && (id == null || connector == null)) {
-            err.println("new: provide --id and --connector, or run interactively at a terminal");
+            err.println(prefix() + ": provide --id and --connector, or run interactively at a terminal");
             err.flush();
             return EXIT_USAGE;
         }
@@ -387,7 +344,7 @@ final class NewCmd implements Callable<Integer> {
         } catch (TapstateException e) {
             return emitDiagnostic(e);
         } catch (IOException e) {
-            err.println("new: cannot write artifact: " + e.getMessage());
+            err.println(prefix() + ": cannot write artifact: " + e.getMessage());
             err.flush();
             return EXIT_USAGE;
         }
@@ -398,7 +355,7 @@ final class NewCmd implements Callable<Integer> {
             return EXIT_USAGE;
         }
         if (connector != null || mode != null || !config.isEmpty()) {
-            err.println("new: --connector/--mode/--set are not valid for --kind pipeline");
+            err.println(prefix() + ": --connector/--mode/--set are not valid for --kind pipeline");
             err.flush();
             return EXIT_USAGE;
         }
@@ -406,7 +363,7 @@ final class NewCmd implements Callable<Integer> {
         boolean interactive = prompter != null
                 || (!nonInteractive && !complete && System.console() != null);
         if (!interactive && !complete) {
-            err.println("new: provide --id, --source and --sync-to, or run interactively at a terminal");
+            err.println(prefix() + ": provide --id, --source and --sync-to, or run interactively at a terminal");
             err.flush();
             return EXIT_USAGE;
         }
@@ -416,7 +373,7 @@ final class NewCmd implements Callable<Integer> {
         } catch (TapstateException e) {
             return emitDiagnostic(e);
         } catch (IOException e) {
-            err.println("new: cannot write artifact: " + e.getMessage());
+            err.println(prefix() + ": cannot write artifact: " + e.getMessage());
             err.flush();
             return EXIT_USAGE;
         }
@@ -452,12 +409,12 @@ final class NewCmd implements Callable<Integer> {
         }
         // a transform is pure logic (X19): no connector, mode, config or pipeline-wiring flags
         if (connector != null || mode != null || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty()) {
-            err.println("new: --connector/--mode/--set/--source/--sync-to are not valid for --kind transform");
+            err.println(prefix() + ": --connector/--mode/--set/--source/--sync-to are not valid for --kind transform");
             err.flush();
             return EXIT_USAGE;
         }
         if (type != null && !TransformBodyPrompter.TYPES.contains(type)) {
-            err.println("new: --type must be one of " + String.join(", ", TransformBodyPrompter.TYPES));
+            err.println(prefix() + ": --type must be one of " + String.join(", ", TransformBodyPrompter.TYPES));
             err.flush();
             return EXIT_USAGE;
         }
@@ -465,7 +422,7 @@ final class NewCmd implements Callable<Integer> {
         boolean complete = id != null && type != null;
         boolean interactive = prompter != null || (!nonInteractive && !complete && System.console() != null);
         if (!interactive && !complete) {
-            err.println("new: provide --id and --type, or run interactively at a terminal");
+            err.println(prefix() + ": provide --id and --type, or run interactively at a terminal");
             err.flush();
             return EXIT_USAGE;
         }
@@ -475,7 +432,7 @@ final class NewCmd implements Callable<Integer> {
         } catch (TapstateException e) {
             return emitDiagnostic(e);
         } catch (IOException e) {
-            err.println("new: cannot write artifact: " + e.getMessage());
+            err.println(prefix() + ": cannot write artifact: " + e.getMessage());
             err.flush();
             return EXIT_USAGE;
         }
@@ -518,7 +475,7 @@ final class NewCmd implements Callable<Integer> {
         if (!interactive && (id == null || primaryKey == null)) {
             // Named rather than defaulted: the key is the view's unique index, and a scaffold that
             // guessed one would hand back a document that validates and indexes the wrong field.
-            err.println("new: provide --id and --primary-key, or run interactively at a terminal");
+            err.println(prefix() + ": provide --id and --primary-key, or run interactively at a terminal");
             err.flush();
             return EXIT_USAGE;
         }
@@ -529,7 +486,7 @@ final class NewCmd implements Callable<Integer> {
         } catch (TapstateException e) {
             return emitDiagnostic(e);
         } catch (IOException e) {
-            err.println("new: cannot write artifact: " + e.getMessage());
+            err.println(prefix() + ": cannot write artifact: " + e.getMessage());
             err.flush();
             return EXIT_USAGE;
         }
@@ -544,7 +501,7 @@ final class NewCmd implements Callable<Integer> {
         }
         boolean interactive = prompter != null || (!nonInteractive && id == null && System.console() != null);
         if (!interactive && id == null) {
-            err.println("new: provide --id, or run interactively at a terminal");
+            err.println(prefix() + ": provide --id, or run interactively at a terminal");
             err.flush();
             return EXIT_USAGE;
         }
@@ -554,7 +511,7 @@ final class NewCmd implements Callable<Integer> {
         } catch (TapstateException e) {
             return emitDiagnostic(e);
         } catch (IOException e) {
-            err.println("new: cannot write artifact: " + e.getMessage());
+            err.println(prefix() + ": cannot write artifact: " + e.getMessage());
             err.flush();
             return EXIT_USAGE;
         }
@@ -570,7 +527,7 @@ final class NewCmd implements Callable<Integer> {
      */
     private boolean rejectsPrimaryKey(PrintWriter err, String kindLabel) {
         if (primaryKey != null) {
-            err.println("new: --primary-key is not valid for --kind " + kindLabel);
+            err.println(prefix() + ": --primary-key is not valid for --kind " + kindLabel);
             err.flush();
             return true;
         }
@@ -579,7 +536,7 @@ final class NewCmd implements Callable<Integer> {
 
     private boolean rejectsDefinitionFlags(PrintWriter err, String kindLabel) {
         if (connector != null || mode != null || !config.isEmpty() || !sources.isEmpty() || !syncTo.isEmpty()) {
-            err.println("new: --connector/--mode/--set/--source/--sync-to are not valid for --kind " + kindLabel);
+            err.println(prefix() + ": --connector/--mode/--set/--source/--sync-to are not valid for --kind " + kindLabel);
             err.flush();
             return true;
         }

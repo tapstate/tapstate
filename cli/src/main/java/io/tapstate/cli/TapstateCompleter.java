@@ -20,10 +20,11 @@ import java.util.TreeSet;
 /**
  * Tab completion for the offline REPL. The first word completes to a verb; after {@code explain} the
  * argument completes to grammar field paths (fed by the schema), and after {@code validate} to
- * filesystem paths. The {@code new} verb's catalog-backed options complete too: {@code --connector}
- * to catalog connector ids, {@code --mode} to the read modes the connector on the line allows (the
- * capability matrix), {@code --kind} to the scaffoldable kinds, and {@code --type} to the transform
- * types. Other verbs offer no argument completion in this build.
+ * filesystem paths. The {@code new} and {@code add} verbs' catalog-backed options complete too:
+ * {@code --connector} to catalog connector ids, {@code --mode} to the read modes the connector on
+ * the line allows (the capability matrix), and {@code --type} to the transform types. {@code add}'s
+ * positional kind completes to the scaffoldable kinds. Other verbs offer no argument completion in
+ * this build.
  *
  * <p>{@link #candidates} is the pure, testable seam; {@link #complete} adapts it to JLine and
  * delegates the {@code validate} path argument to JLine's filesystem completer.
@@ -53,7 +54,8 @@ final class TapstateCompleter implements Completer {
 
     /**
      * The completion strings for a word position, by context. Word 0 completes verbs (filtered by
-     * what is typed); a {@code new} option value completes from the catalog; the first positional
+     * what is typed); a {@code new} or {@code add} option value completes from the catalog; the first
+     * positional argument after {@code add} completes a resource kind, and the first positional
      * argument after {@code explain} completes grammar field paths, regardless of any options typed
      * before it. Everything else returns nothing here ({@code validate}'s filesystem completion is
      * handled in {@link #complete}).
@@ -64,11 +66,15 @@ final class TapstateCompleter implements Completer {
             return verbs.stream().filter(v -> v.startsWith(current)).toList();
         }
         String verb = words.isEmpty() ? "" : words.get(0);
-        if ("new".equals(verb)) {
+        if ("new".equals(verb) || "add".equals(verb)) {
             List<String> values = newOptionValues(words, wordIndex);
             if (values != null) {
                 return values.stream().filter(v -> v.startsWith(current)).toList();
             }
+        }
+        if ("add".equals(verb) && isFirstPositional(words, wordIndex)) {
+            return List.of("pipeline", "serve", "source", "transform", "view").stream()
+                    .filter(v -> v.startsWith(current)).toList();
         }
         if ("explain".equals(verb) && isFirstPositional(words, wordIndex)) {
             return schema.complete(current);
@@ -77,9 +83,9 @@ final class TapstateCompleter implements Completer {
     }
 
     /**
-     * The candidate values for the {@code new} option immediately to the left of the word being
-     * completed, or {@code null} when the slot is not one of {@code new}'s catalog-backed options.
-     * {@code --mode} is narrowed to the modes allowed by the {@code --connector} already on the line.
+     * The candidate values for a scaffolding option immediately to the left of the word being
+     * completed, or {@code null} when the slot is not one of the catalog-backed options. {@code --mode}
+     * is narrowed to the modes allowed by the {@code --connector} already on the line.
      */
     private List<String> newOptionValues(List<String> words, int wordIndex) {
         if (wordIndex < 1 || wordIndex - 1 >= words.size()) {
