@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -29,7 +30,17 @@ class RealPostgresArrayUnwindIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void nativeArraysExpandAndEmptyArraysDisappearBeforeParentDeletionRemovesTheRows(Tiers tier) throws Exception {
-        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        exercise(tier, false);
+    }
+
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void aLiteralMapCannotReconstructAKeyOnlyDeleteImage(Tiers tier) throws Exception {
+        exercise(tier, true);
+    }
+
+    private void exercise(Tiers tier, boolean keyOnlyDelete) throws Exception {
+        String suffix = (keyOnlyDelete ? "key_only_" : "") + tier.name().toLowerCase(Locale.ROOT);
         // Connector state is namespaced by pipeline/node in the shared operator-state database.
         // A separate application database alone does not isolate a second tier's replication slot.
         String pipelineId = "array_unwind_" + suffix;
@@ -37,8 +48,9 @@ class RealPostgresArrayUnwindIT {
         String targetId = "array_target_" + suffix;
         Map<String, Object> postgres = SharedPostgres.settings("unwind_arrays_" + suffix);
         sql(postgres, "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer TEXT, items TEXT[])",
-                "ALTER TABLE orders REPLICA IDENTITY FULL",
-                "INSERT INTO orders VALUES (1, 'ada', ARRAY['a','b']), (2, 'lin', ARRAY[]::TEXT[])");
+                "ALTER TABLE orders REPLICA IDENTITY " + (keyOnlyDelete ? "DEFAULT" : "FULL"),
+                keyOnlyDelete ? "INSERT INTO orders VALUES (1, 'ada', ARRAY['a','b'])"
+                        : "INSERT INTO orders VALUES (1, 'ada', ARRAY['a','b']), (2, 'lin', ARRAY[]::TEXT[])");
         // Confirm the fixture exercises the JDBC carrier used by the connector's registered codec.
         try (Connection connection = SharedPostgres.connect(postgres);
                 Statement statement = connection.createStatement();
@@ -77,6 +89,16 @@ class RealPostgresArrayUnwindIT {
                     """.formatted(targetId, targetUri));
             control.apply(resources);
             control.discoverSchema(sourceId, "postgres", config);
+            String transforms = keyOnlyDelete ? """
+                      - id: listed
+                        from: [orders]
+                        type: map
+                        fields:
+                          items: "=['a', 'b']"
+                      - { id: expanded, from: listed, type: unwind, path: items, include_array_index: item_index }
+                    """ : """
+                      - { id: expanded, from: [orders], type: unwind, path: items, include_array_index: item_index }
+                    """;
             resources.put("pipeline.tap.yml", """
                     version: tapstate/v1
                     kind: pipeline
@@ -84,12 +106,11 @@ class RealPostgresArrayUnwindIT {
                     source: %s
                     settings: { read_mode: snapshot_and_cdc }
                     transforms:
-                      - { id: expanded, from: [orders], type: unwind, path: items, include_array_index: item_index }
-                    serve:
+                    %sserve:
                       from: expanded
                       sync:
                         - source: %s
-                    """.formatted(pipelineId, sourceId, targetId));
+                    """.formatted(pipelineId, sourceId, transforms, targetId));
             control.apply(resources);
             control.lifecycle(pipelineId, LifecycleVerb.START);
             Await.until("two rows from the nonempty native array",
@@ -105,6 +126,20 @@ class RealPostgresArrayUnwindIT {
                     .containsExactlyInAnyOrder("0:a", "1:b");
 
             sql(postgres, "DELETE FROM orders WHERE id = 1");
+            if (keyOnlyDelete) {
+                Await.until("the original key-only delete is refused before the map invents a list",
+                        () -> control.state(pipelineId).filter(PipelineState.FAILED::equals).isPresent(),
+                        () -> control.logs(pipelineId));
+                Await.until("the incomplete before-image diagnosis is published",
+                        () -> control.failureCode(pipelineId).isPresent(),
+                        () -> control.logs(pipelineId));
+                assertThat(control.failureCode(pipelineId))
+                        .contains("transform.unwind-needs-a-complete-before-image");
+                assertThat(mongo.documents(target, "orders"))
+                        .as("refusal emits no guessed deletes or partially changed target rows")
+                        .containsExactlyInAnyOrderElementsOf(expanded);
+                return;
+            }
             Await.until("the expanded rows disappear after deleting their parent",
                     () -> mongo.count(target, "orders") == 0,
                     () -> control.logs(pipelineId));

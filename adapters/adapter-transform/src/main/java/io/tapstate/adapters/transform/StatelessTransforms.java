@@ -1,6 +1,8 @@
 package io.tapstate.adapters.transform;
 
+import io.tapstate.core.event.Op;
 import io.tapstate.spi.transform.TransformPort;
+import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,6 +37,18 @@ public final class StatelessTransforms {
      */
     public static TransformPort unwind(UnwindSpec spec) {
         return new UnwindPort(spec, coded -> LOG.warn(coded.getMessage()));
+    }
+
+    /** Checks the source image before an upstream projection can add fields to it. */
+    public static TransformPort requireCompleteBeforeImage(
+            TransformPort delegate, String path, List<String> parentKey) {
+        List<String> key = List.copyOf(parentKey);
+        return event -> {
+            if (event.op() == Op.DELETE || event.op() == Op.UPDATE) {
+                UnwindBeforeImage.require(event, path, key);
+            }
+            return delegate.transform(event);
+        };
     }
 
     /** The {@code js} port for a GraalVM script captured as its source text. */

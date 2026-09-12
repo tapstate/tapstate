@@ -62,6 +62,96 @@ import org.junit.jupiter.api.Test;
  */
 class StoreBackedDagSourceTest {
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"qualified", "source", "multiple", "regex"})
+    void unwindBindsQualifiedReferencesAndEveryMergedSourceKey(String selection) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(cdcSource("customers_src", "customers"));
+        for (String table : List.of("orders", "customers")) {
+            String key = table.equals("orders") ? "o_id" : "c_id";
+            store.schemas.save(new DiscoveredSourceModel(table + "_src", "mysql", 1L,
+                    new SourceModel(List.of(new SourceTable(table, List.of(
+                            new SourceField(key, "bigint", TapstateType.INT64),
+                            new SourceField("items", "array", TapstateType.STRING)), List.of(key), List.of())))));
+        }
+        FromClause from = switch (selection) {
+            case "qualified" -> FromClause.list(FromRef.literal("orders_src.orders"));
+            case "source" -> FromClause.list(FromRef.literal("orders_src"));
+            case "multiple" -> FromClause.list(FromRef.literal("orders"), FromRef.literal("customers"));
+            default -> FromClause.list(FromRef.regex("orders|customers"));
+        };
+        Step.Inline expand = Step.inline("expand", from,
+                new TransformBody.Unwind("items", "item_no", false, null, null), null);
+        PipelineResource pipeline = new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true), SourceRef.spec("customers_src", true)),
+                List.of(expand), null, null, null, null);
+        var port = new StoreBackedDagSource(store).transformBinding(pipeline, expand).get();
+        List<String> streams = from.equals(FromClause.list(FromRef.literal("orders_src.orders")))
+                || from.equals(FromClause.list(FromRef.literal("orders_src")))
+                ? List.of("orders") : List.of("orders", "customers");
+        for (String stream : streams) {
+            String key = stream.equals("orders") ? "o_id" : "c_id";
+            var event = new io.tapstate.core.event.Envelope(
+                    io.tapstate.core.event.Op.UPDATE, 1L, stream,
+                    Map.of(key, 1L, "items", List.of("a")),
+                    Map.of(key, 2L, "items", List.of("a")), null);
+            org.assertj.core.api.Assertions.assertThatCode(() -> port.transform(event))
+                    .as("%s via %s", stream, from).doesNotThrowAnyException();
+            var deleted = port.transform(new io.tapstate.core.event.Envelope(
+                    io.tapstate.core.event.Op.DELETE, 1L, stream, event.before(), null, null));
+            assertThat(deleted).singleElement().satisfies(row -> {
+                assertThat(row.op()).isEqualTo(io.tapstate.core.event.Op.DELETE);
+                assertThat(row.before()).containsEntry(key, 1L);
+            });
+            assertThatThrownBy(() -> port.transform(new io.tapstate.core.event.Envelope(
+                    io.tapstate.core.event.Op.DELETE, 1L, stream, Map.of(key, 1L), null, null)))
+                    .isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+            var output = port.transform(event);
+            assertThat(output).as("%s via %s", stream, from)
+                    .extracting(io.tapstate.core.event.Envelope::op)
+                    .containsExactly(io.tapstate.core.event.Op.DELETE, io.tapstate.core.event.Op.INSERT);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"DELETE,false", "UPDATE,false", "DELETE,true", "UPDATE,true"})
+    void projectionCannotManufactureAnUnwindsBeforeImage(String operation, boolean computed) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("id", "bigint", TapstateType.INT64),
+                        new SourceField("customer", "varchar", TapstateType.STRING)), List.of("id"), List.of())))));
+        Step.Inline map = Step.inline("map", FromClause.list(FromRef.literal("orders_src.orders")),
+                new TransformBody.MapProjection(Map.of("items", computed
+                        ? FieldRule.computed("[after.id]") : FieldRule.literal(List.of("a")))), null);
+        Step.Inline rename = Step.inline("rename", FromClause.list(FromRef.literal("map")),
+                new TransformBody.MapProjection(Map.of("order_id", FieldRule.rename("id"))), null);
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("rename")),
+                new TransformBody.Unwind("items", "item_no", false, null, null), null);
+        PipelineResource pipeline = new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)), List.of(map, rename, expand),
+                null, null, null, null);
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+        var port = source.transformBinding(pipeline, map).get();
+        var op = io.tapstate.core.event.Op.valueOf(operation);
+        assertThatThrownBy(() -> port.transform(new io.tapstate.core.event.Envelope(op, 1L, "orders",
+                Map.of("id", 1L), op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null)))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+        assertThat(port.transform(new io.tapstate.core.event.Envelope(op, 1L, "orders",
+                Map.of("id", 1L, "customer", "ada"),
+                op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L, "customer", "ada") : null,
+                null))).hasSize(1);
+        PipelineResource ordinary = new PipelineResource("ordinary", null,
+                List.of(SourceRef.spec("orders_src", true)), List.of(map), null, null, null, null);
+        assertThat(source.transformBinding(ordinary, map).get().transform(
+                new io.tapstate.core.event.Envelope(op, 1L, "orders", Map.of("id", 1L),
+                        op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null))).hasSize(1);
+    }
+
     @Test
     void builds_a_real_source_transform_sink_dag_from_the_stored_pipeline() {
         FakeStorePort store = new FakeStorePort();

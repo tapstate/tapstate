@@ -771,3 +771,7 @@ cli.issuer-discovery-rejected:
 cli.auth-issuer-mismatch:
   message: "Server seed {seed} reports issuer {actual}, but {expected} was required."
   solution: "Check the context seeds and sign in again only after confirming that this is the intended cluster."
+
+actuation.unwind-parent-key-unresolved:
+  message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
+  solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."

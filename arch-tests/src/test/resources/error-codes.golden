@@ -19,6 +19,7 @@ actuation.source-table-not-discovered
 actuation.source-table-regex-invalid
 actuation.source-table-selection-empty
 actuation.source-table-spec-unsupported
+actuation.unwind-parent-key-unresolved
 actuation.view-fed-by-many-tables
 actuation.view-key-missing
 actuation.view-key-not-feed-identity

@@ -60,7 +60,10 @@ class UnwindParentKeyTest {
     }
 
     private static List<String> keyReaching(Step.Inline step, Step.Inline... chain) {
-        return StoreBackedDagSource.parentKeyReaching(step, chain(chain), ORDERS_KEYED_ON_O_ID);
+        return StoreBackedDagSource.parentKeysReaching(step, chain(chain), ref -> {
+            List<String> key = ORDERS_KEYED_ON_O_ID.apply(ref);
+            return key.isEmpty() ? Map.of() : Map.of("orders", key);
+        }).getOrDefault("orders", List.of());
     }
 
     @Test
@@ -219,6 +222,58 @@ class UnwindParentKeyTest {
                 .satisfies(e -> assertThat(e.before()).containsEntry("o_id", 7L));
         assertThat(out).filteredOn(e -> e.op() == Op.INSERT).singleElement()
                 .satisfies(e -> assertThat(e.after()).containsEntry("o_id", 8L));
+    }
+
+    @Test
+    void conflictingParentKeysFromTheSameStreamAreRefused() {
+        Step.Inline left = step("left", "orders", new TransformBody.MapProjection(
+                Map.of("left_id", FieldRule.rename("o_id"))));
+        Step.Inline right = step("right", "orders", new TransformBody.MapProjection(
+                Map.of("right_id", FieldRule.rename("o_id"))));
+        Step.Inline merged = Step.inline("expand",
+                FromClause.list(FromRef.literal("left"), FromRef.literal("right")), unwind("item_no", null), null);
+        assertThatThrownBy(() -> StoreBackedDagSource.parentKeysReaching(merged, chain(left, right, merged),
+                ref -> ref.equals(FromRef.literal("orders")) ? Map.of("orders", List.of("o_id")) : Map.of()))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+    }
+
+    @Test
+    void anUndiscoveredParentKeyCannotBecomeAnElementOnlyIdentity() {
+        Step.Inline expand = step("expand", "orders", unwind("item_no", null));
+        assertThatThrownBy(() -> StoreBackedDagSource.transformPortByStream(
+                expand, Map.of("orders", List.of()), null))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+    }
+
+    @Test
+    void streamDispatchPassesDdlAndRejectsUnexpectedDataStreams() throws Exception {
+        Step.Inline expand = step("expand", "orders", unwind("item_no", null));
+        TransformPort port = StoreBackedDagSource.transformPortByStream(
+                expand, Map.of("orders", List.of("o_id")), null).get();
+        Envelope ddl = new Envelope(Op.DDL, 1L, "schema", null, null, Map.of("change", "add"));
+        assertThat(port.transform(ddl)).containsExactly(ddl);
+        assertThatThrownBy(() -> port.transform(new Envelope(Op.READ, 1L, "unknown", null, orderRow(1L), null)))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void streamSpecificFactoriesSurviveSerializationForDagShipping() throws Exception {
+        Step.Inline expand = step("expand", "orders", unwind("item_no", null));
+        var supplier = StoreBackedDagSource.transformPortByStream(
+                expand, Map.of("orders", List.of("o_id"), "customers", List.of("c_id")), null);
+        var bytes = new java.io.ByteArrayOutputStream();
+        try (var output = new java.io.ObjectOutputStream(bytes)) {
+            output.writeObject(supplier);
+        }
+        try (var input = new java.io.ObjectInputStream(new java.io.ByteArrayInputStream(bytes.toByteArray()))) {
+            var restored = (com.hazelcast.function.SupplierEx<?>) input.readObject();
+            TransformPort port = (TransformPort) restored.get();
+            assertThat(port.transform(new Envelope(Op.DELETE, 1L, "customers",
+                    Map.of("c_id", 1L, "items", List.of("a")), null, null)))
+                    .singleElement().satisfies(row -> assertThat(row.before()).containsEntry("c_id", 1L));
+        }
     }
 
     /** One order carrying one element, under whichever key it is given. */

@@ -1126,14 +1126,160 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes),
-                step -> transformPort(step, parentKeyReaching(step, stepsById,
-                        ref -> nestTable(ref, sourceIdByTable).primaryKey())),
+                step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> sinkWriter(pipeline, element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> viewSink(pipeline, view, targets, viewStreams, sourceKeysById),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)),
                 joinBinding(compiledJoins));
+    }
+
+    SupplierEx<? extends TransformPort> transformBinding(PipelineResource pipeline, Step step) {
+        Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+        return transformBinding(step, inlineStepsById(pipeline), vertices,
+                sourceKeyByTable(vertices), sourceKeysById(vertices), stepIds(pipeline));
+    }
+
+    private SupplierEx<? extends TransformPort> transformBinding(Step step,
+            Map<String, Step.Inline> steps, Map<String, SourceVertex> vertices,
+            Map<String, String> keysByTable, Map<String, List<String>> keysBySource, Set<String> stepIds) {
+        String guardedPath = step instanceof Step.Inline inline
+                && (inline.body() instanceof TransformBody.MapProjection || inline.body() instanceof TransformBody.Js)
+                ? downstreamUnwindPath(step.id(), steps, new HashSet<>()) : null;
+        if (!(step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Unwind)
+                && guardedPath == null) {
+            return transformPort(step, List.of());
+        }
+        Map<String, List<String>> keys = parentKeysReaching(step, steps, ref -> {
+            Map<String, List<String>> byStream = new LinkedHashMap<>();
+            for (String key : upstreams(ref, keysByTable, keysBySource, vertices, stepIds)) {
+                SourceVertex vertex = vertices.get(key);
+                if (vertex != null) {
+                    List<String> primaryKey = storePort.schemas().get(vertex.sourceId())
+                            .map(DiscoveredSourceModel::model)
+                            .map(model -> discoveredTable(model, vertex.table()))
+                            .map(SourceTable::primaryKey).orElse(List.of());
+                    byStream.put(vertex.table(), primaryKey);
+                }
+            }
+            return byStream;
+        });
+        return transformPortByStream(step, keys, guardedPath);
+    }
+
+    /** Capture a serializable factory per logical stream; input tables need not share their key names. */
+    static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
+            Map<String, List<String>> parentKeys, String guardedPath) {
+        Map<String, SupplierEx<? extends TransformPort>> factories = new LinkedHashMap<>();
+        parentKeys.forEach((stream, key) -> factories.put(stream, transformPort(step, key)));
+        if (parentKeys.isEmpty()) {
+            throw unresolvedParentKey(step.id(), "unknown", "no source identity reaches this step");
+        }
+        parentKeys.forEach((stream, key) -> {
+            if (key.isEmpty()) {
+                throw unresolvedParentKey(step.id(), stream, "the source has no discovered primary key");
+            }
+        });
+        return () -> {
+            Map<String, TransformPort> ports = new LinkedHashMap<>();
+            for (var entry : factories.entrySet()) {
+                TransformPort port = entry.getValue().get();
+                if (guardedPath != null) {
+                    port = StatelessTransforms.requireCompleteBeforeImage(
+                            port, guardedPath, parentKeys.get(entry.getKey()));
+                }
+                ports.put(entry.getKey(), port);
+            }
+            return event -> {
+                if (event.op() == io.tapstate.core.event.Op.DDL) {
+                    return List.of(event);
+                }
+                TransformPort port = ports.get(event.src());
+                if (port == null) {
+                    throw new IllegalStateException("No parent-key binding for stream " + event.src());
+                }
+                return port.transform(event);
+            };
+        };
+    }
+
+    private static String downstreamUnwindPath(String id, Map<String, Step.Inline> steps, Set<String> visiting) {
+        if (!visiting.add(id)) {
+            return null;
+        }
+        for (Step.Inline next : steps.values()) {
+            boolean reads = refsOf(next.from()).stream().anyMatch(ref -> ref instanceof FromRef.Literal literal
+                    ? literal.ref().equals(id) : Pattern.matches(((FromRef.Regex) ref).pattern(), id));
+            if (!reads) {
+                continue;
+            }
+            if (next.body() instanceof TransformBody.Unwind unwind) {
+                return unwind.path();
+            }
+            if (next.body() instanceof TransformBody.MapProjection || next.body() instanceof TransformBody.Filter
+                    || next.body() instanceof TransformBody.Js || next.body() instanceof TransformBody.Union) {
+                String path = downstreamUnwindPath(next.id(), steps, visiting);
+                if (path != null) {
+                    return path;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Resolve every input separately, retaining its stream identity through projection and expansion. */
+    static Map<String, List<String>> parentKeysReaching(Step step, Map<String, Step.Inline> steps,
+            Function<FromRef, Map<String, List<String>>> sourceKeys) {
+        return step instanceof Step.Inline inline
+                ? parentKeysReaching(step.id(), inline.from(), steps, sourceKeys, new HashSet<>()) : Map.of();
+    }
+
+    private static Map<String, List<String>> parentKeysReaching(String stepId, FromClause from, Map<String, Step.Inline> steps,
+            Function<FromRef, Map<String, List<String>>> sourceKeys, Set<String> visiting) {
+        Map<String, List<String>> keys = new LinkedHashMap<>();
+        for (FromRef ref : refsOf(from)) {
+            sourceKeys.apply(ref).forEach((stream, key) -> mergeParentKey(stepId, keys, stream, key));
+            List<Step.Inline> upstreamSteps = ref instanceof FromRef.Literal literal
+                    ? steps.containsKey(literal.ref()) ? List.of(steps.get(literal.ref())) : List.of()
+                    : steps.values().stream().filter(candidate ->
+                            Pattern.matches(((FromRef.Regex) ref).pattern(), candidate.id())).toList();
+            for (Step.Inline upstream : upstreamSteps) {
+                if (!visiting.add(upstream.id())) {
+                    continue;
+                }
+                Map<String, List<String>> above = parentKeysReaching(stepId, upstream.from(), steps, sourceKeys, visiting);
+                visiting.remove(upstream.id());
+                above.forEach((stream, key) -> {
+                    List<String> current = key;
+                    if (upstream.body() instanceof TransformBody.MapProjection projection) {
+                        current = KeyProjection.renamed(current, projection.fields());
+                    } else if (upstream.body() instanceof TransformBody.Unwind unwind) {
+                        String locator = UnwindWriteKeys.elementLocator(unwind);
+                        if (locator != null && !current.isEmpty() && !current.contains(locator)) {
+                            current = new ArrayList<>(current);
+                            current.add(locator);
+                            current = List.copyOf(current);
+                        }
+                    }
+                    mergeParentKey(stepId, keys, stream, current);
+                });
+            }
+        }
+        return keys;
+    }
+
+    private static void mergeParentKey(String stepId, Map<String, List<String>> keys, String stream, List<String> key) {
+        List<String> previous = keys.putIfAbsent(stream, key);
+        if (previous != null && !previous.equals(key)) {
+            throw unresolvedParentKey(stepId, stream,
+                    "the same stream reaches this step with conflicting parent-key columns");
+        }
+    }
+
+    private static TapstateException unresolvedParentKey(String step, String stream, String reason) {
+        return new TapstateException(ActuationError.UNWIND_PARENT_KEY_UNRESOLVED,
+                Map.of("step", step, "stream", stream, "reason", reason), null);
     }
 
     /**
@@ -1840,70 +1986,6 @@ final class StoreBackedDagSource implements DagSource {
             default -> throw new IllegalStateException("transform step '" + step.id()
                     + "' has a body the linear builder does not carry: " + body.type());
         };
-    }
-
-    /**
-     * What the rows reaching one step are identified by: the discovered key of the table they come
-     * from, and the locator of every expansion between that table and here.
-     *
-     * <p><b>An expansion is why this exists.</b> It emits several rows carrying one parent's key, so
-     * the rows below it are told apart by the parent's key together with what each expansion added,
-     * and a second expansion under a first that fell back to the table's key alone would treat every
-     * row the first produced as one row. A projection can rename those columns, so their current
-     * names have to follow the projection too: the port reads the row after that projection ran.
-     * A dropped required column remains required rather than making the parent key incomplete
-     * silently; the port's before-image check reports its absence.
-     *
-     * <p>The table's key arrives as a function rather than being looked up here so that the walk is
-     * only the walk: what a table's key is comes from a discovered model this method has no business
-     * reading, and a walk that cannot be exercised without one is a walk nobody exercises.
-     */
-    static List<String> parentKeyReaching(Step step, Map<String, Step.Inline> stepsById,
-            Function<FromRef, List<String>> tableKey) {
-        return step instanceof Step.Inline inline
-                ? parentKeyReaching(inline.from(), stepsById, tableKey, new LinkedHashSet<>())
-                : List.of();
-    }
-
-    private static List<String> parentKeyReaching(FromClause from, Map<String, Step.Inline> stepsById,
-            Function<FromRef, List<String>> tableKey, Set<String> visiting) {
-        for (FromRef ref : refsOf(from)) {
-            List<String> declared = tableKey.apply(ref);
-            if (!declared.isEmpty()) {
-                return declared;
-            }
-            // A reference answering with no key is either a step or a table nothing was discovered
-            // for, and only the first has anything above it to ask.
-            if (!(ref instanceof FromRef.Literal literal)) {
-                continue;
-            }
-            Step.Inline upstream = stepsById.get(literal.ref());
-            if (upstream == null || !visiting.add(literal.ref())) {
-                continue;
-            }
-            List<String> above = parentKeyReaching(upstream.from(), stepsById, tableKey, visiting);
-            if (upstream.body() instanceof TransformBody.MapProjection projection) {
-                above = KeyProjection.renamed(above, projection.fields());
-            }
-            if (!(upstream.body() instanceof TransformBody.Unwind unwind)) {
-                if (!above.isEmpty()) {
-                    return above;
-                }
-                continue;
-            }
-            String locator = UnwindWriteKeys.elementLocator(unwind);
-            // An expansion adds to a key; it does not make one. Where nothing above could say what
-            // identifies the parent, appending the locator alone would answer with a key that has
-            // no parent in it - under which two parents whose lists share an element are one row -
-            // and it would answer confidently. Empty stays the single way of saying nobody could.
-            if (locator == null || above.isEmpty() || above.contains(locator)) {
-                return above;
-            }
-            List<String> key = new ArrayList<>(above);
-            key.add(locator);
-            return key;
-        }
-        return List.of();
     }
 
     /** Every inline step of a pipeline by its id, for walking a {@code from:} chain by reference. */

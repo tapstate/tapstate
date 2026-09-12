@@ -5,7 +5,7 @@ source: src_mysql
 settings: { read_mode: snapshot_and_cdc }
 transforms:
   - id: listed
-    from: [orders]
+    from: [src_mysql.orders]
     type: map
     fields:
       items: "=[{'sku': 'a'}, {'sku': 'b'}]"
