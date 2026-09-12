@@ -638,6 +638,53 @@ class E2eExecutorTest {
                 + "expect: { seq: 7 } } } }\n"));
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {2, 4})
+    void goldenPathWaitsForEachRootsInitialChildren(int delayedRoot) throws Exception {
+        AtomicInteger delayedReads = goldenPathDocuments(delayedRoot, false);
+        executeGoldenPathSnapshot();
+        assertThat(delayedReads.get()).isGreaterThanOrEqualTo(2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {2, 4})
+    void goldenPathStillRejectsChildrenThatNeverArrive(int delayedRoot) {
+        goldenPathDocuments(delayedRoot, true);
+        assertThatThrownBy(this::executeGoldenPathSnapshot)
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("timed out")
+                .hasMessageContaining("shipments expected " + (delayedRoot == 2 ? 2 : 1) + " elements, found 0");
+    }
+
+    private AtomicInteger goldenPathDocuments(int delayedRoot, boolean neverArrives) {
+        binding.countsOverTime(new TableAlias("views", "order_state"), 5L);
+        AtomicInteger delayedReads = new AtomicInteger();
+        binding.documentReader = (table, where) -> {
+            int id = ((Number) where.get("id")).intValue();
+            int children = switch (id) {
+                case 1, 2 -> 2;
+                case 3, 4 -> 1;
+                default -> 0;
+            };
+            if (id == delayedRoot && (delayedReads.incrementAndGet() == 1 || neverArrives)) {
+                children = 0;
+            }
+            return Optional.of(Map.of("id", id,
+                    "customer", List.of("alice", "bob", "carol", "dave", "erin").get(id - 1),
+                    "shipments", java.util.Collections.nCopies(children, Map.of("id", 1))));
+        };
+        return delayedReads;
+    }
+
+    private void executeGoldenPathSnapshot() throws Exception {
+        Envelope published = EnvelopeParser.parse(java.nio.file.Files.readString(java.nio.file.Path.of(
+                "examples/the-golden-path-two-engines-become-one-object/spec.e2e.yml")));
+        // Exercise the published snapshot checks without replacing their matchers or waiting policy.
+        List<Step> snapshot = published.steps().stream().takeWhile(step -> !(step instanceof Step.Cdc)).toList();
+        new E2eExecutor(binding, path -> "order_pipeline", Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(new Envelope(published.name(), published.setup(), published.pipeline(), published.seed(), snapshot));
+    }
+
     private void execute(String yaml) {
         binding.calls.clear();
         new E2eExecutor(binding, path -> PIPELINE_ID, Duration.ofMillis(200), Duration.ofMillis(1))
@@ -768,6 +815,8 @@ class E2eExecutorTest {
         }
 
         private final Map<TableAlias, Map<String, Object>> fetchable = new HashMap<>();
+        private java.util.function.BiFunction<TableAlias, Map<String, Object>, Optional<Map<String, Object>>>
+                documentReader;
 
         void holdsDocument(TableAlias table, Map<String, Object> document) {
             fetchable.put(table, document);
@@ -776,7 +825,7 @@ class E2eExecutorTest {
         @Override
         public Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where) {
             calls.add("fetch:" + table + "=" + where);
-            return Optional.ofNullable(fetchable.get(table));
+            return documentReader == null ? Optional.ofNullable(fetchable.get(table)) : documentReader.apply(table, where);
         }
 
         @Override
