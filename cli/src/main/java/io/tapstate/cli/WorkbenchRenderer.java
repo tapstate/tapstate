@@ -68,11 +68,17 @@ final class WorkbenchRenderer {
         HeaderLayout header = renderHeaderAndTabs(frame, area, state, wide, theme);
         Rect contentArea = new Rect(
                 area.x(), area.y() + CONTENT_Y, area.width(), Math.max(0, footerY - (area.y() + CONTENT_Y)));
-        ContentLayout content = renderContent(frame, contentArea, state, wide, theme);
+        Optional<WorkbenchOverlayState.SourceCreate> sourceCreate = state.overlay()
+                .filter(WorkbenchOverlayState.SourceCreate.class::isInstance)
+                .map(WorkbenchOverlayState.SourceCreate.class::cast);
+        ContentLayout content = sourceCreate
+                .map(source -> renderSourceCreatePage(frame, contentArea, source, theme))
+                .orElseGet(() -> renderContent(frame, contentArea, state, wide, theme));
         FooterLayout footer = renderFooter
                 ? renderFooter(frame, area, footerY, state, theme)
                 : new FooterLayout(List.of());
         List<OverlayHit> overlayHits = state.overlay()
+                .filter(overlay -> !(overlay instanceof WorkbenchOverlayState.SourceCreate))
                 .map(overlay -> renderOverlay(frame, area, overlay, theme))
                 .orElseGet(List::of);
         return new RenderLayout(
@@ -164,7 +170,8 @@ final class WorkbenchRenderer {
 
     private static List<OverlayHit> renderOverlay(
             Frame frame, Rect area, WorkbenchOverlayState overlay, WorkbenchTheme theme) {
-        int width = Math.min(60, area.width() - 8);
+        int width = overlay instanceof WorkbenchOverlayState.Actions ? Math.min(40, area.width() - 8)
+                : Math.min(60, area.width() - 8);
         int contentRows = switch (overlay) {
             case WorkbenchOverlayState.More ignored -> 3;
             case WorkbenchOverlayState.ContextPicker picker ->
@@ -179,13 +186,14 @@ final class WorkbenchRenderer {
         };
         int height = contentRows + 2;
         int x = area.x() + (area.width() - width) / 2;
-        int y = area.y() + (area.height() - height) / 2;
+        int y = overlay instanceof WorkbenchOverlayState.Actions
+                ? area.y() + 2 : area.y() + (area.height() - height) / 2;
         Rect box = new Rect(x, y, width, height);
         renderOpaquePopupSurface(frame, box, theme);
         Block block = Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
-                .borderStyle(theme.accent())
+                .borderStyle(overlay instanceof WorkbenchOverlayState.Actions ? theme.base() : theme.accent())
                 .title(Title.from(Line.from(Span.styled(
                         " " + overlayTitle(overlay) + " ", theme.title()))))
                 .build();
@@ -321,14 +329,19 @@ final class WorkbenchRenderer {
         if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
                 || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) {
             List<String> options = source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
-                    ? source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id).toList()
+                    ? source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id)
+                            .filter(id -> id.toLowerCase(Locale.ROOT)
+                                    .contains(source.filter().toLowerCase(Locale.ROOT))).toList()
                     : source.catalog().connectors().stream()
                             .filter(connector -> connector.id().equals(source.connector()))
                             .findFirst().map(WorkbenchActionGateway.SourceConnector::modes).orElse(List.of());
-            for (int index = 0; index < Math.min(4, options.size()); index++) {
+            int visible = Math.min(4, options.size());
+            int first = Math.clamp(source.selectedIndex() - visible / 2, 0, Math.max(0, options.size() - visible));
+            for (int offset = 0; offset < visible; offset++) {
+                int index = first + offset;
                 boolean selected = index == source.selectedIndex();
-                write(frame, box.x() + 4, box.y() + 3 + index,
-                        (selected ? "> " : "  ") + options.get(index),
+                write(frame, box.x() + 4, box.y() + 3 + offset,
+                        (selected ? "  " : "  ") + options.get(index),
                         selected ? theme.selection() : theme.base(), area);
             }
         } else {
@@ -343,6 +356,104 @@ final class WorkbenchRenderer {
         source.message().ifPresent(message -> write(
                 frame, box.x() + 2, box.y() + box.height() - 2, message, theme.error(), area));
         return List.of();
+    }
+
+    private static ContentLayout renderSourceCreatePage(
+            Frame frame,
+            Rect area,
+            WorkbenchOverlayState.SourceCreate source,
+            WorkbenchTheme theme) {
+        Block block = Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(theme.base())
+                .title(Title.from(Line.from(Span.styled(" ✨ New Source ", theme.title()))))
+                .build();
+        frame.renderWidget(block, area);
+        Rect inner = block.inner(area);
+        int leftWidth = Math.clamp(inner.width() / 2, 34, 50);
+        Rect formArea = new Rect(inner.x(), inner.y(), leftWidth, inner.height());
+        Rect previewArea = new Rect(inner.x() + leftWidth + 1, inner.y(),
+                Math.max(0, inner.width() - leftWidth - 1), inner.height());
+        int y = formArea.y();
+        write(frame, formArea.x(), y++, "Guided authoring", theme.label().bold(), formArea);
+        y++;
+        renderSourcePageField(frame, formArea, y++, "1", "Connector", source.connector(),
+                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR, theme);
+        renderSourcePageField(frame, formArea, y++, "2", "Read mode", source.mode(),
+                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE, theme);
+        renderSourcePageField(frame, formArea, y++, "3", "Tables", source.tables().isBlank() ? "All tables" : source.tables(),
+                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES, theme);
+        renderSourcePageField(frame, formArea, y++, "4", "Resource id", source.id(),
+                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.ID, theme);
+        y++;
+        if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) {
+            List<String> options = source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                    ? source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id)
+                            .filter(id -> id.toLowerCase(Locale.ROOT)
+                                    .contains(source.filter().toLowerCase(Locale.ROOT))).toList()
+                    : source.catalog().connectors().stream()
+                            .filter(connector -> connector.id().equals(source.connector()))
+                            .findFirst().map(WorkbenchActionGateway.SourceConnector::modes).orElse(List.of());
+            if (options.isEmpty()) {
+                write(frame, formArea.x() + 2, y, source.pending() ? "Loading connectors..." : "No matching connectors.",
+                        theme.muted(), formArea);
+            } else {
+                int visible = Math.max(1, Math.min(options.size(), formArea.bottom() - y - 2));
+                int first = Math.clamp(source.selectedIndex() - visible / 2, 0, Math.max(0, options.size() - visible));
+                for (int offset = 0; offset < visible; offset++) {
+                    int index = first + offset;
+                    write(frame, formArea.x() + 2, y + offset, pad(options.get(index), formArea.width() - 2),
+                            index == source.selectedIndex() ? theme.selection() : theme.base(), formArea);
+                }
+            }
+            write(frame, formArea.x(), formArea.bottom() - 1,
+                    source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                            ? "Filter: " + source.filter() + "  ↑↓ navigate"
+                            : "↑↓ navigate", theme.muted(), formArea);
+        } else {
+            String hint = switch (source.stage()) {
+                case TABLES -> "Comma-separated names, /regex/, or leave blank for all.";
+                case ID -> "Choose a stable local identifier.";
+                case PREVIEW -> "Review the canonical artifact before creating it.";
+                default -> "";
+            };
+            write(frame, formArea.x(), y, hint, theme.muted(), formArea);
+        }
+        Block previewBlock = Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
+                        ? theme.accent() : theme.base())
+                .title(Title.from(Line.from(Span.styled(" Canonical YAML ", theme.title()))))
+                .build();
+        frame.renderWidget(previewBlock, previewArea);
+        Rect previewInner = previewBlock.inner(previewArea);
+        String yaml = source.canonicalYaml().orElse("Preview appears after the resource id is confirmed.");
+        String[] lines = yaml.split("\\R");
+        for (int index = 0; index < Math.min(lines.length, previewInner.height()); index++) {
+            write(frame, previewInner.x(), previewInner.y() + index, lines[index], theme.base(), previewInner);
+        }
+        source.message().ifPresent(message -> write(
+                frame, formArea.x(), formArea.bottom() - 1, message, theme.error(), formArea));
+        return new ContentLayout(List.of(), Math.max(1, formArea.height()));
+    }
+
+    private static void renderSourcePageField(
+            Frame frame,
+            Rect area,
+            int y,
+            String step,
+            String label,
+            String value,
+            boolean active,
+            WorkbenchTheme theme) {
+        Style labelStyle = active ? theme.title().bold() : theme.muted();
+        int x = area.x();
+        x += write(frame, x, y, step + " ", active ? theme.accent() : theme.muted(), area);
+        x += write(frame, x, y, label + ": ", labelStyle, area);
+        write(frame, x, y, value, active ? theme.base().bold() : theme.base(), area);
     }
 
     private static List<OverlayHit> renderConfirm(
@@ -405,7 +516,7 @@ final class WorkbenchRenderer {
             WorkbenchOverlayState.Actions.Action action = actions.actions().get(index);
             int rowY = box.y() + 1 + index;
             boolean selected = index == actions.selectedIndex();
-            String line = (selected ? "> " : "  ") + action.label() + "  " + action.description();
+            String line = "  " + action.label();
             int width = write(frame, box.x() + 2, rowY, line,
                     selected ? theme.selection() : theme.base(), area);
             hits.add(new OverlayHit(index, new Rect(box.x() + 2, rowY, width, 1)));
@@ -445,7 +556,7 @@ final class WorkbenchRenderer {
         Block block = Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
-                .borderStyle(theme.accent())
+                .borderStyle(theme.base())
                 .title(Title.from(Line.from(Span.styled(
                         " " + state.selectedTab().label() + " ", theme.title()))))
                 .build();
@@ -610,7 +721,7 @@ final class WorkbenchRenderer {
         return Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
-                .borderStyle(focused ? theme.accent() : theme.muted())
+                .borderStyle(focused ? theme.accent() : theme.base())
                 .title(Title.from(Line.from(Span.styled(
                         " " + title + " ", focused ? theme.title() : theme.muted()))))
                 .build();
@@ -1011,6 +1122,12 @@ final class WorkbenchRenderer {
                             new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
                             new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
             };
+        }
+        if (state.overlay().isEmpty()) {
+            List<FooterHint> rootHints = new ArrayList<>(hints.size() + 1);
+            rootHints.add(new FooterHint("F2", "actions", Optional.empty()));
+            rootHints.addAll(hints);
+            hints = List.copyOf(rootHints);
         }
         int x = area.x();
         List<FooterHit> hits = new ArrayList<>();

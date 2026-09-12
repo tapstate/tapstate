@@ -7,6 +7,7 @@ import dev.tamboui.tui.TuiRunner;
 import dev.tamboui.tui.event.Event;
 import dev.tamboui.tui.event.KeyEvent;
 import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.tui.event.MouseEventKind;
 import dev.tamboui.tui.event.PasteEvent;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
@@ -302,7 +303,17 @@ final class Workbench {
                 }
                 return runtime.updateState(state -> state.reduce(key, visibleRows()));
             }
-            if (event instanceof MouseEvent mouse && mouse.isClick()) {
+            if (event instanceof MouseEvent mouse) {
+                if (mouse.kind() == MouseEventKind.SCROLL_UP || mouse.kind() == MouseEventKind.SCROLL_DOWN) {
+                    int direction = mouse.kind() == MouseEventKind.SCROLL_UP ? -1 : 1;
+                    return runtime.updateState(state -> state.reduce(
+                            KeyEvent.ofKey(direction < 0
+                                    ? dev.tamboui.tui.event.KeyCode.UP : dev.tamboui.tui.event.KeyCode.DOWN),
+                            visibleRows()));
+                }
+                if (!mouse.isClick()) {
+                    return false;
+                }
                 var action = layout.actionAt(mouse.x(), mouse.y());
                 if (action.isPresent()) {
                     return switch (action.orElseThrow()) {
@@ -472,7 +483,29 @@ final class Workbench {
             if (event instanceof PasteEvent paste) {
                 return handleOverlayPaste(overlay, paste.text());
             }
-            if (event instanceof MouseEvent mouse && mouse.isClick()) {
+            if (event instanceof MouseEvent mouse) {
+                if (mouse.kind() == MouseEventKind.SCROLL_UP || mouse.kind() == MouseEventKind.SCROLL_DOWN) {
+                    int direction = mouse.kind() == MouseEventKind.SCROLL_UP ? -1 : 1;
+                    return switch (overlay) {
+                        case WorkbenchOverlayState.Actions actions -> runtime.updateState(state ->
+                                state.withOverlay(actions.select(actions.selectedIndex() + direction)));
+                        case WorkbenchOverlayState.SourceCreate source
+                                when source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                                || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE -> {
+                            List<String> choices = sourceChoices(source);
+                            if (choices.isEmpty()) {
+                                yield true;
+                            }
+                            int selected = Math.floorMod(source.selectedIndex() + direction, choices.size());
+                            yield updateSourceCreate(source, source.stage(), selected, source.connector(), source.mode(),
+                                    source.tables(), source.id(), source.canonicalYaml(), false, source.message());
+                        }
+                        default -> true;
+                    };
+                }
+                if (!mouse.isClick()) {
+                    return true;
+                }
                 Optional<WorkbenchRenderer.FooterAction> footerAction = layout.footerActionAt(mouse.x(), mouse.y());
                 if (footerAction.isPresent()) {
                     return handleFooterAction(footerAction.orElseThrow(), runner);
@@ -491,8 +524,8 @@ final class Workbench {
                         case WorkbenchOverlayState.SourceCreate ignored -> true;
                         case WorkbenchOverlayState.Confirm ignored -> true;
                         case WorkbenchOverlayState.Login ignored -> true;
-                        case WorkbenchOverlayState.Actions actions -> runtime.updateState(state ->
-                                state.withOverlay(actions.select(index)));
+                        case WorkbenchOverlayState.Actions actions -> handleActionsKey(
+                                actions.select(index), KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER));
                     case WorkbenchOverlayState.Help ignored -> true;
                 };
             }
@@ -791,12 +824,16 @@ final class Workbench {
             if ((source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
                     || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) && (key.isUp() || key.isDown())) {
                 List<String> choices = sourceChoices(source);
+                if (choices.isEmpty()) {
+                    return true;
+                }
                 int next = Math.floorMod(source.selectedIndex() + (key.isUp() ? -1 : 1), choices.size());
                 return updateSourceCreate(source, source.stage(), next, source.connector(), source.mode(),
                         source.tables(), source.id(), Optional.empty(), false, Optional.empty());
             }
             if (key.isDeleteBackward()) {
                 return switch (source.stage()) {
+                    case CONNECTOR -> updateSourceFilter(source, deleteLastCodePoint(source.filter()));
                     case TABLES -> updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(),
                             source.mode(), deleteLastCodePoint(source.tables()), source.id(), Optional.empty(), false,
                             Optional.empty());
@@ -816,8 +853,16 @@ final class Workbench {
         }
 
         private boolean appendSourceCreateText(WorkbenchOverlayState.SourceCreate source, String text) {
-            if (source.pending() || (source.stage() != WorkbenchOverlayState.SourceCreate.Stage.TABLES
-                    && source.stage() != WorkbenchOverlayState.SourceCreate.Stage.ID)) {
+            if (source.pending()) {
+                return true;
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR) {
+                StringBuilder filter = new StringBuilder(source.filter());
+                text.codePoints().filter(codePoint -> !Character.isISOControl(codePoint)).forEach(filter::appendCodePoint);
+                return updateSourceFilter(source, filter.toString());
+            }
+            if (source.stage() != WorkbenchOverlayState.SourceCreate.Stage.TABLES
+                    && source.stage() != WorkbenchOverlayState.SourceCreate.Stage.ID) {
                 return true;
             }
             StringBuilder value = new StringBuilder(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES
@@ -832,7 +877,11 @@ final class Workbench {
 
         private boolean advanceSourceCreate(WorkbenchOverlayState.SourceCreate source) {
             if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR) {
-                String connector = sourceChoices(source).get(source.selectedIndex());
+                List<String> choices = sourceChoices(source);
+                if (choices.isEmpty()) {
+                    return updateSourceFilter(source, source.filter());
+                }
+                String connector = choices.get(source.selectedIndex());
                 String mode = source.catalog().connectors().stream().filter(item -> item.id().equals(connector))
                         .findFirst().orElseThrow().modes().getFirst();
                 return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.MODE, 0, connector, mode,
@@ -871,7 +920,9 @@ final class Workbench {
 
         private List<String> sourceChoices(WorkbenchOverlayState.SourceCreate source) {
             if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR) {
-                return source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id).toList();
+                String filter = source.filter().toLowerCase(java.util.Locale.ROOT);
+                return source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id)
+                        .filter(id -> id.toLowerCase(java.util.Locale.ROOT).contains(filter)).toList();
             }
             return source.catalog().connectors().stream().filter(item -> item.id().equals(source.connector()))
                     .findFirst().orElseThrow().modes();
@@ -889,7 +940,19 @@ final class Workbench {
                 boolean pending,
                 Optional<String> message) {
             return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
-                    source.catalog(), stage, selectedIndex, connector, mode, tables, id, yaml, pending, message)));
+                    source.catalog(), stage, selectedIndex, source.filter(), connector, mode, tables, id, yaml, pending, message)));
+        }
+
+        private boolean updateSourceFilter(WorkbenchOverlayState.SourceCreate source, String filter) {
+            List<String> choices = source.catalog().connectors().stream()
+                    .map(WorkbenchActionGateway.SourceConnector::id)
+                    .filter(id -> id.toLowerCase(java.util.Locale.ROOT)
+                            .contains(filter.toLowerCase(java.util.Locale.ROOT)))
+                    .toList();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), source.stage(), choices.isEmpty() ? 0 : Math.min(source.selectedIndex(), choices.size() - 1),
+                    filter, source.connector(), source.mode(), source.tables(), source.id(), source.canonicalYaml(),
+                    false, choices.isEmpty() ? Optional.of("No connectors match this filter") : Optional.empty())));
         }
 
         private void previewSource(WorkbenchOverlayState.SourceCreate source) {
@@ -952,8 +1015,8 @@ final class Workbench {
         private void restoreSourceCreate(
                 WorkbenchOverlayState.SourceCreate source, Optional<String> message) {
             runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(source.catalog(),
-                    source.stage(), source.selectedIndex(), source.connector(), source.mode(), source.tables(), source.id(),
-                    source.canonicalYaml(), false, message)));
+                    source.stage(), source.selectedIndex(), source.filter(), source.connector(), source.mode(),
+                    source.tables(), source.id(), source.canonicalYaml(), false, message)));
         }
 
         private boolean handleLoginKey(WorkbenchOverlayState.Login login, KeyEvent key) {

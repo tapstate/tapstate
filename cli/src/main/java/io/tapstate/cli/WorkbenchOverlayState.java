@@ -99,6 +99,7 @@ sealed interface WorkbenchOverlayState
             WorkbenchActionGateway.SourceCatalog catalog,
             Stage stage,
             int selectedIndex,
+            String filter,
             String connector,
             String mode,
             String tables,
@@ -109,12 +110,27 @@ sealed interface WorkbenchOverlayState
         public SourceCreate {
             Objects.requireNonNull(catalog, "catalog");
             Objects.requireNonNull(stage, "stage");
+            Objects.requireNonNull(filter, "filter");
             Objects.requireNonNull(connector, "connector");
             Objects.requireNonNull(mode, "mode");
             Objects.requireNonNull(tables, "tables");
             Objects.requireNonNull(id, "id");
             Objects.requireNonNull(canonicalYaml, "canonicalYaml");
             Objects.requireNonNull(message, "message");
+        }
+
+        SourceCreate(
+                WorkbenchActionGateway.SourceCatalog catalog,
+                Stage stage,
+                int selectedIndex,
+                String connector,
+                String mode,
+                String tables,
+                String id,
+                Optional<String> canonicalYaml,
+                boolean pending,
+                Optional<String> message) {
+            this(catalog, stage, selectedIndex, "", connector, mode, tables, id, canonicalYaml, pending, message);
         }
 
         enum Stage {
@@ -213,11 +229,11 @@ sealed interface WorkbenchOverlayState
         }
 
         enum Action {
-            CONTEXT("Context", "Choose or create a context"),
-            AUTHENTICATION("Authentication", "Sign in to the selected server"),
-            NEW_SOURCE("New Source", "Create a local source artifact"),
-            REFRESH("Refresh", "Load the latest workspace snapshot"),
-            SHELL("Shell", "Open the embedded command session");
+            CONTEXT("🧭  Context", "Choose or create a context"),
+            AUTHENTICATION("🔐  Authentication", "Sign in to the selected server"),
+            NEW_SOURCE("✨  New Source", "Create a local source artifact"),
+            REFRESH("↻  Refresh", "Load the latest workspace snapshot"),
+            SHELL(">_  Shell (F6)", "Open the embedded command session");
 
             private final String label;
             private final String description;
