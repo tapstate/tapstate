@@ -472,11 +472,11 @@ main() {
     #
     # Applying the source twice is free; the second apply reports it unchanged.
     #
-    # The REPL's output is captured so a failed login can be named here. It cannot be left to the row
-    # count below: that check fires half a minute later and says "the target is empty", which sends the
-    # reader to the server log to investigate a pipeline that was never started. Authentication is also
-    # the one failure that cascades -- every verb after it reports cli.not-authenticated, so the real
-    # cause ends up at the top of a screen of consequences.
+    # The REPL's output is captured so a failed login can be named here, and so a failed verb is seen at
+    # all. Neither can be left to the row count below: that check fires half a minute later and says "the
+    # target is empty", which sends the reader to the server log to investigate a pipeline that was never
+    # started. Authentication is also the one failure that cascades -- every verb after it reports
+    # cli.not-authenticated, so the real cause ends up at the top of a screen of consequences.
     admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
     repl_status=0
     repl_out="$(printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nregister ../mysql-connector.jar\nregister ../mongodb-connector.jar\nregister ../postgres-connector.jar\napply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' "$admin_pw" \
@@ -511,12 +511,31 @@ main() {
                     die "the CLI could not log in, so no verb after it ran; inspect it with: docker compose logs bootstrap" ;;
             esac ;;
     esac
-    # Anything else the CLI failed on. Without this the two named cases are the only failures that stop
-    # the script, and every other one -- including a crash -- falls through to the row-count wait, which
-    # then reports an empty target half a minute later and sends the reader to the server log to
-    # investigate a pipeline that was never started.
+    # Anything else the CLI failed on. Two guards, because what one can see the other cannot.
+    #
+    # A CLI that died -- a crash, a kill -- is what the exit status is for, and the failure it names is
+    # the process, not the verb: the session ended, so nothing after it ran at all.
     if [ "$repl_status" -ne 0 ]; then
         die "the CLI exited $repl_status before the pipeline was started; its output is above"
+    fi
+    # A verb that failed is what the exit status cannot see, and it is the case a session produces: a
+    # rejected line is printed and the read loop takes the next one, so a session in which nothing worked
+    # ends exactly the way a healthy one does -- 0. That is how a refused connector registration reached
+    # the row-count wait, which then reported an empty target and sent the reader to the server log, half
+    # a minute later, for a failure that was neither there nor the server's.
+    #
+    # The verbs' own output carries what the status cannot, in one of two shapes. A failure the CLI can
+    # name is a coded diagnostic and opens with `error: <code>`, the header every face of the CLI renders
+    # failures with. A refusal whose response body carried no code has none to open with, and arrives as
+    # the client's own sentence for it -- `The server refused ...` -- under the same indent a message
+    # gets, with no header at all. That is the shape the reported registration refusal took, so a guard
+    # reading the header alone would have let exactly that one through. Either shape means a verb the run
+    # depends on did not take, and the run stops at it rather than half a minute later at the row count.
+    #
+    # A server that stopped answering is deliberately not read here. It is not the misreport this answers:
+    # the target really is empty and the server is really where to look, which is what the row count says.
+    if printf '%s\n' "$repl_out" | grep -q -e 'error: ' -e 'The server refused '; then
+        die "a verb failed before the pipeline was started; the CLI's output is above"
     fi
 
     # Snapshot verification, printed automatically: the demo's payoff is a real row count in the target,

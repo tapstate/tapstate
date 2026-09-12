@@ -659,6 +659,41 @@ else
   bad "the stale-admin remedy leaked into an unrelated auth failure (rc=$RUN_RC): $RUN_OUT"
 fi
 
+# A verb the server refused has to stop the run where it was refused, and the session's exit status is
+# the one thing that cannot do it: a rejected line is printed and the read loop takes the next one, so a
+# session in which nothing worked ends exactly the way a healthy one does, with 0. Reported from a
+# from-scratch install of a published release, where a refused connector registration went through to the
+# row-count wait and came out half a minute later as "the two engines were not assembled ... docker
+# compose logs server" -- for a failure several steps earlier that was not the server's. The
+# discriminating part, as in the auth cases above, is that the run below delivers its rows: a check that
+# merely required a non-zero exit would pass on the row count alone.
+#
+# The two shapes a refusal can take are pinned separately, because the script reads them with two
+# different patterns. A failure the CLI can name is a coded diagnostic, and opens with the `error: <code>`
+# header every face of the CLI renders failures with. A refusal whose response body carried no code has
+# none to open with and arrives as the client's own sentence for it, under the same indent a message
+# gets -- which is the shape the reported one took, since all that is known of its body is that nothing
+# in it could be read as a code.
+FAKE_CLI_OUT='  The server refused the connector registration.' run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'were not assembled' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'docker compose logs server'; then
+  ok "a refusal the CLI could not put a code on stops the run where it was refused"
+else
+  bad "an uncoded refusal reached the row count (rc=$RUN_RC): $RUN_OUT"
+fi
+FAKE_CLI_OUT="error: connector.not-registered
+  No connector 'postgres' is registered." run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'were not assembled' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'docker compose logs server'; then
+  ok "a coded refusal in the session's output stops the run too"
+else
+  bad "a coded refusal reached the row count (rc=$RUN_RC): $RUN_OUT"
+fi
+
 # A run whose online verbs did not take must fail, loudly and non-zero. The REPL is the reason this
 # needs its own check: an interactive session does not end because one command was rejected, so it
 # exits 0 whether register / apply / start succeeded or errored, and set -e sees nothing wrong. The
