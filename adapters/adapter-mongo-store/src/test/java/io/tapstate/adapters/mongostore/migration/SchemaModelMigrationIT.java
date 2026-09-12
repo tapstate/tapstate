@@ -79,7 +79,7 @@ class SchemaModelMigrationIT {
                 .sort(new Document("order", 1)).into(new ArrayList<>());
         moved.forEach(table -> { table.remove("_id"); table.remove("generation"); table.remove("order"); });
         assertThat(moved).containsExactlyElementsOf(old.getList("tables", Document.class));
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(6);
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
         assertThat(SystemCollections.DERIVED_SCHEMAS.on(database)
                 .find(new Document("_id", "pipeline.src.orders")).first()).isNotNull();
     }
@@ -246,7 +246,7 @@ class SchemaModelMigrationIT {
         assertThat(snapshot(sources)).containsExactly(bad);
         sources.replaceOne(new Document("_id", "source"), source("source"));
         migrateAtStartup(database);
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(6);
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
     }
 
     @Test

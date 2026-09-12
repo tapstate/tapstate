@@ -278,6 +278,18 @@ class CanonicalWriterTest {
     class PipelineResources {
 
         @Test
+        void retainsRequiredSourceForBlankEditorDraft() {
+            PipelineResource p = new PipelineResource("blank", null, List.of(), null, null, null, null, null);
+
+            assertThat(writer.write(p)).isEqualTo("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: blank
+                    source: []
+                    """);
+        }
+
+        @Test
         void omitsConstantDefaultsInSyncElements() {
             // canonical-form.md sample B: write_mode upsert and auto_create_table true are
             // documented constant defaults (§4) — dropped; ddl apply is non-default — kept.
