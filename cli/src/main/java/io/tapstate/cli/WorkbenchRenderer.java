@@ -79,7 +79,8 @@ final class WorkbenchRenderer {
                 : new FooterLayout(List.of());
         List<OverlayHit> overlayHits = state.overlay()
                 .filter(overlay -> !(overlay instanceof WorkbenchOverlayState.SourceCreate))
-                .map(overlay -> renderOverlay(frame, area, overlay, theme))
+                .map(overlay -> renderOverlay(frame,
+                        overlay instanceof WorkbenchOverlayState.Actions ? contentArea : area, overlay, theme))
                 .orElseGet(List::of);
         return new RenderLayout(
                 false, wide, content.visibleRows(), header.tabHits(), content.rowHits(),
@@ -150,11 +151,14 @@ final class WorkbenchRenderer {
             Style style = tab == state.selectedTab()
                     ? theme.accentBackground()
                     : theme.muted();
-            int width = write(frame, x, area.y() + TAB_LABELS_Y, label, style, area);
+            int tabStart = x;
+            x += write(frame, x, area.y() + TAB_LABELS_Y, tabIcon(tab) + "  ", style, area);
+            x += write(frame, x, area.y() + TAB_LABELS_Y, tabNumber(tab), style.underlined(), area);
+            x += write(frame, x, area.y() + TAB_LABELS_Y, " " + tabName(tab), style, area);
+            int width = x - tabStart;
             if (width > 0) {
-                hits.add(new TabHit(tab, new Rect(x, area.y() + TAB_LABELS_Y, width, 1)));
+                hits.add(new TabHit(tab, new Rect(tabStart, area.y() + TAB_LABELS_Y, width, 1)));
             }
-            x += width;
             x += write(frame, x, area.y() + TAB_LABELS_Y, divider, theme.muted(), area);
         }
         int moreX = x;
@@ -190,13 +194,15 @@ final class WorkbenchRenderer {
                 ? area.y() + 2 : area.y() + (area.height() - height) / 2;
         Rect box = new Rect(x, y, width, height);
         renderOpaquePopupSurface(frame, box, theme);
-        Block block = Block.builder()
+        var blockBuilder = Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
-                .borderStyle(overlay instanceof WorkbenchOverlayState.Actions ? theme.base() : theme.accent())
                 .title(Title.from(Line.from(Span.styled(
-                        " " + overlayTitle(overlay) + " ", theme.title()))))
-                .build();
+                        " " + overlayTitle(overlay) + " ", theme.title()))));
+        if (!(overlay instanceof WorkbenchOverlayState.Actions)) {
+            blockBuilder.borderStyle(theme.accent());
+        }
+        Block block = blockBuilder.build();
         frame.renderWidget(block, box);
 
         return switch (overlay) {
@@ -517,9 +523,10 @@ final class WorkbenchRenderer {
             int rowY = box.y() + 1 + index;
             boolean selected = index == actions.selectedIndex();
             String line = "  " + action.label();
-            int width = write(frame, box.x() + 2, rowY, line,
+            int rowWidth = Math.max(0, box.width() - 2);
+            write(frame, box.x() + 1, rowY, pad(line, rowWidth),
                     selected ? theme.selection() : theme.base(), area);
-            hits.add(new OverlayHit(index, new Rect(box.x() + 2, rowY, width, 1)));
+            hits.add(new OverlayHit(index, new Rect(box.x() + 1, rowY, rowWidth, 1)));
         }
         return List.copyOf(hits);
     }
@@ -1094,7 +1101,6 @@ final class WorkbenchRenderer {
         } else {
             hints = switch (state.selectedTab()) {
             case OVERVIEW -> List.of(
-                    new FooterHint("1-4", "views", Optional.empty()),
                     new FooterHint("c", "context", Optional.of(FooterAction.CONTEXT)),
                     new FooterHint("a", "auth", Optional.of(FooterAction.AUTH)),
                     new FooterHint("0", "more", Optional.of(FooterAction.MORE)),
@@ -1125,7 +1131,7 @@ final class WorkbenchRenderer {
         }
         if (state.overlay().isEmpty()) {
             List<FooterHint> rootHints = new ArrayList<>(hints.size() + 1);
-            rootHints.add(new FooterHint("F2", "actions", Optional.empty()));
+            rootHints.add(new FooterHint("F2", "actions", Optional.of(FooterAction.ACTIONS)));
             rootHints.addAll(hints);
             hints = List.copyOf(rootHints);
         }
@@ -1229,11 +1235,33 @@ final class WorkbenchRenderer {
     }
 
     private static String tabLabel(WorkbenchState.WorkbenchTab tab) {
+        return tabIcon(tab) + "  " + tabNumber(tab) + " " + tabName(tab);
+    }
+
+    private static String tabIcon(WorkbenchState.WorkbenchTab tab) {
         return switch (tab) {
-            case OVERVIEW -> "🌊  1 Overview";
-            case WORKSPACE -> "💻  2 Workspace";
-            case SOURCES -> "🔌  3 Sources";
-            case PIPELINES -> "🔀  4 Pipelines";
+            case OVERVIEW -> "🌊";
+            case WORKSPACE -> "💻";
+            case SOURCES -> "🔌";
+            case PIPELINES -> "🔀";
+        };
+    }
+
+    private static String tabNumber(WorkbenchState.WorkbenchTab tab) {
+        return switch (tab) {
+            case OVERVIEW -> "1";
+            case WORKSPACE -> "2";
+            case SOURCES -> "3";
+            case PIPELINES -> "4";
+        };
+    }
+
+    private static String tabName(WorkbenchState.WorkbenchTab tab) {
+        return switch (tab) {
+            case OVERVIEW -> "Overview";
+            case WORKSPACE -> "Workspace";
+            case SOURCES -> "Sources";
+            case PIPELINES -> "Pipelines";
         };
     }
 
@@ -1507,6 +1535,7 @@ final class WorkbenchRenderer {
     }
 
     enum FooterAction {
+        ACTIONS,
         CONTEXT,
         AUTH,
         MORE,

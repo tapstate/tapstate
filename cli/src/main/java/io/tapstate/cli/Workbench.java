@@ -352,6 +352,7 @@ final class Workbench {
 
         private boolean handleFooterAction(WorkbenchRenderer.FooterAction action, TuiRunner runner) {
             return switch (action) {
+                case ACTIONS -> openActions();
                 case CONTEXT -> openContextEntry();
                 case AUTH -> openAuthEntry();
                 case MORE -> runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.More(0)));
