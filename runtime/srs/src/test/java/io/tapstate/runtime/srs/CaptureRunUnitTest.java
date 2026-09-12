@@ -734,10 +734,10 @@ class CaptureRunUnitTest {
      * how far the durable read offset may advance -- are functions of the consumer cursors alone, so a run
      * asks for those and nothing else.
      *
-     * <p>The record also carries a schema history that grows by one entry per DDL and is never trimmed.
-     * Fetching the whole record per run therefore carries that history back on every change, and the cost
-     * of doing so climbs for the life of the chain: measured against a real endpoint, a chain with 500
-     * DDLs behind it reads at 6.4 ms where the cursors alone read at 0.5 ms.
+     * <p>The record also carries a schema history that grows by one entry per DDL, up to the bound the
+     * store keeps it under. Fetching the whole record per run therefore carries that history back on every
+     * change, and the cost of doing so climbs with what the record holds: measured against a real endpoint,
+     * a chain with 500 DDLs behind it reads at 6.4 ms where the cursors alone read at 0.5 ms.
      *
      * <p>So this pins two things at once, and the second is the one that would rot silently: a run reads
      * the cursors once rather than once per bound, and the number of whole-record fetches does not move

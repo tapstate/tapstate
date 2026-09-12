@@ -6,9 +6,11 @@ import java.util.Map;
 
 /**
  * One entry in a mining chain's schema history: a versioned snapshot of a table's field schema and the
- * ring sequence of the ddl event that introduced it. The history is append-only — a new version is
- * added on a schema change, never mutated in place — so a consumer can resolve the schema in force at
- * any change it reads from the version the change carries.
+ * ring sequence of the ddl event that introduced it. A version is added on a schema change and never
+ * mutated in place, so a consumer can resolve the schema in force at any change it reads from the version
+ * the change carries. How much of that history is still there is the store's to bound: a store that bounds
+ * it keeps the newest versions and drops the oldest, as {@link SrsMetaStore#appendSchemaVersion} states,
+ * and the version an append was given is there whatever a store bounds.
  *
  * <p>Fields — {@code version} (the monotonic schema version, non-negative), {@code schema} (the field
  * schema at this version, a shallow-unmodifiable defensive copy that preserves field order), and
