@@ -103,9 +103,10 @@ final class CountingJoinStores implements JoinStores {
     }
 
     @Override
-    public void putDimensionRow(String source, String dimensionKey, Map<String, Object> row) {
+    public Map<String, Object> putDimensionRow(String source, String dimensionKey,
+            Map<String, Object> row) {
         writes++;
-        held.putDimensionRow(source, dimensionKey, row);
+        return held.putDimensionRow(source, dimensionKey, row);
     }
 
     @Override

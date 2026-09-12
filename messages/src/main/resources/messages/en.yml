@@ -516,6 +516,9 @@ engine.frontier-order-not-encodable:
 engine.frontier-pinned:
   message: "Chain {chain} has not advanced its durable position for {minutes} minutes ({cause}; the bound combined for it has run {gap} ahead)."
   solution: "The source keeps its log from that position onwards, so act before the log's retention passes it: if the chain is waiting on changes still pending upstream, find what is holding them; if it is starved of positions, the sink has nothing to advance to and the source must supply them."
+engine.join-dimension-row-displaced:
+  message: "A second row of join source {source} arrived under key {key}, replacing the row already filed under it; that row is now unreachable and every row matching this key joins to the new one."
+  solution: "The join matches {source} on a column that does not identify its rows, so two of them share one key. Match it on a column that is unique in that source, or narrow the source so only one row can hold the key. Until then the target holds fewer rows than the query describes."
 position.write-back-while-live:
   message: "Chain {chain} is still being read by: {pipelines}."
   solution: "Stop or pause every pipeline listed, then write the position back; moving it under a running read changes nothing now and everything at the next start."

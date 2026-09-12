@@ -301,7 +301,7 @@ public final class PipelineDagBuilder {
                             bindings.join().factKeyColumns().apply(step),
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
-                            bindings.join().stores()));
+                            bindings.join().stores(), bindings.join().displaced()));
                     if (chains != null) {
                         chains.derived(step.id(), nestUpstream(inline.from(), bindings));
                     }

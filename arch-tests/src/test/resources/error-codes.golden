@@ -160,6 +160,7 @@ dsl.upsert-needs-key
 engine.frontier-order-not-encodable
 engine.frontier-pinned
 engine.job-failed
+engine.join-dimension-row-displaced
 engine.no-such-job
 io.document-too-large
 io.document-unreadable

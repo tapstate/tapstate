@@ -49,10 +49,12 @@ public final class JoinDag {
      *
      * @param sourceUpstream what vertices produce each source the plan names
      * @param factKeyColumns the driving source's own key columns, which the fact mirror files under
+     * @param displaced      where a dimension row lost to a key another row already held is reported
      */
     public static Vertex attach(DAG dag, JoinPlan plan, String pipelineId, String nodeId,
             List<String> factKeyColumns, Function<String, List<Vertex>> sourceUpstream,
-            ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores) {
+            ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
+            DimensionRowDisplacedAlert displaced) {
         Map<Integer, String> sourceByOrdinal = new LinkedHashMap<>();
         Map<String, List<String>> keyColumns = new LinkedHashMap<>();
         String factSource = plan.factSource().name();
@@ -68,7 +70,8 @@ public final class JoinDag {
         }
 
         Vertex vertex = dag.newVertex(nodeId, ProcessorMetaSupplier.of(new JoinVertexSupplier(
-                plan, pipelineId, nodeId, factKeyColumns, Map.copyOf(sourceByOrdinal), stores, false)));
+                plan, pipelineId, nodeId, factKeyColumns, Map.copyOf(sourceByOrdinal), stores,
+                displaced, false)));
         sourceByOrdinal.forEach((edge, source) -> {
             List<Vertex> producers = sourceUpstream.apply(source);
             if (producers == null || producers.isEmpty()) {
@@ -80,7 +83,7 @@ public final class JoinDag {
                     .partitioned(keyOf(keyColumns.get(source))).distributed());
         });
         Vertex projection = dag.newVertex(nodeId + ":project", ProcessorMetaSupplier.of(new JoinVertexSupplier(
-                plan, pipelineId, nodeId, factKeyColumns, Map.of(), stores, true)));
+                plan, pipelineId, nodeId, factKeyColumns, Map.of(), stores, displaced, true)));
         dag.edge(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection)
                 .partitioned(item -> ((JoinUpdate) item).factKey()).distributed());
         return projection;
@@ -172,19 +175,21 @@ public final class JoinDag {
         private final List<String> factKeyColumns;
         private final Map<Integer, String> sourceByOrdinal;
         private final JoinStoresBinding binding;
+        private final DimensionRowDisplacedAlert displaced;
         private final boolean projection;
         private transient JoinStores stores;
         private transient JoinGauge gauge;
 
         private JoinVertexSupplier(JoinPlan plan, String pipelineId, String stepId,
                 List<String> factKeyColumns, Map<Integer, String> sourceByOrdinal,
-                JoinStoresBinding binding, boolean projection) {
+                JoinStoresBinding binding, DimensionRowDisplacedAlert displaced, boolean projection) {
             this.plan = plan;
             this.pipelineId = pipelineId;
             this.stepId = stepId;
             this.factKeyColumns = factKeyColumns;
             this.sourceByOrdinal = sourceByOrdinal;
             this.binding = binding;
+            this.displaced = displaced;
             this.projection = projection;
         }
 
@@ -248,7 +253,7 @@ public final class JoinDag {
                 processors.add(projection
                         ? new JoinProjectionProcessor(new JoinProjection(plan, factKeyColumns, stepId, stores))
                         : new JoinProcessor(new JoinDriver(plan, factKeyColumns, stepId, stores,
-                                JoinDriver.DEFAULT_KEYS_PER_READ, gauge), sourceByOrdinal));
+                                JoinDriver.DEFAULT_KEYS_PER_READ, gauge, displaced), sourceByOrdinal));
             }
             return processors;
         }

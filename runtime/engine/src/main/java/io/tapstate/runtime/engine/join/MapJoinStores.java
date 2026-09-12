@@ -68,8 +68,9 @@ public final class MapJoinStores implements JoinStores {
     }
 
     @Override
-    public void putDimensionRow(String source, String dimensionKey, Map<String, Object> row) {
-        dimension(source).put(dimensionKey, row);
+    public Map<String, Object> putDimensionRow(String source, String dimensionKey,
+            Map<String, Object> row) {
+        return dimension(source).put(dimensionKey, row);
     }
 
     @Override

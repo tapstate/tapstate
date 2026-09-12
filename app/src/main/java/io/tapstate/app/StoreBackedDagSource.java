@@ -1462,7 +1462,8 @@ final class StoreBackedDagSource implements DagSource {
         return new JoinBinding(
                 step -> compiledJoin(byStep, step).plan(),
                 step -> compiledJoin(byStep, step).factKeyColumns(),
-                JoinStoresBinding.onTheCluster());
+                JoinStoresBinding.onTheCluster(),
+                new LoggingDimensionRowDisplacedAlert());
     }
 
     /**
