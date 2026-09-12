@@ -6,21 +6,18 @@ import com.mongodb.client.MongoCollection;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.testsupport.RequiresDocker;
-import org.bson.BsonBinaryWriter;
 import org.bson.Document;
-import org.bson.codecs.DocumentCodec;
-import org.bson.codecs.EncoderContext;
-import org.bson.io.BasicOutputBuffer;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import static io.tapstate.adapters.mongostore.StoredBytes.DOCUMENT_CEILING;
+import static io.tapstate.adapters.mongostore.StoredBytes.bsonSize;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
@@ -55,11 +52,8 @@ class SrsSchemaHistoryCeilingIT {
 
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    /**
-     * The hard ceiling on one stored document: 16 MiB. How many DDLs it takes to reach is a function of
-     * this and of how much one entry weighs; that there is no writing past it is not.
-     */
-    private static final long DOCUMENT_CEILING = 16L * 1024 * 1024;
+    /** The width of the table whose schema each history entry carries. */
+    private static final int COLUMNS = 20;
 
     /** Entries per batched write of the drive; large enough to be few writes, small enough to send. */
     private static final int CHUNK = 2_000;
@@ -81,7 +75,11 @@ class SrsSchemaHistoryCeilingIT {
 
             long atCeiling = storedBytes(collection);
             long mappedBytes = bsonSize(recordDocument(entries));
-            long nextEntryBytes = bsonSize(recordDocument(entries + 1)) - mappedBytes;
+            long nextEntryBytes = elementBytes(entries);
+            assertThat(elementBytes(0))
+                    .as("the element arithmetic the drive steers by is the mapping's own: what the first "
+                            + "entry adds to the record, counted, is what it adds, measured")
+                    .isEqualTo(bsonSize(recordDocument(1)) - bsonSize(recordDocument(0)));
             assertThat(atCeiling)
                     .as("the record under witness is the one the store's mapping describes: %d entries "
                             + "stored in %d bytes", entries, atCeiling)
@@ -114,22 +112,32 @@ class SrsSchemaHistoryCeilingIT {
      * <p>The growth operator is a {@code $push} of the store's own serialised entries — the one
      * production grew this array with before the change under witness; only the count per write
      * differs. Batches are used while a whole batch certainly fits, then entries go in one at a time
-     * while the record's own encoded bytes still leave room — which is what lands the record exactly
+     * while the record's own stored bytes still leave room — which is what lands the record exactly
      * where the next write cannot go, instead of at a number this case would have had to guess at.
+     *
+     * <p>Both numbers the loops steer by are cheap on purpose, because the record on the way to 16 MiB is
+     * the most expensive thing in this file to touch. The bytes so far are counted by the endpoint, which
+     * answers in a score of bytes rather than carrying the record back to be decoded and encoded again; and
+     * what the next entry adds is counted rather than measured by rebuilding the whole history around it.
+     * The two are cross-checked against the mapping's own document in the case above.
      */
     private static int driveHistoryToTheCeiling(MongoCollection<Document> collection) {
         int entries = 0;
+        long stored = storedBytes(collection);
         while (true) {
-            long room = DOCUMENT_CEILING - storedBytes(collection);
-            int batch = (int) Math.min(CHUNK, room / elementBound(entries + CHUNK));
+            long room = DOCUMENT_CEILING - stored;
+            // Sized by the widest key in the batch, so a batch can only undershoot the room it has.
+            int batch = (int) Math.min(CHUNK, room / elementBytes(entries + CHUNK));
             if (batch == 0) {
                 break;
             }
             pushEntries(collection, entries, batch);
             entries += batch;
+            stored = storedBytes(collection);
         }
-        while (bsonSize(recordDocument(entries + 1)) <= DOCUMENT_CEILING) {
+        while (stored + elementBytes(entries) <= DOCUMENT_CEILING) {
             pushEntries(collection, entries, 1);
+            stored += elementBytes(entries);
             entries++;
         }
         return entries;
@@ -142,12 +150,13 @@ class SrsSchemaHistoryCeilingIT {
     }
 
     /**
-     * What the entry landing at this index adds to the record, overstated by a byte on purpose: the
-     * array carries each element's index as its key, so the entry's own bytes plus its type byte and
-     * that key is the whole of it. A batch sized by an overstated entry can only undershoot.
+     * What the entry landing at this index adds to the record: the array carries each element's index as
+     * its key, so the entry's own bytes, its type byte, and that key with its terminator is the whole of
+     * it. Exact rather than a bound, because the case asserts that the next entry does not fit, and a
+     * drive that stopped a byte early would leave one that does.
      */
-    private static long elementBound(int index) {
-        return entryBytes() + 3 + Integer.toString(index).length();
+    private static long elementBytes(int index) {
+        return entryBytes() + 2 + Integer.toString(index).length();
     }
 
     /**
@@ -186,17 +195,19 @@ class SrsSchemaHistoryCeilingIT {
                 new SrsMeta(CHAIN, null, List.of(), null, history, null, 0L, 0L, null));
     }
 
-    /** The stored document's size in bytes, as the endpoint counts it against the ceiling. */
+    /**
+     * The stored document's size in bytes, as the endpoint counts it against the ceiling — asked of the
+     * endpoint rather than worked out here, so a record on its way to 16 MiB is never carried back over the
+     * wire to be measured.
+     */
     private static long storedBytes(MongoCollection<Document> collection) {
-        return bsonSize(collection.find(new Document("_id", CHAIN)).first());
-    }
-
-    /** Encodes a document to BSON to get its stored size, which is the size the ceiling applies to. */
-    private static long bsonSize(Document document) {
-        BasicOutputBuffer buffer = new BasicOutputBuffer();
-        new DocumentCodec().encode(
-                new BsonBinaryWriter(buffer), document, EncoderContext.builder().build());
-        return buffer.getPosition();
+        Document sized = collection.aggregate(List.of(
+                new Document("$match", new Document("_id", CHAIN)),
+                new Document("$project", new Document("bytes", new Document("$bsonSize", "$$ROOT"))))).first();
+        if (sized == null) {
+            throw new IllegalStateException("the chain just seeded was not there: " + CHAIN);
+        }
+        return ((Number) sized.get("bytes")).longValue();
     }
 
     /**
@@ -204,10 +215,6 @@ class SrsSchemaHistoryCeilingIT {
      * measures, so the count that reaches the ceiling is the one this product's records reach.
      */
     private static Map<String, Object> columns() {
-        Map<String, Object> schema = new LinkedHashMap<>();
-        for (int i = 0; i < 20; i++) {
-            schema.put("column_" + i, Map.of("type", "varchar", "length", 255, "nullable", true));
-        }
-        return schema;
+        return StoredBytes.schemaOfWidth(COLUMNS);
     }
 }

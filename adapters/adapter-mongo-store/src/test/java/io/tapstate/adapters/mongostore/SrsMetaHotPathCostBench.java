@@ -313,19 +313,21 @@ class SrsMetaHotPathCostBench {
 
     /** A schema of the size a real table's carries, so the history axis grows at a realistic rate. */
     private static Map<String, Object> columns() {
-        Map<String, Object> schema = new LinkedHashMap<>();
-        for (int i = 0; i < 20; i++) {
-            schema.put("column_" + i, Map.of("type", "varchar", "length", 255, "nullable", true));
-        }
-        return schema;
+        return StoredBytes.schemaOfWidth(20);
     }
 
+    /**
+     * What the record weighs where it is stored. As BSON, because that is the size the endpoint counts a
+     * record against its ceiling, and the ceiling is what the history axis of this instrument is walking
+     * toward: printed as text the same record is a different number, and reporting that one in a column
+     * headed bytes is how the two come to disagree without either being wrong out loud.
+     */
     private static long documentBytes(MongoCollection<Document> collection, String chain) {
         Document found = collection.find(new Document("_id", chain)).first();
         if (found == null) {
             throw new IllegalStateException("the chain just seeded was not there: " + chain);
         }
-        return found.toBsonDocument().toString().length();
+        return StoredBytes.bsonSize(found);
     }
 
     /**

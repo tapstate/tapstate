@@ -17,8 +17,8 @@ import java.util.List;
  * {@link ConsumerOffset} — carrying that pipeline's cursor, its acked position and which tables it has
  * finished loading), {@code cdcStartPosition} (the opaque position the cdc tail starts from,
  * recorded at the snapshot-to-cdc seam; absent until a snapshot seam or start point resolves it),
- * {@code schemaHistory} (the versioned schema, appended to on a schema change and bounded by what the
- * store retains of it), {@code retention} (the retention configuration passed through from the source; a
+ * {@code schemaHistory} (the versioned schema, appended to on a schema change and holding as much of that
+ * history as the store retains), {@code retention} (the retention configuration passed through from the source; a
  * config value only — the change ring is bounded by its capacity and backpressure, not trimmed by this),
  * {@code epoch} (the change ring's current generation, zero until one is opened), {@code snapshotEpoch}
  * (the generation the recorded snapshot began in, zero until a snapshot records its seam) and
