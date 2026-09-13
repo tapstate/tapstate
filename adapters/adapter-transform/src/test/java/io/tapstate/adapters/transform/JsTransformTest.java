@@ -80,6 +80,29 @@ class JsTransformTest {
     }
 
     @Test
+    @DisplayName("an array write drops only the converted container provenance it invalidates")
+    void anArrayWriteDoesNotRestoreAStaleConvertedContainer() {
+        ConvertedValue untouched = new ConvertedValue("64f0c0de", "OBJECT_ID");
+        Envelope row = Envelope.insert(1L, "orders", Map.of(
+                "values", new ConvertedValue(List.of(untouched, "old"), "ARRAY")), null);
+        TransformPort js = js(
+                "function process(r, ctx) {"
+                        + " r.after.first = r.after.values[0];"
+                        + " r.after.values[1] = 'new';"
+                        + " r.after.values.push('tail');"
+                        + " return r;"
+                        + " }");
+
+        Map<String, Object> output = after(js.transform(row).get(0));
+
+        assertThat(output.get("values"))
+                .isInstanceOf(List.class)
+                .isNotInstanceOf(ConvertedValue.class)
+                .isEqualTo(List.of(untouched, "new", "tail"));
+        assertThat(output.get("first")).isEqualTo("64f0c0de").isNotInstanceOf(ConvertedValue.class);
+    }
+
+    @Test
     @DisplayName("process mutates the record and returns it (the enrich case)")
     void processReturnsMutatedRecord() {
         TransformPort js = js(
