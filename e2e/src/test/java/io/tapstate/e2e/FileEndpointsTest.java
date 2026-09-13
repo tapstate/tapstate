@@ -82,7 +82,7 @@ class FileEndpointsTest {
 
     @Test
     void countingReadsRowsThisDriverDidNotWrite() throws IOException {
-        Files.writeString(directory.resolve("orders.csv"), "id,seq\n7,7\n8,8\n");
+        FileEndpoints.replaceTable(directory.resolve("orders.csv"), "id,seq\n7,7\n8,8\n");
 
         assertThat(endpoints.count(at(), "orders")).isEqualTo(2L);
     }

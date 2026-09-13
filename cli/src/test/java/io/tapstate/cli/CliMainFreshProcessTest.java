@@ -35,7 +35,8 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Process-boundary coverage for launch behavior that must happen before a REPL and its transport exist.
+ * Process-boundary coverage for launch behavior that must happen before a REPL and its transport exist,
+ * and for the status a whole session leaves behind, which is only readable where the process ends.
  */
 class CliMainFreshProcessTest {
 
@@ -326,6 +327,27 @@ class CliMainFreshProcessTest {
         }
     }
 
+    @Test
+    void aPipedSessionYieldsTheStatusOfARefusedLine(@TempDir Path home) throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        // The reported shape: a script pipes its lines in and reads the status the run leaves behind.
+        // `apply` is refused because no context names a server, but the verb is not the point -- any
+        // refused line is. `exit` follows it because that is how a script ends the session, and because
+        // it leaves the refusal somewhere other than the last line, which is the only place a status
+        // read off the end would find it.
+        Path script = Files.writeString(home.resolve("session.txt"), "apply nope\nexit\n");
+
+        ProcessResult result = runCli(home, workspace, Map.of(), script);
+
+        assertThat(result.stderr())
+                .withFailMessage("the line was not refused, so this is not the reported run: %s", result.stderr())
+                .contains("error: cli.context-required");
+        assertThat(result.exitCode())
+                .withFailMessage("a refused line left the session exiting %s: stdout=%s stderr=%s",
+                        result.exitCode(), result.stdout(), result.stderr())
+                .isNotZero();
+    }
+
     private static void persistContextAndHumanSession(Path home, Path workspace, URI seed) throws IOException {
         ContextDefinition definition = new ContextDefinition(CONTEXT_ID, List.of(seed), new ContextTls(true), AUTH_REF);
         ContextConfig config = new ContextConfig(ContextConfig.CURRENT_VERSION, "dev", Map.of("dev", definition),
@@ -405,6 +427,12 @@ class CliMainFreshProcessTest {
 
     private static ProcessResult runCli(Path home, Path workspace, Map<String, String> environment, String... arguments)
             throws Exception {
+        return runCli(home, workspace, environment, null, arguments);
+    }
+
+    /** The same run with standard input piped from a file, which is how a script drives a session. */
+    private static ProcessResult runCli(Path home, Path workspace, Map<String, String> environment,
+                                        Path input, String... arguments) throws Exception {
         Path stdout = Files.createTempFile(home, "tapstate-stdout-", ".log");
         Path stderr = Files.createTempFile(home, "tapstate-stderr-", ".log");
         Process process = null;
@@ -418,8 +446,13 @@ class CliMainFreshProcessTest {
             builder.environment().putAll(environment);
             builder.redirectOutput(stdout.toFile());
             builder.redirectError(stderr.toFile());
+            if (input != null) {
+                builder.redirectInput(input.toFile());
+            }
             process = builder.start();
-            process.getOutputStream().close();
+            if (input == null) {
+                process.getOutputStream().close();
+            }
             int exitCode = awaitExit(process);
             return new ProcessResult(exitCode, Files.readString(stdout), Files.readString(stderr));
         } finally {

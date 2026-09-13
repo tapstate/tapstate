@@ -504,7 +504,7 @@ main() {
                     if [ -f ./quickstart.sh ]; then
                         again="sh quickstart.sh"
                     else
-                        again="curl -sSL https://install.tapstate.dev | sh"
+                        again="curl -sSL https://install.tapstate.dev/demo | sh"
                     fi
                     die "the CLI could not log in: this stack already had an admin from an earlier run, and the password in .env is not the one it was created with. Start clean with: docker compose down -v && $again" ;;
                 *)

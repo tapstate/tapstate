@@ -2,6 +2,9 @@ package io.tapstate.archtests;
 
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
 import io.tapstate.app.ConnectorPluginProperties;
+import io.tapstate.core.catalog.OfficialConnectors;
+import io.tapstate.core.catalog.ModeSource;
+import io.tapstate.core.catalog.TapstateCatalog;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -16,8 +19,10 @@ import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -75,7 +80,8 @@ class ConnectorAcceptanceGatesTest {
     private static final List<String> MUST_BE_SCANNED = List.of(
             "deploy/quickstart/docker-compose.yml",
             "deploy/quickstart/quickstart.sh",
-            "docs/quickstart-online.md");
+            "docs/quickstart-online.md",
+            "deploy/quickstart/connectors/README.md");
 
     /**
      * Directories that are neither shipped nor written by hand: version-control internals, build output,
@@ -197,19 +203,25 @@ class ConnectorAcceptanceGatesTest {
     }
 
     /**
-     * The three engines the release actually exercises. Held separately from the full set so that this
-     * gate can state the layering it is guarding: everything else accepted is a managed variant of one
-     * of these, admitted on the strength of being the same engine underneath rather than on having been
-     * run.
+     * The database kinds the release actually exercises. This independent literal makes adding a
+     * kind a deliberate support promise in both the catalog declaration and this gate.
      */
-    private static final List<String> VERIFIED_ENGINES = List.of("mysql", "postgres", "mongodb");
+    private static final List<String> VERIFIED_DATABASE_KINDS = List.of("mysql", "postgres", "mongodb", "oracle", "sqlserver");
+
+    /** Counts include each database kind's own id and its explicitly accepted variants. */
+    private static final Map<String, Integer> EXPECTED_IDS_PER_DATABASE_KIND = Map.of(
+            "mysql", 5,
+            "postgres", 5,
+            "mongodb", 4,
+            "oracle", 1,
+            "sqlserver", 1);
 
     /** Every id a shipped deployment accepts out of the box, in refusal-message order. */
     private static final List<String> ACCEPTED_OUT_OF_THE_BOX = List.of(
             "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
             "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
             "tencent-db-postgres",
-            "mongodb", "mongodb-atlas", "mongodb3", "aliyun-db-mongodb", "tencent-db-mongodb");
+            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver");
 
     @Test
     @DisplayName("what a shipped deployment accepts out of the box is exactly this set")
@@ -228,11 +240,36 @@ class ConnectorAcceptanceGatesTest {
                         + "in two places so that it cannot be made absent-mindedly in one")
                 .containsExactlyElementsOf(ACCEPTED_OUT_OF_THE_BOX);
 
-        // The layering the set encodes: three engines are verified, the rest ride on being the same
-        // engine. Asserting the count rather than listing the variants again keeps this from being a
-        // third copy, while still failing if a fourth engine is slipped in as though it were a variant.
-        assertThat(ACCEPTED_OUT_OF_THE_BOX).containsAll(VERIFIED_ENGINES);
-        assertThat(ACCEPTED_OUT_OF_THE_BOX).hasSize(VERIFIED_ENGINES.size() * 5);
+        assertThat(OfficialConnectors.IDS_BY_DATABASE_KIND.keySet())
+                .as("the declared database kinds must match the independently verified kinds")
+                .containsExactlyElementsOf(VERIFIED_DATABASE_KINDS);
+
+        Map<String, Integer> declaredCounts = new LinkedHashMap<>();
+        OfficialConnectors.IDS_BY_DATABASE_KIND.forEach((kind, ids) -> declaredCounts.put(kind, ids.size()));
+        assertThat(declaredCounts)
+                .as("each database kind has an explicit support count; variants are not uniformly sized")
+                .isEqualTo(EXPECTED_IDS_PER_DATABASE_KIND);
+    }
+
+    @Test
+    @DisplayName("every offered mode of every official connector comes from a capability probe")
+    void everyOfficialConnectorModeIsDerived() {
+        TapstateCatalog catalog = TapstateCatalog.load();
+        assertThat(OfficialConnectors.IDS).as("the official connector scan must not be empty").isNotEmpty();
+        assertThat(catalog.ids())
+                .as("every official connector must resolve in the bundled catalog")
+                .containsAll(OfficialConnectors.IDS);
+        for (String id : OfficialConnectors.IDS) {
+            var entry = catalog.byId(id);
+            assertThat(entry.modes())
+                    .as("official connector %s must offer at least one mode", id)
+                    .isNotEmpty();
+            for (var mode : entry.modes()) {
+                assertThat(entry.provenance().modeSource().get(mode))
+                        .as("official connector %s mode %s must be derived from registered capabilities", id, mode)
+                        .isEqualTo(ModeSource.DERIVED);
+            }
+        }
     }
 
     @Test
@@ -251,7 +288,7 @@ class ConnectorAcceptanceGatesTest {
      * reads the value and for any page that documents it, which is an accusation neither one has earned,
      * and a gate that punishes describing a setting teaches people to stop describing it.
      */
-    private static boolean assignsTheSetting(String text) {
+    static boolean assignsTheSetting(String text) {
         String flattened = text.toLowerCase(Locale.ROOT).replace("-", "").replace("_", "");
         int at = flattened.indexOf(SETTING);
         while (at >= 0) {

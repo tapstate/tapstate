@@ -30,6 +30,7 @@ import io.tapstate.core.model.ViewResource;
 import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 import io.tapstate.core.model.DdlPolicy;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.ErrorPolicy;
 
 import java.math.BigDecimal;
@@ -155,7 +156,7 @@ public final class CanonicalWriter {
     private Node.MapN pipeline(PipelineResource p) {
         B b = new B();
         header(b, p);
-        b.put("source", sources(p.sources()));
+        b.putRequired("source", sources(p.sources()));
         if (p.transforms() != null) {
             List<Node> steps = new ArrayList<>();
             for (Step st : p.transforms()) {
@@ -307,6 +308,17 @@ public final class CanonicalWriter {
             case TransformBody.Js js -> b.literal("script", js.script());
             case TransformBody.MapProjection mp -> b.put("fields", fieldRules(mp.fields()));
             case TransformBody.Filter f -> b.expression("expr", f.expr());
+            // Declared order, which is the order the grammar declares them in: the one required key,
+            // then the two an author already knows from a document store's own unwind, then the two
+            // this side adds. An omitted optional key writes nothing rather than its default - the
+            // canonical form is what the author said, and a default written out reads as a choice.
+            case TransformBody.Unwind u -> {
+                b.scalar("path", u.path());
+                b.scalar("include_array_index", u.includeArrayIndex());
+                b.scalar("preserve_null_and_empty_arrays", u.preserveNullAndEmptyArrays());
+                b.scalar("element_key", u.elementKey());
+                b.scalar("element_type", u.elementType());
+            }
             case TransformBody.Union ignored -> {
             }
             case TransformBody.Nest n -> {
@@ -490,6 +502,9 @@ public final class CanonicalWriter {
         if (e.ddl() != null && e.ddl() != DdlPolicy.FAIL) {
             b.scalar("ddl", e.ddl().yaml());
         }
+        if (e.onFullLoad() != null && e.onFullLoad() != OnFullLoad.APPEND) {
+            b.scalar("on_full_load", e.onFullLoad().yaml());
+        }
         return b.build();
     }
 
@@ -610,9 +625,13 @@ public final class CanonicalWriter {
         return new Node.ScalarN(v, Node.Style.AUTO);
     }
 
-    /** Ordered map builder; null / empty values are silently skipped (§4 empty-container rule). */
+    /** Ordered map builder; optional null / empty values are silently skipped (§4 empty-container rule). */
     private static final class B {
         private final List<Node.Entry> entries = new ArrayList<>();
+
+        void putRequired(String key, Node value) {
+            entries.add(new Node.Entry(key, value));
+        }
 
         void put(String key, Node value) {
             if (value instanceof Node.MapN m && m.entries().isEmpty()) {

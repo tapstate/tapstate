@@ -17,7 +17,8 @@ import org.junit.jupiter.api.Test;
  * The {@code map} port: a field projection over the row image. Each declared output is a rule —
  * rename a source field ({@code $src}), drop it ({@code false}), set a literal, or compute a CEL
  * value; unlisted source fields pass through. Declared fields come first in declared order, then the
- * passed-through fields. Events with no row image ({@code ddl}, {@code delete}) bypass untouched.
+ * passed-through fields. Both of an event's rows are projected; only a {@code ddl}, which carries
+ * no row at all, bypasses untouched.
  */
 class MapTransformTest {
 
@@ -198,13 +199,22 @@ class MapTransformTest {
         assertThat(map.transform(ddl)).containsExactly(ddl);
     }
 
+    /**
+     * A delete carries only the row that is going, and that row is projected like any other. It used
+     * to pass through whole, which left a target addressing a row by a column name the projection had
+     * already renamed away.
+     */
     @Test
-    @DisplayName("passes a delete through (before only, no after to project)")
-    void passesDeleteThrough() {
+    @DisplayName("projects a delete's row, the one row it has")
+    void projectsTheRowOfADelete() {
         TransformPort map = map(fields("stage", FieldRule.literal("prod")));
         Envelope delete = Envelope.delete(1L, "t", Map.of("id", 1), null);
 
-        assertThat(map.transform(delete)).containsExactly(delete);
+        Envelope out = map.transform(delete).get(0);
+
+        assertThat(out.op()).isEqualTo(Op.DELETE);
+        assertThat(out.after()).isNull();
+        assertThat(out.before()).containsEntry("stage", "prod").containsEntry("id", 1);
     }
 
     @Test

@@ -134,6 +134,11 @@ final class ProvisionedStores implements AutoCloseable {
             // addresses by host, port, database and credentials, so a specification that swaps one engine
             // for the other changes the kind and nothing else.
             case POSTGRES -> gated(name, prefix, database, driver, SharedPostgres.settings(database));
+            case ORACLE -> {
+                Map<String, Object> settings = SharedOracle.settings(database);
+                gated(name, prefix, String.valueOf(settings.get("schema")), driver, settings);
+            }
+            case SQLSERVER -> gated(name, prefix, database, driver, SharedSqlServer.settings(database));
             case MONGO -> {
                 String url = SharedMongo.replicaSetUrl(database);
                 environment.put(prefix + "_URI", url);
@@ -223,6 +228,8 @@ final class ProvisionedStores implements AutoCloseable {
             case MYSQL -> new MySqlEndpoints();
             case POSTGRES -> new PostgresEndpoints();
             case MONGO -> new MongoEndpoints();
+            case ORACLE -> new OracleEndpoints();
+            case SQLSERVER -> new SqlServerEndpoints();
         };
     }
 

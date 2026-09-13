@@ -1,0 +1,527 @@
+{
+  "id": "oracle",
+  "name": "Oracle",
+  "displayName": "Oracle",
+  "icon": "icons/oracle.png",
+  "group": "database",
+  "modes": [
+    "cdc",
+    "snapshot"
+  ],
+  "discovery": "catalog",
+  "sink": {
+    "capable": true,
+    "writeSemantics": [
+      "upsert",
+      "append"
+    ]
+  },
+  "pushOut": false,
+  "config": [
+    {
+      "name": "thinType",
+      "type": "string",
+      "label": {
+        "en_US": "Connection mode"
+      },
+      "required": true,
+      "default": "SID",
+      "secret": false,
+      "options": [
+        {
+          "value": "SID",
+          "label": {
+            "en_US": "SID"
+          }
+        },
+        {
+          "value": "SERVICE_NAME",
+          "label": {
+            "en_US": "SERVICE NAME"
+          }
+        }
+      ],
+      "visibleWhen": null
+    },
+    {
+      "name": "host",
+      "type": "string",
+      "label": {
+        "en_US": "DB Address"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "thinType",
+        "equalsAnyOf": [
+          "SID",
+          "SERVICE_NAME"
+        ]
+      }
+    },
+    {
+      "name": "port",
+      "type": "string",
+      "label": {
+        "en_US": "Port"
+      },
+      "required": true,
+      "default": "1521",
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "thinType",
+        "equalsAnyOf": [
+          "SID",
+          "SERVICE_NAME"
+        ]
+      }
+    },
+    {
+      "name": "sid",
+      "type": "string",
+      "label": {
+        "en_US": "SID"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "thinType",
+        "equalsAnyOf": [
+          "SID"
+        ]
+      }
+    },
+    {
+      "name": "database",
+      "type": "string",
+      "label": {
+        "en_US": "Service Name"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "thinType",
+        "equalsAnyOf": [
+          "SERVICE_NAME"
+        ]
+      }
+    },
+    {
+      "name": "tnsName",
+      "type": "string",
+      "label": {
+        "en_US": "TNS Name"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "thinType",
+        "equalsAnyOf": [
+          "TNS_NAME"
+        ]
+      }
+    },
+    {
+      "name": "schema",
+      "type": "string",
+      "label": {
+        "en_US": "Schema"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "user",
+      "type": "string",
+      "label": {
+        "en_US": "user"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "password",
+      "type": "string",
+      "label": {
+        "en_US": "password"
+      },
+      "required": false,
+      "default": null,
+      "secret": true,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "logPluginName",
+      "type": "string",
+      "label": {
+        "en_US": "logPluginName"
+      },
+      "required": false,
+      "default": "logMiner",
+      "secret": false,
+      "options": [
+        {
+          "value": "logMiner",
+          "label": {
+            "en_US": "logMiner"
+          }
+        },
+        {
+          "value": "oracle-log-parser",
+          "label": {
+            "en_US": "OracleLogParser"
+          }
+        }
+      ],
+      "visibleWhen": null
+    },
+    {
+      "name": "rawLogServerHost",
+      "type": "string",
+      "label": {
+        "en_US": "grpc server host"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "rawLogServerPort",
+      "type": "string",
+      "label": {
+        "en_US": "grpc server port"
+      },
+      "required": false,
+      "default": "8190",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "extParams",
+      "type": "string",
+      "label": {
+        "en_US": "Connection String Params"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "loadTableComment",
+      "type": "boolean",
+      "label": {
+        "en_US": "Load Table Comment"
+      },
+      "required": false,
+      "default": "false",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "multiTenant",
+      "type": "boolean",
+      "label": {
+        "en_US": "Multi-tenant"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "pdb",
+      "type": "string",
+      "label": {
+        "en_US": "PDB"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "multiTenant",
+        "equalsAnyOf": [
+          "true"
+        ]
+      }
+    },
+    {
+      "name": "standBy",
+      "type": "boolean",
+      "label": {
+        "en_US": "Read log from slave"
+      },
+      "required": false,
+      "default": "false",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "useSSL",
+      "type": "boolean",
+      "label": {
+        "en_US": "Use SSL"
+      },
+      "required": false,
+      "default": "false",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "sslCert",
+      "type": "string",
+      "label": {
+        "en_US": "SSL Certificate(PEM)"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "useSSL",
+        "equalsAnyOf": [
+          "true"
+        ]
+      }
+    },
+    {
+      "name": "sslKeyPassword",
+      "type": "string",
+      "label": {
+        "en_US": "SSL Certificate Password"
+      },
+      "required": true,
+      "default": null,
+      "secret": true,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "useSSL",
+        "equalsAnyOf": [
+          "true"
+        ]
+      }
+    },
+    {
+      "name": "timezone",
+      "type": "string",
+      "label": {
+        "en_US": "Timezone for Datetime"
+      },
+      "required": false,
+      "default": "",
+      "secret": false,
+      "options": [
+        {
+          "value": "",
+          "label": {
+            "en_US": ""
+          }
+        },
+        {
+          "value": "-11:00",
+          "label": {
+            "en_US": "UTC -11"
+          }
+        },
+        {
+          "value": "-10:00",
+          "label": {
+            "en_US": "UTC -10"
+          }
+        },
+        {
+          "value": "-09:00",
+          "label": {
+            "en_US": "UTC -09"
+          }
+        },
+        {
+          "value": "-08:00",
+          "label": {
+            "en_US": "UTC -08"
+          }
+        },
+        {
+          "value": "-07:00",
+          "label": {
+            "en_US": "UTC -07"
+          }
+        },
+        {
+          "value": "-06:00",
+          "label": {
+            "en_US": "UTC -06"
+          }
+        },
+        {
+          "value": "-05:00",
+          "label": {
+            "en_US": "UTC -05"
+          }
+        },
+        {
+          "value": "-04:00",
+          "label": {
+            "en_US": "UTC -04"
+          }
+        },
+        {
+          "value": "-03:00",
+          "label": {
+            "en_US": "UTC -03"
+          }
+        },
+        {
+          "value": "-02:00",
+          "label": {
+            "en_US": "UTC -02"
+          }
+        },
+        {
+          "value": "-01:00",
+          "label": {
+            "en_US": "UTC -01"
+          }
+        },
+        {
+          "value": "+00:00",
+          "label": {
+            "en_US": "UTC"
+          }
+        },
+        {
+          "value": "+01:00",
+          "label": {
+            "en_US": "UTC +01"
+          }
+        },
+        {
+          "value": "+02:00",
+          "label": {
+            "en_US": "UTC +02"
+          }
+        },
+        {
+          "value": "+03:00",
+          "label": {
+            "en_US": "UTC +03"
+          }
+        },
+        {
+          "value": "+04:00",
+          "label": {
+            "en_US": "UTC +04"
+          }
+        },
+        {
+          "value": "+05:00",
+          "label": {
+            "en_US": "UTC +05"
+          }
+        },
+        {
+          "value": "+06:00",
+          "label": {
+            "en_US": "UTC +06"
+          }
+        },
+        {
+          "value": "+07:00",
+          "label": {
+            "en_US": "UTC +07"
+          }
+        },
+        {
+          "value": "+08:00",
+          "label": {
+            "en_US": "UTC +08"
+          }
+        },
+        {
+          "value": "+09:00",
+          "label": {
+            "en_US": "UTC +09"
+          }
+        },
+        {
+          "value": "+10:00",
+          "label": {
+            "en_US": "UTC +10"
+          }
+        },
+        {
+          "value": "+11:00",
+          "label": {
+            "en_US": "UTC +11"
+          }
+        },
+        {
+          "value": "+12:00",
+          "label": {
+            "en_US": "UTC +12"
+          }
+        },
+        {
+          "value": "+13:00",
+          "label": {
+            "en_US": "UTC +13"
+          }
+        },
+        {
+          "value": "+14:00",
+          "label": {
+            "en_US": "UTC +14"
+          }
+        }
+      ],
+      "visibleWhen": null
+    },
+    {
+      "name": "socketReadTimeOut",
+      "type": "string",
+      "label": {
+        "en_US": "Socket ReadTimeOut (minutes)"
+      },
+      "required": false,
+      "default": "0",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    }
+  ],
+  "provenance": {
+    "specPath": "connectors/oracle-connector/src/main/resources/spec_oracle.json",
+    "specContentHash": "6c0aaa501c5f103e",
+    "pdkApiVersion": null,
+    "requiredLevel": null,
+    "modeSource": {
+      "cdc": "derived",
+      "snapshot": "derived"
+    }
+  }
+}

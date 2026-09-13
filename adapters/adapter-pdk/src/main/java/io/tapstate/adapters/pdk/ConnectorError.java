@@ -99,6 +99,15 @@ public enum ConnectorError implements TapstateErrorCode {
     SPEC_INVALID("connector.spec-invalid", Set.of("artifact", "spec", "detail")),
 
     /**
+     * A connection config value cannot be converted to the type the connector's own connection form
+     * declares for that field, so the connector would cast it and crash. Refused with a diagnosis
+     * instead. {@code connector} is the connector id; {@code field} is the config field; {@code expected}
+     * is the type its form declares; {@code value} is what the connection holds.
+     */
+    CONFIG_TYPE_MISMATCH("connector.config-type-mismatch",
+            Set.of("connector", "field", "expected", "value")),
+
+    /**
      * The connector requires a newer PDK API level than the bridge provides, so it is refused rather
      * than silently downgraded. {@code connector} is the connector id; {@code required} is the level
      * it asked for; {@code provided} is the level the bridge provides.
