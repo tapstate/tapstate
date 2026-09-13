@@ -62,6 +62,32 @@ class MongoSchemaStoreIT {
     }
 
     @Test
+    void declaredStringAttributesSurviveActualBsonStorage() {
+        var string = new io.tapstate.core.common.StringType(36L, false, true, 1L, 2);
+        var bounded = new SourceField("id", "varchar(36)", io.tapstate.core.common.TapstateType.STRING, null, null, string);
+        var unspecified = new SourceField("note", "text", io.tapstate.core.common.TapstateType.STRING, null, null,
+                new io.tapstate.core.common.StringType(null, null, null, null, null));
+        var model = new SourceModel(List.of(new SourceTable("orders", List.of(bounded, unspecified), List.of("id"), List.of())));
+        withStore((store, collection) -> {
+            var observation = new DiscoveredSourceModel("strings", "mysql", 1L, model);
+            store.save(observation);
+            assertThat(store.get("strings")).contains(observation);
+        });
+    }
+
+    @Test
+    void declaredNumericAttributesSurviveActualBsonStorage() {
+        var number = new io.tapstate.core.common.NumericType(128, true, false, true, new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
+        var field = new SourceField("amount", "decimal(18,4)", io.tapstate.core.common.TapstateType.DECIMAL, null, number);
+        var model = new SourceModel(List.of(new SourceTable("orders", List.of(field), List.of(), List.of())));
+        withStore((store, collection) -> {
+            var observation = new DiscoveredSourceModel("numeric-db", "mysql", 1L, model);
+            store.save(observation);
+            assertThat(store.get("numeric-db")).contains(observation);
+        });
+    }
+
+    @Test
     void savedEnvelopeReadsBackEqualThroughRealBson() {
         withStore((store, collection) -> {
             DiscoveredSourceModel envelope =
@@ -312,6 +338,38 @@ class MongoSchemaStoreIT {
                     .contains(observation(7, "replacement"));
             assertThat(reads.get()).isEqualTo(8);
             assertThat(publications.get()).isEqualTo(7);
+        });
+    }
+
+    @Test
+    void aLaterDiscoveryReclaimsAnAbandonedUnpublishedGeneration() {
+        withStore((store, collection) -> {
+            DiscoveredSourceModel before = observation(1, "old");
+            DiscoveredSourceModel current = observation(3, "current");
+            store.save(before);
+            MongoException failure = new MongoException("injected failure before envelope publication");
+            MongoCollection<Document> interrupted = interleave(collection,
+                    call -> call.name().equals("findOneAndReplace"),
+                    () -> { throw failure; }, false);
+
+            assertThatThrownBy(() -> new MongoSchemaStore(interrupted).save(observation(2, "abandoned")))
+                    .isInstanceOf(TapstateException.class)
+                    .hasCause(failure);
+            assertThat(store.get("orders-db")).contains(before);
+            Document abandoned = collection.find(new Document("name", "abandoned")).first();
+            assertThat(abandoned).isNotNull();
+            assertThat(abandoned.getString("generation")).isNotEqualTo(
+                    collection.find(new Document("_id", "orders-db")).first().getString("generation"));
+
+            MongoSchemaStore laterWriter = new MongoSchemaStore(collection);
+            laterWriter.save(current);
+
+            assertThat(laterWriter.get("orders-db")).contains(current);
+            assertThat(collection.countDocuments(new Document("name", "old"))).isZero();
+            assertThat(collection.countDocuments(new Document("generation", abandoned.getString("generation"))))
+                    .as("unpublished tables left by an abandoned writer must be reclaimed")
+                    .isZero();
+            assertThat(collection.countDocuments()).isEqualTo(2);
         });
     }
 

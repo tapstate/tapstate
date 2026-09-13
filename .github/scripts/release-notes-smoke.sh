@@ -186,7 +186,8 @@ has "the supported-versions link is in the body" \
     "https://github.com/tapstate/tapstate/blob/HEAD/SECURITY.md#supported-versions"
 
 # An empty range still has to produce a valid body: a release with no harvested note is normal.
-empty="$(cd "$repo" && bash "$script" --version 0.4.0 --base HEAD --sha HEAD \
+empty_sha="$(git -C "$repo" rev-parse HEAD)"
+empty="$(cd "$repo" && bash "$script" --version 0.4.0 --base HEAD --sha "$empty_sha" \
   --macos-req 'Recommended macOS: 15.0 or newer.' --glibc-req 'Recommended glibc: 2.34 or newer.' 2>&1)"
 empty_code=$?
 if [ "$empty_code" = 0 ] && grep -qF -- "not for production" <<<"$empty" && grep -qF -- "What's new" <<<"$empty"; then
@@ -194,6 +195,16 @@ if [ "$empty_code" = 0 ] && grep -qF -- "not for production" <<<"$empty" && grep
 else
   printf '  FAIL  an empty range still assembles a body:\n%s\n' "$empty"; failed=$((failed + 1))
 fi
+
+# Join may have shipped before this range. Its safety boundaries must survive without a
+# feature PR to harvest, and must be visible prose rather than an approver-only comment.
+with_notes="$out"
+out="$(printf '%s\n' "$empty" | sed '/<!--/,/-->/d')"
+has "an empty range discloses the lack of join fan-out" "Duplicate dimension keys replace the earlier match"
+has "an empty range discloses the join SQL subset" "WHERE, aggregation, subqueries, and ordering/pagination are unsupported"
+has "an empty range discloses the keyed-sync projection requirement" "For default/upsert sync, publish every fact primary-key column"
+has "an empty range links the Join usage draft" "https://github.com/tapstate/tapstate/blob/${empty_sha}/docs/join/README.md"
+out="$with_notes"
 
 # A range whose base does not exist is a mis-wired release, not an empty one.
 bad="$(cd "$repo" && bash "$script" --version 0.4.0 --base v9.9.9 --sha HEAD --macos-req a --glibc-req b 2>&1)"

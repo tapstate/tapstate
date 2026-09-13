@@ -18,6 +18,10 @@ public enum Domain {
     CLI,
     CORE,
     CATALOG,
+    // the naming and shape of the data a batch would move: what a source's discovered columns become
+    // once a sink has stored them. Distinct from DSL, which judges the document the author wrote --
+    // nothing here says the batch is wrong, only what one of its column names will mean on the other
+    // side (core)
     SCHEMA,
     // core ring: pipeline lifecycle state machine (illegal transitions)
     LIFECYCLE,

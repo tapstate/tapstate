@@ -3,12 +3,16 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndReplaceOptions;
 import com.mongodb.client.model.ReturnDocument;
+import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
+import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
+import java.math.BigDecimal;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -16,10 +20,13 @@ import org.bson.Document;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -42,11 +49,12 @@ import java.util.UUID;
  * discovery writes its tables under a fresh generation - invisible, because nothing points at them -
  * and then names that generation in the envelope. That last step is a one-document write, so a reader
  * rechecks the envelope after loading its tables and retries if publication changed meanwhile.
- * Publication atomically returns the displaced envelope: only that generation can be swept, never
- * another writer's unpublished or newly current tables. A process lost before its sweep can leave
- * unreachable documents; reclaiming those requires coordination with in-flight writers.
+ * Writers register a lease in the envelope before inserting tables. Publication and reclamation
+ * compare the envelope's revision: a sweep revokes expired leases before deleting its fixed set of
+ * unreachable generations, and a revoked writer cannot publish. A later sweep can therefore recover
+ * after process death without deleting another writer's current or active unpublished tables.
  *
- * <p>The envelope is a fixed shape of plain scalars and lists, so it is mapped field by field rather
+ * <p>The discovery payload is a fixed shape of plain scalars and lists, so it is mapped field by field rather
  * than through a generic value normalization; on read the driver's {@code Document} / list values are
  * reconstructed into the pure model, so no driver type escapes this module (rule R3). A stored document
  * whose shape cannot be reconstructed is surfaced as a coded {@code io.document-unreadable} diagnostic.
@@ -79,6 +87,13 @@ public final class MongoSchemaStore implements SchemaStore {
 
     /** Maximum complete read attempts under publication contention, not a wall-clock timeout. */
     static final int MAX_READ_ATTEMPTS = 8;
+
+    private static final String WRITERS = "_writers";
+    private static final String REVISION = "_revision";
+    private static final int MAX_WRITE_ATTEMPTS = 8;
+    // A stalled insertion may lose publication rights after five minutes. It must retry discovery
+    // if a later sweep revokes its lease; elapsed time alone never authorizes deleting its tables.
+    private static final long WRITE_LEASE_MILLIS = 300_000L;
 
     private final MongoCollection<Document> collection;
 
@@ -113,19 +128,98 @@ public final class MongoSchemaStore implements SchemaStore {
                     // explicitly: document key order need not match numeric discovery order.
                     .append("order", order));
         }
-        if (!tables.isEmpty()) {
-            StoreIo.run(connectionId, () -> collection.insertMany(tables));
+        // Mongo's clock starts the lease; no process-local registry or clock decides ownership.
+        StoreIo.run(connectionId, () -> collection.updateOne(new Document("_id", connectionId),
+                new Document("$currentDate", new Document(WRITERS + "." + generation, true))
+                        .append("$inc", new Document(REVISION, 1L)), new UpdateOptions().upsert(true)));
+        try {
+            if (!tables.isEmpty()) {
+                StoreIo.run(connectionId, () -> collection.insertMany(tables));
+            }
+            publish(discovered, generation);
+        } catch (RuntimeException failure) {
+            // An ordinary failure relinquishes the lease immediately, leaving cleanup to a later
+            // discovery. Process death instead leaves a lease that a later sweep can expire.
+            try {
+                StoreIo.run(() -> collection.updateOne(new Document("_id", connectionId),
+                        new Document("$unset", new Document(WRITERS + "." + generation, ""))
+                                .append("$inc", new Document(REVISION, 1L))));
+            } catch (RuntimeException releaseFailure) {
+                failure.addSuppressed(releaseFailure);
+            }
+            throw failure;
         }
-        // Returning the displaced envelope in the same atomic operation establishes exactly which
-        // generation this writer owns the cleanup for, even when another process publishes next.
-        Document displaced = StoreIo.call(() -> collection.findOneAndReplace(
-                new Document("_id", connectionId),
-                envelope(discovered, generation),
-                new FindOneAndReplaceOptions().upsert(true).returnDocument(ReturnDocument.BEFORE)));
-        if (displaced != null && displaced.get(GENERATION) instanceof String previous) {
-            StoreIo.run(() -> collection.deleteMany(new Document("_id", ownedKeys(connectionId))
-                    .append(GENERATION, previous)));
+        reclaim(connectionId);
+    }
+
+    private void publish(DiscoveredSourceModel discovered, String generation) {
+        String connectionId = discovered.connectionId();
+        for (int attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
+            Document current = StoreIo.call(() -> collection.find(new Document("_id", connectionId)).first());
+            Document writers = writers(current);
+            if (!writers.containsKey(generation)) {
+                break;
+            }
+            writers.remove(generation);
+            Document replacement = envelope(discovered, generation)
+                    .append(WRITERS, writers).append(REVISION, revision(current) + 1);
+            Document displaced = StoreIo.call(connectionId, () -> collection.findOneAndReplace(
+                    fence(current), replacement,
+                    new FindOneAndReplaceOptions().returnDocument(ReturnDocument.BEFORE)));
+            if (displaced != null) {
+                return;
+            }
         }
+        throw new TapstateException(IoError.SCHEMA_WRITE_CONTENTION,
+                Map.of("connectionId", connectionId), null);
+    }
+
+    private void reclaim(String connectionId) {
+        for (int attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
+            Document current = StoreIo.call(() -> collection.aggregate(List.of(
+                    new Document("$match", new Document("_id", connectionId)),
+                    new Document("$set", new Document("_reclaimBefore",
+                            new Document("$subtract", List.of("$$NOW", WRITE_LEASE_MILLIS)))))).first());
+            Document active = writers(current);
+            Date cutoff = current.getDate("_reclaimBefore");
+            active.entrySet().removeIf(entry -> ((Date) entry.getValue()).compareTo(cutoff) <= 0);
+            Set<String> protectedGenerations = new HashSet<>(active.keySet());
+            protectedGenerations.add(current.getString(GENERATION));
+            Set<String> garbage = new HashSet<>();
+            StoreIo.run(() -> collection.find(new Document("_id", ownedKeys(connectionId)))
+                    .projection(new Document(GENERATION, 1))
+                    .forEach(table -> {
+                        String candidate = table.getString(GENERATION);
+                        if (candidate != null && !protectedGenerations.contains(candidate)) {
+                            garbage.add(candidate);
+                        }
+                    }));
+            // Registration precedes insertion. This CAS proves no writer registered or published
+            // while candidates were collected, and fences every expired writer before deletion.
+            long matched = StoreIo.call(() -> collection.updateOne(fence(current),
+                    new Document("$set", new Document(WRITERS, active))
+                            .append("$inc", new Document(REVISION, 1L))).getMatchedCount());
+            if (matched != 0) {
+                if (!garbage.isEmpty()) {
+                    StoreIo.run(() -> collection.deleteMany(new Document("_id", ownedKeys(connectionId))
+                            .append(GENERATION, new Document("$in", new ArrayList<>(garbage)))));
+                }
+                return;
+            }
+        }
+        // A busy connection can defer its sweep to the next discovery; its publication already won.
+    }
+
+    private static Document writers(Document envelope) {
+        return new Document(envelope.get(WRITERS, Document.class));
+    }
+
+    private static long revision(Document envelope) {
+        return envelope.getLong(REVISION);
+    }
+
+    private static Document fence(Document envelope) {
+        return new Document("_id", envelope.getString("_id")).append(REVISION, revision(envelope));
     }
 
     @Override
@@ -223,7 +317,9 @@ public final class MongoSchemaStore implements SchemaStore {
             fields.add(new Document("name", field.name())
                     .append("type", field.dataType())
                     .append("tapstateType", field.type().name())
-                    .append("unknownBecause", field.unknownBecause()));
+                    .append("unknownBecause", field.unknownBecause())
+                    .append("numericType", numericDocument(field.numericType()))
+                    .append("stringType", stringDocument(field.stringType())));
         }
         List<Document> indexes = new ArrayList<>();
         for (SourceIndex index : table.indexes()) {
@@ -241,11 +337,41 @@ public final class MongoSchemaStore implements SchemaStore {
                 .append("approximateRowCount", table.approximateRowCount());
     }
 
-    /**
-     * The resolved type a stored field carries, or unknown when the document predates the resolution or
-     * names a type this build does not know. An unreadable type is the absence of one, never a refusal of
-     * the whole read: the model is a derived observation that re-discovery replaces.
-     */
+    /** Nullable descriptor attributes retain the distinction between undeclared and zero. */
+    private static Document stringDocument(StringType string) {
+        return string == null ? null : new Document("bytes", string.bytes()).append("fixed", string.fixed())
+                .append("doubleBytes", string.doubleBytes()).append("defaultValue", string.defaultValue())
+                .append("byteRatio", string.byteRatio());
+    }
+
+    private static StringType stringType(Document field) {
+        Document string = field.get("stringType", Document.class);
+        return string == null ? null : new StringType(string.getLong("bytes"), string.getBoolean("fixed"),
+                string.getBoolean("doubleBytes"), string.getLong("defaultValue"), string.getInteger("byteRatio"));
+    }
+
+    private static Document numericDocument(NumericType number) {
+        return number == null ? null : new Document("bit", number.bit()).append("fixed", number.fixed())
+                .append("unsigned", number.unsigned()).append("zerofill", number.zerofill())
+                .append("minValue", number.minValue() == null ? null : number.minValue().toString())
+                .append("maxValue", number.maxValue() == null ? null : number.maxValue().toString())
+                .append("precision", number.precision()).append("scale", number.scale());
+    }
+
+    private static NumericType numericType(Document field) {
+        Document number = field.get("numericType", Document.class);
+        if (number == null) {
+            return null;
+        }
+        return new NumericType(number.getInteger("bit"), number.getBoolean("fixed"), number.getBoolean("unsigned"),
+                number.getBoolean("zerofill"), decimal(number.getString("minValue")),
+                decimal(number.getString("maxValue")), number.getInteger("precision"), number.getInteger("scale"));
+    }
+
+    private static BigDecimal decimal(String value) {
+        return value == null ? null : new BigDecimal(value);
+    }
+
     /**
      * One stored column read back, with the reason it has no resolved type where it has none.
      *
@@ -274,13 +400,13 @@ public final class MongoSchemaStore implements SchemaStore {
                     "the stored type '" + spelling + "' is not a tapstate type in this build");
         }
         if (type != TapstateType.UNKNOWN) {
-            return new SourceField(name, declared, type);
+            return new SourceField(name, declared, type, null, numericType(stored), stringType(stored));
         }
         String because = stored.getString("unknownBecause");
         return new SourceField(name, declared, TapstateType.UNKNOWN,
                 because == null || because.isBlank()
                         ? "the stored record says the type is unknown and does not say which unknown"
-                        : because);
+                        : because, numericType(stored), stringType(stored));
     }
 
     /** The type a stored spelling names, or null where this build has no such type. */
@@ -328,7 +454,11 @@ public final class MongoSchemaStore implements SchemaStore {
             if (fieldName == null) {
                 throw unreadable(id);
             }
-            fields.add(field(fieldName, field));
+            try {
+                fields.add(field(fieldName, field));
+            } catch (IllegalArgumentException | ClassCastException error) {
+                throw unreadable(id);
+            }
         }
         List<SourceIndex> indexes = new ArrayList<>();
         for (Document index : documentList(table.get("indexes"), id)) {

@@ -98,6 +98,10 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     private static final String GRANDCHILD_CONNECTOR_NAMESPACE =
             connectorNamespace(PIPELINE, GRANDCHILD_SOURCE);
     private static final String SINK_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "sync_1");
+    private static final String SINK_PREPARATION_NAMESPACE =
+            io.tapstate.spi.sink.SinkPreparationNamespace.of(new PipelineNode(PIPELINE, "sync_1"));
+    private static final String VIEW_PREPARATION_NAMESPACE =
+            io.tapstate.spi.sink.SinkPreparationNamespace.of(new PipelineNode(PIPELINE, "orders_view"));
     private static final String VIEW_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "orders_view");
     private static final String OTHER_PIPELINE_CONNECTOR_NAMESPACE = connectorNamespace("other_pipe", PARENT_SOURCE);
     private static final String UNOPENED_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "removed_node");
@@ -144,7 +148,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         // under a name no run afterwards looks at.
         assertThat(namespaces).containsExactlyInAnyOrder(ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE,
                 ROOT_NAMESPACE + ".parking", ITEMS_NAMESPACE + ".parking", SOURCE_CONNECTOR_NAMESPACE,
-                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE);
+                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE, SINK_PREPARATION_NAMESPACE);
     }
 
     @Test
@@ -173,7 +177,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.artifacts().save(pipelineWithoutNest());
 
         assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
-                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE);
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE, SINK_PREPARATION_NAMESPACE);
     }
 
     @Test
@@ -182,7 +186,17 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.artifacts().save(pipelineWithView());
 
         assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
-                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE);
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE, VIEW_PREPARATION_NAMESPACE);
+    }
+
+    @Test
+    void rerunDropsPreparationReceiptsButAnOrdinaryStopKeepsThem() {
+        InMemoryStorePort store = seedStore();
+        store.keyedState().save(SINK_PREPARATION_NAMESPACE, "orders", new byte[] {1});
+        actuator(store).stop(PIPELINE, false);
+        assertThat(store.keyedState().load(SINK_PREPARATION_NAMESPACE, "orders")).isPresent();
+        actuator(store).stop(PIPELINE, true);
+        assertThat(store.keyedState().load(SINK_PREPARATION_NAMESPACE, "orders")).isEmpty();
     }
 
     @Test

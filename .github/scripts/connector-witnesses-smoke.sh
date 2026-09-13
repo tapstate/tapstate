@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory() as tmp:
         p=root/path; p.parent.mkdir(parents=True,exist_ok=True); p.write_text(text)
     put('pom.xml','<project><modules><module>e2e</module></modules></project>')
     put('e2e/pom.xml','<project><build><plugins><plugin><artifactId>maven-failsafe-plugin</artifactId><executions><execution><goals><goal>integration-test</goal></goals></execution></executions></plugin></plugins></build></project>')
-    names=['PublishedExamplesIT','RealMysqlToMongoFreshIT','NestFreshIT','DataBrowserFreshIT','WatchFreshIT','AnObjectIdReadsBackTheSameThroughBothFacesIT','SinkValueRoundTripIT']
+    names=['PublishedExamplesIT','RealMysqlToMongoFreshIT','NestFreshIT','DataBrowserFreshIT','WatchFreshIT','AnObjectIdReadsBackTheSameThroughBothFacesIT','SinkValueRoundTripIT','RealTargetPreparationIT','EnterpriseTargetPreparationIT','RealMysqlToEnterpriseDecimalIT']
     for name in names+['UnrelatedIT']:
         put('e2e/src/test/java/sample/'+name+'.java','package sample; class '+name+' {}')
     for n in range(12): put(f'e2e/examples/sample{n}/case.e2e.yml','fixture')
@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory() as tmp:
     call('plan','--durations',root/'durations.json','--output',root/'plan.json')
     plan=json.loads((root/'plan.json').read_text()); assert len(plan['shards'])==10
     assert {t['class'] for t in plan['expected']}=={'sample.'+n for n in names}
-    assert len(plan['expected'])==18
+    assert len(plan['expected'])==21
     assert plan['shards'][0]['estimated_seconds']==100 and len(plan['shards'][0]['tests'])==1
     assert all(s['estimated_seconds']==len(s['tests']) for s in plan['shards'][1:])
     expected=Counter(t['example']+' on '+tier for t in plan['expected'] if 'example' in t for tier in ['IN_PROCESS','REAL_PROCESS'])
@@ -111,7 +111,7 @@ with tempfile.TemporaryDirectory() as tmp:
     p=next(artifacts.rglob('TEST-*DataBrowser*.xml')); suite=ET.parse(p).getroot(); suite.remove(suite.find('testcase')); suite.set('tests','0'); p.write_text(ET.tostring(suite,encoding='unicode')); rehash(); verify(False); reset()
     p=next(artifacts.rglob('TEST-*Watch*.xml')); suite=ET.parse(p).getroot(); ET.SubElement(suite.find('testcase'),'skipped'); suite.set('skipped','1'); p.write_text(ET.tostring(suite,encoding='unicode')); rehash(); verify(False); reset()
     put('e2e/examples/added/case.e2e.yml','fixture'); verify(False)
-    call('plan','--output',root/'added.json'); assert len(json.loads((root/'added.json').read_text())['expected'])==19
+    call('plan','--output',root/'added.json'); assert len(json.loads((root/'added.json').read_text())['expected'])==22
     shutil.rmtree(root/'e2e/examples/added')
     put('e2e/src/test/java/sample/WatchAddedIT.java','package sample; class WatchAddedIT {}'); verify(False)
     (root/'e2e/src/test/java/sample/WatchAddedIT.java').unlink()
