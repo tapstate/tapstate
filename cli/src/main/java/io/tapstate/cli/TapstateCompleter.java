@@ -50,7 +50,9 @@ final class TapstateCompleter implements Completer {
     }
 
     /** Options that consume a following value token (so completion skips past the value). */
-    private static final List<String> VALUE_OPTIONS = List.of("-o", "--output");
+    private static final List<String> VALUE_OPTIONS = List.of(
+            "-c", "--connector", "--id", "-m", "--mode", "--primary-key", "--set", "--source",
+            "--sync-to", "--out", "-o", "--output", "--type", "--kind", "-w", "--workdir");
 
     /**
      * The completion strings for a word position, by context. Word 0 completes verbs (filtered by

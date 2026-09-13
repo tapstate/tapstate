@@ -117,6 +117,19 @@ class TapstateCompleterTest {
     }
 
     @Test
+    void completesAddKindAfterValueTakingOptions() {
+        assertThat(completer.candidates(List.of("add", "--connector", "mysql", ""), 3))
+                .containsExactlyInAnyOrder("pipeline", "serve", "source", "transform", "view");
+        assertThat(completer.candidates(List.of("add", "--workdir", "workspace", ""), 3))
+                .containsExactlyInAnyOrder("pipeline", "serve", "source", "transform", "view");
+    }
+
+    @Test
+    void doesNotCompleteAddKindInAnOptionValueSlot() {
+        assertThat(completer.candidates(List.of("add", "--id", ""), 2)).isEmpty();
+    }
+
+    @Test
     void completesTransformTypeValues() {
         assertThat(completer.candidates(List.of("new", "--type", ""), 2))
                 .containsExactlyInAnyOrder("filter", "map", "js", "union", "nest", "join");
