@@ -51,6 +51,9 @@ public enum IoError implements TapstateErrorCode {
      */
     SCHEMA_READ_CONTENTION("io.schema-read-contention", Set.of("connectionId")),
 
+    /** Publication lost its writer lease or exhausted its attempts under concurrent discovery. */
+    SCHEMA_WRITE_CONTENTION("io.schema-write-contention", Set.of("connectionId")),
+
     /**
      * A document a store operation had to write is larger than the store will accept. {@code id} is
      * the document's id, or {@code unknown} where the failing call did not name one.
