@@ -10,7 +10,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -76,6 +79,55 @@ class SnapshotBufferTest {
 
     private static Envelope row(String ring, int id) {
         return Envelope.read(id, ring, Map.of("id", (long) id), Map.of());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void drainReturnsItsInitialRowsWhileCaptureKeepsAppending() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.busy";
+        Envelope first = row("orders", 100);
+        AtomicBoolean replenish = new AtomicBoolean(true);
+        AtomicInteger appended = new AtomicInteger();
+
+        try (var capture = Executors.newSingleThreadExecutor()) {
+            Queue<Envelope> queue = new LinkedBlockingQueue<>() {
+                @Override
+                public Envelope poll() {
+                    // Keep the queue nonempty with a real capture append before each removal.
+                    // Cap the producer so an unbounded drain fails without hanging the test.
+                    if (replenish.get() && appended.get() < 64) {
+                        int id = 100 + appended.incrementAndGet();
+                        try {
+                            capture.submit(() -> buffer.append(ring, row("orders", id)))
+                                    .get(10, TimeUnit.SECONDS);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(interrupted);
+                        } catch (Exception failure) {
+                            throw new AssertionError(failure);
+                        }
+                    }
+                    return super.poll();
+                }
+            };
+            queue.add(first);
+            var field = SnapshotBuffer.class.getDeclaredField("byRing");
+            field.setAccessible(true);
+            ConcurrentMap<String, Queue<Envelope>> rings =
+                    (ConcurrentMap<String, Queue<Envelope>>) field.get(buffer);
+            rings.put(ring, queue);
+
+            List<Envelope> drained = buffer.drain(ring);
+            replenish.set(false);
+
+            assertThat(drained)
+                    .as("a drain returns its initial rows without chasing the active capture")
+                    .containsExactly(first);
+            assertThat(appended.get()).isEqualTo(1);
+            assertThat(buffer.drain(ring)).extracting(e -> e.after().get("id")).containsExactly(101L);
+            assertThat(buffer.drain(ring)).isEmpty();
+        }
     }
 
     @Test
