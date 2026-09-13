@@ -322,7 +322,7 @@ final class Repl {
             public SourceCatalogResult sourceCatalog() {
                 try {
                     TapstateCatalog catalog = TapstateCatalog.load();
-                    List<SourceConnector> connectors = SourceScaffold.connectors(catalog).stream()
+                    List<SourceConnector> connectors = catalog.ids().stream()
                             .map(id -> new SourceConnector(id, SourceScaffold.modes(catalog.byId(id)),
                                     catalog.byId(id).config().stream().map(Repl::sourceConfigField).toList()))
                             .toList();
@@ -377,7 +377,8 @@ final class Repl {
                         field.visibleWhen().controllingField(), field.visibleWhen().equalsAnyOf()));
         return new WorkbenchActionGateway.SourceConfigField(
                 field.name(), field.type(), label, field.defaultValue(), field.secret(),
-                field.options().stream().map(option -> option.value()).toList(), visibleWhen);
+                field.options().stream().map(option -> new WorkbenchActionGateway.SourceConfigOption(
+                        option.value(), option.label().getOrDefault("en_US", option.value()))).toList(), visibleWhen);
     }
 
     private Path resolveWorkbenchFile(Path relativePath) throws IOException {

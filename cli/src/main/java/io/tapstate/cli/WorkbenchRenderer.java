@@ -11,6 +11,7 @@ import dev.tamboui.widgets.block.BorderType;
 import dev.tamboui.widgets.block.Borders;
 import dev.tamboui.widgets.block.Title;
 import dev.tamboui.widgets.Clear;
+import dev.tamboui.widgets.Paragraph;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -497,6 +498,11 @@ final class WorkbenchRenderer {
         int first = Math.clamp(selected - visible / 2, 0, Math.max(0, fields.size() - visible));
         for (int offset = 0; offset < visible; offset++) {
             WorkbenchActionGateway.SourceConfigField field = fields.get(first + offset);
+            if (!field.options().isEmpty()) {
+                renderSourceConfigOption(frame, area, y + offset, source, field, theme,
+                        first + offset == selected);
+                continue;
+            }
             String value = source.config().getOrDefault(field.name(), "");
             if (field.secret() && !value.isBlank()) {
                 value = "*".repeat(value.codePointCount(0, value.length()));
@@ -511,6 +517,29 @@ final class WorkbenchRenderer {
         }
         write(frame, area.x(), area.bottom() - 1,
                 "↑↓ fields  ←→ choices  type value  " + (selected + 1) + "/" + fields.size(), theme.muted(), area);
+    }
+
+    private static void renderSourceConfigOption(
+            Frame frame, Rect area, int y, WorkbenchOverlayState.SourceCreate source,
+            WorkbenchActionGateway.SourceConfigField field, WorkbenchTheme theme, boolean active) {
+        String value = source.config().get(field.name());
+        if (value == null || field.options().stream().noneMatch(option -> option.value().equals(value))) {
+            value = field.defaultValue();
+        }
+        List<Span> spans = new ArrayList<>();
+        spans.add(Span.styled(field.label() + ": ", active ? theme.title().bold() : theme.muted()));
+        for (int index = 0; index < field.options().size(); index++) {
+            WorkbenchActionGateway.SourceConfigOption option = field.options().get(index);
+            if (index > 0) {
+                spans.add(Span.styled(" ", theme.base()));
+            }
+            boolean selected = option.value().equals(value);
+            spans.add(Span.styled(
+                    selected ? "[" + option.label() + "]" : " " + option.label() + " ",
+                    selected ? theme.base().bold() : theme.muted()));
+        }
+        frame.renderWidget(Paragraph.from(Line.from(spans)), new Rect(
+                area.x() + 2, y, Math.max(1, area.width() - 2), 1));
     }
 
     private static List<OverlayHit> renderConfirm(

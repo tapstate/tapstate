@@ -130,7 +130,7 @@ interface WorkbenchActionGateway {
             String label,
             String defaultValue,
             boolean secret,
-            List<String> options,
+            List<SourceConfigOption> options,
             Optional<SourceConfigVisibility> visibleWhen) {
         public SourceConfigField {
             Objects.requireNonNull(name, "name");
@@ -138,6 +138,13 @@ interface WorkbenchActionGateway {
             Objects.requireNonNull(label, "label");
             options = List.copyOf(options);
             Objects.requireNonNull(visibleWhen, "visibleWhen");
+        }
+    }
+
+    record SourceConfigOption(String value, String label) {
+        public SourceConfigOption {
+            Objects.requireNonNull(value, "value");
+            Objects.requireNonNull(label, "label");
         }
     }
 

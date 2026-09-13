@@ -793,7 +793,8 @@ final class Workbench {
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
                             ready.catalog(), WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR, 0,
                             connector, mode, "", SourceScaffold.suggestedId(connector),
-                            Optional.empty(), false, Optional.empty())));
+                            sourceOptionDefaults(ready.catalog(), connector), Optional.empty(), false,
+                            Optional.empty())));
                 }
                 case WorkbenchActionGateway.SourceCatalogResult.Unavailable ignored -> runtime.updateState(state ->
                         state.withOverlay(new WorkbenchOverlayState.SourceCreate(
@@ -900,8 +901,10 @@ final class Workbench {
                 String connector = choices.get(source.selectedIndex());
                 String mode = source.catalog().connectors().stream().filter(item -> item.id().equals(connector))
                         .findFirst().orElseThrow().modes().getFirst();
-                return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.MODE, 0, connector, mode,
-                        source.tables(), SourceScaffold.suggestedId(connector), Optional.empty(), false, Optional.empty());
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                        source.catalog(), WorkbenchOverlayState.SourceCreate.Stage.MODE, 0, source.filter(), connector,
+                        mode, source.tables(), SourceScaffold.suggestedId(connector),
+                        sourceOptionDefaults(source.catalog(), connector), Optional.empty(), false, Optional.empty())));
             }
             if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) {
                 return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.TABLES, 0, source.connector(),
@@ -1086,11 +1089,33 @@ final class Workbench {
 
         private boolean cycleSourceConfigOption(WorkbenchOverlayState.SourceCreate source, int direction) {
             WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, source.selectedIndex());
-            List<String> options = new java.util.ArrayList<>(field.options());
-            options.add("");
-            int current = options.indexOf(source.config().getOrDefault(field.name(), ""));
+            List<WorkbenchActionGateway.SourceConfigOption> options = field.options();
+            int current = options.stream().map(WorkbenchActionGateway.SourceConfigOption::value)
+                    .toList().indexOf(source.config().getOrDefault(field.name(), ""));
+            if (current < 0) {
+                current = 0;
+            }
             int next = Math.floorMod(current + direction, options.size());
-            return updateSourceConfig(source, source.selectedIndex(), options.get(next), Optional.empty());
+            return updateSourceConfig(source, source.selectedIndex(), options.get(next).value(), Optional.empty());
+        }
+
+        private Map<String, String> sourceOptionDefaults(
+                WorkbenchActionGateway.SourceCatalog catalog, String connector) {
+            return catalog.connectors().stream()
+                    .filter(item -> item.id().equals(connector))
+                    .findFirst()
+                    .orElseThrow()
+                    .configFields().stream()
+                    .filter(field -> !field.options().isEmpty())
+                    .collect(java.util.stream.Collectors.toMap(
+                            WorkbenchActionGateway.SourceConfigField::name,
+                            field -> field.options().stream()
+                                    .filter(option -> option.value().equals(field.defaultValue()))
+                                    .findFirst()
+                                    .orElse(field.options().getFirst())
+                                    .value(),
+                            (left, right) -> right,
+                            java.util.LinkedHashMap::new));
         }
 
         private Map<String, Object> sourceConfig(WorkbenchOverlayState.SourceCreate source) {
