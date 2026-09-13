@@ -1,0 +1,5 @@
+version: tapstate/v1
+kind: source
+id: tgt_db
+connector: sqlserver
+config: { host: ${TGT_DB_HOST}, port: ${TGT_DB_PORT}, user: ${TGT_DB_USER}, password: ${TGT_DB_PASSWORD}, database: ${TGT_DB_DATABASE}, schema: ${TGT_DB_SCHEMA} }

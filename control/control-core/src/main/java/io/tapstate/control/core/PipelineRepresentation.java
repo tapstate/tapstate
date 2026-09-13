@@ -26,6 +26,7 @@ import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewSchema;
@@ -422,6 +423,7 @@ public final class PipelineRepresentation {
             value.put("writeMode", element.writeMode() == null ? null : element.writeMode().name());
             value.put("rename", renameValue(element.rename()));
             value.put("ddl", element.ddl() == null ? null : element.ddl().name());
+            value.put("onFullLoad", element.onFullLoad() == null ? null : element.onFullLoad().name());
             return Collections.unmodifiableMap(value);
         }).toList();
     }
@@ -568,7 +570,9 @@ public final class PipelineRepresentation {
                     enumValue(value(value, "write_mode", "writeMode"), WriteMode.values(), WriteMode::yaml,
                             path + ".writeMode"),
                     rename(objectOrNull(value.get("rename"), path + ".rename")),
-                    enumValue(value.get("ddl"), DdlPolicy.values(), DdlPolicy::yaml, path + ".ddl")));
+                    enumValue(value.get("ddl"), DdlPolicy.values(), DdlPolicy::yaml, path + ".ddl"),
+                    enumValue(value(value, "on_full_load", "onFullLoad"), OnFullLoad.values(), OnFullLoad::yaml,
+                            path + ".onFullLoad")));
         }
         return List.copyOf(result);
     }

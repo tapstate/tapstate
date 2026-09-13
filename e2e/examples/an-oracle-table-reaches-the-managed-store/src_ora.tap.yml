@@ -1,0 +1,8 @@
+version: tapstate/v1
+kind: source
+id: src_ora
+connector: oracle
+# Explicit log selection avoids the legacy continuous-mining option on this server.
+config: { host: ${SRC_ORA_HOST}, port: ${SRC_ORA_PORT}, user: ${SRC_ORA_USER}, password: ${SRC_ORA_PASSWORD}, schema: ${SRC_ORA_SCHEMA}, thinType: SERVICE_NAME, database: ${SRC_ORA_DATABASE}, autoLog: false, multiTenant: true, pdb: ${SRC_ORA_PDB} }
+mode: cdc
+tables: [ orders ]

@@ -88,7 +88,7 @@
     <!-- PDK API: the frozen connector contract surface (TapConnector / TapEvent / ConnectorFunctions
          and the tapdata-api entity types they reference). It is the single shared layer the isolated
          connector class loaders delegate to, so every connector binds to the same contract types; rule
-         R3 locks it to adapter-pdk. This small contract tree is managed here as one snapshot line. The
+         R3 locks it to adapter-pdk. The contract and its compatible entity companion are managed here. The
          connector plugin jars load at runtime inside per-connector class loaders and never reach the host
          classpath. The PDK runtime (TapRuntime and its transitive libraries) is the deliberate exception:
          the assembly root carries it on the host classpath at runtime scope, so a real connector's base
@@ -106,6 +106,8 @@
          with the resolver). The contract (tapdata-api) and its error-code libraries carry a different
          base version, so both are set. -->
     <pdk-api.version>2.0.8-SNAPSHOT</pdk-api.version>
+    <!-- The compatible entity companion adds the DDL warning event used by Oracle sources. -->
+    <pdk-entity.version>2.0.9-SNAPSHOT</pdk-entity.version>
     <pdk-errorcode.version>2.8-SNAPSHOT</pdk-errorcode.version>
     <!-- The PDK runtime (pdk-runner): a connector base class bootstraps TapRuntime through the host
          loader at construction, so the assembly root carries this on its runtime classpath. A separate
@@ -299,8 +301,8 @@
       </dependency>
       <!-- PDK API contract, locked to adapter-pdk by rule R3. Only the small contract tree is managed
            into the reactor (tapdata-pdk-api + the tapdata-api entity types it exposes + the error-code
-           libraries they pull); the transitive io.tapdata versions are managed explicitly so the whole
-           contract tree tracks one snapshot line together. The connector plugins load in isolation at
+           libraries they pull); the transitive io.tapdata versions are managed explicitly against the
+           compatible API and entity baselines. The connector plugins load in isolation at
            runtime and are deliberately NOT managed here. The PDK runtime (pdk-runner) IS managed here so
            its version is single-sourced: the assembly root carries it at runtime scope, where a real
            connector's base class bootstraps the runtime through the host loader, and adapter-pdk pulls it
@@ -316,7 +318,7 @@
       <dependency>
         <groupId>io.tapdata</groupId>
         <artifactId>tapdata-api</artifactId>
-        <version>${pdk-api.version}</version>
+        <version>${pdk-entity.version}</version>
       </dependency>
       <dependency>
         <groupId>io.tapdata</groupId>

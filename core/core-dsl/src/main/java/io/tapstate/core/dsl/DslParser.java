@@ -31,6 +31,7 @@ import io.tapstate.core.model.SrsSchemaEvolution;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
@@ -110,7 +111,7 @@ public final class DslParser {
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
     static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
-    static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "options");
+    static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "on_full_load", "options");
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
     static final Set<String> PUSH_KEYS = Set.of("id", "source", "topic", "format", "options");
@@ -636,7 +637,8 @@ public final class DslParser {
                     s.requireString("source"),
                     enumByYaml(WriteMode.values(), WriteMode::yaml, s, "write_mode"),
                     rename(s.mapping("rename")),
-                    enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl")));
+                    enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
+                    enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, s, "on_full_load")));
         }
         return out;
     }

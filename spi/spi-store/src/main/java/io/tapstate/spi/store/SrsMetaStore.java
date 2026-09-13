@@ -32,11 +32,12 @@ public interface SrsMetaStore {
      * path needs, and all of it. Both bounds that path applies are functions of these cursors: the
      * headroom the ring has left, and how far the durable read offset may advance.
      *
-     * <p>Separate from {@link #read} because the record also carries a schema history that grows by one
-     * entry per DDL and is never trimmed, and this path never looks at it. Fetching the whole record on
-     * every run of changes therefore carries that history back across the wire each time, and the cost of
-     * doing so grows for the life of the chain. A store that can answer this without the history stops
-     * paying for it; one that cannot is still correct, which is why this has a default at all.
+     * <p>Separate from {@link #read} because the record also carries a schema history — one entry per DDL,
+     * bounded by what the store retains of it — and this path never looks at it. Fetching the whole record
+     * on every run of changes therefore carries that history back across the wire each time, and the cost
+     * of doing so grows with what the record holds for the life of the chain. A store that can answer this
+     * without the history stops paying for it; one that cannot is still correct, which is why this has a
+     * default at all.
      */
     default List<ConsumerOffset> consumerOffsets(String miningChainId) {
         return read(miningChainId).map(SrsMeta::consumerOffsets).orElse(List.of());
@@ -150,8 +151,17 @@ public interface SrsMetaStore {
     long openEpoch(String miningChainId);
 
     /**
-     * Appends a version to the chain's append-only schema history. A mutate on an unseeded chain is a
-     * caller ordering error.
+     * Appends a version to the chain's schema history — the version just appended is always recorded. A
+     * mutate on an unseeded chain is a caller ordering error.
+     *
+     * <p>A store may bound how much of the history it retains, dropping the oldest versions once the bound
+     * is reached, so a caller must not assume every version ever appended is still there. What it may
+     * assume is that the version it just appended is, because recording a schema change is the whole of
+     * what this call is for. The bound belongs to the store rather than to this contract because the room
+     * it is measured against is the store's own — a record that is one document under a fixed ceiling, of
+     * which this history is the only facet that grows for the life of a chain. A store that kept every
+     * version arrives at a state where this call, the one write that can record a schema change, is the
+     * write the store refuses.
      */
     void appendSchemaVersion(String miningChainId, SchemaVersion version);
 

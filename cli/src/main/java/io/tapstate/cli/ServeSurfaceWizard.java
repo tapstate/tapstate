@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import io.tapstate.core.model.DdlPolicy;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.QueryElement;
 import io.tapstate.core.model.QueryType;
@@ -70,7 +71,13 @@ final class ServeSurfaceWizard {
                 WizardPrompts.askSourceRef(prompter, existingSourceIds, "Sync to (target source id)", true);
         WriteMode writeMode = askWriteMode();
         DdlPolicy ddl = askDdl();
-        return new SyncElement("sync_" + n, source, writeMode, null, ddl);
+        String policy = prompter.choose("Existing rows before a new full load?", List.of("clear", "fail", "append"));
+        OnFullLoad onFullLoad = switch (policy) {
+            case "clear" -> OnFullLoad.CLEAR;
+            case "fail" -> OnFullLoad.FAIL;
+            default -> OnFullLoad.APPEND;
+        };
+        return new SyncElement("sync_" + n, source, writeMode, null, ddl, onFullLoad);
     }
 
     /** Upsert is the canonical default, listed last so an empty reply selects it (and is then omitted). */

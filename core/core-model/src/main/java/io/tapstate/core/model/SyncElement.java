@@ -27,7 +27,14 @@ public record SyncElement(
         RenameSpec rename,
         @Doc(value = "Policy controlling how schema changes are applied to the target store.",
                 def = "fail")
-        DdlPolicy ddl) {
+        DdlPolicy ddl,
+        @Doc(value = "Treatment of existing target rows before a new full load; resume, recovery and CDC-only never clear rows.",
+                def = "append")
+        OnFullLoad onFullLoad) {
+
+    public SyncElement(String id, String source, WriteMode writeMode, RenameSpec rename, DdlPolicy ddl) {
+        this(id, source, writeMode, rename, ddl, null);
+    }
 
     public SyncElement {
         Objects.requireNonNull(source, "source");
