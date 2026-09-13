@@ -522,8 +522,10 @@ final class WorkbenchRenderer {
     private static void renderSourceConfigOption(
             Frame frame, Rect area, int y, WorkbenchOverlayState.SourceCreate source,
             WorkbenchActionGateway.SourceConfigField field, WorkbenchTheme theme, boolean active) {
-        String value = source.config().get(field.name());
-        if (value == null || field.options().stream().noneMatch(option -> option.value().equals(value))) {
+        String configuredValue = source.config().get(field.name());
+        String value = configuredValue;
+        if (configuredValue == null
+                || field.options().stream().noneMatch(option -> option.value().equals(configuredValue))) {
             value = field.defaultValue();
         }
         List<Span> spans = new ArrayList<>();
