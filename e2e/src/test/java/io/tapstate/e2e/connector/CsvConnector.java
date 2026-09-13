@@ -26,6 +26,8 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -45,6 +47,9 @@ import java.util.stream.Stream;
  * one. Everything the product does around the connector - registering the artifact, resolving the
  * class, deriving the target model, running the DAG, keying the upsert - is the real thing; only the
  * store at each end is a directory instead of a database.
+ *
+ * <p>A table is published by staging its complete contents beside it and atomically replacing the
+ * table's file. Writers must never overwrite a visible table in place because readers open it whole.
  *
  * <h2>Two rules this class must not break</h2>
  *
@@ -97,6 +102,13 @@ public class CsvConnector implements TapConnector {
     private static final String REQUIRE_PASSWORD = "require_password";
 
     private static final String SUFFIX = ".csv";
+
+    /**
+     * What a table's content is staged under while the table is being replaced. The format's suffix is
+     * absent from it on purpose: a staging file that outlived a crash is then not a table by the same
+     * reading that lists the tables, and no lookup resolves to it.
+     */
+    private static final String STAGING_SUFFIX = ".staging";
 
     /**
      * The one command the read face dispatches. It is pinned on both sides on purpose: the caller sends
@@ -578,6 +590,20 @@ public class CsvConnector implements TapConnector {
         return columns;
     }
 
+    /**
+     * Replaces the table's file with the given rows in one step.
+     *
+     * <p>The content is staged beside the file it replaces and moved into place, rather than written over
+     * it. A file opened for writing is emptied before the text lands, so an in-place rewrite is a table
+     * that observably holds nothing for the length of the write while every row it holds is still there -
+     * and that reading is the one a count taken by anyone else cannot tell apart from a run that wrote
+     * nothing at all. A move is the one step a reader cannot land inside.
+     *
+     * <p>The staged name deliberately does not end in the format's suffix, and is not where a table is
+     * looked for: a directory listing made mid-write sees exactly the tables that have been written,
+     * never a half-written one being called a table. A staging file left behind by a crash is therefore
+     * not a table either, and the next write of that table does not collide with it.
+     */
     private static void write(Path file, List<String> header, List<Map<String, Object>> rows) {
         StringBuilder text = new StringBuilder(String.join(",", header)).append('\n');
         for (Map<String, Object> row : rows) {
@@ -590,18 +616,37 @@ public class CsvConnector implements TapConnector {
         }
         try {
             Files.createDirectories(file.getParent());
-            Path replacement = Files.createTempFile(file.getParent(), "." + file.getFileName(), ".tmp");
+            Path staged = Files.createTempFile(file.getParent(), "table-", STAGING_SUFFIX);
             try {
-                Files.writeString(replacement, text.toString());
-                // Readers in another process must see either complete generation, never truncation.
-                Files.move(replacement, file, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                Files.writeString(staged, text.toString());
+                publish(staged, file);
             } finally {
-                Files.deleteIfExists(replacement);
+                // Nothing reads a staging file, so one a failed write leaves behind is one nothing ever
+                // collects. After the move it is already gone, and this call does nothing.
+                Files.deleteIfExists(staged);
             }
         } catch (IOException e) {
             throw new UncheckedIOException("cannot write the table at " + file, e);
         }
+    }
+
+    /**
+     * Puts the staged content where the table is, in one step, with the mode a reader other than this
+     * process needs.
+     *
+     * <p>A temp file is created readable by its owner alone, and a move carries that mode onto the table.
+     * The write this replaces left the mode the process's umask gives instead - readable by anyone. These
+     * directories are read across users: a build running in a container and a harness running out here
+     * share one, each reading what the other wrote. So the staged file is given that mode back before it
+     * is moved into place, or a table this process wrote is one the other user cannot open.
+     */
+    private static void publish(Path staged, Path file) throws IOException {
+        try {
+            Files.setPosixFilePermissions(staged, PosixFilePermissions.fromString("rw-r--r--"));
+        } catch (UnsupportedOperationException noPosixPermissions) {
+            // A filesystem that carries no POSIX permissions has nothing to widen.
+        }
+        Files.move(staged, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     private static List<String> read(Path file) {
