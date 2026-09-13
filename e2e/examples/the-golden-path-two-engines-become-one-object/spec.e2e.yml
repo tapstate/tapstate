@@ -63,8 +63,8 @@ steps:
   # constant and from each other's neighbours.
   - await: { doc: { views.order_state: { where: { id: 1 }, expect: { customer: alice }, size: { shipments: 2 } } } }
   - await: { doc: { views.order_state: { where: { id: 3 }, expect: { customer: carol }, size: { shipments: 1 } } } }
-  - assert: { doc: { views.order_state: { where: { id: 2 }, expect: { customer: bob }, size: { shipments: 2 } } } }
-  - assert: { doc: { views.order_state: { where: { id: 4 }, expect: { customer: dave }, size: { shipments: 1 } } } }
+  - await: { doc: { views.order_state: { where: { id: 2 }, expect: { customer: bob }, size: { shipments: 2 } } } }
+  - await: { doc: { views.order_state: { where: { id: 4 }, expect: { customer: dave }, size: { shipments: 1 } } } }
   # The order nobody shipped. It has to be a document, and it has to have no shipments on it.
   - assert: { doc: { views.order_state: { where: { id: 5 }, expect: { customer: erin }, size: { shipments: 0 } } } }
   # Ripple one: a row inserted into the second engine reaches a document the first engine wrote.

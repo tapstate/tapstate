@@ -461,6 +461,10 @@ final class NewCmd extends SingleResourceOptions implements Callable<Integer> {
             case "filter" -> new TransformBody.Filter("op != 'd'");
             case "js" -> new TransformBody.Js("emit(after)\n");
             case "map" -> new TransformBody.MapProjection(Map.of("id", FieldRule.rename("id")));
+            // The ordinal is in the scaffold rather than left for the author to add, because a
+            // declaration naming neither locator is refused when it is validated - and a
+            // scaffold that fails its own validate teaches the author that the tool is wrong.
+            case "unwind" -> new TransformBody.Unwind("items", "item_no", null, null, null);
             case "nest" -> new TransformBody.Nest(null, null, new NestRoot("main", null, null, null, null));
             case "join" -> new TransformBody.Join(JoinEngine.BUILTIN, "SELECT * FROM a\n");
             default -> throw new IllegalStateException("unhandled transform type: " + type);

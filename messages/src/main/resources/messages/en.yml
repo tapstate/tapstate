@@ -261,6 +261,15 @@ dsl.row-expression-type-unknown:
 dsl.upsert-needs-key:
   message: "The sync at {path} upserts table `{table}` of source `{source}`, but that table declares no key, so no write can be matched to the row it belongs to."
   solution: "Give `{table}` a primary key and discover `{source}` again, or write with `write_mode: append`, which adds rows instead of matching them. A unique index is not enough: only a primary key is read as the key here."
+dsl.unwind-needs-an-element-key:
+  message: "The unwind step `{step}` at {path} names nothing that varies from one element to the next, so every row it expands out of a row would carry that row's own key and the target would keep only the last of them."
+  solution: "Add `element_key` naming a field inside each element that identifies the row it becomes, or `include_array_index` to carry each element's position in the array and be told apart by that."
+dsl.unwind-column-already-exists:
+  message: "Unwind option `{option}` generates column `{column}`, but that name is already in use."
+  solution: "Choose a name distinct from the parent columns, the array path, and the other generated column. Rename a parent column in an earlier map if necessary."
+dsl.unwind-needs-an-upsert-target:
+  message: "The unwind step `{step}` is written by sync `{sync}`, whose {path} appends rows instead of matching them, so deleting a row would append the elements it used to hold instead of taking their rows away."
+  solution: "Write that sync with `write_mode: upsert`, the default, so the expanded rows can be matched and removed; or serve the unwind to a sync that upserts and keep the append target on output that does not expand."
 dsl.composition:
   message: "Composition rule broken at {path}: {detail}."
   solution: "Review how the resources are wired together."
@@ -600,6 +609,12 @@ transform.script-no-process:
 transform.script-output-invalid:
   message: "The js transform script produced output that is not a valid record: {detail}."
   solution: "Ensure process returns a record (or emits one) whose before, after and schema are objects or null."
+transform.unwind-needs-a-complete-before-image:
+  message: "Expanding `{path}` needs the row that an update or a delete replaces, but {detail}, so the rows that row produced cannot be removed."
+  solution: "Configure the source to send the whole earlier row: a document store needs change-stream pre-images turned on for the collection, and a relational source needs its replica identity set to full. Sending only the key columns is not enough here."
+transform.unwind-rows-share-a-key:
+  message: "Two elements of one row expanded `{path}` onto the same key {key}, so the target keeps whichever was written last and the other is lost."
+  solution: "Give the elements something that differs between them - a field of their own named by element_key, or their position in the list via include_array_index - or stop the source producing two elements with one identity."
 nest.sibling-embeds-target-different-parent-keys:
   message: "The embeds under {embedPath} join on different parent fields: {fields}."
   solution: "Have every embed under one parent join on the same parent field; that field is the parent's identity."
@@ -756,3 +771,7 @@ cli.issuer-discovery-rejected:
 cli.auth-issuer-mismatch:
   message: "Server seed {seed} reports issuer {actual}, but {expected} was required."
   solution: "Check the context seeds and sign in again only after confirming that this is the intended cluster."
+
+actuation.unwind-parent-key-unresolved:
+  message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
+  solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
