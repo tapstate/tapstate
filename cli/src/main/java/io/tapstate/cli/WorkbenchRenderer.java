@@ -382,7 +382,8 @@ final class WorkbenchRenderer {
                 .build();
         frame.renderWidget(block, area);
         Rect inner = block.inner(area);
-        int leftWidth = Math.clamp(inner.width() / 2, 34, 50);
+        boolean configStage = source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG;
+        int leftWidth = configStage ? inner.width() : Math.clamp(inner.width() / 2, 34, 50);
         Rect formArea = new Rect(inner.x(), inner.y(), leftWidth, inner.height());
         Rect previewArea = new Rect(inner.x() + leftWidth + 1, inner.y(),
                 Math.max(0, inner.width() - leftWidth - 1), inner.height());
@@ -439,19 +440,21 @@ final class WorkbenchRenderer {
             };
             write(frame, formArea.x(), y, hint, theme.muted(), formArea);
         }
-        Block previewBlock = Block.builder()
-                .borderType(BorderType.ROUNDED)
-                .borders(Borders.ALL)
-                .borderStyle(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
-                        ? theme.accent() : theme.base())
-                .title(Title.from(Line.from(Span.styled(" Canonical YAML ", theme.title()))))
-                .build();
-        frame.renderWidget(previewBlock, previewArea);
-        Rect previewInner = previewBlock.inner(previewArea);
-        String yaml = source.canonicalYaml().orElse("Preview appears after the resource id is confirmed.");
-        String[] lines = yaml.split("\\R");
-        for (int index = 0; index < Math.min(lines.length, previewInner.height()); index++) {
-            write(frame, previewInner.x(), previewInner.y() + index, lines[index], theme.base(), previewInner);
+        if (!configStage) {
+            Block previewBlock = Block.builder()
+                    .borderType(BorderType.ROUNDED)
+                    .borders(Borders.ALL)
+                    .borderStyle(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
+                            ? theme.accent() : theme.base())
+                    .title(Title.from(Line.from(Span.styled(" Canonical YAML ", theme.title()))))
+                    .build();
+            frame.renderWidget(previewBlock, previewArea);
+            Rect previewInner = previewBlock.inner(previewArea);
+            String yaml = source.canonicalYaml().orElse("Preview appears after the resource id is confirmed.");
+            String[] lines = yaml.split("\\R");
+            for (int index = 0; index < Math.min(lines.length, previewInner.height()); index++) {
+                write(frame, previewInner.x(), previewInner.y() + index, lines[index], theme.base(), previewInner);
+            }
         }
         source.message().ifPresent(message -> write(
                 frame, formArea.x(), formArea.bottom() - 1, message, theme.error(), formArea));

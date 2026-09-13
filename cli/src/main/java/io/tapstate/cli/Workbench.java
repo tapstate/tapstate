@@ -836,6 +836,9 @@ final class Workbench {
             }
             if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG
                     && (key.isLeft() || key.isRight())) {
+                if (sourceConfigField(source, source.selectedIndex()).options().isEmpty()) {
+                    return true;
+                }
                 return cycleSourceConfigOption(source, key.isLeft() ? -1 : 1);
             }
             if (key.isDeleteBackward()) {
