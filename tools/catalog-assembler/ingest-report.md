@@ -1,7 +1,9 @@
 # Connector catalog ingest report
 
-Spec SHA: `f3bd43a`
+Spec SHA: `ce0ab33`
 Capability SHA: `f3bd43a`
+
+> The capability face comes from an earlier upstream revision than the spec face: modes, sink and write semantics were derived at `f3bd43a`, while the structure below was read at `ce0ab33`. A full refresh brings them back together.
 Ingested connectors: 80
 
 ## Unclassified — no resolvable mode (need tapstate.modes)
