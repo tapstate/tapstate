@@ -169,11 +169,17 @@ class PublishedExamplesIT {
             } catch (RuntimeException | AssertionError failed) {
                 // Before the containers go away. Everything that would explain this failure is inside
                 // them, and a second run to add a print statement costs two database engines again.
-                FailureScene.write(
-                        FAILURE_SCENES.resolve(specification + "-" + tier.name().toLowerCase(Locale.ROOT) + ".txt"),
-                        envelope,
-                        binding,
-                        new FilePipelineLoader(workspace).resolvePipelineId(envelope.pipeline()));
+                try {
+                    FailureScene.write(
+                            FAILURE_SCENES.resolve(specification + "-" + tier.name().toLowerCase(Locale.ROOT) + ".txt"),
+                            envelope,
+                            binding,
+                            new FilePipelineLoader(workspace).resolvePipelineId(envelope.pipeline()));
+                } catch (RuntimeException | AssertionError sceneFailure) {
+                    // Setup can fail before a pipeline exists. Preserve that cause when collecting
+                    // its status fails too, rather than replacing it with an unknown-pipeline error.
+                    failed.addSuppressed(sceneFailure);
+                }
                 throw failed;
             }
 

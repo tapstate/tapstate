@@ -60,6 +60,11 @@
     </dependency>
     <!-- The CEL runtime: this adapter evaluates the AST core-dsl compiled. Version from the BOM. -->
     <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+
+    <dependency>
       <groupId>dev.cel</groupId>
       <artifactId>cel</artifactId>
     </dependency>

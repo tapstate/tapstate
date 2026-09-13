@@ -19,6 +19,7 @@ actuation.source-table-not-discovered
 actuation.source-table-regex-invalid
 actuation.source-table-selection-empty
 actuation.source-table-spec-unsupported
+actuation.unwind-parent-key-unresolved
 actuation.view-fed-by-many-tables
 actuation.view-key-missing
 actuation.view-key-not-feed-identity
@@ -156,6 +157,9 @@ dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode
 dsl.unsupported-version
+dsl.unwind-column-already-exists
+dsl.unwind-needs-an-element-key
+dsl.unwind-needs-an-upsert-target
 dsl.upsert-needs-key
 engine.frontier-order-not-encodable
 engine.frontier-pinned
@@ -231,3 +235,5 @@ transform.script-compile-failed
 transform.script-failed
 transform.script-no-process
 transform.script-output-invalid
+transform.unwind-needs-a-complete-before-image
+transform.unwind-rows-share-a-key

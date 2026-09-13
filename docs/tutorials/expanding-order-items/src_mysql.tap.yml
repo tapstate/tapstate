@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: src_mysql
+connector: mysql
+config: { host: "127.0.0.1", port: 3306, database: "unwind_source", username: "unwind", password: "replace-with-your-local-password" }
+mode: cdc
+tables: [ orders ]
