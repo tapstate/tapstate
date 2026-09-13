@@ -33,10 +33,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * this project travels no further than a log: nothing downstream changes, and a case that read a target
  * would be asserting the repair this deliberately does not make.
  *
- * <p><b>The edit in the middle is the discriminating half.</b> Changing the row already filed under a
- * key replaces it too, and that is the same row rather than a lost one. Only an arrival carrying no
- * before image can be a second row, so a case that only inserted would be satisfied by an
- * implementation that reported every dimension write it made.
+ * <p><b>The source row key is the discriminating half.</b> Changing the row already filed under a key
+ * replaces it too, and that is the same row rather than a lost one even where its earlier image is
+ * absent. Conversely, an edit of a row that was displaced earlier can replace a different row while
+ * carrying an earlier image. The source's own key distinguishes both; event shape and row contents do
+ * not.
  */
 class ASecondDimensionRowUnderOneJoinKeyIsReportedTest {
 
@@ -47,6 +48,7 @@ class ASecondDimensionRowUnderOneJoinKeyIsReportedTest {
                     new SourceColumn("o_id", TapstateType.INT64, false),
                     new SourceColumn("o_cust_id", TapstateType.INT64, true))),
             new SourceTable("customers", List.of(
+                    new SourceColumn("customer_id", TapstateType.INT64, false),
                     new SourceColumn("c_id", TapstateType.INT64, false),
                     new SourceColumn("c_name", TapstateType.STRING, false))));
 
@@ -61,25 +63,103 @@ class ASecondDimensionRowUnderOneJoinKeyIsReportedTest {
     @DisplayName("a second dimension row under an occupied join key is reported, naming the source and the key")
     void theDisplacedDimensionRowIsSaid() {
         Recording alert = new Recording();
-        JoinDriver driver = new JoinDriver(SqlFrontEnd.derive(SQL, TABLES), List.of("o_id"), STREAM,
-                new MapJoinStores(), alert);
+        JoinDriver driver = driver(alert);
 
-        apply(driver, "c", Envelope.insert(1L, "src", row("c_id", 1L, "c_name", "Ada"), null));
-        apply(driver, "o", Envelope.insert(2L, "src", row("o_id", 10L, "o_cust_id", 1L), null));
-        apply(driver, "c", Envelope.update(3L, "src", row("c_id", 1L, "c_name", "Ada"),
-                row("c_id", 1L, "c_name", "Ada Lovelace"), null));
+        apply(driver, "c", Envelope.insert(1L, "src", customer(101L, 1L, "Ada"), null));
+        apply(driver, "o", Envelope.insert(2L, "src", order(10L, 1L), null));
+        apply(driver, "c", Envelope.update(3L, "src", customer(101L, 1L, "Ada"),
+                customer(101L, 1L, "Ada Lovelace"), null));
 
         assertThat(alert.said)
                 .as("an edit of the row already filed under the key replaces it as well, and nothing "
                         + "was lost -- it is the same row")
                 .isEmpty();
 
-        apply(driver, "c", Envelope.insert(4L, "src", row("c_id", 1L, "c_name", "Bo"), null));
+        apply(driver, "c", Envelope.insert(4L, "src", customer(102L, 1L, "Bo"), null));
 
         assertThat(alert.said)
                 .as("Ada is now unreachable and the order under that key joins to Bo, which is the "
                         + "third option a query must not be answered with: accepted, wrong, and silent")
                 .containsExactly(new Said("c", SHARED_KEY));
+    }
+
+    @Test
+    void anUpdateWithoutABeforeImageDoesNotInventASecondSourceRow() {
+        Recording alert = new Recording();
+        JoinDriver driver = driver(alert);
+
+        apply(driver, "c", Envelope.insert(1L, "src", customer(101L, 1L, "Ada"), null));
+        apply(driver, "c", Envelope.update(2L, "src", null,
+                customer(101L, 1L, "Ada Lovelace"), null));
+
+        assertThat(alert.said)
+                .as("one source row was edited, so no row was displaced")
+                .isEmpty();
+    }
+
+    @Test
+    void aChangedRowInARepeatedSnapshotDoesNotInventASecondSourceRow() {
+        Recording alert = new Recording();
+        JoinDriver driver = driver(alert);
+
+        apply(driver, "c", Envelope.read(1L, "src", customer(101L, 1L, "Ada"), null));
+        apply(driver, "c", Envelope.read(2L, "src",
+                customer(101L, 1L, "Ada Lovelace"), null));
+
+        assertThat(alert.said)
+                .as("the repeated snapshot contains the newer image of the same source row")
+                .isEmpty();
+    }
+
+    @Test
+    void updatingAPreviouslyDisplacedRowStillReportsTheRowItDisplaces() {
+        Recording alert = new Recording();
+        JoinDriver driver = driver(alert);
+        Map<String, Object> ada = customer(101L, 1L, "Ada");
+        Map<String, Object> bo = customer(102L, 1L, "Bo");
+
+        apply(driver, "c", Envelope.insert(1L, "src", ada, null));
+        apply(driver, "c", Envelope.insert(2L, "src", bo, null));
+        apply(driver, "c", Envelope.update(3L, "src", ada,
+                customer(101L, 1L, "Ada Lovelace"), null));
+
+        assertThat(alert.said)
+                .as("Bo is replaced when the formerly displaced Ada row is updated")
+                .containsExactly(new Said("c", SHARED_KEY), new Said("c", SHARED_KEY));
+    }
+
+    @Test
+    void movingARowOntoAnOccupiedJoinKeyReportsTheRowItDisplaces() {
+        Recording alert = new Recording();
+        JoinDriver driver = driver(alert);
+        Map<String, Object> ada = customer(101L, 2L, "Ada");
+
+        apply(driver, "c", Envelope.insert(1L, "src", ada, null));
+        apply(driver, "c", Envelope.insert(2L, "src", customer(102L, 1L, "Bo"), null));
+        apply(driver, "c", Envelope.update(3L, "src", ada,
+                customer(101L, 1L, "Ada"), null));
+
+        assertThat(alert.said)
+                .as("Bo is replaced even though the arriving Ada row carries an earlier image")
+                .containsExactly(new Said("c", SHARED_KEY));
+    }
+
+    @Test
+    void distinctRowsWithTheSamePublishedValuesAreStillDistinguishedByTheirSourceKeys() {
+        Recording alert = new Recording();
+        JoinDriver driver = driver(alert);
+
+        apply(driver, "c", Envelope.insert(1L, "src", customer(101L, 1L, "Ada"), null));
+        apply(driver, "c", Envelope.insert(2L, "src", customer(102L, 1L, "Ada"), null));
+
+        assertThat(alert.said)
+                .as("equal join and projected values do not make two source keys the same row")
+                .containsExactly(new Said("c", SHARED_KEY));
+    }
+
+    private static JoinDriver driver(Recording alert) {
+        return new JoinDriver(SqlFrontEnd.derive(SQL, TABLES), List.of("o_id"), STREAM,
+                new MapJoinStores(), Map.of("c", List.of("customer_id")), alert);
     }
 
     /** The port, remembering what it was told. */
@@ -114,10 +194,15 @@ class ASecondDimensionRowUnderOneJoinKeyIsReportedTest {
         throw new AssertionError("the driver never finished with nothing arriving");
     }
 
-    private static Map<String, Object> row(String k1, Object v1, String k2, Object v2) {
+    private static Map<String, Object> customer(long id, long joinKey, String name) {
         Map<String, Object> row = new LinkedHashMap<>();
-        row.put(k1, v1);
-        row.put(k2, v2);
+        row.put("customer_id", id);
+        row.put("c_id", joinKey);
+        row.put("c_name", name);
         return row;
+    }
+
+    private static Map<String, Object> order(long id, long customerId) {
+        return Map.of("o_id", id, "o_cust_id", customerId);
     }
 }

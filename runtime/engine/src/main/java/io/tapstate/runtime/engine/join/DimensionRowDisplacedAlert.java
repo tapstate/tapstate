@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.join;
 
 import java.io.Serializable;
+import java.util.Objects;
 
 /**
  * Where it is said that a dimension row was displaced by a second row filed under the same join key.
@@ -25,6 +26,19 @@ public interface DimensionRowDisplacedAlert extends Serializable {
     /** Says nothing at all, for a caller that has nowhere to report to. */
     DimensionRowDisplacedAlert NONE = (source, dimensionKey) -> {
     };
+
+    /**
+     * Binds this reporter to the pipeline and join step whose vertex is about to run.
+     *
+     * <p>The default keeps a reporter that does not need execution attribution unchanged. A reporter
+     * whose delivery channel does need it replaces itself here, on the member running the vertex, so
+     * thread-local context from the control-plane thread is never assumed to cross into Jet.
+     */
+    default DimensionRowDisplacedAlert bind(String pipelineId, String stepId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(stepId, "stepId");
+        return this;
+    }
 
     /**
      * A row of {@code source} that was filed under {@code dimensionKey} has been replaced by a different

@@ -7,9 +7,11 @@ import io.tapstate.runtime.engine.join.DimensionRowDisplacedAlert;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 /**
  * Says out loud that a join has lost a dimension row to a key another row already occupied.
@@ -33,10 +35,32 @@ final class LoggingDimensionRowDisplacedAlert implements DimensionRowDisplacedAl
 
     private static final Logger LOG = LoggerFactory.getLogger(LoggingDimensionRowDisplacedAlert.class);
 
+    private final String pipelineId;
+    private final String stepId;
     private final AtomicLong count = new AtomicLong();
+
+    /** An unbound template, carried with the graph until a member starts one join vertex. */
+    LoggingDimensionRowDisplacedAlert() {
+        this.pipelineId = null;
+        this.stepId = null;
+    }
+
+    private LoggingDimensionRowDisplacedAlert(String pipelineId, String stepId) {
+        this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
+        this.stepId = Objects.requireNonNull(stepId, "stepId");
+    }
+
+    /** Gives each member-side vertex its own attribution and widening counter. */
+    @Override
+    public DimensionRowDisplacedAlert bind(String pipelineId, String stepId) {
+        return new LoggingDimensionRowDisplacedAlert(pipelineId, stepId);
+    }
 
     @Override
     public void displaced(String source, String dimensionKey) {
+        if (pipelineId == null || stepId == null) {
+            throw new IllegalStateException("a dimension displacement alert must be bound to a join vertex");
+        }
         long seen = count.incrementAndGet();
         if (!isFirstOfItsDecade(seen)) {
             return;
@@ -51,7 +75,18 @@ final class LoggingDimensionRowDisplacedAlert implements DimensionRowDisplacedAl
         // is what this severity means. Throwing it would stop a job over data that is merely ambiguous.
         TapstateException coded =
                 new TapstateException(EngineError.JOIN_DIMENSION_ROW_DISPLACED, args, null);
-        LOG.warn("{} ({} displaced so far on this member)", coded.getMessage(), seen);
+        String previousPipeline = MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+        MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+        try {
+            LOG.warn("{} (pipeline {}, step {}, {} displaced so far on this member)",
+                    coded.getMessage(), pipelineId, stepId, seen);
+        } finally {
+            if (previousPipeline == null) {
+                MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+            } else {
+                MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, previousPipeline);
+            }
+        }
     }
 
     /** How many have been displaced since this was built - what a caller asserts on rather than the log. */
