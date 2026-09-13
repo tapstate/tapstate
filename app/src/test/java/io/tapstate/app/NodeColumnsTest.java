@@ -46,6 +46,31 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class NodeColumnsTest {
 
     @Test
+    void expansionAndRenamesKeepParentDescriptorsWithoutReusingElementDeclarations() {
+        var number = new io.tapstate.core.common.NumericType(64, true, false, true, null, null, 18, 4);
+        var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
+        NodeColumns source = known("id", "INT64 NOT NULL", "amount", "DECIMAL NOT NULL",
+                "code", "STRING NOT NULL", "customer", "STRING NOT NULL")
+                .withNumericTypes(Map.of("id", number, "amount", number))
+                .withStringTypes(Map.of("code", string, "customer", string));
+        NodeColumns first = NodeColumns.of(new TransformBody.Unwind("amount", "amount_no", false, null, null),
+                one(source), null);
+        NodeColumns expanded = NodeColumns.of(new TransformBody.Unwind("code", "code_no", false, null, null),
+                one(first), null);
+        var renames = rules("parent_id", FieldRule.rename("id"));
+        renames.put("position", FieldRule.rename("amount_no"));
+        NodeColumns renamed = NodeColumns.of(map(renames), one(expanded), null);
+        NodeColumns merged = NodeColumns.merged(List.of(renamed, renamed));
+
+        assertThat(merged.expanded()).isTrue();
+        assertThat(merged.key()).containsExactly("position", "code_no");
+        assertThat(merged.origins()).containsExactlyInAnyOrderEntriesOf(Map.of("parent_id", "id", "customer", "customer"));
+        assertThat(merged.numericTypes()).containsExactlyInAnyOrderEntriesOf(Map.of("parent_id", number));
+        assertThat(merged.stringTypes()).containsExactlyInAnyOrderEntriesOf(Map.of("customer", string));
+        assertThat(merged.unchangedFields()).containsExactly("customer");
+    }
+
+    @Test
     void boundedStringsFollowOnlyDirectValuesAndCompatibleMerges() {
         var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
         NodeColumns source = known("id", "STRING NOT NULL", "code", "STRING NOT NULL")
@@ -358,7 +383,7 @@ class NodeColumnsTest {
         // case covers the one way that guarantee is lost without the build ever going red: a catch-all
         // added to make the error go away. The counts are the arms; a variant absorbed by a catch-all
         // moves the count and not the arms.
-        assertThat(TransformBody.class.getPermittedSubclasses()).hasSize(6);
+        assertThat(TransformBody.class.getPermittedSubclasses()).hasSize(7);
         assertThat(PushFormat.class.getPermittedSubclasses()).hasSize(2);
         assertThat(ViewBlock.class.getPermittedSubclasses()).hasSize(2);
         assertThat(ServeBlock.class.getPermittedSubclasses()).hasSize(2);
