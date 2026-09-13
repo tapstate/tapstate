@@ -109,6 +109,16 @@ class CatalogConsistencyTest {
     }
 
     @Test
+    void mysqlPortKeepsItsNumericConnectorType() {
+        ConfigField port = catalog.byId("mysql").config().stream()
+                .filter(field -> field.name().equals("port"))
+                .findFirst()
+                .orElseThrow();
+
+        assertThat(port.type()).isEqualTo(ConfigType.NUMBER);
+    }
+
+    @Test
     void derivesModesForPostgres() {
         // Both modes must come from the capability probe rather than a spec declaration. A
         // hand-written declaration would satisfy an assertion on modes alone while proving nothing

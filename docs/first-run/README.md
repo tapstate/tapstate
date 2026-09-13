@@ -138,8 +138,8 @@ can rely on it:
   the summary line for that file says so; edit it if the table is keyed otherwise;
 - secret environment names are `<SOURCE_ID>_<FIELD>` upper-cased, e.g. `ORDERS_SRC_PASSWORD`;
 - connection fields are written as the canonical writer renders the connector's catalog types (a
-  `string`-typed port comes out as `port: "3306"`); the demo files are hand-written and differ in
-  such spacing, which is fine — they are copied, never generated;
+  numeric port comes out as `port: 3306`); the demo files are hand-written and differ in such
+  spacing, which is fine — they are copied, never generated;
 - a choice list's default is its first entry (for the recipe question, `sample`);
 - `reshaped-table`: "columns to put first" is written as identity renames (`region: $region`) — a `map`
   step lets unlisted fields through, so keeping fixes the order but does not trim; "drop" is an

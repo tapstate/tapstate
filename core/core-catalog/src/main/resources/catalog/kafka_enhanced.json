@@ -518,7 +518,7 @@
     },
     {
       "name": "batchMaxDelay",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Consumption timeout (ms)"
       },

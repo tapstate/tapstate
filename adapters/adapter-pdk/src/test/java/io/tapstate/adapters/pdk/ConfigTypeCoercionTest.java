@@ -14,11 +14,10 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /**
  * The config map a connector is handed carries the types the connector's own connection form declares,
- * whatever spelling the workspace wrote. A workspace generated from the bundled catalog spells every
- * value as text — {@code port: "3306"} — while a connector's config bean holds a {@code Number} and
- * casts to it, so an uncoerced map reaches the connector as a {@code ClassCastException} thrown out of
- * its own code. The declaration coerced from is the connector's, never the catalog's: the catalog is
- * the side that is wrong here.
+ * whatever spelling the workspace wrote. A hand-written or older workspace can spell a numeric value
+ * as text — {@code port: "3306"} — while a connector's config bean holds a {@code Number} and casts to
+ * it, so an uncoerced map reaches the connector as a {@code ClassCastException} thrown out of its own
+ * code. The declaration coerced from is the connector's own form.
  *
  * <p>The seam under test is {@link PdkConnector#open}, the one place every connector-facing config map
  * is built — discovery, the connection test, the data browser and both runtime ports all reach the

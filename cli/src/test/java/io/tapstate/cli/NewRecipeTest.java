@@ -37,7 +37,7 @@ class NewRecipeTest {
             config:
               host: db
               password: ${ORDERS_SRC_PASSWORD}
-              port: "3306"
+              port: 3306
               username: u
             mode: cdc
             tables: [orders]
