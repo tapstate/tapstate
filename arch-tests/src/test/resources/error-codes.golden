@@ -19,6 +19,7 @@ actuation.source-table-not-discovered
 actuation.source-table-regex-invalid
 actuation.source-table-selection-empty
 actuation.source-table-spec-unsupported
+actuation.unwind-parent-key-unresolved
 actuation.view-fed-by-many-tables
 actuation.view-key-missing
 actuation.view-key-not-feed-identity
@@ -65,6 +66,7 @@ cli.context-required
 cli.context-source-conflict
 cli.context-usage
 cli.demo-workspace-exists
+cli.docker-unavailable
 cli.if-match-needs-one-resource
 cli.issuer-discovery-failed
 cli.issuer-discovery-invalid
@@ -73,15 +75,19 @@ cli.kind-dir-mismatch
 cli.mcp-unavailable
 cli.not-authenticated
 cli.not-connected
+cli.password-required
 cli.remote-plaintext
 cli.repl-builtin-only
 cli.request-timed-out
 cli.resource-not-found
+cli.server-not-named
 cli.unknown-connector
 cli.verb-not-implemented
 cli.version-mismatch
 cli.watch-needs-a-terminal
+cli.workspace-has-no-pipeline
 cli.workspace-not-writable
+cli.workspace-unreadable
 connector.ambiguous-connector-class
 connector.ambiguous-registration
 connector.api-level-incompatible
@@ -89,6 +95,7 @@ connector.api-level-unknown
 connector.capability-missing
 connector.capture-failed
 connector.class-not-found
+connector.config-type-mismatch
 connector.discover-failed
 connector.instance-limit-reached
 connector.instances-busy
@@ -150,6 +157,9 @@ dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode
 dsl.unsupported-version
+dsl.unwind-column-already-exists
+dsl.unwind-needs-an-element-key
+dsl.unwind-needs-an-upsert-target
 dsl.upsert-needs-key
 engine.frontier-order-not-encodable
 engine.frontier-pinned
@@ -209,6 +219,7 @@ position.field-not-editable
 position.nothing-to-write
 position.write-back-while-live
 role.unsupported
+schema.column-name-reads-as-a-path
 source.already-exists
 source.id-mismatch
 source.in-use
@@ -225,3 +236,5 @@ transform.script-compile-failed
 transform.script-failed
 transform.script-no-process
 transform.script-output-invalid
+transform.unwind-needs-a-complete-before-image
+transform.unwind-rows-share-a-key

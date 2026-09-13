@@ -149,7 +149,8 @@ class DataBrowserQueryConfinementIT {
     }
 
     private void seed() {
-        write(dataDirectory.resolve(COLLECTION + ".csv"), "id,status\n1,paid\n2,shipped\n3,paid\n");
+        FileEndpoints.replaceTable(dataDirectory.resolve(COLLECTION + ".csv"),
+                "id,status\n1,paid\n2,shipped\n3,paid\n");
     }
 
     private void writeWorkspace() {

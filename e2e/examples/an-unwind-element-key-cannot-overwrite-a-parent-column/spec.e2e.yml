@@ -1,0 +1,19 @@
+# Discovery supplies the parent seq column; the pipeline cannot infer it from its YAML alone.
+# Starting must reject the conflicting generated column before any row reaches the target. The exact
+# diagnosis distinguishes the refusal from an unrelated start failure. Ordinary non-colliding unwind
+# examples separately prove that expanding an array still succeeds.
+name: an-unwind-element-key-cannot-overwrite-a-parent-column
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  discover: [src_file]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders:
+    values:
+      - { id: 1, seq: 7 }
+steps:
+  - start
+  - await: { state: FAILED }
+  - assert: { failure_code: dsl.unwind-column-already-exists }
+  - assert: { count: { tgt_file.orders: 0 } }

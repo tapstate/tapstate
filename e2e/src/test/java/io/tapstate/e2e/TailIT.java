@@ -7,9 +7,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -234,11 +231,7 @@ class TailIT {
     }
 
     private void write(String csv) {
-        try {
-            Files.writeString(dataDirectory.resolve(COLLECTION + ".csv"), csv);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        FileEndpoints.replaceTable(dataDirectory.resolve(COLLECTION + ".csv"), csv);
     }
 
     private String sourceYaml() {

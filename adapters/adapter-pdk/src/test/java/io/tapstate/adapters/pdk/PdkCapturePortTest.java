@@ -534,7 +534,7 @@ class PdkCapturePortTest {
     }
 
     @Test
-    void reportsTheSeamSampledBeforeTheSnapshotRead(@TempDir Path dir) throws Exception {
+    void reportsTheSeamAfterDiscoveryAndBeforeTheSnapshotRead(@TempDir Path dir) throws Exception {
         // Sampled before the first row, so a change made while the snapshot runs falls after the seam and
         // is re-delivered by the tail. Sampled after, it would fall before and never be delivered at all.
         Path jar = Synthetic.positionedSource(dir);

@@ -15,7 +15,8 @@ import java.util.List;
  * The production {@link Prompter}: a JLine line reader over a terminal. Free-text questions show the
  * default as a hint, secrets read masked, and choices are printed as a numbered menu accepting either
  * the 1-based number or the option text. An empty reply (just Enter, or end-of-input) takes the last
- * option — the wizard's choice lists end with a skip / "(none)" sentinel, so that means "skip".
+ * option — the wizard's choice lists end with a skip / "(none)" sentinel, so that means "skip" — unless
+ * the caller marked a default, in which case the menu shows it and an empty reply takes that one.
  *
  * <p>Built over the system terminal in normal use; a terminal can be injected to drive the adapter
  * over fixed streams in tests.
@@ -64,18 +65,46 @@ final class JLinePrompter implements Prompter, AutoCloseable {
             if (line.isEmpty()) {
                 return options.get(options.size() - 1); // Enter / end-of-input = the skip sentinel
             }
-            try {
-                int index = Integer.parseInt(line);
-                if (index >= 1 && index <= options.size()) {
-                    return options.get(index - 1);
-                }
-            } catch (NumberFormatException notANumber) {
-                if (options.contains(line)) {
-                    return line;
-                }
+            String picked = pick(line, options);
+            if (picked != null) {
+                return picked;
             }
             out.println("  please enter 1-" + options.size() + " or an option name");
             out.flush();
+        }
+    }
+
+    @Override
+    public String choose(String question, List<String> options, String defaultOption) {
+        PrintWriter out = terminal.writer();
+        out.println(question + ":");
+        for (int i = 0; i < options.size(); i++) {
+            String option = options.get(i);
+            out.println("  " + (i + 1) + ") " + option + (option.equals(defaultOption) ? "  (default)" : ""));
+        }
+        out.flush();
+        int defaultIndex = options.indexOf(defaultOption) + 1;
+        while (true) {
+            String line = readLine("  choice [1-" + options.size() + ", Enter = " + defaultIndex + "]: ", null, true);
+            if (line.isEmpty()) {
+                return defaultOption; // Enter / end-of-input = the marked default, wherever it sits
+            }
+            String picked = pick(line, options);
+            if (picked != null) {
+                return picked;
+            }
+            out.println("  please enter 1-" + options.size() + " or an option name");
+            out.flush();
+        }
+    }
+
+    /** The option a non-empty reply names — its 1-based number or its exact text — or null when neither. */
+    private static String pick(String line, List<String> options) {
+        try {
+            int index = Integer.parseInt(line);
+            return index >= 1 && index <= options.size() ? options.get(index - 1) : null;
+        } catch (NumberFormatException notANumber) {
+            return options.contains(line) ? line : null;
         }
     }
 

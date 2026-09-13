@@ -25,8 +25,8 @@ site() {   # $1 dir, $2 vercel.json body; creates the two static entry points
     printf '%s\n' "$2" > "$1/vercel.json"
 }
 
-WITH_E='{"rewrites":[{"source":"/","destination":"/quickstart.sh"},{"source":"/cli","destination":"/install.sh"},{"source":"/e","destination":"/api/event"}]}'
-NO_E='{"rewrites":[{"source":"/","destination":"/quickstart.sh"},{"source":"/cli","destination":"/install.sh"}]}'
+WITH_E='{"rewrites":[{"source":"/","destination":"/install.sh"},{"source":"/cli","destination":"/install.sh"},{"source":"/demo","destination":"/quickstart.sh"},{"source":"/e","destination":"/api/event"}]}'
+NO_E='{"rewrites":[{"source":"/","destination":"/install.sh"},{"source":"/cli","destination":"/install.sh"},{"source":"/demo","destination":"/quickstart.sh"}]}'
 
 # --- case 1: a consistent site is accepted ---------------------------------------------------------
 d="$work/ok"; site "$d" "$WITH_E"; printf 'export default () => {};\n' > "$d/api/event.js"

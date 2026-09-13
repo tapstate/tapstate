@@ -32,13 +32,20 @@ def check(text):
     for dependency in ['**/pom.xml', '.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml']:
         assert re.search(r'^            ' + re.escape(dependency) + r'$', jars, re.M)
     assert jars.count('path: ${{ runner.temp }}/connector-m2/io/tapdata') == 2
-    pdk_key="key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}"
+    pdk_key="key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}"
     assert jars.count(pdk_key) == 2
     assert jars.index('id: pdk') < jars.index('connector-cache.sh prepare')
     assert jars.index('connector-cache.sh verify') < jars.index('name: Cache verified remote PDK dependencies')
     assert "if: steps.pdk.outputs.cache-hit != 'true'" in jars
     assert 'connector-cache.sh prepare' in jars and 'connector-cache.sh seal' in jars and 'connector-cache.sh verify' in jars
     assert '-nsu -Dmaven.repo.local=' in jars
+    assert 'repository: tapdata/tapdata-connectors-enterprise' in jars
+    assert 'token: ${{ secrets.ENTERPRISE_CONNECTORS_READ_TOKEN }}' in jars
+    assert 'persist-credentials: false' in jars
+    assert 'mv "$GITHUB_WORKSPACE/.connector-enterprise-source" "$RUNNER_TEMP/connector-enterprise-source"' in jars
+    for line in jars.splitlines():
+        if 'connector-cache.sh prepare ' in line or 'connector-cache.sh seal ' in line or 'scripts/build-real-connectors.sh --checkout ' in line:
+            assert '--checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source"' in line
     assert '-Dit.test=' not in text  # No second selector list can drift from source inventory.
 assert 'group: real-connectors-sharded-${{ github.ref }}' in workflow
 assert 'cancel-in-progress: true' in workflow
@@ -51,11 +58,13 @@ for before,after in [
     ('shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]','shard: [shard-1, shard-2, shard-3]'),
     ('connector-cache.sh verify','connector-cache.sh key'),
     ('path: ${{ runner.temp }}/connector-m2/io/tapdata', 'path: ~/.m2/repository'),
-    ('pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.sha }}-', 'pdk-inputs-${{ runner.os }}-')]:
+    ('pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-', 'pdk-inputs-${{ runner.os }}-'),
+    ('-${{ steps.source.outputs.enterprise_sha }}-', '-'),
+    (' --checkout "$RUNNER_TEMP/connector-enterprise-source"', '')]:
     mutated=workflow.replace(before,after)
     assert mutated!=workflow
     try: check(mutated)
     except (AssertionError,KeyError,ValueError): pass
     else: raise AssertionError('workflow mutation survived: '+before)
-print('connector-workflow smoke: fixed check name, complete admission and 7 mutations passed')
+print('connector-workflow smoke: fixed check name, complete admission and 9 mutations passed')
 PY

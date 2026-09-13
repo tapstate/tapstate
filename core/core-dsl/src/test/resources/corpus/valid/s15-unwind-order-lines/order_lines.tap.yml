@@ -1,0 +1,20 @@
+# An order row carries its line items as a list; the target wants one row per item. The
+# expansion says which field inside an element identifies the row it becomes, so the rows
+# can be matched and removed again, and carries each element's position alongside it so the
+# order of the list survives without being keyed on a position that shifts.
+version: tapstate/v1
+kind: pipeline
+id: order_lines
+source: src_orders
+transforms:
+  - id: explode
+    from: [ orders ]
+    type: unwind
+    path: items
+    include_array_index: item_no
+    preserve_null_and_empty_arrays: true
+    element_key: sku
+    element_type: json
+serve:
+  from: explode
+  sync: [ { id: dw, source: tgt_lines, write_mode: upsert } ]

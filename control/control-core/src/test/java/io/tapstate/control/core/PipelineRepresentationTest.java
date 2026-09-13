@@ -298,6 +298,76 @@ class PipelineRepresentationTest {
                 });
     }
 
+    /**
+     * The two directions of this face are written separately and only one of them is checked by the
+     * compiler. What a body becomes on the way out is an exhaustive switch over the kinds, so a kind
+     * added to the grammar stops the build until somebody answers for it; what a body is read back
+     * from is a switch over the type name as text, which compiles whatever it does not cover and
+     * refuses that type at runtime. So a kind can be wholly present outbound and wholly absent
+     * inbound, and the shape that takes is an editor that displays a pipeline it then cannot save.
+     */
+    @Test
+    void readsBackAnExpansionItJustWroteOut() {
+        PipelineResource pipeline = expanding();
+
+        PipelineView view = representation.toView(
+                pipeline, "e".repeat(64), List.of(new PipelineSourceSummary("orders", null, "mysql")));
+
+        assertThat(view.transforms()).singleElement().satisfies(step -> {
+            assertThat(step).containsEntry("type", "unwind");
+            assertThat(step).containsEntry("path", "items");
+            assertThat(step).containsEntry("elementKey", "sku");
+        });
+        PipelineResource roundTripped = representation.toModel(new PipelineInput(
+                view.id(), view.metadata(), new ArrayList<Object>(view.sources()), view.transforms(),
+                view.view(), view.serve(), view.settings(), view.experimental()), pipeline);
+
+        assertThat(roundTripped).isEqualTo(pipeline);
+    }
+
+    /**
+     * The keys arrive in whichever spelling the caller used - this face answers in one and every
+     * other body here accepts both, so an expansion accepting only one would be the odd one out in
+     * a way nothing points at.
+     */
+    @Test
+    void readsAnExpansionWrittenInEitherSpelling() {
+        Map<String, Object> underscored = new LinkedHashMap<>();
+        underscored.put("id", "explode");
+        underscored.put("type", "unwind");
+        underscored.put("from", List.of("orders"));
+        underscored.put("path", "items");
+        underscored.put("include_array_index", "item_no");
+        underscored.put("preserve_null_and_empty_arrays", true);
+        underscored.put("element_key", "sku");
+        underscored.put("element_type", "json");
+
+        PipelineResource model = representation.toModel(new PipelineInput(
+                "orders_sync", null, new ArrayList<Object>(List.of("orders")), List.of(underscored),
+                null, null, null, null), expanding());
+
+        assertThat(model.transforms()).singleElement().satisfies(step ->
+                assertThat(((Step.Inline) step).body())
+                        .isEqualTo(new TransformBody.Unwind("items", "item_no", true, "sku", "json")));
+    }
+
+    /** One source, one expansion, nothing else - the smallest artifact that carries one. */
+    private static PipelineResource expanding() {
+        return new PipelineResource(
+                "orders_sync",
+                new Metadata(Map.of(), "Order lines"),
+                List.of(SourceRef.bare("orders")),
+                List.of(Step.inline(
+                        "explode",
+                        FromClause.list(FromRef.literal("orders")),
+                        new TransformBody.Unwind("items", "item_no", true, "sku", "json"),
+                        null)),
+                null,
+                new ServeBlock.Use("lines_api", "warehouse_api", FromRef.literal("explode")),
+                null,
+                null);
+    }
+
     @Test
     void mapsTheStaticPipelineArtifactAndItsReferencedSourceSummaries() {
         PipelineResource pipeline = pipeline(List.of("orders", "customers"));

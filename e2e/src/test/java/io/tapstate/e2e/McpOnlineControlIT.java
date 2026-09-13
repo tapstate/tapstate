@@ -114,9 +114,9 @@ class McpOnlineControlIT {
         Files.createDirectories(connectorJars);
         Files.createDirectories(data);
         Files.createDirectories(later);
-        Files.writeString(data.resolve(DECLARED + ".csv"), "id,total\n1,10\n");
-        Files.writeString(data.resolve(BY_HAND + ".csv"), "id,note\n1,nobody declared me\n");
-        Files.writeString(later.resolve("arrivals.csv"), "id,note\n1,applied mid-session\n");
+        FileEndpoints.replaceTable(data.resolve(DECLARED + ".csv"), "id,total\n1,10\n");
+        FileEndpoints.replaceTable(data.resolve(BY_HAND + ".csv"), "id,note\n1,nobody declared me\n");
+        FileEndpoints.replaceTable(later.resolve("arrivals.csv"), "id,note\n1,applied mid-session\n");
 
         // Packaged under the browsable id, because rows are served only to connectors the product
         // knows speak the request shape it asks in. Listing and sizing are answered for any connector;

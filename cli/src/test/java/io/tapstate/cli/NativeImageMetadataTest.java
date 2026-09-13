@@ -28,4 +28,18 @@ class NativeImageMetadataTest {
                     .contains("\"name\" : \"command\"");
         }
     }
+
+    @Test
+    void calciteParserMetadataRemainsReflectiveInTheNativeImage() throws IOException {
+        InputStream metadata = NativeImageMetadataTest.class.getResourceAsStream(
+                "/META-INF/native-image/io.tapstate/cli/reflect-config.json");
+
+        assertThat(metadata).as("Calcite parser native reflection metadata").isNotNull();
+        try (metadata) {
+            String json = new String(metadata.readAllBytes(), StandardCharsets.UTF_8);
+            assertThat(json)
+                    .contains("\"name\" : \"org.apache.calcite.sql.parser.impl.SqlParserImpl\"")
+                    .contains("\"allDeclaredMethods\" : true");
+        }
+    }
 }

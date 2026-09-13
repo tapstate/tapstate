@@ -1,0 +1,12 @@
+# A pipeline names the sources it reads and the view it materializes.
+# `from:` under view is a table name, never a source id.
+version: tapstate/v1
+kind: pipeline
+id: example_pipeline
+source: [ example_source ]
+# Add a `transforms:` block when the view needs more than a copy of the table:
+# `tapstate explain transforms` lists what a transform can do.
+view:
+  id: example_view
+  from: your_table
+  primary_key: id

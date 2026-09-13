@@ -14,7 +14,6 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -83,8 +82,8 @@ final class DemoCmd implements Callable<Integer> {
      * because this is the copy a user can ask for at any moment, on the machine they are on.
      */
     private static final List<String> STEPS = List.of(
-            "1. Install and bring up the stack (databases, server and store, seeded):",
-            "     curl -sSL https://install.tapstate.dev | sh",
+            "1. Bring up the demo stack (databases, server and store, seeded):",
+            "     curl -sSL https://install.tapstate.dev/demo | sh",
             "2. Write the demo workspace - orders in MySQL, shipments in PostgreSQL:",
             "     tapstate demo -w work",
             "3. Go online, register the connectors this demo reads, and apply it:",
@@ -112,7 +111,7 @@ final class DemoCmd implements Callable<Integer> {
      * step the reader takes will work, and the answer is worth one line now instead of an error three
      * commands from here.
      */
-    java.util.function.BooleanSupplier dockerIsOnThePath = DemoCmd::dockerIsInstalled;
+    java.util.function.BooleanSupplier dockerIsOnThePath = DockerBinary::isOnThePath;
 
     @Spec
     CommandSpec spec;
@@ -149,119 +148,18 @@ final class DemoCmd implements Callable<Integer> {
     }
 
     /**
-     * Writes every resource, or none of them.
-     *
-     * <p>The existence check runs over the whole set before the first byte is written. A per-file check
-     * would leave a workspace holding two of the three when the third is the one already there, which
-     * is a state neither a re-run nor {@code --force} was designed around and which the user did not ask
-     * for.
+     * Writes every resource, or none of them - the all-or-none rule lives in {@link WorkspaceWrite},
+     * shared with the guided first run's {@code sample} recipe, which writes these same files.
      */
     private List<Path> write(Path root) {
-        if (!force) {
-            for (String resource : RESOURCES) {
-                Path target = root.resolve(resource);
-                if (Files.exists(target)) {
-                    throw new TapstateException(
-                            CliError.DEMO_WORKSPACE_EXISTS, Map.of("path", target.toString()), null);
-                }
-            }
-        }
-        // Every directory first, before any file. Creating one can fail on its own - a workspace holding
-        // a plain file called `pipeline` passes the check above and fails here - and doing it up front
-        // means that failure lands before the first byte rather than between two of them.
-        for (String resource : RESOURCES) {
-            Path directory = root.resolve(resource).getParent();
-            try {
-                Files.createDirectories(directory);
-            } catch (IOException cannotCreate) {
-                throw new TapstateException(
-                        CliError.WORKSPACE_NOT_WRITABLE,
-                        Map.of("path", directory.toString(), "reason", reason(cannotCreate)), null);
-            }
-        }
-        // Under --force a target may already hold something, and that something is the user's. Read it
-        // before overwriting it, so the rollback below can put it back; a target that cannot be read is
-        // refused here, while nothing has been written yet, rather than after it is already gone.
-        List<Touched> touched = new ArrayList<>();
-        for (String resource : RESOURCES) {
-            Path target = root.resolve(resource);
-            String existing = null;
-            if (Files.exists(target)) {
-                try {
-                    existing = Files.readString(target);
-                } catch (IOException cannotRead) {
-                    throw new TapstateException(
-                            CliError.WORKSPACE_NOT_WRITABLE,
-                            Map.of("path", target.toString(), "reason", reason(cannotRead)), null);
-                }
-            }
-            touched.add(new Touched(target, existing));
-        }
-        List<Touched> done = new ArrayList<>();
-        for (int i = 0; i < RESOURCES.size(); i++) {
-            Touched target = touched.get(i);
-            try {
-                Files.writeString(target.path(), bundled(RESOURCES.get(i)));
-            } catch (IOException cannotWrite) {
-                // All or none, kept as a promise rather than as an intention. What this invocation
-                // wrote is taken back, so a reader is left with the workspace they had - which for the
-                // ordinary case is no workspace at all, and never two files out of three. A file that
-                // --force overwrote is put back with the bytes it held, because deleting it would make
-                // this command destroy content on a path where it wrote nothing that survived.
-                undo(done);
-                throw new TapstateException(
-                        CliError.WORKSPACE_NOT_WRITABLE,
-                        Map.of("path", target.path().toString(), "reason", reason(cannotWrite)), null);
-            }
-            done.add(target);
-        }
-        return done.stream().map(Touched::path).toList();
+        return WorkspaceWrite.write(root, bundledFiles(), force, CliError.DEMO_WORKSPACE_EXISTS).stream()
+                .map(WorkspaceWrite.Written::path)
+                .toList();
     }
 
-    /** A target this invocation is about to write, and what it held first - {@code null} if nothing. */
-    private record Touched(Path path, String existing) {}
-
-    /**
-     * Puts back what this invocation changed: a file it created is removed, a file it overwrote is
-     * restored. Best effort by necessity: it runs while a write has already failed, so the filesystem is
-     * not answering, and a second failure here must not replace the first one in front of the reader.
-     */
-    private static void undo(List<Touched> done) {
-        for (Touched target : done) {
-            try {
-                if (target.existing() == null) {
-                    Files.deleteIfExists(target.path());
-                } else {
-                    Files.writeString(target.path(), target.existing());
-                }
-            } catch (IOException leaveIt) {
-                // Reported through the diagnostic below, as the state the reader is actually in.
-            }
-        }
-    }
-
-    /** What the filesystem said, in one line, for the diagnostic's named parameter. */
-    private static String reason(IOException failure) {
-        String message = failure.getMessage();
-        return message == null || message.isBlank() ? failure.getClass().getSimpleName() : message;
-    }
-
-    /**
-     * Whether {@code docker} resolves on the PATH. Nothing is executed - a version probe would start a
-     * process, and on a machine where the daemon is down it would hang the one command that has no
-     * reason to touch it at all.
-     */
-    private static boolean dockerIsInstalled() {
-        String path = System.getenv("PATH");
-        if (path == null || path.isBlank()) {
-            return false;
-        }
-        for (String entry : path.split(java.io.File.pathSeparator)) {
-            if (!entry.isBlank() && Files.isExecutable(Path.of(entry, "docker"))) {
-                return true;
-            }
-        }
-        return false;
+    /** The three files as they are written: bundled bytes, verbatim, in the order a reader meets them. */
+    static List<WorkspaceWrite.File> bundledFiles() {
+        return RESOURCES.stream().map(resource -> WorkspaceWrite.File.owned(resource, bundled(resource))).toList();
     }
 
     /** One bundled resource. Absent means a broken build, not a user error, so it crashes bare. */

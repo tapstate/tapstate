@@ -14,7 +14,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The derive driver wires the whole catalog-derive step: read the probe manifest, resolve each
- * module's dist jar, probe it, and write the capability bitmap. Probing is injected so the wiring is
+ * connector id's dist jar, probe it, and write the capability bitmap. Probing is injected so the wiring is
  * tested without classloading; the entry point passes the real {@code ConnectorCapabilityProbe}.
  */
 class CatalogDeriveTest {
@@ -69,6 +69,18 @@ class CatalogDeriveTest {
         assertThat(outcome.skipped()).containsEntry("nojar", "no built jar");
         assertThat(outcome.skipped().get("boom")).contains("ClassNotFoundException");
         assertThat(Files.readString(bitmap)).isEqualTo("mysql\tbatch_read_function\n");
+    }
+
+    @Test
+    void resolvesSqlServerByItsPublicIdWhenTheUpstreamModuleIsMssql() throws IOException {
+        Path manifest = tmp.resolve("manifest.tsv");
+        Files.writeString(manifest, "sqlserver\tmssql-connector\tio.tapdata.connector.mssql.MssqlConnector\n");
+        Path dist = Files.createDirectory(tmp.resolve("dist"));
+        Files.createFile(dist.resolve("sqlserver-connector-v1.jar"));
+        EmitOutcome outcome = CatalogDerive.run(manifest, dist, tmp.resolve("bitmap.tsv"),
+                (jar, connectorClass) -> Set.of("batch_read_function"));
+        assertThat(outcome.bitmap()).containsKey("sqlserver");
+        assertThat(outcome.skipped()).isEmpty();
     }
 
     @Test

@@ -9,6 +9,8 @@ import io.tapdata.pdk.apis.entity.ConnectionOptions;
 import io.tapdata.pdk.apis.entity.TestItem;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -45,6 +47,27 @@ public final class ObservedMongoConnector implements TapConnector {
         var original = functions.getWriteRecordFunction();
         if (original == null) throw new AssertionError("real Mongo connector registered no writer");
         functions.supportWriteRecord(WriteTableWitness.record(witness, original));
+        var stream = functions.getStreamReadFunction();
+        if (stream != null) {
+            functions.supportStreamRead((context, tables, offset, size, consumer) -> {
+                Path tail = witness.resolveSibling(witness.getFileName() + ".tail");
+                String start = "START " + offset;
+                appendTailObservation(tail, start);
+                try {
+                    stream.streamRead(context, tables, offset, size, consumer);
+                } finally {
+                    appendTailObservation(tail, "END");
+                }
+            });
+        }
+    }
+
+    private static void appendTailObservation(Path tail, String observation) throws IOException {
+        // Stop interrupts the stream thread. Record its return with non-interruptible file I/O so
+        // observing teardown neither clears that interrupt nor turns it into a channel failure.
+        try (var out = new FileOutputStream(tail.toFile(), true)) {
+            out.write((observation + "\n").getBytes(StandardCharsets.UTF_8));
+        }
     }
 
     @Override

@@ -206,11 +206,8 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
         for (int id = 1; id <= rows; id++) {
             lines.add(id + "," + table + "-" + id);
         }
-        try {
-            Files.write(sourceDirectory.resolve(table + ".csv"), lines);
-        } catch (IOException e) {
-            throw new UncheckedIOException("cannot seed " + table, e);
-        }
+        FileEndpoints.replaceTable(sourceDirectory.resolve(table + ".csv"),
+                String.join(System.lineSeparator(), lines) + System.lineSeparator());
     }
 
     /** Waits until the chain record names every table a sink is expected to have confirmed. */
