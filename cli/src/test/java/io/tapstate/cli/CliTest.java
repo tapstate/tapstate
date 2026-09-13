@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * The dual-mode CLI's command table: the offline-verb whitelist (validate / new / explain), the coded
+ * The dual-mode CLI's command table: the offline-verb whitelist (validate / new / add / explain), the coded
  * not-connected and not-implemented affordances (which must survive the operands these verbs are really
  * typed with), the exit-code contract, and validate wired to the offline DSL link.
  */

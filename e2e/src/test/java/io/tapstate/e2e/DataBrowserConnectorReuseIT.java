@@ -7,9 +7,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -111,12 +108,8 @@ class DataBrowserConnectorReuseIT {
 
     /** One row saying which address it came from, in the format the connector reads. */
     private static void seed(Path directory, String address) {
-        try {
-            Files.writeString(directory.resolve(COLLECTION + ".csv"),
-                    "id," + WHICH_ADDRESS + "\n1," + address + "\n");
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        FileEndpoints.replaceTable(directory.resolve(COLLECTION + ".csv"),
+                "id," + WHICH_ADDRESS + "\n1," + address + "\n");
     }
 
     @SuppressWarnings("unchecked")

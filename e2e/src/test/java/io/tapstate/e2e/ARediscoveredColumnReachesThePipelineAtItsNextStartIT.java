@@ -187,11 +187,7 @@ class ARediscoveredColumnReachesThePipelineAtItsNextStartIT {
     }
 
     private void writeOrders(String rows) {
-        try {
-            Files.writeString(sourceDirectory.resolve(TABLE + ".csv"), rows);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        FileEndpoints.replaceTable(sourceDirectory.resolve(TABLE + ".csv"), rows);
     }
 
     private static byte[] read(Path file) {

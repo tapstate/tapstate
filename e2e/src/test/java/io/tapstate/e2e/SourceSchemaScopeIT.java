@@ -80,11 +80,7 @@ class SourceSchemaScopeIT {
     }
 
     private void writeTable(String table, String rows) {
-        try {
-            Files.writeString(sourceDirectory.resolve(table + ".csv"), rows);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        FileEndpoints.replaceTable(sourceDirectory.resolve(table + ".csv"), rows);
     }
 
     private static byte[] read(Path file) {
