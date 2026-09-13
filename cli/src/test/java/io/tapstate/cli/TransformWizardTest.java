@@ -51,6 +51,43 @@ class TransformWizardTest {
     }
 
     @Test
+    void buildsAnUnwindTransform() {
+        // path, then the element's own identifying field, then the ordinal column, then whether an
+        // empty array still produces a row, then the declared type of the expanded field
+        ScriptedPrompter p = new ScriptedPrompter(
+                "explode", "unwind", "items", "sku", "item_no", "yes", "json");
+        assertThat(yaml(new TransformWizard(p).run())).isEqualTo(
+                """
+                version: tapstate/v1
+                kind: transform
+                id: explode
+                type: unwind
+                path: items
+                include_array_index: item_no
+                preserve_null_and_empty_arrays: true
+                element_key: sku
+                element_type: json
+                """);
+    }
+
+    @Test
+    void anUnwindsUnansweredOptionsAreWrittenAsAbsentRatherThanAsTheirDefaults() {
+        // Four of the five keys are optional and a blank answer means "not this one". Writing the
+        // defaults out instead would produce an artifact an author has to read past to find the two
+        // lines they actually chose, and would state a false as though it had been decided.
+        ScriptedPrompter p = new ScriptedPrompter("explode", "unwind", "items", "", "item_no", "no", "");
+        assertThat(yaml(new TransformWizard(p).run())).isEqualTo(
+                """
+                version: tapstate/v1
+                kind: transform
+                id: explode
+                type: unwind
+                path: items
+                include_array_index: item_no
+                """);
+    }
+
+    @Test
     void buildsAJsTransformAsAMultilineLiteralBlock() {
         // the whole script is captured as one multi-line block via the lines() primitive
         ScriptedPrompter p = new ScriptedPrompter("parse", "js", "emit(after)\nemit(before)");

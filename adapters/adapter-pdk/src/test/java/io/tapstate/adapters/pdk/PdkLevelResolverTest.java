@@ -99,6 +99,16 @@ class PdkLevelResolverTest {
         }
     }
 
+    @Test
+    void auditedEnterpriseBuildsResolveToTheBaselineLevelWithoutOpeningFutureVersions() {
+        for (String version : new String[] {"2.0.9", "2.0.9-SNAPSHOT", "2.0.9-20260902.031425-5"}) {
+            LevelResolution result = PdkLevelResolver.resolve(version, null);
+            assertThat(result.outcome()).as(version).isEqualTo(LevelOutcome.COMPATIBLE);
+            assertThat(result.requiredLevel()).as(version).isEqualTo(ENGINE);
+        }
+        assertThat(PdkLevelResolver.resolve("2.0.10", null).outcome()).isEqualTo(LevelOutcome.UNKNOWN_VERSION);
+    }
+
     // ---- an unrecognized declared version is a verdict (UNKNOWN_VERSION), not a bare crash ----
 
     @Test

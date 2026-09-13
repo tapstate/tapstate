@@ -1,0 +1,14 @@
+version: tapstate/v1
+kind: pipeline
+id: breadth_crossing
+source: src_db
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: all_orders
+    from: [orders]
+    type: map
+    fields: { id: "$id", seq: "$seq" }
+serve:
+  from: all_orders
+  sync:
+    - source: tgt_db

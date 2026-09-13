@@ -51,7 +51,8 @@ public final class MigrationRunner {
      */
     private static final List<ChangeSet> CHANGE_SETS =
             List.of(new V1BaselineIndexes(), new V2StructuredArtifacts(), new V3RecordedSrsSwitches(),
-                    new V4DiscardInventedPositions(), new V5SplitSourceSchemas(), new V6SplitDerivedSchemas());
+                    new V4DiscardInventedPositions(), new V5SplitSourceSchemas(), new V6SplitDerivedSchemas(),
+                    new V7RepairBlankPipelines());
 
     /**
      * The highest version this build knows. A store above it is one this build must not open: it was
@@ -97,7 +98,7 @@ public final class MigrationRunner {
     /**
      * The same, with the changesets, the two intervals and the clock given rather than assumed.
      * Package-visible so that waiting, being taken over, and a changeset failing part way through can
-     * each be put in front of a real server -- states this build's own two changesets cannot be made to
+     * each be put in front of a real server -- states this build's own changesets cannot be made to
      * reach, and which would otherwise be reasoned about rather than witnessed.
      */
     static void migrate(MongoDatabase database, List<ChangeSet> changeSets,
