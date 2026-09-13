@@ -14,6 +14,7 @@ import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -49,13 +50,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * asked what the table holds while that is going on. Every answer must be the count that is in the file:
  * the reader is never entitled to see the write, only the table.
  *
- * <p>Nothing here is timing-dependent in the direction that matters. The sink is driven for a counted
- * number of passes and the reader reads until the last of them has been applied, so the reader's readings
- * span the sink's writes rather than running ahead of or around them, and a passing run cannot have passed
- * by never looking while the sink was working. A failing run cannot fail because a wait was too short
- * either: there is no wait, and the sink is driven directly rather than through a pipeline.
+ * <p>Each writer applies a bounded number of replacements while the reader checks the settled count.
+ * Reverting either writer to an in-place write must make its corresponding case fail; that mutation
+ * is checked separately for the connector and the harness driver.
  */
-class TheFileTargetIsNeverReadHalfWrittenTest {
+class TheFileTargetIsNeverReadHalfWrittenIT {
 
     /** The table the example this came from settles on, read the way its target is read. */
     private static final String TABLE = "order_state";
@@ -90,29 +89,75 @@ class TheFileTargetIsNeverReadHalfWrittenTest {
         apply(sink, connection, batch, table);
         assertThat(count()).isEqualTo(ROWS);
 
+        assertStableCountDuring(() -> apply(sink, connection, batch, table));
+    }
+
+    @Test
+    void aReadWhileTheDriverKeepsSeedingTheSameRowsStillSeesEveryRow() throws Throwable {
+        EndpointAddress address = EndpointAddress.uri(target.toString());
+        List<Map<String, Object>> rows = SeedRows.generated(ROWS);
+        files.seed(address, TABLE, rows);
+        assertThat(count()).isEqualTo(ROWS);
+
+        assertStableCountDuring(() -> files.seed(address, TABLE, rows));
+    }
+
+    @Test
+    void theDriverCanReplaceATableWhoseFileNameFitsTheFilesystemLimit() throws Exception {
+        String name = "t".repeat(251);
+        Path file = target.resolve(name + ".csv");
+        // Establish that the table name itself is accepted by this filesystem.
+        Files.writeString(file, "id,seq\n1,1\n");
+        EndpointAddress address = EndpointAddress.uri(target.toString());
+
+        files.seed(address, name, SeedRows.generated(ROWS));
+
+        assertThat(files.count(address, name)).isEqualTo(ROWS);
+        try (var entries = Files.list(target)) {
+            assertThat(entries).containsExactly(file);
+        }
+    }
+
+    @Test
+    void theSinkCanReplaceATableWhoseFileNameFitsTheFilesystemLimit() throws Throwable {
+        String name = "t".repeat(251);
+        Path file = target.resolve(name + ".csv");
+        Files.writeString(file, "id,seq\n1,1\n");
+        TapTable table = new TapTable(name)
+                .add(new TapField(SeedRows.ID, "int").isPrimaryKey(true).primaryKeyPos(1))
+                .add(new TapField(SeedRows.SEQ, "int"));
+        table.refreshPrimaryKeys();
+
+        apply(theProductsWritePath(), pointedAt(target), theSettledRows(), table);
+
+        assertThat(files.count(EndpointAddress.uri(target.toString()), name)).isEqualTo(ROWS);
+        try (var entries = Files.list(target)) {
+            assertThat(entries).containsExactly(file);
+        }
+    }
+
+    private void assertStableCountDuring(Replacement replacement) throws Throwable {
         AtomicInteger applied = new AtomicInteger();
         AtomicReference<Throwable> writerFailed = new AtomicReference<>();
         Thread writer = new Thread(() -> {
             try {
                 for (int pass = 0; pass < PASSES; pass++) {
-                    apply(sink, connection, batch, table);
+                    replacement.run();
                     applied.incrementAndGet();
                 }
             } catch (Throwable failed) {
                 writerFailed.set(failed);
             }
-        }, "sink-reapplying-the-same-rows");
+        }, "reapplying-the-same-rows");
         writer.start();
 
         int readings = 0;
         try {
-            // Reading until the sink has applied its last pass is what holds the two together: the loop
-            // cannot end while a write is still to come, so a green run is one taken through the writes.
             do {
                 readings++;
                 long rows = count();
                 assertThat(rows)
-                        .as("the table at %s holds %s rows and the sink is applying those same rows again; "
+                        .as("the table at %s holds %s rows and the writer is applying those same rows again; "
                                 + "reading %s found %s of them, so the target is being written where it can "
                                 + "be read rather than replaced", target, ROWS, readings, rows)
                         .isEqualTo(ROWS);
@@ -121,8 +166,13 @@ class TheFileTargetIsNeverReadHalfWrittenTest {
             writer.join();
         }
         assertThat(writerFailed.get())
-                .as("the sink rejected a batch of the rows it had already written")
+                .as("the writer rejected rows it had already written")
                 .isNull();
+    }
+
+    @FunctionalInterface
+    private interface Replacement {
+        void run() throws Throwable;
     }
 
     /** The harness's own reading of a target, which is what the sweep's closing assertion reads through. */

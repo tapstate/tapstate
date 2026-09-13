@@ -24,6 +24,10 @@ import java.util.Set;
  * with it by construction. Two independent readers of one format is the whole point: the format is
  * the contract, and it is plain enough to read by eye when a specification disagrees.
  *
+ * <p>A table must be replaced whole, never overwritten in place: readers may open it during a write.
+ * Harness-side writers use {@link #replaceTable(Path, String)} even when they provide custom columns.
+ * The connector implements the same publication rule independently inside its isolated jar.
+ *
  * <p>Row shape mirrors the Mongo driver's - an id and a sequence. The {@code seed} generator vocabulary
  * is still only {@code rows: N}, but what a specification may depend on is now more than the count: the
  * ids are the whole numbers 1..N, and an insert continues them. A published example that filters has to
@@ -305,10 +309,18 @@ final class FileEndpoints implements Endpoints {
         for (Row row : rows) {
             text.append(row.id()).append(',').append(row.seq()).append('\n');
         }
+        replaceTable(file, text.toString());
+    }
+
+    /**
+     * Publishes a complete CSV table without exposing a partial write. Custom fixtures supply their
+     * own header and rows; this helper only replaces bytes and does not share the connector's reader.
+     */
+    static void replaceTable(Path file, String text) {
         try {
-            Path staged = Files.createTempFile(file.getParent(), file.getFileName() + ".", STAGING_SUFFIX);
+            Path staged = Files.createTempFile(file.getParent(), "table-", STAGING_SUFFIX);
             try {
-                Files.writeString(staged, text.toString());
+                Files.writeString(staged, text);
                 publish(staged, file);
             } finally {
                 // Nothing reads a staging file, so one a failed write leaves behind is one nothing ever

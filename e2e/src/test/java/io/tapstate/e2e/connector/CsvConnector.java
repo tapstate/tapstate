@@ -48,6 +48,9 @@ import java.util.stream.Stream;
  * class, deriving the target model, running the DAG, keying the upsert - is the real thing; only the
  * store at each end is a directory instead of a database.
  *
+ * <p>A table is published by staging its complete contents beside it and atomically replacing the
+ * table's file. Writers must never overwrite a visible table in place because readers open it whole.
+ *
  * <h2>Two rules this class must not break</h2>
  *
  * <p><b>It may touch nothing but the JDK and {@code io.tapdata.*}.</b> It is loaded from its jar by an
@@ -613,7 +616,7 @@ public class CsvConnector implements TapConnector {
         }
         try {
             Files.createDirectories(file.getParent());
-            Path staged = Files.createTempFile(file.getParent(), file.getFileName() + ".", STAGING_SUFFIX);
+            Path staged = Files.createTempFile(file.getParent(), "table-", STAGING_SUFFIX);
             try {
                 Files.writeString(staged, text.toString());
                 publish(staged, file);
