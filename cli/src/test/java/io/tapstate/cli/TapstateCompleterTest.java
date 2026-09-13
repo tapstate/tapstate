@@ -109,6 +109,27 @@ class TapstateCompleterTest {
     }
 
     @Test
+    void completesAddKindValuesAndOptions() {
+        assertThat(completer.candidates(List.of("add", ""), 1))
+                .containsExactlyInAnyOrder("pipeline", "serve", "source", "transform", "view");
+        assertThat(completer.candidates(List.of("add", "--connector", ""), 2))
+                .contains("mysql", "mongodb");
+    }
+
+    @Test
+    void completesAddKindAfterValueTakingOptions() {
+        assertThat(completer.candidates(List.of("add", "--connector", "mysql", ""), 3))
+                .containsExactlyInAnyOrder("pipeline", "serve", "source", "transform", "view");
+        assertThat(completer.candidates(List.of("add", "--workdir", "workspace", ""), 3))
+                .containsExactlyInAnyOrder("pipeline", "serve", "source", "transform", "view");
+    }
+
+    @Test
+    void doesNotCompleteAddKindInAnOptionValueSlot() {
+        assertThat(completer.candidates(List.of("add", "--id", ""), 2)).isEmpty();
+    }
+
+    @Test
     void completesTransformTypeValues() {
         // Read from the menu rather than written out again here. A type the wizard offers and this
         // list does not is one the shell stops suggesting, which reads to whoever hits tab as the
