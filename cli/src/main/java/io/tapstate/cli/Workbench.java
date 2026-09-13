@@ -792,7 +792,7 @@ final class Workbench {
                     String mode = ready.catalog().connectors().getFirst().modes().getFirst();
                     runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
                             ready.catalog(), WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR, 0,
-                            connector, mode, "", SourceScaffold.suggestedId(connector),
+                            "", connector, mode, "", SourceScaffold.suggestedId(connector),
                             sourceOptionDefaults(ready.catalog(), connector), Optional.empty(), false,
                             Optional.empty())));
                 }
