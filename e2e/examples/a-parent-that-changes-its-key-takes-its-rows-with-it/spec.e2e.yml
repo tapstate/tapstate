@@ -1,0 +1,37 @@
+# A qualified source-table reference must retain its discovered parent key through the literal map.
+# Both parents share element keys, so snapshot counts and subsequent key changes expose a lost parent
+# identity. Real MySQL before images and physical Mongo reads verify the complete write keys.
+name: a-parent-that-changes-its-key-takes-its-rows-with-it
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mysql]
+pipeline: pipeline.tap.yml
+seed:
+  src_mysql.orders:
+    values:
+      - { id: 1, customer: ada, revision: 0 }
+      - { id: 2, customer: grace, revision: 0 }
+steps:
+  - start
+  - await: { count: { tgt_mongo.orders: 4 } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 1, sku: a }, expect: { customer: ada, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 1, sku: b }, expect: { customer: ada, items.sku: b } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 2, sku: a }, expect: { customer: grace, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 2, sku: b }, expect: { customer: grace, items.sku: b } } } }
+  # Only the parent key changes. Pairing by element value leaves two old-key orphans.
+  - cdc: { src_mysql.orders: { update: { where: { id: 1 }, set: { id: 9 } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 9, sku: a }, expect: { customer: ada, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 9, sku: b }, expect: { customer: ada, items.sku: b } } } }
+  - await: { count: { tgt_mongo.orders: 4 } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 2, sku: a }, expect: { customer: grace, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 2, sku: b }, expect: { customer: grace, items.sku: b } } } }
+  - cdc: { src_mysql.orders: { delete: { where: { id: 9 } } } }
+  - await: { count: { tgt_mongo.orders: 2 } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 2, sku: a }, expect: { customer: grace, items.sku: a } } } }
+  - await: { doc: { tgt_mongo.orders: { where: { id: 2, sku: b }, expect: { customer: grace, items.sku: b } } } }
+  # Every expected key is present; the exact count leaves no room for stale rows.
+  - assert: { state: RUNNING }

@@ -58,7 +58,9 @@
                 "enum": [
                   "mongo",
                   "mysql",
-                  "postgres"
+                  "oracle",
+                  "postgres",
+                  "sqlserver"
                 ]
               }
             }

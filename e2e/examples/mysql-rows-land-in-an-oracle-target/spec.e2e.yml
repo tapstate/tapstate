@@ -1,0 +1,25 @@
+# The target table is absent; the product creates it from the source model.
+# Independent JDBC readback distinguishes snapshot, insert, update and delete.
+name: mysql-rows-land-in-an-oracle-target
+setup:
+  databases:
+    src_db: { kind: mysql }
+    tgt_db: { kind: oracle }
+  connectors: [mysql, oracle]
+  apply: [src_db.tap.yml, tgt_db.tap.yml, pipeline.tap.yml]
+  discover: [src_db]
+pipeline: pipeline.tap.yml
+seed:
+  src_db.orders: { rows: 12 }
+steps:
+  - start
+  - await: { count: { tgt_db.orders: 12 } }
+  - await: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 5 } } } }
+  - cdc: { src_db.orders: insert 3 }
+  - await: { count: { tgt_db.orders: 15 } }
+  - await: { doc: { tgt_db.orders: { where: { id: 15 }, expect: { seq: 15 } } } }
+  - cdc: { src_db.orders: { update: { where: { id: 5 }, set: { seq: 505 } } } }
+  - await: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 505 } } } }
+  - cdc: { src_db.orders: { delete: { where: { id: 1 } } } }
+  - await: { count: { tgt_db.orders: 14 } }
+  - assert: { doc: { tgt_db.orders: { where: { id: 5 }, expect: { seq: 505 } } } }

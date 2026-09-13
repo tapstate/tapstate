@@ -26,7 +26,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * property-gated run of this class or catalog-derive:
  *
  * <p>All three read the connectors checkout from {@code -Dtapstate.catalog.connectors=<path>}, falling
- * back to a sibling directory named {@code tapdata-connectors} when the property is absent.
+ * back to a sibling directory named {@code tapdata-connectors} when the property is absent. Additional
+ * checkouts use {@code tapstate.catalog.connectors.1}, {@code .2}, and so on; each refresh replaces only
+ * the ids it visits, preserving other checkouts in the entries, index and capability bitmap.
  *
  * <ol>
  *   <li>{@code -Dtapstate.catalog.manifest=<path>} — walk the checkout and write the probe manifest;</li>
@@ -57,8 +59,11 @@ class CatalogArtifactTest {
         Optional<Path> checkout = connectorsRepo();
         assumeTrue(checkout.isPresent(), "connectors checkout absent — skipping");
 
-        WalkResult walk = ConnectorWalker.walk(checkout.get());
-        Files.writeString(Path.of(manifestPath), ManifestWriter.write(walk.sources()));
+        List<ConnectorSource> sources = new ArrayList<>();
+        for (Path root : connectorRoots(checkout.get())) {
+            sources.addAll(ConnectorWalker.walk(root).sources());
+        }
+        Files.writeString(Path.of(manifestPath), ManifestWriter.write(sources));
     }
 
     @Test
@@ -135,13 +140,15 @@ class CatalogArtifactTest {
         String bitmapTsv = Files.readString(Path.of(bitmapPath));
         Map<String, Set<String>> bitmap = BitmapReader.read(bitmapTsv);
         GeneratedCatalog catalog = CatalogGenerator.generate(
-                checkout.get(), resolveSpecSha(), resolveCapabilitySha(), bitmap);
+                connectorRoots(checkout.get()), resolveSpecSha(), resolveCapabilitySha(), bitmap);
 
         if (UPDATE) {
             writeArtifacts(catalog, bitmapTsv);
             return;
         }
-        assertCheckedIn(catalog, bitmapTsv);
+        CatalogArtifactStore.Snapshot snapshot =
+                CatalogArtifactStore.merge(catalog, bitmapTsv, catalogDir(), bitmapFile(), reportFile());
+        assertCheckedIn(snapshot.catalog(), snapshot.bitmap());
     }
 
     @Test
@@ -155,22 +162,7 @@ class CatalogArtifactTest {
     }
 
     private void writeArtifacts(GeneratedCatalog catalog, String bitmapTsv) throws IOException {
-        Path catalogDir = catalogDir();
-        Files.createDirectories(catalogDir);
-        // Remove stale entries (a connector dropped upstream must not linger), then write fresh.
-        for (Path json : jsonFiles()) {
-            Files.delete(json);
-        }
-        Files.writeString(catalogDir.resolve(INDEX), catalog.index());
-        for (Map.Entry<String, String> entry : catalog.entries().entrySet()) {
-            Files.writeString(catalogDir.resolve(entry.getKey() + ".json"), entry.getValue());
-        }
-        Files.writeString(reportFile(), catalog.report());
-        // The bitmap is checked in alongside what was generated from it, so the capability revision in
-        // the index head has the thing it names sitting next to it rather than in a build that is gone.
-        // It is also what a spec-only refresh merges: with it in the tree, refreshing the spec face
-        // builds no jars at all, and the two jobs stop writing the same files.
-        Files.writeString(bitmapFile(), bitmapTsv);
+        CatalogArtifactStore.write(catalog, bitmapTsv, catalogDir(), bitmapFile(), reportFile());
     }
 
     private void assertCheckedIn(GeneratedCatalog catalog, String bitmapTsv) throws IOException {
@@ -273,6 +265,18 @@ class CatalogArtifactTest {
             }
         }
         throw new IllegalStateException("repo root with core/core-catalog not found above the working directory");
+    }
+
+    private static List<Path> connectorRoots(Path first) {
+        List<Path> roots = new ArrayList<>();
+        roots.add(first);
+        for (int index = 1; ; index++) {
+            String named = System.getProperty(ConnectorsCheckout.PROPERTY + "." + index);
+            if (named == null) {
+                return roots;
+            }
+            roots.add(ConnectorsCheckout.locate(named, Path.of("").toAbsolutePath()).orElseThrow());
+        }
     }
 
     private static Optional<Path> connectorsRepo() {

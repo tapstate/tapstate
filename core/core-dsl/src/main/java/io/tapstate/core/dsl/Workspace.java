@@ -44,6 +44,7 @@ public final class Workspace {
         NestCapacityRules.validate(byId.values());
         ModeRules.validate(byId.values());
         RenameRules.validate(byId.values());
+        UnwindRules.validate(byId.values());
         return new Workspace(byId);
     }
 

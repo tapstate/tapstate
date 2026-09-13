@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * The MongoDB SRS meta store: one durable coordination document per mining chain — the offset, consumer
@@ -37,8 +38,9 @@ import java.util.Optional;
  * the grammar forbids from containing a dot, so the id is a safe update path and one consumer is updated
  * at {@code consumerOffsets.<pipelineId>} independently. That sub-document holds everything belonging to
  * one pipeline rather than to the chain: its read cursor, its acked position, and the tables whose initial
- * load its sink has confirmed. The schema history is an append-only array advanced by {@code $push}. The
- * nullable positions are stored only when present, never as explicit nulls.
+ * load its sink has confirmed. The schema history is an append-only array, advanced by an update that
+ * keeps the newest entries inside a fixed byte budget. The nullable positions are stored only when present,
+ * never as explicit nulls.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A re-seed of an existing chain (which would discard its accumulated truth) and a mutate of
@@ -47,6 +49,31 @@ import java.util.Optional;
  * its model is coded {@code io.document-unreadable}.
  */
 public final class MongoSrsMetaStore implements SrsMetaStore {
+
+    /**
+     * How much of a chain's schema history the record retains, in bytes of stored entries.
+     *
+     * <p>The record is one document, and the endpoint refuses a write whose result passes its 16 MiB
+     * ceiling — while the history is the one facet that grows for the life of a chain, by an entry per
+     * DDL it has ever seen. Left unbounded it arrives at a state where the only write that can record a
+     * schema change is a write that cannot land, and the chain then cannot say that its source's schema
+     * moved: not a slow read, a chain stuck.
+     *
+     * <p>Bytes rather than a count of entries, because bytes are what the ceiling counts. An entry is a
+     * table's field schema, and a wide table's is a hundred times a narrow one's, so a count that holds
+     * the record under the ceiling at one entry size does not at another. A sixteenth of the ceiling
+     * leaves the rest of the record — the consumer cursors and the positions — the room it always had,
+     * and is a window hundreds of versions long at the entry size this product's records carry.
+     */
+    private static final long SCHEMA_HISTORY_BUDGET_BYTES = 1024L * 1024L;
+
+    /**
+     * What one history entry costs the array beyond its own bytes: the key, which is the element's index,
+     * and the type byte. A margin rather than an accounting — the key widens by a digit every tenfold —
+     * and stated as a bound, so an entry is never credited with fewer bytes than it occupies and what is
+     * retained stays inside the budget rather than touching it.
+     */
+    private static final int HISTORY_ENTRY_OVERHEAD_BYTES = 12;
 
     private final MongoCollection<Document> collection;
     private final Clock clock;
@@ -72,10 +99,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * Fetches the consumer cursors alone, asking the endpoint for that field and no other.
      *
      * <p>This exists because of what it does not carry back. The record's schema history grows by one
-     * entry per DDL and is never trimmed, and the cdc write path -- which reads this on every run of
-     * changes -- never looks at it. Measured against a real endpoint on a chain with 500 DDLs behind it,
-     * the whole record is 671 KB and reads at 6.4 ms, while this projection reads at 0.5 ms and does not
-     * move as the history grows.
+     * entry per DDL, up to the bound the record keeps it under, and the cdc write path -- which reads
+     * this on every run of changes -- never looks at it. Measured against a real endpoint on a chain with
+     * 500 DDLs behind it, the whole record is 671 KB and reads at 6.4 ms, while this projection reads at
+     * 0.5 ms and does not move as the history grows.
      *
      * <p>It cannot go through the shared reconstruction: that one requires the schema history to be
      * present and reports a document without it as corruption, which is the right reading there and the
@@ -195,8 +222,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     private void requireSeeded(String miningChainId) {
         Document existing = StoreIo.call(() -> collection.find(new Document("_id", miningChainId)).first());
         if (existing == null) {
-            throw new IllegalStateException("srs meta mutate on an unseeded mining chain: " + miningChainId
-                    + " (create must seed it first)");
+            throw unseededChain(miningChainId);
         }
     }
 
@@ -293,16 +319,112 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 new Document("$inc", new Document("epoch", 1L)),
                 new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)));
         if (updated == null) {
-            throw new IllegalStateException("srs meta mutate on an unseeded mining chain: " + miningChainId
-                    + " (create must seed it first)");
+            throw unseededChain(miningChainId);
         }
         return readEpoch(updated, "epoch");
     }
 
+    /**
+     * Appends a version to the chain's schema history and cuts the retained history back to its budget,
+     * in one atomic update.
+     *
+     * <p>The cut is what keeps the append landable however far the history has already grown, and it has
+     * to be part of the same write. A trim on its own would be a second write, and between the two the
+     * record would still carry an array the endpoint refuses to grow, so a schema change arriving then
+     * would be the one that cannot be recorded. Cutting as part of the append means the entry being
+     * appended is written or the update does not happen at all.
+     *
+     * <p>What it drops is the oldest entries, whole. An entry is never rewritten to make room: versions
+     * are what a consumer resolves the schema in force at a change against, and a version rewritten to
+     * something smaller would resolve to a schema its table never had, which is worse than a version
+     * missing.
+     */
     @Override
     public void appendSchemaVersion(String miningChainId, SchemaVersion version) {
         Objects.requireNonNull(version, "version");
-        update(miningChainId, new Document("$push", new Document("schemaHistory", schemaToDocument(version))));
+        updatePipeline(miningChainId, List.of(new Document("$set",
+                new Document("schemaHistory", historyWithinBudget(schemaToDocument(version))))));
+    }
+
+    /**
+     * The expression that appends one stored entry to the stored history and cuts the array back to the
+     * newest entries the budget holds. Runs inside the update, so what it reads and what it writes are one
+     * atomic act and two appends racing on one chain cannot lose each other's entry.
+     *
+     * <p>The cut walks the array backwards, from the entry just appended to the oldest one, counting how
+     * many of the newest entries the budget holds; what it writes back is that many entries off the end.
+     * The entry just appended is counted whatever it weighs — the write exists to record it — and the first
+     * entry that does not fit closes the window, so what is retained is a suffix of the history: the newest
+     * versions, contiguous, rather than whichever older entries happened to be small enough to squeeze in.
+     *
+     * <p>Only the count travels through the walk, never the entries. An accumulator that carried the kept
+     * entries would copy that array on every step and so cost the square of what it retains, and what it
+     * retains is a byte budget rather than a count: a narrow table's entries are tens of bytes, so
+     * thousands of them fit, and the cost of a single append was measured at hundreds of milliseconds
+     * there. A tail slice of a counted length is also already oldest-first, which is the order the record
+     * stores.
+     */
+    private static Document historyWithinBudget(Document newEntry) {
+        // A missing history reads as an empty one: this is the only write that can record a schema change,
+        // so a record it refused to grow would be a chain that can no longer say its schema moved.
+        Document appended = new Document("$concatArrays", List.of(
+                new Document("$ifNull", List.of("$schemaHistory", List.of())),
+                List.of(new Document("$literal", newEntry))));
+        Document cut = new Document("$reduce",
+                new Document("input", new Document("$reverseArray", "$$all"))
+                        .append("initialValue", new Document("count", 0)
+                                .append("used", 0L)
+                                .append("closed", false))
+                        .append("in", countOfNewestWithinBudget()));
+        // The walk reads `$$all`, so it is bound around it, and the count it arrives at is taken off the
+        // end of that same array — the newest entries, in the order they arrived.
+        return new Document("$let", new Document("vars", new Document("all", appended))
+                .append("in", new Document("$let", new Document("vars", new Document("cut", cut))
+                        .append("in", new Document("$slice", List.of("$$all",
+                                new Document("$subtract", List.of(0, "$$cut.count"))))))));
+    }
+
+    /**
+     * One step of that walk: the accumulator carries how many of the newest entries are kept, what they
+     * weigh between them, and whether the window has closed. Once it has closed the step reads nothing
+     * further — the entries the walk has already decided to drop are never sized.
+     *
+     * <p>An element that is not a document is charged more than the whole budget, which closes the window
+     * on it and on everything older. It is not a version — no consumer could resolve a schema against it —
+     * and it must not be sized either: asking for the size of a string aborts the update, and asking for
+     * the size of a null answers null, which compares as under any budget and would leave the history
+     * growing unbounded again, silently, which is the state this bound exists to end.
+     */
+    private static Document countOfNewestWithinBudget() {
+        Document isDocument = new Document("$eq", List.of(new Document("$type", "$$this"), "object"));
+        // Sized as itself where it is a document and as an empty one where it is not, so that what reaches
+        // the size operator is a document whether or not the branch that uses the answer is taken.
+        Document sizeable = new Document("$cond",
+                List.of(isDocument, "$$this", new Document("$literal", new Document())));
+        Document bytes = new Document("$cond", List.of(isDocument,
+                new Document("$add",
+                        List.of(new Document("$bsonSize", "$$sizeable"), HISTORY_ENTRY_OVERHEAD_BYTES)),
+                SCHEMA_HISTORY_BUDGET_BYTES + 1));
+        // Dropping one drops every older entry with it, which is what makes the survivor a suffix.
+        Document dropped = new Document("count", "$$value.count")
+                .append("used", "$$value.used")
+                .append("closed", true);
+        Document keep = new Document("$cond", List.of(
+                new Document("$or", List.of(
+                        new Document("$eq", List.of("$$value.count", 0)),
+                        new Document("$and", List.of(
+                                new Document("$eq", List.of("$$value.closed", false)),
+                                new Document("$lte", List.of(
+                                        new Document("$add", List.of("$$value.used", "$$bytes")),
+                                        SCHEMA_HISTORY_BUDGET_BYTES)))))),
+                new Document("count", new Document("$add", List.of("$$value.count", 1)))
+                        .append("used", new Document("$add", List.of("$$value.used", "$$bytes")))
+                        .append("closed", false),
+                dropped));
+        return new Document("$cond", List.of("$$value.closed", dropped,
+                new Document("$let", new Document("vars", new Document("sizeable", sizeable))
+                        .append("in", new Document("$let", new Document("vars", new Document("bytes", bytes))
+                                .append("in", keep))))));
     }
 
     @Override
@@ -380,17 +502,45 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         return new Document("$unset", new Document("consumerOffsets." + pipelineId, ""));
     }
 
-    /**
-     * Applies an atomic update to a seeded chain. A zero matched count means no document carried the id:
-     * the chain was never seeded, a caller ordering error surfaced bare (not laundered into an io code).
-     */
+    /** Applies an atomic update to a seeded chain, written with update operators. */
     private void update(String miningChainId, Document update) {
+        applyToSeeded(miningChainId,
+                () -> collection.updateOne(new Document("_id", miningChainId), update));
+    }
+
+    /**
+     * The same for an update written as a pipeline — the form an update takes when what it writes is a
+     * function of what the record already holds, which no single update operator expresses. Still one
+     * atomic act on one document.
+     */
+    private void updatePipeline(String miningChainId, List<Document> pipeline) {
+        applyToSeeded(miningChainId,
+                () -> collection.updateOne(new Document("_id", miningChainId), pipeline));
+    }
+
+    /**
+     * What both update forms share: the id check, the driver translation, and the matched count. A zero
+     * matched count means no document carried the id — the chain was never seeded, a caller ordering error
+     * surfaced bare (not laundered into an io code). The chain id is handed to the translation so that a
+     * write the endpoint refuses for its size names the record it was for.
+     */
+    private void applyToSeeded(String miningChainId, Supplier<UpdateResult> updateOne) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        UpdateResult result = StoreIo.call(() -> collection.updateOne(new Document("_id", miningChainId), update));
+        UpdateResult result = StoreIo.call(miningChainId, updateOne);
         if (result.getMatchedCount() == 0) {
-            throw new IllegalStateException("srs meta mutate on an unseeded mining chain: " + miningChainId
-                    + " (create must seed it first)");
+            throw unseededChain(miningChainId);
         }
+    }
+
+    /**
+     * The caller ordering error every mutator raises on a chain {@code create} has not seeded. One factory
+     * because three paths raise it — the pre-read, the epoch increment and the matched count — and the text
+     * is read back as the contract's own in the port suite, so a copy of it that drifted would surface in
+     * another module, if anywhere.
+     */
+    private static IllegalStateException unseededChain(String miningChainId) {
+        return new IllegalStateException("srs meta mutate on an unseeded mining chain: " + miningChainId
+                + " (create must seed it first)");
     }
 
     /**
