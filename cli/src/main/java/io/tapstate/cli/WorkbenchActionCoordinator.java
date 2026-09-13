@@ -43,6 +43,7 @@ final class WorkbenchActionCoordinator implements AutoCloseable {
         }
         if (active != null) {
             active.cancel(true);
+            worker.getQueue().clear();
         }
         active = worker.submit(() -> {
             T result;

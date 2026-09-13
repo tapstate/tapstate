@@ -383,26 +383,39 @@ final class WorkbenchRenderer {
         frame.renderWidget(block, area);
         Rect inner = block.inner(area);
         boolean configStage = source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG;
-        int leftWidth = configStage ? inner.width() : Math.clamp(inner.width() / 2, 34, 50);
-        Rect formArea = new Rect(inner.x(), inner.y(), leftWidth, inner.height());
-        Rect previewArea = new Rect(inner.x() + leftWidth + 1, inner.y(),
-                Math.max(0, inner.width() - leftWidth - 1), inner.height());
+        boolean stacked = configStage && inner.width() < 120;
+        int leftWidth = stacked
+                ? inner.width()
+                : configStage ? Math.clamp(inner.width() / 2, 60, 82) : Math.clamp(inner.width() / 2, 34, 50);
+        int formHeight = stacked ? Math.max(1, inner.height() * 2 / 3) : inner.height();
+        Rect formArea = new Rect(inner.x(), inner.y(), leftWidth, formHeight);
+        Rect previewArea = stacked
+                ? new Rect(inner.x(), inner.y() + formHeight + 1,
+                        inner.width(), Math.max(0, inner.height() - formHeight - 1))
+                : new Rect(inner.x() + leftWidth + 1, inner.y(),
+                        Math.max(0, inner.width() - leftWidth - 1), inner.height());
         int y = formArea.y();
-        write(frame, formArea.x(), y++, "Guided authoring", theme.label().bold(), formArea);
-        y++;
-        renderSourcePageField(frame, formArea, y++, "1", "Connector", source.connector(),
-                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR, theme);
-        renderSourcePageField(frame, formArea, y++, "2", "Read mode", source.mode(),
-                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE, theme);
-        renderSourcePageField(frame, formArea, y++, "3", "Tables", source.tables().isBlank() ? "All tables" : source.tables(),
-                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES, theme);
         List<WorkbenchActionGateway.SourceConfigField> configFields = sourceConfigFields(source);
-        renderSourcePageField(frame, formArea, y++, "4", "Configuration",
-                configFields.isEmpty() ? "No connector fields" : configFields.size() + " fields",
-                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG, theme);
-        renderSourcePageField(frame, formArea, y++, "5", "Resource id", source.id(),
-                source.stage() == WorkbenchOverlayState.SourceCreate.Stage.ID, theme);
-        y++;
+        if (stacked) {
+            write(frame, formArea.x(), y++, "Configuration · " + source.connector() + " · " + source.mode(),
+                    theme.label().bold(), formArea);
+            y++;
+        } else {
+            write(frame, formArea.x(), y++, "Guided authoring", theme.label().bold(), formArea);
+            y++;
+            renderSourcePageField(frame, formArea, y++, "1", "Connector", source.connector(),
+                    source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR, theme);
+            renderSourcePageField(frame, formArea, y++, "2", "Read mode", source.mode(),
+                    source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE, theme);
+            renderSourcePageField(frame, formArea, y++, "3", "Tables", source.tables().isBlank() ? "All tables" : source.tables(),
+                    source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES, theme);
+            renderSourcePageField(frame, formArea, y++, "4", "Configuration",
+                    configFields.isEmpty() ? "No connector fields" : configFields.size() + " fields",
+                    source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG, theme);
+            renderSourcePageField(frame, formArea, y++, "5", "Resource id", source.id(),
+                    source.stage() == WorkbenchOverlayState.SourceCreate.Stage.ID, theme);
+            y++;
+        }
         if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
                 || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) {
             List<String> options = source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
@@ -440,7 +453,7 @@ final class WorkbenchRenderer {
             };
             write(frame, formArea.x(), y, hint, theme.muted(), formArea);
         }
-        if (!configStage) {
+        if (previewArea.width() >= 4 && previewArea.height() >= 3) {
             Block previewBlock = Block.builder()
                     .borderType(BorderType.ROUNDED)
                     .borders(Borders.ALL)
@@ -450,7 +463,9 @@ final class WorkbenchRenderer {
                     .build();
             frame.renderWidget(previewBlock, previewArea);
             Rect previewInner = previewBlock.inner(previewArea);
-            String yaml = source.canonicalYaml().orElse("Preview appears after the resource id is confirmed.");
+            String yaml = source.canonicalYaml().orElse(source.pending()
+                    ? "Generating live draft preview..."
+                    : "Live YAML preview will appear here.");
             String[] lines = yaml.split("\\R");
             for (int index = 0; index < Math.min(lines.length, previewInner.height()); index++) {
                 write(frame, previewInner.x(), previewInner.y() + index, lines[index], theme.base(), previewInner);
@@ -496,14 +511,28 @@ final class WorkbenchRenderer {
             write(frame, area.x() + 2, y, "No visible connector fields.", theme.muted(), area);
             return;
         }
-        int visible = Math.max(1, Math.min(fields.size(), area.bottom() - y - 2));
+        int contentWidth = Math.max(1, area.width() - 2);
+        int availableRows = Math.max(1, area.bottom() - y - 2);
         int selected = Math.clamp(source.selectedIndex(), 0, fields.size() - 1);
-        int first = Math.clamp(selected - visible / 2, 0, Math.max(0, fields.size() - visible));
-        for (int offset = 0; offset < visible; offset++) {
-            WorkbenchActionGateway.SourceConfigField field = fields.get(first + offset);
+        int[] rowHeights = new int[fields.size()];
+        for (int index = 0; index < fields.size(); index++) {
+            rowHeights[index] = sourceConfigRowHeight(fields.get(index), source, contentWidth);
+        }
+        int selectedRow = 0;
+        for (int index = 0; index < selected; index++) {
+            selectedRow += rowHeights[index];
+        }
+        int first = 0;
+        int firstRow = 0;
+        while (first < selected && selectedRow - firstRow >= availableRows) {
+            firstRow += rowHeights[first++];
+        }
+        int row = 0;
+        for (int index = first; index < fields.size() && row < availableRows; index++) {
+            WorkbenchActionGateway.SourceConfigField field = fields.get(index);
+            boolean active = index == selected;
             if (!field.options().isEmpty()) {
-                renderSourceConfigOption(frame, area, y + offset, source, field, theme,
-                        first + offset == selected);
+                row += renderSourceConfigOption(frame, area, y + row, source, field, theme, active, contentWidth);
                 continue;
             }
             String value = source.config().getOrDefault(field.name(), "");
@@ -512,39 +541,122 @@ final class WorkbenchRenderer {
             }
             if (value.isBlank() && field.defaultValue() != null && !field.defaultValue().isBlank()) {
                 value = "[default: " + field.defaultValue() + "]";
-            } else if (value.isBlank() && !field.options().isEmpty()) {
-                value = "[skip]";
             }
-            write(frame, area.x() + 2, y + offset, pad(field.label() + ": " + value, area.width() - 2),
-                    first + offset == selected ? theme.selection() : theme.base(), area);
+            write(frame, area.x() + 2, y + row, pad(field.label() + ": " + value, contentWidth),
+                    active ? theme.selection() : theme.base(), area);
+            row++;
         }
         write(frame, area.x(), area.bottom() - 1,
                 "↑↓ fields  ←→ choices  type value  " + (selected + 1) + "/" + fields.size(), theme.muted(), area);
     }
 
-    private static void renderSourceConfigOption(
-            Frame frame, Rect area, int y, WorkbenchOverlayState.SourceCreate source,
-            WorkbenchActionGateway.SourceConfigField field, WorkbenchTheme theme, boolean active) {
-        String configuredValue = source.config().get(field.name());
-        String value = configuredValue;
-        if (configuredValue == null
-                || field.options().stream().noneMatch(option -> option.value().equals(configuredValue))) {
-            value = field.defaultValue();
+    private static int sourceConfigRowHeight(
+            WorkbenchActionGateway.SourceConfigField field,
+            WorkbenchOverlayState.SourceCreate source,
+            int width) {
+        if (field.options().isEmpty()) {
+            return 1;
         }
-        List<Span> spans = new ArrayList<>();
-        spans.add(Span.styled(field.label() + ": ", active ? theme.title().bold() : theme.muted()));
+        String value = effectiveSourceConfigValue(field, source);
+        List<List<WorkbenchActionGateway.SourceConfigOption>> lines = sourceConfigOptionLines(field, value, width);
+        return lines.size() == 1 ? 1 : 1 + lines.size();
+    }
+
+    private static int renderSourceConfigOption(
+            Frame frame, Rect area, int y, WorkbenchOverlayState.SourceCreate source,
+            WorkbenchActionGateway.SourceConfigField field, WorkbenchTheme theme, boolean active, int width) {
+        String value = effectiveSourceConfigValue(field, source);
+        List<List<WorkbenchActionGateway.SourceConfigOption>> lines = sourceConfigOptionLines(field, value, width);
+        if (lines.size() == 1) {
+            List<Span> spans = sourceConfigOptionSpans(field, value, lines.getFirst(), active, theme, true);
+            frame.renderWidget(Paragraph.from(Line.from(spans)), new Rect(
+                    area.x() + 2, y, width, 1));
+            return 1;
+        }
+        write(frame, area.x() + 2, y, field.label() + ":", active ? theme.title().bold() : theme.muted(), area);
+        for (int index = 0; index < lines.size(); index++) {
+            frame.renderWidget(Paragraph.from(Line.from(sourceConfigOptionSpans(
+                    field, value, lines.get(index), active, theme, false))), new Rect(
+                    area.x() + 2, y + index + 1, width, 1));
+        }
+        return 1 + lines.size();
+    }
+
+    private static String effectiveSourceConfigValue(
+            WorkbenchActionGateway.SourceConfigField field,
+            WorkbenchOverlayState.SourceCreate source) {
+        String configured = source.config().get(field.name());
+        if (configured != null && field.options().stream().anyMatch(option -> option.value().equals(configured))) {
+            return configured;
+        }
+        if (field.defaultValue() != null
+                && field.options().stream().anyMatch(option -> option.value().equals(field.defaultValue()))) {
+            return field.defaultValue();
+        }
+        return field.options().getFirst().value();
+    }
+
+    private static List<List<WorkbenchActionGateway.SourceConfigOption>> sourceConfigOptionLines(
+            WorkbenchActionGateway.SourceConfigField field, String value, int width) {
+        int inlineWidth = displayWidth(field.label() + ": ");
         for (int index = 0; index < field.options().size(); index++) {
-            WorkbenchActionGateway.SourceConfigOption option = field.options().get(index);
+            if (index > 0) {
+                inlineWidth++;
+            }
+            inlineWidth += displayWidth(sourceConfigOptionText(field.options().get(index), value));
+        }
+        if (inlineWidth <= width) {
+            return List.of(field.options());
+        }
+        List<List<WorkbenchActionGateway.SourceConfigOption>> lines = new ArrayList<>();
+        List<WorkbenchActionGateway.SourceConfigOption> line = new ArrayList<>();
+        int lineWidth = 0;
+        for (WorkbenchActionGateway.SourceConfigOption option : field.options()) {
+            int optionWidth = displayWidth(sourceConfigOptionText(option, value));
+            int requiredWidth = line.isEmpty() ? optionWidth : lineWidth + 1 + optionWidth;
+            if (!line.isEmpty() && requiredWidth > width) {
+                lines.add(List.copyOf(line));
+                line.clear();
+                lineWidth = 0;
+            }
+            if (!line.isEmpty()) {
+                lineWidth++;
+            }
+            line.add(option);
+            lineWidth += optionWidth;
+        }
+        if (!line.isEmpty()) {
+            lines.add(List.copyOf(line));
+        }
+        return List.copyOf(lines);
+    }
+
+    private static List<Span> sourceConfigOptionSpans(
+            WorkbenchActionGateway.SourceConfigField field,
+            String value,
+            List<WorkbenchActionGateway.SourceConfigOption> options,
+            boolean active,
+            WorkbenchTheme theme,
+            boolean includeLabel) {
+        List<Span> spans = new ArrayList<>();
+        if (includeLabel) {
+            spans.add(Span.styled(field.label() + ": ", active ? theme.title().bold() : theme.muted()));
+        }
+        for (int index = 0; index < options.size(); index++) {
             if (index > 0) {
                 spans.add(Span.styled(" ", theme.base()));
             }
+            WorkbenchActionGateway.SourceConfigOption option = options.get(index);
             boolean selected = option.value().equals(value);
-            spans.add(Span.styled(
-                    selected ? "[" + option.label() + "]" : " " + option.label() + " ",
+            spans.add(Span.styled(sourceConfigOptionText(option, value),
                     selected ? theme.base().bold() : theme.muted()));
         }
-        frame.renderWidget(Paragraph.from(Line.from(spans)), new Rect(
-                area.x() + 2, y, Math.max(1, area.width() - 2), 1));
+        return List.copyOf(spans);
+    }
+
+    private static String sourceConfigOptionText(
+            WorkbenchActionGateway.SourceConfigOption option, String value) {
+        return option.value().equals(value) ? "[" + option.label() + "]" : " " + option.label() + " ";
     }
 
     private static List<OverlayHit> renderConfirm(
