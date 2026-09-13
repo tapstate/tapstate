@@ -532,10 +532,30 @@ main() {
     # reading the header alone would have let exactly that one through. Either shape means a verb the run
     # depends on did not take, and the run stops at it rather than half a minute later at the row count.
     #
-    # A server that stopped answering is deliberately not read here. It is not the misreport this answers:
-    # the target really is empty and the server is really where to look, which is what the row count says.
-    if printf '%s\n' "$repl_out" | grep -q -e 'error: ' -e 'The server refused '; then
-        die "a verb failed before the pipeline was started; the CLI's output is above"
+    # START is intentionally refused for a pipeline already running on a re-run.
+    # Remove only that adjacent code/message pair from the guard input, preserving
+    # every other diagnostic (including another illegal transition). Keep the full
+    # original output above so the exception never hides what the CLI actually said.
+    # These are text renderings, not a machine-readable CLI status contract.
+    verb_failures="$(printf '%s\n' "$repl_out" | awk '
+        /error: lifecycle[.]illegal-transition$/ {
+            if (pending != "") print pending
+            pending = $0
+            next
+        }
+        pending != "" {
+            if ($0 == "  Cannot start a pipeline in state RUNNING.") {
+                pending = ""
+                next
+            }
+            print pending
+            pending = ""
+        }
+        { print }
+        END { if (pending != "") print pending }
+    ')"
+    if printf '%s\n' "$verb_failures" | grep -q -e 'error: ' -e 'The server refused ' -e 'request failed: '; then
+        die "a verb failed during pipeline setup; the CLI's output is above"
     fi
 
     # Snapshot verification, printed automatically: the demo's payoff is a real row count in the target,

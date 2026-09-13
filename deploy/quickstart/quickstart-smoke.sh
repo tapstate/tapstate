@@ -694,6 +694,41 @@ else
   bad "a coded refusal reached the row count (rc=$RUN_RC): $RUN_OUT"
 fi
 
+FAKE_CLI_OUT='request failed: 127.0.0.1:8080 is unreachable' run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+  ok "an unreachable server stops setup before the row-count wait"
+else
+  bad "a request failure reached the row count (rc=$RUN_RC): $RUN_OUT"
+fi
+
+# A re-run reaches the same START refusal as the real lifecycle machine. Only that
+# exact diagnostic is benign; another failed verb in the session must still stop it.
+FAKE_CLI_OUT="error: lifecycle.illegal-transition
+  Cannot start a pipeline in state RUNNING." run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+  ok "an already-running pipeline permits a quickstart re-run"
+else
+  bad "an already-running pipeline rejected the re-run (rc=$RUN_RC): $RUN_OUT"
+fi
+for refusal in 'error: connector.not-registered' \
+               'error: lifecycle.illegal-transition
+  Cannot start a pipeline in state FAILED.' \
+               'request failed: 127.0.0.1:8080 is unreachable'; do
+  FAKE_CLI_OUT="error: lifecycle.illegal-transition
+  Cannot start a pipeline in state RUNNING.
+$refusal" run_phase_fakes
+  unset FAKE_CLI_OUT
+  if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+     && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+    ok "an already-running refusal does not hide $refusal"
+  else
+    bad "another failure was hidden by the re-run exception (rc=$RUN_RC): $RUN_OUT"
+  fi
+done
+
 # A run whose online verbs did not take must fail, loudly and non-zero. The REPL is the reason this
 # needs its own check: an interactive session does not end because one command was rejected, so it
 # exits 0 whether register / apply / start succeeded or errored, and set -e sees nothing wrong. The
