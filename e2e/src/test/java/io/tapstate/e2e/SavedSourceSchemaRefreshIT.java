@@ -63,11 +63,7 @@ class SavedSourceSchemaRefreshIT {
     }
 
     private static void writeTable(Path directory) {
-        try {
-            Files.writeString(directory.resolve("orders.csv"), "id,name\n1,one\n");
-        } catch (IOException e) {
-            throw new UncheckedIOException("cannot write the source table", e);
-        }
+        FileEndpoints.replaceTable(directory.resolve("orders.csv"), "id,name\n1,one\n");
     }
 
     private static byte[] read(Path file) {

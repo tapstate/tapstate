@@ -7,8 +7,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * A member-local hand-off from the capture side to the source vertex, keyed by the per-table change ring
@@ -32,7 +32,8 @@ import java.util.concurrent.ConcurrentMap;
  *
  * <p>A drain is once-consumed: it removes a ring's rows and returns them, so a second drain of the same
  * ring yields only what arrived since. That is what lets the vertex come back to it on every pass without
- * re-emitting anything -- taking whatever is waiting and leaving an empty queue behind.
+ * re-emitting anything. Each drain takes at most the rows counted when it starts; concurrent appends
+ * remain for a later pass instead of extending the current drain indefinitely.
  */
 public final class SnapshotBuffer {
 
@@ -49,17 +50,26 @@ public final class SnapshotBuffer {
     public void append(String ringName, Envelope row) {
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(row, "row");
-        byRing.computeIfAbsent(ringName, ignored -> new ConcurrentLinkedQueue<>()).add(row);
+        byRing.computeIfAbsent(ringName, ignored -> new LinkedBlockingQueue<>()).add(row);
     }
 
     /**
-     * Removes and returns {@code ringName}'s buffered snapshot rows in append order, or an empty list when
-     * the ring was never appended to or has already been drained. Once-consumed: the ring's buffer is
-     * cleared, so a later drain returns nothing.
+     * Removes and returns the rows currently buffered for {@code ringName} in append order, or an empty
+     * list when none are waiting. Concurrent appends remain for a later drain; every row is consumed once.
      */
     public List<Envelope> drain(String ringName) {
         Objects.requireNonNull(ringName, "ringName");
-        Queue<Envelope> rows = byRing.remove(ringName);
-        return rows == null ? List.of() : new ArrayList<>(rows);
+        // Keep the queue attached: an append may already hold it but not yet have inserted its row.
+        Queue<Envelope> rows = byRing.get(ringName);
+        if (rows == null) return List.of();
+        // LinkedBlockingQueue reads its count without walking a tail that capture can keep extending.
+        // Take the whole initial batch so seeded snapshot rows still precede any change off the ring.
+        int remaining = rows.size();
+        List<Envelope> drained = new ArrayList<>();
+        Envelope row;
+        while (remaining-- > 0 && (row = rows.poll()) != null) {
+            drained.add(row);
+        }
+        return drained;
     }
 }

@@ -78,6 +78,8 @@ class OfflineZeroNetworkTest {
 
         assertThat(repl.dispatch(List.of("validate"), true)).isTrue();
         assertThat(repl.lastExitCode()).isZero();
+        assertThat(repl.dispatch(List.of("add", "source", "--id", "src_add", "--connector", "mysql",
+                "--dry-run"), true)).isTrue();
         assertThat(repl.dispatch(List.of("new", "--kind", "source", "--id", "src", "--connector", "mysql",
                 "--dry-run"), true)).isTrue();
         assertThat(repl.lastExitCode()).isZero();
@@ -87,7 +89,8 @@ class OfflineZeroNetworkTest {
         assertThat(networkCalls).hasValue(0);
         assertThat(prompter.calls).hasValue(0);
         assertThat(repl.session().isConnected()).isFalse();
-        assertThat(stderr.toString()).isEmpty();
+        assertThat(stderr.toString()).containsOnlyOnce("deprecated")
+                .contains("tapstate add source");
         assertThat(stdout.toString())
                 .contains("valid:", "version: tapstate/v1", "source.id")
                 .doesNotContain("Password", "Sign in", "tapstate(", cached.sessionToken());

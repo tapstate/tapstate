@@ -5,6 +5,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.tapstate.core.event.Envelope;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -14,8 +23,111 @@ import org.junit.jupiter.api.Test;
  */
 class SnapshotBufferTest {
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void retainsALaterAppendWhenAnEmptyDrainRacesWithQueueInsertion() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.late";
+        Envelope first = row("orders", 100);
+        Envelope later = row("orders", 101);
+        buffer.append(ring, first);
+        assertThat(buffer.drain(ring)).containsExactly(first);
+
+        CountDownLatch adding = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        Queue<Envelope> queue = new ConcurrentLinkedQueue<>() {
+            @Override
+            public boolean add(Envelope value) {
+                adding.countDown();
+                try {
+                    if (!resume.await(10, TimeUnit.SECONDS)) {
+                        throw new AssertionError("Timed out releasing the capture append");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+                return super.add(value);
+            }
+        };
+        // Install a real concurrent queue with a scheduling barrier at add: computeIfAbsent can
+        // publish an empty queue before append inserts its row. No production operation is replaced.
+        var field = SnapshotBuffer.class.getDeclaredField("byRing");
+        field.setAccessible(true);
+        ConcurrentMap<String, Queue<Envelope>> rings =
+                (ConcurrentMap<String, Queue<Envelope>>) field.get(buffer);
+        rings.put(ring, queue);
+
+        try (var capture = Executors.newSingleThreadExecutor()) {
+            var appended = capture.submit(() -> buffer.append(ring, later));
+            try {
+                assertThat(adding.await(10, TimeUnit.SECONDS)).as("capture reached queue insertion").isTrue();
+                assertThat(buffer.drain(ring)).isEmpty();
+            } finally {
+                resume.countDown();
+            }
+            appended.get(10, TimeUnit.SECONDS);
+
+            // The append finished and the queue holds the row. An explicit next drain rules out
+            // a missing processor wakeup: the row must still be reachable through the buffer.
+            assertThat(queue).containsExactly(later);
+            assertThat(buffer.drain(ring))
+                    .as("row 101 remains reachable after append completes, even after an empty drain")
+                    .containsExactly(later);
+        }
+    }
+
     private static Envelope row(String ring, int id) {
         return Envelope.read(id, ring, Map.of("id", (long) id), Map.of());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void drainReturnsItsInitialRowsWhileCaptureKeepsAppending() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.busy";
+        Envelope first = row("orders", 100);
+        AtomicBoolean replenish = new AtomicBoolean(true);
+        AtomicInteger appended = new AtomicInteger();
+
+        try (var capture = Executors.newSingleThreadExecutor()) {
+            Queue<Envelope> queue = new LinkedBlockingQueue<>() {
+                @Override
+                public Envelope poll() {
+                    // Keep the queue nonempty with a real capture append before each removal.
+                    // Cap the producer so an unbounded drain fails without hanging the test.
+                    if (replenish.get() && appended.get() < 64) {
+                        int id = 100 + appended.incrementAndGet();
+                        try {
+                            capture.submit(() -> buffer.append(ring, row("orders", id)))
+                                    .get(10, TimeUnit.SECONDS);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(interrupted);
+                        } catch (Exception failure) {
+                            throw new AssertionError(failure);
+                        }
+                    }
+                    return super.poll();
+                }
+            };
+            queue.add(first);
+            var field = SnapshotBuffer.class.getDeclaredField("byRing");
+            field.setAccessible(true);
+            ConcurrentMap<String, Queue<Envelope>> rings =
+                    (ConcurrentMap<String, Queue<Envelope>>) field.get(buffer);
+            rings.put(ring, queue);
+
+            List<Envelope> drained = buffer.drain(ring);
+            replenish.set(false);
+
+            assertThat(drained)
+                    .as("a drain returns its initial rows without chasing the active capture")
+                    .containsExactly(first);
+            assertThat(appended.get()).isEqualTo(1);
+            assertThat(buffer.drain(ring)).extracting(e -> e.after().get("id")).containsExactly(101L);
+            assertThat(buffer.drain(ring)).isEmpty();
+        }
     }
 
     @Test
