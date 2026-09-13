@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.dsl.UnwindWriteKeys;
 import io.tapstate.core.dsl.UnwindRules;
@@ -21,6 +23,7 @@ import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -96,7 +99,39 @@ import java.util.Set;
  *                      identity through renames when publishing their parent key
  */
 record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
-        Map<String, String> origins, boolean expanded) {
+        Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
+        Set<String> unchangedFields, Map<String, StringType> stringTypes) {
+
+    NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
+            Map<String, String> origins, boolean expanded) {
+        this(columns, key, unknownBecause, origins, expanded, Map.of(), columns.keySet(), Map.of());
+    }
+
+    NodeColumns(Map<String, String> columns, String unknownBecause) {
+        this(columns, unknownBecause, Map.of());
+    }
+
+    NodeColumns(Map<String, String> columns, String unknownBecause, Map<String, NumericType> numericTypes) {
+        this(columns, unknownBecause, numericTypes, columns.keySet(), Map.of());
+    }
+
+    NodeColumns(Map<String, String> columns, String unknownBecause, Map<String, NumericType> numericTypes,
+            Set<String> unchangedFields, Map<String, StringType> stringTypes) {
+        this(columns, List.of(), unknownBecause, identityOrigins(columns), false,
+                numericTypes, unchangedFields, stringTypes);
+    }
+
+    NodeColumns withStringTypes(Map<String, StringType> types) {
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types);
+    }
+
+    NodeColumns withUnchangedFields(Set<String> fields) {
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes);
+    }
+
+    NodeColumns withNumericTypes(Map<String, NumericType> types) {
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes);
+    }
 
     NodeColumns {
         // Order-preserving rather than Map.copyOf: the declared order is the output order, and a copy
@@ -104,6 +139,9 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         columns = Collections.unmodifiableMap(new LinkedHashMap<>(columns));
         key = List.copyOf(key);
         origins = Collections.unmodifiableMap(new LinkedHashMap<>(origins));
+        numericTypes = Collections.unmodifiableMap(new LinkedHashMap<>(numericTypes));
+        stringTypes = Collections.unmodifiableMap(new LinkedHashMap<>(stringTypes));
+        unchangedFields = Collections.unmodifiableSet(new LinkedHashSet<>(unchangedFields));
     }
 
     /** The columns a node produces, worked out; it adds nothing to what tells its rows apart. */
@@ -233,8 +271,26 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                     !entry.getValue().equals(input.origins().get(entry.getKey())));
             expanded |= input.expanded();
         }
+        Map<String, NumericType> numbers = new LinkedHashMap<>();
+        Map<String, StringType> strings = new LinkedHashMap<>();
+        for (String column : out.keySet()) {
+            NumericType candidate = inputs.iterator().next().numericTypes().get(column);
+            if (candidate != null && inputs.stream().allMatch(input ->
+                    Objects.equals(candidate, input.numericTypes().get(column)))) {
+                numbers.put(column, candidate);
+            }
+        }
+        for (String column : out.keySet()) {
+            StringType candidate = inputs.iterator().next().stringTypes().get(column);
+            if (candidate != null && inputs.stream().allMatch(input ->
+                    Objects.equals(candidate, input.stringTypes().get(column)))) {
+                strings.put(column, candidate);
+            }
+        }
+        Set<String> unchanged = new LinkedHashSet<>(out.keySet());
+        inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
         return new NodeColumns(out, agreed.stream().filter(out::containsKey).toList(), null,
-                origins, expanded);
+                origins, expanded, numbers, unchanged, strings);
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
@@ -315,7 +371,16 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         origins.remove(unwind.path());
         origins.remove(unwind.includeArrayIndex());
         origins.remove(unwind.elementKey());
-        return new NodeColumns(out, key, null, origins, true);
+        Map<String, NumericType> numbers = new LinkedHashMap<>(upstream.numericTypes());
+        Map<String, StringType> strings = new LinkedHashMap<>(upstream.stringTypes());
+        Set<String> unchanged = new LinkedHashSet<>(upstream.unchangedFields());
+        // The element and its generated locators are new values, not the parent's declaration.
+        for (String replaced : new String[] {unwind.path(), unwind.includeArrayIndex(), unwind.elementKey()}) {
+            numbers.remove(replaced);
+            strings.remove(replaced);
+            unchanged.remove(replaced);
+        }
+        return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings);
     }
 
     /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
@@ -368,7 +433,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             }
         }
         root.columns().forEach(out::putIfAbsent);
-        return known(out);
+        return known(out).withNumericTypes(root.numericTypes()).withStringTypes(root.stringTypes()).withUnchangedFields(root.unchangedFields());
     }
 
     /**
@@ -459,6 +524,9 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         }
         Map<String, TapstateType> upstreamTypes = typesOf(upstream);
         Map<String, String> out = new LinkedHashMap<>();
+        Map<String, NumericType> numbers = new LinkedHashMap<>();
+        Map<String, StringType> strings = new LinkedHashMap<>();
+        Set<String> unchanged = new LinkedHashSet<>();
         Set<String> consumed = new LinkedHashSet<>();
         Set<String> dropped = new LinkedHashSet<>();
         rules.forEach((output, rule) -> {
@@ -468,6 +536,15 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                     String renamed = upstream.columns().get(rename.sourceField());
                     if (renamed != null) {
                         out.put(output, renamed);
+                        if (output.equals(rename.sourceField()) && upstream.unchangedFields().contains(output)) {
+                            unchanged.add(output);
+                        }
+                        if (upstream.stringTypes().containsKey(rename.sourceField())) {
+                            strings.put(output, upstream.stringTypes().get(rename.sourceField()));
+                        }
+                        if (upstream.numericTypes().containsKey(rename.sourceField())) {
+                            numbers.put(output, upstream.numericTypes().get(rename.sourceField()));
+                        }
                     }
                 }
                 case FieldRule.Drop ignored -> dropped.add(output);
@@ -484,6 +561,15 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         upstream.columns().forEach((name, type) -> {
             if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
                 out.put(name, type);
+                if (upstream.unchangedFields().contains(name)) {
+                    unchanged.add(name);
+                }
+                if (upstream.stringTypes().containsKey(name)) {
+                    strings.put(name, upstream.stringTypes().get(name));
+                }
+                if (upstream.numericTypes().containsKey(name)) {
+                    numbers.put(name, upstream.numericTypes().get(name));
+                }
             }
         });
         Map<String, String> origins = new LinkedHashMap<>();
@@ -504,7 +590,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             }
         }
         return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
-                origins, upstream.expanded());
+                origins, upstream.expanded(), numbers, unchanged, strings);
     }
 
     /**

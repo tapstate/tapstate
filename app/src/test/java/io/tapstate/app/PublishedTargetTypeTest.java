@@ -11,21 +11,46 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * Which target columns keep the type token the source declared for them, and which stop.
- *
- * <p>A published target's type is the target store's own word for a column - the string a connector
- * builds the column from. There is exactly one place that word can come from, the source's own
- * declaration, because nothing on this side translates the shared vocabulary into any store's DDL.
- * So a column whose meaning changed on the way through has no second word available, and the answer
- * is no word at all: the connector infers one, which is what every column nobody could resolve a
- * type for already does.
- *
- * <p><b>Both halves are held here on purpose.</b> Dropping the word too eagerly is as wrong as
- * carrying a stale one - it throws away the width and precision the source declared, which is the
- * whole reason the word is carried in the first place - and the two failures look identical from a
- * green test run over rows that happen to fit either way.
+ * Source spelling remains available only while it describes the column. Portable inferred types
+ * and field attributes travel separately to the target connector's type mapping.
  */
 class PublishedTargetTypeTest {
+
+    @Test
+    void expansionPublishesParentMetadataAndTheElementsPortableTypeTogether() {
+        var number = new io.tapstate.core.common.NumericType(null, true, false, null, null, null, 18, 4);
+        var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
+        NodeColumns source = shared("o_id", "INT64 NOT NULL", "o_region", "STRING NULL",
+                "amount", "DECIMAL NULL", "items", "ARRAY NULL")
+                .withNumericTypes(Map.of("amount", number)).withStringTypes(Map.of("o_region", string));
+        NodeColumns projected = NodeColumns.of(new io.tapstate.core.model.TransformBody.MapProjection(
+                Map.of("order_id", io.tapstate.core.model.FieldRule.rename("o_id"))), Map.of("in", source), null);
+        NodeColumns expanded = NodeColumns.of(new io.tapstate.core.model.TransformBody.Unwind(
+                "items", "item_no", false, null, "STRING"), Map.of("in", projected), null);
+        TargetTable target = StoreBackedDagSource.publishedAs(source(), expanded, source);
+        Map<String, TargetField> fields = new LinkedHashMap<>();
+        target.fields().forEach(field -> fields.put(field.name(), field));
+        assertThat(fields.get("amount").numericType()).isEqualTo(number);
+        assertThat(fields.get("o_region").stringType()).isEqualTo(string);
+        assertThat(fields.get("items").type()).isNull();
+        assertThat(fields.get("items").inferredType()).isEqualTo(io.tapstate.core.common.TapstateType.STRING);
+        assertThat(fields.get("item_no").inferredType()).isEqualTo(io.tapstate.core.common.TapstateType.INT64);
+        assertThat(target.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactly("order_id", "item_no");
+    }
+
+    @Test
+    void expansionDoesNotInheritParentUniqueness() {
+        var uniqueParent = new io.tapstate.spi.sink.TargetIndex(List.of("o_id"), true);
+        var uniqueRegion = new io.tapstate.spi.sink.TargetIndex(List.of("o_region"), true);
+        var lookup = new io.tapstate.spi.sink.TargetIndex(List.of("o_region"), false);
+        TargetTable base = new TargetTable("orders", source().fields(), List.of(uniqueParent, uniqueRegion, lookup));
+        NodeColumns expanded = NodeColumns.of(new io.tapstate.core.model.TransformBody.Unwind(
+                "items", "item_no", false, null, "STRING"), Map.of("in", atTheSource()), null);
+        TargetTable target = StoreBackedDagSource.publishedAs(base, expanded, atTheSource());
+        assertThat(target.indexes()).containsExactly(lookup,
+                new io.tapstate.spi.sink.TargetIndex(List.of("o_id", "item_no"), true));
+    }
 
     /** A source table as the sink sees it: the store's own type tokens, one key column. */
     private static TargetTable source() {

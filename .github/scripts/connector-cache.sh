@@ -18,7 +18,9 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(sys.argv[1])
-MODULES = 'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector'
+MODULES = 'mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector'
+KINDS = [module.split('=', 1)[0] for module in MODULES.split(',')]
+MODULE_PATHS = ','.join(module.split('=', 1)[1] for module in MODULES.split(','))
 STAMP = 'connector-cache-manifest.json'
 
 
@@ -41,11 +43,13 @@ def fail(message):
     raise ValueError(message)
 
 
-def fingerprints(repository):
+def fingerprints(repository, reactor=()):
     result = {}
     base = repository / 'io/tapdata'
     for directory in sorted(base.glob('*/*-SNAPSHOT')):
         artifact, version = directory.parent.name, directory.name
+        if ['io.tapdata', artifact, version] in reactor:
+            continue
         metadata = list(directory.glob('maven-metadata-*.xml'))
         metadata = [path for path in metadata if path.name != 'maven-metadata-local.xml']
         aliases = sorted(path for path in directory.glob(f'{artifact}-{version}*') if path.suffix in ('.jar', '.pom'))
@@ -84,49 +88,65 @@ def run_maven(arguments):
         fail('Maven could not refresh snapshot metadata; refusing a stale cache key')
 
 
-def roots_from_effective(path):
-    document = xml(path)
-    projects = [document] if document.tag == 'project' else document.findall('project')
+def roots_from_effective(projects):
     if not projects:
         fail('effective POM contains no reactor projects')
     reactor = {(p.findtext('groupId'), p.findtext('artifactId'), p.findtext('version')) for p in projects}
+    def coordinate(dependency):
+        group, artifact, version = (dependency.findtext(field) or '' for field in ('groupId', 'artifactId', 'version'))
+        if group != 'io.tapdata' or (group, artifact, version) in reactor:
+            return None
+        if '${' in version or not version:
+            fail(f'unresolved external PDK dependency {artifact}: {version}')
+        kind = dependency.findtext('type') or 'jar'
+        classifier = dependency.findtext('classifier') or ''
+        if kind not in ('jar', 'pom', 'test-jar'):
+            fail(f'unsupported PDK snapshot artifact type: {kind}')
+        if kind == 'test-jar':
+            kind, classifier = 'jar', classifier or 'tests'
+        return group, artifact, version, kind, classifier
+
     roots = set()
     for project in projects:
         for dependency in project.findall('./dependencies/dependency') + project.findall('./build/plugins/plugin/dependencies/dependency'):
-            group, artifact, version = (dependency.findtext(field) or '' for field in ('groupId', 'artifactId', 'version'))
-            if group != 'io.tapdata' or (group, artifact, version) in reactor:
+            value = coordinate(dependency)
+            if value:
+                roots.add(value)
+    # The enterprise reactor can mediate a locally installed OSS prerequisite's
+    # transitive PDK version. Its effective direct dependencies do not expose that
+    # edge, so resolve managed variants of the reachable PDK artifacts as well.
+    reachable = {(entry[0], entry[1]) for entry in roots}
+    for project in projects:
+        for dependency in project.findall('./dependencyManagement/dependencies/dependency'):
+            if (dependency.findtext('groupId'), dependency.findtext('artifactId')) not in reachable:
                 continue
-            if '${' in version or not version:
-                fail(f'unresolved external PDK dependency {artifact}: {version}')
-            kind = dependency.findtext('type') or 'jar'
-            classifier = dependency.findtext('classifier') or ''
-            if kind not in ('jar', 'pom', 'test-jar'):
-                fail(f'unsupported PDK snapshot artifact type: {kind}')
-            if kind == 'test-jar':
-                kind, classifier = 'jar', classifier or 'tests'
-            roots.add((group, artifact, version, kind, classifier))
+            value = coordinate(dependency)
+            if value:
+                roots.add(value)
     if not roots:
         fail('selected reactor names no external PDK snapshot dependencies')
-    return sorted(roots)
+    return sorted(roots), sorted(reactor)
 
 
 def key(manifest):
-    return 'real-connectors-v1-' + hashlib.sha256(canonical(manifest)).hexdigest()
+    return 'real-connectors-v2-' + hashlib.sha256(canonical(manifest)).hexdigest()
 
 
 def load(path):
     data = json.loads(path.read_text())
-    if data.get('schema') != 1 or not data.get('snapshots') or not data.get('roots') or not data.get('source_sha') or not data.get('inputs'):
+    if data.get('schema') != 2 or not data.get('snapshots') or not data.get('roots') or not data.get('source_sha') or not data.get('inputs'):
         fail('incomplete connector cache manifest')
+    if set(data['source_sha']) != {'oss', 'enterprise'} or any(not re.fullmatch('[0-9a-f]{40}', sha) for sha in data['source_sha'].values()):
+        fail('connector cache manifest needs OSS and enterprise revisions')
     return data
 
 
 def jars_at(directory):
     paths = sorted(directory.glob('*.jar'))
-    for connector in ('mysql', 'mongodb', 'postgres'):
+    for connector in KINDS:
         if len([p for p in paths if p.name.startswith(connector + '-connector-v')]) != 1:
             fail(f'expected exactly one shaded {connector} connector jar')
-    if len(paths) != 3:
+    if len(paths) != len(KINDS):
         fail('unexpected connector jar set')
     if any(not path.stat().st_size for path in paths):
         fail('empty connector jar')
@@ -136,7 +156,7 @@ def jars_at(directory):
 parser = argparse.ArgumentParser(description=__doc__)
 sub = parser.add_subparsers(dest='command', required=True)
 prepare = sub.add_parser('prepare')
-prepare.add_argument('--checkout', type=Path, required=True)
+prepare.add_argument('--checkout', type=Path, action='append', required=True)
 prepare.add_argument('--repo-local', type=Path, required=True)
 prepare.add_argument('--output', type=Path, required=True)
 for name in ('key', 'seal', 'verify'):
@@ -145,25 +165,45 @@ for name in ('key', 'seal', 'verify'):
     if name != 'key': command.add_argument('--jars', type=Path, required=True)
     if name == 'seal':
         command.add_argument('--repo-local', type=Path, required=True)
-        command.add_argument('--checkout', type=Path, required=True)
+        command.add_argument('--checkout', type=Path, action='append', required=True)
 args = parser.parse_args(sys.argv[2:])
 try:
     if args.command == 'prepare':
-        checkout, repository = args.checkout.resolve(), args.repo_local.resolve()
+        if len(args.checkout) != 2:
+            fail('prepare requires two --checkout arguments: OSS then enterprise')
+        checkouts = dict(zip(('oss', 'enterprise'), (path.resolve() for path in args.checkout)))
+        repository = args.repo_local.resolve()
         if repository == Path.home() / '.m2/repository':
             fail('prepare requires an isolated Maven repository')
         # Caller configuration must not silently change the inputs that the key claims to bind.
         if os.environ.get('MAVEN_ARGS'):
             fail('prepare requires MAVEN_ARGS unset; use --repo-local and the checked-in connector settings')
-        source_sha = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip()
-        if subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain', '--untracked-files=no'], text=True).strip():
-            fail('connector checkout has tracked modifications')
+        source_sha = {}
+        for label, checkout in checkouts.items():
+            source_sha[label] = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip()
+            if subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain', '--untracked-files=no'], text=True).strip():
+                fail(f'{label} connector checkout has tracked modifications')
         settings = ROOT / '.github/maven-settings-connectors.xml'
-        common = ['mvn', '-B', '-U', f'-Dmaven.repo.local={repository}', '-s', str(settings), '-f', str(checkout / 'pom.xml')]
+        common = ['mvn', '-B', '-U', f'-Dmaven.repo.local={repository}', '-s', str(settings)]
         with tempfile.TemporaryDirectory() as temporary:
-            effective = Path(temporary) / 'effective.xml'
-            run_maven(common + ['-pl', MODULES, '-am', 'org.apache.maven.plugins:maven-help-plugin:3.5.1:effective-pom', f'-Doutput={effective}'])
-            roots = roots_from_effective(effective)
+            effective_projects = []
+            selected = {label: [] for label in checkouts}
+            for module in MODULE_PATHS.split(','):
+                owners = [label for label, checkout in checkouts.items() if (checkout / module).is_dir()]
+                if len(owners) != 1:
+                    fail(f'module must belong to exactly one checkout: {module}')
+                selected[owners[0]].append(module)
+            # These local artifacts are installed before the enterprise build, not
+            # resolved as remote snapshots. Include their full reactor in the graph.
+            selected['oss'] += ['connectors-common/sql-core', 'connectors-common/read-partition']
+            for label, checkout in checkouts.items():
+                if not selected[label]:
+                    continue
+                effective = Path(temporary) / f'{label}-effective.xml'
+                run_maven(common + ['-f', str(checkout / 'pom.xml'), '-pl', ','.join(selected[label]), '-am', 'org.apache.maven.plugins:maven-help-plugin:3.5.1:effective-pom', f'-Doutput={effective}'])
+                document = xml(effective)
+                effective_projects.extend([document] if document.tag == 'project' else document.findall('project'))
+            roots, reactor = roots_from_effective(effective_projects)
             # Separate get executions preserve different versions of the same artifact across
             # modules. A single dependency list would mediate them down to one version. Keeping
             # executions in one Maven session avoids repeated JVM startup and metadata fetches.
@@ -172,8 +212,6 @@ try:
                 ET.SubElement(project, name).text = value
             repositories = ET.SubElement(project, 'repositories')
             seen_repositories = {}
-            effective_root = xml(effective)
-            effective_projects = [effective_root] if effective_root.tag == 'project' else effective_root.findall('project')
             for repository_element in [element for entry in effective_projects for element in entry.findall('./repositories/repository')]:
                 identifier = repository_element.findtext('id')
                 normalized = copy.deepcopy(repository_element)
@@ -200,14 +238,14 @@ try:
                 ET.SubElement(configuration, 'transitive').text = 'true'
             resolver_pom = Path(temporary) / 'pom.xml'
             ET.ElementTree(project).write(resolver_pom, encoding='utf-8', xml_declaration=True)
-            run_maven(common[:-2] + ['-f', str(resolver_pom), '-N', 'validate'])
-        snapshots = fingerprints(repository)
+            run_maven(common + ['-f', str(resolver_pom), '-N', 'validate'])
+        snapshots = fingerprints(repository, [list(entry) for entry in reactor])
         for group, artifact, version, kind, classifier in roots:
             filename = f'{artifact}-{version}' + (f'-{classifier}' if classifier else '') + f'.{kind}'
             if version.endswith('-SNAPSHOT') and f'io/tapdata/{artifact}/{version}/{filename}' not in snapshots:
                 fail(f'unresolved required PDK component: {artifact}:{version}:{kind}:{classifier}')
         inputs = {str(path.relative_to(ROOT)): digest(path) for path in [ROOT / 'scripts/build-real-connectors.sh', ROOT / '.github/scripts/connector-cache.sh', settings]}
-        manifest = {'schema': 1, 'source_sha': source_sha, 'modules': MODULES, 'roots': roots, 'snapshots': snapshots, 'inputs': inputs}
+        manifest = {'schema': 2, 'reactor': reactor, 'source_sha': source_sha, 'modules': MODULES, 'roots': roots, 'snapshots': snapshots, 'inputs': inputs}
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
         print(key(manifest))
@@ -215,12 +253,15 @@ try:
         print(key(load(args.manifest)))
     elif args.command == 'seal':
         manifest = load(args.manifest)
-        checkout = args.checkout.resolve()
-        if subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() != manifest['source_sha'] or subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain', '--untracked-files=no'], text=True).strip():
-            fail('connector source changed between probe and build')
+        if len(args.checkout) != 2:
+            fail('seal requires two --checkout arguments: OSS then enterprise')
+        for label, source in zip(('oss', 'enterprise'), args.checkout):
+            checkout = source.resolve()
+            if subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() != manifest['source_sha'][label] or subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain', '--untracked-files=no'], text=True).strip():
+                fail(f'{label} connector source changed between probe and build')
         if any(digest(ROOT / path) != expected for path, expected in manifest['inputs'].items()):
             fail('connector build inputs changed between probe and build')
-        if fingerprints(args.repo_local.resolve()) != manifest['snapshots']:
+        if fingerprints(args.repo_local.resolve(), manifest['reactor']) != manifest['snapshots']:
             fail('PDK snapshot provenance changed between probe and connector build')
         stamp = {'key': key(manifest), 'provenance': manifest, 'jars': jars_at(args.jars)}
         (args.jars / STAMP).write_text(json.dumps(stamp, indent=2, sort_keys=True) + '\n')

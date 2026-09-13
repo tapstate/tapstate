@@ -1,0 +1,5 @@
+version: tapstate/v1
+kind: source
+id: tgt_db
+connector: oracle
+config: { host: ${TGT_DB_HOST}, port: ${TGT_DB_PORT}, user: ${TGT_DB_USER}, password: ${TGT_DB_PASSWORD}, schema: ${TGT_DB_SCHEMA}, thinType: SERVICE_NAME, database: ${TGT_DB_DATABASE}, multiTenant: true, pdb: ${TGT_DB_PDB} }

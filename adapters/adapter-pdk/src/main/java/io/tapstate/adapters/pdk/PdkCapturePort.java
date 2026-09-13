@@ -203,8 +203,8 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     /**
-     * Inits the connector once, samples the seam, then batch-reads the configured streams (or every
-     * discovered stream).
+     * Inits the connector once, discovers its tables, samples the seam, then batch-reads the configured
+     * streams (or every discovered stream).
      *
      * <p>The seam is sampled <em>before</em> the first row is read, which is what makes the join to the
      * change tail gapless. A change made while the snapshot runs then falls after the seam and is
@@ -214,10 +214,14 @@ public final class PdkCapturePort implements CapturePort {
      */
     private Read batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
         connector.connector().init(connector.context());
-        Object seam = startOffset(connector, null);
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
         Map<String, TapTable> discovered = byId(discoverTables(connector, config.streams()));
+        discovered.values().forEach(connector::fillFieldTypes);
+        connector.context().setTableMap(tableMap(discovered));
+        // Position discovery may inspect the selected tables too. Populate their context first, while
+        // still sampling before any snapshot row is read so the snapshot-to-stream transition has no gap.
+        Object seam = startOffset(connector, null);
         List<String> streams = config.streams().isEmpty()
                 ? new ArrayList<>(discovered.keySet()) : config.streams();
         List<TapEvent> raw = new ArrayList<>();
@@ -227,9 +231,6 @@ public final class PdkCapturePort implements CapturePort {
                 throw new IllegalStateException(
                         "stream " + stream + " was requested but the connector did not discover it");
             }
-            // The connector reads by each field's PDK type, which discovery leaves unset; fill it from the
-            // connector's own type mapping before the read, or the read meets a null field type.
-            connector.fillFieldTypes(table);
             batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
         }
         return new Read(raw, discovered, seam);
@@ -501,10 +502,15 @@ public final class PdkCapturePort implements CapturePort {
      * needing a position has to refuse rather than invent one that no connector could be started from.
      */
     private static Optional<SourcePosition> position(PdkConnector connector, Object offset) {
-        return offset == null
-                ? Optional.empty()
-                : Optional.of(new SourcePosition(
-                        ConnectorOffsetCodec.toToken(connector.connectorId(), offset)));
+        if (offset == null) {
+            return Optional.empty();
+        }
+        // A snapshot renders its seam after the read's loader scope has ended. The
+        // connector's native JSON service must still resolve under that same loader.
+        Object represented = read(connector, () -> SqlServerOffset.forStorage(
+                connector.connectorId(), offset, () -> InstanceFactory.instance(JsonParser.class)));
+        return Optional.of(new SourcePosition(
+                ConnectorOffsetCodec.toToken(connector.connectorId(), represented)));
     }
 
     /** Runs a read action under the connector loader, mapping a connector-side failure to a code. */

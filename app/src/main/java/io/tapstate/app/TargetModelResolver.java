@@ -6,6 +6,7 @@ import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRename;
 import io.tapstate.spi.sink.TargetField;
+import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -133,14 +134,21 @@ final class TargetModelResolver {
         List<TargetField> fields = new ArrayList<>(source.fields().size());
         for (String keyColumn : primaryKey) {
             SourceField field = field(source, keyColumn);
-            fields.add(new TargetField(field.name(), field.dataType(), true));
+            fields.add(new TargetField(field.name(), field.dataType(), true, field.type(), field.numericType(), field.stringType()));
         }
         for (SourceField field : source.fields()) {
             if (!primaryKey.contains(field.name())) {
-                fields.add(new TargetField(field.name(), field.dataType(), false));
+                fields.add(new TargetField(field.name(), field.dataType(), false, field.type(), field.numericType(), field.stringType()));
             }
         }
-        return new TargetTable(source.name(), fields);
+        List<TargetIndex> indexes = new ArrayList<>();
+        if (!primaryKey.isEmpty()) {
+            indexes.add(new TargetIndex(primaryKey, true));
+        }
+        source.indexes().stream().filter(index -> !index.fields().isEmpty())
+                .map(index -> new TargetIndex(index.fields(), index.unique()))
+                .filter(index -> !indexes.contains(index)).forEach(indexes::add);
+        return new TargetTable(source.name(), fields, indexes);
     }
 
     /**
@@ -154,7 +162,7 @@ final class TargetModelResolver {
         if (rename == null) {
             return target;
         }
-        return new TargetTable(TableRename.apply(target.name(), rename), target.fields());
+        return new TargetTable(TableRename.apply(target.name(), rename), target.fields(), target.indexes());
     }
 
     /**
@@ -175,17 +183,25 @@ final class TargetModelResolver {
         for (String column : key) {
             for (TargetField field : model.fields()) {
                 if (field.name().equals(column)) {
-                    fields.add(new TargetField(field.name(), field.type(), true));
+                    fields.add(new TargetField(field.name(), field.type(), true, field.inferredType(), field.numericType(), field.stringType()));
                     break;
                 }
             }
         }
         for (TargetField field : model.fields()) {
             if (!key.contains(field.name())) {
-                fields.add(new TargetField(field.name(), field.type(), false));
+                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType(), field.numericType(), field.stringType()));
             }
         }
-        return new TargetTable(model.name(), fields);
+        List<TargetIndex> indexes = new ArrayList<>(model.indexes());
+        List<String> resolvedKey = fields.stream().filter(TargetField::primaryKey).map(TargetField::name).toList();
+        if (!resolvedKey.isEmpty()) {
+            TargetIndex index = new TargetIndex(resolvedKey, true);
+            if (!indexes.contains(index)) {
+                indexes.add(index);
+            }
+        }
+        return new TargetTable(model.name(), fields, indexes);
     }
 
     /** Applies one sync element's rename rules to every source table that can reach that sink. */

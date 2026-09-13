@@ -279,7 +279,8 @@ class MigrationRunnerIT {
         assertThat(before.supported()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
         assertThat(before.pending())
                 .containsExactly("V1BaselineIndexes", "V2StructuredArtifacts", "V3RecordedSrsSwitches",
-                        "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas");
+                        "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas",
+                        "V7RepairBlankPipelines");
 
         MigrationRunner.migrate(database);
 
