@@ -20,8 +20,8 @@
 # The case therefore builds the real Dockerfile against a synthetic context holding two boot jars --
 # the one this checkout's revision produces, and a leftover that sorts above it -- and requires the
 # ambiguity to be resolved rather than silently decided. Either resolution passes: refusing the build
-# (a wildcard that must match exactly one file) or copying the intended jar by exact name. What fails
-# is a build that exits 0 carrying the leftover.
+# with the expected candidate diagnostic or copying the intended jar by exact name. Unrelated build
+# failures and a successful build carrying the leftover both fail this smoke.
 #
 # The context is synthetic on purpose: the Dockerfile reads nothing from the context but that glob, so
 # the case needs no Maven build and never writes into the working tree. The repository's .dockerignore
@@ -56,9 +56,19 @@ printf 'intended-%s' "$VERSION" >"$CTX/app/target/app-$VERSION-boot.jar"
 printf 'leftover-%s' "$STALE"   >"$CTX/app/target/app-$STALE-boot.jar"
 
 echo "building $DOCKERFILE against a context holding app-$VERSION-boot.jar and app-$STALE-boot.jar"
-if ! docker build -f "$DOCKERFILE" -t "$TAG" "$CTX" >"$CTX/build.log" 2>&1; then
-    green "PASS: the build refused a glob matching two boot jars"
-    exit 0
+if ! docker build --progress=plain -f "$DOCKERFILE" -t "$TAG" "$CTX" >"$CTX/build.log" 2>&1; then
+    # Match emitted diagnostic lines, not the RUN source that BuildKit also prints. Strip only
+    # its step/timestamp prefix; raw output from builders without that prefix is already usable.
+    sed -E 's/^#[0-9]+ [0-9]+([.][0-9]+)? //' "$CTX/build.log" >"$CTX/build-output.log"
+    if grep -Fxq 'app/target/app-*-boot.jar matched 2 files in the build context; it must match exactly one:' "$CTX/build-output.log" &&
+        grep -Fxq "  app/target/app-$VERSION-boot.jar" "$CTX/build-output.log" &&
+        grep -Fxq "  app/target/app-$STALE-boot.jar" "$CTX/build-output.log"; then
+        green "PASS: the build refused a glob matching two boot jars"
+        exit 0
+    fi
+    red "FAIL: the build failed without the expected two-jar refusal"
+    cat "$CTX/build.log"
+    exit 1
 fi
 
 SHIPPED="$(docker run --rm --entrypoint cat "$TAG" /opt/tapstate/tapstate.jar)"
