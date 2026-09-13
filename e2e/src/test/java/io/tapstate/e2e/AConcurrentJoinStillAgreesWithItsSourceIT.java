@@ -173,8 +173,9 @@ class AConcurrentJoinStillAgreesWithItsSourceIT {
         @Override public Map<String, Object> dimensionRow(String source, String key) {
             return held.dimensionRow(source, key);
         }
-        @Override public void putDimensionRow(String source, String key, Map<String, Object> row) {
-            held.putDimensionRow(source, key, row);
+        @Override public Map<String, Object> putDimensionRow(String source, String key,
+                Map<String, Object> row) {
+            return held.putDimensionRow(source, key, row);
         }
         @Override public void removeDimensionRow(String source, String key) { held.removeDimensionRow(source, key); }
         @Override public int indexPageCount(String source, String key) { return held.indexPageCount(source, key); }

@@ -96,6 +96,7 @@ public final class JoinDriver {
     private final Map<String, Map<String, Object>> primed = new HashMap<>();
     private final int keysPerRead;
     private final JoinGauge gauge;
+    private final DimensionRowDisplacedAlert displaced;
 
     /**
      * @param plan           what to match on and what to publish
@@ -108,19 +109,39 @@ public final class JoinDriver {
      */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores) {
-        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ, JoinGauge.NONE);
+        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ, JoinGauge.NONE,
+                Map.of(), DimensionRowDisplacedAlert.NONE);
+    }
+
+    /** As above, with the stable row key of each dimension source used to classify replacements. */
+    public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
+            JoinStores stores, Map<String, List<String>> dimensionRowKeyColumns,
+            DimensionRowDisplacedAlert displaced) {
+        this(plan, factKeyColumns, outputStream, stores, DEFAULT_KEYS_PER_READ, JoinGauge.NONE,
+                dimensionRowKeyColumns, displaced);
     }
 
     /** As above, with the size of one read named - which is what a case needs to be small. */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores, int keysPerRead) {
-        this(plan, factKeyColumns, outputStream, stores, keysPerRead, JoinGauge.NONE);
+        this(plan, factKeyColumns, outputStream, stores, keysPerRead, JoinGauge.NONE,
+                Map.of(), DimensionRowDisplacedAlert.NONE);
     }
 
     /** As above, reporting the widest bucket it walks to {@code gauge}. */
     public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
             JoinStores stores, int keysPerRead, JoinGauge gauge) {
+        this(plan, factKeyColumns, outputStream, stores, keysPerRead, gauge, Map.of(),
+                DimensionRowDisplacedAlert.NONE);
+    }
+
+    /** As above, with both reporting places and every dimension source's stable row key named. */
+    public JoinDriver(JoinPlan plan, List<String> factKeyColumns, String outputStream,
+            JoinStores stores, int keysPerRead, JoinGauge gauge,
+            Map<String, List<String>> dimensionRowKeyColumns,
+            DimensionRowDisplacedAlert displaced) {
         this.gauge = Objects.requireNonNull(gauge, "gauge");
+        this.displaced = Objects.requireNonNull(displaced, "displaced");
         if (keysPerRead < 1) {
             throw new IllegalArgumentException("a read carries at least one key");
         }
@@ -134,7 +155,8 @@ public final class JoinDriver {
         }
         this.factSource = plan.factSource().name();
         this.factReadColumns = List.copyOf(plan.readColumns().getOrDefault(this.factSource, List.of()));
-        this.dimensions = compile(plan.from());
+        this.dimensions = compile(plan.from(),
+                Objects.requireNonNull(dimensionRowKeyColumns, "dimensionRowKeyColumns"));
     }
 
     /** Which source the rows are driven from: the one a change to any other source reaches through. */
@@ -409,7 +431,23 @@ public final class JoinDriver {
             // can ever name.
             return;
         }
-        stores.putDimensionRow(dimension.source(), now, after);
+        Map<String, Object> replaced = stores.putDimensionRow(dimension.source(), now, after);
+        String arrivedIdentity = identityOfDimensionRow(after, dimension);
+        String replacedIdentity = replaced == null ? null : identityOfDimensionRow(replaced, dimension);
+        if (arrivedIdentity != null && replacedIdentity != null
+                && !arrivedIdentity.equals(replacedIdentity)) {
+            // A second row under one key: the row just replaced is unreachable from here on, and every
+            // fact row under the key now joins to this one. Said rather than repaired - holding both
+            // would move dimension state, output cardinality and row identity together - so what this
+            // removes is only the silence, which is the half that makes a short target look correct.
+            //
+            // Identity comes from the source's declared row key rather than the envelope's shape or the
+            // rest of the row. A changed replay and an update with no before image are still the same
+            // row; an update of a previously displaced row and a key-moving update can still replace a
+            // different one. Whole-row equality gets both directions wrong, and where no source key is
+            // declared there is no sound way to distinguish them, so no claim is made.
+            displaced.displaced(dimension.source(), now);
+        }
         if (keyMoved || publishedValuesDiffer(dimension, before, after)) {
             queueRecompute(dimension, now, event.ts());
         }
@@ -715,6 +753,11 @@ public final class JoinDriver {
         return keyOf(row, dimension.dimensionColumns());
     }
 
+    /** The stable identity declared by this dimension source, or null where none can be established. */
+    private String identityOfDimensionRow(Map<String, Object> row, Dimension dimension) {
+        return dimension.rowKeyColumns().isEmpty() ? null : keyOf(row, dimension.rowKeyColumns());
+    }
+
     private String factKeyOf(Map<String, Object> row) {
         String key = keyOf(row, factKeyColumns);
         if (key == null) {
@@ -747,13 +790,15 @@ public final class JoinDriver {
      * the far one has to travel through the near one to find its fact rows), and a join keyed on
      * anything but the driving source (the same problem written differently).
      */
-    private List<Dimension> compile(JoinTree tree) {
+    private List<Dimension> compile(JoinTree tree,
+            Map<String, List<String>> dimensionRowKeyColumns) {
         List<Dimension> collected = new ArrayList<>();
-        collect(tree, collected);
+        collect(tree, dimensionRowKeyColumns, collected);
         return List.copyOf(collected.reversed());
     }
 
-    private void collect(JoinTree node, List<Dimension> into) {
+    private void collect(JoinTree node, Map<String, List<String>> dimensionRowKeyColumns,
+            List<Dimension> into) {
         if (node instanceof JoinTree.Source) {
             return;
         }
@@ -783,8 +828,10 @@ public final class JoinDriver {
                     "'" + right.name() + "' is joined on nothing, which is every row against every row");
         }
         into.add(new Dimension(right.name(), join.kind(), List.copyOf(factColumns),
-                List.copyOf(dimensionColumns), plan.outputColumns(right.name())));
-        collect(join.left(), into);
+                List.copyOf(dimensionColumns),
+                List.copyOf(dimensionRowKeyColumns.getOrDefault(right.name(), List.of())),
+                plan.outputColumns(right.name())));
+        collect(join.left(), dimensionRowKeyColumns, into);
     }
 
     /**
@@ -796,7 +843,8 @@ public final class JoinDriver {
      * published, so a filter asking about read columns would find every edit relevant.
      */
     private record Dimension(String source, JoinKind kind, List<String> factColumns,
-            List<String> dimensionColumns, java.util.Set<String> outputColumns) {
+            List<String> dimensionColumns, List<String> rowKeyColumns,
+            java.util.Set<String> outputColumns) {
     }
 
     private sealed interface Work permits Row, Recompute {

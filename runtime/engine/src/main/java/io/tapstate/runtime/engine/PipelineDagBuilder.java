@@ -299,9 +299,10 @@ public final class PipelineDagBuilder {
                     JoinPlan plan = bindings.join().plans().apply(step);
                     byKey.put(step.id(), JoinDag.attach(dag, plan, pipeline.id(), step.id(),
                             bindings.join().factKeyColumns().apply(step),
+                            bindings.join().dimensionRowKeyColumns().apply(step),
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
-                            bindings.join().stores()));
+                            bindings.join().stores(), bindings.join().displaced()));
                     if (chains != null) {
                         chains.derived(step.id(), nestUpstream(inline.from(), bindings));
                     }
