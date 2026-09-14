@@ -3,6 +3,7 @@ package io.tapstate.adapters.pdk;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Date;
@@ -67,6 +68,18 @@ public final class TapEventCodec {
         }
     };
 
+    private static final String BSON_TIMESTAMP = "org.bson.BsonTimestamp";
+    private static final ClassValue<Method> BSON_TIMESTAMP_TIME = new ClassValue<>() {
+        @Override
+        protected Method computeValue(Class<?> type) {
+            try {
+                return type.getMethod("getTime");
+            } catch (NoSuchMethodException e) {
+                throw new IllegalStateException("mongodb timestamp has no time accessor", e);
+            }
+        }
+    };
+
     private record Decimal128Access(Method isFinite, Method bigDecimalValue) {
     }
 
@@ -123,11 +136,12 @@ public final class TapEventCodec {
      * <p>A row travels in two lanes, and which one a value takes is the connector's answer, not ours.
      * A driver type the connector registered a conversion for takes that conversion and arrives as
      * the portable value the connector chose; everything else — the ordinary Java boxes — arrives as
-     * a bare value, normalized. The one compatibility correction is a MongoDB Decimal128 conversion
-     * that narrows an exact decimal to a double; only that double result is replaced with the source's
-     * exact, portable decimal. A row is therefore mixed, which is the contract rather than a gap: the
-     * frozen conversion surface deliberately registers nothing for the ordinary boxes, so putting them
-     * through it would pay a wrapper for a conversion that does not exist.
+     * a bare value, normalized. Two compatibility corrections cover MongoDB conversions with known
+     * loss: a Decimal128 narrowed to a double is replaced with the source's exact portable decimal,
+     * and a timestamp whose seconds were read as milliseconds is rebuilt from seconds. Only those
+     * exact results are replaced. A row is therefore mixed, which is the contract rather than a gap:
+     * the frozen conversion surface deliberately registers nothing for the ordinary boxes, so putting
+     * them through it would pay a wrapper for a conversion that does not exist.
      *
      * <p>On the bare lane: a driver hands over whatever box its own client uses — an int column may
      * arrive in any integral box, a real one as a float — while the type namespace a column resolves
@@ -147,9 +161,9 @@ public final class TapEventCodec {
     }
 
     /**
-     * The connector's own conversions applied to a row, at any depth, plus the Decimal128 compatibility
-     * correction described above; the widths the type namespace speaks are left exactly as the driver
-     * handed them over.
+     * The connector's own conversions applied to a row, at any depth, plus the compatibility corrections
+     * described above; the widths the type namespace speaks are left exactly as the driver handed them
+     * over.
      *
      * <p>This is what a read face wants. It reports what the database holds rather than what a pipeline
      * row speaks, so widening an integer there would answer a question nobody asked; but the registered
@@ -289,14 +303,23 @@ public final class TapEventCodec {
     /**
      * The portable result as a value the rest of the tree can compare. Everything the contract hands over
      * already behaves like one - text, a number, an instant - except its box for bytes, which declares
-     * neither equality nor a hash and would key a join by identity, and the known Decimal128 result that
-     * has already been narrowed to a double.
+     * neither equality nor a hash and would key a join by identity, the known Decimal128 result already
+     * narrowed to a double, and the known MongoDB timestamp result whose seconds were interpreted as
+     * milliseconds.
      */
     private static Object portable(Object source, Object value) {
         if (BSON_DECIMAL128.equals(source.getClass().getName()) && value instanceof Double) {
             BigDecimal exact = decimal128Value(source);
             if (exact != null) {
                 return exact;
+            }
+        }
+        if (BSON_TIMESTAMP.equals(source.getClass().getName()) && value instanceof DateTime timestamp) {
+            int seconds = bsonTimestampSeconds(source);
+            // This connector currently treats the seconds half as epoch milliseconds. Match that exact
+            // result before correcting it, so a connector that already returns the right instant wins.
+            if (timestamp.toInstant().equals(Instant.ofEpochMilli(seconds))) {
+                return new DateTime(Instant.ofEpochSecond(Integer.toUnsignedLong(seconds)));
             }
         }
         return value instanceof ByteData bytes ? new Bytes(bytes.getType(), bytes.getValue()) : value;
@@ -312,6 +335,14 @@ public final class TapEventCodec {
             return (BigDecimal) access.bigDecimalValue().invoke(value);
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("cannot read mongodb decimal128 exactly", e);
+        }
+    }
+
+    private static int bsonTimestampSeconds(Object value) {
+        try {
+            return (Integer) BSON_TIMESTAMP_TIME.get(value.getClass()).invoke(value);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot read mongodb timestamp time", e);
         }
     }
 
