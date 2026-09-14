@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -34,6 +35,8 @@ final class RunningPipeline {
     private final String targetId;
     private final Path sourceDirectory;
     private final Path targetDirectory;
+    private long targetVisibleAfter;
+    private boolean targetVisibilityDelayed;
 
     private RunningPipeline(ControlPlane control, String pipelineId, String sourceId, String targetId,
                             Path sourceDirectory, Path targetDirectory) {
@@ -72,7 +75,17 @@ final class RunningPipeline {
 
     /** The rows that have arrived at the target so far. */
     long rowsAtTarget() {
+        if (targetVisibilityDelayed && System.nanoTime() - targetVisibleAfter < 0) {
+            return 0;
+        }
+        targetVisibilityDelayed = false;
         return new FileEndpoints().count(EndpointAddress.uri(targetDirectory.toString()), TABLE);
+    }
+
+    /** Models a target whose observable count lags the pipeline reaching {@code RUNNING}. */
+    void delayTargetVisibility(Duration delay) {
+        targetVisibleAfter = System.nanoTime() + delay.toNanos();
+        targetVisibilityDelayed = true;
     }
 
     /** Drives a stop and waits for the runtime to report it has reached rest. */
