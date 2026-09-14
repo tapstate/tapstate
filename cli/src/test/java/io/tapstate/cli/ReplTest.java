@@ -2924,9 +2924,9 @@ class ReplTest {
         Harness h = onlineSession(workdir, client);
         List<URI> fetched = new ArrayList<>();
         byte[] jar = completeConnectorJar();
-        h.repl().connectorFetcher(from -> {
+        h.repl().connectorFetcher((from, expected) -> {
             fetched.add(from);
-            return PublishedConnectorArtifacts.Fetched.unvalidated(jar);
+            return PublishedConnectorArtifacts.Fetched.verified(jar);
         });
         int mark = h.sink().toString().length();
 
@@ -2957,9 +2957,9 @@ class ReplTest {
                 Map.of("TAPSTATE_CONNECTORS_URL", "https://mirror.example/connectors"));
         List<URI> fetched = new ArrayList<>();
         byte[] jar = completeConnectorJar();
-        h.repl().connectorFetcher(from -> {
+        h.repl().connectorFetcher((from, expected) -> {
             fetched.add(from);
-            return PublishedConnectorArtifacts.Fetched.unvalidated(jar);
+            return PublishedConnectorArtifacts.Fetched.verified(jar);
         });
         int mark = h.sink().toString().length();
 
@@ -2979,7 +2979,7 @@ class ReplTest {
         client.registerOutcome = new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("local", "hash-local", "1.0", true));
         Harness h = onlineSession(workdir, client);
-        h.repl().connectorFetcher(from -> {
+        h.repl().connectorFetcher((from, expected) -> {
             throw new AssertionError("a local file must not reach the release downloader");
         });
 
@@ -2993,7 +2993,7 @@ class ReplTest {
     void aFailedPublishedDownloadIsCodedAndNeverUploaded(@TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         Harness h = onlineSession(workdir, client);
-        h.repl().connectorFetcher(from -> {
+        h.repl().connectorFetcher((from, expected) -> {
             throw new IOException("HTTP 404");
         });
         int mark = h.sink().toString().length();
@@ -3012,8 +3012,8 @@ class ReplTest {
     void aSuccessfulErrorPageCannotBeUploadedAsAConnector(@TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         Harness h = onlineSession(workdir, client);
-        h.repl().connectorFetcher(from ->
-                PublishedConnectorArtifacts.Fetched.unvalidated("not a jar".getBytes()));
+        h.repl().connectorFetcher((from, expected) ->
+                PublishedConnectorArtifacts.Fetched.unverified("not a jar".getBytes()));
         int mark = h.sink().toString().length();
 
         assertThat(h.repl().dispatch("register sqlserver")).isTrue();
@@ -3021,7 +3021,7 @@ class ReplTest {
         String out = h.sink().toString().substring(mark);
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(out).contains("cli.connector-download-failed")
-                .contains("response is not a complete connector jar");
+                .contains("length does not match the published asset");
         assertThat(client.registerCalls).isEmpty();
     }
 
@@ -3040,7 +3040,8 @@ class ReplTest {
             FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
             Harness h = onlineSession(workdir, client);
             PublishedConnectorArtifacts.Fetcher http = PublishedConnectorArtifacts.Fetcher.http();
-            h.repl().connectorFetcher(ignored -> http.fetch(truncated));
+            h.repl().connectorFetcher((ignored, expected) -> http.fetch(
+                    truncated, new PublishedConnectorArtifacts.Artifact(100, "unused-after-truncation")));
             int mark = h.sink().toString().length();
 
             assertThat(h.repl().dispatch("register oracle")).isTrue();

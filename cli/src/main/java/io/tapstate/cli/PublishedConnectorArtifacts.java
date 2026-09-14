@@ -10,11 +10,13 @@ import java.net.URI;
 import java.net.URLConnection;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.function.UnaryOperator;
-import java.util.zip.ZipFile;
-import java.util.zip.ZipInputStream;
 
 /** Connector jars available from the floating {@code connectors-preview} release. */
 final class PublishedConnectorArtifacts {
@@ -28,12 +30,24 @@ final class PublishedConnectorArtifacts {
     private static final long MAX_ARTIFACT_BYTES = 64L * 1024 * 1024;
     private static final int COPY_BUFFER_BYTES = 8192;
 
-    /** Exact public ids with a matching {@code <id>-connector.jar} release asset. */
-    static final List<String> IDS = List.of("mysql", "mongodb", "postgres", "oracle", "sqlserver");
+    private static final Map<String, Artifact> ARTIFACTS = Map.of(
+            "mysql", new Artifact(47_131_206,
+                    "34def7fca33fdf80f9d7e5561b2a2d9b7a2733fd06da9974359bbb77066ca0e2"),
+            "mongodb", new Artifact(20_400_364,
+                    "7fbdbf1ef2965053c9c5e6d28c0c21c3aa2818938ab758b965cc278d61e0c7b4"),
+            "postgres", new Artifact(52_771_466,
+                    "535aaaed34594dcc9e2dd1937efc4b91865911f11de624aca555b59a609053ee"),
+            "oracle", new Artifact(36_837_471,
+                    "5e273f48ff9ee935881db3863bbbf165e91d86edb9aae3f929f1b835b13c3151"),
+            "sqlserver", new Artifact(16_232_120,
+                    "3254471003dbb5cb6512610efae34bc35f4d4a77c8c02cfbf9fc883659a4c826"));
+
+    /** Exact public ids with a matching {@code <id>-connector.jar} release asset and trusted digest. */
+    static final List<String> IDS = List.copyOf(ARTIFACTS.keySet());
 
     /** Fetches one complete response body; tests replace the network at this seam. */
     interface Fetcher {
-        Fetched fetch(URI from) throws IOException;
+        Fetched fetch(URI from, Artifact expected) throws IOException;
 
         static Fetcher http() {
             return http(name -> null);
@@ -41,10 +55,11 @@ final class PublishedConnectorArtifacts {
 
         /** Uses the standard proxy environment explicitly, including in a native image. */
         static Fetcher http(UnaryOperator<String> env) {
-            return from -> fetchFollowingRedirects(from, env);
+            return (from, expected) -> fetchFollowingRedirects(from, expected, env);
         }
 
-        private static Fetched fetchFollowingRedirects(URI from, UnaryOperator<String> env) throws IOException {
+        private static Fetched fetchFollowingRedirects(
+                URI from, Artifact expected, UnaryOperator<String> env) throws IOException {
             URI current = from;
             String originalScheme = from.getScheme();
             for (int redirects = 0; redirects <= 5; redirects++) {
@@ -61,7 +76,7 @@ final class PublishedConnectorArtifacts {
                 try {
                     int status = connection.getResponseCode();
                     if (status == HttpURLConnection.HTTP_OK) {
-                        return readBoundedJar(connection);
+                        return readVerifiedArtifact(connection, expected);
                     }
                     if (status < 300 || status >= 400) {
                         throw new IOException("HTTP " + status);
@@ -83,14 +98,34 @@ final class PublishedConnectorArtifacts {
         }
     }
 
-    /** Marks whether the transport already performed the complete-JAR check before allocating the byte array. */
-    record Fetched(byte[] bytes, boolean jarValidated) {
-        static Fetched unvalidated(byte[] bytes) {
+    /** Expected release bytes; changing a floating asset requires updating this metadata in the CLI. */
+    record Artifact(long bytes, String sha256) {
+    }
+
+    /** Carries whether a transport seam already checked the trusted length and digest. */
+    static final class Fetched {
+        private final byte[] bytes;
+        private final boolean verified;
+
+        private Fetched(byte[] bytes, boolean verified) {
+            this.bytes = bytes;
+            this.verified = verified;
+        }
+
+        static Fetched unverified(byte[] bytes) {
             return new Fetched(bytes, false);
         }
 
-        private static Fetched validated(byte[] bytes) {
+        static Fetched verified(byte[] bytes) {
             return new Fetched(bytes, true);
+        }
+
+        byte[] bytes() {
+            return bytes;
+        }
+
+        boolean verified() {
+            return verified;
         }
     }
 
@@ -98,7 +133,7 @@ final class PublishedConnectorArtifacts {
     }
 
     static boolean contains(String id) {
-        return IDS.contains(id);
+        return ARTIFACTS.containsKey(id);
     }
 
     static String jarName(String id) {
@@ -136,17 +171,25 @@ final class PublishedConnectorArtifacts {
     }
 
     /** Fetches and rejects an error page before its bytes can reach the server registration endpoint. */
-    static byte[] download(URI source, Fetcher fetcher) throws IOException {
-        Fetched fetched = fetcher.fetch(source);
+    static byte[] download(String id, URI source, Fetcher fetcher) throws IOException {
+        Artifact expected = ARTIFACTS.get(id);
+        if (expected == null) {
+            throw new IllegalArgumentException("no published connector asset for " + id);
+        }
+        return download(expected, source, fetcher);
+    }
+
+    static byte[] download(Artifact expected, URI source, Fetcher fetcher) throws IOException {
+        Fetched fetched = fetcher.fetch(source, expected);
         byte[] artifact = fetched == null ? null : fetched.bytes();
         if (artifact == null) {
-            throw new IOException("the response is not a complete connector jar");
+            throw new IOException("connector artifact response was empty");
         }
         if (artifact.length > MAX_ARTIFACT_BYTES) {
             throw artifactTooLarge();
         }
-        if (!fetched.jarValidated()) {
-            validateCompleteJar(artifact);
+        if (!fetched.verified()) {
+            verifyArtifact(artifact, expected);
         }
         return artifact;
     }
@@ -212,18 +255,24 @@ final class PublishedConnectorArtifacts {
         return false;
     }
 
-    private static Fetched readBoundedJar(HttpURLConnection connection) throws IOException {
+    private static Fetched readVerifiedArtifact(HttpURLConnection connection, Artifact expected) throws IOException {
         long declaredLength = connection.getContentLengthLong();
         if (declaredLength > MAX_ARTIFACT_BYTES) {
             throw artifactTooLarge();
         }
-        Path spool = Files.createTempFile("tapstate-connector-", ".jar");
+        if (declaredLength >= 0 && declaredLength != expected.bytes()) {
+            throw unexpectedLength(expected.bytes(), declaredLength);
+        }
+        Path temporaryDirectory = Path.of(System.getProperty("java.io.tmpdir", "."));
+        Path spool = Files.createTempFile(temporaryDirectory, "tapstate-connector-", ".jar");
         try {
             long received = 0;
             byte[] buffer = new byte[COPY_BUFFER_BYTES];
+            MessageDigest digest = sha256Digest();
             try (InputStream body = connection.getInputStream(); OutputStream file = Files.newOutputStream(spool)) {
                 while (true) {
-                    int allowed = (int) Math.min(buffer.length, MAX_ARTIFACT_BYTES - received + 1);
+                    long lastAllowedByte = Math.min(MAX_ARTIFACT_BYTES, expected.bytes());
+                    int allowed = (int) Math.min(buffer.length, lastAllowedByte - received + 1);
                     int read = body.read(buffer, 0, allowed);
                     if (read < 0) {
                         break;
@@ -235,6 +284,10 @@ final class PublishedConnectorArtifacts {
                     if (received > MAX_ARTIFACT_BYTES) {
                         throw artifactTooLarge();
                     }
+                    if (received > expected.bytes()) {
+                        throw unexpectedLength(expected.bytes(), received);
+                    }
+                    digest.update(buffer, 0, read);
                     file.write(buffer, 0, read);
                 }
             }
@@ -242,48 +295,41 @@ final class PublishedConnectorArtifacts {
                 throw new IOException("connector artifact was truncated: expected "
                         + declaredLength + " bytes but received " + received);
             }
-            validateCompleteJar(spool);
-            return Fetched.validated(Files.readAllBytes(spool));
+            if (received != expected.bytes()) {
+                throw unexpectedLength(expected.bytes(), received);
+            }
+            verifyDigest(expected, HexFormat.of().formatHex(digest.digest()));
+            return Fetched.verified(Files.readAllBytes(spool));
         } finally {
             Files.deleteIfExists(spool);
         }
     }
 
-    private static void validateCompleteJar(byte[] artifact) throws IOException {
-        Path spool = Files.createTempFile("tapstate-connector-check-", ".jar");
+    private static void verifyArtifact(byte[] artifact, Artifact expected) throws IOException {
+        if (artifact.length != expected.bytes()) {
+            throw unexpectedLength(expected.bytes(), artifact.length);
+        }
+        MessageDigest digest = sha256Digest();
+        verifyDigest(expected, HexFormat.of().formatHex(digest.digest(artifact)));
+    }
+
+    private static void verifyDigest(Artifact expected, String actual) throws IOException {
+        if (!expected.sha256().equals(actual)) {
+            throw new IOException("connector artifact checksum does not match the published SHA-256");
+        }
+    }
+
+    private static MessageDigest sha256Digest() {
         try {
-            Files.write(spool, artifact);
-            validateCompleteJar(spool);
-        } finally {
-            Files.deleteIfExists(spool);
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw new IllegalStateException("SHA-256 is unavailable", unavailable);
         }
     }
 
-    private static void validateCompleteJar(Path artifact) throws IOException {
-        try (ZipFile archive = new ZipFile(artifact.toFile())) {
-            if (archive.size() == 0) {
-                throw new IOException("connector jar has no entries");
-            }
-        } catch (IOException invalid) {
-            throw new IOException("the response is not a complete connector jar", invalid);
-        }
-
-        try (ZipInputStream entries = new ZipInputStream(Files.newInputStream(artifact))) {
-            byte[] buffer = new byte[COPY_BUFFER_BYTES];
-            int entryCount = 0;
-            while (entries.getNextEntry() != null) {
-                entryCount++;
-                while (entries.read(buffer) >= 0) {
-                    // Reading every entry makes the ZIP implementation verify sizes and CRCs.
-                }
-                entries.closeEntry();
-            }
-            if (entryCount == 0) {
-                throw new IOException("connector jar has no entries");
-            }
-        } catch (IOException invalid) {
-            throw new IOException("the response is not a complete connector jar", invalid);
-        }
+    private static IOException unexpectedLength(long expected, long actual) {
+        return new IOException("connector artifact length does not match the published asset: expected "
+                + expected + " bytes but received " + actual);
     }
 
     private static IOException artifactTooLarge() {

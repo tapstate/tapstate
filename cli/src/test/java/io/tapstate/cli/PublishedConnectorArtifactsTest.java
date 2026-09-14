@@ -9,6 +9,9 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.URI;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
@@ -31,7 +34,7 @@ class PublishedConnectorArtifactsTest {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThat(PublishedConnectorArtifacts.download(
-                    source, PublishedConnectorArtifacts.Fetcher.http())).isEqualTo(jar);
+                    expected(jar), source, PublishedConnectorArtifacts.Fetcher.http())).isEqualTo(jar);
         } finally {
             server.stop(0);
         }
@@ -40,12 +43,13 @@ class PublishedConnectorArtifactsTest {
     @Test
     void theHttpFetcherRejectsATruncatedBodyWithADeclaredLength() {
         byte[] truncated = {(byte) 'P', (byte) 'K', 3, 4, 9};
-        HttpServer server = declaredLengthServer(100, truncated);
+        PublishedConnectorArtifacts.Artifact expected = expected(completeJar());
+        HttpServer server = declaredLengthServer(expected.bytes(), truncated);
         try {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
-                    source, PublishedConnectorArtifacts.Fetcher.http()))
+                    expected, source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
                     .hasMessageContaining("truncated");
         } finally {
@@ -54,14 +58,29 @@ class PublishedConnectorArtifactsTest {
     }
 
     @Test
-    void completeJarValidationRejectsATruncatedZipWithoutLengthMetadata() {
+    void trustedMetadataRejectsATruncatedZipWithoutLengthMetadata() {
         byte[] truncated = {(byte) 'P', (byte) 'K', 3, 4, 9};
 
         assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
+                expected(completeJar()),
                 URI.create("https://example.invalid/connector.jar"),
-                ignored -> PublishedConnectorArtifacts.Fetched.unvalidated(truncated)))
+                (ignored, expected) -> PublishedConnectorArtifacts.Fetched.unverified(truncated)))
                 .isInstanceOf(IOException.class)
-                .hasMessage("the response is not a complete connector jar");
+                .hasMessageContaining("length does not match the published asset");
+    }
+
+    @Test
+    void trustedMetadataRejectsSameLengthBytesWithTheWrongDigest() {
+        byte[] expectedBytes = completeJar();
+        byte[] corrupted = expectedBytes.clone();
+        corrupted[corrupted.length - 1] ^= 1;
+
+        assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
+                expected(expectedBytes),
+                URI.create("https://example.invalid/connector.jar"),
+                (ignored, expected) -> PublishedConnectorArtifacts.Fetched.unverified(corrupted)))
+                .isInstanceOf(IOException.class)
+                .hasMessage("connector artifact checksum does not match the published SHA-256");
     }
 
     @Test
@@ -71,7 +90,7 @@ class PublishedConnectorArtifactsTest {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
-                    source, PublishedConnectorArtifacts.Fetcher.http()))
+                    expected(completeJar()), source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
                     .hasMessageContaining("exceeds the 64 MiB connector artifact limit");
         } finally {
@@ -82,11 +101,13 @@ class PublishedConnectorArtifactsTest {
     @Test
     void theHttpFetcherBoundsAnOversizedChunkedBody() {
         HttpServer server = chunkedServer(64L * 1024 * 1024 + 1);
+        PublishedConnectorArtifacts.Artifact maximum =
+                new PublishedConnectorArtifacts.Artifact(64L * 1024 * 1024, "unused-after-size-refusal");
         try {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
-                    source, PublishedConnectorArtifacts.Fetcher.http()))
+                    maximum, source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
                     .hasMessageContaining("exceeds the 64 MiB connector artifact limit");
         } finally {
@@ -101,7 +122,7 @@ class PublishedConnectorArtifactsTest {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
-                    source, PublishedConnectorArtifacts.Fetcher.http()))
+                    expected(completeJar()), source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
                     .hasMessage("HTTP 404");
         } finally {
@@ -128,7 +149,7 @@ class PublishedConnectorArtifactsTest {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/release");
 
             assertThat(PublishedConnectorArtifacts.download(
-                    source, PublishedConnectorArtifacts.Fetcher.http())).isEqualTo(jar);
+                    expected(jar), source, PublishedConnectorArtifacts.Fetcher.http())).isEqualTo(jar);
         } finally {
             server.stop(0);
         }
@@ -150,11 +171,13 @@ class PublishedConnectorArtifactsTest {
         try {
             String base = "http://127.0.0.1:" + server.getAddress().getPort();
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
-                    URI.create(base + "/missing"), PublishedConnectorArtifacts.Fetcher.http()))
+                    expected(completeJar()), URI.create(base + "/missing"),
+                    PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
                     .hasMessage("HTTP 302 without a redirect location");
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
-                    URI.create(base + "/downgrade"), PublishedConnectorArtifacts.Fetcher.http()))
+                    expected(completeJar()), URI.create(base + "/downgrade"),
+                    PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
                     .hasMessage("connector download refused a protocol-changing redirect");
         } finally {
@@ -175,7 +198,7 @@ class PublishedConnectorArtifactsTest {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/loop");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
-                    source, PublishedConnectorArtifacts.Fetcher.http()))
+                    expected(completeJar()), source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
                     .hasMessage("too many connector download redirects");
         } finally {
@@ -326,6 +349,16 @@ class PublishedConnectorArtifactsTest {
             return bytes.toByteArray();
         } catch (IOException failed) {
             throw new AssertionError("could not create the connector jar fixture", failed);
+        }
+    }
+
+    private static PublishedConnectorArtifacts.Artifact expected(byte[] bytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return new PublishedConnectorArtifacts.Artifact(
+                    bytes.length, HexFormat.of().formatHex(digest.digest(bytes)));
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw new AssertionError("SHA-256 is required by the Java platform", unavailable);
         }
     }
 }

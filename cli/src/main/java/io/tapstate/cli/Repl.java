@@ -2344,7 +2344,7 @@ final class Repl {
                 source = PublishedConnectorArtifacts.artifact(parsed.path(), env);
                 artifactName = PublishedConnectorArtifacts.jarName(parsed.path());
                 echoDownloading(artifactName, source, parsed.format());
-                artifact = PublishedConnectorArtifacts.download(source, connectorFetcher);
+                artifact = PublishedConnectorArtifacts.download(parsed.path(), source, connectorFetcher);
             } catch (IOException | IllegalArgumentException failed) {
                 return renderDownloadFailure(parsed.path(), failed, parsed.format());
             }
