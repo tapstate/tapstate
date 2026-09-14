@@ -14,6 +14,7 @@ import org.jline.terminal.TerminalBuilder;
 
 import java.net.URI;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -570,13 +571,7 @@ final class Workbench {
 
         private boolean openActions() {
             return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Actions(
-                    List.of(
-                            WorkbenchOverlayState.Actions.Action.CONTEXT,
-                            WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
-                            WorkbenchOverlayState.Actions.Action.NEW_SOURCE,
-                            WorkbenchOverlayState.Actions.Action.REFRESH,
-                            WorkbenchOverlayState.Actions.Action.SHELL),
-                    0)));
+                    availableActions(state), 0)));
         }
 
         private boolean handleActionsKey(WorkbenchOverlayState.Actions actions, KeyEvent key) {
@@ -592,6 +587,8 @@ final class Workbench {
                 case CONTEXT -> openContextEntry();
                 case AUTHENTICATION -> openAuthEntry();
                 case NEW_SOURCE -> openSourceCreate();
+                case APPLY_SELECTED_SOURCE -> confirmSourceApply(selectedSourceRequest().orElseThrow());
+                case APPLY_WORKSPACE_SOURCES -> confirmSourceApply(workspaceSourceRequest().orElseThrow());
                 case REFRESH -> {
                     runtime.updateState(WorkbenchState::closeOverlay);
                     if (refreshCoordinator != null) {
@@ -678,6 +675,10 @@ final class Workbench {
                 }
                 case WorkbenchOverlayState.Confirm.Intent.CreateSource create -> {
                     submitSourceCreate(confirm, create);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.ApplySources apply -> {
+                    submitSourceApply(confirm, apply);
                     yield true;
                 }
                 case WorkbenchOverlayState.Confirm.Intent.DiscardChanges ignored -> runtime.updateState(state ->
@@ -811,11 +812,8 @@ final class Workbench {
                 case WorkbenchActionGateway.SourceCatalogResult.Ready ready -> {
                     if (ready.catalog().connectors().isEmpty()) {
                         runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Actions(
-                                List.of(WorkbenchOverlayState.Actions.Action.CONTEXT,
-                                        WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
-                                        WorkbenchOverlayState.Actions.Action.NEW_SOURCE,
-                                        WorkbenchOverlayState.Actions.Action.REFRESH,
-                                        WorkbenchOverlayState.Actions.Action.SHELL), 2)));
+                                availableActions(state), 0,
+                                Optional.of("No source connectors are available"))));
                         return;
                     }
                     String connector = ready.catalog().connectors().getFirst().id();
@@ -1140,6 +1138,106 @@ final class Workbench {
                 case WorkbenchActionGateway.SourceCreateResult.Unavailable ignored -> restoreSourceCreate(source,
                         Optional.of("Source creation is unavailable"));
             }
+        }
+
+        private List<WorkbenchOverlayState.Actions.Action> availableActions(WorkbenchState state) {
+            List<WorkbenchOverlayState.Actions.Action> actions = new ArrayList<>(List.of(
+                    WorkbenchOverlayState.Actions.Action.CONTEXT,
+                    WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
+                    WorkbenchOverlayState.Actions.Action.NEW_SOURCE));
+            if (selectedSourceRequest().isPresent()) {
+                actions.add(WorkbenchOverlayState.Actions.Action.APPLY_SELECTED_SOURCE);
+            }
+            if (workspaceSourceRequest().isPresent()) {
+                actions.add(WorkbenchOverlayState.Actions.Action.APPLY_WORKSPACE_SOURCES);
+            }
+            actions.add(WorkbenchOverlayState.Actions.Action.REFRESH);
+            actions.add(WorkbenchOverlayState.Actions.Action.SHELL);
+            return List.copyOf(actions);
+        }
+
+        private Optional<WorkbenchActionGateway.SourceApplyRequest> selectedSourceRequest() {
+            WorkbenchState state = runtime.state();
+            if (state.selectedTab() != WorkbenchState.WorkbenchTab.WORKSPACE || state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            WorkbenchSnapshot snapshot = state.snapshot().orElseThrow();
+            if (!(snapshot.workspace().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            return selectedWorkspaceRow()
+                    .filter(Session::isApplicableSource)
+                    .map(row -> new WorkbenchActionGateway.SourceApplyRequest(
+                            List.of(row.local().getFirst().relativePath())));
+        }
+
+        private Optional<WorkbenchActionGateway.SourceApplyRequest> workspaceSourceRequest() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            WorkbenchSnapshot snapshot = state.snapshot().orElseThrow();
+            if (!(snapshot.workspace().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> sources = snapshot.workspace().rows().stream()
+                    .filter(row -> "source".equals(row.key().kind()))
+                    .toList();
+            if (sources.isEmpty() || sources.stream().anyMatch(row -> !isApplicableSource(row))) {
+                return Optional.empty();
+            }
+            return Optional.of(new WorkbenchActionGateway.SourceApplyRequest(sources.stream()
+                    .map(row -> row.local().getFirst().relativePath()).toList()));
+        }
+
+        private static boolean isApplicableSource(WorkbenchArtifactRow row) {
+            return "source".equals(row.key().kind())
+                    && row.local().size() == 1
+                    && row.local().getFirst().valid();
+        }
+
+        private boolean confirmSourceApply(WorkbenchActionGateway.SourceApplyRequest request) {
+            int count = request.relativePaths().size();
+            String noun = count == 1 ? "Source" : "Sources";
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.ApplySources(request),
+                    "Apply " + noun + "?",
+                    "Apply " + count + " local " + noun.toLowerCase(java.util.Locale.ROOT)
+                            + " to the current server?",
+                    false,
+                    state.overlay())));
+        }
+
+        private void submitSourceApply(
+                WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.ApplySources apply) {
+            if (actionCoordinator == null || actionGateway == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.applySources(apply.request()),
+                    failure -> new WorkbenchActionGateway.SourceApplyResult.Unavailable(),
+                    this::completeSourceApply);
+        }
+
+        private void completeSourceApply(WorkbenchActionGateway.SourceApplyResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.SourceApplyResult.Applied ignored -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    refresh();
+                }
+                case WorkbenchActionGateway.SourceApplyResult.Rejected rejected -> restoreActions(
+                        rejected.code() + ": " + rejected.message());
+                case WorkbenchActionGateway.SourceApplyResult.Unreachable ignored ->
+                        restoreActions("Server could not be reached");
+                case WorkbenchActionGateway.SourceApplyResult.Unavailable ignored ->
+                        restoreActions("Source apply is unavailable");
+            }
+        }
+
+        private void restoreActions(String message) {
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Actions(
+                    availableActions(state), 0, Optional.of(message))));
         }
 
         private void restoreSourceCreate(

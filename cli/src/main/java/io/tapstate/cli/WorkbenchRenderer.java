@@ -193,7 +193,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.SourceYamlEditor ignored -> 8;
             case WorkbenchOverlayState.Confirm ignored -> 4;
             case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
-            case WorkbenchOverlayState.Actions actions -> actions.actions().size() + 1;
+            case WorkbenchOverlayState.Actions actions -> actions.actions().size() + (actions.message().isPresent() ? 2 : 1);
             case WorkbenchOverlayState.Help ignored -> 6;
         };
         int height = contentRows + 2;
@@ -765,6 +765,8 @@ final class WorkbenchRenderer {
                     selected ? theme.selection() : theme.base(), area);
             hits.add(new OverlayHit(index, new Rect(box.x() + 1, rowY, rowWidth, 1)));
         }
+        actions.message().ifPresent(message -> write(frame, box.x() + 2, box.bottom() - 2,
+                clip(message, Math.max(0, box.width() - 4)), theme.warning(), area));
         return List.copyOf(hits);
     }
 

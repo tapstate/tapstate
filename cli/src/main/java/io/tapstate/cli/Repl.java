@@ -358,6 +358,75 @@ final class Repl {
                     return new SourceCreateResult.Unavailable();
                 }
             }
+
+            @Override
+            public SourceApplyResult applySources(SourceApplyRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new SourceApplyResult.Unavailable();
+                }
+                try {
+                    List<LocalDraft> drafts = new ArrayList<>();
+                    Map<String, LocalDraft> draftsById = new LinkedHashMap<>();
+                    for (Path relativePath : request.relativePaths()) {
+                        Path file = resolveWorkbenchFile(relativePath);
+                        if (relativePath.getNameCount() < 2 || !"source".equals(relativePath.getName(0).toString())) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-path", "Only Source workspace files can be applied here");
+                        }
+                        LocalDraft draft = draft(relativePath.normalize().toString(), file);
+                        Resource resource = new DslParser().parse(draft.content());
+                        if (!(resource instanceof SourceResource)) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-kind", "The selected file is not a valid Source artifact");
+                        }
+                        if (draftsById.putIfAbsent(resource.id(), draft) != null) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-duplicate", "More than one local Source has the same id");
+                        }
+                        drafts.add(draft);
+                    }
+                    ListOutcome listed = withFailover(() -> controlPlane.list(
+                            session.landingNode(), session.credential(), "source"),
+                            outcome -> outcome instanceof ListOutcome.Unreachable);
+                    if (listed instanceof ListOutcome.Rejected rejected) {
+                        return new SourceApplyResult.Rejected(rejected.code(), rejected.message());
+                    }
+                    if (listed instanceof ListOutcome.Unreachable) {
+                        return new SourceApplyResult.Unreachable();
+                    }
+                    Map<String, RemoteArtifact> remoteById = ((ListOutcome.Listed) listed).artifacts().stream()
+                            .collect(java.util.stream.Collectors.toMap(RemoteArtifact::id, artifact -> artifact,
+                                    (left, right) -> left, LinkedHashMap::new));
+                    List<LocalDraft> guarded = new ArrayList<>(drafts.size());
+                    for (Map.Entry<String, LocalDraft> entry : draftsById.entrySet()) {
+                        RemoteArtifact remote = remoteById.get(entry.getKey());
+                        if (remote == null) {
+                            guarded.add(entry.getValue());
+                        } else if (!remote.readable() || remote.canonicalForm() == null) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-unreadable", "A remote Source cannot be read for safe update");
+                        } else {
+                            guarded.add(new LocalDraft(entry.getValue().source(), entry.getValue().content(),
+                                    CanonicalHash.of(remote.canonicalForm())));
+                        }
+                    }
+                    ApplyOutcome outcome = withFailover(() -> controlPlane.apply(
+                            session.landingNode(), session.credential(), guarded),
+                            value -> value instanceof ApplyOutcome.Unreachable);
+                    return switch (outcome) {
+                        case ApplyOutcome.Applied applied -> new SourceApplyResult.Applied(applied.items().stream()
+                                .filter(item -> "source".equals(item.kind()))
+                                .map(item -> new SourceApplyItem(item.id(), item.change())).toList());
+                        case ApplyOutcome.Rejected rejected -> new SourceApplyResult.Rejected(
+                                rejected.code(), rejected.message());
+                        case ApplyOutcome.Unreachable ignored -> new SourceApplyResult.Unreachable();
+                    };
+                } catch (DslException rejected) {
+                    return new SourceApplyResult.Rejected(rejected.code().code(), "A local Source is not valid");
+                } catch (IOException | RuntimeException unavailable) {
+                    return new SourceApplyResult.Unavailable();
+                }
+            }
         };
     }
 

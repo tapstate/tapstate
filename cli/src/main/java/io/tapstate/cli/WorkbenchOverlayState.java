@@ -188,7 +188,7 @@ sealed interface WorkbenchOverlayState
             return new Confirm(intent, title, message, true, previous);
         }
 
-        sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource,
+        sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource, Intent.ApplySources,
                 Intent.DiscardChanges, Intent.DiscardSourceYaml {
             record DeleteContext(String contextName) implements Intent {
                 public DeleteContext {
@@ -198,6 +198,12 @@ sealed interface WorkbenchOverlayState
 
             record CreateSource(WorkbenchActionGateway.SourceCreateRequest request) implements Intent {
                 public CreateSource {
+                    Objects.requireNonNull(request, "request");
+                }
+            }
+
+            record ApplySources(WorkbenchActionGateway.SourceApplyRequest request) implements Intent {
+                public ApplySources {
                     Objects.requireNonNull(request, "request");
                 }
             }
@@ -251,23 +257,30 @@ sealed interface WorkbenchOverlayState
         }
     }
 
-    record Actions(List<Action> actions, int selectedIndex) implements WorkbenchOverlayState {
+    record Actions(List<Action> actions, int selectedIndex, Optional<String> message) implements WorkbenchOverlayState {
         public Actions {
             actions = List.copyOf(actions);
+            Objects.requireNonNull(message, "message");
             if (actions.isEmpty() || selectedIndex < 0 || selectedIndex >= actions.size()) {
                 throw new IllegalArgumentException("Action selection is outside the menu");
             }
         }
 
+        Actions(List<Action> actions, int selectedIndex) {
+            this(actions, selectedIndex, Optional.empty());
+        }
+
         Actions select(int index) {
             int selected = Math.clamp(index, 0, actions.size() - 1);
-            return selected == selectedIndex ? this : new Actions(actions, selected);
+            return selected == selectedIndex ? this : new Actions(actions, selected, message);
         }
 
         enum Action {
             CONTEXT("🧭  Context", "Choose or create a context"),
             AUTHENTICATION("🔐  Authentication", "Sign in to the selected server"),
             NEW_SOURCE("✨  New Source", "Create a local source artifact"),
+            APPLY_SELECTED_SOURCE("☁️  Apply Selected Source", "Synchronize the selected local source"),
+            APPLY_WORKSPACE_SOURCES("☁️  Apply Workspace Sources", "Synchronize all valid local sources"),
             REFRESH("↻  Refresh", "Load the latest workspace snapshot"),
             SHELL(">_  Shell (F6)", "Open the embedded command session");
 

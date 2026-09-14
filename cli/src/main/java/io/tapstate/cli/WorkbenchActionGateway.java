@@ -43,6 +43,10 @@ interface WorkbenchActionGateway {
         return new SourceCreateResult.Unavailable();
     }
 
+    default SourceApplyResult applySources(SourceApplyRequest request) {
+        return new SourceApplyResult.Unavailable();
+    }
+
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
             Objects.requireNonNull(name, "name");
@@ -194,6 +198,18 @@ interface WorkbenchActionGateway {
         }
     }
 
+    record SourceApplyRequest(List<Path> relativePaths) {
+        public SourceApplyRequest {
+            relativePaths = List.copyOf(relativePaths);
+            if (relativePaths.isEmpty()) {
+                throw new IllegalArgumentException("Source apply request must contain at least one file");
+            }
+            if (relativePaths.stream().anyMatch(Objects::isNull)) {
+                throw new IllegalArgumentException("Source apply paths must not contain null");
+            }
+        }
+    }
+
     sealed interface SourceCatalogResult {
         record Ready(SourceCatalog catalog) implements SourceCatalogResult {
             public Ready {
@@ -243,6 +259,34 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements SourceCreateResult {
+        }
+    }
+
+    sealed interface SourceApplyResult {
+        record Applied(List<SourceApplyItem> items) implements SourceApplyResult {
+            public Applied {
+                items = List.copyOf(items);
+            }
+        }
+
+        record Rejected(String code, String message) implements SourceApplyResult {
+            public Rejected {
+                Objects.requireNonNull(code, "code");
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unreachable() implements SourceApplyResult {
+        }
+
+        record Unavailable() implements SourceApplyResult {
+        }
+    }
+
+    record SourceApplyItem(String id, String change) {
+        public SourceApplyItem {
+            Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(change, "change");
         }
     }
 }
