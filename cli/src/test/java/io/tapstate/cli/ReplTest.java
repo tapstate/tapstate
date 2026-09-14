@@ -2878,7 +2878,7 @@ class ReplTest {
         assertThat(h.sink().toString()).contains("cli.not-connected").contains("discover-schema");
     }
 
-    // --- register: `register <path>` uploads a local artifact to the server -----------------------
+    // --- register: local paths upload directly; published ids download, then upload ---------------
 
     @Test
     void registerUploadsALocalArtifactAndRendersTheRegistration(@TempDir Path workdir) throws Exception {
@@ -2895,6 +2895,111 @@ class ReplTest {
         assertThat(out).contains("registered").contains("orders").contains("hash-abc");
         // the artifact bytes (4) travel to the current landing node under the session credential
         assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x4");
+    }
+
+    @Test
+    void registerDownloadsBothPublishedEnterpriseConnectorsById(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("enterprise", "hash-abc", "2.0.9", true));
+        Harness h = onlineSession(workdir, client);
+        List<URI> fetched = new ArrayList<>();
+        h.repl().connectorFetcher(from -> {
+            fetched.add(from);
+            return new byte[] {(byte) 'P', (byte) 'K', 3, 4, 9};
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register oracle")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().dispatch("register sqlserver")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+
+        assertThat(fetched).containsExactly(
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/oracle-connector.jar"),
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/sqlserver-connector.jar"));
+        assertThat(client.registerCalls).containsExactly(
+                "jwt-tok@http://node1:7900 x5", "jwt-tok@http://node1:7900 x5");
+        assertThat(h.sink().toString().substring(mark))
+                .contains("downloading oracle-connector.jar from github.com")
+                .contains("downloading sqlserver-connector.jar from github.com")
+                .contains("uploading oracle-connector.jar (5 B)")
+                .contains("uploading sqlserver-connector.jar (5 B)");
+    }
+
+    @Test
+    void registerDownloadsFromTheConfiguredMirrorWithoutPollutingJson(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("sqlserver", "hash-sql", "2.0.9", true));
+        Harness h = onlineSession(workdir, client,
+                Map.of("TAPSTATE_CONNECTORS_URL", "https://mirror.example/connectors"));
+        List<URI> fetched = new ArrayList<>();
+        h.repl().connectorFetcher(from -> {
+            fetched.add(from);
+            return new byte[] {(byte) 'P', (byte) 'K', 3, 4, 9};
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register sqlserver -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(fetched).containsExactly(
+                URI.create("https://mirror.example/connectors/sqlserver-connector.jar"));
+        assertThat(out).contains("\"connectorId\"").contains("\"sqlserver\"")
+                .doesNotContain("downloading", "uploading");
+    }
+
+    @Test
+    void anExistingFileNamedLikeAConnectorIdWinsOverTheDownload(@TempDir Path workdir) throws Exception {
+        Files.write(workdir.resolve("oracle"), new byte[] {1, 2, 3, 4});
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("local", "hash-local", "1.0", true));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher(from -> {
+            throw new AssertionError("a local file must not reach the release downloader");
+        });
+
+        assertThat(h.repl().dispatch("register oracle")).isTrue();
+
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x4");
+        assertThat(h.sink().toString()).contains("uploading oracle (4 B)").doesNotContain("downloading");
+    }
+
+    @Test
+    void aFailedPublishedDownloadIsCodedAndNeverUploaded(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher(from -> {
+            throw new IOException("HTTP 404");
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register oracle -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(out).contains("\"error\"").contains("cli.connector-download-failed")
+                .contains("oracle").contains("HTTP 404")
+                .doesNotContain("uploading");
+        assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void aSuccessfulErrorPageCannotBeUploadedAsAConnector(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher(from -> "not a jar".getBytes());
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register sqlserver")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(out).contains("cli.connector-download-failed")
+                .contains("response is not a connector jar");
+        assertThat(client.registerCalls).isEmpty();
     }
 
     @Test

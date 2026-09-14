@@ -66,20 +66,10 @@ final class LocalStack {
     private static final String ENV_ADMIN_PASSWORD = "TAPSTATE_ADMIN_PASSWORD";
 
     /**
-     * Where the connector jars are published, and the two environment names that redirect it - the
-     * same location and the same names the quickstart script reads, so a mirror configured for one
-     * serves the other.
-     */
-    private static final String RELEASES = "https://github.com/tapstate/tapstate/releases";
-    private static final String CONNECTORS_PATH = "/download/connectors-preview";
-    private static final String ENV_CONNECTORS_URL = "TAPSTATE_CONNECTORS_URL";
-    private static final String ENV_BASE_URL = "TAPSTATE_BASE_URL";
-
-    /**
-     * The connector jars staged for the server to register at boot. Three, not the whole official
-     * list: the release publishes one jar per engine, and the managed variants of each engine
-     * (aliyun-rds-mysql, mongodb-atlas and the rest) have no published artifact of their own to fetch.
-     * The set grows here when a jar is published, never ahead of one.
+     * The connector jars staged for the three-database local demo. The release also carries Oracle and
+     * SQL Server for an explicit {@code register <id>}, but starting the local stack must not download
+     * connectors the demo never uses. Managed variants (aliyun-rds-mysql, mongodb-atlas and the rest)
+     * have no published artifact of their own to fetch.
      */
     static final List<String> CONNECTOR_JARS = List.of("mysql", "mongodb", "postgres");
 
@@ -332,7 +322,7 @@ final class LocalStack {
     private void stageConnectors() throws IOException {
         String base = connectorsBase();
         for (String id : CONNECTOR_JARS) {
-            String jar = id + "-connector.jar";
+            String jar = PublishedConnectorArtifacts.jarName(id);
             Path target = dir.resolve(CONNECTORS_DIR).resolve(jar);
             if (Files.exists(target)) {
                 continue;
@@ -347,20 +337,11 @@ final class LocalStack {
     }
 
     private String connectorsBase() {
-        String explicit = env.apply(ENV_CONNECTORS_URL);
-        String base;
-        if (explicit != null && !explicit.isBlank()) {
-            base = explicit;
-        } else {
-            String releases = env.apply(ENV_BASE_URL);
-            base = (releases == null || releases.isBlank() ? RELEASES : releases) + CONNECTORS_PATH;
+        try {
+            return PublishedConnectorArtifacts.base(env);
+        } catch (IllegalArgumentException invalid) {
+            throw unavailable(invalid.getMessage());
         }
-        String normalized = base.endsWith("/") ? base : base + "/";
-        URI endpoint = URI.create(normalized);
-        if (!"https".equalsIgnoreCase(endpoint.getScheme()) || endpoint.getHost() == null) {
-            throw unavailable("connector download endpoint must be an https URL: " + normalized);
-        }
-        return normalized;
     }
 
     /** A stable Compose project per home, so two users never share containers or the named volume. */

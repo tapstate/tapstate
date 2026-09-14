@@ -38,11 +38,21 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle connector bytes, including the bundled `ojdbc8` driver under the Oracle Free Use
-Terms, are excluded from versioned releases, `connectors-preview`, and quickstart.
-They are retained only as CI artifacts for 7 days. This distribution boundary does not
-establish a license for the upstream enterprise connector repository, which has no
-LICENSE file.
+Oracle and SQL Server connector jars are separate assets on the floating
+`connectors-preview` release. They remain outside versioned Tapstate releases and this
+three-database quickstart does not fetch them automatically. An authenticated CLI can
+download and register either one explicitly:
+
+```
+tapstate register oracle
+tapstate register sqlserver
+```
+
+The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under the
+Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under the MIT License.
+Their dependency terms govern those jars and do not change Tapstate's Apache-2.0 license.
+The upstream enterprise connector repository has no LICENSE file; publishing these binary
+assets does not relicense that source repository.
 
 The Oracle Free 23 source example selects `autoLog: false` and uses schema, table
 and column identifiers no longer than 30 characters. The automatic miner requests
@@ -56,7 +66,7 @@ It is **not** how a connector is normally registered, and it is **not** a precon
 registration. The usual path is:
 
 ```
-tapstate register <path-to-jar>
+tapstate register <path-to-jar-or-published-id>
 ```
 
 which uploads the jar's bytes to the running server over HTTP -- no mount, and nothing in this

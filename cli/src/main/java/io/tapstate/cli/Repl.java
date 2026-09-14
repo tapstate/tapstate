@@ -140,6 +140,9 @@ final class Repl {
     /** The transport seam to a server; a network-free fake is injected in tests. */
     private final ControlPlaneClient controlPlane;
 
+    /** The release download seam used when {@code register} is given a published connector id. */
+    private PublishedConnectorArtifacts.Fetcher connectorFetcher;
+
     /** The one shared lazy target resolver; absent only in legacy unit seams that exercise no contexts. */
     private final ContextResolver contextResolver;
 
@@ -257,6 +260,7 @@ final class Repl {
         this.controlPlane = controlPlane;
         this.prompter = prompter;
         this.env = env;
+        this.connectorFetcher = PublishedConnectorArtifacts.Fetcher.http(env);
         this.contextResolver = contextResolver;
         this.explicitContext = explicitContext;
         this.authService = authService;
@@ -282,6 +286,11 @@ final class Repl {
     /** Answers how wide the screen is; overridden so the narrow layout can be exercised. */
     void screenWidth(IntSupplier width) {
         this.screenWidth = width;
+    }
+
+    /** Replaces release downloads without changing registration transport; used by network-free tests. */
+    void connectorFetcher(PublishedConnectorArtifacts.Fetcher fetcher) {
+        this.connectorFetcher = fetcher;
     }
 
     /** Where to get a prompter from if one is asked for and none was injected. */
@@ -2307,12 +2316,14 @@ final class Repl {
     }
 
     /**
-     * {@code register <path> [-o text|json|yaml]} — registers a local connector artifact with the server. A
-     * file path uploads that one jar; a directory path uploads every {@code *.jar} directly under it as a
-     * batch. The server introspects each artifact and stores it content-hash idempotently, then reports what
-     * was registered (newly, or an already-registered no-op). A missing operand or unknown option is a benign
-     * usage line; an unreadable path is a benign "cannot read" line; a coded refusal (a bad artifact, an id
-     * conflict) renders its code and message, and on the machine surfaces an {@code {"error":{...}}} document.
+     * {@code register <path|connector-id> [-o text|json|yaml]} — registers a connector artifact with the
+     * server. An existing file uploads that one jar; an existing directory uploads every {@code *.jar}
+     * directly under it as a batch. An exact published connector id downloads its release asset and uploads
+     * those bytes. Local paths win over ids so a file named {@code oracle} keeps its ordinary meaning. The
+     * server introspects each artifact and stores it content-hash idempotently, then reports what was
+     * registered (newly, or an already-registered no-op). A missing operand or unknown option is a benign
+     * usage line; an unreadable path is a benign "cannot read" line; a download failure or coded server
+     * refusal renders its code and message, and on the machine surfaces an {@code {"error":{...}}} document.
      */
     private int registerOnline(List<String> words) {
         PathAndFormat parsed = parsePathAndFormat(words);
@@ -2324,15 +2335,30 @@ final class Repl {
             return registerDirectory(artifactPath, parsed.format());
         }
         PrintWriter err = commandLine.getErr();
+        boolean publishedId = !Files.exists(artifactPath) && PublishedConnectorArtifacts.contains(parsed.path());
         byte[] artifact;
-        try {
-            artifact = Files.readAllBytes(artifactPath);
-        } catch (IOException e) {
-            err.println("register: cannot read " + artifactPath + ": " + e.getMessage());
-            err.flush();
-            return Cli.EXIT_USAGE;
+        String artifactName;
+        if (publishedId) {
+            URI source;
+            try {
+                source = PublishedConnectorArtifacts.artifact(parsed.path(), env);
+                artifactName = PublishedConnectorArtifacts.jarName(parsed.path());
+                echoDownloading(artifactName, source, parsed.format());
+                artifact = PublishedConnectorArtifacts.download(source, connectorFetcher);
+            } catch (IOException | IllegalArgumentException failed) {
+                return renderDownloadFailure(parsed.path(), failed, parsed.format());
+            }
+        } else {
+            try {
+                artifact = Files.readAllBytes(artifactPath);
+            } catch (IOException e) {
+                err.println("register: cannot read " + artifactPath + ": " + e.getMessage());
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+            artifactName = artifactPath.getFileName().toString();
         }
-        echoUploading(artifactPath.getFileName().toString(), artifact.length, parsed.format());
+        echoUploading(artifactName, artifact.length, parsed.format());
         ConnectorRegisterOutcome outcome = withFailover(() -> controlPlane.register(
                 session.landingNode(), session.credential(), artifact),
                 o -> o instanceof ConnectorRegisterOutcome.Unreachable);
@@ -2351,8 +2377,9 @@ final class Repl {
     }
 
     /**
-     * Parses {@code <path> [-o text|json|yaml]} for the register verb, printing its usage line to err and
-     * returning {@code null} on any error. The single positional operand is the local artifact path to upload.
+     * Parses {@code <path|connector-id> [-o text|json|yaml]} for the register verb, printing its usage line
+     * to err and returning {@code null} on any error. The single positional operand is a local artifact path
+     * or an exact id with an asset on the connector release.
      */
     private PathAndFormat parsePathAndFormat(List<String> words) {
         PrintWriter err = commandLine.getErr();
@@ -2380,13 +2407,13 @@ final class Repl {
             } else if (path == null) {
                 path = word;
             } else {
-                err.println("register: too many operands (usage: register <path> [-o text|json|yaml])");
+                err.println("register: too many operands (usage: register <path|connector-id> [-o text|json|yaml])");
                 err.flush();
                 return null;
             }
         }
         if (path == null || path.isBlank()) {
-            err.println("register: missing operand (usage: register <path> [-o text|json|yaml])");
+            err.println("register: missing operand (usage: register <path|connector-id> [-o text|json|yaml])");
             err.flush();
             return null;
         }
@@ -2685,6 +2712,29 @@ final class Repl {
         PrintWriter err = commandLine.getErr();
         err.println("uploading " + artifact + " (" + humanSize(bytes) + ")");
         err.flush();
+    }
+
+    /** Announces the network read on the human surface; machine output remains one parseable document. */
+    private void echoDownloading(String artifact, URI source, OutputFormat format) {
+        if (format != OutputFormat.TEXT) {
+            return;
+        }
+        PrintWriter err = commandLine.getErr();
+        err.println("downloading " + artifact + " from " + source.getHost());
+        err.flush();
+    }
+
+    /** Renders a local release-fetch failure with the same structured contract as a server refusal. */
+    private int renderDownloadFailure(String connector, Exception failure, OutputFormat format) {
+        String reason = failure.getMessage() == null || failure.getMessage().isBlank()
+                ? failure.getClass().getSimpleName() : failure.getMessage();
+        Map<String, Object> params = Map.of("connector", connector, "reason", reason);
+        MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(CliError.CONNECTOR_DOWNLOAD_FAILED, params);
+        if (format == OutputFormat.TEXT) {
+            return renderRejection(CliError.CONNECTOR_DOWNLOAD_FAILED.code(), rendered.message(), params);
+        }
+        renderRegisterRejection(CliError.CONNECTOR_DOWNLOAD_FAILED.code(), rendered.message(), format);
+        return Cli.EXIT_DIAGNOSTIC;
     }
 
     /** A short human byte size: {@code B} under a kibibyte, else one decimal in {@code KB}/{@code MB}/{@code GB}/{@code TB}. */
