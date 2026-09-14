@@ -1,6 +1,8 @@
 package io.tapstate.adapters.pdk;
 
+import java.lang.reflect.Method;
 import java.math.BigInteger;
+import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Date;
@@ -53,6 +55,17 @@ public final class TapEventCodec {
 
     /** The {@code schema}-map key under which a ddl event's origin ddl travels. */
     private static final String DDL_ORIGIN = "origin";
+    private static final String BSON_TIMESTAMP = "org.bson.BsonTimestamp";
+    private static final ClassValue<Method> BSON_TIMESTAMP_TIME = new ClassValue<>() {
+        @Override
+        protected Method computeValue(Class<?> type) {
+            try {
+                return type.getMethod("getTime");
+            } catch (NoSuchMethodException e) {
+                throw new IllegalStateException("mongodb timestamp has no time accessor", e);
+            }
+        }
+    };
 
     private TapEventCodec() {
     }
@@ -107,9 +120,11 @@ public final class TapEventCodec {
      * <p>A row travels in two lanes, and which one a value takes is the connector's answer, not ours.
      * A driver type the connector registered a conversion for takes that conversion and arrives as
      * the portable value the connector chose; everything else — the ordinary Java boxes — arrives as
-     * a bare value, normalized. A row is therefore mixed, which is the contract rather than a gap:
-     * the frozen conversion surface deliberately registers nothing for the ordinary boxes, so putting
-     * them through it would pay a wrapper for a conversion that does not exist.
+     * a bare value, normalized. The one compatibility correction is a MongoDB timestamp conversion
+     * that reads its seconds half as milliseconds; only that exact wrong result is rebuilt from seconds.
+     * A row is therefore mixed, which is the contract rather than a gap: the frozen conversion surface
+     * deliberately registers nothing for the ordinary boxes, so putting them through it would pay a
+     * wrapper for a conversion that does not exist.
      *
      * <p>On the bare lane: a driver hands over whatever box its own client uses — an int column may
      * arrive in any integral box, a real one as a float — while the type namespace a column resolves
@@ -130,8 +145,9 @@ public final class TapEventCodec {
     }
 
     /**
-     * The connector's own conversions applied to a row, at any depth, and nothing else — the widths the
-     * type namespace speaks are left exactly as the driver handed them over.
+     * The connector's own conversions applied to a row, at any depth, plus the timestamp compatibility
+     * correction described above; the widths the type namespace speaks are left exactly as the driver
+     * handed them over.
      *
      * <p>This is what a read face wants. It reports what the database holds rather than what a pipeline
      * row speaks, so widening an integer there would answer a question nobody asked; but the registered
@@ -265,16 +281,33 @@ public final class TapEventCodec {
         // for bytes declares no equality of its own, so a join key built from a binary column would
         // compare by identity and match nothing, silently. Its tag comes along, because a target of the
         // same kind writes it back, and the way out builds the box again.
-        return new ConvertedValue(portable(converted.getValue()), originType);
+        return new ConvertedValue(portable(value, converted.getValue()), originType);
     }
 
     /**
      * The portable result as a value the rest of the tree can compare. Everything the contract hands over
      * already behaves like one - text, a number, an instant - except its box for bytes, which declares
-     * neither equality nor a hash and would key a join by identity.
+     * neither equality nor a hash and would key a join by identity, and the known MongoDB timestamp result
+     * whose seconds were interpreted as milliseconds.
      */
-    private static Object portable(Object value) {
+    private static Object portable(Object source, Object value) {
+        if (BSON_TIMESTAMP.equals(source.getClass().getName()) && value instanceof DateTime timestamp) {
+            int seconds = bsonTimestampSeconds(source);
+            // This connector currently treats the seconds half as epoch milliseconds. Match that exact
+            // result before correcting it, so a connector that already returns the right instant wins.
+            if (timestamp.toInstant().equals(Instant.ofEpochMilli(seconds))) {
+                return new DateTime(Instant.ofEpochSecond(Integer.toUnsignedLong(seconds)));
+            }
+        }
         return value instanceof ByteData bytes ? new Bytes(bytes.getType(), bytes.getValue()) : value;
+    }
+
+    private static int bsonTimestampSeconds(Object value) {
+        try {
+            return (Integer) BSON_TIMESTAMP_TIME.get(value.getClass()).invoke(value);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot read mongodb timestamp time", e);
+        }
     }
 
     /**
