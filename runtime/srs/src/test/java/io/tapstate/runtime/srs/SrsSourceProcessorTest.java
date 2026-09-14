@@ -51,6 +51,7 @@ import org.junit.jupiter.api.Test;
 class SrsSourceProcessorTest {
 
     private static final String CURSOR_KEY = "test.source.cursor";
+    private static final String PIPELINE = "orders_pipeline";
 
     private static HazelcastInstance hz;
 
@@ -165,9 +166,9 @@ class SrsSourceProcessorTest {
         // strictly before cdc (op i, positioned), the ordering that keeps a stale snapshot from landing after
         // a newer change. Distinct id ranges make the two streams unmistakable in the observed order.
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.snapfirst", snapshotRow(100));
-        buffer.append("srs.chain.snapfirst", snapshotRow(101));
-        buffer.append("srs.chain.snapfirst", snapshotRow(102));
+        buffer.append(PIPELINE, "srs.chain.snapfirst", snapshotRow(100));
+        buffer.append(PIPELINE, "srs.chain.snapfirst", snapshotRow(101));
+        buffer.append(PIPELINE, "srs.chain.snapfirst", snapshotRow(102));
         fill("srs.chain.snapfirst", 2);
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
 
@@ -188,8 +189,8 @@ class SrsSourceProcessorTest {
         // The snapshot phase stamps its rows with the generation the snapshot began in before they reach the
         // buffer; the ring's changes take the same generation and the sequence the ring assigned them.
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.inv1", snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
-        buffer.append("srs.chain.inv1", snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, "srs.chain.inv1", snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, "srs.chain.inv1", snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
         fill("srs.chain.inv1", 2);
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
 
@@ -222,8 +223,8 @@ class SrsSourceProcessorTest {
         // sent, and nothing anywhere reports it. Nothing else in this vertex enforces that, so a bounded
         // read added later - the very shape this one stands in for - would take the property away silently.
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.nofinish", snapshotRow(100));
-        buffer.append("srs.chain.nofinish", snapshotRow(101));
+        buffer.append(PIPELINE, "srs.chain.nofinish", snapshotRow(100));
+        buffer.append(PIPELINE, "srs.chain.nofinish", snapshotRow(101));
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
 
         Job job = hz.getJet().newJob(projectedDag(
@@ -251,7 +252,7 @@ class SrsSourceProcessorTest {
         fill("srs.chain.nogen", 2);
 
         Job job = hz.getJet().newJob(new DAG().vertex(new Vertex("source",
-                SrsSourceProcessor.metaSupplier("srs.chain.nogen", "orders", StartFrom.earliest(), 0L,
+                SrsSourceProcessor.metaSupplier(PIPELINE, "srs.chain.nogen", "orders", StartFrom.earliest(), 0L,
                         SrsReadCursorPublisherFactory.NONE))));
 
         assertThatThrownBy(() -> job.join())
@@ -288,8 +289,8 @@ class SrsSourceProcessorTest {
     void promisesTheSnapshotIsThroughOnceItsRowsHaveLeft() throws InterruptedException {
         SEEN.clear();
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.boundsnap", snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
-        buffer.append("srs.chain.boundsnap", snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, "srs.chain.boundsnap", snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, "srs.chain.boundsnap", snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
 
         try {
@@ -346,7 +347,8 @@ class SrsSourceProcessorTest {
         // A static resolution check: a total-parallelism-one supplier hands the real supplier to one member and
         // a no-op to the rest, so resolving over several members yields more than one distinct supplier.
         ProcessorMetaSupplier meta = SrsSourceProcessor.metaSupplier(
-                "srs.chain.pins", "orders", StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE);
+                PIPELINE, "srs.chain.pins", "orders", StartFrom.earliest(), 1L,
+                SrsReadCursorPublisherFactory.NONE);
         List<Address> addresses = List.of(
                 Address.createUnresolvedAddress("10.0.0.1", 5701),
                 Address.createUnresolvedAddress("10.0.0.2", 5702),
@@ -378,13 +380,13 @@ class SrsSourceProcessorTest {
     @Test
     void keeps_taking_what_the_capture_buffers_after_it_has_started() throws InterruptedException {
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.late", snapshotRow(100));
+        buffer.append(PIPELINE, "srs.chain.late", snapshotRow(100));
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
         com.hazelcast.jet.Job job =
                 hz.getJet().newJob(recordingDag("srs.chain.late", "orders", "out-late", 1024));
         try {
             awaitSize(hz.getList("out-late"), 1);
-            buffer.append("srs.chain.late", snapshotRow(101));
+            buffer.append(PIPELINE, "srs.chain.late", snapshotRow(101));
             awaitSize(hz.getList("out-late"), 2);
         } finally {
             job.cancel();
@@ -430,7 +432,7 @@ class SrsSourceProcessorTest {
     private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize) {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
-                ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
+                PIPELINE, ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
                 order -> new Watermark(
                         order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7)));
         Vertex record = dag.newVertex("record", ProcessorMetaSupplier.forceTotalParallelismOne(
@@ -495,7 +497,8 @@ class SrsSourceProcessorTest {
             SrsReadCursorPublisherFactory publisherFactory, long epoch) {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source",
-                SrsSourceProcessor.metaSupplier(ringName, src, StartFrom.earliest(), epoch, publisherFactory));
+                SrsSourceProcessor.metaSupplier(
+                        PIPELINE, ringName, src, StartFrom.earliest(), epoch, publisherFactory));
         Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
                 .localParallelism(1);
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);

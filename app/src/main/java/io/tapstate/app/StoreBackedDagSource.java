@@ -2020,7 +2020,7 @@ final class StoreBackedDagSource implements DagSource {
         String chain = vertex.table();
         byte axis = axes.axisOf(chain);
         return SrsSourceProcessor.metaSupplier(
-                vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
+                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
                 ringGeneration(vertex.resolution()),
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),

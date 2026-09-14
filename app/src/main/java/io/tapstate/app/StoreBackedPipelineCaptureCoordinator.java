@@ -95,7 +95,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 CaptureRunSpec spec = deriveSpec(
                         pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref));
                 Map<String, Long> observedSnapshotCounts = new LinkedHashMap<>();
-                CaptureRun run = captureStarter.start(spec, snapshotPassthrough(resolution, observedSnapshotCounts));
+                CaptureRun run = captureStarter.start(
+                        spec, snapshotPassthrough(pipelineId, resolution, observedSnapshotCounts));
                 runs.add(run);
                 recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts);
                 snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
@@ -253,12 +254,29 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      */
     private RuntimeException closeRuns(List<CaptureRun> runs, String pipelineId, boolean purgeState) {
         RuntimeException firstFailure = null;
+        boolean capturesStopped = true;
         Set<MiningChainId> chains = new LinkedHashSet<>();
         for (CaptureRun run : runs) {
-            firstFailure = runCleanup(run::close, firstFailure);
+            try {
+                run.close();
+            } catch (RuntimeException failure) {
+                capturesStopped = false;
+                if (firstFailure == null) {
+                    firstFailure = failure;
+                } else {
+                    firstFailure.addSuppressed(failure);
+                }
+            }
             // Collected whether or not the close succeeded: a daemon that refused to stop does not make the
             // consumer membership this pipeline holds any less this pipeline's to give back.
             run.chainId().ifPresent(chains::add);
+        }
+        // A live drain cannot detach an empty queue: capture may already hold that queue and append into it
+        // after the drain returns. Lifecycle teardown has no such race once every capture close returned, so
+        // this is where all of the pipeline's queues and their coordinate strings are released. Keep them when
+        // a close failed because that capture may still be appending.
+        if (capturesStopped) {
+            snapshotBuffer.release(pipelineId);
         }
         // Once per chain, never once per run. Two sources reading one connection are one chain with a ring
         // per table, which is what a pipeline over a parent and a child table is; releasing it per run would
@@ -432,14 +450,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /**
-     * The snapshot pass-through for one source: it appends each snapshot row to the shared buffer under the
-     * source's change-ring name. The source vertex reading that ring drains the buffer and emits its rows ahead
-     * of the cdc tail, so the snapshot flows through the same transform-to-sink chain as cdc, strictly before
-     * it. A read mode that runs no snapshot never calls this, so the buffer for that ring stays empty and the
-     * source is a pure tail.
+     * The snapshot pass-through for one source: it appends each snapshot row to the shared buffer under this
+     * consumer pipeline and the source's change-ring name. Only that pipeline's source vertex can drain the
+     * rows, then emits them ahead of the cdc tail, so the snapshot flows through the same transform-to-sink
+     * chain as cdc, strictly before it. A read mode that runs no snapshot never calls this, so the buffer for
+     * that pipeline and ring stays empty and the source is a pure tail.
      */
     private Consumer<Envelope> snapshotPassthrough(
-            SourceCaptureResolution resolution, Map<String, Long> observedSnapshotCounts) {
+            String pipelineId, SourceCaptureResolution resolution, Map<String, Long> observedSnapshotCounts) {
         Set<String> selectedTables = Set.copyOf(resolution.tables());
         return event -> {
             if (!selectedTables.contains(event.src())) {
@@ -447,7 +465,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                         CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
             }
             observedSnapshotCounts.merge(event.src(), 1L, Long::sum);
-            snapshotBuffer.append(resolution.ringName(event.src()), event);
+            snapshotBuffer.append(pipelineId, resolution.ringName(event.src()), event);
         };
     }
 
